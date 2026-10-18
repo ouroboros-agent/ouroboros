@@ -472,6 +472,13 @@ def test_the_surface_hears_where_the_turn_is_from_the_engine_not_from_the_audio(
     assert _wait_for(lambda: h.hub.turns[-1:] == ["idle"]), repr(h.hub.turns)
     time.sleep(live_turn.MAILBOX_TICK_S * 3)
     assert h.hub.turns[-1] == "idle"  # it already spoke: the call-live fact opens nothing late
+    # A thinking route pauses inside its work (interactionStatus IN_PROGRESS): the turn stays open.
+    engine.push(ResponseStarted(item_id="a3", response_id="resp-3"))
+    engine.push(ResponseDone(item_id="a3", status="completed", usage={}, raw_usage={}, response_id="resp-3", continues=True))
+    assert _wait_for(lambda: h.hub.turns[-1:] == ["awaiting"])
+    engine.push(ResponseStarted(item_id="a4", response_id="resp-4"))
+    engine.push(ResponseDone(item_id="a4", status="completed", usage={}, raw_usage={}, response_id="resp-4"))
+    assert _wait_for(lambda: h.hub.turns[-1:] == ["idle"])
     assert not engine.sent_of(ContextItem) or all(item.source != "call_live" for item in engine.sent_of(ContextItem))
     h.stop()
     h.finish()

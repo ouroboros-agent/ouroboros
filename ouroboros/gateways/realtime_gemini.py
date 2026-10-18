@@ -8,7 +8,11 @@ response/audio item IDs: local playback IDs are labeled, while function IDs and
 resume handles remain provider-owned. Context waits for idle because clientContent
 interrupts generation even when turnComplete is false; an item that opens a response
 completes the client turn (``turnComplete: true``), and items held through one answer
-go out together after it, completing the turn once if any of them opens one.
+go out together after it, completing the turn once if any of them opens one. A thinking
+route (gemini-3.8-live-extended-thinking, wire recorded 2026-10-18) takes a thinkingLevel,
+refuses scheduling on tool results (close 1007) and completes turns inside one interaction:
+``turnComplete`` with ``interactionStatus`` IN_PROGRESS is a pause in its work, and context
+waits for IDLE.
 """
 from __future__ import annotations
 
@@ -74,6 +78,8 @@ def setup_message(config):
     if config.native_search:
         tools.append({"googleSearch": {}})
     generation = {"responseModalities": ["AUDIO"]}
+    if config.thinking_level:  # a thinking route refuses a setup without one (close 1007, observed)
+        generation["thinkingConfig"] = {"thinkingLevel": config.thinking_level}
     if config.route.voice:
         generation["speechConfig"] = {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": config.route.voice}}}
     setup = {
@@ -178,6 +184,7 @@ class GeminiLiveEngine(RealtimeTransport):
         self._transcript_ids = {}
         self._calls = {}
         self._context = []
+        self._interacting = False  # a thinking route paused inside one interaction: context waits for IDLE
         self._pending_tools = None
         self._activating_tools = None
         self._checkpoint = ""
@@ -221,7 +228,7 @@ class GeminiLiveEngine(RealtimeTransport):
         await super()._write(payload)
 
     async def _reopen_tools(self):
-        if self._pending_tools is None or not self._checkpoint or self._item_id or self._calls:
+        if self._pending_tools is None or not self._checkpoint or self._item_id or self._calls or self._interacting:
             return
         self._ready.clear()
         self._activating_tools = self._pending_tools
@@ -242,7 +249,7 @@ class GeminiLiveEngine(RealtimeTransport):
             await self._write({"realtimeInput": {"video": {
                 "mimeType": command.mime, "data": base64.b64encode(command.data).decode("ascii")}}})
         elif isinstance(command, ContextItem):
-            if self._item_id:
+            if self._item_id or self._interacting:
                 if len(self._context) >= EVENT_QUEUE_SIZE:
                     raise LiveEngineRefusal("context_backpressure", "Live context queue is full; retain this item for redelivery.")
                 self._context.append(command)
@@ -257,8 +264,9 @@ class GeminiLiveEngine(RealtimeTransport):
             images = [image_part(data) for data in command.images]
             # The FunctionResponse wire schema places scheduling alongside
             # response. A key inside the arbitrary result object is model data.
-            response = {"id": command.call_id, "name": self._calls[command.call_id],
-                        "response": {"result": command.output}, "scheduling": schedules[command.scheduling]}
+            response = {"id": command.call_id, "name": self._calls[command.call_id], "response": {"result": command.output},
+                        # a thinking route closes the session on a scheduled result (1007, observed 2026-10-18)
+                        **({} if self._config.thinking_level else {"scheduling": schedules[command.scheduling]})}
             if images:
                 response["parts"] = [{"inlineData": {"mimeType": mime, "data": data}} for mime, data in images]
             await self._write({"toolResponse": {"functionResponses": [response]}})
@@ -363,14 +371,16 @@ class GeminiLiveEngine(RealtimeTransport):
         if content.get("turnComplete"):
             for speaker in self._transcripts:
                 self._finish_transcript(speaker)
+            self._interacting = content.get("interactionStatus") == "IN_PROGRESS"
             if self._item_id:
                 self._emit(ResponseDone(self._item_id, "interrupted" if self._interrupted else "completed",
-                                        normalize_usage(self._usage), dict(self._usage), self._response_id))
+                                        normalize_usage(self._usage), dict(self._usage), self._response_id,
+                                        continues=self._interacting))
                 self._item_id = ""
                 self._response_id = ""
                 self._usage = {}
             self._interrupted = self._discard_audio = False
-            held, self._context = list(self._context), []
+            held, self._context = ([], self._context) if self._interacting else (list(self._context), [])
             opens = any(command.opens_response for command in held)
             for index, command in enumerate(held):
                 await self._send_context(command, complete=opens and index == len(held) - 1)

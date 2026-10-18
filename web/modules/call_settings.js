@@ -1,6 +1,6 @@
 /** Settings → Models → Live calls: Gemini Live's model and voice as editable suggestions, the
  * call's own instructions, its turn-taking (how long a silence ends the owner's turn, whether
- * speaking over Ouroboros interrupts it), search and duration limits. Changes apply to the next
+ * speaking over Ouroboros interrupts it), the thinking model's depth, search and duration limits. Changes apply to the next
  * call: the host captures them when a call is admitted. Below them, this device's microphone,
  * speaker and camera with the microphone's cleaning: client-local (`call_devices.js`), outside the
  * server draft, and applied to a running call at once.
@@ -12,6 +12,7 @@ import { DEFAULT_DEVICE_PREFS, listDevices, loadDevicePrefs, openMicrophone, rou
 // Gemini Live's documented models on AI Studio keys; any other model id can be typed.
 const CALL_MODELS = [
     { value: 'gemini-3.8-live', label: 'gemini-3.8-live — Google’s live voice model' },
+    { value: 'gemini-3.8-live-extended-thinking', label: 'gemini-3.8-live-extended-thinking — thinks before it answers' },
 ];
 
 // Google's prebuilt voices with the one-word style its speech docs give each
@@ -31,7 +32,7 @@ export const CALL_SETTINGS_FIELDS = [
     ['s-call-model-google', 'OUROBOROS_CALL_MODEL_GOOGLE'], ['s-call-voice-google', 'OUROBOROS_CALL_VOICE_GOOGLE'],
     ['s-call-instructions', 'OUROBOROS_CALL_INSTRUCTIONS'],
     ['s-call-pause', 'OUROBOROS_CALL_PAUSE', 'normal'], ['s-call-interruptions', 'OUROBOROS_CALL_INTERRUPTIONS', 'true'],
-    ['s-call-native-search', 'OUROBOROS_CALL_NATIVE_SEARCH', 'true'],
+    ['s-call-native-search', 'OUROBOROS_CALL_NATIVE_SEARCH', 'true'], ['s-call-thinking', 'OUROBOROS_CALL_THINKING_LEVEL', 'low'],
     ['s-call-max-minutes', 'OUROBOROS_CALL_MAX_MINUTES'], ['s-presence-call-max-minutes', 'OUROBOROS_PRESENCE_CALL_MAX_MINUTES'],
 ];
 
@@ -61,6 +62,11 @@ export function callSettingsHtml() {
                             <div class="form-field ui-field">
                                 <label for="s-call-interruptions">Speaking interrupts Ouroboros</label>
                                 <select id="s-call-interruptions" class="ui-control"><option value="true">On</option><option value="false">Off</option></select>
+                            </div>
+                            <div class="form-field ui-field">
+                                <label for="s-call-thinking">Thinking</label>
+                                <select id="s-call-thinking" class="ui-control" aria-describedby="s-call-thinking-help"><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select>
+                                <div class="settings-inline-note ui-field-help" id="s-call-thinking-help">For the extended-thinking model only: how long it thinks before answering. More thinking answers later.</div>
                             </div>
                             <div class="form-field ui-field">
                                 <label for="s-call-native-search">Google native search</label>

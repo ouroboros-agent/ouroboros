@@ -85,6 +85,9 @@ class SessionConfig:
     # BCP-47 hints for the provider's speech recognition (the owner's languages first); a hint, never a
     # pin on the spoken reply, which follows each speaker.
     language_hints: Tuple[str, ...] = ()
+    # A thinking route's reasoning depth (Gemini's thinkingLevel: low, medium, high); "" for a route that
+    # does not think. Such a route also takes tool results without scheduling.
+    thinking_level: str = ""
 
 
 # ---- commands: driver -> engine -------------------------------------------------
@@ -215,6 +218,9 @@ class ResponseDone:
     usage: Mapping = field(default_factory=dict)
     raw_usage: Mapping = field(default_factory=dict)
     response_id: str = ""
+    # The provider's interaction goes on past this response (a thinking route paused inside its work,
+    # e.g. before a tool it calls): the turn is not complete yet.
+    continues: bool = False
 
 
 

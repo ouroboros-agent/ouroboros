@@ -214,6 +214,7 @@ One row per `config.SETTINGS_DEFAULTS` key (defaults canonical in `settings_defa
 | OUROBOROS_CALL_INSTRUCTIONS | "" | The owner's words every owner call opens with |
 | OUROBOROS_CALL_PAUSE | normal | Silence that ends the owner's turn: short 500 ms, normal = provider's, long 1600 ms |
 | OUROBOROS_CALL_INTERRUPTIONS | true | The owner's speech interrupts the answer |
+| OUROBOROS_CALL_THINKING_LEVEL | low | A thinking live model's depth (low, medium, high); a model that does not think ignores it |
 | OUROBOROS_CALL_MAX_MINUTES | "" | Optional call duration ceiling (blank = none) |
 | OUROBOROS_PRESENCE_CALL_MAX_MINUTES | "" | Optional ceiling for a Presence call, which holds a Presence slot (blank = none) |
 | LOCAL_MODEL_CHAT_FORMAT | "" | Local-model chat template override |

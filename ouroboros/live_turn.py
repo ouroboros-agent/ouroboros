@@ -381,7 +381,7 @@ class _LiveCall:
         return SessionConfig(route=self.route.engine, instructions=instructions, tools=(*self.tool_schemas, *call_local_schemas(self.spec)),
                              history=() if resume_handle else history, native_search=native_search_enabled(self.spec),
                              resume_handle=resume_handle, compress_at_tokens=compress_at, compress_to_tokens=compress_to,
-                             **call_turn_taking(self.spec, self.renewal.languages))
+                             **call_turn_taking(self.spec, self.renewal.languages, self.route.fact))
 
     async def _open_engine(self, *, resume_handle: str = "") -> None:
         if self.closing or self.hub.ended_by_owner:
@@ -691,9 +691,10 @@ class _LiveCall:
             self._attempt_for(event.response_id or event.item_id)
             self._turn(TURN_ANSWERING)
         elif isinstance(event, ResponseDone):
-            self.response_open, self.current_response = False, ""
-            lane = self.tools_lane  # a tool still owes its result: the engine answers again when it arrives
-            self._turn(TURN_AWAITING if lane.running or lane.pending or lane.claimed else TURN_IDLE)
+            # A thinking route paused inside its work keeps the turn open; a tool still owing its result
+            # means the engine answers again when it arrives.
+            self.response_open, self.current_response, lane = event.continues, "", self.tools_lane
+            self._turn(TURN_AWAITING if event.continues or lane.running or lane.pending or lane.claimed else TURN_IDLE)
             self.renewal.observe(event.usage)
             self._settle(event)
             await self._drain()

@@ -1,0 +1,1481 @@
+{
+ "header": {
+  "provenance": "recorded_live",
+  "model": "gemini-3.8-live-extended-thinking",
+  "recorded_on": "2026-10-18",
+  "recorder": "the sprint's thinking-wire probe (direct AI Studio session, no Ouroboros in between)",
+  "notes": "The owner's audio is a TTS request in Russian to start a task; the tool's result went back 3 s after the call WITHOUT scheduling (a second session sent WHEN_IDLE and was closed: 1007 'Function response scheduling is not supported for this model'); then a typed task report with turnComplete. Audio is a two-sample stand-in beside its recorded length; the tool call id is a label."
+ },
+ "events": [
+  {
+   "direction": "client",
+   "message": {
+    "setup": {
+     "model": "models/gemini-3.8-live-extended-thinking",
+     "systemInstruction": {
+      "parts": [
+       {
+        "text": "You are Ouroboros, an AI talking with your owner on a live voice call. Answer briefly and naturally. When a tool will take a moment, first say in a few words what you are doing, then call it."
+       }
+      ]
+     },
+     "generationConfig": {
+      "responseModalities": [
+       "AUDIO"
+      ],
+      "thinkingConfig": {
+       "thinkingLevel": "low"
+      }
+     },
+     "inputAudioTranscription": {},
+     "outputAudioTranscription": {},
+     "tools": [
+      {
+       "functionDeclarations": [
+        {
+         "name": "start_task",
+         "behavior": "NON_BLOCKING"
+        }
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 0.0,
+   "message": {
+    "setupComplete": {}
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 4.34,
+   "message": {
+    "sessionResumptionUpdate": {
+     "newHandle": "dfdc6150-bb51-48a4-9061-0f70409e8666",
+     "resumable": true
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 4.72,
+   "message": {
+    "voiceActivity": {
+     "type": "ACTIVITY_START",
+     "audioOffset": "0.640s"
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 7.73,
+   "message": {
+    "serverContent": {
+     "inputTranscription": {
+      "text": "Запусти, пожалуйста, задачу, посчитай, сколько транзакций было сегодня на OpenRouter."
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 7.74,
+   "message": {
+    "voiceActivity": {
+     "type": "ACTIVITY_END",
+     "audioOffset": "7.440s"
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 7.78,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 7.78,
+   "message": {
+    "serverContent": {}
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 7.94,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 7.96,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 7040
+        }
+       }
+      ],
+      "role": "model"
+     },
+     "outputTranscription": {
+      "text": "Сейчас я "
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 7.97,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 8.06,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 20480
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 8.26,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 8.3,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 20480
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 8.61,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 8.64,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 28160
+        }
+       }
+      ],
+      "role": "model"
+     },
+     "outputTranscription": {
+      "text": "это проверю."
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 9.01,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 9.05,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 20480
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 9.33,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 9.35,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 7680
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 9.46,
+   "message": {
+    "serverContent": {
+     "generationComplete": true
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 9.46,
+   "message": {
+    "serverContent": {
+     "turnComplete": true,
+     "interactionStatus": "IN_PROGRESS"
+    },
+    "usageMetadata": {
+     "promptTokenCount": 3364,
+     "responseTokenCount": 47,
+     "totalTokenCount": 3411,
+     "promptTokensDetails": [
+      {
+       "modality": "TEXT",
+       "tokenCount": 2872
+      },
+      {
+       "modality": "AUDIO",
+       "tokenCount": 379
+      }
+     ],
+     "responseTokensDetails": [
+      {
+       "modality": "AUDIO",
+       "tokenCount": 47
+      }
+     ],
+     "thoughtsTokenCount": 109
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 10.27,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 10.28,
+   "message": {
+    "toolCall": {
+     "functionCalls": [
+      {
+       "name": "start_task",
+       "args": {
+        "objective": "Посчитать количество транзакций за сегодня на OpenRouter"
+       },
+       "id": "call_3789720_fc_0_0"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "direction": "client",
+   "at_s": 13.28,
+   "message": {
+    "toolResponse": {
+     "functionResponses": [
+      {
+       "id": "<the call's id>",
+       "name": "start_task",
+       "response": {
+        "result": "Task 1234 started; it runs in the background."
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 15.29,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 15.59,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 15.59,
+   "message": {
+    "serverContent": {}
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 15.73,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 15.73,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 15.73,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 4
+        }
+       }
+      ],
+      "role": "model"
+     },
+     "outputTranscription": {
+      "text": "Задачу запустил, "
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 15.84,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 10240
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 15.84,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 15.86,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 10240
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 15.95,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 15.97,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 10240
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 16.11,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 16.13,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 15360
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 16.34,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 16.37,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 20480
+        }
+       }
+      ],
+      "role": "model"
+     },
+     "outputTranscription": {
+      "text": "она выполняется"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 16.66,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 16.69,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 10240
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 16.84,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 16.84,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 10240
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 16.99,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 17.0,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 10240
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 17.14,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 17.17,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 10240
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 17.4,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 17.41,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 2560
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 17.41,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 17.6,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 20480
+        }
+       }
+      ],
+      "role": "model"
+     },
+     "outputTranscription": {
+      "text": " в фоновом режиме."
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 17.68,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 17.85,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 10240
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 17.85,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 18.01,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 12800
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 18.02,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 18.2,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 20480
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 18.34,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 18.49,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 35840
+        }
+       }
+      ],
+      "role": "model"
+     },
+     "outputTranscription": {
+      "text": " Сообщу результаты,"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 18.9,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 18.96,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 20480
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 19.22,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 19.24,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 7680
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 19.34,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 19.39,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 23040
+        }
+       }
+      ],
+      "role": "model"
+     },
+     "outputTranscription": {
+      "text": " как только"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 19.7,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 19.76,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 20480
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 20.03,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 20.09,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 20480
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 20.34,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 20.6,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 35840
+        }
+       }
+      ],
+      "role": "model"
+     },
+     "outputTranscription": {
+      "text": " всё посчитается."
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 21.01,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 21.48,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 33280
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 21.48,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 21.83,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 20480
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 21.83,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 21.84,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 5120
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 21.84,
+   "message": {
+    "serverContent": {
+     "generationComplete": true
+    }
+   }
+  },
+  {
+   "direction": "client",
+   "at_s": 22.84,
+   "message": {
+    "clientContent": {
+     "turns": [
+      {
+       "role": "user",
+       "parts": [
+        {
+         "text": "[room_row:out] The task you started reports: it found 3 open issues."
+        }
+       ]
+      }
+     ],
+     "turnComplete": true
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 22.84,
+   "message": {
+    "serverContent": {
+     "turnComplete": true,
+     "interactionStatus": "IDLE"
+    },
+    "usageMetadata": {
+     "promptTokenCount": 6326,
+     "responseTokenCount": 207,
+     "totalTokenCount": 7035,
+     "promptTokensDetails": [
+      {
+       "modality": "TEXT",
+       "tokenCount": 5765
+      },
+      {
+       "modality": "AUDIO",
+       "tokenCount": 426
+      }
+     ],
+     "responseTokensDetails": [
+      {
+       "modality": "TEXT",
+       "tokenCount": 45
+      },
+      {
+       "modality": "AUDIO",
+       "tokenCount": 162
+      }
+     ],
+     "thoughtsTokenCount": 502
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 23.62,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 23.62,
+   "message": {
+    "serverContent": {}
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 23.76,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 23.79,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 4480
+        }
+       }
+      ],
+      "role": "model"
+     },
+     "outputTranscription": {
+      "text": "Задача, которую вы "
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 23.8,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 23.94,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 20480
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 24.06,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 24.19,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 23040
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 24.41,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 26.61,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 33280
+        }
+       }
+      ],
+      "role": "model"
+     },
+     "outputTranscription": {
+      "text": "запустили, сообщает,"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 26.61,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 26.69,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 23040
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 26.7,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 26.82,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 7680
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 26.83,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 27.58,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 20480
+        }
+       }
+      ],
+      "role": "model"
+     },
+     "outputTranscription": {
+      "text": " что найдено"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 27.58,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 28.13,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 20480
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 28.13,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 28.59,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 23040
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 28.59,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 28.9,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 20480
+        }
+       }
+      ],
+      "role": "model"
+     },
+     "outputTranscription": {
+      "text": " 3 открытых вопроса."
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 28.91,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 29.11,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 20480
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 29.11,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 29.28,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 20480
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 29.28,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 29.47,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 28160
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 29.47,
+   "message": {}
+  },
+  {
+   "direction": "server",
+   "at_s": 29.57,
+   "message": {
+    "serverContent": {
+     "modelTurn": {
+      "parts": [
+       {
+        "inlineData": {
+         "mimeType": "audio/pcm;rate=24000",
+         "data": "AAABAA==",
+         "recorded_b64_chars": 15360
+        }
+       }
+      ],
+      "role": "model"
+     }
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 29.57,
+   "message": {
+    "serverContent": {
+     "generationComplete": true
+    }
+   }
+  },
+  {
+   "direction": "server",
+   "at_s": 29.57,
+   "message": {
+    "serverContent": {
+     "turnComplete": true,
+     "interactionStatus": "IDLE"
+    },
+    "usageMetadata": {
+     "promptTokenCount": 3718,
+     "responseTokenCount": 116,
+     "totalTokenCount": 3962,
+     "promptTokensDetails": [
+      {
+       "modality": "TEXT",
+       "tokenCount": 2973
+      },
+      {
+       "modality": "AUDIO",
+       "tokenCount": 588
+      }
+     ],
+     "responseTokensDetails": [
+      {
+       "modality": "AUDIO",
+       "tokenCount": 116
+      }
+     ],
+     "thoughtsTokenCount": 128
+    }
+   }
+  }
+ ]
+}

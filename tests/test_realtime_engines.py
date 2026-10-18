@@ -574,7 +574,7 @@ def test_gemini_turn_taking_is_sent_only_when_the_owner_chose_it():
     route = EngineRoute("google", "gemini-3.8-live")
     assert "realtimeInputConfig" not in gemini.setup_message(SessionConfig(route, "core"))["setup"]
     normal = call_turn_taking(CallSpec("c", 1, "google", "m", pause="normal"))
-    assert normal == {"silence_ms": 0, "interruptions": True, "language_hints": ()}
+    assert normal == {"silence_ms": 0, "interruptions": True, "language_hints": (), "thinking_level": ""}
     assert "realtimeInputConfig" not in gemini.setup_message(SessionConfig(route, "core", **normal))["setup"]
     chosen = call_turn_taking(CallSpec("c", 1, "google", "m", pause="long", interruptions=False))
     assert gemini.setup_message(SessionConfig(route, "core", **chosen))["setup"]["realtimeInputConfig"] == {
@@ -629,3 +629,52 @@ async def test_gemini_completes_the_client_turn_only_for_what_opens_a_response()
     await engine.send(ContextItem("", "", opens_response=True))  # a bare completion: measured to open a response
     assert socket.sent[-1] == {"clientContent": {"turnComplete": True}}
     await finished(engine, collector)
+
+
+@run_async
+async def test_a_thinking_route_pauses_inside_its_work_and_takes_unscheduled_results():
+    """gemini-3.8-live-extended-thinking's own wire (recorded 2026-10-18): a spoken filler ends a turn
+    with interactionStatus IN_PROGRESS, the tool call follows, and only IDLE ends the interaction."""
+    from ouroboros.gateways.realtime_engine import ToolCall
+
+    fixture = json.loads((WIRE / "gemini" / "thinking_exchange.json").read_text(encoding="utf-8"))
+    assert fixture["header"]["provenance"] == "recorded_live"
+    config = SessionConfig(EngineRoute("google", "gemini-3.8-live-extended-thinking"), "core", (TOOL,), thinking_level="low")
+    engine, connection, events, collector = await opened("google", config=config)
+    socket = connection.sockets[0]
+    assert socket.sent[0]["setup"]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "low"}
+    held_sent = None
+    for row in fixture["events"]:
+        message = row["message"]
+        if row["direction"] != "server" or "setupComplete" in message:
+            continue
+        await feed(engine, socket, message)
+        status = (message.get("serverContent") or {}).get("interactionStatus")
+        if status == "IN_PROGRESS" and held_sent is None:
+            held_sent = len(socket.sent)
+            await engine.send(ContextItem("A room row while it works", "room_row:system"))
+            assert len(socket.sent) == held_sent  # context waits: the interaction is still in progress
+        for call in (message.get("toolCall") or {}).get("functionCalls") or ():
+            await engine.send(ToolResult(call["id"], "Task 1234 started; it runs in the background."))
+            assert "scheduling" not in socket.sent[-1]["toolResponse"]["functionResponses"][0]  # 1007 otherwise
+        if status == "IDLE" and held_sent is not None and not any("clientContent" in sent for sent in socket.sent[held_sent:]):
+            raise AssertionError("the held context was not sent at IDLE")
+    done = selected(events, ResponseDone)
+    assert [d.continues for d in done][:1] == [True] and done[-1].continues is False
+    assert [call.name for call in selected(events, ToolCall)] == ["start_task"]
+    assert all("thoughtsTokenCount" in d.raw_usage for d in done)  # live_usage prices thinking as output
+    await finished(engine, collector)
+
+
+def test_a_thinking_route_is_documented_and_its_depth_is_the_owners():
+    from ouroboros.call_protocol import CallSpec
+    from ouroboros.live_call_route import REALTIME_ROUTE_FACTS, call_turn_taking
+
+    thinking = REALTIME_ROUTE_FACTS[("google", "gemini-3.8-live-extended-thinking")]
+    standard = REALTIME_ROUTE_FACTS[("google", "gemini-3.8-live")]
+    assert thinking.thinking and not standard.thinking and thinking.window_tokens == standard.window_tokens == 131_072
+    spec = CallSpec("c", 1, "google", "gemini-3.8-live-extended-thinking")
+    assert call_turn_taking(spec, (), thinking)["thinking_level"] == "low"
+    assert call_turn_taking(spec, (), standard)["thinking_level"] == "" and call_turn_taking(spec)["thinking_level"] == ""
+    bare = gemini.setup_message(SessionConfig(EngineRoute("google", "gemini-3.8-live"), "core"))["setup"]
+    assert "thinkingConfig" not in bare["generationConfig"]  # a route that does not think is sent none

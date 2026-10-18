@@ -24,7 +24,11 @@ test('Live calls in Settings: one engine (Gemini Live), its model and voice, and
     const fields = SETTINGS_INPUT_FIELDS.filter(([, key]) => key.includes('CALL_'));
     assert.deepEqual(fields.map(([, key]) => key), ['OUROBOROS_CALL_MODEL_GOOGLE', 'OUROBOROS_CALL_VOICE_GOOGLE',
         'OUROBOROS_CALL_INSTRUCTIONS', 'OUROBOROS_CALL_PAUSE', 'OUROBOROS_CALL_INTERRUPTIONS',
-        'OUROBOROS_CALL_NATIVE_SEARCH', 'OUROBOROS_CALL_MAX_MINUTES', 'OUROBOROS_PRESENCE_CALL_MAX_MINUTES']);
+        'OUROBOROS_CALL_NATIVE_SEARCH', 'OUROBOROS_CALL_THINKING_LEVEL', 'OUROBOROS_CALL_MAX_MINUTES',
+        'OUROBOROS_PRESENCE_CALL_MAX_MINUTES']);
+    // The second model thinks before it answers; its depth is its own field (low unless chosen).
+    assert.match(html, /data-model-value="gemini-3\.8-live-extended-thinking"/);
+    assert.match(html, /id="s-call-thinking"[^>]*>[^]*value="low"[^]*value="medium"[^]*value="high"/);
     for (const [id, key, fallback] of fields) {
         assert.equal(html.split(`id="${id}"`).length - 1, 1, key);
         if (key.endsWith('MAX_MINUTES')) {

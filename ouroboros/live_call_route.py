@@ -99,6 +99,8 @@ class RouteFact:
     # The most audio a spoken session was seen to hold before the provider dropped its oldest turns
     # (0 = never seen): the renewal's audio span starts here and a call's own drops lower it.
     held_audio_tokens: int = 0
+    # The route thinks before it speaks (models.get ``thinking``): its setup takes a thinking level.
+    thinking: bool = False
 
 
 REALTIME_ROUTE_FACTS: Dict[Tuple[str, str], RouteFact] = {
@@ -111,6 +113,11 @@ REALTIME_ROUTE_FACTS: Dict[Tuple[str, str], RouteFact] = {
     (ENGINE_GOOGLE, "gemini-3.8-live"): RouteFact(
         131_072, 65_536, None, "https://ai.google.dev/gemini-api/docs/models/gemini-3.8-live", "2026-10-16",
         cold_density=1.25, held_audio_tokens=2_500),
+    # The same window and output maximum in models.get, with thinking true (2026-10-18); the cold density is
+    # the family's until the route's own witness; its held audio was never measured.
+    (ENGINE_GOOGLE, "gemini-3.8-live-extended-thinking"): RouteFact(
+        131_072, 65_536, None, "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-live-extended-thinking",
+        "2026-10-18", cold_density=1.25, thinking=True),
 }
 EVIDENCE_SOURCE_DOCUMENTED = "documented_route_fact"   # the evidence store's source label for these rows
 
@@ -272,11 +279,13 @@ def call_minutes_ceiling(spec: CallSpec) -> Optional[int]:
 PAUSE_SILENCE_MS = {"short": 500, "normal": 0, "long": 1600}
 
 
-def call_turn_taking(spec: CallSpec, languages: Tuple[str, ...] = ()) -> Dict[str, Any]:
-    """The session's ``silence_ms`` and ``interruptions`` from what the owner chose for calls, and the
-    recognition ``language_hints`` the voice recorded (``call_languages``)."""
+def call_turn_taking(spec: CallSpec, languages: Tuple[str, ...] = (), fact: Optional[RouteFact] = None) -> Dict[str, Any]:
+    """The session's ``silence_ms`` and ``interruptions`` from what the owner chose for calls, the
+    recognition ``language_hints`` the voice recorded (``call_languages``), and a thinking route's
+    ``thinking_level`` (the owner's choice, low unless set; a route that does not think takes none)."""
+    thinking = (_call_setting("OUROBOROS_CALL_THINKING_LEVEL") or "low").lower() if fact is not None and fact.thinking else ""
     return {"silence_ms": PAUSE_SILENCE_MS.get(str(spec.pause or "").lower(), 0), "interruptions": bool(spec.interruptions),
-            "language_hints": tuple(languages)}
+            "language_hints": tuple(languages), "thinking_level": thinking}
 
 
 def native_search_enabled(spec: CallSpec) -> bool:
