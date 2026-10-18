@@ -1,9 +1,10 @@
 /** The wave in the glass: the call's light is the owner's wave, drawn inside the composer capsule's
  * frosted glass. Three strands of a sine whose envelope is zero at both ends (`STRANDS`, `waveShape`)
- * run as tapered ribbons across the capsule's width, after the words (a row with no room after them,
- * a phone's, runs them under the words, stepping back, so they stay readable). One voice's colour at a time: the strands and a faint tint of the glass take
- * the speaker's hue (owner blue, Ouroboros crimson) and change it by fading through the neutral,
- * never two hues lit together. The glass's outline breathes with the heard level, a spring of a few
+ * run as tapered ribbons across the capsule's width, after the words (a phone's chip has no room there: its
+ * wave is the words' second line, under the state word, while a voice speaks or the line is empty).
+ * The strands and a faint tint of the glass take the speaker's hue (owner blue, Ouroboros crimson) and
+ * change it by a direct cross-fade: the new hue eases in while the old one eases out, so for a third of a
+ * second both are lit. The glass's outline breathes with the heard level, a spring of a few
  * pixels that never moves the layout. Thinking is a soft travelling pulse; working draws the strands
  * in to the room's three dots and back; muted is one dashed neutral line; an error holds still in
  * amber. In the big view (`data-call-view="big"`) the same glass and wave are larger.
@@ -12,7 +13,7 @@
  * else: `mount` fills the capsule's slot (here the wave's canvas and the work dots), may add layers
  * to the row (here the glass behind it) and draws one frame when the light asks (`draw`); `mark` is
  * the small static sign of Talk and of the shell's mark. The light writes `--call-mic`/`--call-out`
- * on the composer and the capsule writes `data-call-light|voice|tone|view|work`.
+ * on the composer and the capsule writes `data-call-light|voice|tone|view|work|line`.
  */
 import { LEVEL_CEILING_DB, LEVEL_CURVE, LEVEL_FLOOR_DB } from './call_worklet.js';
 
@@ -23,9 +24,11 @@ const HISTORY = 26;
 const HISTORY_STEP = 0.024;
 // After a change of size or a still state the visual paints its own frames this long, so springs settle.
 const SETTLE_SECONDS = 0.9;
+// A change of hue: the new one eases in while the old one eases out, with this time constant (seconds).
+const BLEND_SECONDS = 0.16;
+const HUES = ['idle', 'owner', 'ouroboros', 'error'];
 const clamp = (value, low, high) => Math.min(high, Math.max(low, value));
 const ease = (current, target, dt, up, down) => current + (target - current) * (1 - Math.exp(-Math.max(0, dt) / (target > current ? up : down)));
-const mix = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
 const rgba = (c, alpha) => `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${clamp(alpha, 0, 1).toFixed(3)})`;
 const triplet = (text, fallback) => {
     const numbers = String(text || '').match(/[\d.]+/g);
@@ -73,7 +76,7 @@ function waveMark(doc) {
 }
 
 function mount({ slot, row, wrap, doc, env = globalThis }) {
-    // The glass: the row's own surface while a call is live, tinted by one hue, breathing outward.
+    // The glass: the row's own surface while a call is live, tinted by the speaker's hue, breathing outward.
     const glass = doc.createElement('span');
     glass.className = 'call-glass';
     glass.setAttribute('aria-hidden', 'true');
@@ -97,8 +100,8 @@ function mount({ slot, row, wrap, doc, env = globalThis }) {
     let x0 = 20;
     let x1 = 240;
     let centre = 0.5;
-    let band = 190;  // the big view's free half-height between the words and the controls
-    let under = false;  // a narrow row's wave runs under the words (stepping back), not after them
+    let band = 190;  // the big view's free half-height; a phone's small wave, its reach
+    let place = '';  // where a phone's chip keeps its small wave (call.css --call-wave-place), else after the words
     let mounted = false;
     function fit() {
         width = Math.max(24, slot.clientWidth || 0);
@@ -108,7 +111,7 @@ function mount({ slot, row, wrap, doc, env = globalThis }) {
         const edge = slot.getBoundingClientRect?.() || { left: 0 };
         const buttons = row.querySelector('.call-buttons')?.getBoundingClientRect?.();
         const words = row.querySelector('.call-words');
-        let wordsEnd = 0;
+        place = String(env.getComputedStyle?.(slot)?.getPropertyValue?.('--call-wave-place') || '').trim();
         centre = big() && (env.innerWidth || 0) >= 980 ? 0.54 : 0.5;
         band = 190;
         if (wrap.dataset.callView === 'sheet') { x0 = 3; x1 = width - 3; } else if (big()) {
@@ -124,21 +127,33 @@ function mount({ slot, row, wrap, doc, env = globalThis }) {
         } else {
             x0 = 20;
             x1 = buttons?.width ? Math.max(x0 + 40, buttons.left - edge.left - 10) : width - 20;
-            // The words end where their right-most visible line ends: the state and its time share one row,
-            // so the widest child alone falls short by the time's width.
-            const right = Math.max(0, ...[...(words?.children || [])]
-                .filter(child => !child.hidden && child.getClientRects?.().length)
-                .map(child => child.getBoundingClientRect().right));
-            if (right) {
-                // The wave starts after the words, never under them. A row without room for a whole small
-                // wave there (a phone) keeps it under the words, stepping back, so it never disappears.
-                const end = right - edge.left + 8;
-                if (x1 - end >= 64) x0 = end + (x1 - end >= 190 ? 20 : 4);
-                else { x0 = 14; wordsEnd = end; }
+            const box = words?.getBoundingClientRect?.();
+            const state = row.querySelector('.call-state')?.getBoundingClientRect?.();
+            if (place === 'line' && box?.width && state?.height) {
+                // A phone's chip: the wave is the words' second line. It runs from the words' left edge to the
+                // controls, between the state word's line and the glass's lower edge, so it never touches a
+                // letter; the line holds words instead when there is something to say (call_capsule.js).
+                x0 = box.left - edge.left;
+                const top = state.bottom - (edge.top || 0) + 1;
+                const bottom = height - 1.5;
+                centre = (top + bottom) / 2 / height;
+                band = Math.max(2, (bottom - top) / 2 - 3);  // the reach, less a speaking strand's soft band
+            } else {
+                place = '';
+                // The words end where their right-most visible line ends: the state and its time share one row,
+                // so the widest child alone falls short by the time's width.
+                const right = Math.max(0, ...[...(words?.children || [])]
+                    .filter(child => !child.hidden && child.getClientRects?.().length)
+                    .map(child => child.getBoundingClientRect().right));
+                if (right) {
+                    // The wave starts after the words, never under them; a row with no room for a whole wave
+                    // there draws none (the glass's colour and breath still say who speaks).
+                    const end = right - edge.left + 8;
+                    x0 = end + (x1 - end >= 190 ? 20 : 4);
+                    if (x1 - x0 < 44) x1 = x0;
+                }
             }
         }
-        under = wordsEnd > 0;
-        canvas.style.setProperty('--call-words', `${Math.round(wordsEnd)}px`);
         work.style.setProperty('--call-work-x', `${Math.round((x0 + x1) / 2)}px`);
         work.style.setProperty('--call-work-y', `${(centre * 100).toFixed(1)}%`);
         settle();
@@ -175,9 +190,11 @@ function mount({ slot, row, wrap, doc, env = globalThis }) {
     let velocity = 0;
     let phase = 0;        // the travelling phase
     let busy = 0;         // working: the strands draw in to the three dots
-    let hue = 'idle';     // the colour in use; it fades through the neutral to change
-    let hueLevel = 1;
+    // Each colour's share of the strands and the glass: the one in use eases to 1, the others to 0.
+    const weight = { idle: 1, owner: 0, ouroboros: 0, error: 0 };
+    let glow = 0;         // the glass's tint level, shared by the voices in use
     let breath = 0;       // the outline's spring
+    let shown = 1;        // a phone's wave on the words' second line: 0 while the line holds words
     let breathVelocity = 0;
     const tint = { owner: 0, ouroboros: 0 };
     const written = new Map();
@@ -265,31 +282,29 @@ function mount({ slot, row, wrap, doc, env = globalThis }) {
         phase += reduced ? 0 : dt * (4 + 6 * amp);
         busy = reduced ? (working ? 1 : 0) : ease(busy, working ? 1 : 0, dt, 0.28, 0.22);
 
-        // One hue at a time: a new speaker's colour arrives after the old one faded to the neutral.
-        if (shape.colour !== hue) {
-            hueLevel = reduced ? 0 : ease(hueLevel, 0, dt, 0.1, 0.11);
-            if (hueLevel < 0.07) hue = shape.colour;
-        } else hueLevel = reduced ? 1 : ease(hueLevel, 1, dt, 0.2, 0.2);
+        // A direct cross-fade: the new speaker's hue eases in while the old one eases out at the same pace,
+        // so for a moment the strands and the glass carry both voices' colours.
+        for (const name of HUES) weight[name] = reduced ? Number(name === shape.colour)
+            : ease(weight[name], name === shape.colour ? 1 : 0, dt, BLEND_SECONDS, BLEND_SECONDS);
         const colours = palette();
-        const ink = hue === 'idle' ? colours.neutral
-            : mix(colours.neutral, hue === 'owner' ? colours.owner : hue === 'ouroboros' ? colours.ouroboros : colours.error, hueLevel);
-        const quiet = hue === 'idle' || (hue !== shape.colour && hueLevel < 0.5);
+        const hues = { idle: colours.neutral, owner: colours.owner, ouroboros: colours.ouroboros, error: colours.error };
+        const ink = [0, 1, 2].map(i => HUES.reduce((sum, name) => sum + hues[name][i] * weight[name], 0));
+        const quiet = weight.idle > 0.5;
 
-        // The glass: tinted by the hue in use, its outline breathing with the level.
-        const lit = clamp(amp * 1.4, 0, 1) * (working ? 0.5 : 1) * (hue === 'idle' ? 0 : hueLevel);
-        const tintTarget = name => (hue === name && !working ? 0.18 + 0.82 * lit : hue === name ? 0.2 * hueLevel : 0);
-        for (const [name, other] of [['owner', 'ouroboros'], ['ouroboros', 'owner']]) {
-            // The incoming voice tints the glass only once the outgoing one has cleared it.
-            const target = tint[other] > 0.03 ? 0 : tintTarget(name);
-            tint[name] = reduced ? (hue === name ? 0.5 : 0) : ease(tint[name], target, dt, 0.25, 0.18);
-        }
+        // The glass: tinted by the voices in use, its outline breathing with the level.
+        const lit = clamp(amp * 1.4, 0, 1) * (working ? 0.5 : 1) * (1 - weight.idle);
+        glow = reduced ? 0.5 : ease(glow, working ? 0.2 : 0.18 + 0.82 * lit, dt, 0.25, 0.18);
+        for (const name of ['owner', 'ouroboros']) tint[name] = glow * weight[name];
         const reach = reduced ? 0 : (large ? 8 : 4.5) * clamp(amp * 1.25, 0, 1);
         breathVelocity += (260 * (reach - breath) - 20 * breathVelocity) * dt;
         breath = reduced ? 0 : Math.max(0, breath + breathVelocity * dt);
         put(row, '--call-breath', breath.toFixed(2));
         put(row, '--call-tint-owner', tint.owner.toFixed(3));
         put(row, '--call-tint-ouroboros', tint.ouroboros.toFixed(3));
-        const dots = busy > 0.55 && !under ? '1' : '';  // the three dots stand only after the words
+        // On a phone's chip the words' second line is the wave's only while it has no words to show.
+        const free = place !== 'line' || wrap.dataset.callLine !== 'text';
+        shown = reduced ? (free ? 1 : 0) : ease(shown, free ? 1 : 0, dt, 0.08, 0.05);
+        const dots = busy > 0.55 && x1 > x0 && shown > 0.5 ? '1' : '';  // the dots stand only where the wave has room
         if ((slot.dataset.work || '') !== dots) slot.dataset.work = dots;
         const sheet = wrap.dataset.callView === 'sheet';
         if (!context || !(wrap.dataset.call === 'live' || (sheet && input.mode === 'error'))) return;
@@ -297,10 +312,12 @@ function mount({ slot, row, wrap, doc, env = globalThis }) {
         // ---- the three strands ----
         context.setTransform(ratio, 0, 0, ratio, 0, 0);
         context.clearRect(0, 0, width, height);
+        if (x1 - x0 < 1 || shown < 0.01) return;  // no room, or the words' second line holds words
+        context.globalAlpha = shown;
         const cy = height * centre;
         const span = x1 - x0;
         // The chip's canvas is the whole glass: 0.4 of it is 0.6 of the capsule inside the glass's padding.
-        const reachPx = large ? Math.min(height * 0.4, band) : height * 0.4;
+        const reachPx = large ? Math.min(height * 0.4, band) : place ? band : height * 0.4;
         const tip = large ? 0.9 : 0.7;
         if (input.mode === 'error') {
             ribbon(line(STRANDS[0], { pulse: false }, cy, 0, 1, t), colours.error, 0.95, large ? 3.2 : 2.2, tip);
@@ -322,12 +339,14 @@ function mount({ slot, row, wrap, doc, env = globalThis }) {
         if (busy > 0.98) return;  // the three dots stand where the strands drew in
         const gone = 1 - busy * 0.97;
         const spanScale = 1 - 0.92 * busy;
-        const restBoost = reduced && hue !== 'idle' ? 1.5 : 1;
+        const restBoost = reduced && weight.idle < 0.5 ? 1.5 : 1;
         for (let s = STRANDS.length - 1; s >= 0; s -= 1) {
             const strand = STRANDS[s];
             const p = line(strand, shape, cy, reachPx, spanScale, t);
             const alpha = strand[0] * (quiet ? colours.rest : 0.96) * gone;
-            const body = ((large ? 2.1 : 1.35) + (large ? 3.6 : 2) * strand[0]) * restBoost * (quiet ? 0.9 : 1);
+            // A phone's small wave draws slimmer strands with a narrower soft band, so it keeps clear of the words.
+            const body = ((large ? 2.1 : 1.35) + (large ? 3.6 : 2) * strand[0]) * restBoost * (quiet ? 0.9 : 1)
+                * (place ? 0.72 : 1);
             if (!quiet && s === 0 && !shape.pulse) {
                 // The glass's own light: a soft body between the main strand and its mirror.
                 context.beginPath();
@@ -337,7 +356,7 @@ function mount({ slot, row, wrap, doc, env = globalThis }) {
                 context.fillStyle = rgba(ink, 0.07 * lit * gone);
                 context.fill();
             }
-            if (!quiet) ribbon(p, ink, alpha * colours.band * 1.6, body * 3.6, tip * 2);
+            if (!quiet) ribbon(p, ink, alpha * colours.band * 1.6, body * (place ? 2.4 : 3.6), tip * 2);
             ribbon(p, ink, alpha, body, tip);
         }
     }

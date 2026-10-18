@@ -37,7 +37,7 @@ const KEYBOARD_PLACEHOLDER = 'Message…';
 const GROW = '<svg class="call-size-grow" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4h6v6M10 20H4v-6M20 4l-7 7M4 20l7-7"/></svg>';
 const SHRINK = '<svg class="call-size-shrink" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 10h-6V4M4 14h6v6M14 10l7-7M3 21l7-7"/></svg>';
 const SIZE = { chip: 'Expand the call', big: 'Minimise the call' };
-const CALL_STATE = ['call', 'callView', 'callLight', 'callVoice', 'callTone', 'callSharing', 'callWork'];
+const CALL_STATE = ['call', 'callView', 'callLight', 'callVoice', 'callTone', 'callSharing', 'callWork', 'callLine'];
 
 // Why a call reconnects, beside "Reconnecting…".
 const RECONNECT_WORDS = {
@@ -138,11 +138,12 @@ export function callPresentation(view, live = {}) {
     const heard = Boolean(live.heard);
     const base = { mode: 'live', light: 'listen', voice: heard ? 'ouroboros' : 'owner', sub: '' };
     if (view.muted) return { ...base, light: 'muted', title: 'Muted', sub: 'Ouroboros can’t hear you' };
-    if (heard) return { ...base, title: 'Ouroboros', sub: 'Speaking' };
+    if (heard) return { ...base, title: 'Ouroboros', sub: 'Speaking', voiced: true };
     // The owner's voice, from the microphone gate at once (a caption arrives later).
-    if (live.owner || live.ownerSpeaking) return { ...base, title: 'Listening', sub: 'You’re speaking' };
+    if (live.owner || live.ownerSpeaking) return { ...base, title: 'Listening', sub: 'You’re speaking', voiced: true };
     // One answer is one Speaking, its pauses included: the engine says when it ends (`turn`).
-    if (view.turn === 'answering' && live.answered) return { ...base, voice: 'ouroboros', title: 'Ouroboros', sub: 'Speaking' };
+    if (view.turn === 'answering' && live.answered) return { ...base, voice: 'ouroboros', title: 'Ouroboros', sub: 'Speaking',
+        voiced: true };
     // The tool's own label is the host's sentence, shown as it is (or as the install translated it).
     if (view.activity?.working) return { ...base, light: 'think', work: true, title: 'Working',
         sub: view.activity.label ? tx(view.activity.label) : 'Using a tool', subFormatted: Boolean(view.activity.label) };
@@ -442,9 +443,12 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
         const followUp = note?.kind === 'copied' ? 'Link copied — paste it into your browser'
             : note?.kind === 'copy_failed' ? fmt('Copy this address into your browser: {url}', { url: note.url }) : '';
         const sharing = SOURCES[current.sharing]?.on || '';
-        setWords(words.sub, followUp || current.visionError || (sharing
-            ? `${sharing}${presented.sub ? ` · ${presented.sub}` : ''}` : presented.sub),
-        followUp ? note?.kind === 'copy_failed' : Boolean(presented.subFormatted));
+        const subText = followUp || current.visionError || (sharing
+            ? `${sharing}${presented.sub ? ` · ${presented.sub}` : ''}` : presented.sub);
+        setWords(words.sub, subText, followUp ? note?.kind === 'copy_failed' : Boolean(presented.subFormatted));
+        // The words' second line on a phone's chip (call.css): the wave's while a voice speaks (the line only
+        // names who, and the wave's colour says it) or while it has nothing to say; else its words.
+        wrap.dataset.callLine = !subText || (presented.voiced && !followUp && !current.visionError) ? 'wave' : 'text';
         setWords(words.small, presented.small || '', true);
         const size = $('.call-size');
         size.hidden = sheet;

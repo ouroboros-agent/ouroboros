@@ -327,6 +327,27 @@
     }
 }
 
+/* A phone's chip has no room after the words: they keep two lines, the state word above and, below it,
+   either what is happening or the wave (call_aura.js draws it there while a voice speaks or the line has
+   nothing to say), so the wave never crosses a letter and nothing moves when it comes and goes. */
+@container call-row (max-width: 480px) {
+    .chat-input-wrap[data-call-view="voice"] .call-visual {
+        --call-wave-place: line;
+    }
+
+    .chat-input-wrap[data-call-view="voice"] .call-words {
+        grid-template-rows: auto calc(var(--type-meta) * var(--call-words-leading));
+    }
+
+    .chat-input-wrap[data-call-view="voice"][data-call-line="wave"] .call-sub {
+        opacity: 0;
+    }
+}
+
+.call-sub {
+    transition: opacity 0.18s ease;
+}
+
 @container call-row (max-width: 520px) {
     .chat-input-wrap[data-call-view="keyboard"] .call-mute,
     .chat-input-wrap[data-call-view="keyboard"] .call-show {
@@ -820,13 +841,6 @@
     inset: calc(-1 * var(--space-2));
 }
 
-/* A row with no room after the words (a phone) runs the wave under them, stepping back so the text keeps
-   its reading contrast; with room the wave starts after the words and --call-words stays 0. */
-.chat-input-wrap[data-call-view="voice"] .call-wave {
-    -webkit-mask-image: linear-gradient(90deg, rgb(0 0 0 / 0.42) var(--call-words, 0px), #000 calc(var(--call-words, 0px) + 72px));
-    mask-image: linear-gradient(90deg, rgb(0 0 0 / 0.42) var(--call-words, 0px), #000 calc(var(--call-words, 0px) + 72px));
-}
-
 .chat-input-wrap[data-call-view="keyboard"] .call-wave {
     opacity: 0.2;
 }
@@ -883,7 +897,8 @@
    wave whose colour and the words say the rest. */
 @media (prefers-reduced-motion: reduce) {
     .chat-input-wrap[data-call] .chat-text-row.call-lifted,
-    .call-capsule > :not(.call-visual) {
+    .call-capsule > :not(.call-visual),
+    .call-sub {
         transition: none;
     }
 

@@ -69,9 +69,11 @@ Material 3 tonal colour; no gradient behind content, and no glows, textures, out
    sink or a lift; live work loops as three moving dots; nothing else animates by
    itself, and a state change never moves a neighbour, resizes a bar or changes a
    height. A live call is the one light that answers sound: the owner's wave, three
-   strands drawn inside the composer capsule's glass in one voice's colour at a time
-   (owner blue, Ouroboros crimson, a new speaker arriving through the neutral), its
-   outline breathing with the heard voice, moved only by that voice and the call's
+   strands drawn inside the composer capsule's glass in the speaking voice's colour
+   (owner blue, Ouroboros crimson, the one cross-fading into the other in about a
+   third of a second when the turn passes), after the words or, on a phone's chip,
+   as the words' second line under the state word, its outline breathing with the
+   heard voice, moved only by that voice and the call's
    phases, on that capsule alone and never the room. Its big view is the same capsule
    grown into a tall panel where the composer lives, on the float shadow, no glow
    around it; reduced motion keeps its words and colour.

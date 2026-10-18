@@ -76,7 +76,8 @@ function harness({ reduce = false, width = 1280, vision = { screen: true, camera
     Object.assign(field, { value: '', placeholder: 'Message Ouroboros...' });
     let session = { state: 'idle', muted: false, sharing: '', activity: { working: false, label: '' }, liveSince: 0, active: false };
     const calls = [];
-    const light = { heard: () => false, setMode() {} };
+    const voice = { heard: false, owner: false };  // what the light hears: Ouroboros's playback, the owner's gate
+    const light = { heard: () => voice.heard, speaking: () => voice.owner, setMode() {} };
     const capsule = createCallCapsule({ page, env, visual: CALL_VISUAL, light, view: () => session,
         talk: () => calls.push('talk'), mute: () => calls.push('mute'), show: kind => calls.push(`show:${kind}`),
         vision: () => vision, end: () => calls.push('end'), dismiss: () => calls.push('dismiss'), act: () => {} });
@@ -91,7 +92,7 @@ function harness({ reduce = false, width = 1280, vision = { screen: true, camera
     const flush = () => { while (timers.some(Boolean)) { const index = timers.findIndex(Boolean); const fn = timers[index]; timers[index] = null; fn(); } };
     const lifted = () => row.classList.contains('call-lifted');
     const spacer = () => page.querySelector('.call-spacer');
-    return { dom, doc, env, page, wrap, row, field, capsule, calls, $, set, flush, lifted, spacer, timers,
+    return { dom, doc, env, page, wrap, row, field, capsule, calls, voice, $, set, flush, lifted, spacer, timers,
         done() { capsule.destroy(); dom.restore(); delete globalThis.MutationObserver; } };
 }
 
@@ -324,5 +325,31 @@ test('Talk wears the wave\'s small still sign: three strands, the main one stron
         assert.deepEqual(strands.map(path => path.getAttribute('stroke-width')), ['1', '1.3', '1.8']);
         assert.equal(send.querySelector('.call-entry-word').textContent, 'Talk');
         assert.equal(mark.querySelectorAll('i').length, 0);  // no bars of the old sign
+    } finally { h.done(); }
+});
+
+test('the words\' second line is the wave\'s while a voice speaks or it has nothing to say, else its words', () => {
+    // call.css gives a phone's chip this line for the wave; the capsule says, in every view, whose it is now.
+    const h = harness({ width: 390 });
+    const line = (facts, voice = {}) => {
+        Object.assign(h.voice, { heard: false, owner: false }, voice);
+        h.set({ ...reset, visionError: '', turn: '', ...facts });
+        return [h.wrap.dataset.callLine, h.$('.call-sub').textContent];
+    };
+    try {
+        assert.deepEqual(line({ state: 'live' }), ['text', 'Speak whenever you’re ready']);
+        assert.deepEqual(line({ state: 'live' }, { owner: true }), ['wave', 'You’re speaking']);
+        assert.deepEqual(line({ state: 'live' }, { heard: true }), ['wave', 'Speaking']);
+        assert.deepEqual(line({ state: 'live', turn: 'awaiting' }), ['wave', '']);  // Thinking has no second line
+        assert.deepEqual(line({ state: 'live', activity: { working: true, label: 'Searching the web' } }),
+            ['text', 'Searching the web']);
+        assert.deepEqual(line({ state: 'live', muted: true }, { owner: true }), ['text', 'Ouroboros can’t hear you']);
+        // Words that need reading keep the line even while a voice speaks.
+        assert.deepEqual(line({ state: 'live', visionError: 'The camera is in use by another app' }, { owner: true }),
+            ['text', 'The camera is in use by another app']);
+        assert.deepEqual(line({ state: 'reconnecting', code: 'session_cap' }), ['text', 'Starting a fresh voice session']);
+        assert.deepEqual(line({ state: 'connecting' }), ['wave', '']);
+        h.set({ state: 'idle' });
+        assert.equal(h.wrap.dataset.callLine, undefined);  // the call's attributes leave with it
     } finally { h.done(); }
 });

@@ -504,7 +504,7 @@ test('the visual is one swappable contract: the wave in its slot, the glass behi
     const [canvas, work] = slot.children;
     assert.deepEqual([canvas.className, canvas.attrs['aria-hidden'], canvas.width, canvas.height], ['call-wave', 'true', 1200, 100]);
     assert.equal(work.className, 'call-work chat-live-typing');
-    const [glass] = row.appended;  // the row's glass: its surface while live, tinted by one hue
+    const [glass] = row.appended;  // the row's glass: its surface while live, tinted by the speaker's hue
     assert.equal(glass.className, 'call-glass');
     assert.match(glass.innerHTML, /call-glass-owner.*call-glass-ouroboros/);
     const run = (state, seconds) => { for (let t = 0; t < seconds; t += 1 / 60) { clock += 1000 / 60; handle.draw(state); } };
@@ -519,15 +519,19 @@ test('the visual is one swappable contract: the wave in its slot, the glass behi
     const strongest = fills.map(rgb).filter(([, , , alpha]) => alpha > 0.9);
     assert.ok(strongest.length && strongest.every(([r, g, b]) => Math.abs(r - 47) <= 8 && Math.abs(g - 107) <= 8 && Math.abs(b - 214) <= 8),
         'the main strand in the owner\'s blue');
-    // The turn passes: blue fades out before crimson comes in; never both lit at once.
+    // The turn passes: a direct cross-fade, blue out while crimson comes in, so both are lit only briefly
+    // and crimson holds the glass within about half a second.
     let both = 0;
+    let arrived = Infinity;
     for (let t = 0; t < 1.5; t += 1 / 60) {
         clock += 1000 / 60;
         handle.draw({ mic: 0, out: 0.8, mode: 'listen', voice: 'ouroboros' });
         const [owner, ouroboros] = tints();
         if (owner > 0.1 && ouroboros > 0.1) both += 1;
+        if (arrived === Infinity && ouroboros > 0.5) arrived = t;
     }
-    assert.equal(both, 0);
+    assert.ok(both > 0 && both < 30, String(both));
+    assert.ok(arrived < 0.6, String(arrived));
     assert.ok(tints()[1] > 0.5 && tints()[0] < 0.05, String(tints()));
     // Muted: one dashed line; an error: one still amber strand; reduced motion holds the outline still.
     fills.length = 0;
