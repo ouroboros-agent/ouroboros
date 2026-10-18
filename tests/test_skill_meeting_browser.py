@@ -514,7 +514,7 @@ def test_a_dropped_participant_socket_is_not_called_the_end_of_the_call(tmp_path
     assert until(lambda: companion.status()["state"] == "idle")
     message = companion.status()["message"]
     assert "closed the participant's call socket (peer_send_timeout)" in message and "call ended" not in message
-    assert FakeSession.instances[-1].closed
+    assert until(lambda: FakeSession.instances[-1].closed)  # the window closes on the session's own thread
 
 
 def test_a_closed_window_takes_no_more_call_audio(tmp_path):

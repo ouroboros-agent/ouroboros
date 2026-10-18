@@ -139,6 +139,7 @@ class FakeHub:
         self.present = [OWNER]
         self.closed: list = []
         self.activity: list = []
+        self.turns: list = []
         self.words: list = []  # (state, detail, action) of every state that carried words
         self.ended_by_owner = False
         self.ended_by_ouroboros = False
@@ -169,6 +170,9 @@ class FakeHub:
 
     def send_activity(self, activity, label="") -> None:
         self.activity.append((activity, label))
+
+    def send_turn(self, turn) -> None:
+        self.turns.append(turn)
 
     def send_caption(self, speaker, text, final, item_id="") -> None:
         self.captions.append((speaker, text, final, item_id))
@@ -429,6 +433,71 @@ def test_audio_flows_both_ways_and_a_muted_peer_is_not_heard(harness, monkeypatc
     h.hub.feed(PeerAudio(peer_id="owner-1", role="owner", pcm=b"\x04" * 10))
     assert _wait_for(lambda: len(engine.sent_of(AudioIn)) == 2)
     assert [command.pcm for command in engine.sent_of(AudioIn)] == [b"\x01\x02" * 100, b"\x04" * 10]
+    h.stop()
+    h.finish()
+
+
+def test_an_answer_played_to_its_end_is_written_at_its_acknowledgement_not_after_the_grace(harness):
+    # 100 ms of audio at 24 kHz, played by a 48 kHz peer: the resampler holds the last sample and the
+    # peer floors whole ms, so the acknowledgement reads 99 ms; it is still the end (one mixer frame).
+    h = harness()
+    engine = h.start()
+    engine.push(ResponseStarted(item_id="a1", response_id="resp-1"))
+    engine.push(AudioOut(pcm=b"\x01" * 4800, rate=24000, item_id="a1"))
+    engine.push(Caption(speaker=SPEAKER_OUROBOROS, text="Sunny.", final=True, item_id="a1"))
+    assert _wait_for(lambda: (SPEAKER_OUROBOROS, "Sunny.", True, "a1") in h.hub.captions)
+    h.hub.control("played", item_id="a1", played_ms=50)
+    time.sleep(0.1)
+    assert h.progress == []  # half of it: not heard to the end
+    h.hub.control("played", item_id="a1", played_ms=99)
+    assert _wait_for(lambda: len(h.progress) == 1, timeout=2)  # at once, not after SPOKEN_ACK_GRACE_S
+    assert h.progress[0][1]["_progress_meta_override"]["spoken"]["status"] == "played"
+    h.stop()
+    h.finish()
+
+
+def test_the_surface_hears_where_the_turn_is_from_the_engine_not_from_the_audio(harness):
+    h = harness()
+    engine = h.start()
+    engine.push(Caption(speaker=SPEAKER_OWNER, text="what is the weather", final=True, item_id="u1"))
+    assert _wait_for(lambda: h.hub.turns[-1:] == ["awaiting"])  # the owner finished: an answer is awaited
+    engine.push(ResponseStarted(item_id="a1", response_id="resp-1"))
+    assert _wait_for(lambda: h.hub.turns[-1:] == ["answering"])  # held across the answer's pauses
+    engine.push(ToolCall(call_id="c1", name="web_search", arguments="{}"))
+    engine.push(ResponseDone(item_id="a1", status="completed", usage={}, raw_usage={}, response_id="resp-1"))
+    assert _wait_for(lambda: engine.sent_of(ToolResult))
+    assert _wait_for(lambda: h.hub.turns[-1:] == ["awaiting"])  # the result went in: the engine answers it
+    engine.push(ResponseStarted(item_id="a2", response_id="resp-2"))
+    engine.push(ResponseDone(item_id="a2", status="completed", usage={}, raw_usage={}, response_id="resp-2"))
+    assert _wait_for(lambda: h.hub.turns[-1:] == ["idle"]), repr(h.hub.turns)
+    time.sleep(live_turn.MAILBOX_TICK_S * 3)
+    assert h.hub.turns[-1] == "idle"  # it already spoke: the call-live fact opens nothing late
+    assert not engine.sent_of(ContextItem) or all(item.source != "call_live" for item in engine.sent_of(ContextItem))
+    h.stop()
+    h.finish()
+
+
+def test_a_slow_store_write_never_stops_the_calls_audio(harness, monkeypatch):
+    import supervisor.message_bus as bus
+
+    release, entered, original = threading.Event(), threading.Event(), bus.log_chat
+
+    def slow_log_chat(*args, **kwargs):  # a commit under load (2.7 s measured for a task record)
+        entered.set()
+        assert release.wait(10)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(bus, "log_chat", slow_log_chat)
+    h = harness()
+    engine = h.start()
+    engine.push(Caption(speaker=SPEAKER_OWNER, text="what is the weather", final=True, item_id="u1"))
+    assert entered.wait(5)  # the owner's row is being written, on the call's writer
+    engine.push(ResponseStarted(item_id="a1", response_id="resp-1"))
+    engine.push(AudioOut(pcm=b"\x01" * 480, rate=24000, item_id="a1"))
+    assert _wait_for(lambda: [item for item, _pcm in h.hub.played] == ["a1"], timeout=3)  # audio moves meanwhile
+    assert h.chat_rows() == []
+    release.set()
+    assert _wait_for(lambda: len(h.chat_rows()) == 1)  # and the row lands, in order
     h.stop()
     h.finish()
 
@@ -735,7 +804,8 @@ def test_a_lost_session_reopens_with_history_and_never_re_executes_a_tool(harnes
     first.end_stream()
     assert _wait_for(lambda: len(h.llm.engines) == 2 and h.llm.engines[1].config is not None)
     second = h.engine()
-    assert (STATE_RECONNECTING, "stream_ended") in h.hub.states and h.hub.states[-1] == (STATE_LIVE, "")
+    # The reopened session's Ready reaches the driver on its own task: the call becomes live again.
+    assert _wait_for(lambda: h.hub.states[-1] == (STATE_LIVE, "")) and (STATE_RECONNECTING, "stream_ended") in h.hub.states
     assert h.ledger.abandoned == [("r2", "stream_ended")]
     # The call so far returns as text in the instruction: the tool call is a line, never an effect.
     lines = second.config.instructions.split("\n")

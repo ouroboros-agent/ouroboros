@@ -61,6 +61,15 @@ class Spoken:
     ack_at: float = 0
     started_at: float = 0.0  # when its first audio went to the peers
 
+    def heard_whole(self, played_ms: float) -> bool:
+        """Whether a peer played this item to its end. The host sums its audio in fractional ms at the
+        engine rate, a peer reports whole ms of the samples it rendered at its own rate, and the
+        resampler holds an item's last sample for the next chunk (``call_peers``): the two meet within
+        one mixer frame, never exactly, so the end is reached within that frame."""
+        from ouroboros.call_peers import MIX_FRAME_MS
+
+        return played_ms > 0 and played_ms >= int(self.audio_ms) - MIX_FRAME_MS
+
 
 def narration_meta(emit_progress: Callable[..., None]) -> Dict[str, Any]:
     owner = getattr(emit_progress, "__self__", None)
@@ -204,6 +213,11 @@ class Openings:
 
     def hold(self, item: Any) -> None:
         self.held.append(item)
+
+    def answering(self) -> None:
+        """The engine began answering: it is heard already, so the call-live fact has nothing left to
+        open; whatever else is held still waits for the next completed turn."""
+        self.held = [item for item in self.held if getattr(item, "source", "") != "call_live"]
 
     def take(self) -> List[Any]:
         """Everything held, in order, then the one completion that opens the response; content

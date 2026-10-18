@@ -139,11 +139,15 @@ export function callPresentation(view, live = {}) {
     const base = { mode: 'live', light: 'listen', voice: heard ? 'ouroboros' : 'owner', sub: '' };
     if (view.muted) return { ...base, light: 'muted', title: 'Muted', sub: 'Ouroboros can’t hear you' };
     if (heard) return { ...base, title: 'Ouroboros', sub: 'Speaking' };
-    if (live.ownerSpeaking) return { ...base, title: 'Listening', sub: 'You’re speaking' };
+    // The owner's voice, from the microphone gate at once (a caption arrives later).
+    if (live.owner || live.ownerSpeaking) return { ...base, title: 'Listening', sub: 'You’re speaking' };
+    // One answer is one Speaking, its pauses included: the engine says when it ends (`turn`).
+    if (view.turn === 'answering' && live.answered) return { ...base, voice: 'ouroboros', title: 'Ouroboros', sub: 'Speaking' };
     // The tool's own label is the host's sentence, shown as it is (or as the install translated it).
     if (view.activity?.working) return { ...base, light: 'think', work: true, title: 'Working',
         sub: view.activity.label ? tx(view.activity.label) : 'Using a tool', subFormatted: Boolean(view.activity.label) };
-    if (live.thinking) return { ...base, light: 'think', title: 'Thinking' };
+    // An answer is awaited (the owner finished, a result or an addressed fact went in) or begun but not yet heard.
+    if (live.thinking || view.turn === 'awaiting' || view.turn === 'answering') return { ...base, light: 'think', title: 'Thinking' };
     return { ...base, title: 'Listening', sub: 'Speak whenever you’re ready' };
 }
 
@@ -185,6 +189,8 @@ export function createTalkFacts() {
         },
         /** The owner's voice began (the light's microphone onset): the next answer is a new one. */
         voice() { facts.answered = false; },
+        /** The engine's turn: an awaited answer or an ended one starts the next answer unheard. */
+        turn(next) { if (next !== 'answering') facts.answered = false; },
         heard(now) { if (now) Object.assign(facts, { thinking: false, answered: true }); },
         reset() { Object.assign(facts, { ownerSpeaking: false, thinking: false, answered: false }); },
     };
@@ -226,6 +232,7 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
     let presented = { mode: 'idle' };
     let note = null;         // a sheet's follow-up line (a copied link)
     let dressed = false;     // Talk appears with its own look, never unstyled before call.css applies
+    let lastTurn = 'idle';   // the engine's turn as the last render saw it
     let gone = false;
     const talking = createTalkFacts();
     const stage = createCallStage({ wrap, row, time: $('.call-time'), doc, env, escape: () => minimise() });
@@ -407,7 +414,8 @@ export function createCallCapsule({ page, env = globalThis, visual, light, style
             talking.reset();
             note = null;
         }
-        presented = callPresentation(current, { ...talking.facts, heard: light.heard() });
+        if (current.turn !== lastTurn) { talking.turn(current.turn); lastTurn = current.turn; }
+        presented = callPresentation(current, { ...talking.facts, heard: light.heard(), owner: light.speaking?.() });
         // A call that ends, or a room that leaves it, takes the big view back to the composer at once.
         if (big && presented.mode !== 'live') { big = false; stage.shrink({ instant: true }); }
         stage.clock(current);

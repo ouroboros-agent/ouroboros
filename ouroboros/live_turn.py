@@ -27,7 +27,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ouroboros.call_protocol import (
     ACTION_RETRY, ACTION_SETTINGS, PEER_MEETING, PEER_OWNER, STATE_CLOSED, STATE_CLOSING, STATE_CONNECTING,
-    STATE_LIVE, STATE_RECONNECTING, CallSpec, PeerAudio, PeerControl, PeerJoined, PeerLeft, PeerVideo,
+    STATE_LIVE, STATE_RECONNECTING, TURN_ANSWERING, TURN_AWAITING, TURN_IDLE, CallSpec, PeerAudio, PeerControl,
+    PeerJoined, PeerLeft, PeerVideo,
 )
 from ouroboros.gateways.realtime_engine import (
     SPEAKER_OUROBOROS, SPEAKER_OWNER, USAGE_KEYS,
@@ -39,6 +40,7 @@ from ouroboros.gateways.realtime_transport import LiveEngineRefusal
 from ouroboros.live_call_route import (call_local_schemas, call_minutes_ceiling, call_turn_taking, initial_call_schemas,
                                        native_search_enabled, resolve_call_route)
 from ouroboros.live_awareness import drain_into_call
+from ouroboros.live_call_rows import CallRows
 from ouroboros.live_call_state import Acks, Openings, SessionRenewal, Spoken, narration_meta
 from ouroboros.live_session_view import (
     calibration_ratio, compression_watermarks, history_view, mark_spoken, record_density_witness, renewal_bounds,
@@ -145,6 +147,7 @@ class _LiveCall:
         # Ledger writes run in order on one thread beside the call's loop: a busy store
         # never stalls the audio, and each reservation still precedes its settlement.
         self.records = ThreadPoolExecutor(max_workers=1, thread_name_prefix="call-ledger")
+        self.rows = CallRows(self)  # room rows, narration and checkpoints, in order, beside the audio loop
         self.speaking_item = ""
         self.cancelled_items: set = set()
         self.played_ms: Dict[str, int] = {}
@@ -211,6 +214,7 @@ class _LiveCall:
         finally:
             self.tools_lane.shutdown()
             self.records.shutdown(wait=True)  # every ledger write lands before the terminal
+            self.rows.shutdown()
             if self._reader is not None:
                 self._reader.join(MAILBOX_TICK_S * 4)  # it leaves within one hub wait of the stop flag
         if self.budget_error is not None:
@@ -333,6 +337,15 @@ class _LiveCall:
         except Exception:
             log.debug("call activity unsent", exc_info=True)
 
+    def _turn(self, turn: str) -> None:
+        """Where the turn is (``call_protocol.CALL_TURNS``): an answer awaited, the engine answering, or idle."""
+        if turn == TURN_ANSWERING:
+            self.openings.answering()
+        try:
+            self.hub.send_turn(turn)
+        except Exception:
+            log.debug("call turn unsent", exc_info=True)
+
     def _terminal(self, reason: str, *, failure: Optional[Tuple[str, str]]) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
         from ouroboros.task_finalization import TERMINAL_ORIGIN_HOST_NOTICE
 
@@ -352,8 +365,8 @@ class _LiveCall:
         text = (f"Live call {label} ended ({reason}). The transcript is in this chat: "
                 f"{self.counts['owner']} owner, {self.counts['heard']} heard and "
                 f"{self.counts['ouroboros']} Ouroboros utterances, {self.tools_lane.tool_calls} tool calls, {minutes} min.")
-        if self.counts.get("unrecorded"):
-            text += f" {self.counts['unrecorded']} utterances could not be written to the conversation record."
+        if self.rows.unrecorded:
+            text += f" {self.rows.unrecorded} utterances could not be written to the conversation record."
         return text, self.usage, self.llm_trace
 
     # ---- engine session ----------------------------------------------------------
@@ -541,8 +554,10 @@ class _LiveCall:
             if cap and not self.response_open and not self.reconnecting and now - self.session_started >= cap * 60 - SESSION_CAP_MARGIN_S:
                 asyncio.create_task(self._reconnect("session_cap", resume=False))
             self.renewal.tick(now)
-            for item in self.openings.take():
+            for item in (opened := self.openings.take()):
                 self._post(item)
+            if opened:
+                self._turn(TURN_AWAITING)
             for item_id, spoken in list(self.spoken.items()):
                 if spoken.final_at and now - max(spoken.final_at, spoken.ack_at) >= SPOKEN_ACK_GRACE_S:
                     self._write_spoken_row(item_id)
@@ -576,7 +591,7 @@ class _LiveCall:
                 # Content is acknowledged only once a live session holds it and the checkpoint
                 # is written; otherwise its acknowledgements wait for a later boundary (and
                 # unacknowledged entries are redelivered).
-                if self.engine is not None and not self.closing and self._checkpoint():
+                if self.engine is not None and not self.closing and await asyncio.wrap_future(self._checkpoint()):
                     for ack in item.callbacks:
                         try:
                             ack()
@@ -615,7 +630,7 @@ class _LiveCall:
                 if item_id in self.spoken:
                     self.spoken[item_id].played, self.spoken[item_id].played_ms = True, self.played_ms[item_id]
                     self.spoken[item_id].ack_at = time.monotonic()
-                    if self.spoken[item_id].final_at and played_ms >= self.spoken[item_id].audio_ms:
+                    if self.spoken[item_id].final_at and self.spoken[item_id].heard_whole(played_ms):
                         self._write_spoken_row(item_id)
                 await self._send(PlayedAudio(item_id=item_id, played_ms=played_ms))
             elif kind == "mute":
@@ -674,8 +689,11 @@ class _LiveCall:
         elif isinstance(event, ResponseStarted):
             self.response_open, self.current_response = True, event.response_id or event.item_id
             self._attempt_for(event.response_id or event.item_id)
+            self._turn(TURN_ANSWERING)
         elif isinstance(event, ResponseDone):
             self.response_open, self.current_response = False, ""
+            lane = self.tools_lane  # a tool still owes its result: the engine answers again when it arrives
+            self._turn(TURN_AWAITING if lane.running or lane.pending or lane.claimed else TURN_IDLE)
             self.renewal.observe(event.usage)
             self._settle(event)
             await self._drain()
@@ -720,7 +738,7 @@ class _LiveCall:
             if not self.playback_acked and spoken.started_at:
                 # No peer reports playback (a meeting-only call): its audio plays in real time.
                 played = max(played, int(min(spoken.audio_ms, (time.monotonic() - spoken.started_at) * 1000)))
-            if spoken.final_at and played >= spoken.audio_ms:
+            if spoken.final_at and spoken.heard_whole(played):
                 continue
             self.cancelled_items.add(item)
             spoken.interrupted = True
@@ -744,12 +762,14 @@ class _LiveCall:
             source if source is not None else (self.meeting_mics or self.meeting_audio_since_caption))
         if event.speaker == SPEAKER_OWNER:
             self.meeting_audio_since_caption = False
+            if not self.response_open:
+                self._turn(TURN_AWAITING)  # the owner's words ended: the engine's answer is awaited
         if event.speaker == SPEAKER_OWNER and heard:
             self._on_heard(text, event.item_id)
         elif event.speaker == SPEAKER_OWNER:
             self.counts["owner"] += 1
             self.messages.append({"role": "user", "content": text, "_call_row": True})
-            self._write_owner_row(text, event.item_id)
+            self.rows.owner(text, event.item_id, self.counts["owner"])  # on the writer: the loop moves audio
             self.fanout.note(SPEAKER_OWNER, text)
         elif event.speaker == SPEAKER_OUROBOROS:
             self.counts["ouroboros"] += 1
@@ -757,7 +777,7 @@ class _LiveCall:
             spoken = self.spoken.setdefault(event.item_id, Spoken())
             spoken.text, spoken.final_at = text, time.monotonic()
             spoken.played_ms = max(spoken.played_ms, self.played_ms.get(event.item_id, 0))
-            if spoken.interrupted or (spoken.played and spoken.played_ms >= spoken.audio_ms):
+            if spoken.interrupted or (spoken.played and spoken.heard_whole(spoken.played_ms)):
                 self._write_spoken_row(event.item_id)
             self.fanout.note(SPEAKER_OUROBOROS, text)
 
@@ -800,47 +820,13 @@ class _LiveCall:
         self.tools_lane.reset_rounds()  # a correspondent spoke: a Presence call's round count starts again
         if self.spec.presence_binding_id:
             self._write_presence_heard(text, item_id)
-            return
-        try:
-            from supervisor.message_bus import send_with_budget
-
-            send_with_budget(self.spec.chat_id, f"Heard in the call: {text}", role="system",
-                             system_type="call_heard", narration=False,
-                             progress_meta={"source": SOURCE_CALL, "call_id": self.spec.call_id,
-                                            "item_id": item_id, "call_task_id": self.task_id})
-        except Exception:
-            log.warning("live call %s could not write a heard row", self.spec.call_id, exc_info=True)
+        else:
+            self.rows.heard(text, item_id)
 
     def _write_presence_heard(self, text: str, item_id: str) -> None:
         """A Presence call's correspondents' words become that conversation's dialogue rows."""
         voices, self.voices_since_caption = self.voices_since_caption, set()
-        self._record_presence_utterance("in", text, next(iter(voices)) if len(voices) == 1 else "", item_id)
-
-    def _record_presence_utterance(self, direction: str, text: str, speaker_label: str = "", item_id: str = "") -> None:
-        try:
-            from ouroboros.presence_call import record_call_utterance
-
-            if not record_call_utterance(self.drive_root, self.task, direction=direction, text=text,
-                                         speaker_label=speaker_label, utterance_id=item_id):
-                self.counts["unrecorded"] = self.counts.get("unrecorded", 0) + 1
-        except Exception:
-            log.warning("live call %s could not record a Presence utterance", self.spec.call_id, exc_info=True)
-            self.counts["unrecorded"] = self.counts.get("unrecorded", 0) + 1
-
-    def _write_owner_row(self, text: str, item_id: str) -> None:
-        """The owner's words as an owner row of the room, without an owner turn behind it."""
-        try:
-            from supervisor.message_bus import get_bridge, log_chat
-
-            client_message_id = f"call:{self.spec.call_id}:{item_id or self.counts['owner']}"
-            row = log_chat("in", self.spec.chat_id, 1, text, source=SOURCE_CALL, sender_label="voice",
-                           client_message_id=client_message_id, task_id=self.task_id, drive_root=self.drive_root)
-            if row:
-                get_bridge().broadcast({"type": "chat", "role": "user", "content": text, "ts": row.get("ts"),
-                                        "source": SOURCE_CALL, "chat_id": self.spec.chat_id, "task_id": self.task_id,
-                                        "client_message_id": client_message_id})
-        except Exception:
-            log.warning("live call %s could not write an owner row", self.spec.call_id, exc_info=True)
+        self.rows.presence("in", text, next(iter(voices)) if len(voices) == 1 else "", item_id)
 
     def _write_spoken_row(self, item_id: str) -> None:
         spoken = self.spoken.pop(item_id, None)
@@ -849,13 +835,10 @@ class _LiveCall:
         status = "interrupted" if spoken.interrupted else ("played" if spoken.played else "generated")
         mark_spoken(self.messages, item_id, status)  # a later replay says what was heard
         if self.spec.presence_binding_id:
-            self._record_presence_utterance("out", spoken.text)
+            self.rows.presence("out", spoken.text)
         meta = narration_meta(self.emit_progress)
         meta["spoken"] = {"call_id": self.spec.call_id, "item_id": item_id, "status": status, "played_ms": spoken.played_ms}
-        try:
-            self.emit_progress(spoken.text, narration=True, _progress_meta_override=meta)
-        except TypeError:
-            self.emit_progress(spoken.text, narration=True)
+        self.rows.spoken(spoken.text, meta)
 
     # ---- the ledger ----------------------------------------------------------------
 
@@ -940,29 +923,18 @@ class _LiveCall:
     async def _drain(self) -> None:
         await drain_into_call(self)  # the owner's mailbox, the room's rows and Hurry (``live_awareness``)
 
-    def _checkpoint(self) -> bool:
-        """The call's durable state on its task row; content ACKs wait for this write."""
-        from ouroboros.task_result_schema import require_writable_task_result_schema, stamp_task_result_schema
-        from ouroboros.task_store import patch_document
+    def _checkpoint(self) -> Future:
+        """The call's durable state on its task row, on the writer after everything handed to it so far;
+        resolves to whether it was written (content ACKs wait for it)."""
         from ouroboros.utils import utc_now_iso
 
         if self.drive_root is None or not self.task_id:
-            return False
-        block = {"call_id": self.spec.call_id, "consumed_mailbox_ids": sorted(str(x) for x in self.owner_msg_seen),
-                 "executed_tool_calls": sorted(self.tools_lane.executed), "batches": self.tools_lane.batches,
-                 "utterances": dict(self.counts), "reconnects": self.reconnects, "updated_at": utc_now_iso()}
-
-        def _mutate(current: Dict[str, Any]) -> Dict[str, Any]:
-            require_writable_task_result_schema(current)
-            return stamp_task_result_schema({**current, "live_call": block})
-
-        try:
-            patch_document(pathlib.Path(self.drive_root), self.task_id, _mutate)
-            return True
-        except Exception:
-            log.warning("live call %s checkpoint unwritten; mailbox content stays unacknowledged", self.spec.call_id, exc_info=True)
-            return False
-
+            done: Future = Future()
+            done.set_result(False)
+            return done
+        return self.rows.checkpoint({"call_id": self.spec.call_id, "consumed_mailbox_ids": sorted(str(x) for x in self.owner_msg_seen),
+                                     "executed_tool_calls": sorted(self.tools_lane.executed), "batches": self.tools_lane.batches,
+                                     "utterances": dict(self.counts), "reconnects": self.reconnects, "updated_at": utc_now_iso()})
 
 def run_live_turn(
     messages: List[Dict[str, Any]], tools: Any, llm: Any, drive_logs: pathlib.Path,

@@ -21,6 +21,7 @@ const SOCKET_ANSWER_MS = 15000;
 export const NEW_APP_URL = 'https://ouroboros-agent.ai/install/';
 const ACTIVE = new Set(['permission', 'admission', 'preparing', 'connecting', 'live', 'reconnecting', 'closing']);
 const SERVER_STATES = new Set(['preparing', 'connecting', 'live', 'reconnecting', 'closing', 'closed']);
+const TURNS = new Set(['awaiting', 'answering', 'idle']);
 let microphoneOwner = null;
 const rooms = new Set();  // every mounted room call, for the shell mark and "Go to the call"
 const MIC_FELL_BACK = 'The chosen microphone is not connected; the call hears the system microphone.';
@@ -85,14 +86,14 @@ export class CallSession {
     /** Facts of the current attempt; a new attempt starts from none. */
     clear() {
         Object.assign(this, { callId: '', code: '', detail: '', action: '', words: '', phase: '',
-            activity: { working: false, label: '' }, liveSince: 0 });
+            activity: { working: false, label: '' }, turn: 'idle', liveSince: 0 });
     }
 
     get active() { return ACTIVE.has(this.state); }
 
     view() {
         const { state, code, detail, action, words, phase, muted, callId, liveSince } = this;
-        return { state, code, detail, action, words, phase, muted, callId, liveSince,
+        return { state, code, detail, action, words, phase, muted, callId, liveSince, turn: this.turn,
             sharing: this.vision.kind, visionError: this.vision.error,
             activity: { ...this.activity }, active: this.active };
     }
@@ -283,6 +284,11 @@ export class CallSession {
         else if (msg.type === 'activity') {
             this.activity = { working: msg.activity === 'working', label: String(msg.label || '').slice(0, 200) };
             this.changed(this.view());
+        } else if (msg.type === 'turn') {
+            // Where the turn is, from the engine: an answer awaited, being given, or neither.
+            if (!TURNS.has(msg.turn)) throw new Error('Invalid call turn.');
+            this.turn = msg.turn;
+            this.changed(this.view());
         } else if (msg.type === 'flush') {
             if (!Number.isInteger(msg.epoch) || msg.epoch < 0 || msg.epoch > 65535) throw new Error('Invalid playback epoch.');
             this.flush(msg.epoch);
@@ -352,6 +358,7 @@ export class CallSession {
         this.items.clear(); this.played.clear();
         if (microphoneOwner === this) microphoneOwner = null;
         this.activity = { working: false, label: '' };
+        this.turn = 'idle';
         this.setState(state, facts);
         if (wasActive) this.settled(this.view());
     }
@@ -374,7 +381,7 @@ export function mountCall({ page, chatId, env = globalThis, ws = null, label = (
     let keyed = false;
     const visible = () => !destroyed && onScreen() && doc.visibilityState !== 'hidden';
     const light = createCallLight({ env, visible, heard: now => capsule.heard(now), voice: () => capsule.voice(),
-        draw: state => capsule.draw(state) });
+        owner: () => capsule.render(), draw: state => capsule.draw(state) });
     const session = new CallSession({ chatId, env,
         changed(view) { if (destroyed) return; light.setActive(view.active); capsule.render(); entry?.changed(); },
         caption(msg) { cards.update(msg); capsule.caption(msg); },

@@ -30,6 +30,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.call_languages import SET_CALL_LANGUAGES_TOOL, languages_recorded_text, record_call_languages
+from ouroboros.call_protocol import TURN_AWAITING
 from ouroboros.gateways.realtime_engine import SCHEDULE_SILENT, ContextItem, ToolCall, ToolResult, UpdateTools
 from ouroboros.live_call_route import END_CALL_RESULT, END_CALL_TOOL, call_local_schemas, call_local_tool_names
 from ouroboros.usage_accounting import BudgetExceeded
@@ -198,6 +199,8 @@ class ToolBatchWorker:
                 log.warning("live call %s tool batch failed", call.spec.call_id, exc_info=True)
                 changes, grown = [], False
             call._activity("idle")
+            if not call.response_open:
+                call._turn(TURN_AWAITING)  # the results go in when idle: the engine answers them
             # The latest session that asked for each call receives its result.
             epochs = {tc.call_id: self.claimed.pop(tc.call_id, epoch) for epoch, tc in batch}
             await self._forward_changes(changes, epochs)

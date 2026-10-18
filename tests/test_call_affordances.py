@@ -343,3 +343,14 @@ def test_start_task_in_a_call_remembers_the_task_so_its_report_reaches_the_call(
                                  task_metadata={})
     _start_task(text, "Find tonight's weather", title="Weather")
     assert not hasattr(text, "_call_started_task_ids")  # a text turn waits on its own tasks instead
+
+
+def test_an_item_is_heard_whole_within_one_mixer_frame_of_its_end():
+    from ouroboros.call_peers import MIX_FRAME_MS
+    from ouroboros.live_call_state import Spoken
+
+    item = Spoken(audio_ms=100.0)
+    assert item.heard_whole(99) and item.heard_whole(100 - MIX_FRAME_MS) and item.heard_whole(140)
+    assert not item.heard_whole(100 - MIX_FRAME_MS - 1) and not item.heard_whole(50)  # cut short: not the end
+    assert not Spoken(audio_ms=10.0).heard_whole(0)  # a short item nobody played is not heard
+    assert Spoken(audio_ms=10.0).heard_whole(9)

@@ -10,6 +10,28 @@ const live = (extra = {}) => ({ state: 'live', code: '', detail: '', action: '',
     muted: false, activity: { working: false, label: '' }, ...extra });
 const ended = (code, extra = {}) => live({ state: 'closed', code, ...extra });
 
+test('the live words follow the engine\'s turn and the microphone, never the gaps in the audio', () => {
+    const words = (view, facts) => { const p = callPresentation(view, facts); return [p.title, p.sub, p.voice]; };
+    // The owner's voice opens the gate before any caption: the words change at once.
+    assert.deepEqual(words(live(), { owner: true }), ['Listening', 'You’re speaking', 'owner']);
+    // An answer awaited (the owner finished, a tool's result or an addressed fact went in) reads Thinking.
+    assert.deepEqual(words(live({ turn: 'awaiting' })), ['Thinking', '', 'owner']);
+    assert.deepEqual(words(live({ turn: 'answering' })), ['Thinking', '', 'owner']);  // begun, nothing heard yet
+    // Once heard, one answer stays Speaking through its pauses, in Ouroboros's colour.
+    assert.deepEqual(words(live({ turn: 'answering' }), { answered: true }), ['Ouroboros', 'Speaking', 'ouroboros']);
+    assert.deepEqual(words(live({ turn: 'idle' }), { answered: true }), ['Listening', 'Speak whenever you’re ready', 'owner']);
+    // A tool batch ending inside an awaited answer is no Listening flash.
+    assert.deepEqual(words(live({ turn: 'awaiting', activity: { working: true, label: '' } })), ['Working', 'Using a tool', 'owner']);
+    assert.deepEqual(words(live({ turn: 'awaiting' }), { owner: true }), ['Listening', 'You’re speaking', 'owner']);  // a barge-in
+    const facts = createTalkFacts();
+    facts.heard(true);
+    assert.equal(facts.facts.answered, true);
+    facts.turn('answering');
+    assert.equal(facts.facts.answered, true);
+    facts.turn('awaiting');  // the next answer starts unheard
+    assert.equal(facts.facts.answered, false);
+});
+
 test('every phase the call reports has its words; nothing claims a connection that is not happening', () => {
     assert.deepEqual(callPresentation({ state: 'idle' }), { mode: 'idle' });
     assert.deepEqual(callPresentation(live({ state: 'ended', code: 'owner_end' })), { mode: 'idle' });  // the owner's End

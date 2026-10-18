@@ -117,6 +117,13 @@ class CallActivity(TypedDict):
     label: str
 
 
+class CallTurn(TypedDict):
+    """Where the call's turn is: an answer awaited, the engine answering, or neither (a joining surface
+    receives the latest)."""
+    type: Literal["turn"]
+    turn: Literal["awaiting", "answering", "idle"]
+
+
 class CallCaption(TypedDict):
     type: Literal["caption"]
     speaker: Literal["owner", "ouroboros"]
@@ -155,7 +162,8 @@ class CallSocketContract(TypedDict):
 
 PEER_CONTROLS = {"hello": CallHello, "mute": CallMute, "played": CallPlayed,
                  "context": CallContext, "participant": CallParticipant, "bye": CallBye}
-SERVER_CONTROLS = {"state": CallState, "activity": CallActivity, "caption": CallCaption, "flush": CallFlush}
+SERVER_CONTROLS = {"state": CallState, "activity": CallActivity, "turn": CallTurn, "caption": CallCaption,
+                   "flush": CallFlush}
 
 
 def socket_contract() -> CallSocketContract:

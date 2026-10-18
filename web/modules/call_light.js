@@ -17,7 +17,7 @@ const MAX_PENDING = 32;
 const MOVING_MODES = new Set(['trace', 'listen', 'think']);
 
 export function createCallLight({ env = globalThis, visible = () => true, heard = () => {}, voice = () => {},
-    draw = () => {} } = {}) {
+    owner = () => {}, draw = () => {} } = {}) {
     let target = null;
     let active = false;
     let mode = 'still';
@@ -90,8 +90,9 @@ export function createCallLight({ env = globalThis, visible = () => true, heard 
     function level({ mic: nextMic = 0, out: nextOut = 0, playing: nextPlaying = false, latency = 0 }) {
         if (!active) return;
         micTarget = nextMic;
-        if (!ownerVoice && nextMic > VOICE_GATE && !playing) { ownerVoice = true; voice(); }
-        else if (ownerVoice && nextMic < VOICE_GATE / 2) ownerVoice = false;
+        // The owner's voice opens and closes the gate at once; the words follow it (`owner`), never a caption.
+        if (!ownerVoice && nextMic > VOICE_GATE && !playing) { ownerVoice = true; voice(); owner(true); }
+        else if (ownerVoice && nextMic < VOICE_GATE / 2) { ownerVoice = false; owner(false); }
         pending.push({ at: now() + latency * 1000, out: nextOut, playing: nextPlaying });
         if (pending.length > MAX_PENDING) pending.splice(0, pending.length - MAX_PENDING);
         if (visible()) schedule();
@@ -104,7 +105,7 @@ export function createCallLight({ env = globalThis, visible = () => true, heard 
         last = 0;
         mic = out = micTarget = outTarget = 0;
         pending.length = 0;
-        ownerVoice = false;
+        if (ownerVoice) { ownerVoice = false; owner(false); }
         write();
         hear(false);
     }
@@ -131,6 +132,7 @@ export function createCallLight({ env = globalThis, visible = () => true, heard 
         wake,
         reset,
         heard: () => playing,
+        speaking: () => ownerVoice,
         levels: () => ({ mic, out }),
         destroy() {
             reset();

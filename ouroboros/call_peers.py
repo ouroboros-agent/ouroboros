@@ -160,6 +160,7 @@ class LiveCallHub(cp.CallHub):
         # Born preparing: the call's turn is reading memory before any engine socket exists.
         self._state = {"type": "state", "state": cp.STATE_PREPARING, "reason": "", "engine": spec.engine,
                        "phase": "memory"}
+        self._turn = {"type": "turn", "turn": cp.TURN_IDLE}
         self._counts = dict(input_dropped_samples=0, output_dropped_frames=0,
                             stale_frames=0, control_overflows=0)
 
@@ -264,6 +265,8 @@ class LiveCallHub(cp.CallHub):
             self._peers[info.peer_id] = peer
             self._send(peer, cp.encode_control(self._state))
             self._send(peer, cp.encode_control({"type": "flush", "epoch": self._epoch}))
+            if self._turn["turn"] != cp.TURN_IDLE:  # a surface starts idle: only another turn is news
+                self._send(peer, cp.encode_control(self._turn))
 
     def leave(self, peer_id: str, reason: str = "") -> None:
         with self._condition:
@@ -464,6 +467,16 @@ class LiveCallHub(cp.CallHub):
             raise ValueError("unknown call activity")
         with self._condition:
             self._broadcast(dict(type="activity", activity=activity, label=label))
+
+    def send_turn(self, turn: str) -> None:
+        """Where the turn is: the page shows Thinking while an answer is awaited and holds Speaking
+        across the pauses of one answer, instead of reading phases off the audio's gaps."""
+        if turn not in cp.CALL_TURNS:
+            raise ValueError("unknown call turn")
+        with self._condition:
+            if self._turn["turn"] != turn:
+                self._turn = {"type": "turn", "turn": turn}
+                self._broadcast(self._turn)
 
     def send_caption(self, speaker: str, text: str, final: bool, item_id: str = "") -> None:
         if speaker not in ("owner", "ouroboros"):

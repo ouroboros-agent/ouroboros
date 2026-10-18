@@ -37,6 +37,10 @@ STATE_RECONNECTING = "reconnecting"
 STATE_CLOSING = "closing"
 STATE_CLOSED = "closed"
 CALL_STATES = (STATE_PREPARING, STATE_CONNECTING, STATE_LIVE, STATE_RECONNECTING, STATE_CLOSING, STATE_CLOSED)
+# Where a live call's turn is: an answer is awaited (the owner finished, a tool result or an addressed fact
+# went in), the engine is answering, or neither. The page's Thinking and Speaking follow it.
+TURN_AWAITING, TURN_ANSWERING, TURN_IDLE = "awaiting", "answering", "idle"
+CALL_TURNS = (TURN_AWAITING, TURN_ANSWERING, TURN_IDLE)
 # The one next step a surface offers beside a closed call's reason.
 ACTION_SETTINGS, ACTION_RETRY = "settings", "retry"
 
@@ -120,10 +124,11 @@ def decode_frame(data: bytes) -> AudioFrame | VideoFrame:
 #        phase names what a preparing call is doing ("memory"); detail is the provider's or the
 #        host's own sentence for a closed call; action is its one next step
 #   {"type": "activity", "activity": "working"|"idle", "label": str}   # a tool batch runs
+#   {"type": "turn", "turn": "awaiting"|"answering"|"idle"}  # where the turn is (CALL_TURNS)
 #   {"type": "caption", "speaker": "owner"|"ouroboros", "text": str, "final": bool, "item_id": str}
 #   {"type": "flush", "epoch": int}                           # stop playback of older epochs now
 PEER_MESSAGE_TYPES = ("hello", "mute", "played", "context", "participant", "bye")
-SERVER_MESSAGE_TYPES = ("state", "activity", "caption", "flush")
+SERVER_MESSAGE_TYPES = ("state", "activity", "turn", "caption", "flush")
 MAX_CONTROL_BYTES = 16 * 1024
 
 
@@ -281,6 +286,10 @@ class CallHub:
         raise NotImplementedError
 
     def send_activity(self, activity: str, label: str = "") -> None:
+        raise NotImplementedError
+
+    def send_turn(self, turn: str) -> None:
+        """Where the turn is (``CALL_TURNS``); a joining surface receives the latest."""
         raise NotImplementedError
 
     def send_caption(self, speaker: str, text: str, final: bool, item_id: str = "") -> None:
