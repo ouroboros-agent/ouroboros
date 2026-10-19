@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 from ouroboros.dialogue_import import export_for_older_body
-from tests._dialogue import progress_rows
+from tests._dialogue import chat_rows, progress_rows
 
 from ouroboros.agent import OuroborosAgent
 from ouroboros.gateway.history import make_chat_history_endpoint
@@ -68,7 +68,7 @@ def test_call_narration_is_a_durable_chat_row(tmp_path, monkeypatch):
     delivery = SimpleNamespace(DRIVE_ROOT=tmp_path, RUNNING={}, send_with_budget=message_bus.send_with_budget,
                                append_jsonl=lambda *_: pytest.fail("delivery raised"))
     events_chat_delivery._handle_send_message(frame, delivery)
-    rows = [json.loads(line) for line in (tmp_path / "logs/chat.jsonl").read_text().splitlines()]
+    rows = chat_rows(tmp_path)
     assert len(rows) == 1 and rows[0]["spoken"] == spoken and rows[0]["narration"] is True
     assert rows[0]["direction"] == "out"
     response = asyncio.run(make_chat_history_endpoint(tmp_path)(SimpleNamespace(query_params={"limit": "10"})))

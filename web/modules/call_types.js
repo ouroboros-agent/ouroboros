@@ -87,6 +87,13 @@
  * @property {'settings'|'retry'=} action
  */
 /**
+ * Where the call's turn is: an answer awaited, the engine answering, or neither (a joining surface
+ * receives the latest).
+ * @typedef {Object} CallTurn
+ * @property {'turn'} type
+ * @property {'awaiting'|'answering'|'idle'} turn
+ */
+/**
  * What the call is doing between its words: a tool batch running (its tool names), then idle.
  * @typedef {Object} CallActivity
  * @property {'activity'} type

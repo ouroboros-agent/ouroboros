@@ -220,12 +220,16 @@ def call_catalog_facts(loaded: int, not_loaded: List[Dict[str, Any]]) -> str:
 
 
 def _namespace_skills() -> Dict[str, str]:
-    """Each loaded extension namespace and the skill it belongs to, so the overview can name the skill."""
+    """Each loaded extension namespace and the skill it belongs to, so the overview can name the skill;
+    none when the loader cannot be read (the omission manifest reports that failure, not this label)."""
     from ouroboros.extension_loader import _lock as ext_lock, _tools as ext_tools
 
-    with ext_lock:
-        return {tool_namespace(str(tool.get("name") or "")): str(tool.get("skill") or "")
-                for tool in ext_tools.values() if tool.get("skill")}
+    try:
+        with ext_lock:
+            return {tool_namespace(str(tool.get("name") or "")): str(tool.get("skill") or "")
+                    for tool in ext_tools.values() if tool.get("skill")}
+    except Exception:
+        return {}
 
 
 def _skill_namespace(name: str, groups: Dict[str, Any]) -> str:
