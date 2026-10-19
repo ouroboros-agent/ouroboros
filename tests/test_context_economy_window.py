@@ -258,13 +258,16 @@ def test_a_rebind_narrows_a_view_the_window_cannot_hold_from_its_own_level_by_th
     rebound, mode, event = _rebind(monkeypatch, tmp_path / "n", low, messages, window=tight)
     floor = rebound.projection("low").memory_facts["floor"]
     hosts = {row["section_id"]: row for row in rebound.projection("low").memory_facts.get("host_sections_addressed", [])}
-    if sum(floor["steps"].values()) == sum(old["steps"].values()):
-        # Host details go before any memory step: the knowledge index's outline held this window; a window
-        # short by more than that outline saved narrows the memory view itself.
-        assert "knowledge_index" in hosts
-        rebound, mode, event = _rebind(monkeypatch, tmp_path / "n2", low, messages,
-                                       window=tight - int(hosts["knowledge_index"]["tokens_saved"]) - 1)
+    for attempt in range(12):
+        if sum(floor["steps"].values()) > sum(old["steps"].values()):
+            break
+        # Host details go before any memory step: the addressed host sections held this window; a window
+        # short by more than they saved addresses the next one on the ladder, then narrows the memory view.
+        assert hosts, "a memory step came before any host detail"
+        saved = sum(int(row["tokens_saved"]) for row in hosts.values())
+        rebound, mode, event = _rebind(monkeypatch, tmp_path / f"n{attempt}", low, messages, window=tight - saved - 1)
         floor = rebound.projection("low").memory_facts["floor"]
+        hosts = {row["section_id"]: row for row in rebound.projection("low").memory_facts.get("host_sections_addressed", [])}
     assert mode == "low" and event["view_kept"] is False and messages[0] == rebound.projection("low").system_message()
     assert all(floor["steps"].get(step, 0) >= count for step, count in old["steps"].items())  # nothing unfolds
     assert sum(floor["steps"].values()) > sum(old["steps"].values())
