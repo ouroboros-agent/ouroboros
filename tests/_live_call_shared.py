@@ -71,6 +71,10 @@ class FakeEngine:
     async def close(self, reason: str) -> None:
         self.closed.append(reason)
 
+    def unsent_context(self):
+        held, self.held = tuple(getattr(self, "held", ())), []
+        return held
+
     def push(self, event) -> None:
         self._loop.call_soon_threadsafe(self._queue.put_nowait, event)
 

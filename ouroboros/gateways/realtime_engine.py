@@ -262,7 +262,8 @@ EngineEvent = Union[
 
 
 class LiveEngine(Protocol):
-    """One provider session. ``events()`` ends after ``Closed``."""
+    """One provider session. ``events()`` ends after ``Closed``. ``unsent_context()`` hands back, once, the
+    context it accepted but held for an idle moment that never came, for the next session to be sent."""
 
     async def open(self, config: SessionConfig) -> None: ...
 
@@ -271,6 +272,8 @@ class LiveEngine(Protocol):
     def events(self) -> AsyncIterator[EngineEvent]: ...
 
     async def close(self, reason: str) -> None: ...
+
+    def unsent_context(self) -> Tuple[ContextItem, ...]: ...
 
 
 _FACTORIES: Dict[str, Callable[[], LiveEngine]] = {}

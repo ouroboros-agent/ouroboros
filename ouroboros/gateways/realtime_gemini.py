@@ -239,6 +239,11 @@ class GeminiLiveEngine(RealtimeTransport):
         await self._ws.close()
         await self._connect_session()
 
+    def unsent_context(self):
+        """Context held for an idle moment that never reached the wire (a lost session), handed back once."""
+        held, self._context = tuple(self._context), []
+        return held
+
     async def _send_command(self, command):
         if isinstance(command, AudioIn):
             check_audio(command, INPUT_RATE)

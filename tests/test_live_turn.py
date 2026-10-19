@@ -583,6 +583,26 @@ def test_go_away_mid_answer_resumes_with_the_providers_handle_by_its_deadline(ha
     h.finish()
 
 
+@pytest.mark.parametrize("resumable", [True, False])
+def test_context_held_for_an_idle_moment_reaches_a_resumed_session(harness, resumable):
+    """A line typed while a thinking route works inside one interaction waits in the adapter; if the session is
+    lost meanwhile, a resumed one is sent it, and a fresh one replays the call so far instead."""
+    h = harness()
+    first = h.start()
+    first.push(ResumeCheckpoint(handle="resume-8" if resumable else "", resumable=resumable))
+    first.push(ResponseStarted(item_id="a1", response_id="r1"))  # mid-answer: the adapter holds what arrives
+    line = ContextItem(text="[Dialogue update] the owner typed meanwhile", source="tool_batch:user", opens_response=True)
+    first.held = [line]
+    first.push(GoAway(time_left_s=0.5))
+    # Live again: whatever waited for the new session went out with its open.
+    assert _wait_for(lambda: len(h.llm.engines) == 2 and h.hub.states.count((STATE_LIVE, "")) == 2)
+    second = h.engine()
+    assert (second.config.resume_handle == "resume-8") is resumable
+    assert (line in second.sent) is resumable
+    h.stop()
+    h.finish()
+
+
 def test_a_retryable_engine_error_reconnects_and_a_fatal_one_ends_the_call(harness):
     h = harness()
     first = h.start()

@@ -450,11 +450,13 @@ class _LiveCall:
             self.hub.send_state(STATE_RECONNECTING, reason)
         old, self.engine = self.engine, None
         self.epoch += 1  # events of the lost session are stale from here
+        held = ()
         if old is not None:
             try:
                 await asyncio.wait_for(old.close(reason), timeout=BATCH_SETTLE_WAIT_S)
             except Exception:
                 log.debug("lost engine close failed", exc_info=True)
+            held = old.unsent_context()  # what it kept for an idle moment that never came
         for key in list(self.attempts):
             self._abandon(self.attempts.pop(key), reason)
         self.response_open = False
@@ -464,6 +466,8 @@ class _LiveCall:
                 self.reconnecting = False
                 return
         handle = self.resume_handle if resume else ""
+        if handle:  # a resumed session never saw them; a fresh one replays their rows from the call so far
+            self._queued[:0] = [(len(self.messages), item) for item in held]
         for attempt_no in range(RECONNECT_ATTEMPTS):
             try:
                 await self._open_engine(resume_handle=handle)

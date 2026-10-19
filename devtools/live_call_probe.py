@@ -214,6 +214,9 @@ class ObservedEngine:
     async def close(self, reason):
         await self.engine.close(reason)
 
+    def unsent_context(self):
+        return self.engine.unsent_context()
+
 
 class OwnerPeer:
     """Pace capture and simulated playback independently, including queued flushes."""
