@@ -211,6 +211,7 @@ One row per key (`settings_defaults.py`). Env-only rows have no settings.json ca
 | OUROBOROS_HOST_SERVICE_PORT | 8767 | Host Service port (loopback-only; §12) |
 | OUROBOROS_DESKTOP_KEEP_RUNNING | false | Closing the desktop window keeps Ouroboros running (Windows, macOS; `launcher_background.py`); disk-authored consent, absent until the owner chooses |
 | OUROBOROS_PRESENCE_MAX_ACTIVE | 2 | Cross-process Presence turn cap (UI-bounded 1-20) |
+| OUROBOROS_CALLS_ENABLED | false | Calls are a beta: Talk is offered and a call opens (the owner's or a Presence call) only once this is on, whatever keys exist. Saved only when the owner flips it and never exported to the environment, so a later default reaches every install that never chose |
 | OUROBOROS_CALL_MODEL_GOOGLE | "gemini-3.8-live" | Gemini Live model for calls |
 | OUROBOROS_CALL_VOICE_GOOGLE | "" | Gemini call voice (blank = provider default) |
 | OUROBOROS_CALL_NATIVE_SEARCH | true | Gemini's own Google Search in calls |

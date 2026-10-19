@@ -49,6 +49,7 @@ const RECONNECT_WORDS = {
 const KEY = { tab: 'providers', focus: 's-google' };
 const MODEL = { tab: 'models', focus: 's-call-model-google' };
 const BUDGET = { tab: 'behavior', focus: '' };
+const SWITCH = { tab: 'models', focus: 's-calls-enabled' };
 const REFUSED = { words: 'Google refused the call: “{detail}”', bare: 'Google refused the call', action: 'retry' };
 const UNREACHABLE = { words: 'Can’t reach Google’s voice service', action: 'retry' };
 const NOT_STARTED = { words: 'The call could not start; the room has the details', action: 'retry' };
@@ -67,6 +68,7 @@ const ENDINGS = {
     budget_exceeded: { words: 'The spending limit is reached', action: 'settings', settings: BUDGET },
     missing_credential: NO_KEY,
     missing_credential_google: NO_KEY,
+    calls_disabled: { words: 'Calls are off — turn on Calls (beta) in Settings', action: 'settings', settings: SWITCH },
     authentication: { words: 'Google refused the key', action: 'settings', settings: KEY },
     rate_limit: { words: 'Google says: “{detail}”', bare: 'Google asked to slow down', action: 'retry' },
     provider_closed: { words: 'Google closed the call: “{detail}”', bare: 'Google closed the call', action: 'retry' },

@@ -106,7 +106,8 @@ const PROVIDER_CARDS = [
         id: 'google', title: 'Google', hint: 'Gemini live calls',
         fields: [{ id: 's-google', settingKey: 'GOOGLE_API_KEY', label: 'Google API Key', placeholder: 'Google AI Studio key' }],
         note: 'Live calls (Talk) use this key; their model, voice and limits are in Models → Live calls. A call sends Google '
-            + 'your voice, what you show it and the call\u2019s memory of you; with a free-tier key Google may use that content to improve its products, with a paid one it does not.',
+            + 'your voice, what you show it and the call\u2019s memory of you; with a free-tier key Google may use that content to improve its products, with a paid one it does not. '
+            + 'Google does not offer the Gemini API in Russia or Belarus, so calls do not work from there.',
     },
     {
         id: 'compatible', title: 'OpenAI Compatible', icon: '/static/providers/openai-compatible.svg', hint: 'Custom OpenAI-style endpoint',

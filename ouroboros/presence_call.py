@@ -176,7 +176,8 @@ def open_presence_call(
     """Admit and start one live call for a Presence binding; returns once its thread runs.
 
     ``event`` is the same object ``/presence/turn`` takes. Refusals are
-    ``PresenceCallRefused`` with the admission's own codes, ``presence_call_not_enabled``
+    ``PresenceCallRefused`` with ``calls_disabled`` (the owner has not turned on the calls
+    beta, whatever the binding says), the admission's own codes, ``presence_call_not_enabled``
     (the effective runtime ``execution`` is not ``call``), ``presence_call_busy`` (the
     conversation has a live turn or every active slot is taken), the retained-outcome
     codes, and ``presence_call_hub_unavailable``. The hub is opened before the turn starts
@@ -184,7 +185,11 @@ def open_presence_call(
     test and host seams; the public shape is the keyword set the Host door passes.
     """
     from ouroboros.call_protocol import OPENED_BY_SKILL, CallSpec
+    from ouroboros.llm_live import calls_enabled
 
+    if not calls_enabled():
+        raise PresenceCallRefused("calls_disabled", "calls are off on this install; the owner turns them on in "
+                                  "Settings (Models, Live calls, Calls (beta))")
     drive_root = Path(drive_root)
     try:
         admission = admit_presence_turn(

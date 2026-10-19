@@ -376,9 +376,11 @@ export function mountCall({ page, chatId, env = globalThis, ws = null, label = (
     const styled = ensureStylesheet(doc);
     let destroyed = false;
     let entry = null;
-    // Talk appears once the server says this install has the Google AI key calls need: unknown until
-    // the first state snapshot every room receives (`state`), so no press can lead to a missing key.
+    // Talk appears once the server says calls are on (a beta the owner turns on in Settings) and this
+    // install has the Google AI key they need: unknown until the first state snapshot every room receives
+    // (`state`), so no press can lead to a missing key or a switched-off feature.
     let keyed = false;
+    let enabled = false;
     const visible = () => !destroyed && onScreen() && doc.visibilityState !== 'hidden';
     const light = createCallLight({ env, visible, heard: now => capsule.heard(now), voice: () => capsule.voice(),
         owner: () => capsule.render(), draw: state => capsule.draw(state) });
@@ -400,7 +402,7 @@ export function mountCall({ page, chatId, env = globalThis, ws = null, label = (
         end: () => session.end(),
         dismiss: () => session.dismiss(),
         act: action => act(action),
-        offered: () => keyed });
+        offered: () => keyed && enabled });
     light.attach(capsule.wrap);
     entry = trackCallMark({ session, label, onScreen, reveal, page, env, sign: () => CALL_VISUAL.mark(doc),
         wake: () => light.wake() });
@@ -441,8 +443,11 @@ export function mountCall({ page, chatId, env = globalThis, ws = null, label = (
         leave: end,
         retains: () => session.active,
         state(data) {
-            if (destroyed || typeof data?.calls_key_configured !== 'boolean' || data.calls_key_configured === keyed) return;
+            if (destroyed || typeof data?.calls_key_configured !== 'boolean') return;
+            const on = data.calls_enabled === true;  // an older server sends no switch: calls stay off
+            if (data.calls_key_configured === keyed && on === enabled) return;
             keyed = data.calls_key_configured;
+            enabled = on;
             capsule.entry();
         },
         destroy() {

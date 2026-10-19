@@ -38,6 +38,7 @@
  * @property {boolean} skills_repo_configured
  * @property {boolean} github_token_configured
  * @property {boolean} calls_key_configured  the Google AI key calls need is set (Talk is offered)
+ * @property {boolean} calls_enabled  the owner turned calls on (beta, off by default): Talk needs it as well
  * @property {Object} accounting  // physical-attempt ledger projection
  * @property {Array<ProjectEntry>} projects  // active/deleting sidebar projection
  * @property {Array<number>} project_chat_ids  // complete (uncapped) project chat_ids — WS fan-out isolation SSOT (v6.32.0)

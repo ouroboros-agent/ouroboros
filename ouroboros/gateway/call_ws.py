@@ -53,10 +53,13 @@ async def read_call_body(request: Request) -> dict:
 def build_call_spec(payload: dict) -> cp.CallSpec:
     """Capture configured routing at admission; an explicit voice may be empty."""
     from ouroboros.config import load_settings
-    from ouroboros.llm_live import live_key_present
+    from ouroboros.llm_live import calls_enabled, live_key_present
     from ouroboros.settings_defaults import SETTINGS_DEFAULTS
 
     settings = load_settings()
+    if not calls_enabled(settings):
+        # Calls are a beta the owner turns on in Settings; a page that still shows Talk learns it here.
+        raise CallPeerError("calls_disabled")
     if not live_key_present(settings):
         # Said at once, before any turn starts: calls use Google Gemini Live and need its key.
         raise CallPeerError("missing_credential_google")
@@ -134,6 +137,7 @@ _OWNER_REFUSAL_WORDS = {
     "budget_exhausted": "The spending limit is reached; raise it in Settings to call.",
     "cost_accounting_unavailable": "Spending cannot be checked right now, so the call did not open.",
     "project_room_unavailable": "This project's room is not available for a call.",
+    "calls_disabled": "Calls are off: turn on Calls (beta) in Settings (Models, Live calls).",
     "missing_credential_google": "Calls need a Google AI key: add it in Settings.",
     "call_model_missing": "No Gemini Live model is set in Settings (Models, Live calls).",
     "invalid_call_max_minutes": "The call's minute limit in Settings is not a positive whole number.",

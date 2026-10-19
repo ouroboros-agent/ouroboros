@@ -34,6 +34,21 @@ def live_key_configured() -> bool:
         return False
 
 
+def calls_enabled(settings=None) -> bool:
+    """Whether the owner turned calls on (Settings → Models → Live calls → Calls (beta)). Off by default whatever keys
+    the install holds, so the beta never appears by itself: the page offers Talk only with this and the key
+    (``/api/state`` ``calls_enabled``), and both doors that open a call (the owner's, Presence's) refuse without it.
+    Read from the settings document: the key is never exported to the environment."""
+    if settings is None:
+        from ouroboros.config import load_settings
+
+        try:
+            settings = load_settings()
+        except Exception:
+            return False
+    return str(settings.get("OUROBOROS_CALLS_ENABLED", False) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def make_live_engine(client, route: EngineRoute) -> LiveEngine:
     from ouroboros.gateways.realtime_gemini import GeminiLiveEngine
 

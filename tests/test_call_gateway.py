@@ -99,7 +99,7 @@ def test_owner_open_captures_settings_and_closes_hub_on_finished(owner, monkeypa
 
     calls = []
     monkeypatch.setattr(config, "load_settings", lambda: {
-        "GOOGLE_API_KEY": "test-google-key", "OUROBOROS_CALL_MODEL_GOOGLE": "live-model",
+        "OUROBOROS_CALLS_ENABLED": True, "GOOGLE_API_KEY": "test-google-key", "OUROBOROS_CALL_MODEL_GOOGLE": "live-model",
         "OUROBOROS_CALL_VOICE_GOOGLE": "configured-voice", "OUROBOROS_CALL_MAX_MINUTES": "9",
         "OUROBOROS_CALL_INSTRUCTIONS": " Be brief. ", "OUROBOROS_CALL_PAUSE": "Long", "OUROBOROS_CALL_INTERRUPTIONS": "false"})
 
@@ -126,7 +126,7 @@ def test_owner_admission_refusal_removes_hub(owner, monkeypatch):
     from ouroboros import config
     from supervisor import worker_chat_lane
 
-    monkeypatch.setattr(config, "load_settings", lambda: {"GOOGLE_API_KEY": "test-google-key", "OUROBOROS_CALL_MODEL_GOOGLE": "test"})
+    monkeypatch.setattr(config, "load_settings", lambda: {"OUROBOROS_CALLS_ENABLED": True, "GOOGLE_API_KEY": "test-google-key", "OUROBOROS_CALL_MODEL_GOOGLE": "test"})
     seen = []
 
     def admit(chat_id, spec, callback):
@@ -144,7 +144,7 @@ def test_owner_open_honours_a_chosen_model_and_a_second_surface_joins_the_rooms_
     from ouroboros import config
     from supervisor import worker_chat_lane
 
-    monkeypatch.setattr(config, "load_settings", lambda: {"GOOGLE_API_KEY": "test-google-key", "OUROBOROS_CALL_MODEL_GOOGLE": "settings-model"})
+    monkeypatch.setattr(config, "load_settings", lambda: {"OUROBOROS_CALLS_ENABLED": True, "GOOGLE_API_KEY": "test-google-key", "OUROBOROS_CALL_MODEL_GOOGLE": "settings-model"})
     admitted = []
 
     def admit(chat_id, spec, on_finished):
@@ -173,7 +173,7 @@ def test_two_surfaces_opening_a_room_at_once_share_one_call(monkeypatch):
     from ouroboros.gateway import call_ws
     from supervisor import worker_chat_lane
 
-    monkeypatch.setattr(config, "load_settings", lambda: {"GOOGLE_API_KEY": "test-google-key", "OUROBOROS_CALL_MODEL_GOOGLE": "settings-model"})
+    monkeypatch.setattr(config, "load_settings", lambda: {"OUROBOROS_CALLS_ENABLED": True, "GOOGLE_API_KEY": "test-google-key", "OUROBOROS_CALL_MODEL_GOOGLE": "settings-model"})
     admitted, both_built = [], threading.Barrier(2, timeout=5)
     build = call_ws.build_call_spec
 
@@ -412,7 +412,7 @@ def test_presence_admission_uses_binding_and_never_owner_entry(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize("code,status", [("presence_call_busy", 409), ("presence_call_not_enabled", 403),
-                                         ("presence_call_model_unset", 503)])
+                                         ("presence_call_model_unset", 503), ("calls_disabled", 403)])
 def test_a_presence_refusal_reaches_the_companion_in_plain_words(tmp_path, monkeypatch, code, status):
     from ouroboros.presence_call import PresenceCallRefused
 
@@ -565,7 +565,7 @@ def test_owner_unsupported_settings_and_admission_crash_are_typed(owner, monkeyp
     from ouroboros import config
     from supervisor import worker_chat_lane
 
-    settings = {"GOOGLE_API_KEY": "test-google-key", "OUROBOROS_CALL_MODEL_GOOGLE": "test", "OUROBOROS_CALL_MAX_MINUTES": "-2"}
+    settings = {"OUROBOROS_CALLS_ENABLED": True, "GOOGLE_API_KEY": "test-google-key", "OUROBOROS_CALL_MODEL_GOOGLE": "test", "OUROBOROS_CALL_MAX_MINUTES": "-2"}
     monkeypatch.setattr(config, "load_settings", lambda: settings)
     monkeypatch.setattr(worker_chat_lane, "handle_call_direct", lambda *args: None, raising=False)
     response = owner.post("/api/call/open", json={"chat_id": 1})
@@ -588,7 +588,7 @@ def test_a_turn_that_ends_before_its_driver_closes_the_hub_with_a_reason(owner, 
     from supervisor import worker_chat_lane
 
     calls = []
-    monkeypatch.setattr(config, "load_settings", lambda: {"GOOGLE_API_KEY": "g", "OUROBOROS_CALL_MODEL_GOOGLE": "m"})
+    monkeypatch.setattr(config, "load_settings", lambda: {"OUROBOROS_CALLS_ENABLED": True, "GOOGLE_API_KEY": "g", "OUROBOROS_CALL_MODEL_GOOGLE": "m"})
     monkeypatch.setattr(worker_chat_lane, "handle_call_direct",
                         lambda chat_id, spec, on_finished: calls.append((spec, on_finished)) or {"admitted": True},
                         raising=False)
@@ -604,6 +604,67 @@ def test_a_turn_that_ends_before_its_driver_closes_the_hub_with_a_reason(owner, 
     assert get_hub(spec.call_id) is None
 
 
+def test_calls_are_a_beta_the_owner_turns_on_whatever_keys_exist(owner, monkeypatch):
+    """Off by default: with the key set and the switch off (or never saved) the owner's call is refused before
+    anything starts; turned on, the same install opens it."""
+    from ouroboros import config
+    from supervisor import worker_chat_lane
+
+    admitted = []
+    monkeypatch.setattr(worker_chat_lane, "handle_call_direct",
+                        lambda chat_id, spec, on_finished: admitted.append(spec) or {"admitted": True, "task_id": "t"},
+                        raising=False)
+    settings = {"GOOGLE_API_KEY": "g", "OUROBOROS_CALL_MODEL_GOOGLE": "m"}
+    monkeypatch.setattr(config, "load_settings", lambda: settings)
+    for switch in (None, False, "false"):
+        if switch is not None:
+            settings["OUROBOROS_CALLS_ENABLED"] = switch
+        response = owner.post("/api/call/open", json={"chat_id": 1})
+        assert response.status_code == 400 and response.json()["code"] == "calls_disabled", switch
+        assert "turn on Calls (beta) in Settings" in response.json()["error"]
+    assert admitted == []
+    settings["OUROBOROS_CALLS_ENABLED"] = "true"
+    assert owner.post("/api/call/open", json={"chat_id": 1}).status_code == 200 and len(admitted) == 1
+    close_hub(admitted[-1].call_id)
+
+
+@pytest.fixture
+def settings_file(tmp_path, monkeypatch):
+    from ouroboros import config as cfg
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    monkeypatch.setattr(cfg, "DATA_DIR", data_dir, raising=True)
+    monkeypatch.setattr(cfg, "SETTINGS_PATH", data_dir / "settings.json", raising=True)
+    for key in cfg.SETTINGS_DEFAULTS:
+        monkeypatch.delenv(key, raising=False)
+    cfg.reset_runtime_mode_baseline_for_tests()
+    yield data_dir / "settings.json"
+    cfg.reset_runtime_mode_baseline_for_tests()
+
+
+def test_the_calls_switch_is_saved_only_when_chosen_and_never_rides_the_environment(settings_file):
+    """A later default for the beta reaches every install that never chose: neither an unrelated save of the
+    merged document nor the launcher's long-lived environment keeps a copy of today's default."""
+    from ouroboros import config as cfg
+    from ouroboros.gateway.owner_settings import _owner_write_settings
+
+    stored = lambda: json.loads(settings_file.read_text(encoding="utf-8"))  # noqa: E731
+    settings_file.write_text(json.dumps({"TOTAL_BUDGET": 5.0}), encoding="utf-8")
+    cfg.save_settings({**cfg.load_settings(), "TOTAL_BUDGET": 6.0})
+    assert "OUROBOROS_CALLS_ENABLED" not in stored() and cfg.load_settings()["OUROBOROS_CALLS_ENABLED"] is False
+    environ = {}
+    cfg.apply_settings_to_env({**cfg.load_settings(), "OUROBOROS_CALLS_ENABLED": True}, environ=environ)
+    assert "OUROBOROS_CALLS_ENABLED" not in environ
+    _owner_write_settings({**cfg.load_settings(), "OUROBOROS_CALLS_ENABLED": True},
+                          authored_keys=("OUROBOROS_CALLS_ENABLED",))
+    assert stored()["OUROBOROS_CALLS_ENABLED"] is True
+    _owner_write_settings({**cfg.load_settings(), "OUROBOROS_CALLS_ENABLED": False},
+                          authored_keys=("OUROBOROS_CALLS_ENABLED",))
+    cfg.save_settings({**cfg.load_settings(), "TOTAL_BUDGET": 7.0})
+    assert stored()["OUROBOROS_CALLS_ENABLED"] is False, "an explicit off stays through later saves"
+
+
 def test_owner_open_without_a_google_key_is_refused_at_once(owner, monkeypatch):
     from ouroboros import config
     from supervisor import worker_chat_lane
@@ -612,7 +673,8 @@ def test_owner_open_without_a_google_key_is_refused_at_once(owner, monkeypatch):
     monkeypatch.setattr(worker_chat_lane, "handle_call_direct",
                         lambda chat_id, spec, on_finished: admitted.append(spec) or {"admitted": True, "task_id": "t"},
                         raising=False)
-    settings = {"OUROBOROS_CALL_MODEL_GOOGLE": "g-model", "OPENAI_API_KEY": "an-openai-key-opens-nothing"}
+    settings = {"OUROBOROS_CALLS_ENABLED": True, "OUROBOROS_CALL_MODEL_GOOGLE": "g-model",
+                "OPENAI_API_KEY": "an-openai-key-opens-nothing"}
     monkeypatch.setattr(config, "load_settings", lambda: settings)
     response = owner.post("/api/call/open", json={"chat_id": 1})
     assert response.status_code == 400 and response.json()["code"] == "missing_credential_google"
@@ -634,7 +696,7 @@ def test_an_emptied_model_field_opens_the_default_model(owner, monkeypatch):
                         lambda chat_id, spec, on_finished: admitted.append(spec) or {"admitted": True, "task_id": "t"},
                         raising=False)
     # Settings' Gemini Live model field says "Use engine default" when it is empty.
-    monkeypatch.setattr(config, "load_settings", lambda: {"GOOGLE_API_KEY": "g", "OUROBOROS_CALL_MODEL_GOOGLE": ""})
+    monkeypatch.setattr(config, "load_settings", lambda: {"OUROBOROS_CALLS_ENABLED": True, "GOOGLE_API_KEY": "g", "OUROBOROS_CALL_MODEL_GOOGLE": ""})
     response = owner.post("/api/call/open", json={"chat_id": 1})
     assert response.status_code == 200, response.text
     assert admitted[-1].model == SETTINGS_DEFAULTS["OUROBOROS_CALL_MODEL_GOOGLE"] == "gemini-3.8-live"

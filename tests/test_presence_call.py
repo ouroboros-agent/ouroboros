@@ -128,6 +128,33 @@ def _wait_ended(opened: PresenceCallOpened, run) -> None:
 
 # --- opening -------------------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _calls_on(monkeypatch):
+    """Calls are a beta the owner turns on; these tests are about an install where he did."""
+    monkeypatch.setenv("OUROBOROS_CALLS_ENABLED", "true")
+
+
+@pytest.mark.parametrize("switch", ["", "false"])
+def test_calls_off_refuse_a_presence_call_whatever_the_binding_says(tmp_path, monkeypatch, switch):
+    monkeypatch.setenv("OUROBOROS_CALL_MODEL_GOOGLE", "gemini-live-test")
+    if switch:
+        monkeypatch.setenv("OUROBOROS_CALLS_ENABLED", switch)
+    else:
+        monkeypatch.delenv("OUROBOROS_CALLS_ENABLED")  # never chosen: the default, off
+    hub = _Hub(monkeypatch)
+    drive_root, repo, binding = _setup(tmp_path, execution="call")
+    with pytest.raises(PresenceCallRefused) as refused:
+        _open(drive_root, repo, binding, hub, _Driver(drive_root, hub))
+    assert refused.value.code == "calls_disabled" and "Calls (beta)" in refused.value.message
+    lease = _configured_gate(drive_root).try_acquire(KEY)
+    assert hub.opened == [] and lease is not None  # nothing was taken
+    lease.release()
+    monkeypatch.setenv("OUROBOROS_CALLS_ENABLED", "true")  # turned on, the same binding opens its call
+    opened = _open(drive_root, repo, binding, hub, _Driver(drive_root, hub))
+    _wait_ended(opened, presence_call_run(opened.call_id))
+    assert [spec.call_id for spec in hub.opened] == [opened.call_id]
+
+
 def test_a_call_needs_the_execution_call_runtime(tmp_path, monkeypatch):
     hub = _Hub(monkeypatch)
     drive_root, repo, binding = _setup(tmp_path, execution="")

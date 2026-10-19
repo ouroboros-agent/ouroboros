@@ -9,6 +9,7 @@ test server. Screenshots go to ``OUROBOROS_UI_EVIDENCE_DIR`` when it is set.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -188,8 +189,9 @@ def _admissions(page, admissions, refusal=None):
     page.route("**/api/call/open", admit)
 
 
-def _calls_key(page, configured: bool) -> None:
-    """The isolated server has no Google AI key: the state it reports says the install has one (or not)."""
+def _calls_key(page, configured: bool, enabled=None) -> None:
+    """The isolated server has no Google AI key and calls off: the state it reports says the install has the key and
+    the switch on (or not)."""
     def state(route):
         response = route.fetch()
         try:
@@ -197,17 +199,18 @@ def _calls_key(page, configured: bool) -> None:
         except Exception:
             route.fulfill(response=response)
             return
-        route.fulfill(response=response, json={**body, "calls_key_configured": configured})
+        route.fulfill(response=response, json={**body, "calls_key_configured": configured,
+                                                "calls_enabled": configured if enabled is None else enabled})
     page.route("**/api/state", state)
 
 
 def _open(browser, url, *, width=1280, height=900, scheme="dark", touch=False, motion="no-preference", init=FAKE_CALL,
-          key=True):
+          key=True, calls=None):
     context = browser.new_context(viewport={"width": width, "height": height}, color_scheme=scheme,
                                   reduced_motion=motion, has_touch=touch)
     page = context.new_page()
     page.add_init_script(init)
-    _calls_key(page, key)
+    _calls_key(page, key, calls)
     errors = []
     page.on("pageerror", lambda error: errors.append(str(error)))
     page.goto(url, wait_until="domcontentloaded")
@@ -812,6 +815,37 @@ def test_reduced_motion_keeps_words_and_colour_and_telegram_has_no_talk(direct_s
             expect(keyless.locator("#chat-send")).to_have_text("Send")
             assert not keyless_errors, keyless_errors
             _close(keyless)
+            # Calls are a beta the owner turns on: the key alone offers no Talk.
+            off, off_errors = _open(browser, server["url"], key=True, calls=False)
+            off.locator("#chat-attach").wait_for()
+            off.wait_for_function("() => !!document.querySelector('#page-chat .call-capsule')")
+            off.wait_for_timeout(500)
+            assert off.locator("#chat-send").get_attribute("data-call-entry") != "talk"
+            expect(off.locator("#chat-send")).to_have_text("Send")
+            # Settings saves the switch only when he flips it, so a later default reaches an untouched install.
+            off.click('[data-nav-page="settings"]')
+            expect(off.locator("#btn-save-settings")).to_be_enabled(timeout=30_000)
+            off.locator('[data-settings-tab="models"]').click()
+            switch = off.locator("#s-calls-enabled")
+            expect(switch).not_to_be_checked()
+
+            def save():
+                with off.expect_response(lambda r: r.request.method == "GET" and "/api/settings" in r.url) as reread:
+                    with off.expect_request(lambda r: r.method == "POST" and r.url.endswith("/api/settings")) as sent:
+                        off.locator("#btn-save-settings").click()
+                assert reread.value.ok
+                expect(off.locator("#settings-status")).to_contain_text("saved", timeout=30_000)
+                return json.loads(sent.value.post_data or "{}")
+
+            off.locator("#s-call-instructions").fill("Speak briefly.")
+            unrelated = save()
+            assert "OUROBOROS_CALLS_ENABLED" not in unrelated and unrelated["OUROBOROS_CALL_INSTRUCTIONS"] == "Speak briefly."
+            for on in (True, False):
+                switch.set_checked(on)
+                assert save()["OUROBOROS_CALLS_ENABLED"] == ("true" if on else "false")
+                expect(switch).to_be_checked(checked=on)
+            assert not off_errors, off_errors
+            _close(off)
         finally:
             browser.close()
 

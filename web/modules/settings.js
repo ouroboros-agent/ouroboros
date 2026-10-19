@@ -98,6 +98,12 @@ export function uiDirChange(edited, loaded) {
     return value === String(loaded ?? '').trim() ? {} : { OUROBOROS_UI_DIR: value };
 }
 
+// The calls beta's switch travels only when flipped: an untouched box must not save the default as a
+// choice, so a later default reaches every install that never chose; an explicit choice, off included, stays.
+export function callsChange(checked, loaded) {
+    return Boolean(checked) === isTruthySetting(loaded) ? {} : { OUROBOROS_CALLS_ENABLED: checked ? 'true' : 'false' };
+}
+
 function applyInputValue(id, value) {
     const el = byId(id);
     el.value = value === undefined || value === null ? '' : value;
@@ -700,6 +706,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             ...slot, inputId: slot.settingsInputId,
         })) });
         applyCheckboxValue('s-auto-grant-reviewed-skills', s.OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS);
+        applyCheckboxValue('s-calls-enabled', s.OUROBOROS_CALLS_ENABLED);  // the calls beta: off until turned on
         // Owner-facing mutative-subagents control shows the EFFECTIVE state when it
         // is binary-representable: an explicit value, or unset in advanced/pro
         // (every acting surface on = "On"). Unset in LIGHT mode is surface-aware
@@ -958,6 +965,8 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             body[key] = key === 'OUROBOROS_SERVER_HOST' ? value || fallback : value || '';
         });
         Object.assign(body, uiDirChange(fieldValue('s-ui-dir'), currentSettings?.OUROBOROS_UI_DIR));
+        const calls = byId('s-calls-enabled');
+        if (calls) Object.assign(body, callsChange(calls.checked, currentSettings?.OUROBOROS_CALLS_ENABLED));
         body.OUROBOROS_WEBSEARCH_MODEL = collectSearchSelection().model;
         VALUE_FIELDS
             // Owner-only keys travel through their audited owner endpoints, never

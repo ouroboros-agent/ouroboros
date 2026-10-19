@@ -105,9 +105,9 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_MODEL_FALLBACKS": OPENROUTER_DEFAULTS["fallback"],
     "OUROBOROS_SERVED_MODEL_REDOS": 2,  # redos of a round another model answered (`llm_substitution.py`)
     "OUROBOROS_MAX_WORKERS": 10, "OUROBOROS_PRESENCE_MAX_ACTIVE": 2,
-    # Live calls (Gemini Live): model, voice ("" = provider default), the owner's call instructions, turn-taking
-    # (pause short|normal|long; speech interrupts), native search, a thinking model's depth, minute ceilings ("" = none).
-    "OUROBOROS_CALL_MODEL_GOOGLE": "gemini-3.8-live", "OUROBOROS_CALL_VOICE_GOOGLE": "", "OUROBOROS_CALL_INSTRUCTIONS": "",
+    # Live calls (Gemini Live): the beta's switch (off whatever keys exist), model, voice ("" = provider default), call
+    # instructions, turn-taking (pause short|normal|long; speech interrupts), search, thinking, minute ceilings ("" = none).
+    "OUROBOROS_CALLS_ENABLED": False, "OUROBOROS_CALL_MODEL_GOOGLE": "gemini-3.8-live", "OUROBOROS_CALL_VOICE_GOOGLE": "", "OUROBOROS_CALL_INSTRUCTIONS": "",
     "OUROBOROS_CALL_PAUSE": "normal", "OUROBOROS_CALL_INTERRUPTIONS": True, "OUROBOROS_CALL_NATIVE_SEARCH": True,
     "OUROBOROS_CALL_THINKING_LEVEL": "low", "OUROBOROS_CALL_MAX_MINUTES": "", "OUROBOROS_PRESENCE_CALL_MAX_MINUTES": "",
     "OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT": 6,
@@ -542,17 +542,17 @@ SETTINGS_KEYS_NOT_EXPORTED_TO_ENV = frozenset({
     # which no owner authored — back over that environment, so the operator's LAN-reachable server silently became
     # loopback at the first self-restart. A default standing in for an absent key is not a decision.
     "OUROBOROS_SERVER_HOST",
-    # Read once per server generation (server_web.ServedUI.apply). An exported copy outlives the choice it
-    # copied: the desktop launcher keeps its environment across Restart, so clearing a saved directory or
-    # `none` would come back from that stale copy. The environment stays an operator's input for an ABSENT key.
-    "OUROBOROS_UI_DIR",
+    # Read from the document where used (server_web.ServedUI.apply; each call door). An exported copy outlives the
+    # choice it copied: the desktop launcher keeps its environment across Restart, so a cleared directory or `none`
+    # would come back from that stale copy, and a later calls default would never reach an install that never chose.
+    # The environment stays an operator's input for an ABSENT key.
+    "OUROBOROS_UI_DIR", "OUROBOROS_CALLS_ENABLED",
 }) | ENDPOINT_AUTHORED_SETTINGS  # disk-only in BOTH directions (never read from env, never exported to it)
 
-# A SAVED value of these keys, blank included, is the owner's choice and wins over the environment; an
-# ABSENT key leaves the choice to the environment (a deployment's OUROBOROS_UI_DIR=none). A merged write
-# carries every key the read produced, so it must not author an absent key with the value the environment
-# or the default gave it: one unrelated Settings save would otherwise freeze the operator's choice on disk.
-SAVED_CHOICE_SETTINGS = frozenset({"OUROBOROS_UI_DIR"})
+# A SAVED value of these keys, blank included, is the owner's choice and wins over the environment; an ABSENT key
+# follows the environment (a deployment's OUROBOROS_UI_DIR=none) or the default. A merged write carries every key the
+# read produced, so it must not author an absent key: one unrelated Settings save would freeze the default on disk.
+SAVED_CHOICE_SETTINGS = frozenset({"OUROBOROS_UI_DIR", "OUROBOROS_CALLS_ENABLED"})
 
 
 def unauthored_saved_choices(prepared, stored, authored=()) -> frozenset:
