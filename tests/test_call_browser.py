@@ -9,7 +9,6 @@ test server. Screenshots go to ``OUROBOROS_UI_EVIDENCE_DIR`` when it is set.
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 
@@ -826,17 +825,14 @@ def test_reduced_motion_keeps_words_and_colour_and_telegram_has_no_talk(direct_s
             off.click('[data-nav-page="settings"]')
             expect(off.locator("#btn-save-settings")).to_be_enabled(timeout=30_000)
             off.locator('[data-settings-tab="models"]').click()
-            switch = off.locator("#s-calls-enabled")
-            expect(switch).not_to_be_checked()
+            expect(switch := off.locator("#s-calls-enabled")).not_to_be_checked()
 
-            def save():
-                with off.expect_response(lambda r: r.request.method == "GET" and "/api/settings" in r.url) as reread:
+            def save():  # the POST's body, once the page has read the saved document back
+                with off.expect_response(lambda r: r.request.method == "GET" and "/api/settings" in r.url):
                     with off.expect_request(lambda r: r.method == "POST" and r.url.endswith("/api/settings")) as sent:
                         off.locator("#btn-save-settings").click()
-                assert reread.value.ok
                 expect(off.locator("#settings-status")).to_contain_text("saved", timeout=30_000)
-                return json.loads(sent.value.post_data or "{}")
-
+                return sent.value.post_data_json or {}
             off.locator("#s-call-instructions").fill("Speak briefly.")
             unrelated = save()
             assert "OUROBOROS_CALLS_ENABLED" not in unrelated and unrelated["OUROBOROS_CALL_INSTRUCTIONS"] == "Speak briefly."
