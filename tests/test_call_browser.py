@@ -221,6 +221,15 @@ def _close(page) -> None:
     page.context.close()
 
 
+def _resize(page, width: int, height: int) -> None:
+    """Resize the viewport, then wait for the shell's own layout switch: web/theme.js answers the media
+    query's change event a frame later, and a measurement before it reads the old layout at the new width
+    (a docked shell at 320 px squeezes the composer to a few pixels)."""
+    page.set_viewport_size({"width": width, "height": height})
+    page.wait_for_function("() => !window.ouroLayout || document.documentElement.dataset.layout === (matchMedia("
+                           "`(min-width: ${window.ouroLayout.dockedMinWidth}px)`).matches ? 'docked' : 'stack')")
+
+
 def _talk_ready(page, root=ROOM):
     from playwright.sync_api import expect
     send = page.locator(f"{root} .chat-send-inline")
@@ -329,9 +338,9 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
             assert all(f["magic"] == [79, 67] and f["version"] == 1 and f["kind"] == 1
                        and f["rate"] == hello["rate"] and f["bytes"] > 0 for f in frames)
             for width in WIDTHS:
-                page.set_viewport_size({"width": width, "height": 900})
+                _resize(page, width, 900)
                 _no_sideways_scroll(page, f"live {width}")
-            page.set_viewport_size({"width": 1280, "height": 900})
+            _resize(page, 1280, 900)
             _shot(page, f"{engine}-dark-1280-listening")
 
             # The owner speaks: his blue light from the microphone, his words streaming into the call's card,
@@ -447,9 +456,9 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
             page.emulate_media(color_scheme="light")
             expect(page.locator("html")).to_have_attribute("data-theme", "light")
             for width in WIDTHS:
-                page.set_viewport_size({"width": width, "height": 900})
+                _resize(page, width, 900)
                 _no_sideways_scroll(page, f"live light {width}")
-            page.set_viewport_size({"width": 1280, "height": 900})
+            _resize(page, 1280, 900)
             _state(page, state="preparing", phase="memory")
             expect(state).to_have_text("Preparing memory…")
             _shot(page, f"{engine}-light-1280-preparing")
@@ -477,7 +486,7 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
             expect(state).to_have_text("Listening", timeout=10000)
 
             # A phone: the same states at 390 px, both themes.
-            page.set_viewport_size({"width": 390, "height": 844})
+            _resize(page, 390, 844)
             epoch = 2
             for scheme in ("light", "dark"):
                 page.emulate_media(color_scheme=scheme)
@@ -524,7 +533,7 @@ def test_talk_phases_voices_captions_and_the_capsule(direct_server_with_data, en
                 epoch += 1
                 _send(page, {"type": "flush", "epoch": epoch})
                 expect(state).to_have_text("Listening", timeout=10000)
-            page.set_viewport_size({"width": 1280, "height": 900})
+            _resize(page, 1280, 900)
 
             # End: everything stops, the composer comes back with its Talk.
             room.locator(".call-end").click()
