@@ -531,8 +531,10 @@ mechanism, tool, log, or config already lives. Reinventing what already
 exists is not only waste (P7) — it is a sign the map was not used.
 
 The map carries three mandatory layers — structural (what exists),
-operational (where things live and how to work with them) and rationale
-(the *why* of every non-trivial decision); the map's own head defines them.
+operational (a complete registry of logs, state files, configs, paths,
+environment variables and tool surface: where things live and how to work
+with them) and rationale (the *why* of every non-trivial decision); the
+map's own head defines them.
 A map without rationale forgot how it was drawn, and the next deep-review
 pass proposes to undo every decision whose *why* was lost.
 
