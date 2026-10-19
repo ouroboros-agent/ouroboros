@@ -436,6 +436,8 @@ def _run_periodic_custody_sweep(stop_event: Any = None, latch: Any = None) -> No
             _step_failed(step, "Periodic custody step %s failed")
         if not _stop_requested(stop_event):
             _prune_review_checkouts(stop_event=stop_event)  # ended tasks' copies, a crashed process's orphans
+        if not _stop_requested(stop_event):
+            _prune_context_views()  # ended tasks' host-section captures
     finally:
         (latch or _CUSTODY_SWEEP_LOCK).release()
 
@@ -877,6 +879,19 @@ def _run_deferred_startup_prunes():
     except Exception:
         log.debug("Agent media prune failed", exc_info=True)
     _prune_review_checkouts()  # last: a first pass after the update may capture many copies
+
+
+def _prune_context_views() -> None:
+    """A task's host-section captures live as long as the task (``section_floor.prune_context_views``)."""
+    try:
+        from functools import partial
+
+        from ouroboros.section_floor import prune_context_views
+
+        _prune_event("context_views_prune", ("removed", "errors"),
+                     report=prune_context_views(DATA_DIR, partial(_startup_live_task_ids, DATA_DIR, include_pending=True)))
+    except Exception:
+        log.debug("Context view prune failed", exc_info=True)
 
 
 # Memory only: the views pass of the review checkout prune runs once per process, until done.

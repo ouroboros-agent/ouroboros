@@ -468,3 +468,30 @@ def test_a_known_route_reply_allowance_replaces_mains_reserve(tmp_path, monkeypa
         with pytest.raises(ValueError, match="positive evidenced allowance"):
             fit.build_context_fit_plan(env, core, {"id": "task-1"}, preferred_mode="max", route_resolver=resolver,
                                        known_window_tokens=128_000, known_output_reserve_tokens=bad)
+
+
+def test_a_tasks_captures_go_once_it_ended_and_stay_while_it_may_still_read_them(tmp_path):
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
+
+    section = HostSection("runtime", "the full runtime facts " * 40, operative_view="runtime: 3 facts")
+    for task_id in ("ended", "running", "live", "unknown"):
+        section_floor._retain(tmp_path, section_floor.section_address(task_id, section), section.full_text)
+    hashed = tmp_path / "state/context_views" / hashlib.sha256(b"an.unusual.id").hexdigest()
+    hashed.mkdir()
+    write_task_result(tmp_path, "ended", "completed", result="done")
+    write_task_result(tmp_path, "running", STATUS_RUNNING, result="running")
+    write_task_result(tmp_path, "live", "completed", result="done")  # its result is terminal, yet it runs again
+    report = section_floor.prune_context_views(tmp_path, lambda: {"live"})
+    left = sorted(path.name for path in (tmp_path / "state/context_views").iterdir())
+    assert report == {"removed": 1, "kept": 4, "errors": 0}
+    assert left == sorted(["running", "live", "unknown", hashed.name])
+    # Live ownership that cannot be read removes nothing.
+    write_task_result(tmp_path, "running", "completed", result="done")
+
+    def unreadable():
+        raise ValueError("startup pending ownership is unreadable")
+
+    with pytest.raises(ValueError):
+        section_floor.prune_context_views(tmp_path, unreadable)
+    assert (tmp_path / "state/context_views/running").is_dir()
+    assert section_floor.prune_context_views(tmp_path, set())["removed"] == 2  # running and live ended now

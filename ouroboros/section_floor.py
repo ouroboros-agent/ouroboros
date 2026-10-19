@@ -16,9 +16,10 @@ import math
 import os
 import pathlib
 import re
+import shutil
 import tempfile
 from dataclasses import dataclass, replace
-from typing import Callable, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 from ouroboros.context_layout import TIER0_ALWAYS_FULL
 from ouroboros.utils import estimate_tokens
@@ -156,3 +157,38 @@ def fit_host_sections(
                          "sha256": hashlib.sha256(section.full_text.encode("utf-8")).hexdigest(),
                          "reader": reader})
     return addressed, receipts
+
+
+def prune_context_views(drive_root: Any, live_task_ids: Any = None) -> dict:
+    """Retire the captures of tasks that ended (the periodic custody sweep, ``server_maintenance``).
+
+    A task's captures serve only that task's views, and a later view of it writes a missing one
+    again, so a task's folder goes once its durable result is truly terminal and the task is not
+    live now. A folder whose task is live, unfinished or unreadable stays, and so does one named
+    by a digest (an id a file name cannot hold), whose task cannot be read back from its name.
+    ``live_task_ids`` is a set or a zero-arg callable.
+    """
+    from ouroboros.process_scope import task_scope_terminal_evidence
+    from ouroboros.task_results import load_task_result
+
+    report = {"removed": 0, "kept": 0, "errors": 0}
+    try:
+        folders = sorted(entry for entry in (pathlib.Path(drive_root) / "state" / "context_views").iterdir()
+                         if entry.is_dir() and not entry.is_symlink())
+    except OSError:
+        return report
+    live = (live_task_ids() if callable(live_task_ids) else live_task_ids) or set()
+    for folder in folders:
+        try:
+            ended = folder.name not in live and task_scope_terminal_evidence(load_task_result(drive_root, folder.name))
+        except Exception:
+            ended = False
+        if not ended:
+            report["kept"] += 1
+            continue
+        try:
+            shutil.rmtree(folder)
+            report["removed"] += 1
+        except OSError:
+            report["errors"] += 1
+    return report

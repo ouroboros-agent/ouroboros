@@ -791,7 +791,7 @@ def scan_data_paths(root: pathlib.Path = REPO) -> frozenset[str]:
 # ``state/context_views/*/*/*.md`` (``ouroboros/section_floor.py``; a section-4 row).
 # 389 -> 390 (live calls): the recognition languages a call's voice recorded,
 # ``state/call_languages.json`` (``ouroboros/call_languages.py``; a section-2 row).
-EXPECTED_SCAN_PATHS = 390
+EXPECTED_SCAN_PATHS = 391
 
 # Scanned paths that must always be present — guards the scanner itself
 # against a silent regression that would shrink coverage while keeping counts
