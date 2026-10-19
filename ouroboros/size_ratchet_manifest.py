@@ -286,6 +286,7 @@ BAND_PATHS = {
     "web/tests/chat_decision.test.js": "Main and Project question binding and late-read checks share the existing decision fixture and canonical reader contract.",
     "web/tests/chat_instance_dom.test.js": "Entered the band from 1000 lines with the alias-free subagent cost pin (stage-2 fix wave): that regression reproduces only through the real createChatInstance card path, and this file owns the DOM harness that drives it; split when the next createChatInstance face lands.",
     "web/tests/dashboard_read_states.test.js": "Dashboard sub-tab controllers share one DOM, fetch and manual-timer fixture; Storage lifecycle sequences stay beside the existing passive-read and stale-response tests without a cap-driven split.",
+    "web/tests/document_reader.test.js": "The reader fixture and its text/image lifecycle, focus and source contracts share one coherent test owner; keeping their assertions together avoids cap-driven fixture duplication.",
     "web/tests/harness_login_cards.test.js": "Login-card suite grew past 1000 lines with the name-the-account face cases (agy pickup, issue #232); split when the next face lands.",
     "web/tests/onboarding_agents_step.test.js": "Keeps the shared onboarding controller tests together across preview freshness, typed failure delivery, owner draft preservation and explicit reviewer recovery.",
     "web/tests/subagents_settings.test.js": "Real editor parsing, lowering choices, dirty drafts and duplicate/API transitions are covered together.",

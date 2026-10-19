@@ -746,8 +746,8 @@ test('owner attachments mount above the caption from the shared atoms and releas
         assert.ok(block.querySelectorAll('.chat-file-item')[1].classList.contains('is-unavailable'));
         assert.ok(block.innerHTML.includes('ZIP · Unavailable'),
             'an unavailable card says so in words, not only by its dimmed style');
-        assert.equal(block.innerHTML.match(/aria-haspopup="dialog"/g)?.length, 1,
-            'the live card announces the file dialog it opens, as a delivered card does; the inert one opens nothing');
+        assert.equal(block.innerHTML.match(/aria-haspopup="dialog"/g)?.length, 3,
+            'each photo tile and the live card announce the dialog they open, as delivered ones do; the inert card opens nothing');
         assert.ok(fx.tracker.adds > adds, 'listeners belong to the media controller');
         const single = new NodeStub('div', fx.tracker);
         single.innerHTML = '<div class="sender">You</div><div class="message"></div>';

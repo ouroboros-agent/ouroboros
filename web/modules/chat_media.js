@@ -64,6 +64,11 @@ function fileExtension(filename) {
     return match ? match[1].slice(0, 10).toUpperCase() : 'FILE';
 }
 
+// A card the reader opens names what it does: Read a document, View an image.
+function readLabelHtml(kind) {
+    return `<span class="chat-file-more is-read">${escapeHtml(kind === 'image' ? tr('media.view', 'View') : tr('media.read', 'Read'))}</span>`;
+}
+
 function formatDuration(seconds) {
     const total = Number.isFinite(Number(seconds)) ? Math.max(0, Math.floor(Number(seconds))) : 0;
     const hours = Math.floor(total / 3600);
@@ -362,9 +367,44 @@ export function createChatMedia({
         downloadBlob(await sourceBlob(source, mime), filename);
     }
 
-    // The card's Open and Download, shared by the file dialog and the document reader.
+    // A photo's Open, its menu's and the reader's: a durable photo rides the host-bridge helper
+    // with BOTH addresses (bridge form for the launcher gate, canonical for browsers); a data:
+    // display keeps window.open, whose shell interceptor saves the bytes.
+    async function openImage(sourceRef, display, filename) {
+        if (!sourceRef.durable) {
+            window.open(display, '_blank', 'noopener');
+            return true;
+        }
+        try {
+            await openViaHostBridge(sourceRef.bridge || sourceRef.durable, filename, { browserUrl: sourceRef.durable });
+            return true;
+        } catch (error) {
+            showToast(`Could not open image: ${error?.message || error}`, 'error');
+            return false;
+        }
+    }
+
+    // A photo's Copy, its menu's and the reader's: the image itself on the clipboard.
+    async function copyImage(sourceRef, mime) {
+        try {
+            if (!navigator.clipboard?.write || typeof ClipboardItem !== 'function') {
+                throw new Error('copying images is not available here. Use Open in new tab or Download.');
+            }
+            const blob = await sourceBlob(sourceRef, mime);
+            await navigator.clipboard.write([new ClipboardItem({ [blob.type || mime]: blob })]);
+            showToast('Image copied.', 'ok');
+            return true;
+        } catch (error) {
+            showToast(`Could not copy image: ${error?.message || error}`, 'error');
+            return false;
+        }
+    }
+
+    // The card's Open and Download, shared by the file dialog and the document reader; a photo
+    // (`display`) keeps its own Open, and an image in the reader the photo's Copy.
     const fileActions = {
         async open(file) {
+            if (file.display) return openImage(file.source, file.display, file.filename);
             try {
                 await openViaHostBridge(file.source.bridge || file.source.durable, file.filename, { browserUrl: file.source.durable });
                 return true;
@@ -382,8 +422,15 @@ export function createChatMedia({
                 return false;
             }
         },
+        copy: (file) => copyImage(file.source, file.mime),
     };
     const reader = createDocumentReader({ actions: fileActions, formatSize: humanSize });
+
+    // The reader over the chat for a card or photo tile; it is the one transient, so a file dialog closes first.
+    function openReader(file, owner, trigger, event) {
+        closeFileDialog();
+        return reader.open(file, { owner, returnFocus: trigger, pointer: event?.detail > 0 });
+    }
 
     function ensureFileDialog() {
         if (fileDialog) return fileDialog;
@@ -419,6 +466,7 @@ export function createChatMedia({
     }
 
     function openFileDialog(file, owner = null) {
+        reader.close({ restoreFocus: false });
         const dialog = ensureFileDialog();
         dialogFile = file;
         dialogOwner = owner;
@@ -546,6 +594,7 @@ export function createChatMedia({
         return `<details class="chat-photo-actions">
             <summary aria-label="${escapeHtmlAttr(tr('media.photo_actions', 'Photo actions'))}" aria-haspopup="menu" aria-expanded="false">•••</summary>
             <div class="chat-photo-menu ui-popup" role="menu" aria-label="${escapeHtmlAttr(tr('media.photo_actions', 'Photo actions'))}" hidden>
+                <button type="button" role="menuitem" data-photo-action="view">${escapeHtml(tr('media.view', 'View'))}</button>
                 <button type="button" role="menuitem" data-photo-action="open">${escapeHtml(tr('media.open_in_new_tab', 'Open in new tab'))}</button>
                 <button type="button" role="menuitem" data-photo-action="download">${escapeHtml(tr('media.download', 'Download'))}</button>
                 <button type="button" role="menuitem" data-photo-action="copy">${escapeHtml(tr('media.copy_to_clipboard', 'Copy to clipboard'))}</button>
@@ -553,7 +602,15 @@ export function createChatMedia({
         </details>`;
     }
 
-    function wirePhotoActions(item, source, sourceRef, filename, mime) {
+    // A photo tile: the image is its own button, which opens it in the reader; `•••` keeps the explicit
+    // actions and View, the same opener, for a photo so small that `•••` covers it.
+    function photoHtml(src, alt, attrs = '') {
+        return `<button type="button" class="chat-photo-open" aria-haspopup="dialog"><img class="chat-photo" src="${escapeHtmlAttr(src)}" alt="${escapeHtmlAttr(alt)}"${attrs}></button>
+            ${photoActionsHtml()}`;
+    }
+
+    // `item` is the tile itself, not its bubble: buildGallery may move it into an earlier bubble's grid.
+    function wirePhotoActions(item, source, sourceRef, filename, mime, { title = '', meta = '' } = {}) {
         const action = (name) => item.querySelector(`[data-photo-action="${name}"]`);
         const details = item.querySelector('.chat-photo-actions');
         const trigger = details.querySelector('summary');
@@ -575,41 +632,26 @@ export function createChatMedia({
             } });
         });
         listen(menu, 'click', (event) => {
-            if (event.target.closest('[data-photo-action]')) binding?.close({ restoreFocus: true });
+            const action = event.target.closest('[data-photo-action]');
+            // View hands focus to the reader; revealing a clipped summary here moves the feed.
+            if (action) binding?.close({ restoreFocus: action.dataset.photoAction !== 'view' });
         }, { capture: true }, item);
         const disposeMenu = () => { binding?.destroy(); menu.remove(); };
         disposers.add(disposeMenu);
         resourceOwners.set(disposeMenu, item);
 
-        // A durable photo rides the host-bridge helper with BOTH addresses
-        // (bridge form for the launcher gate, canonical for browsers); a data:
-        // display keeps window.open, whose shell interceptor saves the bytes.
-        const openPhoto = () => {
-            if (sourceRef.durable) {
-                openViaHostBridge(sourceRef.bridge || sourceRef.durable, filename, { browserUrl: sourceRef.durable })
-                    .catch((error) => showToast(`Could not open image: ${error?.message || error}`, 'error'));
-                return;
-            }
-            window.open(source, '_blank', 'noopener');
-        };
-        listen(item.querySelector('.chat-photo'), 'click', openPhoto);
-        listen(action('open'), 'click', openPhoto, undefined, item);
+        // The tile and the menu's View show the image in the reader, from the very source it displays;
+        // focus goes back to whichever opened it.
+        const tile = item.querySelector('.chat-photo-open');
+        const file = { kind: 'image', src: source, display: source, source: sourceRef, filename, mime, title, meta, canOpen: true };
+        listen(tile, 'click', (event) => openReader(file, item, tile, event), undefined, item);
+        listen(action('view'), 'click', (event) => openReader(file, item, trigger, event), undefined, item);
+        listen(action('open'), 'click', () => openImage(sourceRef, source, filename), undefined, item);
         listen(action('download'), 'click', async () => {
             try { await downloadSource(sourceRef, filename, mime); }
             catch (error) { showToast(`Could not download image: ${error?.message || error}`, 'error'); }
         }, undefined, item);
-        listen(action('copy'), 'click', async () => {
-            try {
-                if (!navigator.clipboard?.write || typeof ClipboardItem !== 'function') {
-                    throw new Error('copying images is not available here. Use Open in new tab or Download.');
-                }
-                const blob = await sourceBlob(sourceRef, mime);
-                await navigator.clipboard.write([new ClipboardItem({ [blob.type || mime]: blob })]);
-                showToast('Image copied.', 'ok');
-            } catch (error) {
-                showToast(`Could not copy image: ${error?.message || error}`, 'error');
-            }
-        }, undefined, item);
+        listen(action('copy'), 'click', () => copyImage(sourceRef, mime), undefined, item);
     }
 
     function buildMediaBubble(msg) {
@@ -637,13 +679,13 @@ export function createChatMedia({
         const filename = `image.${mime.split('/')[1]?.split('+')[0] || 'png'}`;
         const body = `<div class="message"><div class="chat-gallery-grid">
             <figure class="chat-gallery-item">
-                <img class="chat-photo" src="${escapeHtmlAttr(source)}" alt="Photo attachment">
-                ${photoActionsHtml()}
+                ${photoHtml(source, 'Photo attachment')}
                 ${caption ? `<figcaption>${escapeHtml(caption)}</figcaption>` : ''}
             </figure>
         </div></div>`;
         const bubble = bubbleFrame(msg, body);
-        wirePhotoActions(bubble, source, mediaSourceRef(msg, source), filename, mime);
+        wirePhotoActions(bubble.querySelector('.chat-gallery-item'), source, mediaSourceRef(msg, source), filename, mime,
+            { title: caption, meta: fileExtension(filename) });
         return bubble;
     }
 
@@ -660,10 +702,9 @@ export function createChatMedia({
         const size = explicitSize ? Number(msg.size_bytes)
             : source.base64 ? base64Bytes(source.base64) : null;
         const meta = [fileExtension(fullName), humanSize(size)].filter(Boolean).join(' · ');
+        // Only the delivered copy opens in the reader (a raster image too); any other address keeps the file dialog.
         const readable = source.reader ? documentReaderKind(fullName, mime) : '';
-        const more = readable
-            ? `<span class="chat-file-more is-read">${escapeHtml(tr('media.read', 'Read'))}</span>`
-            : '<span class="chat-file-more" aria-hidden="true">•••</span>';
+        const more = readable ? readLabelHtml(readable) : '<span class="chat-file-more" aria-hidden="true">•••</span>';
         let content;
         if (mime.startsWith('audio/') && source.src) {
             content = playerHtml({ audio: true, src: source.src, title: filename });
@@ -692,9 +733,10 @@ export function createChatMedia({
             const card = bubble.querySelector('.chat-file-card');
             // The item, not the bubble: a grouped file moves into an earlier bubble's grid.
             const item = bubble.querySelector('.chat-file-item');
-            const file = { source, filename, mime, meta, kind: readable, reader: source.reader, size, canOpen: Boolean(source.durable) };
+            const file = { source, filename, mime, meta, kind: readable, reader: source.reader, src: source.src, size,
+                canOpen: Boolean(source.durable) };
             if (card && source.src) listen(card, 'click', (event) => (readable
-                ? reader.open(file, { owner: item, returnFocus: card, pointer: event?.detail > 0 })
+                ? openReader(file, item, card, event)
                 : openFileDialog(file, item)));
         }
         return bubble;
@@ -792,7 +834,7 @@ export function createChatMedia({
     // other bubble decorations are placed against).
     function mountAttachments(bubble, views, caption) {
         const block = destroyed ? null : buildAttachmentBlock({
-            listen, own, photoActionsHtml, wirePhotoActions, playerHtml, wirePlayer, openFileDialog,
+            listen, own, photoHtml, wirePhotoActions, playerHtml, wirePlayer, openFileDialog, openReader, readLabelHtml,
             humanSize, fileExtension, release, onDomWrite,
         }, views);
         const message = block && bubble?.querySelector('.message');

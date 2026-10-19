@@ -32,11 +32,11 @@ Pages share supervisor, review, marketplace, extension and provider primitives.
 - `skill_card_renderer.js`, `skill_presentation.js` ← skill cards and the words every Skills surface shares.
 - `client_surface.js` ← the send-time surface snapshot (raw observables, no device taxonomy) spread into each chat frame.
 - `chat_markdown.js` ← marked+DOMPurify, chat URLs, KaTeX, lazy Mermaid, bounded charts, unloaded images (DESIGN §5; vendors: `web/vendor/VENDOR-MANIFEST.md`).
-- `document_reader.js` ← read-only reader of a delivered Markdown or text file, bounded by `DOCUMENT_READER_MAX_BYTES` and `DOCUMENT_READER_TIMEOUT_MS` (DESIGN "Document reading").
+- `document_reader.js` ← chat text (`DOCUMENT_READER_MAX_BYTES`) and chat images; reads/loads use `DOCUMENT_READER_TIMEOUT_MS` (DESIGN "Document reading").
 - `log_events.js` ← event classification and the one factual task-presentation projection for Chat and Logs: task truth maps only to `Working` / `Done` / `Done with warnings` / `Failed` / `Cancelled`; it owns no actions, incidents or notifications, and compact headlines never expose raw reason codes. Task-to-task delivery appears in the receiving timeline (`task_message_injected`), delivery or refusal in the sending one (`task_message_routed`).
 - `effort_evidence.js` ← Logs: requested effort, host carrier, engine preparation, sourced provider observation; missing echoes stay unknown.
 - `toast.js`, `masonry.js`, `widget_frame.js`, `widget_job.js` ← toasts, layout, framed-widget bootstrap/lifecycle, bounded widget request/job policy.
-- `result_files.js` ← Files and validated question materials via canonical artifacts, document/photo readers and explicit downloads.
+- `result_files.js` ← Files and validated question materials via canonical artifacts, the reader and explicit downloads.
 - `history_retention.js` ← history-transfer details and storage problems for Chat and Logs; routine transfer alters no task outcome.
 - `settled_card.js` ← `syncSettledItems`: the settled card's Files row and Continue action follow one detail.
 - `task_continue.js` ← Continue projects the host's `continuation_offer`; `hard_limit_reached` is one neutral reason that buys no model call; Stop, Panic and an author finish cannot Continue (§6); one stored nonce per task makes a retry return the same admission.

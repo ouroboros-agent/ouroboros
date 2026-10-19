@@ -7982,6 +7982,23 @@ html[data-layout="stack"] .project-panel.open {
     border-radius: 0;
 }
 
+/* The tile's own button opens the image in the reader; its `•••` menu stays separate. */
+.chat-photo-open {
+    display: block;
+    width: 100%;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+}
+
+.chat-photo-open:focus-visible {
+    outline: 2px solid var(--focus-accent-border);
+    outline-offset: -2px;
+}
+
 /* One photo alone keeps its own ratio up to the token height, whoever sent it:
    an Ouroboros single-photo bubble or an owner bubble with one image. */
 .chat-bubble:not(.is-multiple) .chat-gallery-grid:not(.is-multiple) .chat-gallery-item {
@@ -8270,6 +8287,42 @@ html[data-layout="stack"] .project-panel.open {
     white-space: nowrap;
 }
 
+/* The reader's own head: the name and its actions share one wrapping row beside Close, so the
+   actions take a line of their own before the name is squeezed, at any width, and the whole
+   name wraps instead of being cut (a phone has no hover title). */
+.document-reader-head.has-lead {
+    grid-template-areas: "lead close";
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: start;
+}
+
+.document-reader-lead {
+    grid-area: lead;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: var(--space-2) var(--space-4);
+    min-width: 0;
+}
+
+.document-reader-lead .document-reader-identity { flex: 1 1 240px; }
+.document-reader-lead .document-reader-actions { margin-inline-start: auto; }
+.document-reader-head.has-lead .document-reader-title {
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+    /* A caption can be paragraphs long. Keep the whole text keyboard-scrollable
+       without letting it displace Close, the actions or the reading region. */
+    max-height: 20vh;
+    max-height: 20dvh;
+    overflow: auto;
+    overscroll-behavior: contain;
+}
+
+.document-reader-head.has-lead .document-reader-title:focus-visible {
+    outline: 2px solid var(--focus-accent-border);
+    outline-offset: 2px;
+}
+
 .document-reader-meta {
     margin-top: var(--space-1);
     color: var(--text-meta);
@@ -8366,6 +8419,21 @@ html[data-layout="stack"] .project-panel.open {
 
 .document-reader-status p { margin: 0; }
 .document-reader-status.is-error { color: var(--text-primary); }
+
+/* An image: Fit shows it whole and never enlarges it; Actual size scrolls its own pixels. */
+.document-reader-body.is-image {
+    display: grid;
+    grid-template: minmax(0, 1fr) / minmax(0, 1fr);
+}
+
+.document-reader-image {
+    max-width: 100%;
+    max-height: 100%;
+    margin: auto;
+    object-fit: contain;
+}
+
+.document-reader-body.is-actual .document-reader-image { max-width: none; max-height: none; }
 
 /* A phone reads the document on a full sheet; Close returns to the same place in the chat. */
 @media (max-width: 620px) {

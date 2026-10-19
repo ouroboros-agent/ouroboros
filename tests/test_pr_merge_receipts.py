@@ -64,6 +64,9 @@ class FakeGh:
                 return github.GhResult(False, "⚠️ GH_TIMEOUT: exceeded 120s.", None, None, "timeout")
             if self.merge == "timeout_open":
                 return github.GhResult(False, "⚠️ GH_TIMEOUT: exceeded 120s.", None, None, "timeout")
+            if self.merge == "timeout_queued":  # auto-merge took the request; its answer was lost
+                self.pr.update(autoMergeRequest={"enabledAt": "now"})
+                return github.GhResult(False, "⚠️ GH_TIMEOUT: exceeded 120s.", None, None, "timeout")
             return github.GhResult(False, "⚠️ GH_ERROR: pre-effect refusal", 1, None, "pre_effect")
         if args[:2] == ["pr", "edit"]:
             return github.GhResult(False, "GraphQL: The 'login' field requires 'read:org' scope", 1, None, "exit")
@@ -155,6 +158,117 @@ def test_queued_is_not_merged(world, merge, reason):
     _merge(world, reviewed_head_sha=HEAD)
     outcome = _receipts(world)[0]["outcome"]
     assert outcome == {"status": "queued", "reason": reason}
+
+
+QUEUED_CLOSED = "queued earlier; PR now CLOSED, auto-merge off; request accepted, outcome unresolved"
+
+
+def _merges(world):
+    return sum(c[:2] == ["pr", "merge"] for c in world.gh.calls)
+
+
+@pytest.mark.parametrize(("merge", "reason"), [("queued", "auto_merge_pending"), ("accepted_open", "accepted_still_open")])
+def test_a_closed_pr_is_the_latest_readback_beside_the_earlier_queued_request(world, merge, reason):
+    """GitHub's newest answer (CLOSED, head and base moved) is the observation and the coverage
+    subject; the queued request stays the outcome, observation-only, worded as earlier."""
+    world.gh.merge = merge
+    _merge(world, reviewed_head_sha=HEAD, reviewed_base_sha=BASE)
+    (queued,) = _receipts(world)
+    moved_head, moved_base = "e" * 40, "f" * 40
+    world.gh.pr.update(state="CLOSED", autoMergeRequest=None, headRefOid=moved_head, baseRefOid=moved_base)
+    out = _merge(world, reviewed_head_sha=HEAD, reviewed_base_sha=BASE)
+    (receipt,) = _receipts(world)
+    assert receipt["receipt_id"] == queued["receipt_id"] and receipt["outcome"] == {"status": "queued", "reason": reason}
+    assert receipt["observed_after"] == {**queued["observed_after"], "state": "CLOSED", "auto_merge": False,
+                                         "head_sha": moved_head, "base_sha": moved_base}
+    assert receipt["coverage"]["status"] == "changes_after_review"
+    assert "base_changed_since_review" in receipt["coverage"]["gaps"]
+    assert receipt["revision"] == queued["revision"] + 1
+    assert out.startswith(f"⚠️ PR #7 merge: {QUEUED_CLOSED}; review coverage changes_after_review")
+    assert f"Earlier GitHub readback: {reason}." in out and "\nGitHub readback:" not in out
+    assert "sent no new merge request" in out
+    body = world.gh.pr["body"]
+    assert f"- Outcome: **queued** {QUEUED_CLOSED.removeprefix('queued ')}\n" in body
+    assert f"- Observed PR head `{moved_head}`, base `{moved_base}`" in body
+    assert world.ctx.pending_events[-1]["text"] == merge_receipts.card_row_text(receipt)
+    assert _merges(world) == 1
+
+
+def test_the_same_closed_readback_again_changes_no_fact_revision_or_delivery(world):
+    world.gh.merge = "queued"
+    _merge(world)
+    world.gh.pr.update(state="CLOSED", autoMergeRequest=None)
+    _merge(world)
+    (closed,) = _receipts(world)
+    patches = sum(c[:1] == ["api"] and "PATCH" in c for c in world.gh.calls)
+    assert _merge(world).startswith(f"⚠️ PR #7 merge: {QUEUED_CLOSED};")
+    (again,) = _receipts(world)
+    assert {k: v for k, v in again.items() if k != "updated_at"} == {k: v for k, v in closed.items() if k != "updated_at"}
+    assert sum(c[:1] == ["api"] and "PATCH" in c for c in world.gh.calls) == patches
+    assert _merges(world) == 1
+
+
+def test_an_unconfirmed_request_whose_auto_merge_went_away_reads_as_earlier(world):
+    world.gh.merge = "timeout_queued"
+    _merge(world)
+    assert _receipts(world)[0]["outcome"] == {"status": "queued", "reason": "auto_merge_pending"}
+    world.gh.pr.update(autoMergeRequest=None)
+    out = _merge(world)
+    (receipt,) = _receipts(world)
+    assert receipt["outcome"] == {"status": "queued", "reason": "auto_merge_pending"}
+    assert (receipt["observed_after"]["state"], receipt["observed_after"]["auto_merge"]) == ("OPEN", False)
+    assert out.startswith("⚠️ PR #7 merge: queued earlier; PR now OPEN, auto-merge off; effect unconfirmed;")
+    assert "Earlier GitHub readback: auto_merge_pending." in out and "Earlier merge request: failure=timeout" in out
+    assert "- Outcome: **queued** earlier; PR now OPEN, auto-merge off; effect unconfirmed\n" in world.gh.pr["body"]
+    assert _merges(world) == 1
+
+
+def test_a_reopened_pr_reads_queued_again_without_a_resend(world):
+    world.gh.merge = "accepted_open"
+    _merge(world)
+    world.gh.pr.update(state="CLOSED")
+    assert QUEUED_CLOSED in _merge(world)
+    world.gh.pr.update(state="OPEN")
+    out = _merge(world)
+    (receipt,) = _receipts(world)
+    assert receipt["outcome"] == {"status": "queued", "reason": "accepted_still_open"}
+    assert receipt["observed_after"]["state"] == "OPEN"
+    assert out.startswith("⚠️ PR #7 merge: queued; review coverage") and "\nGitHub readback: accepted_still_open." in out
+    assert "- Outcome: **queued**\n" in world.gh.pr["body"]
+    assert _merges(world) == 1
+
+
+def test_a_confirmed_merge_keeps_its_readback_against_a_later_closed_answer(world):
+    """MERGED is terminal on GitHub, so a later CLOSED answer is a lagging replica."""
+    _merge(world, reviewed_head_sha=HEAD, reviewed_base_sha=BASE)
+    (merged,) = _receipts(world)
+    world.gh.pr.update(state="CLOSED", mergeCommit=None, mergedAt=None)
+    out = _merge(world, reviewed_head_sha=HEAD, reviewed_base_sha=BASE)
+    (receipt,) = _receipts(world)
+    assert all(receipt[key] == merged[key] for key in (
+        "outcome", "observed_after", "coverage", "effect", "revision", "publication"))
+    assert out.startswith(f"⚠️ PR #7 merge: merged as {MERGE[:12]}") and "already recorded" in out
+    assert "PR_MERGE" not in out and "earlier" not in out
+    assert f"- Outcome: **merged** — merge commit `{MERGE}`" in world.gh.pr["body"]
+    assert _merges(world) == 1
+
+
+def test_an_unreadable_pr_leaves_a_queued_receipt_untouched(world, monkeypatch):
+    world.gh.merge = "queued"
+    _merge(world)
+    (before,) = _receipts(world)
+    original = world.gh
+    world.gh.pr.update(state="CLOSED", autoMergeRequest=None)
+
+    def unreadable(args, *a, **kw):
+        if args[:2] == ["pr", "view"]:
+            return github.GhResult(False, "⚠️ GH_ERROR: HTTP 502", 1, 502, "exit")
+        return original(args, *a, **kw)
+
+    monkeypatch.setattr(github, "_gh_run", unreadable)
+    out = _merge(world)
+    assert "pr_unreadable" in out and f"(receipt_id={before['receipt_id']}, outcome queued)" in out
+    assert _receipts(world) == [before] and _merges(world) == 1
 
 
 def test_an_unknown_outcome_is_always_read_back_without_a_retry_escape(world):
@@ -440,7 +554,8 @@ def test_parallel_callers_share_one_atomic_intent(world, monkeypatch):
 
 
 @pytest.mark.serial
-@pytest.mark.parametrize(("mode", "status"), [("ok", "merged"), ("accepted_open", "queued"), ("refused", "refused")])
+@pytest.mark.parametrize(("mode", "status"), [("ok", "merged"), ("accepted_open", "queued"), ("queued", "queued"),
+                                              ("refused", "refused")])
 def test_losing_claim_cannot_erase_the_winners_effect_or_settled_outcome(world, monkeypatch, mode, status):
     from concurrent.futures import ThreadPoolExecutor
     from threading import Barrier, Event, local
@@ -489,6 +604,9 @@ def test_losing_claim_cannot_erase_the_winners_effect_or_settled_outcome(world, 
     assert stored["effect"] == winner["effect"]
     assert stored["outcome"] == winner["outcome"]
     assert stored["coverage"] == winner["coverage"]
+    # The loser's readback predates the winner's effect: the winner's (auto-merge) snapshot stays.
+    assert stored["observed_after"] == winner["observed_after"]
+    assert stored["observed_after"]["auto_merge"] is (mode == "queued")
     assert stored["outcome"]["status"] == status and stored["state"] == "settled"
     assert all(f"merge: {status}" in text for text in outputs)
     assert sum(c[:2] == ["pr", "merge"] for c in world.gh.calls) == 1

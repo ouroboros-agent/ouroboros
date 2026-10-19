@@ -146,6 +146,22 @@ def test_main_question_materials_reader_and_keyboard(wait_clone, tmp_path, width
                         assert actual == payloads[material['label']]
                         assert hashlib.sha256(actual).hexdigest() == material['sha256']
                     receipt['stages'].append('PNG decoded at 240x120; all material bytes match registered custody')
+                    picture = materials.get_by_role('button', name='comparison.png', exact=False)
+                    expect(picture.locator('.chat-file-more')).to_have_text('View')
+                    card.locator('.chat-quiz-question').focus()
+                    _m1660_tab_to(page, picture)
+                    page.keyboard.press('Enter')
+                    dialog = page.locator('dialog.document-reader')
+                    expect(dialog).to_be_visible()
+                    page.wait_for_function("() => document.querySelector('dialog.document-reader .document-reader-image')?.naturalWidth === 240")
+                    expect(dialog.get_by_role('region', name='Image')).to_be_focused()
+                    shown = dialog.locator('.document-reader-image').evaluate('(img) => [img.width, img.height]')
+                    assert shown == [240, 120], f'Fit shows the material whole and never enlarges it: {shown}'
+                    page.screenshot(path=str(evidence / 'image-preview.png'), animations='disabled')
+                    page.keyboard.press('Escape')
+                    expect(dialog).to_have_count(0)
+                    expect(picture).to_be_focused()
+                    receipt['stages'].append('Keyboard opened the image material in the in-chat preview at its own size; Escape restored focus')
                     document = materials.get_by_role('button', name='decision-brief.md', exact=False)
                     # The keyboard starts at the question text, where Main's waiting pill lands a question.
                     card.locator('.chat-quiz-question').focus()

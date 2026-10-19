@@ -249,6 +249,60 @@ def test_concurrent_publication_through_outbox_dedup_and_history(world, monkeypa
     assert sum(c[:2] == ["pr", "merge"] for c in world.gh.calls) == 1
 
 
+def closed_receipt_projection(world, monkeypatch):
+    """Queued, then CLOSED twice, through the real outbox consumer and history endpoint."""
+    from ouroboros.gateway.history import make_chat_history_endpoint
+    from supervisor import events_chat_delivery as delivery
+    from supervisor import message_bus
+    from supervisor import terminal_delivery as td
+
+    monkeypatch.setattr(delivery, "_DELIVERED_MESSAGE_IDS", deque(maxlen=1000))
+    monkeypatch.setattr(message_bus, "DATA_DIR", world.root)
+    monkeypatch.setattr(message_bus, "publish_event", lambda *a, **k: None)
+    bridge = message_bus.LocalChatBridge({})
+    monkeypatch.setattr(message_bus, "get_bridge", lambda: bridge)
+    monkeypatch.setattr(message_bus, "load_state", lambda: {"owner_id": 7})
+    frames = []
+    bridge._broadcast_fn = frames.append
+    ctx = SimpleNamespace(DRIVE_ROOT=world.root, task_registry={}, send_with_budget=message_bus.send_with_budget,
+                          append_jsonl=lambda *a: pytest.fail(f"delivery error {a}"))
+    world.gh.merge = "queued"
+    texts = [registered_merge(world)]
+    world.gh.pr.update(state="CLOSED", autoMergeRequest=None)
+    texts += [registered_merge(world), registered_merge(world)]
+    for event in world.ctx.pending_events:
+        delivery._handle_send_message(event, ctx)
+    assert td.pending_deliveries(world.root) == []
+    payload = json.loads(asyncio.run(make_chat_history_endpoint(world.root)(
+        SimpleNamespace(query_params={"chat_id": "7"}))).body)
+    (stored,) = _receipts(world)
+    return SimpleNamespace(texts=texts, stored=stored, payload=payload,
+                           live=[row for row in frames if row.get("type") == "chat"],
+                           history=[row for row in payload["messages"] if row.get("card_row_id")])
+
+
+@pytest.mark.serial
+def test_a_closed_pr_reaches_the_card_through_outbox_history_and_the_consumer(world, monkeypatch):
+    seen = closed_receipt_projection(world, monkeypatch)
+    note = merge_fixture.QUEUED_CLOSED
+    assert note not in seen.texts[0] and all(note in text for text in seen.texts[1:])
+    assert sorted({row["card_row_revision"] for row in seen.live}) == [seen.stored["revision"] - 1, seen.stored["revision"]]
+    assert [row["text"] for row in seen.history] == [merge_receipts.card_row_text(seen.stored)] * len(seen.history)
+    assert {row["card_row_revision"] for row in seen.history} == {seen.stored["revision"]}
+    fixture = world.root / "closed-projection.json"
+    fixture.write_text(json.dumps({"live": seen.live, "history": seen.history, "expect": note}), encoding="utf-8")
+    result = run_in_group([shutil.which("node"), "--test", "--test-name-pattern=canonical receipt revisions",
+                           "web/tests/chat_card_row_placement.test.js"],
+                          cwd=pathlib.Path(__file__).resolve().parents[1],
+                          env={**os.environ, "MERGE_RECEIPT_PROJECTION": str(fixture)}, timeout=30)
+    if output := os.environ.get("OUROBOROS_UI_EVIDENCE_DIR"):
+        pathlib.Path(output).mkdir(parents=True, exist_ok=True)
+        shutil.copy(fixture, output)
+        (pathlib.Path(output) / "closed-projection-node.txt").write_text(result.stdout + result.stderr, encoding="utf-8")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert sum(c[:2] == ["pr", "merge"] for c in world.gh.calls) == 1
+
+
 def test_legacy_ambiguous_refusal_keeps_observation_custody(world):
     world.gh.merge = "timeout_open"
     registered_merge(world)
