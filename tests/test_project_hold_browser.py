@@ -116,9 +116,11 @@ def test_project_hold_reload_reconnect_and_automatic_same_id_recovery(
                     page.wait_for_function("() => window.__testSockets?.some(s => s.readyState === 1)")
                     _open_project(page)
                     panel = page.locator(f"#panel-pchat-{PROJECT}")
-                    # The room's status word sits in the panel bar (host), right after its title.
-                    page.wait_for_function("([id, text]) => document.getElementById(id)?.innerText.includes(text)",
-                                           arg=["project-panel", WAIT], timeout=30_000)
+                    # The room's status word sits in the panel bar (host), right after its title: the room waits,
+                    # and the hold's own label is said beside it on the work's row and card, never in the bar.
+                    page.wait_for_function("(text) => document.querySelector('#project-panel .project-panel-bar "
+                                           ".rw-trigger .status-badge')?.textContent.trim() === text",
+                                           arg="Waiting", timeout=30_000)
                     detail = page.request.get(url + f"/api/tasks/{TASK}").json()
                     census = page.request.get(url + "/api/state").json()["active_chat_activities"]
                     row = next(a for a in census if a["activity_id"] == TASK)

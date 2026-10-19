@@ -744,6 +744,7 @@ def _handle_review_skill(
     author_disposition: str = "",
     author_rationale: str = "",
     review_reference: Optional[Dict[str, Any]] = None,
+    reviewers: Optional[List[str]] = None, reason: str = "",
     _resolved_binding: ResolvedResourceBinding | None = None,
     **_kwargs: Any,
 ) -> str:
@@ -807,7 +808,7 @@ def _handle_review_skill(
     payload = run_skill_review_lifecycle_blocking(
         ctx,
         skill_name,
-        source="tool",
+        source="tool", reviewers=reviewers, reason=reason,
         review_impl=_review_with_optional_rebuttal,
         _resolved_binding=binding,
     )
@@ -1314,6 +1315,8 @@ _REVIEW_SCHEMA = {
                 "type": "string",
                 "description": "Skill name (directory name in OUROBOROS_SKILLS_REPO_PATH).",
             },
+            "reviewers": {"type": "array", "items": {"type": "string"}, "description": "Enabled row ids/handles; omitted means the whole pool. Blocking widens to all ticked reviewers; Advisory requires at least one ticked reviewer and a reason when narrowed. Unticked advisers are heard, not counted. Cyber Pro composes freely."},
+            "reason": {"type": "string", "description": "Why these reviewers; required for a narrowed Advisory panel, including a re-review after blockers."},
             "review_rebuttal": {
                 "type": "string",
                 "description": (

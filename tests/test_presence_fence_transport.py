@@ -8,8 +8,9 @@ RUNNING worker attempt. The final seal then treated that refusal as owner mail a
 
 Real seams, both directions: ``make_agent``, the agent's fence request, the handler the supervisor
 dispatch table maps ``acceptance_fence`` to (with its ack file), ``transition_acceptance_fence`` under
-the real queue lock, the loop's final seal and whole turns through ``run_presence_turn``. Only model
-and reviewer transports are scripted (``tests.test_presence_continuation_bootstrap``).
+the real queue lock, the loop's final seal (it runs at an author stop) and whole turns through
+``run_presence_turn``. Only model and reviewer transports are scripted
+(``tests.test_presence_continuation_bootstrap``).
 """
 from __future__ import annotations
 
@@ -115,14 +116,13 @@ def _seal_args(root: Path, agent, *, kind: str = "pooled"):
                                                       "_execution_owner": {"kind": kind}},
         _task_acceptance_fence_token=None, _task_acceptance_sealed_fence_token=None,
         _task_acceptance_fence_generation=None, _task_acceptance_queue_descendants=[],
-        _task_acceptance_reviewed=True, _task_acceptance_fence_generation_mismatch=False, _owner_directives=[],
+        _task_acceptance_fence_generation_mismatch=False, _owner_directives=[],
         owner_message_admission_lock=agent._owner_message_admission_lock, owner_message_admission_agent=agent,
         begin_acceptance_fence=agent._begin_acceptance_fence,
         inspect_acceptance_fence=agent._inspect_acceptance_fence,
         end_acceptance_fence=agent._end_acceptance_fence,
     )
-    trace = {"review_decision": {"eligibility": "eligible"}, "review_runs": [],
-             "acceptance_decision": {"status": "accepted", "reason": "clean_pass", "source": "task_acceptance_review"}}
+    trace = {"review_decision": {}, "review_runs": []}
     return SimpleNamespace(_ctx=ctx), SimpleNamespace(task_id=TASK), trace
 
 
@@ -198,16 +198,18 @@ def test_another_data_root_in_the_server_process_travels_the_bus(supervisor, mon
 # --- whole Presence turns -----------------------------------------------------------------------------
 
 
-def _run_presence_turn(root: Path, monkeypatch, *, event_queue=None, supervisor=None, number=77, in_worker=False):
-    """One whole turn through run_presence_turn with the production agent constructor, the real loop,
-    Required/blocking acceptance review (the reviewer transport answers PASS at once), presence_finish
-    and the final delivery seal. Model script: nominate the answer, then select it on every later round."""
+def _run_presence_turn(root: Path, monkeypatch, *, event_queue=None, supervisor=None, number=77, in_worker=False,
+                       stop=False):
+    """One whole turn through run_presence_turn with the production agent constructor and the real loop
+    under Required/blocking result review. A message finish delivers without opening the seal (Presence
+    speech is never held, and the seal runs only at an author stop); ``stop`` ends the turn with an author
+    stop, which seals once right before it is delivered."""
     from ouroboros.presence_runner import presence_turn_task_id, run_presence_turn
     from ouroboros.task_results import load_task_result
-    from tests.test_presence_continuation_bootstrap import (
-        ANSWER, admission, event, finish, install_bootstrap_harness, nominate)
+    from tests.test_presence_continuation_bootstrap import ANSWER, admission, event, finish, install_bootstrap_harness
 
     h = install_bootstrap_harness(monkeypatch, root)
+    h.addressed = ""  # nobody writes to the author during the turn
     h.release.set()
     if in_worker:  # a proactive turn started from background work runs on that worker's thread
         monkeypatch.setenv("OUROBOROS_IN_WORKER", "1")
@@ -215,10 +217,9 @@ def _run_presence_turn(root: Path, monkeypatch, *, event_queue=None, supervisor=
     task_id = presence_turn_task_id(admission().binding_id, turn_event.source_event_id)
 
     def script(_messages):
-        if h.calls == 1:
-            return nominate(ANSWER)
-        candidate = h.agents[0].tools._ctx._delivery_candidate
-        return finish(f"select-{h.calls}", answer_sha256=candidate.content_sha256)
+        if stop:
+            return finish(f"stop-{h.calls}", action="stop", outcome="silent", rationale="The room needs nothing from me now.")
+        return finish(f"answer-{h.calls}", message=ANSWER)
 
     h.script = script
     outcome: dict = {}
@@ -242,7 +243,8 @@ def _run_presence_turn(root: Path, monkeypatch, *, event_queue=None, supervisor=
         "model_calls": h.calls,
         "paid_reviews": len(h.reviews),
         "not_accepted_notes": sum(str(m.get("content") or "").count(MARKER) for m in (h.inputs[-1] if h.inputs else [])),
-        "delivered": result is not None and result.outcome == "message" and result.text == ANSWER,
+        "delivered": result is not None and (result.outcome == "silent" if stop else (
+            result.outcome == "message" and result.text == ANSWER)),
         "error": repr(outcome.get("error")) if "error" in outcome else None,
         "row_status": row.get("status"), "row_reason_code": row.get("reason_code"),
         "supervisor_ack_unavailable": _ack_unavailable(h.data),
@@ -256,20 +258,17 @@ def _run_presence_turn(root: Path, monkeypatch, *, event_queue=None, supervisor=
     return diagnosis
 
 
-def test_a_reviewed_presence_host_turn_delivers_and_releases_its_row(supervisor, monkeypatch):
-    """The Host's configuration: run_presence_turn(event_queue=<supervisor bus>)."""
+def test_a_presence_host_message_turn_delivers_once_and_never_opens_the_fence(supervisor, monkeypatch):
+    """The Host's configuration: run_presence_turn(event_queue=<supervisor bus>). A message finish is no
+    author stop, so no seal begins; the turn delivers in one call and leaves no fence row (the stop's own
+    seal is the next test)."""
     diagnosis = _run_presence_turn(supervisor.root, monkeypatch, event_queue=supervisor.bus.queue,
                                    supervisor=supervisor)
     assert diagnosis["delivered"] and diagnosis["row_status"] == "completed", diagnosis
     assert diagnosis["row_reason_code"] == "final_message", diagnosis
-    assert diagnosis["supervisor_ack_unavailable"] == [], diagnosis
-    # The no-fence shape is 2 or 3 calls (the panel may still be pending at the first finish, whose
-    # early feedback releases and re-seals); the loop this replaces was 11+ calls and 17 refusals.
-    assert diagnosis["model_calls"] <= 3 and diagnosis["paid_reviews"] == 1, diagnosis
-    assert diagnosis["bus_fence_events"] == [] and diagnosis["queue_answers"][-1] == ("end", "sealed"), diagnosis
-    assert supervisor.queue.ACCEPTANCE_FENCES == {}, "the turn's end releases its own row (no task_done)"
-    snapshot = json.loads((supervisor.root / "state" / "queue_snapshot.json").read_text(encoding="utf-8"))
-    assert snapshot.get("acceptance_fences") == [], snapshot.get("acceptance_fences")
+    assert diagnosis["supervisor_ack_unavailable"] == [] and diagnosis["model_calls"] == 1, diagnosis
+    assert diagnosis["bus_fence_events"] == [] and diagnosis["queue_answers"] == [], diagnosis
+    assert supervisor.queue.ACCEPTANCE_FENCES == {}
 
 
 def test_a_presence_author_stop_seals_in_process_once_and_leaves_no_row(supervisor, monkeypatch):
@@ -384,7 +383,6 @@ def test_a_refusal_that_is_not_owner_mail_delivers_disclosed(tmp_path, monkeypat
     assert _seal_admission_before_delivery(tools, limit_ctx, trace) is True
     assert controls == []
     assert trace["review_decision"]["admission_released"] is False
-    assert trace["acceptance_decision"]["reason"] == "admission_close_unconfirmed"
     assert _ack_unavailable(tmp_path) == [("begin", "refused", cause)]  # the typed cause is the durable record
 
 
@@ -402,13 +400,13 @@ def test_a_superseded_pooled_attempt_never_publishes(tmp_path, monkeypatch):
 
 
 def test_a_worker_hosted_presence_turn_delivers_with_admission_unconfirmed(supervisor, monkeypatch):
-    """A proactive Presence turn started from background work runs inside that worker: it proves no
-    RUNNING attempt, so the queue refuses ``stale_attempt``. It was never a pooled attempt, so nothing
-    superseded it: the whole turn delivers once with admission unconfirmed instead of looping."""
+    """A proactive Presence turn started from background work runs inside that worker: its author stop's
+    seal proves no RUNNING attempt, so the queue refuses ``stale_attempt``. It was never a pooled attempt,
+    so nothing superseded it: the whole turn delivers once with admission unconfirmed instead of looping."""
     diagnosis = _run_presence_turn(supervisor.root, monkeypatch, event_queue=supervisor.bus.queue,
-                                   supervisor=supervisor, number=78, in_worker=True)
+                                   supervisor=supervisor, number=78, in_worker=True, stop=True)
     assert diagnosis["error"] is None and diagnosis["delivered"], diagnosis
-    assert diagnosis["model_calls"] <= 3, diagnosis  # the Host turn's shape; the loop was 11+ calls
+    assert diagnosis["model_calls"] == 1, diagnosis  # the loop was 11+ calls
     assert ("begin", "refused", "stale_attempt") in diagnosis["supervisor_ack_unavailable"], diagnosis
     assert diagnosis["bus_fence_events"] and all(pooled for _a, pooled in diagnosis["bus_fence_events"]), diagnosis
     assert supervisor.queue.ACCEPTANCE_FENCES == {}
@@ -426,4 +424,3 @@ def test_owner_mail_still_revises_after_a_refusal(tmp_path, monkeypatch):
     monkeypatch.setattr(loop, "_arm_delivery_control", lambda *_a, **kw: controls.append(kw["control"]))
     assert _seal_admission_before_delivery(tools, limit_ctx, trace) is False
     assert controls == ["owner_revision_required"]
-    assert trace["acceptance_decision"]["reason"] == "owner_followup"

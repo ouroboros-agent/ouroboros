@@ -292,7 +292,7 @@ def test_cancel_receipt_rides_verbatim_live_durable_and_on_replay(
     monkeypatch.setattr(message_bus, "publish_event", lambda *_a, **_k: None)
 
     verbatim = (
-        "⚠️ Task t-1 was cancelled. Below is the last persisted intermediate "
+        "⚠️ Task t-1 was stopped. Below is the last persisted intermediate "
         "model message, preserved WITHOUT review.\n\n"
         "## Heading\n**bold** and `code` and an unclosed `backtick"
     )

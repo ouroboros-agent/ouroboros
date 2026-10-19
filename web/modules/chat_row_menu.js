@@ -8,7 +8,7 @@
 // so selected text stays copyable.
 import { tr } from './i18n.js';
 import { bindMenu } from './ui_interactions.js';
-import { ACTION_PAUSE, pauseTaskAction, taskControlActions } from './task_control_menu.js';
+import { ACTION_PAUSE, pauseTaskAction } from './task_control_menu.js';
 import { copyTextWithToast } from './ui_helpers.js';
 import { fullText } from './text_fit.js';
 
@@ -21,9 +21,10 @@ const shown = (node) => Boolean(node?.isConnected && !node.hidden && !node.disab
 
 /**
  * `feed` is the chat's transcript, `replies` its reply controller (chat_reply.js), `cardOf(taskId)` its root card
- * record, `activityOf(record)` the census row that card's controls read. Returns `{ open, destroy }`.
+ * record, `actionsOf(record)` the items that card's own Stop… menu offers now (its work's controls),
+ * `afterAction()` the re-read once an action settled. Returns `{ open, destroy }`.
  */
-export function createChatRowMenu({ feed, replies, cardOf, activityOf }) {
+export function createChatRowMenu({ feed, replies, cardOf, actionsOf, afterAction = () => {} }) {
     const doc = feed.ownerDocument;
     let current = null;  // { menu, binding, row }
     let press = null;  // a touch that may become (or became) a long press
@@ -59,10 +60,9 @@ export function createChatRowMenu({ feed, replies, cardOf, activityOf }) {
         if (shown(record.resumeRunBtn)) items.push(['resume', tr('task.control.resume', 'Resume'), () => record.resumeRunBtn.click(), true]);
         if (shown(record.cancelRunBtn)) {
             // The card's own Stop… offers Pause on the same facts; its menu re-checks before any effect.
-            const activity = activityOf(record);
-            if (taskControlActions({ cancelPending: Boolean(record.cancelPendingPolicy),
-                budgetPaused: activity?.phase === 'budget_paused' }).includes(ACTION_PAUSE)) {
-                items.push(['pause', tr('task.control.pause', 'Pause'), () => pauseTaskAction(record.groupId), true]);
+            if (actionsOf(record).includes(ACTION_PAUSE)) {
+                items.push(['pause', tr('task.control.pause', 'Pause'),
+                    () => pauseTaskAction(record.groupId).finally(afterAction), true]);
             }
             items.push(['stop', record.cancelRunBtn.textContent, () => record.cancelRunBtn.click()]);
         }

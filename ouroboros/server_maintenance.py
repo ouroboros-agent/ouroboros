@@ -1,5 +1,5 @@
 """Generation startup and periodic upkeep: custody, delegated runs, cancel latches,
-owed deliveries, orphaned results and post-task synthesis. History-sized work runs
+owed deliveries, orphaned results, held Continues and post-task synthesis. History-sized work runs
 off-loop; delegated-snapshot GC fails closed on an unreadable log."""
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ _PAUSE_NOTICE_SWEEP_LOCK = threading.Lock()
 _USAGE_SWEEP_LOCK = threading.Lock()
 _SYNTHESIS_SWEEP_LOCK = threading.Lock()
 _OWNER_PAUSE_SWEEP_LOCK = threading.Lock()
+_CONTINUATION_SWEEP_LOCK = threading.Lock()
 _COLD_CUSTODY_SWEEP_LOCK = threading.Lock()
 _LAST_COLD_CUSTODY_SWEEP = [0.0]
 _CUSTODY_SWEEP_LOCK = threading.Lock()
@@ -166,6 +167,11 @@ def _run_terminal_duty(drive_root: pathlib.Path, step: str, latch: Any,
         elif step == "owner_pause_settlement":
             from supervisor.owner_pause_control import settle_requested_owner_pauses
             settle_requested_owner_pauses(stop_requested=lambda: _stop_requested(stop_event))
+        elif step == "held_continuation_recheck":
+            from supervisor.continuation_admission import recheck_held_continuations
+            released = recheck_held_continuations(stop_requested=lambda: _stop_requested(stop_event))
+            if released:
+                log.info("Held Continue re-check released: %s", released)
         elif step == "post_task_synthesis_recovery":
             from ouroboros.agent_task_pipeline import recover_pending_root_post_task_synthesis
             from ouroboros.config import REPO_DIR
@@ -303,7 +309,8 @@ def _periodic_supervisor_maintenance(
 ) -> None:
     """Throttled upkeep on the supervisor tick, nothing history-sized inline (INV-24).
     Each tick starts the schedule duty when its previous pass ended;
-    the 20 s cadence independently starts cancel, delivery, question, notice, usage and synthesis duties; every 600 s
+    the 20 s cadence independently starts cancel, delivery, question, notice, usage and synthesis duties,
+    plus the held-Continue re-check while a pending Continue waits under its writer hold; every 600 s
     the custody block (reaping, delegated runs, then the working copies' retirers); every 300 s the reconcile
     block (zombie heal, the age-only retirers, drive settlement, then the maintenance dispatcher). The first
     two stamp here before handing off; the reconcile pass stamps when it ENDS (issue #1230). A due cadence
@@ -314,10 +321,16 @@ def _periodic_supervisor_maintenance(
     if _stop_requested(stop_event):
         return
     now = time.time()
+    from supervisor import queue
     if now - _LAST_CANCEL_INTENT_SWEEP[0] > BODY_MAINTENANCE_INTERVAL_SEC:
         # One existing cadence, independent single-flight operations: its stamp
         # advances on dispatch, never on a slow duty's completion.
         _LAST_CANCEL_INTENT_SWEEP[0] = now
+        from supervisor.continuation_admission import held_continuation_predecessors
+        # A writer hold installs no root fence: the held row itself is the cheap
+        # scheduling hint, and the off-loop pass re-reads the queue under its lock.
+        held = (("held_continuation_recheck", _CONTINUATION_SWEEP_LOCK),) if held_continuation_predecessors(
+            queue.PENDING) else ()
         for step, latch in (
             ("cancel_intent_sweep", _CANCEL_INTENT_SWEEP_LOCK),
             ("terminal_delivery_replay", _DELIVERY_SWEEP_LOCK),
@@ -325,13 +338,13 @@ def _periodic_supervisor_maintenance(
             ("pause_notice_replay", _PAUSE_NOTICE_SWEEP_LOCK),
             ("abandoned_usage_reconciliation", _USAGE_SWEEP_LOCK),
             ("post_task_synthesis_recovery", _SYNTHESIS_SWEEP_LOCK),
+            *held,
         ):
             if latch.acquire(blocking=False):
                 _start_maintenance_thread(latch, step, _run_terminal_duty,
                                           (pathlib.Path(DATA_DIR), step, latch, stop_event))
             else:
                 _duty_busy(latch, BODY_MAINTENANCE_INTERVAL_SEC)
-    from supervisor import queue
     # The host accepts a saved cold request while its actor is still RUNNING;
     # waiting for the park event would make release and acceptance wait on each other.
     from supervisor.active_activity import get_direct_activity_registry
@@ -1076,9 +1089,10 @@ def _run_periodic_reconcile_sweep(marker: list, stop_event: Any = None, latch: A
         if _stop_requested(stop_event):
             return
         from ouroboros.late_review_marks import replay_owed_late_reviews
-        from ouroboros.review_operation import collect_orphaned_operations_softly
+        from ouroboros.review_operation import retire_dead_review_pointers_softly
 
-        collect_orphaned_operations_softly(DATA_DIR, stop=lambda: _stop_requested(stop_event))
+        # This process's closed operations retry a failed final pointer; a dead controller's open one goes.
+        retire_dead_review_pointers_softly(DATA_DIR, stop=lambda: _stop_requested(stop_event))
         replay_owed_late_reviews(DATA_DIR, stop=lambda: _stop_requested(stop_event))  # owed rows only
         if _stop_requested(stop_event):
             return

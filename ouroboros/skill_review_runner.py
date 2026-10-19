@@ -96,7 +96,7 @@ _UI_REVIEW_FIELDS = (
     "content_hash", "job_id", "group_id", "review_round", "snapshot_attempt",
     "snapshot_revised", "task_id", "root_task_id", "origin_task_id",
     "origin_root_task_id", "presentation_owner_task_id", "chat_id", "source",
-    "terminal_reason", "started_at", "finished_at", "executions",
+    "terminal_reason", "started_at", "finished_at", "executions", "panel",
 )
 
 
@@ -320,6 +320,7 @@ def _terminal_history_payload(
         "failure_signature": skill_review_history.finding_signature(findings),
         "fail_findings": skill_review_history.extract_fail_findings(findings),
         "job_id": str(job_data.get("job_id") or ""),
+        "panel": dict(getattr(result, "panel", None) or job_data.get("panel") or {}),
     }
     for key in (
         "group_id", "review_round", "snapshot_attempt", "snapshot_revised",
@@ -703,9 +704,11 @@ def _call_review_with_lifecycle_guard(
     skill_name: str,
     drive_root: pathlib.Path | None = None,
     binding: ResolvedResourceBinding | None = None,
+    panel: Any = None,
 ) -> SkillReviewOutcome:
     sentinel = object()
     previous = {
+        "_skill_review_panel": getattr(ctx, "_skill_review_panel", sentinel),
         "_skill_review_lifecycle_guard": getattr(ctx, "_skill_review_lifecycle_guard", sentinel),
         "_skill_review_lifecycle_job_id": getattr(ctx, "_skill_review_lifecycle_job_id", sentinel),
         "_skill_review_content_hash": getattr(ctx, "_skill_review_content_hash", sentinel),
@@ -719,6 +722,7 @@ def _call_review_with_lifecycle_guard(
     }
     state_root = pathlib.Path(drive_root or ctx.drive_root)
     job_data = _read_review_job(review_job_state_path(state_root, skill_name))
+    setattr(ctx, "_skill_review_panel", dict(panel.facts) if panel is not None else {})
     setattr(ctx, "_skill_review_lifecycle_guard", True)
     setattr(ctx, "_skill_review_lifecycle_job_id", str(job_data.get("job_id") or ""))
     setattr(ctx, "_skill_review_content_hash", str(job_data.get("content_hash") or ""))
@@ -921,7 +925,7 @@ def _outcome_payload(
         "content_hash": outcome.content_hash,
         "reviewer_models": outcome.reviewer_models,
         "review_profile": str(getattr(outcome, "review_profile", "") or ""),
-        "findings": outcome.findings,
+        "findings": outcome.findings, "panel": dict(outcome.panel),
         "raw_actor_records": list(getattr(outcome, "raw_actor_records", []) or []),
         "advisory_result": dict(getattr(outcome, "advisory_result", {}) or {}),
         "error": outcome.error,
@@ -1123,6 +1127,7 @@ def _on_finished(
                 "finished_at": job.finished_at or now,
                 "duration_sec": duration,
                 "pid": os.getpid(),
+                "panel": dict(getattr(result, "panel", {}) or {}),
                 "review_status": review_status,
                 "error": error,
                 "deps_error": deps_error,
@@ -1317,6 +1322,7 @@ def run_skill_review_lifecycle_blocking(
     repo_path: str | None = None,
     _resolved_binding: ResolvedResourceBinding | None = None,
     owner_attestation: bool = False,
+    reviewers: Optional[list[str]] = None, reason: str = "", _panel: Any = None,
 ) -> Dict[str, Any]:
     binding = _resolved_binding
     if binding is None and repo_path is None:
@@ -1366,23 +1372,40 @@ def run_skill_review_lifecycle_blocking(
             deps_status="not_run", deps_error="",
             extension_action=None, extension_reason=None,
         )
-    content_hash = _skill_content_hash(
-        drive_root, skill_name, repo_path, binding,
-    )
+    from ouroboros.reviewer_slot_config import ComposedPanel, PanelCompositionError, compose_review_panel, composed_review_pool
+    content_hash = _skill_content_hash(drive_root, skill_name, repo_path, binding)
+    try:
+        panel = None if owner_attestation else _panel or compose_review_panel(reviewers or (), reason, surface="skill",
+                                                chosen_by="ouroboros" if source == "tool" else "owner")
+    except PanelCompositionError as exc:
+        previous = skill_review_history.load_history(drive_root, skill_name, limit=1)
+        prior = _read_review_job(review_job_state_path(drive_root, skill_name))
+        candidates = [prior, *previous]
+        if not any(row.get("content_hash") == content_hash and row.get("status") in {"running", "pending", "timeout", "failed", "interrupted"}
+                   and (row.get("review_wave") or (row.get("status") == "running" and row.get("panel"))) for row in candidates):
+            return _outcome_payload(SkillReviewOutcome(skill_name=skill_name, status=STATUS_PENDING,
+                error=str(exc), dispatch_refusal_code="TOOL_ARG_ERROR"), deps_status="not_run", deps_error="",
+                extension_action=None, extension_reason=None)
+        # Current tick edits cannot revoke collection. The existing resume selector still
+        # verifies every material/lifecycle axis; without that match this error refuses a new send.
+        panel = ComposedPanel((), True, {"composition_error": str(exc)})
+    except ValueError:
+        panel = None  # the review collects its paid wave or returns its typed configuration refusal
     mark_stale_review_job_interrupted(drive_root, skill_name, current_content_hash=content_hash)
     dedupe_key = _review_dedupe_key(skill_name, content_hash) + (":owner_attestation" if owner_attestation else "")
     started_monotonic: Dict[str, float] = {}
     bound_content_hash: Dict[str, str] = {}
     owned_job: Dict[str, str] = {}
     progress = JobProgressTarget()
-    provenance = _review_provenance(ctx, source, skill_name)
+    provenance = {**_review_provenance(ctx, source, skill_name), "panel": panel.facts if panel is not None else {}}
 
     def _run_review() -> SkillReviewOutcome:
         with _review_job_heartbeat(drive_root, skill_name):
-            progress.set("Running tri-model review…")
-            outcome = _call_review_with_lifecycle_guard(
-                review_impl, ctx, skill_name, drive_root, binding,
-            )
+            progress.set("Running skill review…")
+            with composed_review_pool(panel.seats) if panel is not None else contextlib.nullcontext():
+                outcome = _call_review_with_lifecycle_guard(review_impl, ctx, skill_name, drive_root, binding, panel)
+            if not outcome.panel and panel is not None:
+                outcome.panel = dict(panel.facts)
             deps_status = "not_required"
             deps_error = ""
             reviewed = _load_binding_skill(binding) if binding is not None else find_skill(

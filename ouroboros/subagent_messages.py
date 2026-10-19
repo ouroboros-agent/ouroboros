@@ -225,8 +225,6 @@ def apply_chat_row_metadata(record, message_meta, *, direction="", task_id="", r
             revision = meta.get("card_row_revision")
             if type(revision) is int and revision >= 0:
                 record["card_row_revision"] = revision
-    if record_type == "acceptance_late_settlement" and isinstance(meta.get("late_evidence"), dict):
-        record["late_evidence"] = dict(meta["late_evidence"])
 
 
 def copy_chat_replay_metadata(record, entry):

@@ -83,6 +83,7 @@ from ouroboros.tools.shell_effects import (  # noqa: F401
 from ouroboros.tools.shell_outputs import (  # noqa: F401
     _directory_fingerprint,
     _changed_path_covers,
+    _declared_output_baseline, _declared_output_refusal,
     _directory_fingerprint_from_entries,
     _fingerprint_output,
     _protected_output_source_reason,
@@ -368,6 +369,8 @@ def _run_shell(
     if not work_dir.exists() or not work_dir.is_dir():
         return _pre_spawn_refusal(ctx, f"⚠️ SHELL_CWD_BLOCKED: cwd is not a directory: {work_dir}. "
             f"root={binding.root}, source={binding.source}.")
+    if output_refusal := _declared_output_refusal(ctx, outputs, pathlib.Path(work_dir), cwd_root=cwd_root, binding=binding):
+        return _pre_spawn_refusal(ctx, output_refusal)
     # Disclose the room-lens default once; explicit cwd is already caller-visible.
     if not str(cwd or "").strip() and not getattr(ctx, "_room_cwd_noted", False):
         try:
@@ -390,14 +393,8 @@ def _run_shell(
         if (cwd_root == "user_files" and repo_root is None and not outputs)
         else None
     )
-    before_outputs = _snapshot_declared_outputs(
-        ctx,
-        outputs,
-        pathlib.Path(work_dir),
-        cwd_root=cwd_root,
-        changed_paths=set(before_changed or []),
-        binding=binding,
-    )
+    before_outputs, baseline_problem = _declared_output_baseline(ctx, outputs, pathlib.Path(work_dir), cwd_root=cwd_root,
+                                                                 changed_paths=set(before_changed or []), binding=binding)
 
     # Scratch is confined/new/untracked, patch-excluded, and never an artifact.
     scratch_abs = _resolve_scratch_abs(scratch, work_dir)
@@ -487,6 +484,7 @@ def _run_shell(
             before_outputs=before_outputs,
             binding=binding,
         )
+        artifact_note += f"\n- output baseline unavailable before the run ({baseline_problem}): a registered output may predate it" if baseline_problem and artifact_note else ""
         audit_note = ""
         if cwd_root == "user_files" and not outputs:
             # Remove scratch effects without hiding a simultaneous real deliverable.
@@ -725,7 +723,7 @@ def get_tools() -> List[ToolEntry]:
 	                    "type": "array",
 	                    "items": {"type": "string"},
 	                    "default": [],
-	                    "description": "Generated paths copied/registered after success, e.g. outputs=['report.txt']. The managed artifact directory is created lazily; do not move files into an assumed physical store.",
+	                    "description": "Generated paths copied/registered after success, e.g. outputs=['report.txt']. The managed artifact directory is created lazily; do not move files into an assumed physical store. A declaration whose location is refused stops the call before it starts. Only outputs accept a relative '../' spelling, judged by its resolved location like an absolute one; cwd and file-tool path rules are unchanged.",
 	                },
 	                "scratch": {
 	                    "type": "array",
@@ -770,7 +768,7 @@ def get_tools() -> List[ToolEntry]:
 	                    "type": "array",
 	                    "items": {"type": "string"},
 	                    "default": [],
-	                    "description": "Generated paths copied/registered after success, e.g. outputs=['report.txt']. The managed artifact directory is created lazily; do not move files into an assumed physical store.",
+	                    "description": "Generated paths copied/registered after success, e.g. outputs=['report.txt']. The managed artifact directory is created lazily; do not move files into an assumed physical store. A declaration whose location is refused stops the call before it starts. Only outputs accept a relative '../' spelling, judged by its resolved location like an absolute one; cwd and file-tool path rules are unchanged.",
 	                },
 	                "scratch": {
 	                    "type": "array",

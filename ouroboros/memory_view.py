@@ -61,9 +61,9 @@ LIVE_ROOMS = ("none", "lines", "lines_with_words")
 MARKS = ("all", "room_and_global", "none")
 LEGACY_FILE = "memory/dialogue_blocks.json"
 # A task's typed host facts its lane-2 line names by type and address, never by text or JSON:
-# the late review the owner did not see, a failed or uncertain send, a cancel receipt (it may
-# carry an unreviewed model draft), a custody notice and a terminal incident (the old passive
-# view showed each of them).
+# the late review the owner did not see (old task-acceptance rows only; nothing writes them
+# now), a failed or uncertain send, a cancel receipt (it may carry an unreviewed model draft),
+# a custody notice and a terminal incident (the old passive view showed each of them).
 TYPED_HOST_FACTS: Mapping[str, str] = MappingProxyType({
     "acceptance_late_settlement": "late review evidence", "presence_delivery": "delivery",
     "cancel_receipt": "cancel receipt", "custody_notice": "custody notice", "terminal_incident": "terminal incident"})

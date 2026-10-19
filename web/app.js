@@ -6,16 +6,12 @@ import { loadVersion } from './modules/utils.js';
 import { bindScrollFade } from './modules/scroll_fade.js';
 import { initChat, createChatInstance as createChatRoom } from './modules/chat.js';
 import { createStateSnapshotSequencer } from './modules/chat_activity.js';
-import {
-    buildProjectActivityIndex,
-    reconcileProjectActivityCensus,
-    summarizeProjectActivities,
-} from './modules/project_activity.js';
+import { IDLE_SUMMARY, buildProjectActivityIndex, reconcileProjectRooms } from './modules/project_activity.js';
 import { initFiles } from './modules/files.js';
 import { createNotificationActivation, getNotifier } from './modules/notifications.js';
 import { showToast } from './modules/toast.js';
 import { apiClient } from './modules/api_client.js';
-import { openNewProjectDialog, openProjectRowMenu } from './modules/project_create.js';
+import { openNewProjectDialog, openProjectRowMenu, repositionProjectRowMenu } from './modules/project_create.js';
 
 import { initLogs } from './modules/logs.js';
 import { initEvolution } from './modules/evolution.js';
@@ -34,7 +30,7 @@ import { renderPageHeader } from './modules/page_header.js';
 import { isStackLayout, onLayoutChange } from './modules/layout.js';
 import { createLayerStack } from './modules/layers.js';
 import { createTelegramHost } from './modules/host_telegram.js';
-import { DRAWER_DRAG, bindDrawerDrag } from './modules/drawer_drag.js';
+import { DRAG, DRAWER_DRAG, bindDrawerDrag } from './modules/drawer_drag.js';
 
 import { fmt, markBootRead, pendingBootRead, refreshDictionary, setLanguage, storedLanguage, tr } from './modules/i18n.js';
 import { initOnboardingOverlay } from './modules/onboarding_overlay.js';
@@ -84,12 +80,14 @@ if (navProjectsHeader) navProjectsHeader.innerHTML = renderProjectsHeader();
 const navDrawerBackdrop = document.getElementById('nav-drawer-backdrop');
 const projectPanelBackdrop = document.getElementById('project-panel-backdrop');
 const projectPanel = document.getElementById('project-panel');
-// The Project panel's header is the one page header (page_header.js): ☰ · name · status … ×. A Project is
-// named by its owner, not by the sidebar, so its name stays visible in every layout (owner Q3=A).
+// The Project panel's header is the one page header (page_header.js): name · status … ×; its ☰ is the room's
+// composer row's first control (owner 19.10, 1A). A Project is named by its owner, not by the sidebar, so its name
+// stays visible in every layout (owner Q3=A).
 projectPanel?.insertAdjacentHTML('afterbegin', renderPageHeader({
     title: '',
     titleId: 'project-panel-title',
     named: false,
+    showMobileNav: false,
     variant: 'project',
     className: 'project-panel-bar project-inspector-header',
     trailingHtml: `<button id="project-panel-close" class="shell-icon-control project-panel-close" type="button" title="Close project thread" aria-label="Close project thread">${SHELL_ICONS.close}</button>`,
@@ -101,7 +99,7 @@ const navProjectsToggle = document.getElementById('nav-projects-toggle');
 const navProjectsCount = document.getElementById('nav-projects-count');
 const navProjectsActivity = document.getElementById('nav-projects-activity');
 const navProjectsList = document.getElementById('nav-projects-list');
-// Collapsed, the list keeps the live Projects and the open one; the rest wait behind this one quiet row.
+// Collapse keeps pinned, live, open and keyboard-owned Projects; other fetched rows wait here.
 const navProjectsShowAll = document.createElement('button');
 navProjectsShowAll.type = 'button';
 navProjectsShowAll.id = 'nav-projects-show-all';
@@ -116,7 +114,8 @@ const projectPaintRequests = new Map();
 const projectReveals = new Map();
 let knownProjectsJson = '';
 let lastProjectRows = [];
-let projectActivityRows = new Map();
+const pendingProjectPins = new Set();
+let projectRooms = new Map();
 let projectActivityIndex = buildProjectActivityIndex();
 let activitySocketDisconnected = false;
 let projectPanelHideTimer = null;
@@ -195,6 +194,30 @@ function updateUnreadBadge() {
     }
 }
 
+// The scrim fades with the drawer (style.css): shown at once when the drawer opens, put away once its fade has run
+// when it closes, unless the drawer opened again meanwhile. A docked window or reduced motion has no fade to wait for.
+const DRAWER_SCRIM_FADE_MS = DRAG.settleMax + 20;  // the longest settle after a drag; a tap's close is shorter
+let drawerScrimTimer = 0;
+function syncDrawerScrim(open) {
+    if (!navDrawerBackdrop) return;
+    clearTimeout(drawerScrimTimer);
+    drawerScrimTimer = 0;
+    if (open || navDrawerBackdrop.hidden) { navDrawerBackdrop.hidden = !open; return; }
+    if (!isStackLayout() || window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+        navDrawerBackdrop.hidden = true;
+        return;
+    }
+    drawerScrimTimer = setTimeout(() => {
+        drawerScrimTimer = 0;
+        if (!navState.mobileDrawerOpen && !navDrawerBackdrop.classList.contains('dragging')) navDrawerBackdrop.hidden = true;
+    }, DRAWER_SCRIM_FADE_MS);
+}
+// A finger that takes the drawer during the fade takes its scrim too (drawer_drag.js then puts it away itself).
+function releaseDrawerScrim() {
+    clearTimeout(drawerScrimTimer);
+    drawerScrimTimer = 0;
+}
+
 function syncNavigationState() {
     const activeProjectId = navState.activeProjectId;
     const drawerOpen = Boolean(navState.mobileDrawerOpen);
@@ -203,7 +226,7 @@ function syncNavigationState() {
     document.querySelectorAll('[data-mobile-nav-toggle]').forEach((button) => {
         button.setAttribute('aria-expanded', drawerOpen ? 'true' : 'false');
     });
-    if (navDrawerBackdrop) navDrawerBackdrop.hidden = !drawerOpen;
+    syncDrawerScrim(drawerOpen);
     // In the stack layout the closed drawer is off screen: inert and out of the tab order.
     if (primarySidebar) primarySidebar.inert = isStackLayout() && !drawerOpen;
     // The drawer is a modal layer (its scrim stays live); the Project panel's layer, modal only where it covers the
@@ -253,10 +276,19 @@ function syncNavigationState() {
     // After the unhide, so focus can go into the panel when it opens.
     if (activeProjectId) {
         layers.push({ id: 'project', el: projectPanel, modal: isStackLayout(), live: [projectPanelBackdrop].filter(Boolean),
-            onClose: () => closeProjectPanel() });
+            onClose: () => closeProjectPanel(), focus: focusProjectRoom });
     } else layers.remove('project');
     // Last: the open Project's row is marked, and a closed Project's focus is back on its row, which then stays.
     syncProjectsCollapse();
+}
+
+// Keys scroll what is being read: an opened Project gives the focus to its room's feed (focusable, out of the tab
+// order), so End, PageDown and the arrows move the messages, and a press on their text keeps the focus there. With
+// the panel itself focused they moved nothing (#1998). The panel takes it only before its room has mounted.
+function focusProjectRoom() {
+    const feed = projectInstances.get(navState.activeProjectId)?.page?.querySelector('.chat-messages') || projectPanel;
+    if (!feed.hasAttribute('tabindex')) feed.tabIndex = -1;
+    try { feed.focus({ preventScroll: true }); } catch { /* detached */ }
 }
 
 // Crossing the switch: a drawer has no place in the docked layout; the Project layer changes its modality.
@@ -281,6 +313,7 @@ const disposeDrawerDrag = DRAWER_DRAG ? bindDrawerDrag({
     sidebar: primarySidebar, scrim: navDrawerBackdrop,
     isOpen: () => navState.mobileDrawerOpen, setOpen: (open) => setMobileDrawerOpen(open),
     isStack: () => isStackLayout(), isCoarse: () => window.matchMedia('(pointer: coarse)').matches,
+    onGrab: releaseDrawerScrim, onLayout: (sync) => onLayoutChange(() => sync()),
 }) : () => {};
 const navDrawerClose = document.getElementById('nav-drawer-close');
 if (navDrawerClose) {
@@ -296,11 +329,11 @@ const stateSnapshots = createStateSnapshotSequencer((data, requestedAt, generati
     data = data && typeof data === 'object' ? data : {};
     lastStateSnapshot = data;
     // A complete REST body cannot prove absence while the socket is in a
-    // disconnect episode. Keep the previous rows and render them unknown until
+    // disconnect episode. Keep the previous rooms and render them unknown until
     // a post-reconnect snapshot is sequenced.
-    const activity = reconcileProjectActivityCensus(projectActivityRows, activitySocketDisconnected ? {} : data);
-    projectActivityRows = activity.rows;
-    projectActivityIndex = buildProjectActivityIndex([...projectActivityRows.values()]);
+    projectRooms = reconcileProjectRooms(projectRooms, activitySocketDisconnected ? {} : data).rooms;
+    projectActivityIndex = buildProjectActivityIndex(projectRooms, data.project_chat_ids
+        ?? (data.projects || lastProjectRows).map((project) => project?.chat_id));
     renderProjectsNav(data.projects || lastProjectRows,
         data.project_chat_ids ?? (data.projects ? undefined : Array.from(state.projectChatIds)), projectActivityIndex);
     applyTaskBindings(data.task_bindings || {});
@@ -653,8 +686,8 @@ navProjectsShowAll.addEventListener('click', () => {
     syncNavigationState();
 });
 
-// Collapsed Projects keep what is alive (a Project whose dots show work running or waiting) and the open one; the
-// rest wait behind "Show all N" (docs/DESIGN.md "Shell"). Expanded, every row shows.
+// Collapsed Projects keep the pinned ones, what is alive (a Project whose dots show work running or waiting) and the
+// open one; the rest wait behind "Show all N" (docs/DESIGN.md "Shell"). Expanded, every row shows.
 function syncProjectsCollapse() {
     if (!navProjectsList) return;
     const collapsed = !navState.projectsExpanded;
@@ -662,15 +695,21 @@ function syncProjectsCollapse() {
     navProjects?.toggleAttribute('data-collapsed', collapsed);
     let total = 0;
     let shown = 0;
+    let pinsShown = false;
+    let afterPins = null;
     for (const item of navProjectsList.children) {
         if (!item.classList.contains('nav-project-item')) continue;
         total += 1;
         // A row under the keyboard or with its menu open stays until focus leaves it (the list's focusout below).
-        const keep = !collapsed || item.hasAttribute('data-live') || Boolean(item.querySelector('.nav-project-row.active'))
+        const keep = !collapsed || item.hasAttribute('data-pinned') || item.hasAttribute('data-live') || Boolean(item.querySelector('.nav-project-row.active'))
             || item.contains(document.activeElement) || Boolean(item.querySelector('[aria-expanded="true"]'));
         item.hidden = !keep;
         if (keep) shown += 1;
+        // Pins lead the list; air before the first shown row after them is the group's one boundary, no caption.
+        if (keep && item.hasAttribute('data-pinned')) pinsShown = true;
+        else if (keep && pinsShown) afterPins ||= item;
     }
+    for (const item of navProjectsList.children) item.toggleAttribute('data-after-pins', item === afterPins);
     navProjectsList.hidden = collapsed && shown === 0;
     navProjectsShowAll.hidden = !collapsed || shown === total;
     navProjectsShowAll.textContent = fmt('Show all {n}', { n: total });
@@ -679,6 +718,8 @@ function syncProjectsCollapse() {
     if (focused === navProjectsShowAll && navProjectsShowAll.hidden) {
         navProjectsList.querySelector('.nav-project-item:not([hidden]) [data-project-id]')?.focus({ preventScroll: true });
     }
+    // An open row menu follows its anchor once collapsed-row visibility has settled.
+    repositionProjectRowMenu();
 }
 // Focus leaving the Projects lets a row that stayed only for the keyboard go behind "Show all".
 navProjects?.addEventListener('focusout', (event) => {
@@ -711,6 +752,7 @@ function renderProjectsNav(projects, projectChatIds, activityIndex = projectActi
             _unread: String(p.lifecycle || 'active') === 'active' && isUnread(p),
         }))
         .sort((a, b) => {
+            if ((a.pinned === true) !== (b.pinned === true)) return a.pinned === true ? -1 : 1;
             if (a._unread !== b._unread) return a._unread ? -1 : 1;  // unread to the top
             return recency(b).localeCompare(recency(a));
         });
@@ -719,7 +761,7 @@ function renderProjectsNav(projects, projectChatIds, activityIndex = projectActi
     }
     if (rows.some(p => p._unread)) refreshSharedProjectSeen();
     const json = JSON.stringify(rows.map(p => [
-        p.id, p.name, p.chat_id, p.lifecycle, p.visible_revision, p._unread, p.delete_error,
+        p.id, p.name, p.chat_id, p.lifecycle, p.visible_revision, p._unread, p.delete_error, p.pinned === true,
     ]));
     // Activity is a projection over the existing census and must not rebuild
     // the keyed menu: replacing rows here would steal focus from an open menu,
@@ -745,8 +787,8 @@ function renderProjectsNav(projects, projectChatIds, activityIndex = projectActi
 // ended. Retain its row for the next complete census, but stop motion and make
 // the marker explicitly unknown rather than quietly showing stale liveness.
 function markProjectActivityUnknown() {
-    projectActivityRows = reconcileProjectActivityCensus(projectActivityRows).rows;
-    projectActivityIndex = buildProjectActivityIndex([...projectActivityRows.values()]);
+    projectRooms = reconcileProjectRooms(projectRooms).rooms;
+    projectActivityIndex = buildProjectActivityIndex(projectRooms, [...state.projectChatIds]);
     patchProjectActivityMarkers(projectActivityIndex);
 }
 
@@ -757,7 +799,8 @@ function setActivityMarker(marker, summary) {
     marker.hidden = !active;
     marker.dataset.state = active ? String(summary.state || 'unknown') : 'idle';
     marker.dataset.motion = summary.motion ? '1' : '0';
-    marker.dataset.waiting = summary.waiting ? '1' : '0';
+    // Amber: something in the room waits for the owner (the server's room.amber); a pause is not amber.
+    marker.dataset.amber = summary.amber ? '1' : '0';
     marker.title = active ? label : '';
     marker.setAttribute('aria-hidden', 'true');
     // A Project row whose dots show is live: a collapsed list keeps it.
@@ -783,9 +826,10 @@ function patchProjectActivityMarkers(activityIndex = projectActivityIndex) {
     );
     for (const row of lastProjectRows) {
         const button = buttons.get(String(row.id));
-        const summary = activityIndex.byProject.get(String(row.id)) || summarizeProjectActivities();
+        const summary = activityIndex.byChat.get(String(row.chat_id)) || IDLE_SUMMARY;
         setActivityMarker(button?.querySelector('.nav-activity-marker'), summary);
-        const name = row.name || row.id;
+        // The pin is said in the row's full name (its tooltip and accessible name), never drawn in the row.
+        const name = `${row.name || row.id}${row.pinned === true ? ' · Pinned' : ''}`;
         const baseName = String(row.lifecycle || 'active') === 'deleting'
             ? `${name} — Deleting…${row.delete_error ? ` ${row.delete_error}` : ''}`
             : row._unread ? `${name} · Unread` : name;
@@ -846,10 +890,11 @@ function refreshSharedProjectSeen() {
         .finally(() => { sharedSeenRead = null; });
 }
 
-// Paint the collapsible, scrollable projects list from the cached rows.
+// Keep keyed controls (and menu anchors) when pinning reorders the list.
 function paintProjectsNav() {
     const rows = lastProjectRows;
-    navProjectsList.textContent = '';
+    const keyed = new Map([...navProjectsList.children].map(item => [item.dataset.navProjectId, item]));
+    const focused = document.activeElement;
     navProjects.hidden = false;
     const unreadCount = rows.filter((project) => project._unread).length;
     if (navProjectsCount) {
@@ -858,75 +903,119 @@ function paintProjectsNav() {
         if (unreadCount) navProjectsCount.setAttribute('aria-label', navProjectsCount.title);
         else navProjectsCount.removeAttribute('aria-label');
     }
-    for (const project of rows) {
+    for (const [index, project] of rows.entries()) {
         const deleting = String(project.lifecycle || 'active') === 'deleting';
-        const item = document.createElement('div');
-        item.className = `nav-project-item${deleting ? ' is-deleting' : ''}`;
-        const btn = document.createElement('button');
-        btn.className = 'nav-row nav-project-row';
-        btn.type = 'button';
-        btn.dataset.projectId = project.id;
-        btn.title = deleting
-            ? `${project.name || project.id} — Deleting…${project.delete_error ? ` ${project.delete_error}` : ''}`
-            : (project.name || project.id);
+        let item = keyed.get(project.id);
+        keyed.delete(project.id);
+        if (item && item.classList.contains('is-deleting') !== deleting) { item.remove(); item = null; }
+        if (!item) {
+            item = document.createElement('div');
+            item.dataset.navProjectId = project.id;
+            item.className = `nav-project-item${deleting ? ' is-deleting' : ''}`;
+            const btn = document.createElement('button');
+            btn.className = 'nav-row nav-project-row';
+            btn.type = 'button';
+            btn.dataset.projectId = project.id;
+            const label = document.createElement('span');
+            label.className = 'nav-row-label';
+            const marker = document.createElement('span');
+            marker.className = 'nav-activity-marker chat-live-typing';
+            for (let i = 0; i < 3; i += 1) marker.appendChild(document.createElement('span'));
+            btn.append(label, marker);
+            item.appendChild(btn);
+            if (deleting) {
+                const status = document.createElement('span');
+                status.className = 'nav-project-deleting-status';
+                status.textContent = 'Deleting…';
+                item.appendChild(status);
+            } else {
+                // Pressing a row opens its Project; pressing the open one again keeps it open (like every reference).
+                btn.addEventListener('click', () => openProjectPanel(item.project, { openOnly: true }));
+                // The action control is a sibling button, never nested interactive UI.
+                const kebab = document.createElement('button');
+                kebab.type = 'button';
+                kebab.className = 'nav-project-kebab';
+                kebab.innerHTML = SHELL_ICONS.more;  // the shell's one ⋯ (page_icons.js)
+                kebab.title = tr('project.kebab_title', 'Project actions');
+                kebab.addEventListener('click', (event) => {
+                    event.stopPropagation();
+                    openProjectRowMenu(item.project, {
+                        apiClient, anchorEl: kebab,
+                        isPinPending: () => pendingProjectPins.has(item.project.id),
+                        onPin: (pinned) => setProjectPin(item.project, pinned),
+                        onChanged: (change = {}) => {
+                            if (change.optimistic && change.projectId) {
+                                const row = lastProjectRows.find(p => p.id === change.projectId);
+                                if (row) { row.lifecycle = 'deleting'; row._unread = false; }
+                                if (navState.activeProjectId === change.projectId) closeProjectPanel();
+                                paintProjectsNav();
+                            } else refreshProjectsNav();
+                            knownProjectsJson = '';
+                        },
+                    });
+                });
+                item.appendChild(kebab);
+            }
+        }
+        item.project = project;
+        item.toggleAttribute('data-pinned', project.pinned === true);
+        const btn = item.querySelector('.nav-project-row');
         btn.disabled = deleting;
-        const label = document.createElement('span');
-        label.className = 'nav-row-label';
-        label.textContent = project.name || project.id;
-        btn.appendChild(label);
-        const activityMarker = document.createElement('span');
-        activityMarker.className = 'nav-activity-marker chat-live-typing';
-        for (let i = 0; i < 3; i += 1) activityMarker.appendChild(document.createElement('span'));
-        btn.appendChild(activityMarker);
-        if (project._unread && !deleting) {
+        btn.querySelector('.nav-row-label').textContent = project.name || project.id;
+        btn.classList.toggle('active', project.id === navState.activeProjectId);
+        btn.classList.toggle('has-unread', project._unread && !deleting);
+        const unread = btn.querySelector('.nav-unread-dot');
+        if (project._unread && !deleting && !unread) {
             const dot = document.createElement('span');
             dot.className = 'nav-unread-dot';
             dot.title = 'Unread messages';
             btn.appendChild(dot);
-            btn.classList.add('has-unread');
-        }
-        // The action control is a sibling button, never nested interactive UI.
-        let trailing;
-        if (deleting) {
-            trailing = document.createElement('span');
-            trailing.className = 'nav-project-deleting-status';
-            trailing.textContent = 'Deleting…';
-            trailing.title = project.delete_error || 'Cancellation and cleanup are in progress';
-        } else {
-            const kebab = document.createElement('button');
-            kebab.type = 'button';
-            kebab.className = 'nav-project-kebab';
-            kebab.innerHTML = SHELL_ICONS.more;  // the shell's one ⋯ (page_icons.js)
-            kebab.title = tr('project.kebab_title', 'Project actions');
-            kebab.setAttribute('aria-label', fmt('Actions for {name}', { name: project.name || project.id }));
-            kebab.addEventListener('click', (event) => {
-                event.stopPropagation();
-                openProjectRowMenu(project, {
-                    apiClient,
-                    anchorEl: kebab,
-                    onChanged: (change = {}) => {
-                        if (change.optimistic && change.projectId) {
-                            const row = lastProjectRows.find(p => p.id === change.projectId);
-                            if (row) { row.lifecycle = 'deleting'; row._unread = false; }
-                            if (navState.activeProjectId === change.projectId) closeProjectPanel();
-                            knownProjectsJson = '';
-                            paintProjectsNav();
-                            return;
-                        }
-                        knownProjectsJson = '';
-                        refreshProjectsNav();
-                    },
-                });
-            });
-            trailing = kebab;
-        }
-        if (project.id === navState.activeProjectId) btn.classList.add('active');
-        // Pressing a row opens its Project; pressing the open one again keeps it open (like every reference).
-        if (!deleting) btn.addEventListener('click', () => openProjectPanel(project, { openOnly: true }));
-        item.append(btn, trailing);
-        navProjectsList.appendChild(item);
+        } else if (!project._unread || deleting) unread?.remove();
+        const kebab = item.querySelector('.nav-project-kebab');
+        if (kebab) kebab.setAttribute('aria-label', fmt('Actions for {name}', { name: project.name || project.id }));
+        else item.querySelector('.nav-project-deleting-status').title = project.delete_error || 'Cancellation and cleanup are in progress';
+        if (navProjectsList.children[index] !== item) navProjectsList.insertBefore(item, navProjectsList.children[index] || null);
     }
+    for (const item of keyed.values()) item.remove();
+    // Moving an existing node can blur it even though its identity survives.
+    if (focused?.isConnected && navProjectsList.contains(focused) && focused !== document.activeElement) focused.focus({ preventScroll: true });
     patchProjectActivityMarkers(projectActivityIndex);
+}
+
+// The ⋯ menu's Pin or Unpin asks for the state its label named, so a menu opened before
+// another window changed the pin never flips it back. The row moves only once saved.
+async function setProjectPin(project, pinned) {
+    if (pendingProjectPins.has(project.id)) return;
+    pendingProjectPins.add(project.id);
+    const focused = document.activeElement;
+    try {
+        const { project: saved } = await apiClient.projectUpdate(project.id, { pinned });
+        if (saved?.id !== project.id || saved.pinned !== pinned) throw new Error('Pin state was not confirmed');
+        // Pre-response reads cannot overwrite this confirmation. The next forced
+        // read shares the existing sequencer; only pinned is merged into the summary.
+        stateSnapshots.retire();
+        const row = lastProjectRows.find(p => p.id === project.id);
+        if (row) row.pinned = saved.pinned;
+        knownProjectsJson = '';
+        renderProjectsNav(lastProjectRows, Array.from(state.projectChatIds));
+        let keyboard = false;
+        try { keyboard = focused?.matches(':focus-visible') === true; } catch { /* older selector support */ }
+        if (keyboard && focused === document.activeElement && focused?.isConnected
+                && focused.closest('.nav-project-item')?.dataset.navProjectId === project.id) {
+            focused.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+            const head = primarySidebar.querySelector('.sidebar-head');
+            if (head && getComputedStyle(head).position === 'sticky') {
+                const overlap = head.getBoundingClientRect().bottom - focused.getBoundingClientRect().top;
+                if (overlap > 0) primarySidebar.scrollTop -= overlap;
+            }
+        }
+    } catch (err) {
+        showToast(fmt('Could not save project pin: {error}', { error: err?.body?.error || err.message }), 'error');
+    } finally {
+        pendingProjectPins.delete(project.id);
+        repositionProjectRowMenu();
+        refreshProjectsNav();
+    }
 }
 
 document.getElementById('nav-projects-add')?.addEventListener('click', async (event) => {
@@ -989,15 +1078,17 @@ window.addEventListener('ouro:open-project', (event) => {
     openProjectPanel(resolved, { openOnly: true, taskId: event.detail.task_id || '', quizId: event.detail.quiz_id || '' });
 });
 
-// Resizable side sections: edge drag-handles write --sidebar-width /
-// --project-panel-width on :root and persist (debounced) to /api/ui/preferences.
+// Resizable side sections: edge drag-handles resize the sidebar and the Project panel, whose widths live in
+// --sidebar-width / --project-panel-width on :root, persisted (debounced) to /api/ui/preferences.
 // Disabled in the stack layout (layout.js). Width 0 = keep the CSS default.
+// While a handle is dragged, each frame writes the measured width into the dragged box's own --drag-width, which no
+// element inherits (style.css), and everything that lines up with the box follows it by layout: one element
+// restyles. The stored width on :root is inherited by every element, so writing it per frame restyled the whole
+// document, about half of a drag frame on the owner's Main in WebKit; it is written once, when the drag ends.
 // CW10 note: the DEVELOPMENT.md "no inline styles in JS" rule targets static styling
 // that belongs in a stylesheet — the drag's transient `userSelect:none` was that, and
-// is now the `.resizing-panels` class. Setting a custom property (`--sidebar-width`)
-// for a DYNAMIC, per-frame drag value is the idiomatic CSS-variable theming API, not a
-// static inline style; routing it through a managed <style> rule re-parsed each frame
-// would be strictly worse, so CSS-variable mutation is the accepted pattern here.
+// is now the `.resizing-panels` class. A measured width in a narrowly named custom property is the exception
+// DEVELOPMENT "Design System" names.
 function setupResizablePanels(prefs) {
     const root = document.documentElement;
     let persistTimer = 0;
@@ -1018,11 +1109,10 @@ function setupResizablePanels(prefs) {
         handle.title = 'Drag to resize';
         target.appendChild(handle);
         let startX = 0, startW = 0, dragging = false, frame = 0, wanted = 0;
-        // One write per displayed frame: a mouse reports more often than the screen draws, and each write relays out
-        // the room.
+        // One write per displayed frame (a mouse reports more often than the screen draws), on the dragged box only.
         const apply = () => {
             frame = 0;
-            root.style.setProperty(cssVar, `${wanted}px`);
+            target.style.setProperty('--drag-width', `${wanted}px`);
         };
         handle.addEventListener('pointerdown', (e) => {
             if (isStackLayout()) return;  // the stack layout has a drawer, not a resizable column
@@ -1042,10 +1132,14 @@ function setupResizablePanels(prefs) {
             if (frame) { cancelAnimationFrame(frame); apply(); }
             dragging = false; document.body.classList.remove('resizing-panels');  // CW10
             try { handle.releasePointerCapture(e.pointerId); } catch {}
-            // Keep the width that is shown: a Project panel dragged past the content area's edge stops at it.
+            // Keep the width that is shown: a Project panel dragged past the content area's edge stops at it. A box
+            // hidden mid-drag (Escape closed the Project) shows no width, and the stored one stays.
             const shown = Math.round(target.getBoundingClientRect().width) || 0;
-            root.style.setProperty(cssVar, `${shown}px`);
-            persist({ [prefKey]: shown });
+            if (shown) {
+                root.style.setProperty(cssVar, `${shown}px`);
+                persist({ [prefKey]: shown });
+            }
+            target.style.removeProperty('--drag-width');
         };
         handle.addEventListener('pointerup', end);
         handle.addEventListener('pointercancel', end);

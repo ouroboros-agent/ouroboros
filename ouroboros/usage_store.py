@@ -375,6 +375,21 @@ class Txn:
         return [dict(record) for record in self.conn.execute(_TASK_PAGE_SQL, (
             str(task_id), str(category), before, int(limit)))]
 
+    def review_seat_costs(self, category: str, *, limit: int) -> List[Dict[str, Any]]:
+        """What one reviewer seat cost in one wave: per (wave, row), the summed cost of every
+        physical attempt — its turns and its verdict-extraction calls, whatever model served each —
+        with the distinct models seen (``models``, comma-joined), newest wave first, at most ``limit``.
+
+        ``priced`` is false when any attempt of the seat had no known price; the category/time
+        index addresses only this category. No payload fields."""
+        return [dict(record) for record in self.conn.execute(
+            "SELECT review_wave_id AS wave_id, review_slot_id AS row_id, GROUP_CONCAT(DISTINCT model) AS models, "
+            "SUM(CAST(cost_usd AS REAL)) AS usd, MIN(COALESCE(pricing_known, 0)) AS priced, "
+            "MAX(ts_last_epoch) AS last_epoch FROM attempts INDEXED BY attempts_category_time "
+            "WHERE category=? AND COALESCE(review_wave_id, '') != '' AND COALESCE(review_slot_id, '') != '' "
+            "GROUP BY review_wave_id, review_slot_id ORDER BY last_epoch DESC LIMIT ?",
+            (str(category), int(limit)))]
+
     def bucket(self, scope: str, key: str = "") -> Bucket:
         address = (scope, str(key))
         if address not in self._buckets:

@@ -189,7 +189,7 @@ Every path-addressed `/api/files/*` operation resolves its requested `path` and 
 
 Update-status, log-tail and schedule-list reads run off the event loop.
 
-`/api/state` adds `current_questions`/`main_attention`, each with completeness and typed gaps (§3); `active_chat_activities` stays root-only. GET neither scans chat nor writes; actions reuse `/api/decisions` and task endpoints.
+`/api/state` adds `current_questions`/`main_attention` and the work projection (`works`, `rooms`), each with completeness and typed gaps (§3); `active_chat_activities` stays root-only. GET neither scans chat nor writes; actions reuse `/api/decisions` and task endpoints.
 
 ### WebSocket protocol
 

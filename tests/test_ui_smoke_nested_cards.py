@@ -16,8 +16,6 @@ size-ratchet byte gate. Reuses its server fixture.
 """
 from __future__ import annotations
 
-import json
-
 import pytest
 
 from tests.test_ui_smoke_playwright import direct_server_with_data  # noqa: F401 - pytest fixture import
@@ -67,8 +65,8 @@ FACTS = """sel => {
 
 
 def _seed(data_dir):
-    logs_dir = data_dir / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
+    from ouroboros import dialogue_store
+
     rows = [{
         "ts": "2026-09-02T10:00:00+00:00", "chat_id": 1, "task_id": "nest-root",
         "content": "Root task started", "suggested_name": "Nested cards keep their place",
@@ -89,7 +87,9 @@ def _seed(data_dir):
                 "delegated_runs_started": 1, "delegated_runs_settled": 1, "delegated_runs_failed": 0,
                 "delegated_runs_succeeded": 1, "subscription_cost_usd": 0.4}} if role == "scout" else {}),
         })
-    (logs_dir / "progress.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    # The running server reads its dialogue store; a log file written after boot is never imported.
+    for row in rows:
+        dialogue_store.append(data_dir, "progress", row)
 
 
 @pytest.mark.parametrize("browser_engine", ["chromium", "webkit"])

@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import math
 import multiprocessing
+import os
 import pathlib
 import sqlite3
 
@@ -393,6 +394,28 @@ def test_the_export_appends_the_post_cutover_rows_byte_identical_and_a_re_cutove
     assert ds.accepted_row(tmp_path, 1, "old-body") is not None and ds.dispatch_state(tmp_path, 1, "after-1") == "pending"
     assert ds.stream_end(tmp_path, "chat") == chain_offsets(tmp_path, "chat")[1]
     assert di.export_for_older_body(tmp_path)[str(tmp_path)]["chat"]["rows"] == 0, "the files hold everything again"
+
+
+def test_the_export_appends_through_a_binary_descriptor(tmp_path, monkeypatch):
+    """Windows opens a descriptor in text mode unless ``O_BINARY`` is set, and ``os.write`` then
+    turns each LF into CRLF: the exported lines would no longer be the stored rows at their
+    coordinates. The export's open carries ``O_BINARY`` wherever the platform has it; a sentinel
+    stands in for it here, so the flag is checked on every platform."""
+    sentinel, real_binary, real_open, flags = 1 << 40, getattr(os, "O_BINARY", 0), os.open, []
+    di.cutover(tmp_path)
+    ds.append(tmp_path, "chat", chat("after-1", "после"))
+    live = tmp_path / "logs" / "chat.jsonl"
+
+    def recording_open(path, mode, *args, **kwargs):
+        if pathlib.Path(path) == live:
+            flags.append(mode)
+            mode = (mode & ~sentinel) | (real_binary if mode & sentinel else 0)
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "O_BINARY", sentinel, raising=False)
+    monkeypatch.setattr(os, "open", recording_open)
+    assert di.export_for_older_body(tmp_path)[str(tmp_path)]["chat"]["rows"] == 1
+    assert flags and all(mode & sentinel for mode in flags), f"the export opened {live.name} without O_BINARY"
 
 
 @pytest.mark.parametrize("written", ["whole", "part", "none", "absent", "foreign"])

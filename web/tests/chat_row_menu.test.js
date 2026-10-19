@@ -4,6 +4,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createChatRowMenu } from '../modules/chat_row_menu.js';
+import { cardMenuActions, emptyWorkState } from '../modules/work_status.js';
 import { installDomDouble } from './dom_double.js';
 
 function fixture() {
@@ -32,11 +33,14 @@ function fixture() {
     const plain = el('div', { className: 'chat-bubble user' }, el('div', { className: 'message', text: 'unsaved echo' }));
     feed.append(bubble, plain);
     const activity = { phase: 'working' };
+    const works = emptyWorkState();
     const cards = new Map();
-    const menu = createChatRowMenu({ feed, replies, cardOf: (id) => cards.get(id), activityOf: () => activity });
+    // chat.js's own wiring: the card's Stop… items come from its work, else from the card's own task controls.
+    const menu = createChatRowMenu({ feed, replies, cardOf: (id) => cards.get(id),
+        actionsOf: (record) => cardMenuActions(works, record, activity) });
     const openMenu = () => doc.body.children.find((node) => node.classList.contains('chat-row-menu')) || null;
     const items = () => (openMenu()?.children || []).map((node) => node.dataset.rowAction);
-    return { ...env, feed, cards, bubble, plain, copy, link, words, menu, started, copied, opened, activity, openMenu, items,
+    return { ...env, feed, cards, bubble, plain, copy, link, words, menu, started, copied, opened, activity, works, openMenu, items,
         close() { menu.destroy(); env.restore(); } };
 }
 
@@ -239,6 +243,23 @@ test('a work card offers Reply, Copy, Open project, Resume, Pause and Stop… ex
         summary.emit('contextmenu', { clientX: 1, clientY: 1 });
         assert.deepEqual(f.items(), ['copy', 'project'], 'a card that offers no Reply, settled without Stop…');
         assert.equal(card.contains(f.openMenu()), false, 'the menu is portalled outside the card');
+    } finally { f.close(); }
+});
+
+test('a work card\'s Pause follows its work\'s controls, never the census phase', () => {
+    const f = fixture();
+    try {
+        const { summary } = workCard(f);
+        const work = (controls) => f.works.episodes.set('t-1', { work_id: 't-1', confirmed: true,
+            episode: { task_id: 't-1', live: true }, controls });
+        work([{ action: 'stop', target: 't-1' }]);
+        summary.emit('contextmenu', { clientX: 1, clientY: 1 });
+        assert.deepEqual(f.items(), ['reply', 'copy', 'project', 'stop'], 'the census says working; the work offers no Pause');
+        f.openMenu().emit('keydown', { key: 'Escape', target: f.openMenu().children[0] });
+        work([{ action: 'pause', target: 't-1' }, { action: 'stop', target: 't-1' }]);
+        f.activity.phase = 'budget_paused';
+        summary.emit('contextmenu', { clientX: 1, clientY: 1 });
+        assert.deepEqual(f.items(), ['reply', 'copy', 'project', 'pause', 'stop'], 'the work\'s Pause, whatever the census says');
     } finally { f.close(); }
 });
 

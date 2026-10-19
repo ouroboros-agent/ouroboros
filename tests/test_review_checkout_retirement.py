@@ -5,15 +5,14 @@ or that a crash left, is retired on the 600 s custody pass once no review can st
 one (``checkout.json``) when its task is terminal and not live, no active review custody names its
 round, no live review operation runs for the task and no retained seat checks from it; an unmarked
 older one under the same conditions only past the GC retention wait and only when a recorded round
-names its task. C9: a dead controller's pointer of a non-acceptance surface is removed by the orphan
-collector, never settled through acceptance; a live controller keeps it.
+names its task. C9: a dead controller's open review pointer is removed by the maintenance pass, never
+settled; a live controller keeps it.
 """
 from __future__ import annotations
 
 import json
 import os
 import pathlib
-import shutil
 import subprocess
 import sys
 import time
@@ -22,6 +21,7 @@ from types import SimpleNamespace
 import pytest
 
 from ouroboros import obligations, review_checking_prune as rp, review_operation
+from ouroboros.force_remove import force_rmtree
 from ouroboros.startup_migrations import prepare_startup_state
 from ouroboros.task_results import load_task_result, write_task_result
 from ouroboros.tools.review_subject import CHECKOUT_MARKER, ReviewSubjectSpec, checkout_token, isolated_checkout
@@ -32,6 +32,20 @@ RETRY_KEY = "review:round-1"
 
 def _git(repo, *args):
     return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=True).stdout.strip()
+
+
+def _registered(repo) -> set:
+    """The worktree paths Git registers for REPO, as paths: Git prints them with forward slashes on Windows."""
+    lines = _git(repo, "worktree", "list", "--porcelain").splitlines()
+    return {pathlib.Path(line[len("worktree "):]) for line in lines if line.startswith("worktree ")}
+
+
+def _rewrite(path: pathlib.Path, data: bytes) -> None:
+    """Rewrite a file in place. Git for Windows hides a ``.git`` it creates, and Windows refuses a
+    create-always open (``write_text``/``write_bytes``) of a hidden file with EACCES."""
+    with path.open("r+b") as handle:
+        handle.write(data)
+        handle.truncate()
 
 
 def _repo(path):
@@ -154,22 +168,60 @@ def test_an_unreadable_review_state_removes_no_checkout(subject):
     assert entry.is_dir() and report["checkouts_removed"] == 0 and report["errors"], report
 
 
-def test_a_dead_controllers_pointer_of_another_surface_is_removed_never_settled(tmp_path, monkeypatch):
+def test_a_dead_controllers_pointer_is_removed_never_settled(tmp_path):
+    """Both directions: an open pointer whose controller is proven dead is removed (the retired task
+    acceptance's open pointer too: nothing settles it any more), a live controller's stays, and a closed
+    pointer is history the pass never touches."""
     prepare_startup_state(tmp_path)
-    monkeypatch.setattr("ouroboros.acceptance_settlement.settle_acceptance_operation",
-                        lambda *a, **k: pytest.fail("a liveness pointer went through acceptance settlement"))
     dead = {"pid": _dead_pid(), "birth": "gone", "session": "gone"}
-    pointers = {owner: {"state": "dispatched", "surface": surface, "retry_key": f"{surface}:{owner}",
-                        "controller": controller}
-                for owner, surface, controller in (("op-dead", "multi_model_review", dead),
-                                                   ("op-live", "plan_review", _alive_controller()))}
+    pointers = {owner: {"state": state, "surface": surface, "retry_key": f"{surface}:{owner}", "controller": controller}
+                for owner, surface, state, controller in (
+                    ("op-dead", "multi_model_review", "dispatched", dead),
+                    ("op-live", "plan_review", "dispatched", _alive_controller()),
+                    ("op-acceptance", "task_acceptance", "retained", dead),
+                    ("op-closed", "task_acceptance", "closed", dead))}
     write_task_result(tmp_path, TASK, "completed", result="done", review_operations=pointers)
     assert obligations.review_collection_pending(load_task_result(tmp_path, TASK)), "an open liveness pointer is found"
 
-    report = review_operation.recover_orphaned_acceptance_operations(tmp_path)
-    assert report["retired"] == [{"task_id": TASK, "owner_id": "op-dead"}], report
-    assert set(load_task_result(tmp_path, TASK)["review_operations"]) == {"op-live"}, "a live controller keeps its pointer"
-    assert review_operation.recover_orphaned_acceptance_operations(tmp_path)["retired"] == []
+    report = review_operation.retire_dead_review_pointers(tmp_path)
+    assert report["retired"] == [{"task_id": TASK, "owner_id": "op-dead"},
+                                 {"task_id": TASK, "owner_id": "op-acceptance"}], report
+    left = load_task_result(tmp_path, TASK)["review_operations"]
+    assert set(left) == {"op-live", "op-closed"}, "a live controller keeps its pointer, a closed one stays history"
+    assert left["op-closed"] == pointers["op-closed"]
+    assert review_operation.retire_dead_review_pointers(tmp_path)["retired"] == []
+    assert obligations.review_collection_pending(load_task_result(tmp_path, TASK)), "the live pointer still holds"
+
+
+def test_a_row_an_older_body_flagged_with_nothing_open_is_written_back_and_packs(tmp_path):
+    """Both directions: a terminal row whose stored review_collection_pending is 1 only because an older body
+    flagged it for its acceptance collection (here a closed acceptance pointer) is written back to 0 by one
+    pass and becomes packable, its body untouched; a row with an open live pointer keeps its 1."""
+    from ouroboros import store
+    from ouroboros.evidence_packs import task_packable
+
+    prepare_startup_state(tmp_path)
+    closed = {"op-closed": {"state": "closed", "surface": "task_acceptance", "retry_key": "task_acceptance:closed",
+                            "controller": {"pid": _dead_pid(), "birth": "gone", "session": "gone"}}}
+    live = {"op-live": {"state": "dispatched", "surface": "plan_review", "retry_key": "plan_review:live",
+                        "controller": _alive_controller()}}
+    write_task_result(tmp_path, "old-flag", "completed", result="done", review_operations=closed)
+    write_task_result(tmp_path, "open-review", "completed", result="done", review_operations=live)
+    with store.open_store(tmp_path, write=True) as txn:  # the column as the older body derived it
+        txn.conn.execute("UPDATE tasks SET review_collection_pending=1 WHERE task_id='old-flag'")
+
+    def column(task):
+        with store.open_store(tmp_path, write=False) as txn:
+            return txn.row(task, "review_collection_pending")
+
+    assert (column("old-flag"), column("open-review")) == (1, 1)
+    report = review_operation.retire_dead_review_pointers(tmp_path)
+    assert report["reclassified"] == ["old-flag"] and report["retired"] == [], report
+    assert (column("old-flag"), column("open-review")) == (0, 1)
+    with store.open_store(tmp_path, write=False) as txn:
+        assert task_packable(txn, "old-flag") and not task_packable(txn, "open-review")
+    assert review_operation.retire_dead_review_pointers(tmp_path)["reclassified"] == []
+    assert load_task_result(tmp_path, "old-flag")["review_operations"] == closed
 
 
 def test_checkout_retirement_targets_only_its_registration_and_keeps_an_offline_owner_worktree(subject):
@@ -177,14 +229,14 @@ def test_checkout_retirement_targets_only_its_registration_and_keeps_an_offline_
     offline = subject.repo.parent / "owners-offline-checkout"
     _git(subject.repo, "worktree", "add", "--detach", str(offline), "HEAD")
     offline.rename(offline.with_name("temporarily-unmounted"))
-    before = _git(subject.repo, "worktree", "list", "--porcelain")
-    assert str(offline) in before and str(entry / "repo") in before
+    before = _registered(subject.repo)
+    assert offline in before and entry / "repo" in before
 
     report = _prune(subject)
-    after = _git(subject.repo, "worktree", "list", "--porcelain")
+    after = _registered(subject.repo)
     assert report["checkouts_removed"] == 1 and not entry.exists(), report
-    assert str(entry / "repo") not in after
-    assert str(offline) in after, "another owner's unavailable checkout must retain its registration"
+    assert entry / "repo" not in after
+    assert offline in after, "another owner's unavailable checkout must retain its registration"
 
 
 def test_checkout_retirement_keeps_a_git_locked_checkout_until_its_registration_can_be_removed(subject, monkeypatch):
@@ -213,7 +265,8 @@ def test_checkout_retirement_keeps_a_git_locked_checkout_until_its_registration_
 @pytest.mark.parametrize("replacement", [False, True], ids=["deleted", "recloned"])
 def test_checkout_of_a_deleted_subject_retires_only_after_review_custody_ends(subject, replacement):
     entry = _retain(subject)
-    shutil.rmtree(subject.repo)
+    force_rmtree(subject.repo)  # its Git objects are read-only (Windows refuses a plain rmtree)
+    assert not subject.repo.exists()
     if replacement:
         _repo(subject.repo)  # the new repository has no registration for this old checkout
     _attempt(subject, "reviewing")
@@ -235,7 +288,7 @@ def test_existing_broken_git_metadata_keeps_the_checkout_and_reports_the_git_err
     registration = pathlib.Path(gitfile.read_text().removeprefix("gitdir: ").strip())
     metadata = registration / "commondir" if damage == "common_dir" else gitfile
     original = metadata.read_bytes()
-    metadata.write_text("unavailable-metadata\n")
+    _rewrite(metadata, b"unavailable-metadata\n")
     with pytest.raises(subprocess.CalledProcessError) as refusal:
         _git(entry / "repo", "rev-parse", "--git-common-dir")
 
@@ -243,7 +296,7 @@ def test_existing_broken_git_metadata_keeps_the_checkout_and_reports_the_git_err
     assert report["errors"] == [f"{entry.name}: Git common directory unavailable: {refusal.value.stderr.strip()}"]
     assert report["checkouts_removed"] == 0 and (entry / "repo" / "a.txt").read_text() == "two\n"
     assert registration.is_dir(), "a Git refusal alone does not prove the registration is gone"
-    metadata.write_bytes(original)
+    _rewrite(metadata, original)
     report = _prune(subject)
     assert not report["errors"] and report["checkouts_removed"] == 1 and not entry.exists(), report
 

@@ -231,15 +231,15 @@ def test_later_park_retains_child_without_rewriting_initial_or_crossing_source_i
 
     binding = pc.ReviewWaitBinding(None, tmp_path, "author", "source-identity", turn_event())
     write_task_result(tmp_path, "author", "running", metadata={"presence_event_identity": binding.identity})
-    first = pc._persist(binding, {}, "", "panel-1", "first-park")
-    second = pc._persist(binding, {}, "work-late", "panel-2", "second-park")
+    first = pc._persist(binding, "", "review-1", "first-park")
+    second = pc._persist(binding, "work-late", "review-2", "second-park")
     assert second["initial"] == first["initial"] and first["initial"]["work_ref"] == ""
     assert second["child_work_ref"] == "work-late"
     # A later empty observation or host terminal must not withdraw admitted independent work.
-    third = pc._persist(binding, {}, "", "panel-3", "third-park")
+    third = pc._persist(binding, "", "review-3", "third-park")
     assert third["child_work_ref"] == "work-late" and third["initial"] == first["initial"]
     with pytest.raises(ValueError, match="this event's RUNNING row"):
-        pc._persist(replace(binding, identity="another-source"), {}, "unrelated-work", "panel-x", "bad-park")
+        pc._persist(replace(binding, identity="another-source"), "unrelated-work", "review-x", "bad-park")
     assert load_task_result(tmp_path, "author")["presence_continuation"] == third
 
 
@@ -249,7 +249,7 @@ def test_later_child_must_read_back_before_the_park_can_publish(tmp_path, monkey
 
     binding = pc.ReviewWaitBinding(None, tmp_path, "author", "source-identity", turn_event())
     write_task_result(tmp_path, "author", "running", metadata={"presence_event_identity": binding.identity})
-    pc._persist(binding, {}, "", "panel-1", "first-park")
+    pc._persist(binding, "", "review-1", "first-park")
     load = task_results.load_task_result
 
     def missing_child(*args, **kwargs):
@@ -259,7 +259,7 @@ def test_later_child_must_read_back_before_the_park_can_publish(tmp_path, monkey
 
     monkeypatch.setattr(task_results, "load_task_result", missing_child)
     with pytest.raises(ValueError, match="did not read back"):
-        pc._persist(binding, {}, "work-late", "panel-2", "second-park")
+        pc._persist(binding, "work-late", "review-2", "second-park")
 
 
 @pytest.mark.parametrize("failure", ["raises", "lost"])
@@ -294,7 +294,8 @@ def test_a_v1_replay_rebuilds_a_lost_pointer_before_returning_the_envelope(tmp_p
                       presence_continuation=record)
     record_continuing_turn(tmp_path, KEY, task_id, outcome="message", message="Released.", work_ref="",
                            lent_at=record["lent_at"])
-    # The author re-selected its released output at its terminal (silent), and its pointer write was lost.
+    # A pre-fold continuation released its output early; the author re-selected it at its terminal
+    # (silent), and its pointer write was lost. The stored record still replays.
     metadata = {**task["metadata"], "presence_outcome": "silent", "presence_result_text": ""}
     write_task_result(tmp_path, task_id, "completed", metadata=metadata, terminal_origin="model_final",
                       result="Released.")
@@ -336,14 +337,14 @@ def test_a_second_park_and_late_terminal_keep_the_newest_turn_pointer(tmp_path, 
             if task["id"] == first_id:
                 binding = self.review_wait_callback.args[0]
                 ctx = SimpleNamespace(task_metadata=task["metadata"])
-                assert pc._yield_conversation(binding, ctx, {"review_binding": "panel-1"}) == (True, "")
+                assert pc._yield_conversation(binding, ctx, {"review_binding": "review-1"}) is True
                 assert not binding.lease.held()
                 if successor:
                     clock["now"] = "2026-10-06T10:01:00+00:00"
                     assert run(second).text == "Newer reply"
                 assert binding.lease.reacquire(lambda: False)
                 clock["now"] = "2026-10-06T10:02:00+00:00"
-                assert pc._yield_conversation(binding, ctx, {"review_binding": "panel-2"}) == (True, "")
+                assert pc._yield_conversation(binding, ctx, {"review_binding": "review-2"}) is True
                 continued = load_task_result(tmp_path, first_id)["presence_continuation"]
                 assert (continued["first_lent_at"], continued["lent_at"]) == (
                     "2026-10-06T10:00:00+00:00", clock["now"])

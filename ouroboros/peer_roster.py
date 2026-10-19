@@ -236,6 +236,39 @@ def _waiting_facts(stored: Dict[str, Any], attempt: Any) -> List[Dict[str, Any]]
     return facts
 
 
+_HOLD_CODES = {"continuation_writer_unsettled": "earlier_work_unconfirmed", "saved_work_hold": "saved_on_stop",
+               "owner_restart_hold": "after_restart", "panic_hold": "after_panic",
+               "root_fence_lifted_pending_selection": "awaiting_selection",
+               "root_fence_member_pending_selection": "awaiting_selection"}
+
+
+def _queue_hold_facts(task: Dict[str, Any], stored: Dict[str, Any], waiting: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """What holds a listed root that its own result records do not say: the queue row's typed hold
+    (a Continue waiting for the earlier attempt's writers, work saved by a stop, a Panic, a member awaiting
+    selection) and an owner Pause over its tree, named by the actor the fence recorded (gateway/work_status.py)."""
+    from ouroboros.gateway.work_status import REASON_TEXT  # D01->D11 is lazy-only
+
+    facts: List[Dict[str, Any]] = []
+    hold = task.get("_budget_pause_hold") if isinstance(task.get("_budget_pause_hold"), dict) else {}
+    if hold and not hold.get("selected"):
+        reason = str(hold.get("reason") or "")
+        code = _HOLD_CODES.get(reason) or ("restore_failed" if reason.startswith("restore_refused:") else "held")
+        text = REASON_TEXT.get(code, code)
+        fact = {"kind": "hold", "reason": code, "text": text if isinstance(text, str) else code,
+                "since": _iso_text(hold.get("held_at")) or None}
+        predecessor = ((task.get("metadata") or {}).get("continuation") or {}).get("predecessor_task_id")
+        if code == "earlier_work_unconfirmed" and predecessor:
+            fact["tasks"] = [str(predecessor)]
+        facts.append(fact)
+    fence = stored.get("owner_pause") if isinstance(stored.get("owner_pause"), dict) else {}
+    if fence.get("state") in {"requested", "paused"} and not any(wait.get("kind") == "owner_pause" for wait in waiting):
+        by = "mind" if fence.get("actor") == "mind" else "owner" if str(fence.get("requested_by") or "owner") == "owner" \
+            else "host"
+        facts.append({"kind": "owner_pause", "state": str(fence["state"]), "by": by,
+                      "since": _iso_text(fence.get("paused_at") or fence.get("requested_at")) or None})
+    return facts
+
+
 def _compact_root(task_id: str, task: Dict[str, Any], *, status: str, direct: bool = False,
                   canonical_root: Optional[pathlib.Path] = None,
                   queue_row: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -297,6 +330,8 @@ def _compact_root(task_id: str, task: Dict[str, Any], *, status: str, direct: bo
     from ouroboros.live_works import root_present_fields
     row.update(root_present_fields(canonical_root, task_id, task, stored, settled=settled))
     waiting = [] if settled else _waiting_facts(stored, queue_row.get("attempt") or task.get("_attempt"))
+    if not settled:
+        waiting += _queue_hold_facts(task, stored, waiting)
     if waiting:
         row["waiting"] = waiting
     return row
@@ -347,6 +382,48 @@ def independent_roots(drive_root: pathlib.Path) -> Dict[str, Any]:
         "queue_snapshot": observation,
         "direct_roots": direct_observation,
     }
+
+
+def unlisted_live_work(drive_root: pathlib.Path, listed: set) -> List[Dict[str, Any]]:
+    """Live work whose own root is not a listed root: helpers that outlived their ended lead, and external
+    runs still working under a settled root. Facts only, never a tell_task target (``independent_roots`` stays the
+    address book). Never raises; an unreadable source yields no rows (the roster discloses freshness)."""
+    root = pathlib.Path(drive_root)
+    groups: Dict[str, Dict[str, Any]] = {}
+    try:
+        snapshot = _load_queue_snapshot(root)
+        for status_key in ("running", "pending"):
+            for row in snapshot.get(status_key) or []:
+                task = row.get("task") if isinstance(row, dict) and isinstance(row.get("task"), dict) else {}
+                root_id = str(task.get("root_task_id") or "").strip()
+                if not root_id or root_id in listed or root_id == str(row.get("id") or task.get("id") or ""):
+                    continue
+                entry = groups.setdefault(root_id, {"helpers_running": 0, "helpers_waiting": 0, "external_runs": 0})
+                entry["helpers_running" if status_key == "running" else "helpers_waiting"] += 1
+    except Exception:
+        log.debug("Unlisted live work: queue snapshot unreadable", exc_info=True)
+    try:
+        from ouroboros.delegate_custody_reconcile import open_runs, run_tree_id
+
+        for entry in open_runs(root):  # started, not settled: a run still working
+            root_id = run_tree_id(entry)
+            if root_id and root_id not in listed:
+                groups.setdefault(root_id, {"helpers_running": 0, "helpers_waiting": 0, "external_runs": 0})[
+                    "external_runs"] += 1
+    except Exception:
+        log.debug("Unlisted live work: delegated custody unreadable", exc_info=True)
+    rows = []
+    for root_id, counts in sorted(groups.items()):
+        from ouroboros.task_results import load_task_result
+
+        try:
+            stored = load_task_result(root, root_id) or {}
+        except Exception:
+            stored = {}
+        rows.append({"work_id": root_id, "title": str(stored.get("suggested_name") or stored.get("title") or ""),
+                     "room": {"chat_id": stored.get("chat_id"), "project_id": str(stored.get("project_id") or "")},
+                     "root_status": str(stored.get("status") or "unknown"), **counts})
+    return rows
 
 
 def host_listed_independent_root(drive_root: pathlib.Path, task_id: str) -> Optional[Dict[str, Any]]:
@@ -422,9 +499,9 @@ def roster_fingerprint(roster: Dict[str, Any], *, exclude: str = "") -> tuple:
 
 
 _WAIT_LABELS = {"owner": "owner answer", "review": "review", "model": "model access", "budget": "budget pause",
-                "sleep": "sleep", "owner_pause": "owner Pause", "unknown": "unknown wait"}
-_WAIT_DETAILS = ("quiz_id", "reason", "role", "mode", "retained", "state", "settlement", "rail", "until", "reset_at",
-                 "wake_at", "senders", "tasks", "runs", "services", "any_mail")
+                "sleep": "sleep", "owner_pause": "owner Pause", "hold": "held", "unknown": "unknown wait"}
+_WAIT_DETAILS = ("quiz_id", "reason", "text", "by", "role", "mode", "retained", "state", "settlement", "rail", "until",
+                 "reset_at", "wake_at", "senders", "tasks", "runs", "services", "any_mail")
 
 
 def _detail_text(value: Any) -> str:

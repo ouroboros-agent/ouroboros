@@ -23,6 +23,7 @@ from tests.test_ui_smoke_project_continuity import (
 )
 
 from tests._shared import producer_evidence_dir
+from tests._work_projection_shared import with_work_fields
 from tests._store_shared import seed_result
 
 
@@ -134,7 +135,7 @@ def test_ui_smoke_live_managed_task_keeps_working_without_detail_polls(direct_se
                     "client_message_id": "", "kind": "managed_task",
                     "phase": "working", "started_at": 1.0,
                 }]
-                route.fulfill(content_type="application/json", body=json.dumps(payload))
+                route.fulfill(content_type="application/json", body=json.dumps(with_work_fields(payload)))
 
             page.route("**/api/state*", _inject)
             _goto_main_ready(page, url, "Working")

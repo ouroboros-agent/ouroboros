@@ -138,17 +138,11 @@ def _register_delivered(ctx: Any, delivery_id: str, emitted: "Dict[str, Any] | N
 
 def _handoff_delivered_review(ctx: Any, task_id: str, delivery_id: str) -> None:
     """After a delivery is registered (a real send, or a copy suppressed as already delivered):
-    the late-acceptance join, then settle-on-ack — the Done card held behind this very debt
-    follows the answer now (owner Fork 2). ``prepare=False``: readiness is task_done's to mint,
-    so an ack that lands before the row is terminal settles nothing and task_done retries."""
+    settle-on-ack — the Done card held behind this very debt follows the answer now (owner
+    Fork 2). ``prepare=False``: readiness is task_done's to mint, so an ack that lands before
+    the row is terminal settles nothing and task_done settles it."""
     if not task_id:
         return
-    try:
-        from ouroboros.acceptance_late import handoff_delivered_acceptance
-
-        handoff_delivered_acceptance(ctx, task_id, delivery_id)
-    except Exception:
-        log.debug('historical acceptance remains owed before operation handoff', exc_info=True)
     try:
         from ouroboros.terminal_projection import settle_terminal_projection
 
@@ -364,11 +358,6 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
 
         # Project lifecycle rows and a root's Main notice pin Main; others keep lineage routing.
         chat_id = int(evt["chat_id"]) if system_type in ROOM_FIXED_ROW_TYPES else bound_chat or int(evt["chat_id"])
-        if system_type == "acceptance_late_settlement":
-            from ouroboros.acceptance_late import supplement_chat
-            retained_chat = supplement_chat(ctx.DRIVE_ROOT, evt)
-            if retained_chat is not None:
-                chat_id = retained_chat
         if delivery_id:
             progress_meta = dict(progress_meta or {})
             progress_meta["delivery_id"] = delivery_id

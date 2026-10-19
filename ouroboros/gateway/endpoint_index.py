@@ -308,7 +308,7 @@ HTTP_SHAPES: dict[str, Shape] = {
                                 note="401 error_code auth_required: the git clone needs credentials (not the network gate)"),
     "POST /api/projects/from-task": Shape("200:ProjectFromTaskResponse 400,409,500:ErrorResponse", "ProjectFromTaskRequest",
                                           note="409: the task already belongs to another project"),
-    "POST /api/projects/{project_id}/update": Shape("200:ProjectUpdateResponse 400,404,500:ErrorResponse",
+    "POST /api/projects/{project_id}/update": Shape("200:ProjectUpdateResponse 400,404,409,500:ErrorResponse",
                                                     "ProjectUpdateRequest"),
     "POST /api/projects/{project_id}/delete": Shape("200:ProjectDeleteResponse 404,500:ErrorResponse"),
     "GET /api/fs/dirs": Shape("200:FsDirsResponse 400,403,404,500:ErrorResponse", query="path"),

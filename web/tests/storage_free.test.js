@@ -104,10 +104,10 @@ test('counts of one read as one: in use, kept, deleting and stuck', () => {
     assert.deepEqual(doneSentences(free('done', { run: run({ removed: 1, removed_bytes: 1e9, deleting: 1, deleting_bytes: 1e6, stuck: 1,
         kept: [{ reason: 'in_use', count: 1 }], free_before: null, free_after: null }) })), [
         'Removed 1.0 GB (1 folder).', '1 was kept: still in use.', '1 is still being deleted.',
-        '1 could not be deleted yet; the app retries once it changes.', 'The next count will show the new total.',
+        '1 could not be deleted yet; the app retries at its next maintenance run.', 'The next count will show the new total.',
     ]);
     assert.deepEqual(doneSentences(free('done', { run: run({ deleting: 0, deleting_bytes: 0, stuck: 2, free_before: null, free_after: null }) })).slice(3, 4),
-        ['2 could not be deleted yet; the app retries once they change.']);
+        ['2 could not be deleted yet; the app retries at its next maintenance run.']);
 });
 
 test('an empty preview says so and keeps the door', () => {

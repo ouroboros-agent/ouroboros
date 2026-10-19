@@ -542,7 +542,7 @@ def acceptance_observation_prompt(ctx: Any, observation: Dict[str, Any]) -> str:
     candidate = getattr(ctx, "_delivery_candidate", None)
     retained = (
         "The retained complete answer remains available. " if candidate is not None
-        else "When nominating the complete task result for review, use this source selector. "
+        else "When selecting a completion, use this source selector. "
     )
     # ``tool_count`` stays on the stored observation (delivery bounds material
     # tool indices with it) but changes every round, and the unknown-queue mark
@@ -559,10 +559,44 @@ def acceptance_observation_prompt(ctx: Any, observation: Dict[str, Any]) -> str:
         "supply complete effective_criteria or exact material_tool_indices when it changed, "
         "even if the answer text is unchanged. New read-only observations can matter. "
         "Raw owner messages stay evidence; their count is not a change in requirements. "
-        "While review is pending, answer status questions through send_user_message "
+        "While a review is running, answer status questions through send_user_message "
         "and keep the retained deliverable; a short progress reply is not its replacement. "
         "This observation supersedes an earlier source selector, not the owner's words."
     )
+
+
+def prepare_acceptance_observation(ctx: Any, trace: dict, incoming: Any, messages: list) -> None:
+    """Capture the owner-source facts every round; while delivery control asks Main to select a
+    completion, append them when they changed (earlier rows stay for prefix caching)."""
+    observed = capture_acceptance_observation(ctx, trace, incoming)
+    if not getattr(ctx, "_delivery_control_required", False):
+        return
+    note = acceptance_observation_prompt(ctx, observed)
+    if not note:
+        return
+    latest = next((row for row in reversed(messages) if row.get("acceptance_observation")), None)
+    if isinstance(latest, dict) and latest.get("content") == note:
+        return  # the transcript already ends its observation history with these exact facts
+    messages.append({"role": "user", "content": note, "acceptance_observation": True})
+
+
+def _latch_final_answer_marker(llm_trace: Dict[str, Any], content: str | None,
+                               current_tool_calls: list | None = None) -> None:
+    """Anytime capture of an explicit FINAL ANSWER marker; marker-only, never mined prose. The
+    tool-call count stamp keeps the stale-answer invariant: later grounding invalidates this
+    fallback unless the model emits a newer marker."""
+    from ouroboros.outcomes import FINAL_ANSWER_MARKER, extract_final_answer
+
+    del current_tool_calls
+    text = content or ""
+    answer = extract_final_answer(text)
+    if not answer:
+        if any(line.strip().startswith(FINAL_ANSWER_MARKER) for line in text.splitlines()):
+            llm_trace.pop("best_valid_final_answer", None)
+            llm_trace.pop("best_valid_final_answer_tools", None)
+        return
+    llm_trace["best_valid_final_answer"] = answer
+    llm_trace["best_valid_final_answer_tools"] = len(llm_trace.get("tool_calls") or [])
 
 
 def _visible_round_text(content: Any) -> str:

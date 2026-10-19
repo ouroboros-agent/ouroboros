@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -255,7 +256,9 @@ def test_a_folder_vanishing_mid_walk_counts_as_empty(tmp_path, monkeypatch, walk
     assert (row["logical_bytes"], row["files"], row["unreadable"]) == (3, 1, 0)
 
 
-def test_a_folder_swapped_for_a_link_mid_walk_is_never_listed_through_it(tmp_path, monkeypatch, walk):
+def _swap_mid_walk(tmp_path, monkeypatch, listing=lambda info: info):
+    """Count ``task_results`` while its folder ``victim`` turns into a link to an outside folder just
+    after the walk read its listing entry; LISTING shapes what that entry reports."""
     data, outside = tmp_path / "data", tmp_path / "outside"
     _write(outside / "secret.bin", 100)
     victim = data / "task_results" / "victim"
@@ -268,11 +271,32 @@ def test_a_folder_swapped_for_a_link_mid_walk_is_never_listed_through_it(tmp_pat
         if entry.name == "victim" and not victim.is_symlink():
             victim.rmdir()
             victim.symlink_to(outside, target_is_directory=True)
-        return info
+        return listing(info)
 
     monkeypatch.setattr(storage, "_listing_stat", swap_after_stat)
-    row = _row(_count(data), "task_results")
+    return _row(_count(data), "task_results")
+
+
+def test_a_folder_swapped_for_a_link_mid_walk_is_never_listed_through_it(tmp_path, monkeypatch, walk):
+    row = _swap_mid_walk(tmp_path, monkeypatch)
     assert (row["logical_bytes"], row["unreadable"]) == (3, 1)
+
+
+def _windows_listing(info):
+    """A Windows listing entry (``os.DirEntry.stat``): type, size and attributes, but no inode,
+    device, link count or blocks, so the walk asks the entry itself for those."""
+    return SimpleNamespace(st_mode=info.st_mode, st_size=info.st_size, st_ino=0, st_dev=0, st_nlink=0,
+                           st_file_attributes=getattr(info, "st_file_attributes", 0))
+
+
+def test_a_windows_listing_counts_a_folder_turned_link_unreadable_and_still_walks_the_rest(tmp_path, monkeypatch):
+    """A listing without identity sends the by-path walk to each folder itself; a folder that became
+    a link since its listing entry is unreadable, as at the recheck before a listing, never a quietly
+    skipped link, and an untouched folder beside it is still walked."""
+    monkeypatch.setattr(storage, "_RELATIVE", False, raising=False)
+    _write(tmp_path / "data" / "task_results" / "kept" / "inner.bin", 5)
+    row = _swap_mid_walk(tmp_path, monkeypatch, listing=_windows_listing)
+    assert (row["logical_bytes"], row["unreadable"]) == (8, 1)
 
 
 # ----------------------------------------------------- A7, A8, A9: the file

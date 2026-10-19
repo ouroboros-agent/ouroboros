@@ -208,27 +208,39 @@ export function openNewProjectDialog({ apiClient, onCreated }) {
 }
 
 let closeOpenProjectRowMenu = null;
+let repositionOpenProjectRowMenu = null;
 
-// Accessible row menu: Rename/Delete only. `project` is a sidebar read model;
-// callbacks refresh the authoritative registry projection.
-export async function openProjectRowMenu(project, { apiClient, anchorEl, onChanged }) {
+export function repositionProjectRowMenu() {
+    repositionOpenProjectRowMenu?.();
+}
+
+// Accessible row menu: Pin/Unpin, Rename, Delete. `project` is a sidebar read model;
+// callbacks refresh the authoritative registry projection. `onPin` receives the state
+// the label named; a pin still being saved reads as such and cannot be pressed again.
+export async function openProjectRowMenu(project, { apiClient, anchorEl, onChanged, onPin, isPinPending = () => false }) {
+    const pinPending = isPinPending();
     const maxNameLength = PROJECT_NAME_MAX;
+    const pinned = project.pinned === true;
     closeOpenProjectRowMenu?.();
     const menu = document.createElement('div');
     menu.className = 'project-row-menu ui-popup';
     menu.setAttribute('role', 'menu');
     menu.setAttribute('aria-label', `Actions for ${project.name || project.id}`);
     menu.innerHTML = `
+        <button type="button" role="menuitem" data-prm="pin"${pinPending ? ' aria-disabled="true"' : ''}>${
+            pinPending ? (pinned ? 'Unpinning…' : 'Pinning…') : (pinned ? 'Unpin' : 'Pin')}</button>
         <button type="button" role="menuitem" data-prm="rename">Rename…</button>
         <button type="button" role="menuitem" class="danger" data-prm="delete">Delete project…</button>
     `;
     let binding;
     const close = (options) => binding?.close(options);
     menu.addEventListener('click', async (event) => {
-        const action = event.target.closest('[data-prm]')?.dataset?.prm;
-        if (!action) return;
+        const item = event.target.closest('[data-prm]');
+        const action = item?.dataset?.prm;
+        if (!action || item.getAttribute('aria-disabled') === 'true') return;
         close({ restoreFocus: true });
-        if (action === 'rename') {
+        if (action === 'pin') onPin?.(!pinned);
+        else if (action === 'rename') {
             const res = await openConfirmDialog({
                 title: 'Rename project',
                 body: `New name for “${project.name || project.id}”:`,
@@ -284,8 +296,16 @@ export async function openProjectRowMenu(project, { apiClient, anchorEl, onChang
         onClose: () => {
             menu.remove();
             anchorEl.setAttribute('aria-expanded', 'false');
-            if (closeOpenProjectRowMenu === close) closeOpenProjectRowMenu = null;
+            if (closeOpenProjectRowMenu === close) {
+                closeOpenProjectRowMenu = repositionOpenProjectRowMenu = null;
+            }
         },
     });
     closeOpenProjectRowMenu = close;
+    repositionOpenProjectRowMenu = () => {
+        if (!anchorEl.isConnected) close();
+        // A menu opened during a save must not retain its disabled snapshot afterwards.
+        else if (pinPending && !isPinPending()) close({ restoreFocus: true });
+        else binding.reposition();
+    };
 }

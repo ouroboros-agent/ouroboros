@@ -73,7 +73,6 @@ def test_schema_three_false_acceptance_zero_never_hides_pending_plan_after_old_w
     assert list(task_store.plan_collection_candidates(tmp_path)) == ["task"]
     assert _flags(tmp_path, "task") == (0, 1, 2)
     assert task_store.read_document(tmp_path, "task") == original
-    assert list(task_store.review_collection_candidates(tmp_path)) == []
 
 
 def test_actual_plan_writes_set_selection_until_the_last_pending_seat_settles(tmp_path):
@@ -184,7 +183,6 @@ def test_known_plan_work_uses_its_own_index_before_unknown_history(tmp_path, mon
     assert selected
     assert all(any("tasks_plan_collection" in step for step in _plan(tmp_path, statement, params))
                for statement, params in selected)
-    assert list(task_store.review_collection_candidates(tmp_path)) == ["acceptance"]
     assert _flags(tmp_path, "old-0") == (0, None, 1)
     assert "plan_collection_pending" not in store.FLAG_COLUMNS.values()
     publish(tmp_path / "packer", document("quiet"))

@@ -14,6 +14,7 @@ import pytest
 from ouroboros import dialogue_store
 from tests.test_ui_smoke_playwright import direct_server_with_data  # noqa: F401
 from tests._shared import producer_evidence_dir
+from tests._work_projection_shared import state_fields
 from tests.test_project_admission_refusal_browser import _producers
 from tests.test_project_authority_outages import _uncertain_child
 from tests.test_project_hold_recovery import worker
@@ -71,8 +72,8 @@ def test_nested_child_wait_and_same_id_recovery(direct_server_with_data, tmp_pat
     def state_transport(route):
         response = route.fetch()
         body = response.json()
-        body.update(active_chat_activities=_chat_activities_snapshot_safe(root), active_chat_activities_complete=True,
-                    supervisor_ready=True, task_bindings={})
+        # This process's census and the server's own work projection of it.
+        body.update(**state_fields(root, {}), active_chat_activities_complete=True, supervisor_ready=True, task_bindings={})
         route.fulfill(response=response, json=body)
 
     def frame(page, tid, **fields):
@@ -171,7 +172,7 @@ def test_nested_child_wait_and_same_id_recovery(direct_server_with_data, tmp_pat
                   subagent_task_id="held", parent_task_id="parent", root_task_id="parent", subagent_role="researcher",
                   status="cancelled")
             page.wait_for_function("() => document.querySelector('.chat-live-card[data-task-id=held]')?.dataset.finished === '1'")
-            assert child_card.locator('[data-live-phase]').inner_text() == "Cancelled"
+            assert child_card.locator('[data-live-phase]').inner_text() == "Stopped"
             assert not child_card.locator('[data-live-typing]').is_visible()
             shot(page, "cancelled-narrow")
             assert not errors, errors
@@ -248,8 +249,8 @@ def test_held_tree_header_updates_on_child_reply_without_detail_polling(direct_s
             return
         response = route.fetch()
         body = response.json()
-        body.update(active_chat_activities=_chat_activities_snapshot_safe(root), active_chat_activities_complete=True,
-                    supervisor_ready=True, task_bindings={})
+        # This process's census and the server's own work projection of it.
+        body.update(**state_fields(root, {}), active_chat_activities_complete=True, supervisor_ready=True, task_bindings={})
         completed_states.append(body)
         route.fulfill(response=response, json=body)
 
@@ -297,14 +298,18 @@ def test_held_tree_header_updates_on_child_reply_without_detail_polling(direct_s
             assert queue.persist_queue_snapshot()
             page.wait_for_function("text => document.querySelector('.chat-live-card[data-task-id=parent] [data-live-phase]')?.textContent === text", arg=WAIT)
             assert child_card.locator('[data-live-phase]').inner_text() == "Working"
-            assert page.locator('#chat-status').inner_text() == 'Working'
+            # The room says the server's room: the parent waits and the child's state is unconfirmed (a ring),
+            # whatever the child's card still shows from its earlier snapshot.
+            page.wait_for_function("() => { const s = document.querySelector('#chat-status');"
+                                   " return s?.textContent === 'Waiting' && s.dataset.mark === 'ring'; }")
             # Deliver the real child hold response, then keep subsequent state
             # reads unresolved: another census cannot mask a missing async sync.
             show_child_hold = freeze_next_child_reply = True
             with page.expect_response(lambda response: "queue_only=1" in response.url):
                 pass
-            page.wait_for_function("text => document.querySelector('#chat-status')?.textContent === text", arg=WAIT, timeout=10000)
+            page.wait_for_function("text => document.querySelector('.chat-live-card[data-task-id=held] [data-live-phase]')?.textContent === text", arg=WAIT, timeout=10000)
             assert len(completed_states) == state_count_at_child_reply
+            assert page.locator('#chat-status').inner_text() == 'Waiting'
             assert parent.locator(':scope > [data-live-summary-button] [data-live-phase]').inner_text() == WAIT
             assert child_card.locator('[data-live-phase]').inner_text() == WAIT
             assert not parent.locator(':scope > [data-live-summary-button] [data-live-typing]').is_visible()
@@ -323,8 +328,13 @@ def test_held_tree_header_updates_on_child_reply_without_detail_polling(direct_s
             write_task_result(root, "held", "cancelled", result="Stopped by the owner.")
             frame(page, "held", content="Stopped by the owner.", delegation_role="subagent", subagent_event="cancelled",
                   subagent_task_id="held", parent_task_id="parent", root_task_id="parent", subagent_role="researcher",status="cancelled")
-            page.wait_for_function("text => document.querySelector('#chat-status')?.textContent === text", arg=WAIT)
+            # Every member is confirmed again: the same word, one dot, and the parent's row says what it waits for.
+            page.wait_for_function("() => { const s = document.querySelector('#chat-status');"
+                                   " return s?.textContent === 'Waiting' && s.dataset.mark === 'dot'; }")
+            page.locator("#page-chat .rw-trigger").click()
+            page.wait_for_function("text => document.querySelector('#page-chat .rw-row[data-id=parent] .rw-secondary')?.textContent === text", arg=WAIT)
             shot(page, "held-parent-header-waiting")
+            page.keyboard.press("Escape")
             # Real working sibling is still entitled to Working in the same room.
             queue.RUNNING["working-sibling"]={"task":{"id":"working-sibling","chat_id":1},"started_at":time.time(),"attempt":1}
             write_task_result(root,"working-sibling","running",chat_id=1)

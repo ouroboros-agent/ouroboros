@@ -48,10 +48,35 @@ def test_shell_sheets_key_structure_off_the_layout_attribute_not_width_queries()
     assert 'html[data-layout="stack"] #app' in css
     assert 'html[data-layout="stack"] #primary-sidebar' in css
     assert 'html[data-layout="stack"] .project-panel' in css
-    # Docked, the Project panel keeps its own width beside Main and never covers the sidebar (owner 18.10, 4A).
-    docked_panel = css.split('html[data-layout="docked"] .project-panel {', 1)[1].split("}", 1)[0]
-    assert "max-width: calc(100vw - var(--sidebar-width))" in docked_panel
+    # Docked, the Project panel keeps its own width beside Main and never covers the sidebar (owner 18.10, 4A): it
+    # is placed in the columns after the sidebar's, and its cap is that area.
+    placed = css.split('html[data-layout="docked"] .project-panel-backdrop,\nhtml[data-layout="docked"] .project-panel {', 1)[1]
+    assert "position: absolute;" in placed.split("}", 1)[0] and "grid-column: 2 / -1;" in placed.split("}", 1)[0]
+    capped = placed.split('html[data-layout="docked"] .project-panel {', 1)[1].split("}", 1)[0]
+    assert "max-width: 100%;" in capped
     assert "data-project-fill" not in css and "data-project-fill" not in _read("web/app.js")
+
+
+def test_a_handle_drag_restyles_one_box_and_the_room_follows_it_by_layout():
+    """A drag frame writes the measured width into the dragged box's own --drag-width, which no element inherits; the
+    stored width on :root, which every element inherits (a whole-document restyle, about half of a WebKit drag frame
+    on the owner's Main), is written once at the end. So nothing but the box itself may read the stored width: the
+    grid column, the dimmed room and the panel's cap follow the box by layout, also while it is dragged."""
+    sheets = {rel: re.sub(r"/\*.*?\*/", "", _read(rel), flags=re.S)
+              for rel in ("web/style.css", "web/ui.css", "web/room_work.css", "web/settings.css", "web/model_roles.css",
+                          "web/model_wait.css")}
+    readers = {var: [(rel, line.strip()) for rel, text in sheets.items() for line in text.splitlines()
+                     if f"var({var})" in line] for var in ("--sidebar-width", "--project-panel-width")}
+    assert readers["--sidebar-width"] == [("web/style.css", "width: var(--drag-width, var(--sidebar-width));")], readers
+    assert readers["--project-panel-width"] == [("web/style.css", "width: var(--drag-width, var(--project-panel-width));")], readers
+    css = sheets["web/style.css"]
+    assert "width: var(--drag-width, var(--sidebar-width));" in css.split("#primary-sidebar {", 1)[1].split("}", 1)[0]
+    assert "width: var(--drag-width, var(--project-panel-width));" in css.split(".project-panel {", 1)[1].split("}", 1)[0]
+    registered = css.split("@property --drag-width {", 1)[1].split("}", 1)[0]
+    assert "inherits: false;" in registered and "syntax: '*';" in registered, "no element inherits a drag's width"
+    assert "overflow-x: clip;" in css.split("\n#app {", 1)[1].split("}", 1)[0], "the sliding panel never widens the page"
+    # What a drag writes, and when, is behaviour: tests/test_shell_interactions_browser.py drags both handles (the
+    # stored widths change once, at the end; a Project closed mid-drag keeps its width).
 
 
 def test_the_layout_numbers_live_once_in_theme_js():

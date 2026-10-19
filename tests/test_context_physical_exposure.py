@@ -165,7 +165,6 @@ def test_exposure_restores_through_one_continuation(tmp_path):
 
 def test_inspected_child_handle_is_readable_now_and_retained_canonically(tmp_path):
     import shutil
-    from dataclasses import asdict
     from ouroboros.artifacts import read_actor_source_bytes
     from ouroboros.tool_access_roots import resource_root_path
     from ouroboros.tools.compact_context import _compact_context, record_context_view
@@ -189,23 +188,16 @@ def test_inspected_child_handle_is_readable_now_and_retained_canonically(tmp_pat
     request = replace(_request(original, 0), working_note="I kept the evidence.",
         expected_view_revision=cc.context_reclaim_transcript_sha256(original), keep_unit_ids=(),
         restore_unit_refs=(restore_ref,))
-    authored, receipt = cc.compact_tool_history_llm(original, request=request,
+    _authored, receipt = cc.compact_tool_history_llm(original, request=request,
         drive_root=relocated, task_id="child", observed_messages=original, observed_tool_schemas=[],
         fit_candidate=lambda *_args: {"accepted": True})
     assert receipt.status == "applied" and receipt.restored_unit_refs[0]["checkpoint_ref"]["read"]
-    from ouroboros.review_source_closure import retain_review_refs
-    retained = tmp_path / "review-custody"
-    history = {"messages": authored, "view_receipt": asdict(receipt)}
-    retained_history = retain_review_refs(history, relocated, retained, "child", carrier="checkpoint")
-    assert retained_history == history  # Source/capsule identity is byte-stable during promotion.
-    shutil.rmtree(relocated)
-    exact = read_actor_source_bytes(retained, "child", receipt.restored_unit_refs[0]["checkpoint_ref"])
-    assert exact == own
+    assert read_actor_source_bytes(relocated, "child", receipt.restored_unit_refs[0]["checkpoint_ref"]) == own
     for field, value in (("kind", "unowned"), ("sha256", "0" * 64)):
         bad = copy.deepcopy(restore_ref)
         bad["checkpoint_ref"][field] = value
         _, refused = cc.compact_tool_history_llm(original,
-            request=replace(request, restore_unit_refs=(bad,)), drive_root=retained, task_id="child",
+            request=replace(request, restore_unit_refs=(bad,)), drive_root=relocated, task_id="child",
             observed_messages=original, fit_candidate=lambda *_args: {"accepted": True})
         assert refused.status == "source_unavailable"
 

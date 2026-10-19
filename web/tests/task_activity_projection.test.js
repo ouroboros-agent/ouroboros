@@ -2,10 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { activeModelWaits, mergeModelWaits } from '../modules/model_wait.js';
-import { summarizeProjectActivities } from '../modules/project_activity.js';
-import { chatStatusCounts, computeDerivedChatStatus } from '../modules/chat_activity.js';
-import { activityWaitPhase, censusTaskPhase, desiredLiveCardPhase, modelActivityPresentation, paintTaskPhase,
+import { activityWaitPhase, censusTaskPhase, desiredLiveCardPhase, paintTaskPhase,
     setInertCardPresentation, setLiveCardPhase, syncParkedPhase, taskActivityPresentation } from '../modules/task_phase_chip.js';
+import { emptyWorkState, ownStopPress, roomStatusView } from '../modules/work_status.js';
+import { room, work } from './work_fixture.js';
+
+// The room's header is the server's room (work_status.roomStatusView); the sidebar reads the same rooms
+// (project_activity.test.js). The census presenters below stay the cards' own words.
+const inRoom = (activity, extra = {}, works = []) => ({ ...emptyWorkState(), room: room(activity, extra), works });
 
 function element(hidden = false) {
     let text = '';
@@ -25,10 +29,11 @@ for (const [patch, text, motion, waiting] of [
     [{ phase: 'working' }, 'Working', true, false],
     [{ phase: 'thinking' }, 'Thinking', true, false],
     [{ phase: 'queued' }, 'Queued', false, false],
-    [{ phase: 'budget_paused', pause_cause: 'owner' }, 'Paused · owner pause', false, true],
-    [{ phase: 'budget_paused', pause_cause: 'authority' }, 'Paused · technical issue', false, true],
-    [{ phase: 'budget_paused', pause_cause: 'owner', finishing_reviews: true }, 'Paused · owner pause · review work finishing', false, true],
-    [{ phase: 'budget_pausing', pause_cause: 'owner', finishing_reviews: true }, 'Pausing… · owner pause', false, true],
+    // The census `owner` cause also covers Ouroboros's own Pause: only the work projection says who paused.
+    [{ phase: 'budget_paused', pause_cause: 'owner' }, 'Paused', false, true],
+    [{ phase: 'budget_paused', pause_cause: 'authority' }, 'Paused · technical problem', false, true],
+    [{ phase: 'budget_paused', pause_cause: 'owner', finishing_reviews: true }, 'Paused · review work finishing', false, true],
+    [{ phase: 'budget_pausing', pause_cause: 'owner', finishing_reviews: true }, 'Pausing…', false, true],
     [{ phase: 'budget_pausing' }, 'Pausing…', false, true],
     [{ phase: 'unknown' }, 'Activity unconfirmed', false, false],
     [{ required_question_unavailable: true }, 'Activity unconfirmed', false, false],
@@ -41,7 +46,7 @@ for (const [patch, text, motion, waiting] of [
     [{ project_admission_hold: { label: 'Waiting for Project verification' }, required_question_unavailable: true },
         'Waiting for Project verification', false, true],
 ]) {
-    test(`census, full card, compact chip and sidebar share ${text} (${JSON.stringify(patch)})`, () => {
+    test(`census, full card and compact chip share ${text} (${JSON.stringify(patch)})`, () => {
         const row = { activity_id: 'root', phase: 'working', ...patch };
         const view = censusTaskPhase(row, null, true, waitingModel(row));
         assert.equal(view.text, text);
@@ -57,10 +62,6 @@ for (const [patch, text, motion, waiting] of [
         paintTaskPhase(compact, view);
         assert.equal(compact.textContent, text);
         assert.equal(compact.dataset.motion, full.phaseEl.dataset.motion);
-        const sidebar = summarizeProjectActivities([row]);
-        assert.equal(sidebar.label, text);
-        assert.equal(sidebar.motion, motion);
-        assert.equal(sidebar.waiting, waiting);
     });
 }
 
@@ -81,20 +82,20 @@ for (const [phase, text, motion, detail] of [
         syncParkedPhase(full, row.phase, row);
         assert.equal(full.phaseEl.textContent, text);
         assert.equal(censusTaskPhase(row).text, text);
-        assert.equal(summarizeProjectActivities([row]).label, text);
         assert.equal(desiredLiveCardPhase(full).detail, detail);
         assert.equal(full.phaseEl.dataset.motion, motion ? '1' : '0');
         assert.equal(censusTaskPhase(row, null, false).text, 'Activity unconfirmed');
         assert.equal(censusTaskPhase(row, null, true, true).text, 'Waiting for access');
-        assert.equal(censusTaskPhase({ ...row, phase: 'budget_paused', pause_cause: 'owner' }).text, 'Paused · owner pause');
+        assert.equal(censusTaskPhase({ ...row, phase: 'budget_paused', pause_cause: 'owner' }).text, 'Paused');
         full.cancelPendingPolicy = 'immediate';
         assert.equal(desiredLiveCardPhase(full).text, 'Cancelling…');
-        const records = [{ ...full, root: { isConnected: true }, groupId: 'root', direct: true }];
-        const counts = chatStatusCounts(new Map([['root', row]]), records);
-        assert.equal(computeDerivedChatStatus(counts).text, 'Cancelling…');
+        // The owner's own Stop press on the room's working work: the header says it until the server catches up.
+        const state = inRoom('working', {}, [work({ activity_id: 'root', kind: 'direct_chat' })]);
+        const stopping = ownStopPress(state, new Map([['root', full]]));
+        assert.equal(roomStatusView(state, { stopping }).text, 'Cancelling…');
         full.finished = true;
         assert.equal(syncParkedPhase(full, 'working', row), false);
-        assert.equal(desiredLiveCardPhase(full, 'cancelled').text, 'Cancelled');
+        assert.equal(desiredLiveCardPhase(full, 'cancelled').text, 'Stopped');
     });
 }
 
@@ -139,8 +140,7 @@ test('a known failed outcome remains static beside the actual late phase', () =>
     setLiveCardPhase(full, wanted.phase, wanted.text, wanted.className, wanted.secondary);
     assert.equal(full.phaseEl.dataset.motion, '0');
     assert.equal(full.phaseSecondaryEl.dataset.motion, '1');
-    assert.equal(summarizeProjectActivities([base]).label, flattened(shared));
-    assert.equal(summarizeProjectActivities([base]).motion, true);
+    assert.deepEqual([shared.text, shared.secondary, flattened(shared)], ['Failed', 'Finalizing…', 'Failed · Finalizing…']);
     setInertCardPresentation(full, true);
     assert.equal(full.phaseEl.hidden, true);
     assert.equal(full.phaseEl.getAttribute('aria-label'), 'Task status: Failed, Finalizing…');
@@ -152,28 +152,14 @@ test('a known failed outcome remains static beside the actual late phase', () =>
 });
 
 test('the chat header says Finalizing… for ended work, never Working, while real work still wins', () => {
-    // 12.10: a failed root writing its reflection kept the header on "Working" for ~19 min.
-    const finalizing = { activity_id: 'failed', kind: 'managed_task', phase: 'finalizing', status: 'failed',
-        root_phase_checkpoint: { post_task_synthesis: 'running' } };
-    const heldCard = { root: { isConnected: true }, groupId: 'failed', finished: false,
-        finalizingHold: true, observedOutcome: 'error' };
-    const status = (activities, records) => computeDerivedChatStatus(chatStatusCounts(new Map(activities), records)).text;
-    assert.equal(status([['failed', finalizing]], []), 'Finalizing…');
-    assert.equal(status([], [heldCard]), 'Finalizing…');
-    assert.equal(status([['failed', finalizing]], [heldCard]), 'Finalizing…');
-    const working = { activity_id: 'w', kind: 'managed_task', phase: 'working' };
-    assert.equal(status([['failed', finalizing], ['w', working]], [heldCard]), 'Working');
-    const direct = { activity_id: 'd', kind: 'direct_turn', phase: 'working' };
-    assert.notEqual(status([['failed', finalizing], ['d', direct]], [heldCard]), 'Finalizing…');
-    assert.equal(status([], [{ root: { isConnected: true }, groupId: 'x', finished: false }]), 'Working');
-    assert.equal(computeDerivedChatStatus({ ...chatStatusCounts(new Map([['failed', finalizing]]), []),
-        isConnected: false }).text, 'Reconnecting…');
-    // A direct-chat root wraps up the same way (gateway census kind direct_chat).
-    const directFinalizing = { ...finalizing, activity_id: 'dr', kind: 'direct_chat' };
-    const directCard = { ...heldCard, groupId: 'dr', direct: true };
-    assert.equal(status([['dr', directFinalizing]], []), 'Finalizing…');
-    assert.equal(status([['dr', directFinalizing]], [directCard]), 'Finalizing…');
-    assert.equal(status([], [directCard]), 'Finalizing…');
+    // A failed root still writing its reflection never keeps the header on "Working": the server's room
+    // says Finalizing… when every working work is finalizing (gateway/work_status.roll_up_room).
+    assert.equal(roomStatusView(inRoom('working', { transition: 'finalizing' })).text, 'Finalizing…');
+    assert.equal(roomStatusView(inRoom('working', { transition: 'finalizing' })).tone, 'live');
+    assert.equal(roomStatusView(inRoom('working')).text, 'Working', 'another work running: the room works');
+    assert.equal(roomStatusView(inRoom('working', { transition: 'finalizing' }), { connected: false }).text, 'Reconnecting…');
+    // A card the projection does not list (an unfinished held card) never sets the header.
+    assert.equal(roomStatusView(emptyWorkState()).text, 'Online');
 });
 
 test('terminal detail stays terminal offline; finalization cannot be ended by a stale detail response', () => {
@@ -206,10 +192,6 @@ test('the validated model wait affects only its task attempt and independent sib
     const waiting = censusTaskPhase(row, null, true, waitingModel(row));
     assert.equal(waiting.text, 'Waiting for access');
     assert.equal(waiting.motion, false);
-    const mixed = summarizeProjectActivities([row, { activity_id: 'other', phase: 'working' }]);
-    assert.equal(mixed.motion, true);
-    assert.equal(mixed.waiting, true);
-    assert.equal(mixed.label, 'Working · Waiting for access');
     row.model_waits.w.state = 'resolved';
     assert.equal(censusTaskPhase(row, null, true, waitingModel(row)).motion, true);
 });
@@ -282,35 +264,28 @@ test('Stop retains its existing active-operation movement without animating a pa
     }
 });
 
-// One producer for the header (owner 15.10, 3C/4A): the word, its tone and its dots come together, and the tone
-// follows the call's operation, never its English word.
-test('the header producer pins word, tone and dots; a stop policy passes its own word through', () => {
-    const header = (fields) => {
-        const { text, tone, dots } = computeDerivedChatStatus(fields);
+// One producer for the header: the word, its tone and its dots come together from
+// the server's room; the tone follows the room's activity, never an English word.
+test('the header producer pins word, tone and dots; an own Stop press passes its own word through', () => {
+    const header = (state, overlay = {}) => {
+        const { text, tone, dots } = roomStatusView(state, overlay);
         return [text, tone, dots];
     };
-    const call = (phase) => header({ activeDirectCount: 1, modelActivity: modelActivityPresentation({ phase }) });
-    for (const phase of ['preparing', 'dispatching', 'awaiting_response', 'response_ready', 'response_received']) {
-        assert.equal(call(phase)[1], 'live', phase);
-        assert.equal(call(phase)[2], 'moving', phase);
+    for (const [call, word] of [['preparing', 'Preparing'], ['sending', 'Sending'], ['thinking', 'Thinking'], ['working', 'Working']]) {
+        assert.deepEqual(header(inRoom('working', { call })), [word, 'live', 'moving'], call);
     }
-    assert.deepEqual(call('queued'), ['Queued', 'queued', 'still']);
-    // Rejoining waits on a call it already started: a single fact, one dot, never queued work.
-    assert.deepEqual(call('rejoining'), ['Rejoining', 'held', 'one']);
-    assert.deepEqual(call('unknown'), ['Activity unconfirmed', 'unknown', 'one']);
-    // A stop policy's view carries no operation: its own word stays (Cancelling…, Finalizing…), never Working.
-    for (const [stopPolicy, word] of [['immediate', 'Cancelling…'], ['finalize', 'Finalizing…']]) {
-        const view = taskActivityPresentation({ phase: 'working', stopPolicy });
-        assert.deepEqual(header({ activeManagedCount: 1, modelActivity: view }), [word, 'live', 'moving']);
+    // The owner's own Stop press keeps its word (Cancelling…, Finalizing…), never Working.
+    for (const [stopping, word] of [['immediate', 'Cancelling…'], ['finalize', 'Finalizing…']]) {
+        assert.deepEqual(header(inRoom('working'), { stopping }), [word, 'live', 'moving']);
     }
-    assert.deepEqual(header({ queuedManagedCount: 1 }), ['Queued', 'queued', 'still']);
-    assert.deepEqual(header({ waitingOwnerCount: 1 }), ['Waiting for your answer', 'wait', 'one']);
-    // Amber belongs to the owner's question alone: pauses, access waits and holds are neutral facts.
-    assert.deepEqual(header({ pausedManagedCount: 1, pausedCause: 'owner' }), ['Paused · owner pause', 'held', 'one']);
-    assert.deepEqual(header({ pausingManagedCount: 1 }), ['Pausing…', 'held', 'one']);
-    assert.deepEqual(header({ waitingModelCount: 1 }), ['Waiting for access', 'held', 'one']);
-    assert.deepEqual(header({ projectWaitLabel: 'Waiting for Project verification' }), ['Waiting for Project verification', 'held', 'one']);
-    assert.deepEqual(header({ supervisorStarting: true }), ['Starting…', 'starting', 'one']);
-    assert.deepEqual(header({ isConnected: false, activeDirectCount: 1 }), ['Reconnecting…', 'offline', 'one']);
-    assert.deepEqual(header({}), ['Online', 'online', 'one']);
+    assert.deepEqual(header(inRoom('queued')), ['Queued', 'queued', 'still']);
+    assert.deepEqual(header(inRoom('waiting', { turn: [{ kind: 'question', task_id: 'q' }] })), ['Waiting for your answer', 'wait', 'one']);
+    // Amber belongs to what waits for the owner; a pause, a wait on the model and a Project hold are neutral facts.
+    assert.deepEqual(header(inRoom('paused')), ['Paused', 'held', 'one']);
+    assert.deepEqual(header(inRoom('working', { transition: 'pausing' })), ['Pausing…', 'held', 'moving']);
+    assert.deepEqual(header(inRoom('waiting')), ['Waiting', 'held', 'one']);
+    assert.deepEqual(header(inRoom('unknown')), ['Activity unconfirmed', 'unknown', 'one']);
+    assert.deepEqual(header(emptyWorkState(), { ready: false }), ['Starting…', 'starting', 'one']);
+    assert.deepEqual(header(inRoom('working'), { connected: false }), ['Reconnecting…', 'offline', 'one']);
+    assert.deepEqual(header(emptyWorkState()), ['Online', 'online', 'one']);
 });

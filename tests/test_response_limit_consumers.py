@@ -29,7 +29,7 @@ def test_native_catalog_maximum_remains_planning_evidence_not_an_engine_option(n
     assert "maxOutputTokens" not in gateway.uploads[-1][0]["options"]
 
 
-def test_real_reviewer_repair_and_forced_candidate_share_the_physical_ceiling(transport):
+def test_a_real_reviewer_send_and_the_forced_candidate_share_the_physical_ceiling(transport):
     from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
     from ouroboros.task_pacing import prospective_wrapup_attempt_request
     from tests._usage_store_testing import ledger_rows
@@ -38,16 +38,18 @@ def test_real_reviewer_repair_and_forced_candidate_share_the_physical_ceiling(tr
     route = dict(provider="openai", model=model, base_url="https://api.openai.com/v1")
     record_response_ack(root, **route, max_output_tokens=4096)
     ce.record_owner_ack(root, **route, window_tokens=100000)
-    result = run_review_request(ReviewRequest(surface="task_acceptance", goal="assess", task_id="processing", no_proxy=False,
-        max_tokens=65536, policy={"classify_outcome_tier": True, "min_successful_slots": 1}),
+    # The review_change wave's surface (a task's result review dispatches under it too).
+    result = run_review_request(ReviewRequest(surface="multi_model_review", goal="assess", task_id="processing",
+        no_proxy=False, max_tokens=65536, policy={"min_successful_slots": 1}),
         slots=[ReviewSlot(slot_id="one", model=model)], drive_root=root, llm=client)
-    assert len(sent) == 2, result.actors  # Actual reviewer sends its invalid-response repair.
-    assert all(payload["max_completion_tokens"] == 4096 for payload in sent)
-    assert len(ledger_rows(root)) == 2
+    # One answered send: the format-repair resend left with the task-acceptance machine.
+    assert len(sent) == 1, result.actors
+    assert sent[0]["max_completion_tokens"] == 4096
+    assert len(ledger_rows(root)) == 1
     prospective = prospective_wrapup_attempt_request(llm=client, messages=[{"role": "user", "content": "finish"}],
         model=model, reasoning_effort="high")
     assert prospective.max_completion_tokens == 4096
-    assert len(ledger_rows(root)) == 2  # Preparing a forced send reserves nothing.
+    assert len(ledger_rows(root)) == 1  # Preparing a forced send reserves nothing.
 
 
 @pytest.mark.parametrize("role", ["main", "light", "reviewer:triad_1", "consciousness"])
@@ -397,9 +399,10 @@ def test_a_malformed_subscription_identity_keeps_its_failed_window_evidence(tmp_
     assert window_scaled_reserves(0, output_reserve=65536, tokenizer_margin=1, model_id="claudexor::missing-model") == (65536, 1)
 
 
-def test_commit_gate_seats_and_the_catalog_row_price_reserve_each_route_maximum(transport, tmp_path, monkeypatch):
+def test_commit_gate_seats_reserve_each_route_maximum(transport, tmp_path):
+    """Each paid seat reserves its own route's maximum response. (A catalog row's price is no
+    longer a reservation estimate: ``review_price`` measures it from the usage ledger.)"""
     from ouroboros.review_execution import ReviewRouteKind
-    from ouroboros.tools import review_helpers
     from ouroboros.tools.review_admission import commit_gate_paid_seats
     from ouroboros.tools.review_multi_model import _review_output_budget
     root, _client, _sent = transport
@@ -411,12 +414,6 @@ def test_commit_gate_seats_and_the_catalog_row_price_reserve_each_route_maximum(
                              "session_profiles": ["", ""], "use_local": [False, False]}}
     seats = commit_gate_paid_seats(prepared, False)
     assert [seat["max_completion_tokens"] for seat in seats] == [4096, _review_output_budget()]
-    priced = []
-    monkeypatch.setattr("ouroboros.usage_admission.review_wave_admission",
-                        lambda **kw: priced.append(kw["max_completion_tokens"]) or {"slot_bounds": [None]})
-    for slot_id, model in (("one", capped), ("two", other)):
-        review_helpers.review_row_call_usd({"slot_id": slot_id, "model": model}, allow_live_fetch=False)
-    assert priced == [4096, _review_output_budget()]
 
 
 def test_light_consolidation_and_memory_fit_plan_the_route_maximum(monkeypatch):

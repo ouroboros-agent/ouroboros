@@ -42,7 +42,7 @@ log = logging.getLogger(__name__)
 
 BUILTIN_SOURCE = {"id": "builtin", "kind": "builtin", "name": "Built in"}
 SEED_MARKER = ".seed-origin"
-RECEIPT_SCHEMA_VERSION = 2  # 1 was the launcher's native-seed pass
+RECEIPT_SCHEMA_VERSION = 3  # requested instruction turn-ons must finish before the receipt
 _MANIFEST_NAMES = ("SKILL.md", "skill.json")
 
 
@@ -451,37 +451,38 @@ def _requested_on(drive: pathlib.Path, skill: Any) -> bool:
 
 
 def _wants_lifecycle_work(drive: pathlib.Path, skill: Any) -> bool:
-    """A built-in extension accepted without a review that is on, or asked to turn on (it stays off until
+    """A built-in accepted without a review that is on, or asked to turn on (it stays off until
     its dependencies are ready)."""
     from ouroboros.skill_acceptance import accepted_without_review
 
-    if skill is None or skill.source != "native" or not skill.manifest.is_extension() or not accepted_without_review(skill):
+    if skill is None or skill.source != "native" or not accepted_without_review(skill):
         return False
     return bool(skill.enabled) or _requested_on(drive, skill)
 
 
 def _builtins_needing_work(drive: pathlib.Path, names: List[str], logger: Any, *,
                            requested_on: bool) -> Optional[List[str]]:
-    """Built-ins (``_wants_lifecycle_work``) whose isolated dependencies are not ready, and with
-    ``requested_on`` also those still waiting to turn on; ``None`` when they could not be inspected
-    (callers treat that as work left)."""
+    """Unfinished dependency work and ready instruction turn-ons; ``requested_on`` also includes
+    turn-ons waiting for owner grants. Unknown inspection returns ``None``, never completion."""
     try:
         from ouroboros.config import get_skills_repo_path
         from ouroboros.skill_dependencies import skill_deps_not_ready
-        from ouroboros.skill_loader import find_skill
+        from ouroboros.skill_loader import find_skill, grant_status_for_skill
 
         repo_path = get_skills_repo_path() or None
         found = [find_skill(drive, name, repo_path=repo_path) for name in names]
         return [skill.name for skill in found if _wants_lifecycle_work(drive, skill) and (
-            skill_deps_not_ready(drive, skill, strict=True)[1] or (requested_on and _requested_on(drive, skill)))]
+            skill_deps_not_ready(drive, skill, strict=True)[1] or (_requested_on(drive, skill) and (
+                requested_on or (skill.manifest.is_instruction()
+                                 and grant_status_for_skill(drive, skill)["all_granted"]))))]
     except Exception:
         logger.warning("Built-in skill dependencies could not be inspected", exc_info=True)
         return None
 
 
 def _builtins_needing_dependencies(drive: pathlib.Path, names: List[str], logger: Any) -> Optional[List[str]]:
-    """The receipt's condition: no built-in that wants its dependencies is still without them (a turn-on
-    waiting for the owner's grants never holds it)."""
+    """Do not certify unfinished dependencies or an instruction's interrupted turn-on.
+    A turn-on waiting for the owner's grants never holds the receipt."""
     return _builtins_needing_work(drive, names, logger, requested_on=False)
 
 
@@ -512,7 +513,8 @@ def _dependency_pass(drive: pathlib.Path, names: List[str], logger: Any) -> List
             return {"deps_status": "skipped"}
         status, error = accepted_release_dependencies(drive, skill, repo_path=repo_path)
         turn_on = reconcile_turn_on_when_ready(drive, name, repo_path=repo_path, reason="dependencies ready at startup")
-        state = extension_loader.reconcile_extension(name, drive, load_settings, repo_path=repo_path)
+        state = (extension_loader.reconcile_extension(name, drive, load_settings, repo_path=repo_path)
+                 if skill.manifest.is_extension() else {})
         return {"deps_status": status, "error": error, "turn_on": turn_on["action"],
                 "extension_action": state.get("action")}
 
@@ -534,7 +536,7 @@ def ensure_builtin_skills(drive_root: Optional[pathlib.Path] = None, *, log_obj:
     records for launcher-seeded built-ins), then, unless ``state/native_seed.json`` already names
     this committed bundled tree, re-seeding changed built-ins and releasing built-ins the app no
     longer bundles. The receipt is removed before that pass and written only when it completed
-    with no built-in still needing dependencies; the dependency pass then runs off the boot path.
+    with no dependencies or ready instruction turn-ons unfinished; the lifecycle pass runs off the boot path.
     Returns the number re-seeded."""
     from ouroboros.config import DATA_DIR
     from ouroboros.skill_identity import convert_skill_identities

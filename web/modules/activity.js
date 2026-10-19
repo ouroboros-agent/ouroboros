@@ -11,6 +11,7 @@ import { setInlineStatus } from './ui_helpers.js';
 import { openConfirmDialog } from './confirm_dialog.js';
 import { taskCancelPending } from './log_events.js';
 import { waitingModel } from './project_activity.js';
+import { openWorkControls, pauseReasons, resumeTargets, workOfEpisode } from './work_status.js';
 import { censusTaskFacts, censusTaskPhase, paintTaskPhase } from './task_phase_chip.js';
 import {
     ACTION_HURRY,
@@ -54,8 +55,8 @@ export function ownOutcomePhase(activity, queueFact = null) {
         ? { ...view, secondary: queueFact, secondaryMotion: false } : view;
 }
 
-/** An answered root whose late work remains (D10) names its own work, when it answered,
- * and that only the work left after the delivered answer waits — never a generic turn. */
+/** An answered root whose late work remains (its upkeep, or a review its Pause deferred) names
+ * its own work, when it answered, and that only the work after the answer waits — never a generic turn. */
 function lateWorkHtml(a, late) {
     const at = new Date(String(late.answered_at || ''));
     const iso = Number.isNaN(at.getTime()) ? '' : at.toISOString();
@@ -66,10 +67,11 @@ function lateWorkHtml(a, late) {
     return { name: esc(late.title || 'Answered task'), sub: `Remaining work ${state} · answer delivered${when}` };
 }
 
-/** A census-only live root (a direct turn, or an answered root whose late work the owner
- * paused, D10): its phase, and the shared control — Resume once the census says Paused.
- * `slot` marks where the caller paints a known outcome (`ownOutcomePhase`). */
-export function liveActivityRowHtml(a, nowMs = Date.now(), slot = null) {
+/** A census-only live root (a direct turn, or an answered root whose late work remains):
+ * its phase, and the shared control — Resume only where its work's Resume control targets it
+ * (`resume`, work_status.resumeTargets). `slot` marks where the caller paints a known outcome
+ * (`ownOutcomePhase`). */
+export function liveActivityRowHtml(a, nowMs = Date.now(), slot = null, resume = false) {
     const names = { direct_chat: 'Direct turn', managed_task: 'Managed task' };
     const started = Number(a.started_at) || 0;
     const elapsed = started > 0 ? ` · ${Math.max(0, Math.round(nowMs / 1000 - started))}s` : '';
@@ -81,7 +83,7 @@ export function liveActivityRowHtml(a, nowMs = Date.now(), slot = null) {
                     <span class="activity-sub">${late ? late.sub : `${outcome ? slot(outcome) : esc(a.phase || '')}${elapsed}`}</span>
                 </div>
                 <div class="activity-row-actions">
-                    <button type="button" class="btn btn-xs btn-danger" data-act="task-control" data-id="${esc(a.activity_id || '')}" data-root="1"${a.phase === 'budget_paused' ? ' data-budget-paused="1"' : ''}>${esc(TASK_CONTROL_TRIGGER_LABEL)}</button>
+                    <button type="button" class="btn btn-xs btn-danger" data-act="task-control" data-id="${esc(a.activity_id || '')}" data-root="1"${a.phase === 'budget_paused' ? ' data-budget-paused="1"' : ''}${resume ? ' data-resume="1"' : ''}>${esc(TASK_CONTROL_TRIGGER_LABEL)}</button>
                 </div>
             </div>`;
 }
@@ -263,14 +265,23 @@ export function initActivity({ mount, ws } = {}) {
     // Known-outcome chips of the last queue render; paintTaskPhase writes them into
     // their slots once the markup is mounted. The words come from the translation seam.
     let phaseViews = [];
+    // The body the queue was last drawn from: a work's controls come from it, at their exact targets.
+    let lastCensus = null;
     const phaseSlot = (view) => `<span class="activity-phase" data-i18n-skip><span data-activity-phase="${
         phaseViews.push(view) - 1}"></span><span class="chat-live-phase-secondary" hidden></span></span>`;
 
     function renderQueue(queue, census) {
         if (!Array.isArray(queue?.running) || !Array.isArray(queue?.pending)) throw new Error('Queue unavailable');
+        lastCensus = census;
         const { running, pending } = queue;
         const activities = Array.isArray(census?.active_chat_activities) ? census.active_chat_activities : [];
         const phases = new Map(activities.map((a) => [String(a?.activity_id || ''), a?.phase]));
+        // Resume is offered only on a task a work's Resume control names (the server's door decision).
+        const resumable = resumeTargets(census);
+        // Who paused is the work's fact: the census's own `owner` cause cannot tell the owner from Ouroboros.
+        const pausedBy = pauseReasons(census);
+        const ownActivity = (a) => (a && pausedBy.has(String(a.activity_id || ''))
+            ? { ...a, pause_cause: pausedBy.get(String(a.activity_id)) } : a);
         const rootPhases = new Map();
         for (const q of [...running, ...pending]) {
             const t = q?.task || {}, id = String(q.id || t.id || '');
@@ -319,14 +330,14 @@ export function initActivity({ mount, ws } = {}) {
             const ownId = String(q.id || t.id || ''), rootId = String(t.root_task_id || ownId);
             const phase = phases.get(ownId) ?? rootPhases.get(rootId) ?? phases.get(rootId);
             const paused = rowBudgetPaused(q, t, kind) || (ownerPaused && phases.get(ownId) === 'budget_paused');
-            const resumable = paused && (!ownerPaused || phase === 'budget_paused');
+            const parked = paused && (!ownerPaused || phase === 'budget_paused');
             const kindLabel = phase === 'unknown' ? 'pause status unknown'
                 : phase === 'budget_pausing' ? 'pausing' : restartHeld ? 'held after Restart'
                 : continueHeld ? 'held: earlier work not proven settled'
                 : (paused ? (ownerPaused ? 'paused' : sleeping ? 'sleeping'
                     : authorityPaused ? 'paused (technical)' : 'paused (budget)') : sleeping ? 'sleeping' : kind);
             // A result is still the row's own, beside its wait word.
-            const outcome = ownId && ownOutcomePhase(activities.find((entry) => entry?.activity_id === ownId),
+            const outcome = ownId && ownOutcomePhase(ownActivity(activities.find((entry) => entry?.activity_id === ownId)),
                 kindLabel === 'running' ? '' : kindLabel);
             const heldFacts = continueHeld ? heldWorkFacts(t._budget_pause_hold.blockers) : '';
             const meta = `${outcome ? phaseSlot(outcome) : esc(kindLabel)}${heldFacts ? ` · ${esc(heldFacts)}` : ''}${q.type ? ` · ${esc(q.type)}` : ''}${rt}`;
@@ -339,7 +350,7 @@ export function initActivity({ mount, ws } = {}) {
                     <span class="activity-sub">${meta}${projectWait}</span>
                 </div>
                 <div class="activity-row-actions">
-                    <button type="button" class="btn btn-xs btn-danger" data-act="task-control" data-id="${id}"${resumable ? ' data-budget-paused="1"' : ''}${phases.has(ownId) || isRootTaskRow(t, ownId) ? ' data-root="1"' : ''}>${esc(TASK_CONTROL_TRIGGER_LABEL)}</button>
+                    <button type="button" class="btn btn-xs btn-danger" data-act="task-control" data-id="${id}"${parked || resumable.has(ownId) ? ' data-budget-paused="1"' : ''}${resumable.has(ownId) ? ' data-resume="1"' : ''}${phases.has(ownId) || isRootTaskRow(t, ownId) ? ' data-root="1"' : ''}>${esc(TASK_CONTROL_TRIGGER_LABEL)}</button>
                 </div>
             </div>`;
         };
@@ -348,7 +359,7 @@ export function initActivity({ mount, ws } = {}) {
         const known = new Set([...running, ...pending].map((q) => String(q.id || q.task?.id || '')));
         const live = activities.filter((a) => a && !known.has(String(a.activity_id || '')));
         const parts = [...running.map((q) => row(q, 'running')), ...pending.map((q) => row(q, 'pending')),
-            ...live.map((a) => liveActivityRowHtml(a, Date.now(), phaseSlot))];
+            ...live.map((a) => liveActivityRowHtml(ownActivity(a), Date.now(), phaseSlot, resumable.has(String(a.activity_id || ''))))];
         if (parts.length) return parts.join('');
         return census?.active_chat_activities_complete === true
             ? '<div class="activity-empty">Nothing running or queued.</div>'
@@ -526,9 +537,15 @@ export function initActivity({ mount, ws } = {}) {
             } catch (exc) {
                 if (exc?.status !== 404) showToast(`Could not refresh task state: ${exc?.message || exc}`, 'error');
             }
+            // A work's current episode offers that work's controls: Stop reaches every episode root still
+            // running, Stop earlier attempt the earlier ones, each at the server's exact target.
+            const work = btn.dataset.root === '1' ? workOfEpisode(lastCensus, id) : null;
+            if (work && openWorkControls(btn, work, { cancelPending: taskCancelPending(stored), withResume: true,
+                afterAction: refresh })) return;
             openTaskControlMenu(btn, {
                 cancelPending: taskCancelPending(stored),
                 budgetPaused: btn.dataset.budgetPaused === '1',
+                resume: btn.dataset.resume === '1',
                 // A child's Pause would not name its own tree (the server refuses it).
                 wholeTree: btn.dataset.root === '1',
                 busy: taskControlBusy(id),

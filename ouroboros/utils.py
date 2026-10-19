@@ -897,6 +897,15 @@ def llm_usage_cost(event: Dict[str, Any]) -> float:
 
 def safe_relpath(p: str) -> str:
     """Normalize relative paths and reject traversal/NUL/control-char payloads."""
+    p = normalized_path_text(p).lstrip("/")
+    if ".." in pathlib.PurePosixPath(p).parts:
+        raise ValueError("Path traversal is not allowed.")
+    return p
+
+
+def normalized_path_text(p: str) -> str:
+    """The character refusal and separator spelling ``safe_relpath`` applies before its
+    traversal rule; a caller that judges ``..`` by the resolved location reuses only this."""
     if not isinstance(p, str):
         raise ValueError("Path must be a string.")
     for ch in p:
@@ -906,10 +915,7 @@ def safe_relpath(p: str) -> str:
             raise ValueError(
                 f"Path contains control character U+{ord(ch):04X}."
             )
-    p = p.replace("\\", "/").lstrip("/")
-    if ".." in pathlib.PurePosixPath(p).parts:
-        raise ValueError("Path traversal is not allowed.")
-    return p
+    return p.replace("\\", "/")
 
 def truncate_for_log(s: str, max_chars: int = 4000) -> str:
     if len(s) <= max_chars:

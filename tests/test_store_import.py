@@ -251,6 +251,47 @@ def test_the_boot_probe_retiers_an_existing_store_both_ways(tmp_path, monkeypatc
     assert "retiered_from" not in ensure_current_store(root, with_children=False)
 
 
+_SIBLING_WRITE = """
+import sys
+from ouroboros import store
+with store.open_store(sys.argv[1], write=True) as txn:
+    txn.set_meta("sibling_wrote", True)
+    print(txn.conn.execute("PRAGMA journal_mode").fetchone()[0])
+"""
+
+
+@pytest.mark.parametrize("before, after", [(store.TIER_ENFORCED, store.TIER_NAME), (store.TIER_NAME, store.TIER_ENFORCED)],
+                         ids=["enforced_to_name", "name_to_enforced"])
+def test_a_boot_retier_leaves_this_process_choosing_the_journal_its_siblings_choose(tmp_path, monkeypatch, before, after):
+    """A lock-tier re-record converts the file the way an export hands it off, but this process keeps
+    running: its next write picks the journal mode a sibling process (a worker) picks, while this
+    process's cached connection stays open across the sibling's write. Left in the handed-off set it
+    wrote in DELETE mode for its whole life while the workers chose their own mode, and on Windows a
+    worker's open PERSIST journal then fails every DELETE commit of the server."""
+    import sys
+
+    from ouroboros import platform_layer
+    from tests.group_run import run_in_group
+
+    root = fixture_root(tmp_path)
+    monkeypatch.setattr(platform_layer, "kernel_file_locks_enforced", lambda path, **kw: before == store.TIER_ENFORCED)
+    ensure_current_store(root, with_children=False)
+    identity = store_import._mount_identity(root / "state")
+    monkeypatch.setattr(store_import, "_mount_identity", lambda path: {**identity, "st_dev": identity["st_dev"] + 1})
+    monkeypatch.setattr(platform_layer, "kernel_file_locks_enforced", lambda path, **kw: after == store.TIER_ENFORCED)
+    assert ensure_current_store(root, with_children=False)["retiered_from"] == before  # the volume changed
+    with store.open_store(root, write=True) as txn:
+        txn.set_meta("server_wrote", True)
+        mine = txn.conn.execute("PRAGMA journal_mode").fetchone()[0]
+    try:
+        sibling = run_in_group([sys.executable, "-c", _SIBLING_WRITE, str(root)], timeout=120,
+                               cwd=str(pathlib.Path(__file__).resolve().parents[1]), env=dict(os.environ))
+    finally:
+        store.close_connections()
+    assert sibling.returncode == 0, sibling.stdout + sibling.stderr
+    assert mine == sibling.stdout.strip().splitlines()[-1] == store._journal_mode(store.store_path(root), after).lower()
+
+
 # ---- export -------------------------------------------------------------------------
 
 def test_the_export_reproduces_every_file_byte_for_byte(tmp_path):

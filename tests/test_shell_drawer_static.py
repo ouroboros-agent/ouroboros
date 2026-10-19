@@ -1,7 +1,7 @@
 """The phone drawer (docs/DESIGN.md "Shell", plan P4/P5, owner Q1=A): the same sidebar slides in from the
-left as a layer over a scrim; its head row shows the one × exactly where the header's ☰ was; ☰ is in the
-leading slot of EVERY header, the open Project included; the closed drawer is inert and out of the tab
-order; there is no empty 64px band."""
+left as a layer over a scrim; its head row shows the one × exactly where a page header's ☰ is; a room (Main,
+an open Project) carries its ☰ as the composer row's first control instead (owner 19.10, 1A), and the × stays
+in the drawer's head (2A); the closed drawer is inert and out of the tab order; there is no empty 64px band."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -32,8 +32,15 @@ def test_drawer_is_a_layer_with_one_close_control_where_the_menu_button_was():
     assert "querySelector('.sidebar-head')?.insertAdjacentHTML('beforeend', renderNavRows('head'))" in app_js
     assert "navDrawerClose.innerHTML = SHELL_ICONS.close;" in app_js
     assert "navDrawerClose.addEventListener('click', () => setMobileDrawerOpen(false));" in app_js
-    # ☰ stays in every header, the open Project included.
+    # A room's ☰ is its composer's first control; its header opts out; every other page keeps ☰ in its header.
     assert "body.project-panel-open .mobile-nav-toggle" not in css
+    chat_js = _read("web/modules/chat.js")
+    row = chat_js.split('<div class="chat-toolbar-row">', 1)[1]
+    assert row.lstrip().startswith("${renderMobileNavToggle({ inComposer: true })}"), "the composer row starts with ☰"
+    assert "showMobileNav: false,  // a room's ☰ is its composer row's first control" in chat_js
+    assert "showMobileNav: false," in app_js.split("projectPanel?.insertAdjacentHTML('afterbegin', renderPageHeader({", 1)[1].split("}));", 1)[0]
+    composer = css.split('html[data-layout="stack"] .chat-toolbar-row > .composer-menu {', 1)[1].split("}", 1)[0]
+    assert "height: var(--composer-control-height);" in composer, "as tall as the capsules beside it"
     # The closed drawer is inert in the stack layout; the scrim stays live under the modal layer.
     assert "primarySidebar.inert = isStackLayout() && !drawerOpen;" in app_js
     assert "live: [navDrawerBackdrop].filter(Boolean)" in app_js

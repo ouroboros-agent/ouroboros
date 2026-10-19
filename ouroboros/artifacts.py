@@ -764,6 +764,7 @@ def read_task_result_source_bytes(
     review = result.get("review_projection")
     panels = review.get("panels") if isinstance(review, dict) else []
     refs = [row.get("applied_source_ref") for row in (panels if isinstance(panels, list) else []) if isinstance(row, dict)]
+    # completion observations, and the historical source an older record's acceptance debt pinned (read-only)
     for key in ("completion_observations", "acceptance_debt"):
         if isinstance(value := result.get(key), dict):
             refs.append(value.get("source_ref"))
@@ -791,134 +792,6 @@ def persist_exact_text_source(
             "status": "source_unavailable",
             "reason": f"{type(exc).__name__}: {exc}",
         }
-
-
-def persist_tool_trajectory_source(
-    drive_root: Union[pathlib.Path, str], task_id: str, tool_calls: Any,
-) -> Dict[str, Any]:
-    """Persist the complete redacted tool-call corpus behind acceptance views."""
-    try:
-        from ouroboros.observability import redact_projection
-
-        calls = [dict(call) for call in (tool_calls or []) if isinstance(call, dict)]
-        projected = redact_projection(calls).value
-        data = json.dumps(projected, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
-        stored_ref = store_actor_source_bytes(
-            drive_root, task_id, category="tool_results",
-            source_id="acceptance_tool_trajectory", data=data, extension="json",
-        )
-        path = str(stored_ref["path"])
-        return {
-            **stored_ref,
-            "reader": "read_file",
-            "artifact_ref": f"artifact_store:{path}#chars=0-{len(data.decode('utf-8'))}",
-        }
-    except Exception:
-        log.warning("acceptance tool trajectory source persistence failed", exc_info=True)
-        return {}
-
-
-def collect_exact_repo_diff(repo: Any, *, include_recent_commit: bool = False) -> str:
-    """Project the unbounded, hook-disabled repository diff of ONE bytes capture.
-
-    The text is the decoded, REDACTED projection of `repo_diff_capture`, not a
-    second read of the tree, and it carries the capture's own gap disclosure: an
-    unreadable or partially captured repository reads as a stated gap, never as
-    a clean (empty) diff. The EXACT bytes stay with the capture, which this
-    legacy text-only path releases once projected.
-    """
-    from ouroboros.repo_diff_capture import capture_repo_diff, repo_diff_projection_text
-
-    if not repo:
-        return ""
-    capture = capture_repo_diff(repo, include_recent_commit=include_recent_commit)
-    try:
-        return repo_diff_projection_text(capture)
-    finally:
-        capture.release()
-
-
-def materialize_repo_diff_evidence(
-    repo: Any, drive_root: Any, task_id: str, *, limit: int = 20000,
-    include_recent_commit: bool = False, capture: Any = None,
-) -> tuple[str, Dict[str, Any]]:
-    """Return a redacted exact diff or a typed cannot-verify projection.
-
-    ``capture`` is the ALREADY-TAKEN bytes capture of this acceptance round: the
-    packet preview and this exact source must describe the same tree, so the
-    second independent `git` read is gone. A caller without one (a direct/legacy
-    call) still gets its own single capture.
-
-    Two identities leave here, and they are not interchangeable: the EXACT bytes
-    are retained privately (`retain_private_capture`, never returned to a
-    reviewer, a log, an export or a download), and the redacted TEXT projection
-    is what the packet and the actor-readable source handle carry.
-    """
-    from ouroboros.repo_diff_capture import (
-        capture_disclosure, capture_repo_diff, repo_diff_projection, retain_private_capture,
-    )
-    from ouroboros.utils import truncate_review_artifact
-
-    if capture is None:
-        capture = capture_repo_diff(repo, include_recent_commit=include_recent_commit)
-    # Decoded and redacted WHOLE by the projection, before any bound below.
-    try:
-        redacted, decode_gaps = repo_diff_projection(capture)
-        disclosure = capture_disclosure(capture, decode_gaps)
-    except BaseException:
-        capture.release()
-        raise
-    meta: Dict[str, Any] = {"capture_disclosure": disclosure}
-    # Host-private forensics; deliberately NOT part of the evidence packet. Every
-    # exact-source materialization streams the bytes it projected into the
-    # private CAS (spooled sections included, so a source past the memory
-    # ceiling is kept whole), and the packet SAYS whether that happened rather
-    # than letting a digest imply a retention that never took place.
-    private_ref = retain_private_capture(drive_root, capture)
-    if private_ref.get("blob_ref"):
-        meta["private_source_ref"] = private_ref
-    disclosure["raw_retained"] = bool(private_ref.get("blob_ref"))
-    if private_ref.get("status") == "unavailable":
-        disclosure["raw_retention"] = {"status": "unavailable", "reason": "private capture retention failed"}
-    if not capture.available:
-        # An unreadable repository is unknown, never a clean tree.
-        meta.update(complete=False, issue={
-            "tool": "repo_diff", "status": "source_unavailable",
-            "reason": "repo_diff_capture_unavailable", "source_ref": {},
-            "gaps": disclosure["gaps"],
-        })
-        return redacted, meta
-    if not redacted:
-        meta.update(complete=False, issue={
-            "tool": "repo_diff", "status": "source_unavailable",
-            "reason": "partial_repo_diff_without_exact_source", "source_ref": {},
-        })
-        return "", meta
-    if len(redacted) <= limit and disclosure["complete"]:
-        meta["complete"] = True
-        return redacted, meta
-    if drive_root is not None and str(task_id or ""):
-        # The generic exact-text source writer is unchanged: it persists the
-        # REDACTED projection for the actor/reviewer, never the raw bytes.
-        exact, source_ref, issue = persist_exact_text_source(
-            drive_root, str(task_id), source_id="acceptance_repo_diff", text=redacted,
-        )
-        if exact:
-            meta.update(complete=disclosure["complete"], source_ref=source_ref)
-            if not disclosure["complete"]:
-                meta["issue"] = {"tool": "repo_diff", "status": "partial_source_gaps",
-                                 "reason": "repo_diff_capture_gaps", "source_ref": source_ref,
-                                 "gaps": disclosure["gaps"]}
-            return exact, meta
-        meta.update(complete=False, source_ref=source_ref, issue={
-            "tool": "repo_diff", **issue, "source_ref": source_ref,
-        })
-        return truncate_review_artifact(redacted, limit=limit), meta
-    meta.update(complete=False, issue={
-        "tool": "repo_diff", "status": "source_unavailable",
-        "reason": "partial_repo_diff_without_task_source_ref", "source_ref": {},
-    })
-    return truncate_review_artifact(redacted, limit=limit), meta
 
 
 def _matching_projection(drive_root: Any, call: Dict[str, Any]) -> Dict[str, Any]:

@@ -88,7 +88,7 @@ def test_a_pool_rows_delivery_is_native_unless_the_row_says_packet(monkeypatch, 
     monkeypatch.setenv("OUROBOROS_SUBAGENTS", stored)  # the applied settings plane the pool reads
     monkeypatch.setattr(rsc, "reviewer_slot_last_executions", lambda: {})
     monkeypatch.setattr(server_maintenance, "review_pool_migration_records", lambda: {})
-    monkeypatch.setattr(settings_mod, "_review_pool_costs", lambda items, env: {})
+    monkeypatch.setattr(settings_mod, "_review_pool_costs", lambda items: {})
     body = json.loads(asyncio.run(settings_mod.api_review_pool(None)).body)
     assert [(row["subagent_id"], row["delivery"]) for row in body["pool"]] == [
         ("bare", "native"), ("packed", "packet"), ("session", "session")]

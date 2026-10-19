@@ -92,8 +92,8 @@ _ISO_SETTINGS_ALLOW_EXACT = frozenset({
     # The roster carries the delegation actor AND the review pool (its marked rows).
     "OUROBOROS_SUBAGENTS",
     "OUROBOROS_WEBSEARCH_MODEL",
-    # Review policy knobs (non-secret): must propagate so settings.json's task-acceptance
-    # self-review config is honored by isolated benchmark servers (else it silently
+    # Review policy knobs (non-secret): must propagate so settings.json's result-review
+    # config is honored by isolated benchmark servers (else it silently
     # falls back to the "auto" default and the end-of-task review never runs).
     "OUROBOROS_TASK_REVIEW_MODE", "OUROBOROS_REVIEW_ENFORCEMENT",
     # Shared paid review-cycle ceiling (non-secret): bench templates pin it to

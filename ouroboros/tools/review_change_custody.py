@@ -29,6 +29,13 @@ log = logging.getLogger(__name__)
 TOOL_NAME = "review_change"
 
 
+def _tool_name(wave: Any) -> str:
+    """The wave's own attempt-row tool name (``review_change.wave_tool_name``)."""
+    from ouroboros.tools.review_change import wave_tool_name
+
+    return wave_tool_name(getattr(wave, "request", None))
+
+
 def paid_repo_key(ctx: Any, root: Any) -> str:
     """The host-bound source owns a copy's paid pool, never its review identity.
 
@@ -109,7 +116,7 @@ def attempt_record(wave: Any, ctx: Any, **fields: Any) -> Any:
 
     attempt = CommitAttemptRecord(
         ts=utc_now_iso(), commit_message=wave.label, task_id=str(getattr(ctx, "task_id", "") or ""),
-        root_task_id=wave.root_task_id, repo_key=make_repo_key(wave.root), tool_name=TOOL_NAME,
+        root_task_id=wave.root_task_id, repo_key=make_repo_key(wave.root), tool_name=_tool_name(wave),
         review_budget_repo_key=(getattr(getattr(wave, "rejoin", None), "review_budget_repo_key", "")
                                 or paid_repo_key(ctx, wave.root)),
         pre_review_fingerprint=str(wave.frozen.diff_sha), review_retry_key=wave.retry_key,
@@ -119,7 +126,7 @@ def attempt_record(wave: Any, ctx: Any, **fields: Any) -> Any:
     return attempt
 
 
-def pending_round_attempt(ctx: Any, *, root: pathlib.Path, retry_key: str) -> Optional[Any]:
+def pending_round_attempt(ctx: Any, *, root: pathlib.Path, retry_key: str, tool_name: str = TOOL_NAME) -> Optional[Any]:
     """The open operation of THIS round on THIS task, or ``None``: the newest attempt
     row of (root, ``review_change``, task) under the wave's retry key whose custody is
     still active — a seat late, in flight or lost (``review_state_custody``). Found,
@@ -136,7 +143,7 @@ def pending_round_attempt(ctx: Any, *, root: pathlib.Path, retry_key: str) -> Op
     def _active(state: Any) -> ReviewStateMutation:
         expired = state.expire_stale_attempts(now_ts=_utc_now())
         rows = [item for item in state.get_active_attempts(repo_key=repo_key)
-                if item.tool_name == TOOL_NAME and item.task_id == task_id and item.review_retry_key == retry_key]
+                if item.tool_name == tool_name and item.task_id == task_id and item.review_retry_key == retry_key]
         return ReviewStateMutation(rows, changed=bool(expired))
 
     rows = update_state(drive, _active)
@@ -200,7 +207,7 @@ def install_paid_stamp(ctx: Any, wave: Any) -> Dict[str, int]:
         triad = copy.deepcopy(list(reserved.get("multi_model_review") or []))
 
         def _mutate(state: Any) -> None:
-            number = holder["attempt"] or state.next_attempt_number(repo_key, TOOL_NAME, task_id)
+            number = holder["attempt"] or state.next_attempt_number(repo_key, _tool_name(wave), task_id)
             state.record_attempt(attempt_record(
                 wave, ctx, status="reviewing", phase="review", paid=True, attempt=number,
                 triad_raw_results=triad))
@@ -210,7 +217,7 @@ def install_paid_stamp(ctx: Any, wave: Any) -> Dict[str, int]:
 
     def _checkpoint(*, surface: str, slot_id: str, operation_id: str, invocation_id: str) -> None:
         checkpoint_pending_review_invocation(
-            drive, repo_key=repo_key, tool_name=TOOL_NAME, task_id=task_id, attempt=holder["attempt"],
+            drive, repo_key=repo_key, tool_name=_tool_name(wave), task_id=task_id, attempt=holder["attempt"],
             review_retry_key=wave.retry_key, surface=surface, slot_id=slot_id, operation_id=operation_id,
             invocation_id=invocation_id)
 

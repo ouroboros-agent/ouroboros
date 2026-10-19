@@ -695,8 +695,10 @@ def _leave_wave_by_mail(a):
 
 def test_a_left_wave_that_settles_after_its_author_ended_stays_in_its_room_once(author):
     """Nobody reads an ended author's mailbox, so the settlement keeps the wave's own recorded outcome in
-    the author's room: collected at $0 from its attempt row, never a second send, never Git, no verdict.
-    A replay is unchanged and the mind's release is final."""
+    the author's room: collected at $0 from its attempt row, never a second send, never Git. The wave's own
+    ledger record settles from the same seats (a journal fact, nothing committed or applied), so it no
+    longer waits for a re-issue that will never come. A replay is unchanged and the mind's release is final."""
+    from ouroboros import review_ledger
     from ouroboros.artifacts import read_actor_source_bytes
     from tests.test_late_review_marks import _release
 
@@ -713,8 +715,12 @@ def test_a_left_wave_that_settles_after_its_author_ended_stays_in_its_room_once(
     [mark] = until(lambda: _late_marks(a.data))
     assert mark["room_id"] == "1" and mark["review"]["surface"] == "commit_gate"
     text = mark["text"]
-    assert text.startswith(f"Late commit review of task {TASK}.") and "No panel verdict was formed" in text
+    assert text.startswith(f"Late commit review of task {TASK}.") and "Its record now reads PASS" in text
+    assert "No panel verdict was formed" not in text and "nothing was committed or applied" in text
     assert "kept here because its author's task ended" in text and "has settled" not in text
+    settled = review_ledger.load_record(a.data, wait["record_id"])
+    assert settled["state"] == "settled" and settled["verdict"]["aggregate"] == "PASS"
+    assert {row["seat_id"]: row["status"] for row in settled["rows"]} == {"first": "responded", "second": "responded"}
     assert "- m1 (seat first): " in text and "- m2 (seat second): " in text and "outcome unknown" not in text
     until(lambda: _owed_left_rows(a) == {})  # the duty owed since the author left is discharged by the mark
     source = json.loads(read_actor_source_bytes(a.data, TASK, mark["target_ref"]))
@@ -820,7 +826,8 @@ def test_a_failed_settled_duty_write_recovers_from_retained_seats_while_controll
 def test_a_duty_whose_controller_died_before_settlement_keeps_what_was_recorded(author):
     """The process that owned the left wave dies before its settlement notice (the duty landed when the
     author left): once the task ended, maintenance composes the wave from its attempt row at $0, every
-    seat without a retained outcome told unknown, never a settled claim and never a second send."""
+    seat without a retained outcome told unknown, never a second send. Those seats can never answer, so the
+    wave's record settles as a failed quorum: an unknown seat is a failed seat, never a pass."""
     import subprocess
     import sys
 
@@ -841,7 +848,12 @@ def test_a_duty_whose_controller_died_before_settlement_keeps_what_was_recorded(
     text = mark["text"]
     assert "2 seat(s) have no retained outcome and stay unknown; nothing is sent again." in text
     assert "- m1 (seat first): outcome unknown" in text and "- m2 (seat second): outcome unknown" in text
-    assert "has settled" not in text and "answered" not in text and "No panel verdict was formed" in text
+    assert "has settled" not in text and "answered" not in text and "Its record now reads QUORUM_FAILED" in text
+    from ouroboros import review_ledger
+
+    lost = review_ledger.load_record(a.data, wait["record_id"])
+    assert lost["state"] == "settled" and lost["verdict"]["aggregate"] == "QUORUM_FAILED"
+    assert all(row["operation_state"] == "custody_lost" for row in lost["rows"]), "unknown is a failed seat, never a pass"
     assert _owed_left_rows(a) == {} and sorted(a.reviewer.rounds) == ["m1"] and _commit_count(a) == 1
     assert "kept here because its author's task ended" in text and wait["retry_key"] == mark["review"]["subject"]["retry_key"]
 

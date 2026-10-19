@@ -3,6 +3,8 @@
   "skills": [
     {"name": "telegram", "category": ["messaging"], "recommended": true},
     {"name": "unix_computer_use", "category": ["computer"], "recommended": true, "default_on": true},
-    {"name": "windows_computer_use", "category": ["computer"], "recommended": true, "default_on": true}
+    {"name": "windows_computer_use", "category": ["computer"], "recommended": true, "default_on": true},
+    {"name": "ui_design", "category": ["design"], "recommended": true, "default_on": true},
+    {"name": "design_demo", "category": ["design"], "recommended": true, "default_on": true}
   ]
 }

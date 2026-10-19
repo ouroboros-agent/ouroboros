@@ -1,72 +1,68 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { computeHydratedDirectActivities, chatStatusCounts, computeDerivedChatStatus } from '../modules/chat_activity.js';
-import { summarizeProjectActivities } from '../modules/project_activity.js';
+import { computeHydratedDirectActivities } from '../modules/chat_activity.js';
+import { summarizeRoom } from '../modules/project_activity.js';
 import { censusTaskPhase, desiredLiveCardPhase, setHistoricalUnavailable, setLiveCardPhase, setLiveCardTypingVisible, syncParkedPhase } from '../modules/task_phase_chip.js';
+import { emptyWorkState, roomStatusView, workRowView } from '../modules/work_status.js';
 import { readFileSync } from 'node:fs';
+import { projection, room, work } from './work_fixture.js';
 
 const hold = { label: 'Waiting for Project verification', reason: 'project_routing_fence_lookup_failed', detail: 'Authority is unreadable.' };
 const held = { activity_id: 'same-id', chat_id: 7, kind: 'managed_task', phase: 'queued', project_admission_hold: hold };
+// The server classifies a Project or task-scope hold as a wait whose reason is the hold's own label.
+const heldWork = (row, label = hold.label) => work(row, { activity: 'waiting',
+    because: [{ code: 'project_admission', text: label }] });
+const inRoom = (activity, extra = {}) => ({ ...emptyWorkState(), room: room(activity, extra) });
 
-test('known non-Project wait keeps the scope label in Chat', () => {
+test('a known non-Project wait keeps its scope label, on its row: the header says Waiting', () => {
     const scopeHold = { ...hold, label: 'Waiting for task scope verification' };
     const row = { ...held, chat_id: 1, project_admission_hold: scopeHold };
-    const activities = computeHydratedDirectActivities(new Map(), [row], 1);
-    assert.equal(computeDerivedChatStatus(chatStatusCounts(activities, [])).text, scopeHold.label);
+    assert.equal(roomStatusView(inRoom('waiting')).text, 'Waiting');
+    assert.deepEqual([workRowView(heldWork(row, scopeHold.label)).word, workRowView(heldWork(row, scopeHold.label)).secondary],
+        ['Waiting', scopeHold.label]);
 });
 
-test('held task is stationary across hydrated Chat and Project', () => {
-    const activities = computeHydratedDirectActivities(new Map(), [held], 7);
-    const card = { root: { isConnected: true }, groupId: 'same-id', finished: false };
-    const status = computeDerivedChatStatus(chatStatusCounts(activities, [card]));
-    assert.deepEqual(status, { kind: 'online', text: hold.label, tone: 'held', showDots: false, dots: 'one' });
-    assert.equal(summarizeProjectActivities([{ ...held, required_question_unavailable: true }]).label, hold.label);
-    assert.equal(summarizeProjectActivities([held]).motion, false);
+test('a held task is stationary in Chat and the sidebar, its label beside the word', () => {
+    assert.deepEqual(roomStatusView(inRoom('waiting')),
+        { kind: 'online', text: 'Waiting', tone: 'held', showDots: false, dots: 'one', amber: '', mark: 'dot' });
+    const sidebar = summarizeRoom({ ...room('waiting'), works: ['same-id'] }, [heldWork(held)]);
+    assert.deepEqual(sidebar, { state: 'dot', motion: false, amber: false, word: 'Waiting', label: `Waiting · ${hold.label}` });
 });
 
-for (const [phase, text, kind, showDots, tone] of [
-    ['budget_pausing', 'Pausing…', 'thinking', true, 'held'],
-    ['budget_paused', 'Paused', 'online', false, 'held'],
-    ['unknown', 'Activity unconfirmed', 'online', false, 'unknown'],
-    ['queued', hold.label, 'online', false, 'held'],
+for (const [activity, extra, text, kind, showDots, tone] of [
+    ['working', { transition: 'pausing' }, 'Pausing…', 'thinking', true, 'held'],
+    ['paused', {}, 'Paused', 'online', false, 'held'],
+    ['unknown', {}, 'Activity unconfirmed', 'online', false, 'unknown'],
+    ['waiting', {}, 'Waiting', 'online', false, 'held'],
 ]) {
-    test(`Project hold preserves the ${phase} Chat header`, () => {
-        const row = { ...held, phase };
-        const activities = computeHydratedDirectActivities(new Map(), [row], 7);
-        const card = { root: { isConnected: true }, groupId: 'same-id', finished: false,
-            parkedPhase: phase === 'queued' ? '' : phase, projectHold: hold.label };
-        assert.deepEqual(computeDerivedChatStatus(chatStatusCounts(activities, [card])),
-            { kind, text, tone, showDots, dots: 'one' });
-        const resumed = computeHydratedDirectActivities(activities,
-            [{ ...row, phase: 'working', project_admission_hold: undefined }], 7);
-        card.parkedPhase = '';
-        card.projectHold = '';
-        assert.equal(computeDerivedChatStatus(chatStatusCounts(resumed, [card])).text, 'Working');
+    test(`a held task's room says ${text}; a card's hold never sets the header`, () => {
+        const view = roomStatusView(inRoom(activity, extra));
+        assert.deepEqual([view.kind, view.text, view.tone, view.showDots], [kind, text, tone, showDots]);
+        // Same-id recovery: the server's room works again.
+        assert.equal(roomStatusView(inRoom('working')).text, 'Working');
     });
 }
 
-test('same-ID recovery clears the hold; independent work and budget remain truthful', () => {
+test('same-ID recovery clears the hold on its row; independent work and a pause remain truthful', () => {
     const activities = computeHydratedDirectActivities(new Map(), [held], 7);
     const recovered = computeHydratedDirectActivities(activities, [{ ...held, phase: 'working', project_admission_hold: undefined }], 7);
     assert.equal(recovered.get('same-id').project_admission_hold, undefined);
-    assert.equal(computeDerivedChatStatus(chatStatusCounts(recovered, [])).text, 'Working');
+    assert.equal(roomStatusView(inRoom('working')).text, 'Working');
     const sibling = { ...held, activity_id: 'sibling', phase: 'working', project_admission_hold: undefined };
-    assert.equal(summarizeProjectActivities([held, sibling]).motion, true);
-    assert.match(summarizeProjectActivities([held, sibling]).label, /Waiting for Project/);
-    const paused = computeHydratedDirectActivities(new Map(), [{ ...held, phase: 'budget_paused' }], 7);
-    // Batch4: one census phase covers budget pause, owner Pause and Restart hold, so no cause is claimed.
-    assert.equal(computeDerivedChatStatus(chatStatusCounts(paused, [])).text, 'Paused');
+    const mixed = summarizeRoom({ ...room('working'), works: ['sibling', 'same-id'] }, [work(sibling), heldWork(held)]);
+    assert.deepEqual([mixed.state, mixed.motion], ['working', true]);
+    // One room word: a budget pause, the owner's Pause and a Restart hold all read Paused; the row says which.
+    assert.equal(roomStatusView(inRoom('paused')).text, 'Paused');
 });
 
 test('the census phase (a Main portal\'s chip source) keeps a budget pause beside the Project wait, as the sidebar does', () => {
     const paused = { ...held, phase: 'budget_paused' };
     assert.equal(censusTaskPhase(paused, null).text, `Paused · ${hold.label}`);
     assert.equal(censusTaskPhase(paused, null).motion, false);
-    assert.equal(censusTaskPhase(paused, null).text, summarizeProjectActivities([paused]).label);
     assert.equal(censusTaskPhase({ ...held, phase: 'budget_pausing' }, null).text, `Pausing… · ${hold.label}`);
     assert.equal(censusTaskPhase({ ...held, phase: 'budget_pausing' }, null).motion, false);
     assert.equal(censusTaskPhase(held, null).text, hold.label);
-    assert.equal(censusTaskPhase(paused, { status: 'cancelled' }).text, 'Cancelled');
+    assert.equal(censusTaskPhase(paused, { status: 'cancelled' }).text, 'Stopped');
 });
 
 test('a held card with retained progress waits statically; Stop, terminal and same-ID recovery outrank it', () => {
@@ -165,16 +161,12 @@ test('nested wait keeps the host cause as text and clears it only on a recovery 
     assert.equal(desiredLiveCardPhase(card).text, 'Working');
 });
 
-test('held children do not claim room activity, while a real working sibling still does', () => {
-    const activities = computeHydratedDirectActivities(new Map(), [held], 7);
-    const root = { groupId: 'same-id', root: { isConnected: true }, projectHold: hold.label };
+test('held children never vote on the room: the server room speaks whatever the cards hold', () => {
     const child = { groupId: 'child', isSubagent: true, root: { isConnected: true }, projectHold: hold.label };
-    assert.equal(computeDerivedChatStatus(chatStatusCounts(activities, [root, child])).text, hold.label);
-    assert.equal(computeDerivedChatStatus(chatStatusCounts(new Map(), [child])).text, hold.label);
-    const sibling = { groupId: 'sibling', root: { isConnected: true } };
-    assert.equal(computeDerivedChatStatus(chatStatusCounts(activities, [root, child, sibling])).text, 'Working');
-    child.projectHold = '';
-    assert.equal(computeDerivedChatStatus(chatStatusCounts(activities, [root, child])).text, 'Working');
+    const state = (activity) => ({ ...inRoom(activity), works: [] });
+    assert.equal(roomStatusView(state('waiting')).text, 'Waiting');
+    assert.equal(roomStatusView(state('working')).text, 'Working', 'a held child under working work');
+    assert.equal(child.projectHold, hold.label, 'its hold stays its own card\'s fact');
 });
 
 test('actual child queue hydration refreshes room status once and reconciles departure without polling reviews', async () => {
@@ -210,17 +202,19 @@ test('actual child queue hydration refreshes room status once and reconciles dep
         const childFrame = id => frame(id, { delegation_role: 'subagent', subagent_event: 'scheduled',
             subagent_task_id: id, parent_task_id: 'same-id', root_task_id: 'same-id', subagent_role: 'reader' });
         childFrame('child');
+        // The server's room for the held root: a wait (its reason, the hold's label, is on the row).
         const snapshot = () => instance.hydrateStateSnapshot({ active_chat_activities: [held],
-            active_chat_activities_complete: true, supervisor_ready: true });
+            active_chat_activities_complete: true, supervisor_ready: true,
+            ...projection(7, [heldWork(held)], room('waiting')) });
         const status = () => globalThis.document.byId.get('chat-status').textContent;
         snapshot(); await settle();
-        assert.equal(status(), 'Working', 'the child has not entered its hold yet');
+        assert.equal(status(), 'Waiting', 'the room says what the server says');
         queue.pending = queue.running.splice(0);
         queue.pending[0].task.project_admission_hold = hold;
         snapshot();
-        assert.equal(status(), 'Working', 'the snapshot finishes before its queue read');
+        assert.equal(status(), 'Waiting', 'the snapshot finishes before its queue read');
         await settle();
-        assert.equal(status(), hold.label, 'the async queue response refreshes the header without another snapshot');
+        assert.equal(status(), 'Waiting', 'the child\'s queue read paints its card, never the room\'s header');
         const messages = globalThis.document.byId.get('chat-messages');
         const child = walkCard(messages, 'child');
         assert.equal(child.querySelector('[data-live-phase]').textContent, hold.label);
@@ -240,7 +234,7 @@ test('actual child queue hydration refreshes room status once and reconciles dep
         queue.pending[0].task.project_admission_hold = hold;
         snapshot(); await settle();
         frame('working-sibling');
-        assert.equal(status(), 'Working', 'independent working card keeps room activity');
+        assert.equal(status(), 'Waiting', 'a card the projection does not list never sets the header');
         handlers.get('log')({ chat_id: 7, data: { type: 'task_done', task_id: 'working-sibling', status: 'cancelled' } });
 
         childFrame('review-child');

@@ -113,12 +113,6 @@ D20 = "Presence"
 "ouroboros/_usage_rows.py" = "D16"
 "ouroboros/_usage_settlement.py" = "D16"
 "ouroboros/_usage_wait.py" = "D16"
-"ouroboros/acceptance_preparation.py" = "D01"
-"ouroboros/acceptance_history.py" = "D01"
-"ouroboros/acceptance_late.py" = "D01"
-"ouroboros/acceptance_retrieving.py" = "D01"
-"ouroboros/acceptance_settlement.py" = "D01"
-"ouroboros/acceptance_material.py" = "D06"
 "ouroboros/agent.py" = "D01"
 "ouroboros/call_protocol.py" = "D01"  # live-call wire vocabulary shared by peers, the driver and the gateway
 "ouroboros/call_languages.py" = "D01"  # the recognition languages a call's voice recorded (owner, Presence bindings)
@@ -139,7 +133,6 @@ D20 = "Presence"
 "ouroboros/artifact_storage.py" = "D05"
 "ouroboros/artifacts.py" = "D05"
 "ouroboros/chat_uploads.py" = "D05"
-"ouroboros/repo_diff_capture.py" = "D05"
 "ouroboros/betterleaks_runtime.py" = "D14"
 "ouroboros/browser_policy.py" = "D05"
 "ouroboros/cancel_intents.py" = "D09"
@@ -317,6 +310,9 @@ D20 = "Presence"
 "ouroboros/gateway/reply_preparation.py" = "D11"
 "ouroboros/gateway/storage.py" = "D11"
 "ouroboros/gateway/main_decisions.py" = "D11"  # addressed canonical Main questions and human recovery controls
+"ouroboros/gateway/work_status.py" = "D11"  # one work, one status: pure classification read by every surface and the mind
+"ouroboros/gateway/work_projection.py" = "D11"  # server observations for the work projection
+"ouroboros/gateway/work_contracts.py" = "D11"
 "ouroboros/gateway/task_events.py" = "D11"
 "ouroboros/gateway/task_archive.py" = "D11"
 "ouroboros/gateway/task_hurry.py" = "D11"
@@ -372,10 +368,9 @@ D20 = "Presence"
 "ouroboros/local_model_server.py" = "D02"
 "ouroboros/local_model_autostart.py" = "D02"
 "ouroboros/loop.py" = "D01"
-"ouroboros/loop_acceptance.py" = "D01"
-"ouroboros/loop_acceptance_review.py" = "D01"
 "ouroboros/loop_budget.py" = "D01"
 "ouroboros/loop_delivery.py" = "D01"
+"ouroboros/delivery_seal.py" = "D01"
 "ouroboros/loop_forced_finalization.py" = "D01"
 "ouroboros/loop_messages.py" = "D01"
 "ouroboros/loop_model_call.py" = "D01"
@@ -507,7 +502,6 @@ D20 = "Presence"
 "ouroboros/review_dispatch.py" = "D06"
 "ouroboros/review_evidence.py" = "D06"
 "ouroboros/review_evidence_sections.py" = "D06"
-"ouroboros/review_evidence_refs.py" = "D06"
 "ouroboros/review_checking.py" = "D06"
 "ouroboros/review_checking_prune.py" = "D06"
 "ouroboros/review_execution.py" = "D06"
@@ -519,6 +513,7 @@ D20 = "Presence"
 "ouroboros/review_pool_migration.py" = "D06"
 "ouroboros/review_pool_receipts.py" = "D06"
 "ouroboros/review_projection.py" = "D06"
+"ouroboros/review_price.py" = "D06"
 "ouroboros/review_status_projection.py" = "D06"
 "ouroboros/review_records.py" = "D06"
 "ouroboros/review_session_custody.py" = "D06"
@@ -726,6 +721,7 @@ D20 = "Presence"
 "ouroboros/tools/review_binary_context.py" = "D06"
 "ouroboros/tools/review_brief_coupling.py" = "D06"
 "ouroboros/tools/review_change.py" = "D06"
+"ouroboros/tools/review_result.py" = "D06"
 "ouroboros/tools/review_change_custody.py" = "D06"
 "ouroboros/tools/review_checklist.py" = "D06"
 "ouroboros/tools/governance_context.py" = "D06"
@@ -1171,6 +1167,7 @@ lazy_only = [
   "D12->D01",
   "D12->D05",
   "D12->D06",
+  "D12->D09",
   "D12->D10",
   "D12->D15",
   "D12->D16",
@@ -1216,6 +1213,7 @@ lazy_only = [
   "D19->D08",
   "D19->D20",
   "D20->D01",
+  "D20->D02",
   "D20->D06",
   "D20->D07",
   "D20->D08",

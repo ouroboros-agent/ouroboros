@@ -1,6 +1,6 @@
 import { escapeHtmlAttr, escapeHtmlText as escapeHtml } from './utils.js';
 import { bindMarkdownTables, destroyChatMarkdown, enhanceChatMarkdown, mountChatMarkdown, renderChatMarkdown } from './chat_markdown.js';
-import { bindHeaderControlPlacement, renderPageHeader } from './page_header.js';
+import { bindHeaderControlPlacement, renderMobileNavToggle, renderPageHeader } from './page_header.js';
 import { strokeIcon } from './page_icons.js';
 import { mainHeaderActionsHtml } from './chat_header.js';
 import { pageLabel } from './pages.js';
@@ -15,6 +15,7 @@ import { bindComposerFileTargets, cleanupUploadedAttachments, createChatMedia, s
 import { attachmentCaption, attachmentViews, composerText, createComposerAttachments, createUnconfirmedSends } from './chat_attachments.js';
 import { createChatDecision } from './chat_decision.js';
 import { createRoomWork } from './room_work.js';
+import { applyCardWorkViews, cardControls, cardMenuActions, emptyWorkState, openCardControls, ownStopPress, reconcileWorkState, roomStatusView } from './work_status.js';
 import { createMainWaiting } from './main_waiting.js';
 import { createHostStart } from './host_starting_status.js';
 import { createModelWaitController, isModelWaitReference } from './model_wait.js';
@@ -47,9 +48,7 @@ import {
     REUSABLE_TASK_IDS,
     TASK_CONTROL_TRIGGER_LABEL,
     cancelRunEligibility,
-    resumeRunEligibility,
     createTaskResumeButton,
-    openTaskControls,
     requestStop,
 } from './task_control_menu.js';
 import { openConfirmDialog } from './confirm_dialog.js';
@@ -112,14 +111,12 @@ import {
     boundActivityPreview,
     buildTimelineItemHtml,
     buildMessageKey,
-    chatStatusCounts,
     chatLogThreadAccepts,
     chatMediaMessageKey,
     chatThreadAccepts,
     clearStickyCardState,
     confirmAndSendPanic,
     confirmAndSendRestart,
-    computeDerivedChatStatus,
     computeHydratedDirectActivities,
     documentMessageKey,
     durableChatMediaUrl,
@@ -173,7 +170,6 @@ export {
     clearStickyCardState,
     clearTransientRoutingAnnotations,
     confirmAndSendPanic,
-    computeDerivedChatStatus,
     computeHydratedDirectActivities,
     headerBudgetPresentation,
     insertTimelineNode,
@@ -193,6 +189,8 @@ export {
 
 // Host placement: custody warns; settled reviews show results.
 const CARD_ROW_PHASES = new Map([['timeline', 'warn'], ['reviews', 'result']]);
+const SUBAGENT_LIFECYCLE_EVENTS = new Set(['scheduled', 'running', 'completed', 'completed_warn', 'failed',
+    'cancelled', 'rejected', 'interrupted']);  // a helper's narration is `progress`
 const CHAT_STORAGE_KEY = 'ouro_chat';
 const CHAT_DRAFT_KEY = 'ouro_chat_draft';
 const CHAT_INPUT_HISTORY_KEY = 'ouro_chat_input_history';
@@ -233,6 +231,7 @@ export function createChatInstance({
             className: 'chat-page-header',
             toolbarClass: 'ui-chrome-group',
             actionsHtml: mainHeaderActionsHtml(),
+            showMobileNav: false,  // a room's ☰ is its composer row's first control
         });
     // Main: the history note (gaps, a failed read, an approximate position) floats UNDER the bar as its own
     // strip, never as a second row of it; the Project panel keeps its in-flow status bar.
@@ -247,6 +246,7 @@ export function createChatInstance({
                 </button>
                 <div id="chat-attachment-preview" class="chat-attachment-preview"></div>
                 <div class="chat-toolbar-row">
+                    ${renderMobileNavToggle({ inComposer: true })}
                     <div class="chat-composer-pills" id="chat-composer-pills">
                         <button class="chat-swarm ui-hit-area" id="chat-swarm" type="button" data-armed="false" title="Swarm: route your next message into a new managed task, run a deep plan review with plan_task, then delegate when parallel work helps. Auto-disarms after sending.">Swarm</button>
                     </div>
@@ -401,8 +401,9 @@ export function createChatInstance({
     const LIVE_CARD_CAP = 200;
     const liveCardBound = createLiveCardBound(LIVE_CARD_CAP);
     const liveCardRecords = new Map();
-    // The room's work status in its header (room_work.js), mounted once the owners it reads exist.
-    let roomWork = null;
+    // The server's work projection (work_status.js), re-read on facts only.
+    let roomWork = null, workState = emptyWorkState();
+    const reread = () => void refreshHeaderControlState(true);
     // A wait creates its task record; its open/closed state is one
     // input of the block predicate, so the block appears with the controls and
     // leaves with them (the record and its no-reopen wait ledger stay).
@@ -518,14 +519,13 @@ export function createChatInstance({
         }
     }
 
-    function setStatus({ kind, text, tone = 'online', dots = 'one', title = '' }) {
-        // Replay frames never touch the badge; syncChatStatus writes the producer's word, tone and dots once.
+    function setStatus({ kind, text, tone = 'online', dots = 'one', amber = '', mark = '', title = '' }) {
+        // Replay frames never touch the badge; syncChatStatus writes it once.
         if (!statusBadge) return;
         statusBadge.className = `status-badge ${kind}`;
         statusBadge.textContent = text;
         statusBadge.title = title; // a failed boot step's cause; empty otherwise
-        statusBadge.dataset.tone = tone;
-        statusBadge.dataset.dots = dots;
+        Object.assign(statusBadge.dataset, { tone, dots, amber, mark });
         roomWork?.update();
     }
 
@@ -570,7 +570,7 @@ export function createChatInstance({
         activity: (record) => currentActivity(record), follow: portals.follow,
         expand: (record) => { setLiveCardExpanded(record, true); hydrateCardReviews(record.groupId); } });
     const rowMenu = createChatRowMenu({ feed: messagesDiv, replies, cardOf: (id) => liveCardRecords.get(id),
-        activityOf: (record) => currentActivity(record) });
+        actionsOf: (record) => cardMenuActions(workState, record, currentActivity(record)), afterAction: reread });
 
     let childHoldRead = false;
     async function refreshChildProjectHolds() {
@@ -601,13 +601,14 @@ export function createChatInstance({
                     }
                 }
             });
-            syncChatStatus();
         } catch { /* Keep the last fact; absence or a failed read proves no recovery. */ }
         finally { childHoldRead = false; }
     }
 
     function hydrateStateSnapshot(data, snapshotRequestedAt = Infinity) {
         if (data) void refreshChildProjectHolds();
+        workState = reconcileWorkState(workState, data, chatId, ws.isConnected?.() !== false);
+        applyCardWorkViews(liveCardRecords, workState);
         syncHeaderControlState(data ?? { accounting: { available: false } });
         portals.sync(data);
         mainWaiting?.snapshot(data, snapshotRequestedAt);
@@ -773,11 +774,6 @@ export function createChatInstance({
             || (record.finished && record.phaseEl?.dataset?.phase !== 'done');
     }
 
-    // Lane facts from census/task_done/history affect only the header, never chrome.
-    function noteDirectTurn(record, direct) {
-        if (record && typeof direct === 'boolean') record.direct = direct;
-    }
-
     // Work chooses card chrome (owner 16.09): title and Main conversion, regardless
     // of lane. Attention-only or non-Done endings have neither title nor conversion.
     // Bare outcome/receipts are not work; _is_direct_chat retains its host duties.
@@ -871,7 +867,8 @@ export function createChatInstance({
 
     function syncCancelRunButtonMutation(record) {
         if (!record?.root) return false;
-        const canResume = () => resumeRunEligibility(record, currentActivity(record));
+        // Resume where the card's work offers it.
+        const canResume = () => cardControls(workState, record.groupId).resume;
         const resumable = canResume();
         let changed = false;
         if (resumable && !record.resumeRunBtn) {
@@ -884,7 +881,7 @@ export function createChatInstance({
         } else if (!resumable && record.resumeRunBtn) {
             record.resumeRunBtn.remove(); record.resumeRunBtn = null; changed = true;
         }
-        const eligible = stopEligible(record) || resumable;
+        const eligible = stopEligible(record) || resumable || cardControls(workState, record.groupId).menu;
         const existing = record.root.querySelector('[data-cancel-run]');
         if (!eligible) {
             if (!existing) return changed;
@@ -907,8 +904,8 @@ export function createChatInstance({
         // Pending cancel offers only hard escalation; dismiss keeps the run.
         btn.addEventListener('click', (event) => {
             event.stopPropagation();
-            openTaskControls(btn, record.groupId, { record, activity: currentActivity(record),
-                cancelPending: Boolean(record.cancelPendingPolicy), stop: (action) => cancelRunFromCard(record, action) });
+            openCardControls(btn, record, cardControls(workState, record.groupId).work, { activity: currentActivity(record),
+                stop: (action) => cancelRunFromCard(record, action), afterAction: reread });
         });
         actions.appendChild(btn);
         record.cancelRunBtn = btn;
@@ -1178,7 +1175,6 @@ export function createChatInstance({
             const activity = activeDirectActivities.get(row.task_id);
             if (row.ts) reanchorTaskCard(record, row.ts);
             if (row.suggested_name) applySuggestedName(row.task_id, row.suggested_name);
-            noteDirectTurn(record, activity ? activity.kind !== 'managed_task' : row._is_direct_chat);
             if (row.task_phase === 'finalizing') markLiveCardFinalizing(row.task_id, row);
             else if (!row.task_terminal_status && !activity) setHistoricalUnconfirmed(record);
             if (activity) syncParkedPhase(record, activity.phase, activity);
@@ -1294,9 +1290,6 @@ export function createChatInstance({
             // The proactively-coined LLM name; becomes the card title when set.
             suggestedName: '',
             reviewOwnerDetailObserved: false,
-            // Host fact for the header pill: a direct conversation turn (census
-            // kind, rebuilt task_done, history rows) vs a managed/Swarm root.
-            direct: String(activeDirectActivities.get(normalizedGroupId)?.kind || 'managed_task') !== 'managed_task',
         };
         const reviewDisclosure = reviewDisclosureByTask.get(normalizedGroupId) || {
             sectionExpanded: false,
@@ -1351,6 +1344,9 @@ export function createChatInstance({
             if (record.titleEl) record.titleEl.textContent = _pendingName;
         }
         resetLiveCardRecord(record);
+        // A card the last complete body does not name asks for a read.
+        if (!_historyReplayActive && workState.complete && !workState.members.has(normalizedGroupId)) reread();
+        applyCardWorkViews(new Map([[normalizedGroupId, record]]), workState);
         const activity = activeDirectActivities.get(normalizedGroupId);
         if (activity) syncParkedPhase(record, activity.phase, activity);
         const ended = concludedDirectActivities.get(normalizedGroupId);
@@ -1830,7 +1826,6 @@ export function createChatInstance({
         const summary = taskTerminalSummary({ ...msg, task_id: taskId });
         const record = getLiveCardRecord(taskId);
         changed = noteTaskDetails(record, msg) || changed;
-        noteDirectTurn(record, msg?._is_direct_chat);
         syncSettledItems(record, msg);
         changed = Boolean(record.reviewController?.updateMany(reviewGroupsFromTaskDetail(msg, taskId))) || changed;
         if (finalizing && !record.finished) record.finalizingHold = true;
@@ -1958,7 +1953,6 @@ export function createChatInstance({
         changed = queueTaskLiveUpdate(
             presented, taskId, normalizeLogTs(rawTs), presented.dedupeKey || '', rawTs,
         ) || changed;
-        noteDirectTurn(liveCardRecords.get(taskId), msg._is_direct_chat);
         // History may carry the coined name that live frames deliver separately.
         if (msg.suggested_name) changed = applySuggestedName(taskId, msg.suggested_name) || changed;
         // Outcome survives a lost summary even while post-work keeps controls live.
@@ -1983,10 +1977,7 @@ export function createChatInstance({
         // Worker narration carries subagent_event="progress" too. It is activity,
         // not a lifecycle row: route it through the progress key so the later
         // terminal frame cannot overwrite the only full narration disclosure.
-        if (![
-            'scheduled', 'running', 'completed', 'completed_warn',
-            'failed', 'cancelled', 'rejected', 'interrupted',
-        ].includes(event)) {
+        if (!SUBAGENT_LIFECYCLE_EVENTS.has(event)) {
             return routeSubagentProgressToCard(childId, evt);
         }
         const rawTs = tsValue || new Date().toISOString();
@@ -2136,8 +2127,7 @@ export function createChatInstance({
         );
         if (childInfo) return Boolean(changed || queued);
         const subagentChanged = updateSubagentCardFromEvent(evt, rawTs);
-        // Host-attested lane and Stop facts also travel on tool-only turns.
-        if (typeof evt._is_direct_chat === 'boolean') noteDirectTurn(liveCardRecords.get(taskId), evt._is_direct_chat);
+        // Host-attested Stop facts also travel on tool-only turns.
         if (evt.cancelable === true) markTaskCancelable(taskId);
         if (eventType === 'task_done' && summary.terminal) {
             recordTerminalActivity(taskId, summary.phase);
@@ -2525,7 +2515,7 @@ export function createChatInstance({
                 // Persisted terminals without task_summary (crash/timeout/cancel) also settle
                 // progress-only cards, or reload revives them as Working. A child's terminal
                 // resolves the child card, never its parent; a root's uses the shared terminal
-                // mapping (P5: a cancelled root replays as "Cancelled", never a generic "Done").
+                // mapping (P5: a cancelled root replays as "Stopped", never a generic "Done").
                 const settleReplayedTerminal = (tid, terminalRecord, phase, summary = false) => {
                     if (!taskDoneIsTerminal(terminalRecord)) return;
                     if (subagentChildParents.has(tid)) return routeSubagentTerminalToCard(tid, terminalRecord);
@@ -3109,7 +3099,7 @@ export function createChatInstance({
     if (asPanel) {
         // Late panels missed socket open; seed from the socket and latest snapshot.
         hostStart.read(stateSnapshots.latest?.());
-        const seed = computeDerivedChatStatus(hostStart.status());
+        const seed = deriveChatStatus();
         if (ws.isConnected?.()) setStatus(seed);
     } else headerControlInterval = setInterval(refreshHeaderControlState, 3000);
     // Both Main and late panels hydrate once; each instance filters its chat.
@@ -3326,13 +3316,11 @@ export function createChatInstance({
     // Active blocks host their own running indicator.
     const foregroundCards = () => Array.from(liveCardRecords.values()).filter((r) => isForegroundLiveCard(r) && !r.modelWaiting);
 
+    // The server's room under this client's own facts.
     function deriveChatStatus() {
-        return computeDerivedChatStatus({
-            ...chatStatusCounts(activeDirectActivities, liveCardRecords.values(), (id) => modelWaits.waiting(id)),
-            isConnected: ws.isConnected ? ws.isConnected() : true,
-            pendingSubmissionsCount: pendingSubmissions.size,
-            ...hostStart.status(),
-        });
+        return roomStatusView(workState, { connected: ws.isConnected ? ws.isConnected() : true, ready: hostStart.ready(),
+            boot: hostStart.status().bootPhase,
+            sending: pendingSubmissions.size > 0, stopping: ownStopPress(workState, liveCardRecords) });
     }
 
     function syncChatStatus() {
@@ -3446,7 +3434,6 @@ export function createChatInstance({
             syncParkedPhase(record, v.phase, v);
             syncCancelRunButton(record);
             markReviewAnchor(record);
-            noteDirectTurn(record, v.kind !== 'managed_task');
             if (v.kind === 'managed_task') missingManagedTaskIds.delete(k);
         }
         for (const taskId of globallyActiveActivityIds) missingManagedTaskIds.delete(taskId);
@@ -3494,13 +3481,9 @@ export function createChatInstance({
 
     onWs('typing', (msg) => {
         if (!isMyThread(msg)) return;  // each column shows typing only for its own thread
-        // A typing frame is a submission receipt, never liveness: it pulls the
-        // authoritative census at once and retires the linked `Sending...`
-        // only once that census has answered, so the header steps from
-        // Sending... straight to Thinking... when the census lists the turn
-        // (hydration retires the cmid itself) and to Online otherwise, never
-        // through a blank in between. The header derives from that census,
-        // pending sends and live cards only.
+        // A typing frame is a submission receipt, never liveness: it re-reads the
+        // state at once and retires the linked `Sending...` only once that read
+        // answers, so the room steps from Sending... to the server's word.
         const cmid = String(msg.client_message_id || '');
         if (!cmid) return;
         void refreshHeaderControlState(true).then(() => {
@@ -3553,6 +3536,7 @@ export function createChatInstance({
                 syncChatStatus();
                 return result;
             };
+            if (isModelWaitReference(msg)) reread();
             const reference = admitCardMetadata(msg);
             if (reference !== undefined) return settled(reference, false);
             const review = attachReviewFromRow(msg, msg.ts || '', true);
@@ -3565,6 +3549,7 @@ export function createChatInstance({
             learnSubagentLineage(msg);
             if (msg.is_progress) {
                 showTaskIncidentToast(msg);
+                if (SUBAGENT_LIFECYCLE_EVENTS.has(String(msg.subagent_event || '').toLowerCase())) reread();  // members
                 const changed = updateLiveCardFromProgressMessage(msg, { grantCancelAuthority: true });
                 return settled(changed, false);
             }
@@ -3573,6 +3558,7 @@ export function createChatInstance({
             // conclusion; task_done or the queue snapshot concludes it.
             const finalizing = Boolean(explicitTaskId) && msg.task_phase === 'finalizing';
             const typedTerminal = positiveTaskTerminalFact(msg);
+            if (typedTerminal) reread();
             if (!finalizing && (!explicitTaskId || typedTerminal)) {
                 if (explicitTaskId) {
                     // 4A (active set): a keyed final concludes ITS OWN turn —
@@ -3647,6 +3633,7 @@ export function createChatInstance({
         // frames without chat_id default to the main chat.
         if (!isMyLogThread(msg)) return;
         withRemoteActivity(() => updateLiveCardFromLogEvent({ ...msg.data, _live_tool_frame: !msg.data._historical }));
+        if (!msg.data._historical && ['task_done', 'task_model_wait'].includes(msg.data.type)) reread();
     });
 
     // Admission names the card and its future Project. The broadcast has only
@@ -3683,6 +3670,7 @@ export function createChatInstance({
             applyQuizStateFrame: chatDecision.applyQuizStateFrame,
             messagesRoot: () => messagesDiv,
             deliverContentMutation: withRemoteActivity,
+            onQuestionFrame: reread,
         });
 
     let wsHasConnectedOnce = false;
@@ -3747,7 +3735,7 @@ export function createChatInstance({
         present: isInstanceVisible, expand: record =>
             (explicitCardExpansion.set(record.groupId, true), setLiveCardExpanded(record, true)) });
     roomWork = createRoomWork({ page, asPanel, ws, statusBadge, messagesDiv, reading, stateSnapshots, revealQuestion,
-        activeDirectActivities, liveCardRecords, pendingSubmissions, pendingSuggestedNames, modelWaits, stopEligible,
+        works: () => workState, liveCardRecords, pendingSubmissions, pendingSuggestedNames,
         cancelRunFromCard, refreshHeaderControlState, captureVisibleTimelineAnchor, restoreVisibleTimelineAnchor,
         historyPager, showLatest, hostReady: hostStart.ready });
 

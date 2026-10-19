@@ -10,6 +10,7 @@ import pytest
 
 from ouroboros import artifacts, context_compaction as cc, headless, observability
 from ouroboros.task_results import write_task_result
+from tests._store_shared import remove_store_tree
 from tests.test_context_reclaim_materializer import _request, _unit
 
 
@@ -63,7 +64,7 @@ def test_shared_checkpoint_history_has_bounded_parsing_and_survives_gc(tmp_path,
         "parses": sum(parsed.values()), "sources": len(refs),
         "per_body": sorted(parsed.values()),
     }
-    shutil.rmtree(child)
+    remove_store_tree(child)
     for ref in refs:
         assert artifacts.read_actor_source_bytes(parent, task_id, ref) == originals[ref["path"]]
 

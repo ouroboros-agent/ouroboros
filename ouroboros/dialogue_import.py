@@ -40,6 +40,7 @@ coordinates are the store's; ``store_switch`` calls it before a root is handed t
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import logging
 import os
@@ -113,10 +114,13 @@ def rotate_final(root: pathlib.Path, stream: str) -> Optional[pathlib.Path]:
 
 
 def _gen(data: bytes) -> str:
-    """The generation signature a legacy address carries (``utils.jsonl_generation_signature``)."""
-    for line in data.decode("utf-8", errors="replace").splitlines():
-        if line.strip():
-            return hashlib.sha256(line.strip().encode("utf-8", errors="replace")).hexdigest()
+    """The generation signature a legacy address carries (``utils.jsonl_generation_signature``): the
+    first non-blank line as that text-mode reader ends it, at ``\\n``/``\\r`` only. A row ``append_jsonl``
+    wrote keeps U+2028, U+2029 and U+0085 raw, and ``str.splitlines`` would cut it there."""
+    with io.TextIOWrapper(io.BytesIO(data), encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if line.strip():
+                return hashlib.sha256(line.strip().encode("utf-8", errors="replace")).hexdigest()
     return ""
 
 
@@ -634,7 +638,9 @@ def _export_stream(root: pathlib.Path, stream: str) -> Dict[str, Any]:
                                              "from": int(marks["files_seq"])})
                 remainder = data
             if remainder:
-                handle = os.open(str(live), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+                # Byte-exact: a Windows descriptor is text mode without O_BINARY and would write each
+                # LF as CRLF, so the exported lines would no longer be the stored rows at their coordinates.
+                handle = os.open(str(live), os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0), 0o644)
                 try:
                     view = memoryview(remainder)
                     while view:

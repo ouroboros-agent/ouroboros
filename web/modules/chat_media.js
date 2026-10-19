@@ -994,6 +994,8 @@ export function createChatMedia({
         applyQuizStateFrame,
         messagesRoot,
         deliverContentMutation = (mutate) => mutate(),
+        // A live question or its lifecycle changed what waits for the owner: the caller re-reads the state.
+        onQuestionFrame = () => {},
     }) {
         const keysFor = (msg, legacy) => ({ legacy, exact: msg.history_id ? `history:${msg.history_id}` : legacy });
         function alreadyRendered(msg, keys) {
@@ -1062,13 +1064,15 @@ export function createChatMedia({
         for (const type of ['photo', 'video']) onWs(type, deliver(appendMediaBubble));
         onWs('document', deliver(appendDocumentBubble));
         onWs('links', deliver(appendLinksMessage));
-        onWs('quiz', deliver(appendQuizMessage));
+        const question = deliver(appendQuizMessage);
+        onWs('quiz', (msg) => { question(msg); if (isMyThread(msg)) onQuestionFrame(msg); });
         if (applyQuizStateFrame && messagesRoot) {
             // Lifecycle updates address an EXISTING card by quiz_id — no
             // thread routing, no unread bump, never a new bubble.
-            onWs('quiz_state', (msg) => deliverContentMutation(
-                () => applyQuizStateFrame(messagesRoot(), msg),
-            ));
+            onWs('quiz_state', (msg) => {
+                deliverContentMutation(() => applyQuizStateFrame(messagesRoot(), msg));
+                onQuestionFrame(msg);
+            });
         }
         return { appendMediaBubble, appendDocumentBubble, appendLinksMessage, appendQuizMessage };
     }

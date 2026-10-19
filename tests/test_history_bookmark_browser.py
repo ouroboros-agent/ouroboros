@@ -162,9 +162,11 @@ def _assert_note_readable(facts):
 def test_main_coverage_status_remains_readable_away_from_history_control(direct_server_with_data, browser_engine, theme, tmp_path):
     from playwright.sync_api import sync_playwright
 
+    # Long enough that an owner's bubble (right-aligned since #1998) reaches under the note on the left.
+    words = ' '.join(['and the history keeps every message the owner sent across the whole column'] * 3)
     _append(direct_server_with_data['data_dir'], 'chat', [
         {'direction': 'in', 'chat_id': 1, 'ts': '2026-09-01T10:00:00Z',
-         'client_message_id': f'main-{index}', 'text': f'Main saved message {index:04d}'} for index in range(1400)])
+         'client_message_id': f'main-{index}', 'text': f'Main saved message {index:04d} {words}'} for index in range(1400)])
     with sync_playwright() as pw:
         browser = getattr(pw, browser_engine).launch(headless=True)
         try:

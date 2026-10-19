@@ -367,6 +367,7 @@ def _walk_roots(roots: List[Tuple[str, Tuple[str, ...]]], walk: _Walk, named: Tu
                         if not info.st_ino:  # a Windows listing has no identity: ask the folder itself
                             info = _path_stat(child)
                             if _is_reparse(info) or not stat.S_ISDIR(info.st_mode):
+                                unreadable += 1  # it changed into a link or a file while counting
                                 continue
                         if (info.st_dev, info.st_ino) in walk.skip:
                             continue  # another place's root: counted there

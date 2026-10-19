@@ -1,9 +1,8 @@
 """The quiet-wake door: finish_task(silent=true) on a consciousness wake's own turn.
 
 The scenarios run the real loop (scripted model responses) and the real terminal
-pipeline: a clean silent wake publishes no final row, owes no outbox delivery and
-mints no delivery subject, while its words, activity, sends and cost stay on the
-record. Owner words admitted after the last live reply, other turns, and any
+pipeline: a clean silent wake publishes no final row and owes no outbox delivery,
+while its words, activity, sends and cost stay on the record. Owner words admitted after the last live reply, other turns, and any
 outcome but a clean one keep the ordinary final.
 """
 
@@ -627,25 +626,6 @@ def test_completion_wins_quiet_row_speaks_only_its_custody_line(wake):
     assert "run-7" in event["text"] and INTERNAL not in json.dumps(event, ensure_ascii=False)
 
 
-def test_held_quiet_candidate_rewritten_with_new_words_is_no_longer_quiet(wake, monkeypatch):
-    """An informed retained-work choice rewrites the held candidate in place: the same bytes keep
-    their quiet provenance, new bytes are new words and become ordinary speech."""
-    import ouroboros.acceptance_preparation as preparation
-    from ouroboros.loop_delivery import DeliveryCandidate
-
-    held = DeliveryCandidate(full_text=INTERNAL, content_sha256="a" * 64, revision=1, evidence_revision=0,
-                             evidence_fingerprint="", acceptance_binding={}, quiet=True)
-    wake.ctx._delivery_candidate = held
-    monkeypatch.setattr(preparation, "preparation_delivery_choice", lambda *_a: True)
-    limit = SimpleNamespace(task_id=TASK_ID, root_task_id=TASK_ID, status_drive_root=wake.root,
-                            drive_root=wake.root, drive_logs=wake.root / "logs")
-    assert loop._replace_delivery_candidate(wake.registry, limit, {}, INTERNAL, control="forced_preserve:x") is held
-    assert held.quiet is True
-    rewritten = loop._replace_delivery_candidate(wake.registry, limit, {}, "Wrap-up: ordinary words.",
-                                                 control="forced_replace:x")
-    assert rewritten is held and held.full_text == "Wrap-up: ordinary words." and held.quiet is False
-
-
 def test_history_replay_and_completion_wins_owe_no_silent_row(wake):
     from supervisor.terminal_delivery import build_completed_result_event
     from ouroboros.task_finalization import build_sealed_final_package, sealed_final_prompt_section
@@ -657,14 +637,3 @@ def test_history_replay_and_completion_wins_owe_no_silent_row(wake):
     assert package["final_result_text"] == "" and package["internal_terminal_text"] == "internal note"
     section = sealed_final_prompt_section(package)
     assert "finished silently" in section and "never sent to the owner" in section
-
-
-def test_acceptance_history_mints_no_subject_for_silence(wake):
-    """A zero-physical seed would otherwise record a missing delivery body as a history gap."""
-    from ouroboros.acceptance_history import retain_acceptance_history
-    from ouroboros.task_results import write_task_result
-
-    write_task_result(wake.root, TASK_ID, "running")
-    trace = {"acceptance_history_seed": {"task_id": TASK_ID, "task_attempt": 1, "accounting_root_task_id": TASK_ID}}
-    assert retain_acceptance_history(wake.root, {"id": TASK_ID}, "", trace, {}, {}, [], None,
-                                     usage={"wake_silent": True}) == {}

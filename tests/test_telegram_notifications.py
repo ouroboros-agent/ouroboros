@@ -805,7 +805,7 @@ def test_tasks_notify_word_and_icon_follow_the_host_phase(tmp_path, monkeypatch)
     asyncio.run(nt._check_tasks_notify(api, {"TELEGRAM_NOTIFY_TASKS": "on"}, 42, {"notified_task_ids": []}, "en"))
     assert [text for _chat, text in _Rec.sent] == [
         "❌ Task fail1 failed · 3r",
-        "🚫 Task stop1 cancelled",
+        "🚫 Task stop1 stopped",
         "⚠️ Task warn1 done with warnings",
         "✅ Task ok1 done",
         "⚠️ Task odd1 done · failed",  # unknown phase: the legacy axes rule
@@ -819,13 +819,13 @@ def test_tasks_notify_word_and_icon_follow_the_host_phase(tmp_path, monkeypatch)
     monkeypatch.setenv("OUROBOROS_UI_LANGUAGE", "ru")
     memory.update_memory(data, "ru", lambda doc: (memory.apply_generated(doc, {
         "code:tg.notify.task_finished": {"text": "{icon} Задача {id} {word}{tail}"},
-        "code:task.headline.error": {"text": "Ошибка"}, "code:task.headline.cancelled": {"text": "Отменена"},
+        "code:task.headline.error": {"text": "Ошибка"}, "code:task.headline.cancelled": {"text": "Остановлена"},
         "code:task.headline.warn": {"text": "Готова с предупреждениями"}, "code:task.headline.done": {"text": "Готова"},
     }, model="test"), doc)[1], create=True)
     asyncio.run(nt._check_tasks_notify(api, {"TELEGRAM_NOTIFY_TASKS": "on"}, 42, {"notified_task_ids": []}, "ru"))
     assert [text for _chat, text in _Rec.sent] == [
         "❌ Задача fail1 ошибка · 3r",
-        "🚫 Задача stop1 отменена",
+        "🚫 Задача stop1 остановлена",
         "⚠️ Задача warn1 готова с предупреждениями",
         "✅ Задача ok1 готова",
         "⚠️ Задача odd1 готова · failed",

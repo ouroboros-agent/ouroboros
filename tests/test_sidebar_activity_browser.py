@@ -1,7 +1,8 @@
-"""Real SPA census consumers, socket lifecycle, CSS and navigation preservation.
+"""Real SPA sidebar marks over the server's work projection, socket lifecycle, CSS and navigation preservation.
 
 Uses the existing static-document fixture; never starts or bootstraps Ouroboros.
-All runtime replies are synthetic. Run with either fixture browser engine.
+All runtime replies are synthetic: each census row lands in its Project's room, and the work fields are the
+server's own projection of those rows. Run with either fixture browser engine.
 """
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ from urllib.parse import urlparse
 import pytest
 
 from tests import test_subscription_setup_browser as setup_browser
+from tests._work_projection_shared import work_fields
 
 subscription_ui = setup_browser.subscription_ui
 pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
@@ -70,6 +72,19 @@ def row_color(page, project):
     return page.locator(f'[data-project-id="{project}"]').evaluate('el => getComputedStyle(el).color')
 
 
+def served(body):
+    """The body as the server sends it: each census row in its Project's room (by the Project's chat id), and the
+    server's work projection of the rows. A body without its census carries no work fields either."""
+    reply = copy.deepcopy(body)
+    if 'active_chat_activities' in reply:
+        rooms = {project['id']: project['chat_id'] for project in reply.get('projects') or ()}
+        rows = [dict(row, chat_id=rooms.get(row.get('project_id'), row.get('chat_id', 1)))
+                for row in reply['active_chat_activities']]
+        reply['active_chat_activities'] = rows
+        reply.update(work_fields(rows, complete=reply.get('active_chat_activities_complete', True)))
+    return reply
+
+
 def mount_sidebar(ui, width, theme, reduced, projects, census):
     """Open the real SPA over synthetic state replies; return the mutable body and its controls."""
     page = ui['page']
@@ -87,13 +102,13 @@ def mount_sidebar(ui, width, theme, reduced, projects, census):
 
     def state_response(route):
         if mode['fault'] == 'hold':
-            held.append((route, copy.deepcopy(body)))
+            held.append((route, served(body)))
         elif mode['fault'] == 'http':
             route.fulfill(status=503, json={'error': 'fixture failure'})
         elif mode['fault'] == 'network':
             route.abort()
         else:
-            route.fulfill(json=copy.deepcopy(body))
+            route.fulfill(json=served(body))
 
     origin = urlparse(ui['url']).netloc
     page.route('**/*', lambda r: r.fallback() if urlparse(r.request.url).netloc == origin else r.abort())
@@ -138,17 +153,21 @@ def test_sidebar_activity_census_and_navigation(subscription_ui, width, theme, r
     def marker(project):
         return page.locator(f'[data-project-id="{project}"] .nav-activity-marker')
 
-    def observe(project, state, moving=False):
+    def observe(project, state, moving=False, amber=False):
         target = marker(project)
         page.wait_for_function("([selector, state]) => document.querySelector(selector)?.dataset.state === state",
                                arg=[f'[data-project-id="{project}"] .nav-activity-marker', state])
         assert target.get_attribute('data-motion') == ('1' if moving else '0')
+        assert target.get_attribute('data-amber') == ('1' if amber else '0'), project
         paint = target.evaluate("""el => ({gap:getComputedStyle(el).gap, dots:[...el.children].map(s => {
-            const c=getComputedStyle(s); return {width:c.width,height:c.height,animation:c.animationName,
-                duration:c.animationDuration,delay:c.animationDelay};})})""")
+            const c=getComputedStyle(s); return {shown:c.display !== 'none',width:c.width,height:c.height,
+                animation:c.animationName,duration:c.animationDuration,delay:c.animationDelay};})})""")
         assert paint['gap'] == '3px'
         assert len(paint['dots']) == 3
-        for index, dot in enumerate(paint['dots']):
+        # Work is three dots; one fact (a wait or a pause) is one dot, and an unconfirmed room one hollow ring.
+        shown = [dot for dot in paint['dots'] if dot['shown']]
+        assert len(shown) == (3 if state in ('working', 'queued') else 1), (project, state, paint)
+        for index, dot in enumerate(shown):
             assert (dot['width'], dot['height']) == ('4px', '4px')
             assert dot['animation'] == ('typing-bounce' if moving and not reduced else 'none')
             if moving and not reduced:
@@ -160,8 +179,10 @@ def test_sidebar_activity_census_and_navigation(subscription_ui, width, theme, r
 
     observe('p-work', 'working', True)
     observe('p-queue', 'queued')
-    observe('p-wait', 'waiting')
-    assert page.locator('[data-project-id="p-wait"]').get_attribute('title') == 'Waiting room · Waiting for access'
+    # A model wait nobody has to act on continues by itself: one dot, with its reason in the row's name.
+    observe('p-wait', 'dot')
+    assert page.locator('[data-project-id="p-wait"]').get_attribute('title') == (
+        'Waiting room · Waiting · Waiting for the model to become available')
     assert marker('p-empty').is_hidden()
     assert page.locator('[data-project-id="p-empty"]').is_enabled()
     assert page.locator('[data-project-id="p-delete"]').is_disabled()
@@ -171,12 +192,11 @@ def test_sidebar_activity_census_and_navigation(subscription_ui, width, theme, r
     assert page.locator(WORK + ' .nav-unread-dot').count() == 1
     assert page.locator('#nav-projects-count').inner_text() == '1'
     assert 'Unread' in page.locator(WORK).get_attribute('aria-label')
-    # Ink: a wait is the one amber fact; working and queued dots take the row's own foreground (queued quieter),
-    # so they never out-shout the name; none is the saturated project token.
-    assert dot_color(page, 'p-wait') == token_color(page, 'p-wait', '--amber')
-    assert dot_color(page, 'p-work') == row_color(page, 'p-work')
-    assert dot_color(page, 'p-queue') == row_color(page, 'p-queue')
-    for project in ('p-work', 'p-queue'):
+    # Ink: amber is only what waits for the owner, so this wait takes the row's own foreground as working and
+    # queued dots do (queued quieter): the dots never out-shout the name; none is the saturated project token.
+    for project in ('p-work', 'p-queue', 'p-wait'):
+        assert dot_color(page, project) == row_color(page, project)
+    for project in ('p-work', 'p-queue', 'p-wait'):
         assert dot_color(page, project) != token_color(page, project, '--project')
     assert marker('p-queue').evaluate('el => getComputedStyle(el).opacity') == '0.55'
     assert marker('p-work').evaluate('el => getComputedStyle(el).opacity') == '1'
@@ -212,12 +232,15 @@ def test_sidebar_activity_census_and_navigation(subscription_ui, width, theme, r
         marker:document.querySelector('[data-project-id="p-work"] .nav-activity-marker')}; }""")
     owner_wait = activity('work', 'p-work', required_question=dict(wait_for_answer=True, owner_wait_state='waiting'))
     refresh(active_chat_activities=[owner_wait])
-    observe('p-work', 'waiting')
+    # The owner's question is the one amber fact; the word already says it.
+    observe('p-work', 'dot', amber=True)
+    assert dot_color(page, 'p-work') == token_color(page, 'p-work', '--amber')
     assert page.locator(WORK).get_attribute('title').endswith('Waiting for your answer')
     mixed = [owner_wait, activity('independent', 'p-work', 'finalizing')]
     refresh(active_chat_activities=mixed)
-    observe('p-work', 'working', True)
-    assert page.locator(WORK).get_attribute('aria-label').endswith('Finalizing… · Waiting for your answer')
+    # Independent work keeps its motion; the question is still amber, and the row's name says both facts.
+    observe('p-work', 'working', True, amber=True)
+    assert page.locator(WORK).get_attribute('aria-label').endswith('Finalizing… · A question waits for your answer')
     assert page.evaluate("""() => sidebarKept.row === document.querySelector('[data-project-id="p-work"]')
         && sidebarKept.menu === document.querySelector('.project-row-menu') && sidebarKept.focus === document.activeElement
         && sidebarKept.unread.isConnected && sidebarKept.marker.isConnected""")
@@ -357,12 +380,16 @@ RAIL = """() => {
         const label = row.querySelector('.nav-row-label');
         const style = getComputedStyle(marker);
         return {
-            id: row.dataset.projectId, state: marker.dataset.state, deleting: item.classList.contains('is-deleting'),
+            id: row.dataset.projectId, state: marker.dataset.state, amber: marker.dataset.amber === '1',
+            deleting: item.classList.contains('is-deleting'),
             active: row.classList.contains('active'), row: rect(row), label: rect(label),
             ellipsized: label.scrollWidth > label.clientWidth, marker: rect(marker),
             drawn: style.display !== 'none' && style.visibility !== 'hidden', opacity: style.opacity,
-            dots: [...marker.children].map((dot) => rect(dot).left - rect(marker).left),
-            dotColor: getComputedStyle(marker.firstElementChild).backgroundColor, rowColor: getComputedStyle(row).color,
+            dots: [...marker.children].filter((dot) => getComputedStyle(dot).display !== 'none')
+                .map((dot) => rect(dot).left - rect(marker).left),
+            // A hollow ring (unconfirmed) draws its ink in its border.
+            dotColor: (({ backgroundColor: fill, borderTopColor: ring }) => (fill === 'rgba(0, 0, 0, 0)' ? ring : fill))(
+                getComputedStyle(marker.firstElementChild)), rowColor: getComputedStyle(row).color,
             unread: rect(row.querySelector('.nav-unread-dot')),
             trailing: rect(item.lastElementChild), trailingKind: item.lastElementChild.className,
         };
@@ -403,9 +430,10 @@ def assert_rail(page, rows, states, *, lit=()):
         for key in ('left', 'right', 'width', 'height'):
             assert row['marker'][key] == pytest.approx(marker[key], abs=0.01), (row['id'], key, row['marker'], marker)
         assert row['marker']['width'] == pytest.approx(18, abs=0.01)  # three 4px dots, two 3px gaps
-        assert row['dots'] == pytest.approx([0, 7, 14], abs=0.01)
+        # Work is three dots; one fact (a wait or a pause) is one dot at the column's start, unconfirmed one ring.
+        assert row['dots'] == pytest.approx([0, 7, 14] if row['state'] in ('working', 'queued') else [0], abs=0.01)
         assert abs((row['marker']['top'] + row['marker']['bottom']) - (row['row']['top'] + row['row']['bottom'])) <= 1
-        if row['state'] == 'waiting':
+        if row['amber']:
             assert row['dotColor'] == amber
         elif row['state'] == 'working':
             assert row['dotColor'] == row['rowColor'], (row['id'], row['dotColor'])  # the row's ink, lit row or not
@@ -449,7 +477,7 @@ def test_sidebar_activity_rail_geometry(subscription_ui, width, theme, reduced):
     initial = [row for spec in specs for row in spec[-1]] + [activity('main', phase='thinking')]
     mounted = mount_sidebar(ui, width, theme, reduced, projects, initial)
     refresh = mounted['refresh']
-    states = dict(wu='working', w='working', wl='working', qu='queued', q='waiting', a='waiting',
+    states = dict(wu='working', w='working', wl='working', qu='queued', q='dot', a='dot',
                   iu='idle', i='idle', dw='working', d='idle')
     states = {'p-' + key: value for key, value in states.items()}
 
@@ -471,7 +499,7 @@ def test_sidebar_activity_rail_geometry(subscription_ui, width, theme, reduced):
                                "'[data-project-id=\"' + project + '\"]')).color === color",
                                arg=[project, token_color(page, project, token)])
 
-    page.wait_for_function("() => document.querySelector('[data-project-id=\"p-a\"] .nav-activity-marker')?.dataset.state === 'waiting'")
+    page.wait_for_function("() => document.querySelector('[data-project-id=\"p-a\"] .nav-activity-marker')?.dataset.state === 'dot'")
     assert page.locator('[data-project-id="p-dw"]').get_attribute('title') == 'Deleting working — Deleting… · Working'
     reference = assert_rail(page, rail_rows(page), states)
     capture('default')

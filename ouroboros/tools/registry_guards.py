@@ -377,10 +377,10 @@ def _builtin_tool_availability(name: str, ctx: Any = None) -> tuple[bool, str, s
     tool = str(name or "").strip()
     if tool == "web_search":
         try:
-            from ouroboros.tools.search import _available_web_search_backends
+            from ouroboros.tools.search import _available_web_search_backends, _web_search_unavailability
 
             if not _available_web_search_backends():
-                return False, "missing_credential", "web_search_backend"
+                return (False, *_web_search_unavailability())
         except ImportError:
             return True, "", ""
         except Exception:

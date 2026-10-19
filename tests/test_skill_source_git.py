@@ -141,13 +141,14 @@ def test_token_retry_never_asks_this_computers_credential_helpers(credentials, t
         pytest.skip("git is not installed")
     calls = tmp_path / "helper-calls.txt"
     helper = tmp_path / "helper.sh"
-    helper.write_text(f'#!/bin/sh\necho "$1" >> "{calls}"\n'
-                      'if [ "$1" = get ]; then echo username=stored; echo password=stored-login; fi\n',
-                      encoding="utf-8")
+    # LF bytes and forward slashes: Windows text mode would end the script's lines with CR for its
+    # sh, and a git config value reads a backslash as an escape.
+    helper.write_bytes(f'#!/bin/sh\necho "$1" >> "{calls.as_posix()}"\n'
+                       'if [ "$1" = get ]; then echo username=stored; echo password=stored-login; fi\n'.encode())
     helper.chmod(0o755)
     gitconfig = tmp_path / "gitconfig"
-    gitconfig.write_text(f'[credential]\n\thelper = {helper}\n'
-                         f'[credential "https://github.com"]\n\thelper = {helper}\n', encoding="utf-8")
+    gitconfig.write_bytes(f'[credential]\n\thelper = {helper.as_posix()}\n'
+                          f'[credential "https://github.com"]\n\thelper = {helper.as_posix()}\n'.encode())
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(gitconfig))  # never this computer's real helpers
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     for name in ("GIT_ASKPASS", "SSH_ASKPASS"):

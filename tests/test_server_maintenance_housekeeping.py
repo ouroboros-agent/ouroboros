@@ -41,7 +41,7 @@ def _reconcile_pass(monkeypatch):
     monkeypatch.setattr(sm, "_run_drive_custody_pass", lambda *_a: None)
     monkeypatch.setattr(sm, "_tick_maintenance_child", lambda: None)
     monkeypatch.setattr("supervisor.workspace_preparation.recover_interrupted_preparations", lambda *a, **k: None)
-    monkeypatch.setattr("ouroboros.review_operation.collect_orphaned_operations_softly", lambda *a, **k: None)
+    monkeypatch.setattr("ouroboros.review_operation.retire_dead_review_pointers_softly", lambda *a, **k: None)
     monkeypatch.setattr("ouroboros.late_review_marks.replay_owed_late_reviews", lambda *a, **k: None)
     sm._run_periodic_reconcile_sweep([0.0], latch=SimpleNamespace(release=lambda: None))
 

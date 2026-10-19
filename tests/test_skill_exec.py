@@ -1328,7 +1328,7 @@ def test_selected_skill_blocks_self_authored_marker_write(tmp_path):
 
 
 def test_skill_development_review_uses_ordinary_extension_reconciliation(tmp_path, monkeypatch):
-    import types
+    from ouroboros.skill_review import SkillReviewOutcome
 
     ctx = _make_ctx(tmp_path)
     skills_root = tmp_path / "skills"
@@ -1341,7 +1341,7 @@ def test_skill_development_review_uses_ordinary_extension_reconciliation(tmp_pat
     monkeypatch.setattr(
         skill_exec_mod,
         "_review_skill_impl",
-        lambda _ctx, skill_name: types.SimpleNamespace(
+        lambda _ctx, skill_name: SkillReviewOutcome(
             skill_name=skill_name,
             status="pass",
             content_hash="hash",

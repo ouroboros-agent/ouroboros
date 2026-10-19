@@ -38,6 +38,7 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 SEEDS = REPO / "skills"
 UNIX = "unix_computer_use"
 WINDOWS = "windows_computer_use"
+DESIGN = ["ui_design", "design_demo"]
 UNIX_043 = "1e237c1bc89f0600a7362f69eddafdff4ddd1f2d"  # official history: os any, permissions with net
 log = logging.getLogger(__name__)
 
@@ -469,7 +470,7 @@ def test_an_unchanged_committed_tree_needs_no_payload_work(seed_repo, monkeypatc
     repo, drive = seed_repo
     assert ensure(repo, drive) == 0
     first = receipt(drive)
-    assert first["schema_version"] == 2 and first["seed_tree"]
+    assert first["schema_version"] == 3 and first["seed_tree"]
 
     def forbidden(*args, **kwargs):
         raise AssertionError("an unchanged bundled tree must not be reconciled again")
@@ -536,13 +537,14 @@ def test_dependency_work_left_or_unknown_writes_no_receipt(seed_repo, monkeypatc
     assert receipt(drive) is None
 
 
-def test_an_earlier_launcher_receipt_reruns_the_pass_once(seed_repo, monkeypatch):
+@pytest.mark.parametrize("schema", [1, 2])
+def test_an_earlier_launcher_receipt_reruns_the_pass_once(seed_repo, monkeypatch, schema):
     repo, drive = seed_repo
     tree = subprocess.run(["git", "rev-parse", "HEAD:skills"], cwd=repo, capture_output=True, text=True,
                           check=True).stdout.strip()
     (drive / "state").mkdir(exist_ok=True)
     (drive / "state" / "native_seed.json").write_text(json.dumps(
-        {"schema_version": 1, "repo": str(repo.resolve()), "seed_tree": tree, "post_bootstrap_seeds": []}),
+        {"schema_version": schema, "repo": str(repo.resolve()), "seed_tree": tree, "post_bootstrap_seeds": []}),
         encoding="utf-8")
     calls = []
     real = skill_builtin.reseed_changed_builtins
@@ -551,7 +553,7 @@ def test_an_earlier_launcher_receipt_reruns_the_pass_once(seed_repo, monkeypatch
     ensure(repo, drive)
     ensure(repo, drive)
 
-    assert calls == [1] and receipt(drive)["schema_version"] == 2
+    assert calls == [1] and receipt(drive)["schema_version"] == 3
 
 
 def test_the_pass_starts_the_dependency_step_off_the_boot_path(seed_repo, monkeypatch):
@@ -769,16 +771,24 @@ def test_a_new_install_starts_with_its_own_computer_use_skill_ticked_and_on(data
     from ouroboros import skill_starter
 
     on(monkeypatch, platform)
+    monkeypatch.setattr("ouroboros.skill_review.review_skill", lambda *a, **k: pytest.fail("trusted starter review"))
     rows = [{"id": "builtin", "name": "Built in", "kind": "builtin", "trust": "trusted", "confirmed": True}]
     monkeypatch.setenv("OUROBOROS_SKILL_SOURCES", json.dumps(rows))
-    assert skill_builtin.default_on_names(SEEDS) == [own]
+    assert skill_builtin.default_on_names(SEEDS) == [own, *DESIGN]
     ticked = skill_starter.default_starter_ids(data, rows, repo_dir=REPO)
     assert f"builtin/{own}" in ticked and f"builtin/{other}" not in ticked
+    assert all(f"builtin/{name}" in ticked for name in DESIGN)
 
     marker = skill_starter.run_starter(data, None, origin="first_start", repo_dir=REPO)
 
     assert marker["results"][f"builtin/{own}"]["status"] == "installed"
-    assert marker["defaults_offered"] == [own]
+    assert marker["defaults_offered"] == sorted([own, *DESIGN])
+    for name in DESIGN:
+        assert marker["results"][f"builtin/{name}"]["status"] == "installed"
+        assert load_enabled(data, name) is True
+        skill = find_skill(data, name)
+        assert skill.review.gate_for(skill.content_hash)["blocking_reason"] == "trusted_source"
+        assert not (data / "state" / "skills" / name / "review.json").exists()
     _dependency_pass(data, [own], log)  # dependencies an offline first start missed
     assert load_enabled(data, own) is True and not (data / "skills" / "native" / other).exists()
     assert lifecycle == ([["comtypes==1.4.17"]] if own == WINDOWS else [])
@@ -806,7 +816,7 @@ def test_an_existing_windows_install_gets_the_windows_skill_once_on_update(data,
     assert skill.review.gate_for(skill.content_hash)["blocking_reason"] == "trusted_source"
     from ouroboros.skill_starter import read_marker
 
-    assert read_marker(data)["defaults_offered"] == [WINDOWS]
+    assert read_marker(data)["defaults_offered"] == sorted([WINDOWS, *DESIGN])
     shutil.rmtree(data / "skills" / "native" / WINDOWS)  # the owner removes it
     _boot(data, monkeypatch)
     assert not (data / "skills" / "native" / WINDOWS).exists()
@@ -881,6 +891,109 @@ def test_unticking_everything_at_onboarding_stands_after_an_update(data, monkeyp
     on(monkeypatch, platform)
     skill_starter.classify_first_start(data, {})
     assert skill_starter.after_onboarding(data, [], repo_dir=REPO) == "done"
-    assert skill_starter.read_marker(data)["defaults_offered"] == [own]
+    assert skill_starter.read_marker(data)["defaults_offered"] == sorted([own, *DESIGN])
     _boot(data, monkeypatch)  # a later app update re-runs the startup pass
     assert not (data / "skills" / "native" / own).exists() and lifecycle == []
+
+
+# Real upgrade receipts: no helper unlinks them between boots.
+@pytest.fixture
+def instruction_upgrade(seed_repo, monkeypatch):
+    from ouroboros import skill_lifecycle_actions, skill_review
+
+    repo, drive = seed_repo
+    _starter(drive, "upgrade")
+    ensure(repo, drive)
+    assert receipt(drive) is not None
+    _write(repo / "skills", "new_instruction", "1.0.0")
+    (repo / "skills" / "builtin.json").write_text(json.dumps({"skills": [{
+        "name": "new_instruction", "category": ["design"], "recommended": True, "default_on": True,
+    }]}), encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "add default instruction")
+    monkeypatch.setattr(skill_builtin, "threading", SimpleNamespace(Thread=_SyncThread))
+    monkeypatch.setattr(skill_lifecycle_actions, "_sync_schedules", lambda *a, **k: None)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("an instruction turn-on must not review or load an extension")
+
+    monkeypatch.setattr(skill_review, "review_skill", forbidden)
+    monkeypatch.setattr("ouroboros.extension_loader.reconcile_extension", forbidden)
+    return repo, drive
+
+
+def test_upgrade_turns_on_a_new_default_instruction_without_review_or_extension_load(instruction_upgrade):
+    repo, drive = instruction_upgrade
+    skill_builtin.ensure_builtin_skills(drive, repo_dir=repo, log_obj=log)
+    skill = find_skill(drive, "new_instruction")
+    assert skill.enabled and skill.review.gate_for(skill.content_hash)["blocking_reason"] == "trusted_source"
+    assert not (drive / "state/skills/new_instruction/review.json").exists()
+    assert receipt(drive) is None  # work was still outstanding when the receipt was inspected
+    skill_builtin.ensure_builtin_skills(drive, repo_dir=repo, log_obj=log)
+    assert receipt(drive)["schema_version"] == 3
+
+
+def test_fresh_instruction_starter_needs_no_review_or_extension_load(instruction_upgrade, monkeypatch):
+    from ouroboros import skill_starter
+    from ouroboros.skill_source_catalog import builtin_snapshot
+
+    repo, _drive = instruction_upgrade
+    fresh = repo.parent / "fresh_data"
+    fresh.mkdir()
+    monkeypatch.setattr("ouroboros.config.SETTINGS_PATH", fresh / "settings.json")
+    monkeypatch.setenv("OUROBOROS_SKILL_SOURCES", json.dumps([
+        {"id": "builtin", "name": "Built in", "kind": "builtin", "trust": "trusted", "confirmed": True},
+    ]))
+    marker = skill_starter.run_starter(fresh, None, origin="first_start", repo_dir=repo)
+    assert marker["state"] == "done" and marker["defaults_offered"] == ["new_instruction"]
+    assert load_enabled(fresh, "new_instruction") is True
+    assert not (fresh / "state/skills/new_instruction/review.json").exists()
+    catalog = {row["name"]: row for row in builtin_snapshot(repo)["entries"]}
+    assert catalog["new_instruction"]["category"] == ["design"]
+    assert catalog["new_instruction"]["recommended"] is True
+
+
+@pytest.mark.parametrize("choice", ["off", "removed"])
+def test_instruction_owner_choice_survives_later_boots_and_release(instruction_upgrade, choice):
+    repo, drive = instruction_upgrade
+    skill_builtin.ensure_builtin_skills(drive, repo_dir=repo, log_obj=log)
+    if choice == "off":
+        save_enabled(drive, "new_instruction", False, actor="owner_ui")
+    else:
+        shutil.rmtree(drive / "skills/native/new_instruction")
+    skill_builtin.ensure_builtin_skills(drive, repo_dir=repo, log_obj=log)
+    assert receipt(drive) is not None
+    _write(repo / "skills", "new_instruction", "1.1.0")
+    _git(repo, "commit", "-qam", "update instruction")
+    skill_builtin.ensure_builtin_skills(drive, repo_dir=repo, log_obj=log)
+    skill = find_skill(drive, "new_instruction")
+    assert (skill is None) if choice == "removed" else (not skill.enabled)
+    assert receipt(drive) is not None
+
+
+def test_instruction_upgrade_respects_review_trust_opt_out(instruction_upgrade, monkeypatch):
+    repo, drive = instruction_upgrade
+    monkeypatch.setenv("OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS", "false")
+    skill_builtin.ensure_builtin_skills(drive, repo_dir=repo, log_obj=log)
+    skill = find_skill(drive, "new_instruction")
+    assert not skill.enabled and not skill.review.gate_for(skill.content_hash)["executable_review"]
+    assert receipt(drive) is not None  # the review choice is not unfinished startup work
+
+
+@pytest.mark.parametrize("interruption", ["disabled_pass", "thread_never_ran", "old_receipt"])
+def test_instruction_turn_on_is_retried_after_interrupted_startup(instruction_upgrade, monkeypatch, interruption):
+    repo, drive = instruction_upgrade
+    with monkeypatch.context() as interrupted:
+        if interruption == "thread_never_ran":
+            interrupted.setattr(skill_builtin, "threading", SimpleNamespace(
+                Thread=lambda **kwargs: SimpleNamespace(start=lambda: None)))
+        skill_builtin.ensure_builtin_skills(drive, repo_dir=repo, log_obj=log,
+                                            dependency_pass=interruption == "thread_never_ran")
+    assert not load_enabled(drive, "new_instruction") and receipt(drive) is None
+    if interruption == "old_receipt":
+        identity = {**skill_builtin._seed_identity(repo), "schema_version": 2}
+        (drive / "state/native_seed.json").write_text(json.dumps(identity), encoding="utf-8")
+    skill_builtin.ensure_builtin_skills(drive, repo_dir=repo, log_obj=log)
+    assert load_enabled(drive, "new_instruction") is True
+    skill_builtin.ensure_builtin_skills(drive, repo_dir=repo, log_obj=log)
+    assert receipt(drive)["schema_version"] == 3

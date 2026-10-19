@@ -99,8 +99,6 @@ from ouroboros.runtime_limits import (
     WAKE_DEFAULT_SEC,  # noqa: F401
     _bounded_positive_int_setting,  # noqa: F401
     _clamped_number_setting,  # noqa: F401
-    get_acceptance_reserve_pct,  # noqa: F401
-    get_acceptance_review_est_sec,  # noqa: F401
     get_bg_wakeup_max_sec, get_bg_wakeup_min_sec,  # noqa: F401
     get_claudexor_harness_install_timeout_sec,  # noqa: F401
     get_claudexor_quota_refresh_timeout_sec,  # noqa: F401
@@ -815,7 +813,7 @@ def load_settings_lock_held(*, _settings_lock_held: bool = True) -> dict:
     compatibility migration is persisted only while that lock is held; the write contains
     the raw mapping plus the normalized pair, never a defaults-merged settings document."""
     from ouroboros.review_pool_migration import apply_at_read_seam, environment_overridable_keys
-    from ouroboros.server_runtime import MODEL_SLOT_KEYS, authored_model_slots, propose_unauthored_model_slots
+    from ouroboros.server_runtime import SAVED_MODEL_ROLE_KEYS, authored_model_slots, propose_unauthored_model_slots
     loaded: dict = {}
     try:
         raw = _settings_integrity.read_settings_json_verified(SETTINGS_PATH)
@@ -840,7 +838,7 @@ def load_settings_lock_held(*, _settings_lock_held: bool = True) -> dict:
         raw_env = environ.get(key)
         if raw_env is None or key in _DISK_AUTHORED_SETTINGS or key in ENDPOINT_AUTHORED_SETTINGS:  # DISK-authored
             continue
-        if raw_env == echo.get(key) or (key in loaded and (key in MODEL_SLOT_KEYS or key in SAVED_CHOICE_SETTINGS)):
+        if raw_env == echo.get(key) or (key in loaded and (key in SAVED_MODEL_ROLE_KEYS or key in SAVED_CHOICE_SETTINGS)):
             continue  # this tree's own projection of a proposal is no choice; a saved slot or choice (blank too) is the owner's
         if key == "OUROBOROS_RETURN_REASONING" and raw_env == "":
             settings[key] = ""

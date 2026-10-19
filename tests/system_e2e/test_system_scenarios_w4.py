@@ -752,7 +752,7 @@ def test_s21_chat_lineage_cancel_delivers_receipt_to_outbox_and_chat(
             chat_row = chat_rows[-1]
             assert chat_row.get("direction") == "system", chat_row
             assert int(chat_row.get("chat_id") or 0) == lineage_chat, chat_row
-            assert f"Task {task_id} was cancelled" in str(chat_row.get("text") or ""), chat_row
+            assert f"Task {task_id} was stopped" in str(chat_row.get("text") or ""), chat_row
 
             # (b) The details-panel block on the durable result (the W2-F1 fact
             # a chatless task never gets).
@@ -762,7 +762,7 @@ def test_s21_chat_lineage_cancel_delivers_receipt_to_outbox_and_chat(
                          else None), 90)
             assert receipt, oracle.task_result(task_id)
             assert receipt.get("settled_status") == "cancelled", receipt
-            assert receipt.get("outcome") == "cancelled", receipt
+            assert receipt.get("outcome") == "stopped", receipt
             assert receipt.get("delivery_id") == delivery_id, receipt
             assert isinstance(receipt.get("salvage"), dict), receipt
 

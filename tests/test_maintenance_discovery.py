@@ -48,7 +48,7 @@ def test_reconcile_pass_reserves_the_child_and_walks_no_stamp_in_the_server(root
     monkeypatch.setattr(server_maintenance, "_run_reconcile_prunes", lambda *_a: None)
     monkeypatch.setattr("supervisor.workspace_preparation.recover_interrupted_preparations", lambda *a, **k: None)
     monkeypatch.setattr("ouroboros.late_review_marks.replay_owed_late_reviews", lambda *a, **k: None)
-    monkeypatch.setattr("ouroboros.review_operation.collect_orphaned_operations_softly", lambda *a, **k: None)
+    monkeypatch.setattr("ouroboros.review_operation.local_reviews_settled", lambda *a, **k: True)
     spawns = []
     monkeypatch.setattr(maintenance, "spawn_maintenance_job", lambda *a: spawns.append(a) or _FakeChild(_QUIET))
     latch, marker, finished = threading.Lock(), [0.0], threading.Event()

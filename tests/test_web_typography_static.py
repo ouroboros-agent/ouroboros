@@ -382,15 +382,16 @@ DECLARATION = re.compile(r"^\s*(--[a-z0-9-]+)\s*:", re.MULTILINE)
 
 
 def _js_sources() -> str:
-    """Every web module, concatenated.
+    """Every first-party web script, concatenated: the two page scripts (app.js
+    and theme.js, beside the vendored *.min.js bundles) and the modules.
 
     JS participates in the variable contract from both ends: it writes measured
     values with ``setProperty('--chat-input-reserve', …)`` and it reads themed
     ones with ``getComputedStyle(...).getPropertyValue('--diagram-bg')``. A
-    token at either end is live even though no CSS rule mentions it."""
-    return "".join(
-        path.read_text(encoding="utf-8") for path in sorted((WEB / "modules").rglob("*.js"))
-    )
+    token at either end is live even though no CSS rule mentions it: app.js's
+    handles write the dragged box's ``--drag-width``."""
+    scripts = [WEB / "app.js", WEB / "theme.js", *sorted((WEB / "modules").rglob("*.js"))]
+    return "".join(path.read_text(encoding="utf-8") for path in scripts)
 
 
 def test_every_css_variable_is_declared_somewhere() -> None:

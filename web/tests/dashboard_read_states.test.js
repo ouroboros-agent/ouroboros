@@ -900,7 +900,7 @@ test('Activity shows a row\'s own known outcome first and its unfinished finaliz
     assert.deepEqual(chip(rowOf(mount, 'done-root')).text + chip(rowOf(mount, 'done-root')).secondary, 'DoneFinalizing…');
     assert.deepEqual(chip(rowOf(mount, 'warn-root')), { text: 'Done with warnings', phase: 'warn',
         label: 'Task status: Done with warnings', secondary: '' });
-    assert.equal(chip(rowOf(mount, 'cancelled-root')).text, 'Cancelled');
+    assert.equal(chip(rowOf(mount, 'cancelled-root')).text, 'Stopped');
     // No known outcome: the queue's own words, exactly as before.
     for (const [id, word] of [['live-root', /running · task · 9s/], ['queued-root', /Queued work[\s\S]*pending · task/]]) {
         assert.equal(chip(rowOf(mount, id)), null, id);
@@ -914,8 +914,9 @@ test('Activity shows a row\'s own known outcome first and its unfinished finaliz
     assert.deepEqual(chip(rowOf(mount, 'answered-direct')).text + '|' + chip(rowOf(mount, 'answered-direct')).secondary,
         'Done|Finalizing…');
     assert.match(rowOf(mount, 'answered-direct').textContent, /Direct turn[\s\S]*· 10s/);
+    // The census's `owner` cause also covers Ouroboros's own Pause: without a work it never says who paused.
     assert.deepEqual(chip(rowOf(mount, 'late-root')), { text: 'Done', phase: 'done',
-        label: 'Task status: Done, Paused · owner pause', secondary: 'Paused · owner pause' });
+        label: 'Task status: Done, Paused', secondary: 'Paused' });
     assert.equal(chip(rowOf(mount, 'thinking-direct')), null);
     assert.match(rowOf(mount, 'thinking-direct').textContent, /thinking · 5s/);
     // Controls follow occupancy and the existing pause facts, never the outcome.
@@ -929,6 +930,24 @@ test('Activity shows a row\'s own known outcome first and its unfinished finaliz
     });
     assert.ok(queue.querySelectorAll('[data-activity-phase]').every((node) => node.closest('[data-i18n-skip]')),
         'chip words come from the translation seam, so the overlay leaves them alone');
+});
+
+test('Activity says who paused only where the work projection names it', async (t) => {
+    const { mount, routes, ws } = setup(t);
+    emptyActivity(routes);
+    const paused = (id) => outcomeRow(id, 'completed', 'ok', 'budget_paused', 'paused', { pause_cause: 'owner' });
+    const pausedWork = (id, code, extra = {}) => ({ work_id: id, room: 1, activity: 'paused', confirmed: true,
+        episode: { task_id: id, live: true }, because: [{ code, text: 'Paused' }], controls: [], ...extra });
+    routes.set(backgroundUrl, response({ bg_consciousness_enabled: false, active_chat_activities_complete: true,
+        active_chat_activities: ['by-owner', 'by-mind', 'unnamed', 'unconfirmed'].map(paused),
+        works: [pausedWork('by-owner', 'paused_by_owner'), pausedWork('by-mind', 'paused_by_mind'),
+            pausedWork('unconfirmed', 'paused_by_owner', { confirmed: false })], works_complete: true }));
+    await initActivity({ mount, ws }).refresh();
+    assert.equal(chip(rowOf(mount, 'by-owner')).secondary, 'Paused · by you');
+    assert.equal(chip(rowOf(mount, 'by-mind')).secondary, 'Paused · by Ouroboros');
+    // No work, or a work the server could not confirm: the census alone never names who paused.
+    assert.equal(chip(rowOf(mount, 'unnamed')).secondary, 'Paused');
+    assert.equal(chip(rowOf(mount, 'unconfirmed')).secondary, 'Paused');
 });
 
 test('Activity keeps pause words for members and paints a host hold beside a known outcome as text', async (t) => {
@@ -1357,7 +1376,7 @@ test('Storage tray frees the checked groups under the plan after the shared conf
         deleting: 0, deleting_bytes: 0, stuck: 1, kept: [], free_before: 140e9, free_after: 148e9, stopped: false, error: null } })));
     await timers.fire();
     await settle();
-    assert.match(storageTray(mount).textContent, /Removed 8\.0 GB \(5 folders\)\.\s*1 could not be deleted yet; the app retries once it changes\./);
+    assert.match(storageTray(mount).textContent, /Removed 8\.0 GB \(5 folders\)\.\s*1 could not be deleted yet; the app retries at its next maintenance run\./);
     assert.equal(timers.polls(), 0, 'an entry the child reported stuck is not polled for');
     assert.equal(mount.querySelector('[data-storage-live]').textContent, 'Not counted yet. Removed 8.0 GB (5 folders).', 'the live region carries one phase sentence');
     routes.set(storageUrl, response(freeBody('done', { run: { groups: posted.groups, selected: 6, done: 6, removed: 5, removed_bytes: 8e9,

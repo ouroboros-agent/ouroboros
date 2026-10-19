@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { activeModelWaits, createModelWaitController, isModelWaitReference, MODEL_WAIT_REASONS, mergeModelWaits, modelWaitAction, modelWaitRoleLabel, unsavedPersistenceNotice } from '../modules/model_wait.js';
 import { desiredLiveCardPhase } from '../modules/task_phase_chip.js';
-import { computeDerivedChatStatus } from '../modules/chat_activity.js';
+import { emptyWorkState, roomStatusView } from '../modules/work_status.js';
+import { room } from './work_fixture.js';
 
 const row = (patch = {}) => ({ wait_id: 'wait-light', revision: 1, task_attempt: 1,
     role: 'light', model: 'claudexor::source-a=same-model', source: 'source-a',
@@ -122,10 +123,11 @@ test('the typed history discriminator survives a chat transport wrapper', () => 
 });
 
 test('waiting has no computation animation and yields to real work and terminal truth', () => {
-    assert.deepEqual(computeDerivedChatStatus({ waitingModelCount: 1, queuedManagedCount: 1 }), {
-        kind: 'online', text: 'Waiting for access', tone: 'held', showDots: false, dots: 'one',
+    // The room waits for the model (the server's room); the card says the access wait itself.
+    assert.deepEqual(roomStatusView({ ...emptyWorkState(), room: room('waiting') }), {
+        kind: 'online', text: 'Waiting', tone: 'held', showDots: false, dots: 'one', amber: '', mark: 'dot',
     });
-    assert.equal(computeDerivedChatStatus({ waitingModelCount: 1, activeManagedCount: 1 }).text, 'Working');
+    assert.equal(roomStatusView({ ...emptyWorkState(), room: room('working') }).text, 'Working');
     assert.equal(desiredLiveCardPhase({ modelWaiting: true }).text, 'Waiting for access');
     assert.equal(desiredLiveCardPhase({ modelWaiting: true, cancelPendingPolicy: 'immediate' }).text, 'Cancelling…');
     assert.equal(desiredLiveCardPhase({ modelWaiting: true, finished: true }, 'done').text, 'Done');

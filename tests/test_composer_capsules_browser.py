@@ -52,6 +52,7 @@ ROW = """() => {
         },
         eff: { open: eff.dataset.open, fit: eff.dataset.fit || '', shown: shown(eff), right: rect(eff).right, head: eff.querySelector('.chat-capsule-head').textContent },
         swarmShown: shown(row.querySelector('.chat-composer-pills')),
+        menuShown: shown(row.querySelector('.composer-menu')),  // a room's ☰ (the stack layout shows it)
         namesShown: [...row.querySelectorAll('.chat-capsule-name')].map(shown),
         solo: row.dataset.ownerSolo || '', compact: row.dataset.ownerCompact || '',
         oneLine: Math.max(...tops) - Math.min(...tops) < 2, rowHeight: rect(row).height,
@@ -302,6 +303,7 @@ def test_one_capsule_open_at_a_time_and_a_narrow_switch_keeps_both_reachable(dir
             press = page.tap if touch else page.click
             closed = _row(page)
             assert closed["oneLine"] and not closed["docScroll"], closed
+            assert closed["menuShown"] is (width < 1000), ("a phone's room keeps ☰ first in the row", closed)
             seen = {"closed": closed}
             for first, second in (("effort", "context"), ("context", "effort")):
                 heads = {"effort": f"{EFFORT} .chat-capsule-head", "context": f"{CONTEXT} .chat-capsule-head"}
@@ -311,11 +313,13 @@ def test_one_capsule_open_at_a_time_and_a_narrow_switch_keeps_both_reachable(dir
                 page.wait_for_timeout(450)
                 one = _row(page)
                 if one[short[first]]["fit"] == "solo":
-                    # Alone on the line: the pills and the other capsule step aside; an outside
-                    # press gives the line back before the other capsule can be reached.
+                    # Alone on the line: the room's ☰, the pills and the other capsule step aside; an
+                    # outside press gives the line back before the other capsule can be reached.
                     assert one["solo"] == first and not one[short[second]]["shown"] and not one["swarmShown"], one
+                    assert not one["menuShown"], one
                     press("#chat-messages")
-                    _until(page, f"r.{short[first]}.open === 'false' && r.solo === '' && r.{short[second]}.shown && r.swarmShown")
+                    _until(page, f"r.{short[first]}.open === 'false' && r.solo === '' && r.{short[second]}.shown && r.swarmShown"
+                                 f" && r.menuShown === {str(closed['menuShown']).lower()}")
                 else:
                     assert width > 1000 and one["solo"] == "" and one[short[second]]["shown"], one
                 # The second capsule opens with one press (on a desktop the first one closes at once),
@@ -333,7 +337,7 @@ def test_one_capsule_open_at_a_time_and_a_narrow_switch_keeps_both_reachable(dir
                 _until(page, "r.ctx.open === 'false' && r.eff.open === 'false'")
                 back = _row(page)
                 assert back["ctx"]["shown"] and back["eff"]["shown"] and back["swarmShown"] and back["solo"] == "", back
-                assert back["oneLine"], back
+                assert back["menuShown"] is closed["menuShown"] and back["oneLine"], back
             _record(tmp_path, f"capsules-switch-{engine}-{width}", seen)
         finally:
             browser.close()

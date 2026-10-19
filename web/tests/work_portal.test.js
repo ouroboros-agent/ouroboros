@@ -8,6 +8,7 @@ import test, { after } from 'node:test';
 import { createChatInstance } from '../modules/chat.js';
 import { createWorkPortals } from '../modules/work_portal.js';
 import { ElementStub, installDom, restoreDom, walkCard } from './chat_dom_fixture.js';
+import { projection, room as serverRoom, work } from './work_fixture.js';
 
 const originalQuery = ElementStub.prototype.querySelector;
 after(() => { ElementStub.prototype.querySelector = originalQuery; });
@@ -335,21 +336,33 @@ test('a bound claim stays pending: Retry Continue on the work\'s own card, nothi
     } finally { f.close(); }
 });
 
-test('an admitted successor held in the room carries Resume as its one primary, from its own census row', async () => {
+test('an admitted successor paused in the room carries Resume as its one primary, from its work\'s own control', async () => {
     const details = {};
     const f = fixture({ details });
     try {
         const node = await runningPortal(f);
         details['w-1'] = failedDetail(continuedBy());
-        f.state({ task_bindings: bindings, active_chat_activities: [successorRow({ phase: 'budget_paused', pause_cause: 'owner',
-            can_resume: true, last_line: '' })] });
+        const paused = successorRow({ phase: 'budget_paused', pause_cause: 'owner', can_resume: true, last_line: '' });
+        // The work runs in its Project room (chat 7): the portal's card in Main still reads that work's controls.
+        const pausedWork = (controls) => projection(7, [work(paused, { activity: 'paused', paused_by: 'owner',
+            because: [{ code: 'paused_by_owner', text: 'Paused by you' }], controls })], serverRoom('paused'));
+        f.state({ task_bindings: bindings, active_chat_activities: [paused],
+            ...pausedWork([{ action: 'stop', target: 'w-1-c1' }]) });
         await settle();
         assert.equal(node.hidden, true);
-        assert.deepEqual(controls(f, 'w-1-c1'), ['Resume', 'Stop…'], 'held: Resume beside Stop…');
+        assert.deepEqual(controls(f, 'w-1-c1'), ['Stop…'], 'a paused phase alone offers no Resume');
+        f.state({ task_bindings: bindings, active_chat_activities: [paused],
+            ...pausedWork([{ action: 'resume', target: 'w-1-c1' }, { action: 'stop', target: 'w-1-c1' }]) });
+        await settle();
+        assert.deepEqual(controls(f, 'w-1-c1'), ['Resume', 'Stop…'], 'paused: Resume beside Stop…');
+        assert.equal(f.part('w-1-c1', 'live-phase').textContent, 'Paused · by you', 'the portal says the work\'s word');
         const primary = f.card('w-1-c1').querySelector('.chat-live-actions').children.filter((b) => b.classList.contains('btn-primary'));
         assert.deepEqual(primary.map((b) => b.textContent), ['Resume']);
-        // Released in the room: the next census says working, and the card's controls follow it.
-        f.state({ task_bindings: bindings, active_chat_activities: [successorRow()] });
+        // Released in the room: the next body says working, and the card's controls follow its work.
+        const working = successorRow();
+        f.state({ task_bindings: bindings, active_chat_activities: [working], ...projection(7, [work(working, {
+            controls: [{ action: 'wrap_up', target: 'w-1-c1' }, { action: 'stop', target: 'w-1-c1' }] })],
+        serverRoom('working')) });
         await settle();
         assert.deepEqual(controls(f, 'w-1-c1'), ['Stop…']);
         assert.equal(f.part('w-1-c1', 'live-activity').textContent, 'Continuing the audit.');

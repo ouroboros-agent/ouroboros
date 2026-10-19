@@ -409,7 +409,7 @@ _SUBAGENT_ICONS = {
 _SUBAGENT_TERMINAL = {"completed", "completed_warn", "failed", "cancelled", "rejected"}
 _SUBAGENT_LABELS_EN = {"scheduled": "queued", "running": "running", "update": "running", "progress": "running",
     "completed": "done", "completed_warn": "done (warn)", "failed": "failed",
-    "cancelled": "cancelled", "rejected": "rejected (duplicate)",
+    "cancelled": "stopped", "rejected": "rejected (duplicate)",
     "interrupted": "interrupted", "_title": "subagent"}
 _SUBAGENT_LABELS = Index("subagent", _SUBAGENT_LABELS_EN, "the status words of a subagent card")
 

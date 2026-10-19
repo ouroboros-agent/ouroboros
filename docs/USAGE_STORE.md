@@ -107,6 +107,13 @@ new receipt, failure, missing result or live ownership keeps the debt. A
 batched task-store query finds missing results before ownership reads. Their
 exact revisions stay, so a result landing after the last receipt (child
 copyback or quarantine restore) is projected later without a new receipt.
+`review_price.py` prices one review by one reviewer row from the same rows:
+`review_seat_costs` groups the review category's attempts by
+`(review_wave_id, review_slot_id)` through the `(category, ts_last)` index,
+summing every physical attempt of a seat in one wave; the median of a row's
+recent waves on its current model is shown with its count and range, no
+history reads `cost unknown`, and one process keeps the table for half an hour
+so `## Review` never waits on the ledger.
 
 ## 5. Lock tiers
 
@@ -127,7 +134,8 @@ current-facts store; `usage_store` keeps the money error vocabulary over it.
 Ordinary transactions lease one lazy connection per process, file and thread.
 Durability pragmas run at connection open; acquisition and commit waits retain
 their existing per-operation budgets. Returning a lease leaves no transaction
-open. Thread exit, fork, file replacement and export release cached handles;
+open. Thread exit, fork, file replacement, export and a folder's move
+(`close_connections_under`, each process its own) release cached handles;
 the raw descriptor follows the last connection. Fork callers must be outside
 transactions. Export/retire closes all idle handles and leaves DELETE mode
 after checkpointing, before a rename; an active lease refuses handoff with the
@@ -298,8 +306,8 @@ facts. A different final price is a conflict, never last-write-wins. Receipt
 retention precedes application; repeating `--apply` recovers an interrupted run.
 Existing dirty-owner maintenance refreshes terminal task/root projections after
 the ledger write, including after restart. Completed review attribution permits
-price recovery; live review operations (including late acceptance after the
-author task ends), live owners and post-task work remain protected. Price
+price recovery; live review operations (including a review wave that settles after
+the author's task ends), live owners and post-task work remain protected. Price
 uncertainty grants no continuation rights. Applying a price to an unresolved attempt closes its monetary row, removing that row's model-handoff blocker; separate live ownership checks and incomplete-response facts remain. Refining an already-settled nonfinal row never expands the open-attempt set.
 
 Standalone command custody uses the selected data root's existing current queue

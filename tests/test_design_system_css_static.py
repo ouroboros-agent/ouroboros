@@ -53,7 +53,7 @@ def media_widths(css):
 
 
 def test_viewport_width_queries_match_the_shrinking_debt_inventory():
-    actual = {str(path.relative_to(ROOT)): dict(counts) for path in first_party_sheets()
+    actual = {path.relative_to(ROOT).as_posix(): dict(counts) for path in first_party_sheets()
               if (counts := media_widths(path.read_text(encoding='utf-8')))}
     assert actual == MAX_WIDTH_DEBT, (
         'New raw viewport breakpoints are forbidden; components follow their container. '

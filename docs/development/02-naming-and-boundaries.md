@@ -109,7 +109,7 @@ rule is retried unchanged (`tools/arg_feedback`).
 A producer that knows its call failed publishes that fact typed
 (`tool_result._publish_tool_result`, or a first-line `⚠️ IDENTIFIER`): identifier-less
 `⚠️ prose` and bare `ERROR: ...` are recorded as a successful call in `tools.jsonl`, the
-outcome classifier and the acceptance packet, so the failure is lost where the next
+outcome classifier and the result subject, so the failure is lost where the next
 decision reads it. A wrapper carries its inner producer's failure forward, and a
 supervising wake is acknowledged on the published `supervision_wake_id`, never on the
 tool's name (ARCHITECTURE §6 "Delegated subagents").
@@ -261,15 +261,15 @@ lane a consciousness wake-up also runs on) and never give the model an argument 
 A task's own words travel as `KIND_TASK_MESSAGE` with provenance `independent_task`,
 never as `KIND_OWNER_TEXT`; the value lands at three seams in one change
 (`owner_mailbox.TASK_MESSAGE_PROVENANCES`, `deliver_task_message`,
-`loop_round_limits`) and enters no owner corpus (`owner_source_sha256`, the acceptance
-premises), because a task-minted message there would let a task authorize its own
-acceptance (`tests/test_task_authored_messages.py`; ARCHITECTURE §6 "Owner routing
+`loop_round_limits`) and enters no owner corpus (`owner_source_sha256`, the result review's
+ask), because a task-minted message there would let a task author its own
+request (`tests/test_task_authored_messages.py`; ARCHITECTURE §6 "Owner routing
 verbs").
 
 ### The owner corpus archives inputs; the owner door's stamp is the only authority
 
 A task-authored objective copies only its retained owner corpus, never the draft. Other
-runs record their first user turn for acceptance and Safety, labelled by
+runs record their first user turn for the owner corpus and Safety, labelled by
 what the host knows: `initial_user` when owner routing stamped the run
 (`metadata.origin_message_ref` or `origin_suppressed`, inherited by value by a promoted
 root), `initial_text` otherwise. `dialogue_provenance.run_origin` mints that fact once

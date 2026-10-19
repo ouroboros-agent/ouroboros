@@ -6,7 +6,7 @@
 // call, or the replay summary of a turn that ran only such calls) is not
 // content. Presence is the same live, on reload and on reconnect; a wait-only
 // block leaves with its wait and its resolved episode cannot reopen it; the
-// header keeps the census verdict beside a block.
+// header keeps the server room's word beside a block (a card never sets it).
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test, { after } from 'node:test';
@@ -17,6 +17,7 @@ import {
 import { upsertToolFoldRow } from '../modules/chat_render_batch.js';
 import { summarizeChatLiveEvent } from '../modules/log_events.js';
 import { ElementStub, installDom, restoreDom, walkCard } from './chat_dom_fixture.js';
+import { projection, room, work } from './work_fixture.js';
 
 // The folded row a sequence of observations produces, with no DOM in the way.
 const fold = (...observations) => {
@@ -94,12 +95,27 @@ function fixture(history = [], detail = { active_direct_turns: [] }, chatId = 1)
             .find((node) => String(node.className || '').includes('typing-bubble'))?.style.display === 'none',
         emit: (type, row) => handlers.get(type)({ chat_id: chatId, ts: TS, ...row }),
         log: (row) => handlers.get('log')({ chat_id: chatId, data: { task_id: TASK, ts: TS, ...invocation(row), ...row } }),
-        census: (rows) => instance.hydrateStateSnapshot({
+        // The census rows (the cards' facts) beside the server's room and works for them. Plain thinking or working
+        // rows default to the room the server rolls up for them; any other state names its room and works.
+        census: (rows, serverRoom = plainRoom(rows), works = rows.map((row) => work(row))) => instance.hydrateStateSnapshot({
             active_chat_activities: rows, active_chat_activities_complete: true, supervisor_ready: true,
+            ...projection(chatId, works, serverRoom),
         }, Infinity, ++generation),
         close() { instance.destroy(); restoreDom(env.prior); },
     };
 }
+
+// The server's room for rows that only think or work: Working, or the one exact call they share.
+function plainRoom(rows) {
+    if (!rows.length || !rows.every((row) => ['thinking', 'working'].includes(row.phase) && !row.owner_wait
+        && !row.required_question && !row.required_question_unavailable)) return null;
+    const calls = new Set(rows.map((row) => row.phase));
+    return room('working', { call: calls.size === 1 ? [...calls][0] : '' });
+}
+const asked = (row, extra = {}) => work(row, { activity: 'waiting', release: 'owner',
+    because: [{ code: 'owner_answer', text: 'Waiting for your answer' }], turn: [{ kind: 'question', task_id: row.activity_id }], ...extra });
+const askedRoom = (row) => room('waiting', { turn: [{ kind: 'question', task_id: row.activity_id }] });
+const unconfirmed = (row) => work(row, { activity: 'unknown', confirmed: false });
 
 const toolCarrier = (evidence, extra = {}) => ({ task_id: TASK, role: 'system', system_type: 'task_evidence',
     text: '', ts: TS, narration: false, tool_evidence: evidence, ...extra });
@@ -186,22 +202,26 @@ for (const chatId of [1, 1234]) test(`canonical owner wait settles without a Pro
         await f.instance.refreshHistory({ revision: 1 });
         const row = { activity_id: TASK, chat_id: chatId, kind: 'managed_task', phase: 'working',
             required_question_unavailable: true, owner_wait: { owner_wait_state: 'waiting', quiz_state: 'open' } };
-        f.census([row]);
+        f.census([row], askedRoom(row), [asked(row)]);
         assert.equal(f.card().querySelector('[data-live-phase]').textContent, 'Waiting for your answer');
         assert.equal(f.status(), 'Waiting for your answer');
         for (const owner_wait of [{ owner_wait_state: 'waiting', quiz_state: 'answered' },
             { owner_wait_state: 'resumed', quiz_state: 'open' }, { wait_ended_at: TS, quiz_state: 'open' }]) {
-            f.census([{ ...row, owner_wait }]);
+            f.census([{ ...row, owner_wait }], room('working', { call: 'working' }));
             assert.equal(f.card().querySelector('[data-live-phase]').textContent, 'Working');
             assert.equal(f.status(), 'Working');
         }
-        f.census([{ ...row, owner_wait: undefined }]);
+        f.census([{ ...row, owner_wait: undefined }], room('unknown'), [unconfirmed(row)]);
         assert.equal(f.status(), 'Activity unconfirmed');
-        f.census([{ ...row, owner_wait: { quiz_state: 'unknown' }, required_question_unavailable: false }]);
+        f.census([{ ...row, owner_wait: { quiz_state: 'unknown' }, required_question_unavailable: false }], room('unknown'),
+            [unconfirmed(row)]);
         assert.equal(f.status(), 'Activity unconfirmed', 'unreadable wait facts do not imply resumed work');
-        f.census([{ ...row, phase: 'budget_paused', pause_cause: 'sleep' }]);
-        assert.equal(f.card().querySelector('[data-live-phase]').textContent, 'Paused · sleep');
-        f.census([{ ...row, owner_wait: undefined, required_question_unavailable: false }]);
+        const sleeping = { ...row, phase: 'budget_paused', pause_cause: 'sleep' };
+        f.census([sleeping], room('waiting'), [work(sleeping, { activity: 'waiting',
+            because: [{ code: 'sleeping', text: 'Sleeping until it is woken' }] })]);
+        assert.equal(f.card().querySelector('[data-live-phase]').textContent, 'Waiting · sleeping');
+        assert.equal(f.status(), 'Waiting', 'a cold sleep waits; its reason stays on the row');
+        f.census([{ ...row, owner_wait: undefined, required_question_unavailable: false }], room('working', { call: 'working' }));
         assert.equal(f.status(), 'Working', 'no quiz evidence invents no wait');
     } finally { f.close(); }
 });
@@ -216,28 +236,34 @@ test('ordinary unfinished speech cannot settle the evidence card', async () => {
         await f.instance.refreshHistory({ revision: 1 });
         assert.equal(f.card().dataset.finished, '0');
         assert.equal(f.card().querySelector('[data-live-phase]').hidden, true);
-        f.census([{ activity_id: TASK, chat_id: 1, kind: 'managed_task', phase: 'queued' }]);
+        const queued = { activity_id: TASK, chat_id: 1, kind: 'managed_task', phase: 'queued' };
+        f.census([queued], room('queued'), [work(queued, { activity: 'queued' })]);
         assert.equal(f.card().querySelector('[data-live-phase]').textContent, 'Queued');
         assert.equal(f.status(), 'Queued');
     } finally { f.close(); }
 });
 
-test('current confirmed pause exposes direct Resume with its cause and keeps refusal visible', async () => {
+test('a work\'s Resume control exposes the card\'s Resume with its cause and keeps a refusal visible', async () => {
     const f = fixture([toolCarrier({ observations: [{ key: 'one', tool: 'read_file', fact: 'settled', status: 'ok' }] })]);
     try {
         document.body = new ElementStub('body', document);
         await f.instance.refreshHistory({ revision: 1 });
         const row = { activity_id: TASK, chat_id: 1, kind: 'direct_chat', phase: 'budget_paused', pause_cause: 'owner' };
-        f.census([row]);
+        const paused = (controls) => work(row, { activity: 'paused', paused_by: 'owner',
+            because: [{ code: 'paused_by_owner', text: 'Paused by you' }], controls });
+        // The census alone (a paused phase) offers no Resume: only the work's own control does.
+        f.census([row], room('paused'), [paused([{ action: 'stop', target: TASK }])]);
+        assert.equal(f.card().querySelector('[data-resume-run]'), null, 'a paused phase without the work\'s Resume control');
+        f.census([row], room('paused'), [paused([{ action: 'resume', target: TASK }, { action: 'stop', target: TASK }])]);
         const button = f.card().querySelector('[data-resume-run]');
         assert.ok(button);
         assert.equal(button.textContent, 'Resume');
-        assert.equal(f.card().querySelector('[data-live-phase]').textContent, 'Paused · owner pause');
+        assert.equal(f.card().querySelector('[data-live-phase]').textContent, 'Paused · by you');
         await button.listeners.get('click')[0]({ stopPropagation() {} });
         assert.equal(f.requests.filter(url => url.endsWith(`/tasks/${TASK}/resume`)).length, 1);
-        assert.equal(f.card().querySelector('[data-live-phase]').textContent, 'Paused · owner pause', 'a refusal invents no Running state');
+        assert.equal(f.card().querySelector('[data-live-phase]').textContent, 'Paused · by you', 'a refusal invents no Running state');
         for (const phase of ['budget_pausing', 'queued', 'working', 'unknown']) {
-            f.census([{ ...row, phase }]);
+            f.census([{ ...row, phase }], room('working'), [work({ ...row, phase }, { controls: [{ action: 'stop', target: TASK }] })]);
             assert.equal(f.card().querySelector('[data-resume-run]'), null, phase);
             assert.ok(f.card().querySelector('[data-cancel-run]'), `${phase}: positive current root remains stoppable`);
         }
@@ -254,12 +280,13 @@ test('required answer, unavailable wait, and parallel active work keep separate 
         await f.instance.refreshHistory({ revision: 1 });
         const row = { activity_id: TASK, chat_id: 1, kind: 'managed_task', phase: 'working',
             required_question: { owner_wait_state: 'waiting', quiz_state: 'open' } };
-        f.census([row]);
+        f.census([row], askedRoom(row), [asked(row)]);
         assert.equal(f.card().querySelector('[data-live-phase]').textContent, 'Waiting for your answer');
         assert.equal(f.status(), 'Waiting for your answer');
-        f.census([row, { activity_id: 'another', chat_id: 1, kind: 'managed_task', phase: 'working' }]);
+        const another = { activity_id: 'another', chat_id: 1, kind: 'managed_task', phase: 'working' };
+        f.census([row, another], room('working', { turn: [{ kind: 'question', task_id: TASK }] }), [asked(row), work(another)]);
         assert.equal(f.status(), 'Working', 'one waiting task cannot hide another task working');
-        f.census([{ ...row, required_question: null, required_question_unavailable: true }]);
+        f.census([{ ...row, required_question: null, required_question_unavailable: true }], room('unknown'), [unconfirmed(row)]);
         assert.equal(f.card().querySelector('[data-live-phase]').textContent, 'Activity unconfirmed');
         assert.equal(f.status(), 'Activity unconfirmed');
     } finally { f.close(); }
@@ -274,7 +301,7 @@ const wait = (patch = {}) => ({ role: 'system', system_type: 'task_model_wait', 
     wait_id: 'wait-main', revision: 1, task_attempt: 1, role_name: 'main', model: 'openai::gpt-5.5',
     reason: 'quota', state: 'waiting', auto_continue: true, ...patch });
 
-test('a wait with zero tools opens a block with the controls and leaves with the wait; a stale revision cannot resurrect it', () => {
+test('a wait with zero tools opens a block with the controls and leaves with the wait; a stale revision cannot resurrect it', async () => {
     const f = fixture();
     try {
         f.census(direct());
@@ -283,7 +310,13 @@ test('a wait with zero tools opens a block with the controls and leaves with the
         assert.ok(card, 'the open wait is the block');
         assert.ok(card.querySelector('.model-waits'), 'the wait controls live inside it');
         assert.equal(card.dataset.modelWaiting, '1');
-        assert.equal(f.status(), 'Waiting for access');
+        // A card never sets the header: the wait frame asks for a fresh state, and the server's room says it.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.ok(f.requests.some((url) => url.startsWith('/api/state')), 'the model wait frame re-read the state');
+        assert.equal(f.status(), 'Thinking', 'until the server says otherwise the room keeps its word');
+        f.census(direct(), room('waiting'), direct().map((row) => work(row, { activity: 'waiting',
+            because: [{ code: 'model_wait', text: 'Waiting for the model to become available' }] })));
+        assert.equal(f.status(), 'Waiting');
         f.emit('chat', wait({ role: 'system', revision: 2, state: 'resolved', resolution: 'quota_restored' }));
         assert.equal(f.card(), null, 'no block remains once the wait resolved');
         f.emit('chat', wait({ role: 'system', revision: 1 }));
@@ -947,6 +980,27 @@ test('a host note inside a child leaves the child\'s collapsed line and title al
         f.emit('chat', childNote({ subagent_event: 'completed', status: 'completed',
             result: 'Scouted the module.', narration: false }));
         assert.equal(activity(), 'Scouted the module.', 'the child\'s terminal is the host\'s own account and leads');
+    } finally { f.close(); }
+});
+
+// A helper's narration is activity: only its lifecycle frames re-read the state (its work's members changed).
+test('helper narration never re-reads the state; a helper lifecycle frame does', async () => {
+    const f = fixture();
+    try {
+        f.census(managed());
+        const reads = () => f.requests.filter((url) => url.startsWith('/api/state')).length;
+        // Its first frame mints a card for a member the last body did not list: that one asks once.
+        f.emit('chat', childNote({ content: 'Reading the spec.', narration: true }));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const before = reads();
+        for (const line of ['Comparing two runs.', 'Writing the summary.', 'Checking the result.']) {
+            f.emit('chat', childNote({ content: line, narration: true }));
+        }
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(reads(), before, 'three more narration lines, no state read');
+        f.emit('chat', childNote({ subagent_event: 'completed', status: 'completed', result: 'Done.', narration: false }));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.ok(reads() > before, 'the helper ended: its work changed members, so the state is read');
     } finally { f.close(); }
 });
 

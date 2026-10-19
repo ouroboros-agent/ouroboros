@@ -176,8 +176,8 @@ def _time_fact(ctx: Any) -> dict[str, Any]:
 
     Disclosed consequence: a metadata-poor task (no ``created_at``/
     ``started_at`` and no anchor latched yet) reports ``state: "not_set"``
-    until a path that OWNS a mutation — the acceptance launch — latches the
-    anchor. A poll answering the same question twice never changes its own
+    until a path that OWNS a mutation — the loop's time-budget notice — latches
+    the anchor. A poll answering the same question twice never changes its own
     next answer."""
     try:
         from ouroboros.task_pacing import observe_budget_profile, observe_budget_snapshot
@@ -325,17 +325,6 @@ def coordination_live_context(ctx: Any) -> dict[str, Any]:
     """
 
     root_task_id = _coordination_root_id(ctx)
-    try:
-        from ouroboros.task_pacing import project_task_acceptance_review_capacity
-
-        review_capacity = project_task_acceptance_review_capacity(ctx)
-    except Exception as exc:
-        review_capacity = {
-            "state": "unknown", "reason": type(exc).__name__,
-            "root_task_id": root_task_id, "cap_cycles": None,
-            "claimed_cycles": None, "remaining_cycles": None,
-            "binding_seen": False, "dedupe": "task_acceptance_binding_sha256",
-        }
     return {
         "observed_at": utc_now_iso(),
         "root_task_id": root_task_id,
@@ -343,7 +332,6 @@ def coordination_live_context(ctx: Any) -> dict[str, Any]:
         "time": _time_fact(ctx),
         "settled_spend": _settled_spend_fact(ctx, root_task_id),
         "active_descendants": _active_descendants_fact(ctx),
-        "review_capacity": review_capacity,
     }
 
 

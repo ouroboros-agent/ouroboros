@@ -1,7 +1,11 @@
 """Real child Host death/exec, manual follow-up and controls with production agent bootstrap.
 
 This is a TCP Host consumer, not a Slack provider or full server/supervisor boot.
-Inference and reviewer transports are local scripts; lifecycle owners are real.
+Inference and reviewer transports are local scripts; lifecycle owners are real. The
+author parks through the kept trigger (``tests/presence_lifecycle_host.py``): it
+reviews its own result, leaves that review for an addressed message and parks, so
+two model calls precede every park. Blocking and Advisory enforcement park alike:
+nothing is released early.
 """
 from __future__ import annotations
 
@@ -324,10 +328,7 @@ def test_killed_author_stays_interrupted_and_explicit_new_event_can_continue(tmp
     try:
         first = first_host.turn().json()
         assert first.get("status") == "continuing", first
-        if mode == "advisory":
-            assert first["outcome"] == "message" and first["text"] == ANSWER and first["output_ref"]
-        else:
-            assert (first["outcome"], first["text"], first["output_ref"]) == ("deferred", "", "")
+        assert (first["outcome"], first["text"], first["output_ref"]) == ("deferred", "", "")
         ref = first["continuation_ref"]
         assert first_host.work(ref).status_code == 202
         assert len(first_host.inputs()) == 2
@@ -468,7 +469,10 @@ def test_second_park_exposes_late_child_without_changing_initial_replay(tmp_path
             assert host.client.post("/fixture/release-review").status_code == 200
         final = eventually(lambda: (reply if (reply := host.work(ref)).status_code == 200 else None))
         assert final.json()["child_work_ref"] == child_ref, final.text
-        assert final.json()["status"] in {"completed", "cancelled"}
+        # A Stop while parked ends on the zero-call control rail: the direct turn's owner Stop settles failed
+        # (owner_requested_finalization) and speaks nothing; a released review lets the author complete.
+        assert final.json()["status"] == ("failed" if ending == "stop" else "completed")
+        assert ending != "stop" or (final.json()["text"], final.json()["output_ref"]) == ("", "")
         assert len(host.inputs()) == (4 if ending == "stop" else 5)
         # Polling reads the durable terminal before handle_task's finally closes
         # its model receiver. Require actual closure too; terminal is not its ACK.
@@ -502,23 +506,17 @@ def test_terminal_poll_precedes_author_teardown_but_cleanup_must_finish(tmp_path
         marker = tmp_path / "before-author-close.json"
         blocked = eventually(lambda: json.loads(marker.read_text()) if marker.exists() else None)
         assert blocked["task_id"] == ref and blocked["closed"] is False
-        assert blocked["status"] in {"completed", "cancelled"}
+        assert blocked["status"] == "failed"  # the owner's Stop of a parked direct turn settles failed, silently
         final = host.work(ref)
-        # A canonical answer is final the moment it is recorded; an unanswered terminal of a still-live
-        # author stays observed (202) until its execution ends.
-        canonical = blocked["status"] == "completed"
-        assert (final.status_code, final.json()["status"]) == ((200, "completed") if canonical else (202, "pending"))
+        # A recorded failed is final the moment it is recorded (``presence_recovery.retained_work_view``: only
+        # an unanswered terminal, cancelled or reconciled, of a still-live author stays observed as 202).
+        assert (final.status_code, final.json()["status"], final.json()["text"]) == (200, "failed", "")
         assert final.json()["child_work_ref"] == LATE_CHILD
         assert host.client.get("/fixture/live").json() == [ref]
         assert len(host.inputs()) == 4
         assert host.client.post("/fixture/release-close").status_code == 200
         eventually(lambda: host.client.get("/fixture/live").json() == [])
-        if canonical:
-            assert host.work(ref).json() == final.json()
-        else:
-            ended = host.work(ref)
-            assert (ended.status_code, ended.json()["status"], ended.json()["child_work_ref"]) == (
-                200, "cancelled", LATE_CHILD)
+        assert host.work(ref).json() == final.json()
         assert host.turn().json() == initial and len(host.inputs()) == 4
         assert host.work(LATE_CHILD).status_code == 202
         (tmp_path / "teardown-order-facts.json").write_text(json.dumps({
@@ -602,14 +600,8 @@ def test_v1_tcp_disconnect_before_first_park_keeps_one_author(tmp_path, mode):
         assert host.client.post("/fixture/release-review").status_code == 200
         final = eventually(lambda: (reply if (reply := host.work(ref)).status_code == 200 else None)).json()
         assert final["status"] == "completed" and len(host.inputs()) == 3
-        if mode == "advisory":
-            assert initial["text"] == ANSWER and initial["output_ref"]
-            assert final["text"] == "" and final["output_ref"] == ""
-            assert final["outputs"] == [{"outcome": "message", "text": ANSWER,
-                                          "output_ref": initial["output_ref"]}]
-        else:
-            assert initial["text"] == "" and initial["output_ref"] == ""
-            assert final["text"] == ANSWER and final["output_ref"]
+        assert initial["text"] == "" and initial["output_ref"] == ""
+        assert final["text"] == ANSWER and final["output_ref"] and final["outputs"] == []
         assert host.turn().json() == initial and len(host.inputs()) == 3
         assert host.client.get("/fixture/live").json() == []
         (tmp_path / "consumer-facts.json").write_text(json.dumps({

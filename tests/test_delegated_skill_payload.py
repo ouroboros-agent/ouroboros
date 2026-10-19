@@ -833,15 +833,16 @@ def test_payload_instructions_variant_is_payload_only(tmp_path, monkeypatch, acc
     from ouroboros.tools.delegate import _HOST_INSTRUCTIONS, _host_instructions
 
     ordinary = _host_instructions(delegated_run_shape(False))
-    assert "do not touch the host's runtime controls, skills, or memory" in ordinary
+    ban = "do not touch the host's runtime controls or memory, or modify its skills"
+    assert ban in ordinary
     assert "PAYLOAD ASSIGNMENT" not in ordinary
     mutating = _host_instructions(delegated_run_shape(True, access))
-    assert "do not touch the host's runtime controls, skills, or memory" in mutating
+    assert ban in mutating
     payload = _host_instructions(delegated_run_shape(True, access), payload_skill="alpha")
-    assert "runtime controls, skills, or memory" not in payload
-    assert "do not touch the host's runtime controls or memory" in payload
+    assert "modify its skills" not in payload
+    assert "do not touch the host's runtime controls or memory." in payload
     assert "PAYLOAD ASSIGNMENT" in payload and "'alpha'" in payload
-    assert "do not touch the host's runtime controls, skills, or memory" in _HOST_INSTRUCTIONS  # source intact
+    assert ban in _HOST_INSTRUCTIONS  # source intact
 
 
 def test_idempotent_already_applied_branch_runs_the_finalizer(tmp_path, monkeypatch):

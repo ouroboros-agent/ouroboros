@@ -291,8 +291,12 @@ def test_task_status_stays_factual_in_main_and_project_chat(
         assert card_visual_state(parent) == parent_visual_before_child_failure
         assert "error" not in child.get_attribute("class").split()
 
+        # The room says the server's room (DESIGN "Room work status"). These
+        # frames exist only on the test socket, so the server holds no work
+        # here: the room stays Online while the cards say each outcome, and a
+        # child's failure never turns it to Attention.
         page.wait_for_function(
-            "selector => document.querySelector(selector)?.textContent === 'Working'",
+            "selector => document.querySelector(selector)?.textContent === 'Online'",
             arg=status_selector,
             timeout=30_000,
         )

@@ -321,7 +321,8 @@ def test_preparation_captures_the_current_tree_when_it_runs_not_when_requested(e
     (src / "crlf.txt").write_bytes(b"one\r\ntwo\r\n")
     (src / "tool.sh").write_bytes(b"#!/bin/sh\necho hi\n")
     os.chmod(src / "tool.sh", 0o755)
-    git(src, "add", "crlf.txt", "tool.sh")
+    git(src, "add", "crlf.txt")
+    git(src, "add", "--chmod=+x", "tool.sh")  # Windows has no exec bit to read: the mode is git's
     git(src, "commit", "-qm", "modes and line endings")
     (src / "a.txt").write_bytes(b"base\nedited before the request\n")
     (src / "notes.txt").write_bytes(b"untracked eligible input\n")
@@ -338,7 +339,8 @@ def test_preparation_captures_the_current_tree_when_it_runs_not_when_requested(e
     copy = pathlib.Path(row["workspace_root"])
     assert (copy / "a.txt").read_bytes() == b"base\nedited while the request was queued\n"
     assert (copy / "crlf.txt").read_bytes() == b"one\r\ntwo\r\n"
-    assert (copy / "tool.sh").stat().st_mode & 0o111
+    assert git(copy, "ls-files", "-s", "tool.sh").startswith(b"100755 ")
+    assert os.name == "nt" or (copy / "tool.sh").stat().st_mode & 0o111  # Windows reports 0o100666
     assert (copy / "notes.txt").read_bytes() == b"untracked eligible input\n"
     binding = row["workspace_copy"]
     assert binding["target_head"] == head and binding["baseline_sha"] != head  # synthetic dirty baseline

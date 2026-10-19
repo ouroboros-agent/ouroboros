@@ -647,12 +647,12 @@ export function taskOutcomeSeverity(evt) {
     const record = normalizeTaskTerminalRecord(evt);
     const lifecycle = String(record.outcome_axes?.lifecycle?.status || record.status || '').toLowerCase();
     // v6.82 (P5): a cancelled task is neither Done nor Failed — it is honestly
-    // Cancelled. Checked first: forced teardown routinely leaves failure-shaped
+    // Stopped. Checked first: forced teardown routinely leaves failure-shaped
     // side facts (e.g. artifacts missing on a cancelled workspace task) that must
     // not relabel an owner-requested cancellation as a failure.
     // 'cancel_requested' as a STATUS is legacy replay only (phase A moved cancel
     // intent to the durable cancel_state projection); old task_done frames and
-    // pre-redesign history rows keep resolving as Cancelled.
+    // pre-redesign history rows keep resolving as cancelled.
     if (lifecycle === 'cancelled' || lifecycle === 'cancel_requested') {
         return 'cancelled';
     }
@@ -703,7 +703,7 @@ export function taskTerminalPhase(evt) {
 // Durable task detail is allowed to finish a card only at one of the task
 // result store's genuinely-settled statuses. In particular, interrupted and
 // the legacy cancel_requested latch remain retryable rather than becoming a
-// fabricated Done/Cancelled projection.
+// fabricated Done/Stopped projection.
 const TERMINAL_TASK_DETAIL_STATUSES = new Set([
     'completed', 'failed', 'cancelled', 'rejected_duplicate',
 ]);
@@ -738,7 +738,7 @@ export function taskPresentation(phase = 'working') {
             : normalizedPhase === 'cancelled' ? 'cancelled'
                 : ['error', 'timeout', 'lifecycle_error'].includes(normalizedPhase) ? 'error'
                     : 'working';
-    const english = { done: 'Done', warn: 'Done with warnings', cancelled: 'Cancelled', error: 'Failed', working: 'Working' }[word];
+    const english = { done: 'Done', warn: 'Done with warnings', cancelled: 'Stopped', error: 'Failed', working: 'Working' }[word];
     // The English twin of project_dialogue.OUTCOME_PHASE_HEADLINE; an install language reads it by code.
     return { phase: normalizedPhase, headline: tr(`task.headline.${word}`, english) };
 }

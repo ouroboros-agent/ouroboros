@@ -18,7 +18,6 @@ import pathlib
 import uuid
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
-from ouroboros.acceptance_preparation import incident_cause_clauses
 from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
 from ouroboros.review_records import recorded_author_stop
 from ouroboros.task_finalization import TERMINAL_ORIGIN_HOST_SALVAGE
@@ -187,13 +186,7 @@ def _text_sha256(value: Any) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
-def build_owner_message_ref(
-    *,
-    chat_id: int,
-    client_message_id: str,
-    ts: str,
-    text: str,
-) -> Dict[str, Any]:
+def build_owner_message_ref(*, chat_id: int, client_message_id: str, ts: str, text: str) -> Dict[str, Any]:
     """The canonical owner-row identity, built AT INGRESS from host-known facts.
 
     Identity is captured where the host writes the canonical row and passed by
@@ -426,9 +419,7 @@ def latest_chat_annotations(drive_root: Any) -> Dict[str, Dict[str, Any]]:
     return _latest_annotations(path)
 
 
-def chat_annotation_receipt(
-    drive_root: Any, client_message_id: str, routing_token: str,
-) -> Dict[str, Any]:
+def chat_annotation_receipt(drive_root: Any, client_message_id: str, routing_token: str) -> Dict[str, Any]:
     """The latest annotation written for one routing attempt, read BY TOKEN.
 
     A later act under the same owner message no longer hides an earlier act's
@@ -645,7 +636,7 @@ ROUTING_REFUSAL_CAUSES: Dict[str, str] = {
     "skill_repair_payload_unreadable": "the skill's files could not be read",
     "skill_repair_admission_unwritable": "the skill repair request could not be recorded",
     "repair_promotion_failed": "the skill repair request could not be started",
-    "task_acceptance_fence": "the task tree is already being accepted",
+    "task_acceptance_fence": "the task tree is closing after its author stopped it",
     "invalid_task_depth": "the task depth was invalid",
     "promotion_persistence_failed": "the task record could not be saved",
     "routing_receipt_persist_failed": "the receipt could not be saved",
@@ -680,12 +671,11 @@ MAIN_NOTICE_TYPE = "main_notice"
 # send handler and room_membership replay read this one set.
 MAIN_PINNED_ROW_TYPES = frozenset({"project_started", "project_handoff", "project_completion_summary", MAIN_NOTICE_TYPE})
 # Rows whose address is the producer's, never their task's room: Main pins, the
-# origin-addressed refusals, the late-acceptance supplement (its retained chat is
-# the send handler's decision) and the Main question pointer. The bus write seam
+# origin-addressed refusals and the Main question pointer. The bus write seam
 # (``message_bus.send_with_budget``) reads this one set; the readers above keep
 # each component's own reading.
 ROOM_FIXED_ROW_TYPES = MAIN_PINNED_ROW_TYPES | ORIGIN_ADDRESSED_NOTICE_TYPES | frozenset({
-    "acceptance_late_settlement", "project_question_pointer", "relay_reply"})
+    "project_question_pointer", "relay_reply"})
 
 # Statuses of an act that LANDED (or is still in flight): no cause sentence.
 _LANDED_ROUTING_STATUSES = frozenset({"scheduled", "delivered", "read", "pending", "dispatch_pending", "accepted"})
@@ -757,7 +747,7 @@ def routing_option_label(option: Any) -> str:
 
 
 OUTCOME_PHASE_HEADLINE = {"working": "Working", "done": "Done", "warn": "Done with warnings",
-                          "error": "Failed", "cancelled": "Cancelled"}
+                          "error": "Failed", "cancelled": "Stopped"}
 
 # One owner sentence per typed cause, for BOTH lifecycle writers and the card.
 # Keyed on the CODE only — never on (status × reason): the status word already
@@ -766,8 +756,8 @@ OUTCOME_PHASE_HEADLINE = {"working": "Working", "done": "Done", "warn": "Done wi
 # code stays typed on the row. web/modules/log_events.js carries the twin;
 # web/tests/fixtures/outcome_phase_parity.json pins both.
 TASK_CAUSE_PHRASES = {
-    # Acceptance-decision reasons. A clean accepted decision renders no clause (clean_pass and
-    # clean_pass_obligations_closed carry no sentence); an accepted decision with a sentence states its cause.
+    # Reasons of a task-acceptance decision stored before the result review. A clean accepted decision renders no
+    # clause (clean_pass, clean_pass_obligations_closed carry no sentence); one with a sentence states its cause.
     "previous_revision_accepted": "The reviewers approved an earlier version of this answer; the current version was not re-reviewed.",
     "admission_close_unconfirmed": "Reviewers approved this answer; the supervisor did not confirm that task admission was closed.",
     "author_stop": "Ouroboros stopped with unfinished work; no review approval was granted.",
@@ -1308,10 +1298,21 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any], *, includ
         warning_clauses.append(TASK_CAUSE_PHRASES["partial_result"])
     line = _join_cause_clauses([clause, *warning_clauses, TASK_CAUSE_PHRASES.get(review_cause, review_cause),
                                 _author_stop_rationale(decision, completion),
-                                *incident_cause_clauses(decision, reason, TASK_CAUSE_PHRASES),
+                                *_incident_cause_clauses(decision, reason),
                                 *_terminal_limitations(result, event, reason, held=held),
                                 TASK_CAUSE_PHRASES.get(custody, custody) if custody else ""])
     return line if not line or line.endswith((".", "!", "?", "…", ")")) else line + "."
+
+
+def _incident_cause_clauses(decision: Dict[str, Any], reason: str) -> List[str]:
+    """An old record's unresolved local evidence-assembly failure states both facts: it and the rail."""
+    from ouroboros.outcomes import REASON_FINAL_MESSAGE
+
+    incident = decision.get("acceptance_incident")
+    if not isinstance(incident, dict) or not incident or str(incident.get("status") or "") == "resolved":
+        return []
+    rail = TASK_CAUSE_PHRASES.get(reason, "") if reason not in {"", REASON_FINAL_MESSAGE} else ""
+    return [TASK_CAUSE_PHRASES["acceptance_preparation_failed"], rail]
 
 
 def _author_stop_rationale(decision: Dict[str, Any], completion: Optional[Dict[str, Any]] = None) -> str:
@@ -1501,9 +1502,7 @@ def enqueue_project_completion_summary(
     result: Dict[str, Any], task_done_event: Dict[str, Any],
 ) -> bool:
     """Whether this call queued a live Main copy; the typed pair also reports durability."""
-    return project_completion_delivery_outcome(
-        drive_root, evt, task_id, task, result, task_done_event,
-    )[1]
+    return project_completion_delivery_outcome(drive_root, evt, task_id, task, result, task_done_event)[1]
 
 
 def announce_project_started(

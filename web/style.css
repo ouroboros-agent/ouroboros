@@ -20,11 +20,31 @@ body {
     overflow: hidden;
 }
 
+/* The sidebar's column is as wide as the sidebar's own box (its width below), and the dimmed room and the Project
+   panel are placed in the columns after it: everything that lines up with the sidebar follows its box by layout.
+   So a drag of a handle writes the width it measures into the dragged box's own --drag-width, which no element
+   inherits, and a frame restyles that one box; the stored width on :root (--sidebar-width, --project-panel-width),
+   which every element inherits, is written once, when the drag ends (app.js). */
+@property --drag-width {
+    syntax: '*';
+    inherits: false;
+}
+/* The phone drawer's finger (drawer_drag.js) moves by one number on the drawer and its scrim: not inherited, so a
+   frame restyles those two boxes, not every row inside the drawer. */
+@property --drawer-p {
+    syntax: '<number>';
+    inherits: false;
+    initial-value: 0;
+}
+
 #app {
     display: grid;
-    grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+    grid-template-columns: auto minmax(0, 1fr);
     height: var(--vvh);
     position: relative;
+    /* The docked Project panel slides in from 18px past the window's edge; clipped here, that offset never widens
+       the page, so a scrollIntoView during the slide cannot scroll the whole window sideways. */
+    overflow-x: clip;
 }
 
 /* An older desktop page can survive a source update with its old #divider in the DOM.
@@ -77,6 +97,7 @@ html[data-layout="stack"] .shell-icon-control {
     --nav-item-h: 32px;      /* a Project row */
     --nav-control-h: 28px;   /* a row's ⋯ and the header's + */
     --nav-label-x: calc(var(--space-3) + 18px + var(--space-3));  /* the one text column every label starts on */
+    width: var(--drag-width, var(--sidebar-width));
     height: var(--vvh);
     display: flex;
     flex-direction: column;
@@ -169,8 +190,8 @@ html[data-layout="stack"] .shell-icon-control {
 }
 :root[data-window-chrome="integrated"][data-layout="stack"] .app-page-header { padding-left: max(12px, var(--window-chrome-clearance)); }
 
-/* Resizable side-section drag handles (v6.33.0). Thin edge strips that set
-   --sidebar-width / --project-panel-width; absent in the stack layout (layout.js). */
+/* Resizable side-section drag handles (v6.33.0). Thin edge strips that resize the sidebar and the Project panel
+   (app.js: --drag-width while dragged, the stored width when the drag ends); absent in the stack layout (layout.js). */
 /* CW10 (v6.34.0): suppress text selection while dragging via a class, not a JS
    inline style (DEVELOPMENT.md: no element.style.* property mutations in UI JS). */
 body.resizing-panels { user-select: none; }
@@ -247,10 +268,13 @@ html[data-layout="stack"] .resize-handle { display: none; }
 }
 
 /* Sidebar activity reuses the live-card's three 4px dots (`.chat-live-typing`
-   supplies the size, 3px gap and 1.4s bounce). The dots take the row's own
-   foreground, like the shared status-sentence dot, so they never out-shout the
-   title and follow its hover/active ink; a confirmed wait is the one amber
-   fact; queued and unknown work stay static at a quieter step of that ink. */
+   supplies the size, 3px gap and 1.4s bounce) as the room's one mark in the
+   server's work projection: three moving dots for work, three still dots for
+   queued work, one dot for a wait or a pause, a hollow ring when unconfirmed.
+   The dots take the row's own foreground, like the shared status-sentence dot,
+   so they never out-shout the title and follow its hover/active ink; amber is
+   the one hue, while something in the room waits for the owner; queued and
+   unknown work stay static at a quieter step of that ink. */
 .nav-activity-marker {
     pointer-events: none;
 }
@@ -268,14 +292,18 @@ html[data-layout="stack"] .resize-handle { display: none; }
 .nav-activity-marker[hidden] { display: none; }
 
 /* Same specificity as the later shared `.chat-live-typing span` accent rule
-   would lose on order; name the composed marker so the row ink wins: the dots never out-shout the name. */
+   would lose on order; name the composed marker so the row ink wins: the dots never out-shout the name, and
+   what waits for the owner is the one amber. */
 .nav-activity-marker.chat-live-typing span { background: currentColor; }
-.nav-activity-marker[data-state="waiting"] span { background: var(--amber); }
+.nav-activity-marker[data-amber="1"] span { background: var(--amber); }
 .nav-activity-marker[data-state="queued"],
 .nav-activity-marker[data-state="unknown"] { opacity: 0.55; }
+/* One fact is one dot; an unconfirmed room is one hollow ring. */
+.nav-activity-marker:is([data-state="dot"], [data-state="unknown"]) span:not(:first-child) { display: none; }
+.nav-activity-marker[data-state="unknown"] span { box-sizing: border-box; background: transparent; border: 1px solid currentColor; }
 
 /* Only confirmed computation inherits the bounce. */
-.nav-activity-marker[data-state="waiting"] span,
+.nav-activity-marker[data-state="dot"] span,
 .nav-activity-marker[data-state="queued"] span,
 .nav-activity-marker[data-state="unknown"] span,
 .nav-activity-marker[data-state="idle"] span { animation: none; }
@@ -1611,6 +1639,18 @@ html[data-layout="docked"] .app-page-header[data-empty] {
 #chat-messages > *,
 .chat-messages > * {
     flex-shrink: 0;
+    contain-intrinsic-size: auto 160px;
+}
+
+/* Lazy rows while the column's width keeps moving (a live window resize, the sidebar's or a Project panel's handle):
+   chat_reading_position.js marks the feed [data-resizing], and the browser lays out only the rows near the screen;
+   every other row keeps the size it was last laid out at (the `auto` above remembers it; 160px stands in only for a
+   row never laid out). Once the width holds, the mark goes, every row is laid out at the final width and the
+   reading place is re-applied in that same frame. Never lazy at rest: a row that takes its real size only as it
+   nears the screen moves the passage being read in WebKit, and landings, history pages and the bottom are measured
+   against exact rows (tests/test_chat_lazy_rows_browser.py). */
+:is(#chat-messages, .chat-messages)[data-resizing] > * {
+    content-visibility: auto;
 }
 
 /* An actual flex item keeps the overlay reserve inside scrollable overflow in
@@ -3537,16 +3577,42 @@ html[data-layout="stack"] .mobile-nav-toggle {
     flex: 0 0 44px;
     display: inline-flex;
 }
+/* A room's ☰ is the first control of its composer's row, under the thumb (owner 19.10, 1A): as tall as the
+   capsules beside it, with the touch minimum as its finger target (.ui-hit-area). */
+html[data-layout="stack"] .chat-toolbar-row > .composer-menu {
+    position: relative;  /* its hit area (.ui-hit-area::after) is centred on it, not on the composer */
+    flex: 0 0 auto;
+    width: var(--composer-control-height);
+    height: var(--composer-control-height);
+}
+html[data-layout="stack"] .chat-toolbar-row > .composer-menu svg {
+    width: 18px;
+    height: 18px;
+}
 /* The drawer (a layer, layers.js): the same sidebar slides in from the left over a scrim; it leaves 48px of the
-   room showing for the scrim, never more than 360px. Its head row holds the one × exactly where the header's ☰
-   was (the header's inset and leading slot), so the control the finger reached for stays under it. */
+   room showing for the scrim, never more than 360px. Its head row holds the one × exactly where a page header's ☰
+   is (the header's inset and leading slot), so the control the finger reached for stays under it; a room's ☰ is
+   its composer's first control, and the × stays here (owner 19.10, 2A). */
 html[data-layout="stack"] .nav-drawer-backdrop {
     position: fixed;
     inset: 0;
     z-index: var(--z-drawer-scrim);
     display: block;
     background: rgba(0, 0, 0, 0.48);
+    /* It fades with the drawer: shown at once and faded in from 0 (@starting-style), faded out before app.js puts
+       it away; while it fades out it is not a target. */
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity var(--drawer-settle, 280ms) ease;
     touch-action: pan-y pinch-zoom;  /* a sideways finger on the scrim drags the drawer closed (drawer_drag.js) */
+}
+html[data-layout="stack"] body.nav-drawer-open .nav-drawer-backdrop {
+    opacity: 1;
+    pointer-events: auto;
+    transition-duration: var(--drawer-settle, 340ms);
+}
+@starting-style {
+    html[data-layout="stack"] body.nav-drawer-open .nav-drawer-backdrop { opacity: 0; }
 }
 html[data-layout="stack"] .nav-drawer-backdrop[hidden] {
     display: none;
@@ -3556,8 +3622,11 @@ html[data-layout="stack"] #primary-sidebar {
     inset: 0 auto 0 0;
     z-index: var(--z-drawer);
     width: min(100vw - 48px, 360px);
-    transform: translateX(-105%);
-    transition: transform 200ms cubic-bezier(0.32, 0.72, 0, 1), box-shadow 200ms ease;
+    /* Closed it sits exactly off screen, where a drag picks it up (p = 0); it closes in 280ms and opens in 340ms on
+       the iOS sheet curve, or at the finger's speed after a drag (--drawer-settle, drawer_drag.js). */
+    transform: translateX(-100%);
+    transition: transform var(--drawer-settle, 280ms) cubic-bezier(0.32, 0.72, 0, 1),
+        box-shadow var(--drawer-settle, 280ms) ease;
     padding-bottom: calc(var(--space-3) + var(--inset-bottom));
     touch-action: pan-y;  /* a sideways finger is the drawer's (drawer_drag.js); up and down scroll the list */
 }
@@ -3567,6 +3636,11 @@ html[data-layout="stack"] #primary-sidebar {
 html[data-layout="stack"] :is(#chat-messages, .chat-messages, .files-list, .files-sidebar, .files-preview-content,
     .skills-scroll, .widgets-scroll, .settings-scroll, .costs-scroll, .activity-scroll, .evolution-container,
     #log-entries, .updates-scroll) {
+    touch-action: pan-y pinch-zoom;
+}
+/* Outside the scrollers too (a header, the composer's row of capsules, the attach button): the page itself only pans
+   up and down and zooms, so a sideways finger anywhere on the room is the drawer's, from the screen's edge on. */
+html[data-layout="stack"] body {
     touch-action: pan-y pinch-zoom;
 }
 html[data-layout="stack"] .sidebar-head {
@@ -3579,24 +3653,30 @@ html[data-layout="stack"] .drawer-head {
     padding: calc(var(--chrome-inset) + var(--inset-top)) 0 var(--chrome-inset);
 }
 /* The shadow belongs to the open drawer: on the closed one it leaked a grey band onto the phone's left edge. */
+/* Pulled past fully open the drawer gives a little (a rubber band, drawer_drag.js, at most DRAG.rubberMax = 48px). Its
+   surface reaches 64px past its left edge as a solid shadow, so the room never shows through the gap: a shadow paints
+   outside the box, where the drawer's own scroller would clip a child or a pseudo-element. */
 html[data-layout="stack"] #primary-sidebar.open {
     transform: translateX(0);
-    box-shadow: var(--elev-float);
+    box-shadow: -64px 0 0 var(--surface-side), var(--elev-float);
+    transition-duration: var(--drawer-settle, 340ms);
 }
 /* Under a finger (drawer_drag.js) the layer moves by one number, --drawer-p (0 closed … 1 open), with no
-   transition; the scrim is exactly as dark as the drawer is open. Releasing drops the class, and the transition
-   springs the drawer the rest of the way; reduced motion keeps the finger tracking and drops the spring. */
+   transition; the scrim is exactly as dark as the drawer is open. Releasing drops the class, and the drawer and its
+   scrim settle the rest of the way at the finger's speed; reduced motion keeps the finger tracking and drops the
+   settle. */
 html[data-layout="stack"] #primary-sidebar.dragging {
     transition: none;
     will-change: transform;
     transform: translate3d(calc((var(--drawer-p, 0) - 1) * 100%), 0, 0);
-    box-shadow: var(--elev-float);
+    box-shadow: -64px 0 0 var(--surface-side), var(--elev-float);
 }
-html[data-layout="stack"] .nav-drawer-backdrop.dragging {
+html[data-layout="stack"] body .nav-drawer-backdrop.dragging {
     opacity: var(--drawer-p, 0);
+    transition: none;
 }
 @media (prefers-reduced-motion: reduce) {
-    html[data-layout="stack"] #primary-sidebar { transition: none; }
+    html[data-layout="stack"] :is(#primary-sidebar, #primary-sidebar.open, .nav-drawer-backdrop) { transition: none; }
 }
 html[data-layout="stack"] .unread-badge {
     top: 2px;
@@ -4105,6 +4185,8 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .chat-capsule:is([data-fit="solo"], [data-fit="overflow"], [data-snap="true"]) :is(.chat-capsule-body, .chat-capsule-value) {
     transition: none;
 }
+/* A room's ☰ is one of the controls that step aside: the fit gives the open strip the whole line. */
+.chat-toolbar-row[data-owner-solo] > .composer-menu,
 .chat-toolbar-row[data-owner-solo] .chat-composer-pills,
 .chat-toolbar-row[data-owner-solo="effort"] .chat-context-mode,
 .chat-toolbar-row[data-owner-solo="context"] .chat-effort-range {
@@ -6865,7 +6947,7 @@ body.keyboard-open .chat-instance-panel .chat-input-area {
     min-height: 0;
 }
 
-/* Collapsed Projects keep their live rows; the rest wait behind one quiet row in the names' column. */
+/* Collapse keeps pinned, live, open and keyboard-owned Projects; other fetched rows wait here. */
 .nav-projects-show-all {
     min-height: var(--nav-item-h);
     padding-left: var(--nav-label-x);
@@ -6900,6 +6982,12 @@ body.keyboard-open .chat-instance-panel .chat-input-area {
     align-items: center;
     width: 100%;
     border-radius: var(--radius-sm);
+}
+
+/* Pinned Projects lead the same list: the first row shown after them keeps one step of air, the way the sidebar's
+   zones part. No caption, glyph, tint, rule or column, so nothing reads as one more Project (DESIGN "Shell"). */
+.nav-project-item[data-after-pins] {
+    margin-top: var(--space-2);
 }
 
 /* A Project row reads in the secondary ink at the body size; unread takes the primary ink as well as its dot. */
@@ -7196,7 +7284,7 @@ body.keyboard-open .chat-instance-panel .chat-input-area {
     top: 0;
     right: 0;
     bottom: 0;
-    width: var(--project-panel-width);
+    width: var(--drag-width, var(--project-panel-width));
     z-index: var(--z-project-panel);
     border-left: 1px solid var(--divider);
     /* A reading surface keeps its own backing even where native backdrop blur is not composited.
@@ -7244,10 +7332,7 @@ body.keyboard-open .chat-instance-panel .chat-input-area {
 
 .project-panel-backdrop {
     position: fixed;
-    top: 0;
-    right: 0;
-    bottom: 0;
-    left: var(--sidebar-width);
+    inset: 0;
     z-index: var(--z-project-scrim);
     cursor: default;
     background: rgba(0, 0, 0, 0.18);
@@ -7325,9 +7410,16 @@ body.keyboard-open .chat-instance-panel .chat-input-area {
 }
 
 /* Docked, the panel lies beside Main at its own width (its handle resizes it apart from the sidebar's), over the
-   dimmed room, and never wider than the content area, so it never covers the sidebar (owner 18.10, 4A). */
+   dimmed room, and never wider than the content area, so it never covers the sidebar (owner 18.10, 4A). Both are
+   placed in the columns after the sidebar's (#app), so the room's dimmed edge and the panel's cap follow the
+   sidebar's box by layout, frame by frame while it is dragged. */
+html[data-layout="docked"] .project-panel-backdrop,
 html[data-layout="docked"] .project-panel {
-    max-width: calc(100vw - var(--sidebar-width));
+    position: absolute;
+    grid-column: 2 / -1;
+}
+html[data-layout="docked"] .project-panel {
+    max-width: 100%;
 }
 
 /* The stack layout: the project thread is a full-width layer over the room. */
@@ -7342,12 +7434,15 @@ html[data-layout="stack"] .project-panel {
     transform: translateY(14px);
 }
 
-html[data-layout="stack"] .project-panel-backdrop {
-    left: 0;
-}
-
 html[data-layout="stack"] .project-panel.open {
     transform: translateY(0);
+}
+
+/* With the keyboard up a Project room shrinks to the visible viewport, as Main does (body.keyboard-open #page-chat):
+   its composer, with the room's ☰, stays above the keyboard instead of behind it. */
+body.keyboard-open .project-panel {
+    height: var(--vvh);
+    max-height: var(--vvh);
 }
 
 @media (prefers-reduced-motion: reduce) {

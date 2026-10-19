@@ -247,6 +247,17 @@ def test_s3_chat_card_dropdown_hurry_and_soft_stop(direct_server_with_data):
                 trigger = live.locator("[data-cancel-run]")
                 trigger.wait_for(state="attached", timeout=30_000)
                 assert trigger.inner_text().strip() == "Stop…"
+                # Wrap up and Hurry are a running root's controls: the server starts the root first, then the
+                # page reads that state (its controls come from the server's work, never a queued snapshot).
+                import time
+                import urllib.request
+                deadline = time.monotonic() + 60
+                while time.monotonic() < deadline and not any(
+                        w.get("work_id") == "live-root" and w.get("activity") == "working"
+                        for w in json.load(urllib.request.urlopen(url + "/api/state", timeout=10))["works"]):
+                    time.sleep(0.25)
+                with page.expect_response("**/api/state*", timeout=15_000):
+                    pass
                 page.evaluate(_FETCH_STUB_JS, "live-root")
                 bubbles_before = _chat_bubble_count(page)
 

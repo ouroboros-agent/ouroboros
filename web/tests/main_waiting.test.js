@@ -361,6 +361,27 @@ test('Resume is offered only for a resumable pause the owner did not make; the t
         ['budget', true, true], ['owner', false, true], ['blocked', false, true], ['unstated', false, true], ['restart', true, false]]);
 });
 
+test('the task control carries Resume only where the server allows it and no Resume button of its own stands', t => {
+    const main = mainPage(t);
+    const priorObserver = globalThis.IntersectionObserver;
+    globalThis.IntersectionObserver = class { observe() {} disconnect() {} takeRecords() { return []; } };
+    t.after(() => { globalThis.IntersectionObserver = priorObserver; });
+    main.waiting.snapshot(census({ actions: [action('budget'), action('owner', { pause_cause: 'owner' }),
+        action('blocked', { can_resume: false })] }));
+    const menuOf = id => {
+        const control = find(main.actionNode(id), node => node.textContent === 'Stop…');
+        for (const fn of control.listeners.get('click') || []) fn({ target: control, stopPropagation() {}, preventDefault() {} });
+        const items = [];
+        const walk = node => { if (node?.dataset?.taskControl) items.push(node.dataset.taskControl); (node?.children || []).forEach(walk); };
+        walk(main.env.mount);
+        return items;
+    };
+    // The owner's own Pause has no Resume button: the menu carries it; a standing button or a refused Resume keeps it out.
+    assert.ok(menuOf('owner').includes('resume'));
+    assert.ok(!menuOf('budget').includes('resume') && menuOf('budget').includes('stop_now'));
+    assert.ok(!menuOf('blocked').includes('resume') && menuOf('blocked').includes('stop_now'));
+});
+
 test('a complete census removes a message whose task no longer waits; an incomplete one keeps it with its controls withdrawn', t => {
     const main = mainPage(t);
     const row = action('paused');

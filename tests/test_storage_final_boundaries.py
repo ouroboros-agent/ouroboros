@@ -62,7 +62,9 @@ def test_ctrl_c_exports_real_pytest_terminal_results(tmp_path, entry, workers, r
                                env={**os.environ, EVIDENCE_ENV: str(evidence),
                                     NESTED_WORKERS_ENV: str(max(workers, 1))})
         try:
-            deadline = time.monotonic() + 40
+            # The ready files are the ordering signal; the deadline only bounds a hung launch. Two
+            # xdist workers importing tests.conftest under a loaded runner took over 40 s on CI.
+            deadline = time.monotonic() + 180
             while not all(p.exists() for p in ready) and proc.poll() is None and time.monotonic() < deadline:
                 time.sleep(.02)
             assert all(p.exists() for p in ready), (evidence / 'launcher.log').read_text()

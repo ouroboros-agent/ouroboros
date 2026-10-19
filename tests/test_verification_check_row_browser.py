@@ -120,7 +120,7 @@ def _assert_running(card):
     """A failed check leaves the task running. The chip's exact word while a model call is held
     follows the host's census (`Working`, `Preparing request`, …), so the invariant is "not over"."""
     phase = card.locator("[data-live-phase]").first.inner_text()
-    assert phase not in {"Done", "Done with warnings", "Failed", "Cancelled", ""}, phase
+    assert phase not in {"Done", "Done with warnings", "Failed", "Stopped", ""}, phase
 
 
 def _check_row(card):
@@ -181,7 +181,7 @@ def test_failed_check_row_live_expanded_finished_and_replayed(direct_server_with
 
             model.release.set()
             page.wait_for_function(
-                f"() => ['Done', 'Done with warnings', 'Failed', 'Cancelled'].includes(document.querySelector("
+                f"() => ['Done', 'Done with warnings', 'Failed', 'Stopped'].includes(document.querySelector("
                 f"'.chat-live-card[data-task-id=\"{task_id}\"] [data-live-phase]')?.textContent)", timeout=180_000)
             assert card.locator("[data-live-phase]").first.inner_text() == "Done", "a failed check is not a failed task"
             _assert_row(card)

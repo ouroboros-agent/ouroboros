@@ -1,26 +1,23 @@
-"""Review reconciliation consumes the invocation projection without forensic replay."""
+"""Review collection consumes the invocation projection without forensic replay."""
 from __future__ import annotations
-
-import queue
 
 import pytest
 
 from ouroboros import delegate_custody as c
 from ouroboros import review_operation
-from ouroboros.review_dispatch import reconcile_pending_acceptance_runs
 from ouroboros.review_execution import ReviewRouteUnavailable
 from ouroboros.review_session_custody import validate_producer_invocation
 from tests._review_session_route_shared import _run_session_directly
 from tests.test_custody_invocation_record import _legacy_rows, _publish, _request, _started
 from tests.test_review_operation_collection import (
-    PASS, TASK, _ctx, _observe, _session_run, forbid_effects,  # noqa: F401
+    PASS, SURFACE, TASK, _collect, _ctx, _observe, _session_run, _verdict, forbid_effects,  # noqa: F401
 )
 
 pytestmark = pytest.mark.usefixtures("forbid_effects")
 
 
 def _history(root, *, multiple=False):
-    request = _request(task_id=TASK, root_task_id=TASK, slot_id="s", operation_id="op-session")
+    request = _request(task_id=TASK, root_task_id=TASK, surface=SURFACE, slot_id="s", operation_id="op-session")
     rows = [request, {"type": c.START_FAILED, "invocation_id": "inv", "definite": True},
             {**request, "request": {"prompt": "repeated"}}]
     if multiple:
@@ -32,7 +29,7 @@ def _history(root, *, multiple=False):
 
 @pytest.mark.parametrize("legacy", ["modern", "proven", "gap"])
 @pytest.mark.parametrize("tokenless", [False, True])
-def test_reconcile_never_replays_custody_chain(tmp_path, monkeypatch, legacy, tokenless):
+def test_collection_never_replays_custody_chain(tmp_path, monkeypatch, legacy, tokenless):
     _history(tmp_path, multiple=legacy == "gap")
     if legacy != "modern":
         _legacy_rows(tmp_path, lose_bound_request=True)
@@ -45,23 +42,21 @@ def test_reconcile_never_replays_custody_chain(tmp_path, monkeypatch, legacy, to
 
     def forbidden(*args, **kwargs):
         replays.append(1)
-        raise AssertionError("reconcile replayed the custody chain")
+        raise AssertionError("collection replayed the custody chain")
 
     monkeypatch.setattr(c, "custody_rows", forbidden)
     monkeypatch.setattr(c, "_iter_rows", forbidden)
-    trace = {"review_runs": [run]}
-    assert reconcile_pending_acceptance_runs(trace, drive_root=tmp_path, usage_ctx=_ctx(tmp_path)) == 1
-    actor = run["actors"][0]
+    actor, fact = _collect(run, tmp_path, _ctx(tmp_path))
     gap = legacy == "gap" or (tokenless and legacy != "modern")
     if gap:
         assert actor["failure_code"] == "review_custody_legacy_gap"
         assert actor["usage"]["custody_state"] == "legacy_gap"
-        assert run["collection"]["facts"] == {"s": "unavailable"} and calls == []
+        assert fact == "unavailable" and calls == []
     else:
         assert actor["operation_state"] != "custody_lost"
         assert actor["usage"]["delegated_run_id"] == "b"
-        assert actor["parsed"]["verdict"] == "PASS"
-        assert run["collection"]["facts"] == {"s": "collected"}
+        assert _verdict(actor) == "PASS"
+        assert fact == "collected"
         assert calls == [("handshake",), ("get_run", "b"), ("close",)]
     assert replays == []
 
@@ -69,7 +64,7 @@ def test_reconcile_never_replays_custody_chain(tmp_path, monkeypatch, legacy, to
 @pytest.mark.parametrize("multiple", [False, True])
 def test_completed_producer_uses_last_started_and_names_legacy_gap(tmp_path, multiple):
     _history(tmp_path, multiple=multiple)
-    expected = {"task_id": TASK, "root_task_id": TASK, "surface": "task_acceptance",
+    expected = {"task_id": TASK, "root_task_id": TASK, "surface": SURFACE,
                 "slot_id": "s", "operation_id": "op-session"}
     payload = {"usage": {"delegated_run_id": "b"}}
     validate_producer_invocation(tmp_path, "inv", expected, payload, {}, error_source=False)
@@ -102,42 +97,3 @@ def test_operation_lookup_keeps_first_matching_repeated_request(tmp_path):
     answer = review_operation._invocation_for_operation(tmp_path, slot, "operation", {})
     oracle = c.invocation_record(tmp_path, "inv", rows=list(c.custody_rows(tmp_path)))
     assert answer == {**oracle, "invocation_id": "inv"}
-
-
-@pytest.mark.parametrize("legacy_gap", [False, True])
-def test_maintenance_pass_collects_without_chain_replay(tmp_path, monkeypatch, legacy_gap):
-    from ouroboros.review_projection import publish_acceptance_checkpoint
-    from ouroboros.task_results import write_task_result
-
-    _history(tmp_path, multiple=legacy_gap)
-    if legacy_gap:
-        _legacy_rows(tmp_path)
-    run = _session_run()
-    run["actors"][0]["pending_invocation_id"] = "inv"
-    run["binding_hash"] = "b" * 64
-    write_task_result(tmp_path, TASK, "completed", chat_id=3, result="reviewed answer A")
-    publish_acceptance_checkpoint(_ctx(tmp_path), {"review_runs": [run]}, task_id=TASK)
-    bus = queue.Queue()
-    monkeypatch.setattr("supervisor.workers.get_event_q", lambda **kw: bus)
-    calls = _observe(monkeypatch, {"summary": {"state": "succeeded"},
-                                   "primaryOutput": {"text": PASS, "truncated": False}})
-    replays, reads = [], []
-    reader = review_operation._invocation_for_operation
-
-    def read(*args, **kwargs):
-        answer = reader(*args, **kwargs)
-        reads.append(answer)
-        return answer
-
-    def forbidden(*args, **kwargs):
-        replays.append(1)
-        raise AssertionError("maintenance replayed the custody chain")
-
-    monkeypatch.setattr(review_operation, "_invocation_for_operation", read)
-    monkeypatch.setattr(c, "custody_rows", forbidden)
-    monkeypatch.setattr(c, "_iter_rows", forbidden)
-    report = review_operation.recover_orphaned_acceptance_operations(tmp_path)
-    assert not report["errors"] and report["settled"], report
-    assert reads and reads[0]["state"] == ("legacy_gap" if legacy_gap else "started")
-    assert replays == []
-    assert (("get_run", "b") in calls) is (not legacy_gap)

@@ -926,21 +926,9 @@ def _dispatch_round_model(
         ctx.tools._ctx._deferred_resource_refusal = None
     previous_call = ctx.accumulated_usage.get("_last_llm_call_meta")
     ctx.tools._ctx._usable_main_capture = None
-    from ouroboros.acceptance_settlement import expose_acceptance_feedback
-
-    import copy
-    from ouroboros.loop_delivery import completion_observation, completion_feedback
+    from ouroboros.loop_delivery import completion_observation
     trace = getattr(ctx.tools._ctx, "_execution_trace", None) or {}
-    observation = completion_observation(ctx.tools._ctx, trace)
-    feedback_snapshot = copy.deepcopy({key: trace.get(key) for key in (
-        "review_runs", "acceptance_review_outcome", "acceptance_preparation")})
-    ctx.tools._ctx._completion_observation = observation
-
-    def observe_feedback(sent):
-        expose_acceptance_feedback(trace, sent, str(ctx.task_id))
-        expose_acceptance_feedback(feedback_snapshot, sent, str(ctx.task_id))
-        observation.update(feedback=copy.deepcopy(completion_feedback(feedback_snapshot)),
-                           preparation=copy.deepcopy(feedback_snapshot.get("acceptance_preparation") or {}))
+    ctx.tools._ctx._completion_observation = completion_observation(ctx.tools._ctx, trace)
 
     with contextlib.ExitStack() as binding:
         deferral = None
@@ -969,7 +957,6 @@ def _dispatch_round_model(
             # The loop's own active-turn slot: a reprepared send keeps this exact
             # owner because the slot survives kwargs deep-copying by identity.
             model_turn_state=getattr(ctx.tools._ctx, "model_turn_state", None),
-            model_context_observer=observe_feedback,
             send_clock_policy=main_clock_policy(
                 getattr(ctx.tools._ctx, "task_metadata", {}), task_type=ctx.task_type),
             **({"max_tokens": int(max_tokens)} if max_tokens else {}),

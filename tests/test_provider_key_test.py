@@ -739,7 +739,7 @@ def test_provider_test_and_active_model_enumeration_never_select_legacy_heavy():
     assert LEGACY_MODEL_SETTING_KEYS == ("OUROBOROS_MODEL_HEAVY",)
     assert provider_api._provider_test_model("anthropic", {
         "OUROBOROS_MODEL_HEAVY": "anthropic::owner-legacy-heavy",
-    }) == "anthropic::claude-opus-5"
+    }) == "anthropic::claude-opus-5-5"
 
 
 @pytest.mark.parametrize("retired_key", [

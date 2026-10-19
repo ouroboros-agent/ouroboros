@@ -11,10 +11,7 @@ from tests._store_shared import result_signature
 
 
 @pytest.mark.parametrize("count", [1, 26])
-def test_persisted_input_contract_retains_exact_sources_and_review_inputs_after_gc(tmp_path, count):
-    from ouroboros.review_source_closure import retain_review_request_sources
-    from ouroboros.review_substrate import ReviewRequest
-
+def test_persisted_input_contract_retains_exact_sources_after_gc(tmp_path, count):
     parent, task = tmp_path / "canonical", "input-contract"
     child = headless.prepare_task_drive(parent, task, "empty")
     inputs = []
@@ -26,20 +23,9 @@ def test_persisted_input_contract_retains_exact_sources_and_review_inputs_after_
     contract = artifacts.attachment_manifest_projection(child, task, manifest)
     write_task_result(child, task, "running", result="answer", task_contract=contract)
     write_task_result(parent, task, "running", child_drive_root=str(child))
-    request = ReviewRequest(surface="task_acceptance", task_id=task, goal="inspect inputs", subject="answer",
-                            evidence={"task_contract": contract}, retry_key="input-review")
-    # Actual pre-dispatch owner, with the contract in the persisted task source
-    # as well as the mutable request. No reviewer/provider is launched.
-    retain_review_request_sources(request, source_root=child, custody_root=parent)
-    reader = Path(request.policy["native_data_root"])
-    saved = next(row["source_ref"] for row in request.policy["review_source_closure"]["sources"]
-                 if row["name"] == "task-result")
-    exact_snapshot = artifacts.read_actor_source_bytes(reader, task, saved)
-    placed_contract = request.evidence["task_contract"]
-    assert placed_contract != contract  # Mutable placement still rebinds addresses.
-    rows = artifacts.resolve_attachment_manifest(reader, task, placed_contract)
-    assert all(Path(row["abs_path"]).is_relative_to(reader) for row in rows)
 
+    # An older persisted acceptance request (the retired task acceptance wrote these) names the
+    # same contract; an old record still promotes whole, its captured bytes retained as written.
     raw = json.dumps({"request": {"surface": "task_acceptance", "task_id": task,
                                   "evidence": {"task_contract": contract}}}).encode("utf-8")
     captured = artifacts.store_actor_source_bytes(child, task, category="context_checkpoints",
@@ -53,14 +39,11 @@ def test_persisted_input_contract_retains_exact_sources_and_review_inputs_after_
     assert artifacts.read_actor_source_bytes(parent, task, captured) == raw
     assert task_custody.settle_child_drive(parent, task, child, live=lambda _: False)["status"] == "removed"
     assert artifacts.read_actor_source_bytes(parent, task, captured) == raw
-    assert artifacts.read_actor_source_bytes(reader, task, saved) == exact_snapshot
-    assert artifacts.read_actor_source_bytes(parent, task, saved) == exact_snapshot
-    for placed_root, authority in ((parent, result["task_contract"]), (reader, placed_contract)):
-        rows = artifacts.resolve_attachment_manifest(placed_root, task, authority)
-        assert len(rows) == count
-        for row in rows:
-            artifacts.stream_artifact_file(Path(row["abs_path"]), expected=row)
-            assert Path(row["abs_path"]).read_text(encoding="utf-8").startswith("exact input ")
+    rows = artifacts.resolve_attachment_manifest(parent, task, result["task_contract"])
+    assert len(rows) == count
+    for row in rows:
+        artifacts.stream_artifact_file(Path(row["abs_path"]), expected=row)
+        assert Path(row["abs_path"]).read_text(encoding="utf-8").startswith("exact input ")
 
 
 def _inventory(tmp_path, fault="missing"):
@@ -433,9 +416,10 @@ def _acceptance_checkpoint(child, task, contract):
 
 
 def test_review_input_attachment_copies_are_owned_sources(tmp_path):
-    from ouroboros.review_source_closure import retain_review_request_sources
-    from ouroboros.review_substrate import ReviewRequest
-
+    """An older persisted request names a reviewer's attachment copy under
+    ``source_handles/review_inputs/request-*`` of the task's canonical store, where the retired
+    acceptance's request-source closure placed it; nothing places one now, and the old record
+    still promotes completely."""
     parent, task = tmp_path / "canonical", "att-snapshot-task"
     child = headless.prepare_task_drive(parent, task, "empty")
     image = tmp_path / "screen.png"
@@ -444,11 +428,13 @@ def test_review_input_attachment_copies_are_owned_sources(tmp_path):
         child, task, artifacts.stage_task_attachments(child, task, [str(image)]))
     write_task_result(child, task, "running", result="answer", task_contract=contract)
     write_task_result(parent, task, "running", child_drive_root=str(child))
-    request = ReviewRequest(surface="task_acceptance", task_id=task, goal="check image", subject="answer",
-                            evidence={"task_contract": contract}, retry_key="img-review")
-    retain_review_request_sources(request, source_root=child, custody_root=parent)
-    placed = request.evidence["task_contract"]
-    assert "source_handles/review_inputs/request-" in Path(placed["attachment_manifest"][0]["abs_path"]).as_posix()
+    [row] = contract["attachment_manifest"]
+    staged = Path(row["abs_path"])
+    copy = (artifacts.task_artifact_dir_path(parent, task, create=True) / "source_handles" / "review_inputs"
+            / "request-old" / "task_results" / "artifacts" / task / "attachments" / staged.name)
+    copy.parent.mkdir(parents=True)
+    copy.write_bytes(staged.read_bytes())
+    placed = {**contract, "attachment_manifest": [{**row, "abs_path": str(copy)}]}
     captured = _acceptance_checkpoint(child, task, placed)  # the persisted request names the placement
     write_task_result(child, task, "completed", result="answer", artifact_status="ready",
                       task_contract=contract, review_evidence={"source_refs": [captured]})

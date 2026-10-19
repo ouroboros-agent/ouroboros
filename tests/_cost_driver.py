@@ -8,10 +8,12 @@ previous request, boot or test cached in memory is present.
 Only what would leave the machine or start real work is replaced: the provider check says a
 provider is ready (no model is called; a call would be recorded and refused), workers are not
 spawned, the supervisor's git bootstrap (checkout reset + import-test child process) and the
-boot-time update check do not run, the owned Claudexor daemon is not warmed, and the host
-service listens on an ephemeral loopback port. Everything else — the ASGI lifespan, the store
-import, the supervisor's init, the gateway handlers, the WebSocket chat door and the Stop path —
-is production code.
+boot-time update check do not run, the owned Claudexor daemon is not warmed, the starter-skill
+installer does not run (the boot of this fresh root with a ready provider schedules it; it would
+clone the skill sources from GitHub and install skills while the boundaries are measured; the
+request is recorded as ``starter_requests``), and the host service listens on an ephemeral
+loopback port. Everything else — the ASGI lifespan, the store import, the supervisor's init, the
+gateway handlers, the WebSocket chat door and the Stop path — is production code.
 
 Boundaries (tags in the output):
 
@@ -97,7 +99,7 @@ class _Tagger:
 
 
 def _stub_external_effects(srv: Any, result: Dict[str, Any]) -> None:
-    from ouroboros import claudexor_daemon, llm
+    from ouroboros import claudexor_daemon, llm, skill_starter
     from supervisor import workers
 
     srv.has_startup_ready_provider = lambda _settings: True
@@ -105,6 +107,8 @@ def _stub_external_effects(srv: Any, result: Dict[str, Any]) -> None:
     srv._boot_managed_update_tasks = lambda: None
     workers.spawn_workers = lambda *_a, **_k: None
     claudexor_daemon.warm_owned_daemon = lambda *_a, **_k: None
+    skill_starter.schedule_starter = lambda _root, _ids, *, origin, repo_dir=None: (
+        result.setdefault("starter_requests", []).append(origin))
 
     def refuse_model(*_args, **_kwargs):
         result.setdefault("model_calls", []).append(BOUNDARY.get() or threading.current_thread().name)

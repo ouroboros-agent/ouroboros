@@ -167,6 +167,38 @@ def test_install_from_a_review_row_starts_the_review_and_records_the_reason(ctx)
     assert record["task_id"] == "task-1" and record["basis"] == "review"
 
 
+@pytest.mark.parametrize("tool", ["skill_install", "skill_update"])
+@pytest.mark.parametrize("enforcement,expected", [("blocking", ["a", "b"]), ("advisory", ["a"])])
+def test_skill_tools_carry_the_admitted_panel_before_mutation(tmp_path, monkeypatch, tool, enforcement, expected):
+    from ouroboros import skill_source_install as installer
+    from tests.review_pool_rosters import pool_roster, pool_seat, set_review_pool
+    set_review_pool(monkeypatch, pool_roster(pool_seat("a", "openai/a"), pool_seat("b", "openai/b")))
+    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", enforcement)
+    called, panels = [], []
+    def install(*_args, **kwargs):
+        called.append(kwargs)
+        return {"name": "notes", "needs_review": True, "source": {"name": "community"}}
+    monkeypatch.setattr(installer, "install_item" if tool == "skill_install" else "update_installed", install)
+    monkeypatch.setattr(installer, "start_review", lambda *_a, **kw: panels.append(kw["panel"]))
+    args = ({"id": "community/notes", "reason": "notes for the trip"} if tool == "skill_install"
+            else {"name": "notes", "mode": "replace"})
+    why = "review_reason" if tool == "skill_install" else "reason"  # the install reason never explains reviewers
+    context = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    invalid = _typed_call(tool, context, **args, reviewers=["a"], **{why: 42})
+    assert invalid.code == "TOOL_ARG_ERROR" and f"{why} must be a string" in invalid.text
+    assert called == panels == []
+    if enforcement == "advisory":
+        refused = _typed_call(tool, context, **args, reviewers=["a"])
+        assert refused.code == "TOOL_ARG_ERROR" and "REVIEW_PANEL_REASON_REQUIRED" in refused.text
+        assert f"Supply {why} or omit reviewers" in refused.text
+        assert called == panels == []
+    result = _typed_call(tool, context, **args, reviewers=["a"], **{why: "one area changed"})
+    assert result.code == "OK" and len(called) == len(panels) == 1
+    assert panels[0].facts["assigned"] == expected and panels[0].facts["reason"] == "one area changed"
+    assert panels[0].facts["chosen_by"] == "ouroboros"
+    assert called[0].get("reason", "") == ("notes for the trip" if tool == "skill_install" else "")
+
+
 def test_install_from_a_trusted_row_is_accepted_at_once(ctx):
     context, drive, reviews, _hub = ctx
     _call("skill_search", context)

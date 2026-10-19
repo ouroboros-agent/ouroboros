@@ -558,16 +558,18 @@ class ToolRegistry:
             if entry.name == "review_change":
                 schema = copy.deepcopy(schema)
                 props = schema["parameters"]["properties"]
-                props["subject"]["enum"] = ["index", "worktree", "base..head"]
-                props["subject"]["description"] = "The assigned repository's staged index, worktree or base..head change."
+                props["subject"]["enum"] = ["index", "worktree", "base..head", "result"]
+                props["subject"]["description"] = ("The assigned repository's staged index, worktree or base..head "
+                                                   "change, or result: your own task's result (reply and produced work).")
                 props["surface"]["enum"] = ["change", "preflight"]
                 props["surface"]["description"] = "change = the panel review; preflight = one named reviewer's early look."
                 props["workspace_root"]["description"] = "An optional repository inside your assigned write root."
                 schema["description"] = (
-                    "Ask independent reviewers about a change in your assigned write root. "
+                    "Ask independent reviewers about a change in your assigned write root, or about your own result. "
                     "This never approves, commits or integrates your work; the parent retains integration and recheck. "
-                    "Use subject=index, worktree or base..head; surface=change uses the review pool, "
-                    "preflight uses one named reviewer. The same unchanged call collects an existing paid operation."
+                    "Use subject=index, worktree or base..head for a change and subject=result for your result; "
+                    "surface=change uses the review pool, preflight uses one named reviewer. The same unchanged call "
+                    "collects an existing paid operation."
                 )
         return {"type": "function", "function": schema}
 
@@ -709,11 +711,12 @@ class ToolRegistry:
         # Rebuild from the load-time facts, never from empty: a rebuilt schema
         # list must not erase module_load_failed omissions (H3, capinv-447).
         self._capability_omissions = [dict(item) for item in self._module_load_omissions]
+        # Every locally unavailable built-in is withheld under its own cause, not only a missing key.
         unavailable_tools = {
-            entry.name: detail
+            entry.name: (reason, detail)
             for entry in self._entries.values()
             for available, reason, detail in [_builtin_tool_availability(entry.name, self._ctx)]
-            if not available and reason == "missing_credential" and entry.name not in disabled_tools
+            if not available and entry.name not in disabled_tools
         }
         built_in = [
             schema
@@ -728,12 +731,13 @@ class ToolRegistry:
         ]
         if disabled_tools:
             self._capability_omissions.append({"surface": "tools", "reason": "disabled_by_contract", "tools": sorted(disabled_tools)})
-        if unavailable_tools:
+        for cause in dict.fromkeys(reason for reason, _detail in unavailable_tools.values()):
+            names = sorted(name for name, (reason, _detail) in unavailable_tools.items() if reason == cause)
             self._capability_omissions.append({
                 "surface": "tools",
-                "reason": "missing_credential",
-                "tools": sorted(unavailable_tools),
-                "details": {name: unavailable_tools[name] for name in sorted(unavailable_tools)},
+                "reason": cause,
+                "tools": names,
+                "details": {name: unavailable_tools[name][1] for name in names},
             })
         # Live (enabled, granted, reviewed) extension tool schemas join normal tool
         # discovery: liveness, acting-child grants and the network resource
@@ -854,7 +858,7 @@ class ToolRegistry:
         if entry:
             available, reason, detail = _builtin_tool_availability(requested, self._ctx)
             if not available:
-                if reason == "missing_credential":
+                if reason:
                     self._capability_omissions.append({
                         "surface": "tools",
                         "reason": reason,

@@ -391,7 +391,7 @@ def withdraw_stop_episode(drive_root: Any, task_id: str) -> bool:
     Running custody owes its salvage before the terminal write; when the monotonic
     guard keeps the worker's own completed row instead, that undelivered row (and
     its undelivered receipt block) would hold the Done card and later replay a
-    false "was cancelled" message. A delivered id is history and stays.
+    false "was stopped" message. A delivered id is history and stays.
     """
     tid = str(task_id or "")
     did = _stop_episode_delivery_id(pathlib.Path(drive_root), tid)
@@ -1142,7 +1142,7 @@ def deliver_miss_lane_outcome(
         # observable; the shared seam below re-registers idempotently (and
         # records the typed handoff row when there is no lineage chat).
         event = build_unreviewed_salvage_event(
-            pathlib.Path(drive_root), row, task_id, outcome="cancelled",
+            pathlib.Path(drive_root), row, task_id, outcome="stopped",
             salvaged_text=text, preserved_path=path, settled_status="cancelled",
             unreconciled_runs=list(unreconciled_runs or []),
         )
@@ -1150,7 +1150,7 @@ def deliver_miss_lane_outcome(
         if event is not None:
             owed = register_pending_delivery(pathlib.Path(drive_root), event)
         deliver_unreviewed_salvage(
-            pathlib.Path(drive_root), row, task_id, outcome="cancelled",
+            pathlib.Path(drive_root), row, task_id, outcome="stopped",
             salvaged_text=text, preserved_path=path,
             settled_status="cancelled", event_queue=event_queue,
             unreconciled_runs=list(unreconciled_runs or []),
@@ -1560,7 +1560,7 @@ def deliver_unreviewed_salvage(
     chat send with its ordinary formatting and transport behavior.
 
     ``unreconciled_runs`` names delegated runs the teardown could NOT settle
-    (engine unreachable): the owner is being told the task is cancelled, so a run
+    (engine unreachable): the owner is being told the task is stopped, so a run
     that may still be mutating the tree belongs in the same message.
     """
     event = build_unreviewed_salvage_event(

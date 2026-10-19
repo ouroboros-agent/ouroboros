@@ -40,7 +40,7 @@ const terminalCases = [
         status: 'failed', reason_code: 'delegated_custody_unreconciled',
         delegated_runs_unreconciled: ['run-a1'],
     }, { phase: 'error', headline: 'Failed' }],
-    ['Cancelled', { status: 'cancelled' }, { phase: 'cancelled', headline: 'Cancelled' }],
+    ['Stopped', { status: 'cancelled' }, { phase: 'cancelled', headline: 'Stopped' }],
 ];
 
 test('factual task presentation uses the approved five-word family', () => {
@@ -609,30 +609,47 @@ test('Batch4: chat feeds every census phase to its card', () => {
 
 test('an owner Pause shows the review work it lets finish, and the line clears when it ends', () => {
     const record = chipRecord();
+    // The census `owner` cause also covers Ouroboros's own Pause: who paused is the work projection's to say.
     assert.equal(syncParkedPhase(record, 'budget_paused', { pause_cause: 'owner', finishing_reviews: true }), true);
-    assert.equal(record.phaseEl.textContent, 'Paused · owner pause · review work finishing');
+    assert.equal(record.phaseEl.textContent, 'Paused · review work finishing');
     assert.equal(syncParkedPhase(record, 'budget_paused', { pause_cause: 'owner', finishing_reviews: true }), false,
         'an unchanged fact writes nothing');
     assert.doesNotMatch(record.phaseEl.textContent, /\d/, 'the census names tasks and sends alike: never a count');
     assert.equal(syncParkedPhase(record, 'budget_paused', { pause_cause: 'owner' }), true);
-    assert.equal(record.phaseEl.textContent, 'Paused · owner pause');
+    assert.equal(record.phaseEl.textContent, 'Paused');
     syncParkedPhase(record, 'budget_pausing', { pause_cause: 'owner', finishing_reviews: true });
-    assert.equal(record.phaseEl.textContent, 'Pausing… · owner pause', 'only a settled Pause names finishing review work');
+    assert.equal(record.phaseEl.textContent, 'Pausing…', 'only a settled Pause names finishing review work');
 });
 
-test('pause causes come only from current typed facts and update without a phase transition', () => {
+test('pause causes come only from current typed facts, in their short reason words, and update without a phase transition', () => {
     const record = chipRecord();
-    for (const [pause_cause, label] of [['budget', 'budget limit'], ['owner', 'owner pause'], ['restart', 'after restart'], ['sleep', 'sleep']]) {
+    for (const [pause_cause, label] of [['budget', 'Paused · spending limit'], ['owner', 'Paused'],
+        ['restart', 'Paused · app stopped'], ['authority', 'Paused · technical problem'], ['sleep', 'Waiting · sleeping']]) {
         assert.equal(syncParkedPhase(record, 'budget_paused', { pause_cause }), true);
-        assert.equal(record.phaseEl.textContent, `Paused · ${label}`);
+        assert.equal(record.phaseEl.textContent, label);
     }
     syncParkedPhase(record, 'budget_paused', { pause_cause: 'future-cause' });
     assert.equal(record.phaseEl.textContent, 'Paused', 'unknown cause stays generic');
-    syncParkedPhase(record, 'budget_pausing', { pause_cause: 'owner' });
-    assert.equal(record.phaseEl.textContent, 'Pausing… · owner pause');
+    syncParkedPhase(record, 'budget_pausing', { pause_cause: 'budget' });
+    assert.equal(record.phaseEl.textContent, 'Pausing… · spending limit');
     assert.equal(record.inlineTypingEl.style.display, 'none', 'submitted work can settle without a Working animation');
     const late = desiredLiveCardPhase({ finalizingHold: true, observedOutcome: 'error',
-        parkedPhase: 'budget_paused', pauseCause: 'owner' });
+        parkedPhase: 'budget_paused', pauseCause: 'restart' });
     assert.equal(late.text, 'Failed');
-    assert.equal(late.secondary, 'Paused · owner pause');
+    assert.equal(late.secondary, 'Paused · app stopped');
+});
+
+test('the card of a work\'s current episode says the work\'s word and reason; Stop and a closed socket still win', () => {
+    const record = chipRecord();
+    record.workView = { phase: 'paused', text: 'Paused · by Ouroboros', secondary: '', classes: 'paused',
+        motion: false, waiting: true };
+    assert.equal(syncParkedPhase(record, 'budget_paused', { pause_cause: 'owner' }), true);
+    assert.equal(record.phaseEl.textContent, 'Paused · by Ouroboros');
+    assert.equal(record.phaseEl.className, 'chat-live-phase paused', 'Ouroboros\'s Pause is not amber');
+    assert.equal(desiredLiveCardPhase({ ...record, cancelPendingPolicy: 'immediate' }).text, 'Cancelling…');
+    syncParkedPhase(record, 'unknown', { pause_cause: 'owner' });
+    assert.equal(record.phaseEl.textContent, 'Activity unconfirmed');
+    record.workView = null;
+    syncParkedPhase(record, 'budget_paused', { pause_cause: 'owner' });
+    assert.equal(record.phaseEl.textContent, 'Paused', 'without its work the card keeps its own census words');
 });

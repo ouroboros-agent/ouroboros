@@ -539,19 +539,14 @@ def focus_source_projection(
     return {**payload, **current, **({"reason": reason} if reason else {})}
 
 
-def review_source_reader(task_id: str, ref: Dict[str, Any]) -> Dict[str, Any]:
-    """A receiver-independent selector for one author's immutable acceptance source."""
-    return {"tool": "get_task_result", "arguments": {
-        "task_id": task_id, "review_source_sha256": str(ref.get("sha256") or "")}}
-
-
 def host_acceptance_source(drive_root: Any, task_id: str, digest: str) -> tuple:
     """``(ref, bytes)`` of this physical author's own HOST acceptance record, named by digest.
 
-    The digest fixes the path (no caller path, no store search); the bytes must
-    hash to it and decode to a host-root task-acceptance run of this very task,
-    or this raises. The model's ``review_source_sha256`` reader and the owner's
-    record download (``gateway.task_archive.serve_task_source``) share it.
+    These records are history: the retired task acceptance wrote them and nothing
+    writes a new one. The digest fixes the path (no caller path, no store search);
+    the bytes must hash to it and decode to a host-root task-acceptance run of this
+    very task, or this raises. The model's ``review_source_sha256`` reader and the
+    owner's record download (``gateway.task_archive.serve_task_source``) share it.
     """
     from ouroboros.artifacts import read_actor_source_bytes
     from ouroboros.source_retention import retained_task_roots
@@ -579,11 +574,11 @@ def host_acceptance_source(drive_root: Any, task_id: str, digest: str) -> tuple:
 
 def review_source_projection(drive_root: Any, task_id: str, digest: str,
                              start_char: Any = None, end_char: Any = None) -> Dict[str, Any]:
-    """Read a physical author's exact acceptance source, including historical panels.
+    """Read a physical author's exact host acceptance record, named by its digest.
 
-    Only host acceptance panels (``host_acceptance_source``) and the canonical
-    debt's exact pinned subject qualify; no caller path, successor substitution
-    or artifact-store search.
+    Host acceptance panels (``host_acceptance_source``) and the exact subject an
+    older record's acceptance debt pinned qualify (both read-only history); no
+    caller path, successor substitution or artifact-store search.
     """
     from ouroboros.artifacts import read_actor_source_bytes, text_source_range_projection
 
@@ -595,12 +590,8 @@ def review_source_projection(drive_root: Any, task_id: str, digest: str,
 
         debt = (load_task_result(drive_root, task_id, strict=True) or {}).get("acceptance_debt") or {}
         historical_ref = debt.get("source_ref") or {}
-        if historical_ref.get("sha256") == digest:
-            from ouroboros.acceptance_history import read_acceptance_history
-
-            read_acceptance_history(drive_root, task_id, debt)
-            ref = historical_ref
-            raw = read_actor_source_bytes(drive_root, task_id, ref)
+        if isinstance(historical_ref, dict) and historical_ref.get("sha256") == digest:
+            ref, raw = historical_ref, read_actor_source_bytes(drive_root, task_id, historical_ref)
         else:
             ref, raw = host_acceptance_source(drive_root, task_id, digest)
         projection, reason = text_source_range_projection(raw.decode("utf-8"), unavailable["kind"], start_char, end_char)

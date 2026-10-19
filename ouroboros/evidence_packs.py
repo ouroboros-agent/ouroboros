@@ -609,8 +609,9 @@ def pending_restore_bytes(root: Any) -> int:
 def row_packable(status: Any, review_pending: Any) -> bool:
     """The packing rule over a row's two indexed facts: the status is terminal, and no review of the
     task may still read its loose files (``review_collection_pending`` 1 names an open review
-    operation of any surface or an acceptance not yet collected, whose agent-session reader holds a
-    retained handle's absolute path; NULL is a row no body with the selector ever wrote, so no such
+    operation, whose agent-session reader holds a retained handle's absolute path, or a row an older
+    body flagged for its acceptance collection until the maintenance pass writes it back
+    (``task_store.reclassify_review_collection``); NULL is a row no body with the selector ever wrote, so no such
     reader exists, and the selector stays a derived fact, never a retention duty). No duty, money or
     delivery fact is consulted (packing moves verified bytes, never content: a later write becomes
     the next generation)."""

@@ -615,12 +615,13 @@ def test_a_checked_role_save_that_did_not_land_is_told_once_its_wait_settles(wai
     closing = {**copy.deepcopy(repeat), 'wait_id': 'closing-wait', 'role': 'light', 'revision': 1, 'state': 'waiting'}
     for key in ('applied_request_id', 'resolution'):
         closing.pop(key, None)
-    ui['rows']['closing-wait'] = closing
+    # This wait is closing-task's own: the census (which the frame below reads again) lists it under no other task.
     frame({'type': 'log', 'chat_id': 1, 'data': {'type': 'task_model_wait', 'task_id': task, 'chat_id': 1,
                                                  'ts': '2026-09-06T22:03:01Z', **closing}})
     answers['closing-wait'] = [lambda body: (202, {
         'ok': True, 'decision_id': body['decision_id'], 'request_id': body['request_id'], 'state': 'waiting',
-        'duplicate': False, 'applied': False, 'saved': False, 'wait': pending('closing-wait', body)})]
+        'duplicate': False, 'applied': False, 'saved': False,
+        'wait': {**copy.deepcopy(closing), 'pending_action': {k: v for k, v in body.items() if k != 'decision_id'}}})]
     closing_view = choose('closing-wait', 'closing-model')
     closing_view.locator('[data-wait-notice]').filter(has_text='Settings were not saved.').wait_for()
     frame({'type': 'log', 'chat_id': 1, 'data': {'type': 'task_done', 'task_id': task, 'status': 'completed',

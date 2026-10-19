@@ -55,3 +55,18 @@ test('opening the block builds its list once from the row in memory; closing or 
     assert.match(gone.inserted[0][1], /not in the current list/);
     fillFindingsOnOpen({ open: true, dataset: {} }, [demo]); // other <details> blocks are not ours
 });
+
+test("an adviser seat's finding says it is heard, not counted; a ticked reviewer's reads as before", () => {
+    const skill = { ...demo, review_findings: [
+        { item: 'security', verdict: 'FAIL', severity: 'critical', reason: 'Writes outside its folder', slot_id: 'critic', additional: true },
+        { item: 'security', verdict: 'PASS', reason: 'Stays in its folder', slot_id: 'a', additional: false },
+        { item: 'network', verdict: 'FAIL', severity: 'critical', reason: 'Calls an unknown host', slot_id: 'b' },
+    ] };
+    assert.equal(renderReviewFindingsList(skill), '<ul>'
+        + '<li><strong>FAIL</strong> (adviser, not counted) security: Writes outside its folder</li>'
+        + '<li><strong>PASS</strong> security: Stays in its folder</li>'
+        + '<li><strong>FAIL</strong> network: Calls an unknown host</li>'
+        + '</ul>');
+    // Findings recorded before advisers existed carry no flag and read exactly as they did.
+    assert.doesNotMatch(renderReviewFindingsList(demo), /adviser|not counted/);
+});

@@ -235,18 +235,19 @@ def steady(root):
         root, startup=False, owner_liveness=lambda _tid: False, claim_guard=None)
 
 
-def test_synthesis_duty_rests_owner_waits_and_unadopted_projections(tmp_path, monkeypatch):
+def test_synthesis_duty_ends_a_saved_pause_and_rests_unadopted_projections(tmp_path, monkeypatch):
     stuck_roots(tmp_path)
     bodies = counted_bodies(monkeypatch)
-    steady(tmp_path)  # the first settle mints readiness (a write): its rest lands next pass
+    steady(tmp_path)  # ends the saved Pause once; the first settle mints readiness (a write): its rest lands next pass
     steady(tmp_path)
     rests = marks(tmp_path)
-    assert rests["synthesis_recovery:paused-1"]["waits_on"] == ["owner_resume"]
+    assert "synthesis_recovery:paused-1" not in rests  # nothing waits on a Resume: the Pause ended that upkeep
+    assert synthesis_phase(tmp_path, "paused-1") == "degraded"
     assert rests["synthesis_recovery:unadopted-1"]["waits_on"] == ["child_files"]
     before, bodies[:] = revision(tmp_path), []
     steady(tmp_path)
     assert bodies == [] and revision(tmp_path) == before
-    assert {"paused-1", "unadopted-1"} <= set(o.members(tmp_path, "synthesis"))  # the debt stays
+    assert "unadopted-1" in o.members(tmp_path, "synthesis")  # the debt stays
     write_task_result(tmp_path, "unadopted-1", "failed", note="a new fact")
     bodies[:] = []
     steady(tmp_path)
@@ -277,21 +278,24 @@ def test_a_projection_whose_card_becomes_producible_comes_back_once_and_settles(
     assert bodies == []
 
 
-def test_startup_still_visits_a_paused_late_phase(tmp_path, monkeypatch):
-    from ouroboros import post_task_synthesis
-    from supervisor import owner_pause_control
-
+def test_a_rest_an_earlier_version_left_on_a_saved_pause_does_not_hide_it(tmp_path, monkeypatch):
+    """A member an earlier version rested on its owner's Resume is examined anyway: the steady pass
+    still ends that saved Pause once, and a projection rest beside it holds across a restart."""
     stuck_roots(tmp_path)
+    legacy = o.DutyRest(tmp_path, "synthesis_recovery", name="synthesis")
+    legacy.wait("paused-1", "owner_resume")
+    legacy.commit()
+    assert marks(tmp_path)["synthesis_recovery:paused-1"]["waits_on"] == ["owner_resume"]
     steady(tmp_path)
+    assert synthesis_phase(tmp_path, "paused-1") == "degraded"
     steady(tmp_path)
-    calls = []
-    monkeypatch.setattr(post_task_synthesis, "revoke_late_phase_grant", lambda root, tid, **kw: calls.append(tid))
-    monkeypatch.setattr(owner_pause_control, "retain_late_phase_latch", lambda root, tid: calls.append(tid))
     bodies = counted_bodies(monkeypatch)
-    for _restart in range(2):
-        pipeline.recover_pending_root_post_task_synthesis(tmp_path)
-    assert calls == ["paused-1"] * 4  # every boot restores the in-memory latch
+    pipeline.recover_pending_root_post_task_synthesis(tmp_path)
     assert "unadopted-1" not in bodies  # a projection rest holds across a restart
+
+
+def synthesis_phase(root, task_id):
+    return (task_results.load_task_result(root, task_id).get("root_phase_checkpoint") or {}).get("post_task_synthesis")
 
 
 def test_projection_reconcile_rests_on_its_cause_and_the_registry_wakes_only_delivery_waits(tmp_path, monkeypatch):

@@ -12,7 +12,7 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
 import { bindLanguageSettings, languageBlockHtml, saveLanguageChoice } from './settings_language.js';
 import { installAltMenuSuppression, installDesktopShellLinkInterceptor } from './ui_helpers.js';
 import { createModelRolesEditor, modelRolesHost, modelRoleMap, parseModelSource } from './model_roles.js';
-import { ALLOW_EMPTY_REVIEW_POOL, PACKET_ONLY_POOL_WARNING, availableSubagentsEditorHost, packetOnlyReviewPool, reviewPoolRows } from './subagents_settings.js';
+import { ALLOW_EMPTY_REVIEW_POOL, PACKET_ONLY_POOL_WARNING, availableSubagentsEditorHost, packetOnlyReviewPool, reviewPoolRows, reviewerTickCaption } from './subagents_settings.js';
 import { PROCESSING_PREFERENCE_KEY, MODEL_PROCESSING_PREFERENCES_KEY, processingIntentLabel,
     configuredApiProviders, apiProviderLabel } from './route_editor_primitives.js';
 import { MODEL_CATALOG_TIMEOUT_MS, mergeModelCatalog, catalogReadState, summarizeReadErrors } from './settings_catalog.js';
@@ -884,7 +884,7 @@ import { createStarterSkillsRow } from './onboarding_starter_skills.js';
 
     function reviewersNote() {
         const count = reviewPoolRows(catalogDraft()).length;
-        if (count) return `Reviewers: ${count} — the rows marked Reviewer under Models → Available subagents. Outside Cyber Pro each of them reviews every change to Ouroboros itself; in Cyber Pro the agent composes the panel from them.`;
+        if (count) return `Reviewers: ${count} — the rows marked Reviewer under Models → Available subagents. ${reviewerTickCaption(state.reviewEnforcement, state.runtimeMode)}`;
         if (agentsStep?.previewError) return 'Automatic reviewers are unavailable. Mark rows as Reviewer under Models → Available subagents, or use Main on the summary.';
         return (catalogDraft()?.items || []).length ? 'No row is marked Reviewer, so the main model reviews alone. Mark rows under Models → Available subagents for a second opinion.'
             : 'Reviewers will be prepared from your connected access.';
@@ -1309,6 +1309,8 @@ import { createStarterSkillsRow } from './onboarding_starter_skills.js';
                 choice.setAttribute('aria-pressed', String(selected));
             });
             markStepEdited();
+            const note = root.querySelector('[data-reviewers-note]');  // what a tick means under the mode just chosen
+            if (note) note.textContent = reviewersNote();
         }));
     }
 

@@ -13,7 +13,7 @@ boundary instead of the whole line of thought:
   by the task's own Stop/Panic/deadline); no unrecorded effect starts;
 - ``post_batch`` — the completed batch and its results;
 - ``candidate`` — a no-tool answer published as the delivery candidate, before
-  acceptance, review or delivery;
+  its review or delivery;
 - ``resumed`` — an exact Resume's restored continuation and its budget tail,
   written before the grant is consumed (``save_resumed``): the pause retired
   this file, and consumption ends the pause's own recovery ownership.
@@ -668,10 +668,10 @@ def resume_from_working(tools: Any, state: Dict[str, Any], messages: list, trace
                         usage: dict, seen: set) -> tuple:
     """Restore a frozen working checkpoint; ``(model, effort, local, mode, round, plan, tool_tail)``.
 
-    Same ID: the whole continuation (usage, delivery candidate, acceptance
-    evidence) continues. A NEW execution ID (an idle retry) restores the
+    Same ID: the whole continuation (usage, delivery candidate, review and
+    owner-source state) continues. A NEW execution ID (an idle retry) restores the
     transcript, route and cumulative execution clock: its own accounting starts
-    here (spend stays on the ledger's tree), and it borrows no acceptance or delivery authority
+    here (spend stays on the ledger's tree), and it borrows no review or delivery authority
     from the attempt it continues. Nothing is re-executed; runs are disclosed.
     """
     from ouroboros.budget_pause import observe_task_runs
@@ -685,18 +685,21 @@ def resume_from_working(tools: Any, state: Dict[str, Any], messages: list, trace
             if key in {"_delivery_candidate_revision", "_delivery_evidence_revision", "_delivery_evidence_fingerprint",
                        "_delivery_effective_criteria", "_delivery_material_tool_indices"}},
         "acceptance": {}}, messages, trace, usage, seen)
-    # Saved prose is evidence, never permission to skip today's finalization.
-    # Same-ID panels can still be collected/replayed by the ordinary gate.
-    ctx._task_acceptance_reviewed = False
-    ctx._task_acceptance_reviewed_subject = ""
+    # Saved prose is evidence, never permission to skip today's finalization:
+    # a restored attempt holds no seal of the interrupted one.
     ctx._task_acceptance_sealed_fence_token = None
     ctx._task_acceptance_sealed_fence_generation = None
     if ctx._delivery_candidate is not None:
-        ctx._delivery_candidate.acceptance_binding = {}
+        # It holds no verdict and says so explicitly: an empty binding let a superseded PASS stay current.
+        from ouroboros.loop_delivery import _unaccepted_delivery_binding
+
+        ctx._delivery_candidate.acceptance_binding = _unaccepted_delivery_binding(
+            tools, ctx._delivery_candidate.content_sha256)
     if not same_id:
         for run in trace.get("review_runs") or []:
             if isinstance(run, dict) and run.get("authority") == "host_root":
                 run.update(superseded_by_revision=True, superseded_reason="working_recovery_new_execution")
+        # ``acceptance_decision`` is written no more; a pre-fold checkpoint's own does not carry over.
         for key in ("acceptance_decision", "review_decision", "root_phase_checkpoint", "task_completion"):
             trace.pop(key, None)
     from ouroboros.task_pacing import restore_cost_ceiling
@@ -727,7 +730,7 @@ def resume_from_working(tools: Any, state: Dict[str, Any], messages: list, trace
         f"[SYSTEM NOTICE]\nThis task continued from its working checkpoint ({boundary}, saved "
         f"{handoff.get('saved_at') or 'earlier'}) because {_CAUSES.get(str(handoff.get('cause') or ''), 'it was interrupted')}"
         + ("" if same_id else f"; this is a new execution of task {handoff.get('source_task_id')} — its earlier "
-           "acceptance/review state does not carry over")
+           "review state does not carry over")
         + ". Work after that point may be lost. Cumulative spend, rounds and elapsed time were NOT reset; prior "
         "tool results remain recorded; do not repeat completed effects. The previous browser process and "
         "task-local services ended; their recorded results are evidence, not proof they still run. Re-read "

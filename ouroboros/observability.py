@@ -493,7 +493,6 @@ _PUBLISHED_CHILD_REF_FIELDS = (
     "review_evidence",
     "review_projection",
     "completion_observations",
-    "acceptance_debt",
     "owner_wait",
     "verification_ledger",
     "root_phase_checkpoint",

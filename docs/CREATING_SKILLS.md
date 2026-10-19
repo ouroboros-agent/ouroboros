@@ -849,8 +849,8 @@ A skill with the `call_peer` grant brings audio into a live call, the owner's or
 
 `GET /identity` advertises `presence_continuation_version: 1` on supporting hosts. Request
 `continuation_version: 1` beside `binding_id` and `event` on `/presence/turn` (negotiation is not
-event identity). An author whose result waits for acceptance review then yields the conversation
-and answers early: `status: "continuing"` with `continuation_ref` (equal to `turn_ref`) and an
+event identity). An author parked on a review it left for an addressed message (a commit, change or result
+review) yields the conversation and answers early: `status: "continuing"` with `continuation_ref` (equal to `turn_ref`) and an
 initial `outcome`/`text`/`output_ref`. `deferred` with empty text means a result may follow; an
 author-selected early output (Advisory `pending_review=finish`) is speech to send once under its
 `output_ref`; `silent`/`tool_delivered` send nothing. A promoted child keeps its own `work_ref`; poll
@@ -1692,9 +1692,20 @@ requires fresh reviewer approval. See ARCHITECTURE §13 for the shared runtime g
 
 ## Reference skills
 
-The simplest reference for each type lives in the OuroborosHub catalog
-(`razzant/OuroborosHub`); `unix_computer_use` and `windows_computer_use` ship
-bundled under `repo/skills/`:
+Bundled references live under `repo/skills/`: `ui_design` guides visual work;
+`design_demo` presents a visual choice in one self-contained page. Both are
+`type: instruction`, recommended and on by default on fresh and upgraded installs.
+Trusted installation needs no review call; an owner's Off or removal stands.
+`unix_computer_use` and `windows_computer_use` are bundled extensions.
+
+Non-declared delegated sessions receive an index of enabled, accepted or reviewed
+instruction skills from every installed bucket: bounded descriptions, triggers and
+absolute manifest paths. Workers may read these files and their references, never
+modify host skills. The index lives in host instructions; retries reuse its stored
+bytes. Bodies are read on demand. Declared-input sessions need explicit references
+in their brief.
+
+The OuroborosHub catalog (`razzant/OuroborosHub`) supplies other examples:
 
 - `weather` — `type: extension`, declarative form/key-value widget,
   reads no env keys.
@@ -1735,7 +1746,10 @@ record its own check (`check: "self"` after reading the exact release, with
 `basis: "self_check"`; an edit invalidates it, and outside Cyber Pro that basis
 admits nothing. A trusted source ignores this choice and says so in the result.
 Every acceptance path keeps preflight, the owner's auto-grant setting,
-dependencies and readiness. There is no one-reviewer depth in these tools.
+dependencies and readiness. Who reviews follows the review pool: under Blocking
+every marked reviewer; under Advisory Ouroboros may name `reviewers` (one or more
+pool rows) and must state why when it narrows the panel; a review the owner starts
+uses the whole pool. Unmarked rows it adds are advisers: heard, never counted.
 
 A git repository is a source in one of two shapes:
 

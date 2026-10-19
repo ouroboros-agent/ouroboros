@@ -100,13 +100,14 @@ def acceptance_skill_lifecycle(
     task_started_at: str = "",
     history_coverage: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
-    """Per-skill lifecycle facts for the acceptance packet — VISIBILITY ONLY.
+    """Per-skill lifecycle facts of the skills a task touched — VISIBILITY ONLY.
 
-    Names come from the task's own trace plus any skill whose review history
-    records this ``root_task_id`` (which is how a child-authored payload shows
-    up at all). A UI or manual review carries no root task id and is simply not
-    joined. Acceptance judges quality, never the execution route, so nothing
-    here is a gate.
+    The task's completion observations
+    (``task_finalization.build_completion_observations``) read them. Names come
+    from the task's own trace plus any skill whose review history records this
+    ``root_task_id`` (which is how a child-authored payload shows up at all). A
+    UI or manual review carries no root task id and is simply not joined.
+    Nothing here is a gate.
     """
     root = pathlib.Path(drive_root) if drive_root else None
     if root is None:

@@ -240,7 +240,7 @@ def test_a_failed_prune_step_spares_the_others_and_the_next_pass_runs_it_again(t
     monkeypatch.setattr(maintenance, "_periodic_zombie_reconcile", lambda **kw: None)
     monkeypatch.setattr(maintenance, "_run_drive_custody_pass", lambda *a: None)
     monkeypatch.setattr(maintenance, "_tick_maintenance_child", lambda: None)
-    monkeypatch.setattr(review_operation, "collect_orphaned_operations_softly", lambda *a, **kw: None)
+    monkeypatch.setattr(review_operation, "retire_dead_review_pointers_softly", lambda *a, **kw: None)
     monkeypatch.setattr(owner_mailbox, "sweep_settled_owner_mailboxes",
                         lambda *a, **kw: pytest.fail("the drive-custody pass owns the mailbox sweep"))
     calls = []

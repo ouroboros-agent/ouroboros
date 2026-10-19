@@ -688,8 +688,7 @@ def item_detail(drive_root: pathlib.Path, item_id: str, *, rows: Optional[List[D
 
 def probe_source(drive_root: pathlib.Path, *, url: str = "", path: str = "") -> Dict[str, Any]:
     """What an address or folder holds, read once into a scratch folder (nothing is saved)."""
-    import shutil
-
+    from ouroboros.force_remove import force_rmtree
     from ouroboros.skill_source_git import SkillSourceFetchError, fetch_tree, scratch_dir
     from ouroboros.skill_sources import SkillSourceError, repository_owner, validate_git_url
 
@@ -723,7 +722,7 @@ def probe_source(drive_root: pathlib.Path, *, url: str = "", path: str = "") -> 
     except SkillSourceFetchError as exc:
         return {**warning, "error": f"This computer could not read {url}: {exc}"}
     finally:
-        shutil.rmtree(scratch, ignore_errors=True)
+        force_rmtree(scratch)  # the clone's git objects are read-only, which a plain rmtree leaves on Windows
 
 
 __all__ = [

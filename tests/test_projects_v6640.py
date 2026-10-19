@@ -407,7 +407,6 @@ def test_project_sidebar_and_menu_static_contracts():
     assert "await markProjectViewed(project.id, revision)" in app
     assert "async function markProjectViewed" in app
     assert "await fetchJson('/api/ui/preferences'" in app
-    assert "item.append(btn, trailing)" in app
     assert "hideProjectFromSidebar" not in app
     assert "project_last_viewed" not in app
     assert "project_hidden" not in app

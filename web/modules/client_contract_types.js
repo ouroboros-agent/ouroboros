@@ -505,9 +505,10 @@
  */
 
 /**
- * `POST /api/projects/{project_id}/update`: rename, the one mutable field.
+ * `POST /api/projects/{project_id}/update`: name and/or pin; at least one.
  * @typedef {Object} ProjectUpdateRequest
- * @property {string} name
+ * @property {string=} name
+ * @property {boolean=} pinned
  */
 
 /**

@@ -190,7 +190,10 @@ def test_find_keeps_count_and_discloses_display_cuts(tmp_path, registered, count
 def test_ambiguity_survives_wire_with_original_match_count(tmp_path, registered):
     calls, current = registered
     current["root"] = dialog(calls, *(make(calls, f"b{i}", 50000, name="label" * 30) for i in range(3000)))
-    out = delivered(tmp_path, "element_act", hwnd=1, select={"role": "button"}, do="invoke", timeout_ms=0)
+    # timeout_ms=0 bounds the one sweep by the 750 ms worker grace; this fake tree's 3000
+    # siblings outlast that on a loaded runner ("timeout"). An ambiguous match returns at once
+    # whatever the bound, so a real wait budget changes only how long the sweep may take.
+    out = delivered(tmp_path, "element_act", hwnd=1, select={"role": "button"}, do="invoke", timeout_ms=60000)
     assert out["ok"] is False and out["reason"] == "ambiguous" and out["matched"] == 3000
     assert out["shown"] == len(out["candidates"]) > 0
     assert out["omitted"] == 3000 - out["shown"] > 0

@@ -364,7 +364,8 @@ class OuroborosAgent:
         )
 
     def _fence_request(self, accept: Tuple[str, ...], **request: Any) -> Dict[str, Any]:
-        """The ONE transport seam of the queue-owned acceptance fence.
+        """The ONE transport seam of the queue-owned root admission seal (``delivery_seal``),
+        whose stored names keep the ``acceptance_fence`` of its origin.
 
         An agent in the process that holds the queue (a process fact, whoever built it:
         a direct turn, a Presence turn) applies the fence in-process — no event, no ack
@@ -525,7 +526,7 @@ class OuroborosAgent:
                 actor_id=task.get("actor_id"),
                 delegation_role=task.get("delegation_role"),
                 # The producer's raw origin marker (promote_chat_to_task, presence_promote,
-                # api, ...): the acceptance packet reads run_origin from this record.
+                # api, ...): ``dialogue_provenance.run_origin`` reads it from this record.
                 source=task.get("source"),
                 project_id=str(task.get("project_id") or ""),
                 role=task.get("role"),
@@ -542,8 +543,6 @@ class OuroborosAgent:
                 workspace_mode=task.get("workspace_mode"),
                 task_constraint=task.get("task_constraint"),
                 task_contract=task.get("task_contract"),
-                **({"acceptance_original_root_cap": task["_acceptance_original_root_cap"]}
-                   if "_acceptance_original_root_cap" in task else {}),
                 model_lane=task.get("model_lane"),
                 requested_model_lane=task.get("requested_model_lane"),
                 parent_model_lane=task.get("parent_model_lane"),
@@ -583,7 +582,7 @@ class OuroborosAgent:
                     execution_owner=execution_owner,
                     child_drive_root=str(self.env.drive_root), budget_drive_root=str(canonical),
                     _is_direct_chat=bool(task.get("_is_direct_chat")),
-                    **{key: running[key] for key in ("started_at", "ts", "task_attempt", "acceptance_original_root_cap") if key in running},
+                    **{key: running[key] for key in ("started_at", "ts", "task_attempt") if key in running},
                 )
         except Exception:
             log.warning("Failed to persist running task status", exc_info=True)
@@ -808,9 +807,9 @@ class OuroborosAgent:
         _restore_saved_clocks(ctx, task, saved_start)
 
         if self._event_queue is not None:
-            # Optional runtime seam consumed by loop.py.  Unit/direct contexts
-            # remain compatible, while production queued tasks establish the
-            # admission fence in the supervisor process before reviewing.
+            # Optional runtime seam consumed by ``delivery_seal``.  Unit/direct contexts
+            # remain compatible, while production queued tasks seal root admission
+            # in the supervisor process before delivering an author stop.
             ctx.begin_acceptance_fence = self._begin_acceptance_fence
             ctx.inspect_acceptance_fence = self._inspect_acceptance_fence
             ctx.end_acceptance_fence = self._end_acceptance_fence
@@ -993,21 +992,10 @@ class OuroborosAgent:
             root_task_id = str(task.get("root_task_id") or metadata.get("root_task_id") or task_id)
             parent_task_id = str(task.get("parent_task_id") or metadata.get("parent_task_id") or "")
             budget_root = task.get("budget_drive_root") or metadata.get("budget_drive_root") or self.env.drive_root
-            root_limit_known = True
             try:
                 root_limit = float(runtime_setting("OUROBOROS_PER_TASK_COST_USD", "0") or 0)
             except (TypeError, ValueError):
                 root_limit = 0.0
-                root_limit_known = False
-            if task_id == root_task_id and not parent_task_id:
-                import math
-                task = dict(task)
-                task["_acceptance_original_root_cap"] = (
-                    {"state": "finite", "usd": root_limit, "source": "task_admission"}
-                    if root_limit_known and math.isfinite(root_limit) and root_limit > 0 else
-                    {"state": "unlimited", "source": "task_admission"}
-                    if root_limit_known and math.isfinite(root_limit) else
-                    {"state": "unknown", "source": "invalid_admission_setting"})
             from ouroboros.usage_admission import task_billing_fields
             from ouroboros.usage_ledger import BillingAuthorityUnavailable
             try:
@@ -1317,7 +1305,7 @@ class OuroborosAgent:
         ``narration`` is the VOICE of the note, not its text: only the model's own
         round narration (``loop_messages._emit_round_progress``) is the turn's
         speech. Every other caller — checkpoints, fallback and plan notes, the
-        acceptance, nudge and transport lines, and the whole ToolContext ABI
+        review, nudge and transport lines, and the whole ToolContext ABI
         (``emit_progress_fn``) — is the HOST talking about the turn, so it keeps
         the default. Both voices stay visible rows; the flag decides only whether
         a note may claim the card title and the collapsed activity line."""

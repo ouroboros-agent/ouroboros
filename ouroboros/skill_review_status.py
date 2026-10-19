@@ -89,6 +89,7 @@ def aggregate_skill_review_status(
     # as STATUS_PENDING (non-executable under every enforcement mode) and MUST
     # reload that way — never as advisory-overridable BLOCKERS or WARNINGS —
     # so honor them before the severity-driven aggregation below.
+    findings = [finding for finding in findings if not finding.get("additional")]
     if preflight_failed(findings):
         return STATUS_PENDING
     is_official_hub = review_profile == "official_hub"
@@ -185,7 +186,7 @@ def preflight_failed(findings: Any) -> bool:
     Re-review that would deterministically fail again (#335).
     """
     for finding in findings or []:
-        if not isinstance(finding, dict):
+        if not isinstance(finding, dict) or finding.get("additional"):
             continue
         if finding.get("verdict") == "FAIL" and (
             finding.get("item") in ("skill_preflight", "plugin_api_admission")

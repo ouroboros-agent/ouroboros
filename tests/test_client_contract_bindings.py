@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib
 import pathlib
 import re
+import threading
 import typing
 
 import pytest
@@ -107,6 +108,10 @@ def test_the_project_journey_answers_its_published_shapes(client):
     assert assert_bound("POST /api/projects/from-task", client.post("/api/projects/from-task", json={})) == "ErrorResponse"
     deleted = client.post(f"/api/projects/{project['id']}/delete", json={})
     assert assert_bound("POST /api/projects/{project_id}/delete", deleted) == "ProjectDeleteResponse"
+    # The answer precedes the Project's cancellation worker; the journey that started it joins it.
+    for worker in [thread for thread in threading.enumerate() if thread.name == f"project-delete-{project['id']}"]:
+        worker.join(timeout=60)
+        assert not worker.is_alive(), "the Project deletion worker never finished"
 
 
 def test_settings_language_and_desktop_routes_answer_their_published_shapes(client, monkeypatch):
@@ -216,8 +221,9 @@ def test_model_mcp_and_control_routes_answer_their_published_shapes(client, monk
 
 
 def test_the_update_status_review_pool_and_spend_answer_their_published_shapes(client, monkeypatch):
-    # A row's price may need a live tariff read; the shape does not, so the test stays offline.
-    monkeypatch.setattr("ouroboros.tools.review_helpers.review_row_call_usd", lambda *_a, **_kw: None)
+    # A row's price is measured from the process data root's usage ledger, which this disposable
+    # root does not own; the shape does not need it, so every row reads as unpriced.
+    monkeypatch.setattr("ouroboros.review_price.review_price", lambda *_a, **_kw: None)
     status = client.get("/api/update/status")
     assert assert_bound("GET /api/update/status", status) == "UpdateStatusResponse"
     assert status.json()["check_ok"] is None and status.json()["update_tx"]["active"] in {True, False}

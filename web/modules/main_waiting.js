@@ -121,7 +121,9 @@ export function createMainWaiting({ page, messagesDiv, toolbar = page?.querySele
             button.addEventListener('click', () => {
                 if (!connected || !record.available || record.row.cancelable !== true) return;
                 openTaskControlMenu(button, { budgetPaused: record.row.phase === 'budget_paused',
-                    resumeVisible: canResume(record), onAction: async action => {
+                    // Resume rides the menu where the server allows it and no Resume button of its own stands
+                    // beside it (an interrupted owner Resume of a member).
+                    resume: record.row.can_resume === true && !canResume(record), onAction: async action => {
                         if (!connected || !record.available || record.row.cancelable !== true) return;
                         try {
                             if (action === ACTION_RESUME) await resumeTaskAction(record.groupId);

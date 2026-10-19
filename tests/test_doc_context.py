@@ -180,7 +180,7 @@ def test_forked_context_uses_canonical_global_cognition_not_child_noise(monkeypa
     assert f"{len('CANONICAL_DEEP_REVIEW')} chars" in rendered
     assert "CANONICAL_DEEP_REVIEW" not in rendered and "CHILD_DEEP_NOISE" not in rendered
     call = {"root": "runtime_data", "path": str((canonical / "memory" / "deep_review.md").resolve())}
-    pointer = f"Read: read_file(root='runtime_data', path='{call['path']}')"
+    pointer = f"Read: read_file(root='runtime_data', path={call['path']!r})"  # as the product spells it (repr)
     assert json.dumps(pointer, ensure_ascii=False)[1:-1] in rendered
     registry = ToolRegistry(repo_dir=env.repo_dir, drive_root=child)
     registry.set_context(ctx)

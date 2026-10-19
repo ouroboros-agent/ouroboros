@@ -4,7 +4,6 @@ from tests import _dialogue as dialogue_test
 
 import hashlib
 import json
-import shutil
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -21,6 +20,7 @@ from ouroboros.projects_registry import bind_task_to_project, create_project
 from ouroboros.task_finalization import build_completion_observations, build_sealed_final_package, sealed_final_prompt_section
 from ouroboros.task_results import load_task_result, write_task_result
 from ouroboros.task_status import load_effective_task_result
+from tests._store_shared import remove_store_tree
 
 
 def _trace():
@@ -83,7 +83,7 @@ def test_sealed_observations_survive_copyback_and_recovery_without_global_attrib
     if source_root != canonical:
         assert not (task_artifact_dir_path(source_root, "observation") / ref["path"]).exists()
         copied = copy_child_task_result(canonical, {"id": "observation", "drive_root": str(source_root)})
-        shutil.rmtree(source_root)
+        remove_store_tree(source_root)
     else:
         copied = stored
     assert (task_artifact_dir_path(canonical, "observation") / ref["path"]).read_bytes() == raw

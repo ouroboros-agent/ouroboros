@@ -24,6 +24,7 @@ import json
 
 import pytest
 
+from tests._work_projection_shared import with_work_fields
 from tests.test_ui_smoke_playwright import direct_server_with_data  # noqa: F401 - pytest fixture import
 from tests.ui_chat_viewport_smoke import _OBSERVE_STATE_READS, _wait_state_reads_quiescent
 
@@ -288,7 +289,7 @@ def test_ui_smoke_late_open_chat_shows_managed_activity(direct_server_with_data)
                     )
                     route.fulfill(
                         content_type="application/json",
-                        body=json.dumps(payload),
+                        body=json.dumps(with_work_fields(payload)),
                     )
 
                 page.route("**/api/state*", _inject)
@@ -558,7 +559,7 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                     payload = response.json()
                     payload["active_chat_activities"] = list(state["activities"])
                     payload["project_chat_ids"] = [9] if any(a.get("chat_id") == 9 for a in state["activities"]) else []
-                    route.fulfill(content_type="application/json", body=json.dumps(payload))
+                    route.fulfill(content_type="application/json", body=json.dumps(with_work_fields(payload)))
 
                 history = {"messages": []}
                 page.route("**/api/state*", _inject)
@@ -669,7 +670,8 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                 page.wait_for_timeout(100)
                 assert page.evaluate("() => window.__taskDetailCalls.length") == 3
                 assert page.evaluate("() => window.__finishTransitions") == 1
-                _wait_status(page, "Online")
+                # The room says what the server lists, here the finished root again; its card stays finished, unread.
+                _wait_status(page, "Working")
 
                 rehome_card = '.chat-live-card[data-task-id="rehome-root"]'
                 state["activities"] = [_activity("rehome-root")]
@@ -687,20 +689,20 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                 state["activities"] = [_activity("rehome-root", 9)]
                 with page.expect_response("**/api/state*", timeout=10_000):
                     page.evaluate("() => window.__ouroWs.emit('projects_changed', {})")
-                page.wait_for_function(
-                    "(sel) => document.querySelector(sel + ' [data-cancel-run]') === null",
-                    arg=rehome_card,
-                )
+                # The work lives in its Project now: Main's room no longer lists it, and Main's card stays the
+                # work's portal with the work's own Stop (DESIGN "Work portal"), never a marker's.
+                _wait_status(page, "Online")
+                assert page.locator(f"{rehome_card} [data-cancel-run]").count() == 1
                 assert page.evaluate("() => window.__taskDetailCalls.length") == 3
                 assert page.locator(rehome_card).get_attribute("data-finished") == "0"
                 page.evaluate("() => window.__ouroWs.emit('chat', {type: 'chat', role: 'assistant', is_progress: true, chat_id: 9, task_id: 'rehome-root', cancelable: true, content: 'Project work continues.'})")
-                assert page.locator(f"{rehome_card} [data-cancel-run]").count() == 0
+                assert page.locator(f"{rehome_card} [data-cancel-run]").count() == 1
                 history["messages"] = [{"text": "Historical project progress.", "role": "assistant", "is_progress": True, "task_id": "rehome-root", "cancelable": True, "project_mirror": True}]
                 with page.expect_response("**/api/chat/history*", timeout=10_000):
                     page.evaluate("() => window.__ouroWs.emit('open', {previouslyConnected: true})")
                 page.wait_for_selector(rehome_card)
                 assert page.get_by_text("Historical project progress.").count() >= 1
-                assert page.locator(f"{rehome_card} [data-cancel-run]").count() == 0
+                page.wait_for_selector(f"{rehome_card} [data-cancel-run]")
 
                 # A later rehome snapshot clears an earlier candidate and response.
                 # cannot finish the still-running card.
@@ -732,7 +734,7 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                 assert page.locator(rehome_card).get_attribute("data-finished") == "0"
 
                 # Fast terminal truth ledgers a root even though rehome left no
-                # local activity/missing entry; late typing and old state stay inert.
+                # local activity/missing entry; late typing and old state leave its card finished.
                 page.evaluate(
                     """() => window.__ouroWs.emit('log', {
                         type: 'log', chat_id: 1,
@@ -755,7 +757,8 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                 )
                 page.wait_for_timeout(150)
                 assert page.evaluate("() => window.__taskDetailCalls.length") == 4
-                _wait_status(page, "Online")
+                # The room says what the server lists, here the finished root again; its card stays finished.
+                _wait_status(page, "Working")
 
                 # Durable fallback settles a reusable logical slot without
                 # permanently blocking its next Working cycle.
@@ -804,7 +807,8 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                     }""",
                     arg=reusable_card,
                 )
-                _wait_status(page, "Working")
+                # The server lists no work here: the reopened card alone never lights the room.
+                _wait_status(page, "Online")
                 page.evaluate(
                     """() => window.__ouroWs.emit('log', {
                         type: 'log', chat_id: 1,
@@ -995,8 +999,8 @@ def test_ui_smoke_open_project_panel_heals_lost_task_done_from_state_fanout(
                 # in-flight page read; let it land before minting the card below.
                 _wait_state_reads_quiescent(page)
 
-                # A visible root card carries host-attested Stop authority and is
-                # what lights the panel header (typing frames are receipts only).
+                # A visible root card carries host-attested Stop authority. The panel's header says the
+                # server's room, which does not list this card's work: the card alone never lights it.
                 page.evaluate(
                     """(chatId) => window.__ouroWs.emit('chat', {
                         type: 'chat', role: 'assistant', is_progress: true,
@@ -1007,7 +1011,8 @@ def test_ui_smoke_open_project_panel_heals_lost_task_done_from_state_fanout(
                     project_chat,
                 )
                 page.wait_for_selector(f"{card} [data-cancel-run]", timeout=10_000)
-                _panel_status_is(page, "Working")
+                _panel_status_is(page, "Online")
+                assert page.locator(f"{card} .chat-live-phase").inner_text().strip() == "Working"
 
                 # Early final prose does not conclude while post-task work runs.
                 page.evaluate(
@@ -1018,8 +1023,10 @@ def test_ui_smoke_open_project_panel_heals_lost_task_done_from_state_fanout(
                     })""",
                     project_chat,
                 )
-                # The room's word is the card's own for post-task work (a finalizing root is not Online).
-                _panel_status_is(page, "Finalizing…")
+                # The card says its post-task work; the room still says what the server lists.
+                page.wait_for_function("(sel) => document.querySelector(sel + ' .chat-live-phase')?.textContent.trim()"
+                                       " === 'Finalizing…'", arg=card, timeout=10_000)
+                _panel_status_is(page, "Online")
                 # Make the next request barrier strictly newer than the live
                 # progress frame even on a millisecond-resolution browser clock.
                 page.wait_for_timeout(20)

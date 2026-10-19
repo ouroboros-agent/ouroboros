@@ -9,7 +9,6 @@ from pathlib import Path
 
 import pytest
 
-
 WEB = Path(__file__).resolve().parents[1] / "web"
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from tests import _dialogue as dialogue_test
+from tests._store_shared import remove_store_tree
 
 import json
 import pathlib
@@ -151,7 +152,7 @@ def test_terminal_child_projection_is_idempotent_and_honest_for_all_outcomes(tmp
     cases = [
         ("ok", "completed", {"execution": {"status": "ok"}}, "Done"),
         ("failed", "failed", {"execution": {"status": "failed"}}, "Failed"),
-        ("cancelled", "cancelled", {"execution": {"status": "ok"}}, "Cancelled"),
+        ("cancelled", "cancelled", {"execution": {"status": "ok"}}, "Stopped"),
         ("degraded", "completed", {"execution": {"status": "best_effort"}}, "Done with warnings"),
     ]
     for suffix, status, axes, label in cases:
@@ -250,7 +251,7 @@ def test_terminal_root_fallback_covers_cancel_without_preempting_open_synthesis(
     )
     row = next(row for row in _chat_rows(tmp_path) if row.get("task_id") == "cancelled-root")
     assert row["summary_kind"] == "terminal_root_projection"
-    assert row["outcome"] == "Cancelled"
+    assert row["outcome"] == "Stopped"
 
     pending = write_task_result(
         tmp_path, "normal-root", STATUS_COMPLETED,
@@ -343,8 +344,6 @@ def test_facts_row_never_suppresses_final_artifact_failure_truth(tmp_path):
 
 
 def test_split_facts_row_keeps_only_canonical_result_ref_after_child_gc(tmp_path):
-    import shutil
-
     from ouroboros import agent_task_pipeline as pipeline
     from ouroboros.headless import copy_child_task_result
     from ouroboros.task_results import STATUS_COMPLETED, load_task_result, write_task_result
@@ -372,7 +371,7 @@ def test_split_facts_row_keeps_only_canonical_result_ref_after_child_gc(tmp_path
     )
     copied = copy_child_task_result(canonical, task)
     assert copied and load_task_result(canonical, "split-root")
-    shutil.rmtree(child)
+    remove_store_tree(child)
 
     row = next(row for row in _chat_rows(canonical) if row.get("task_id") == "split-root")
     assert row["result_ref"] == {

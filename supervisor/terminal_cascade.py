@@ -220,13 +220,13 @@ def _cascade_root_outcome(root_status: str) -> str:
     """How the tree's ONE message describes its root — from the ROOT'S OWN status.
 
     A cascade over a root that had already ``failed`` (or was killed on a budget
-    hard stop) used to describe it as "cancelled", which is the summary telling
+    hard stop) used to describe it as "stopped", which is the summary telling
     the owner a different story than the task card. Only a root this cascade
-    actually cancelled is called cancelled.
+    actually cancelled is called stopped.
     """
     status = str(root_status or "").strip().lower()
     if status == "completed":
-        return "completed before the cancellation (result preserved)"
+        return "completed before the stop (result preserved)"
     if status and status != "cancelled":
-        return f"already settled as {status} before the cancellation (result preserved)"
-    return "cancelled"
+        return f"already settled as {status} before the stop (result preserved)"
+    return "stopped"

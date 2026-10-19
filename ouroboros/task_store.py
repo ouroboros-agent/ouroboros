@@ -517,9 +517,25 @@ def _collection_candidates(root: Any, column: str, predicate: Callable[[dict], b
         return  # failed acquisition/classification leaves the same candidates owed
 
 
+def reclassify_review_collection(root: Any, task_id: str) -> bool:
+    """Write back a ``review_collection_pending`` 1 the current predicate no longer selects (a row an older
+    body flagged for its acceptance collection, which nothing rewrites now). Changes no body or write_seq;
+    a racing body writer wins. True when the column was cleared."""
+    from ouroboros.obligations import review_collection_pending
+
+    with open_store(root, write=False) as txn:
+        stamp = txn.row(str(task_id), "write_seq", "review_collection_pending")
+        body = txn.body_text(str(task_id)) if stamp is not None and stamp[1] == 1 else None
+    if body is None or review_collection_pending(json.loads(body)):
+        return False
+    with open_store(root, write=True) as txn:
+        return txn.conn.execute("UPDATE tasks SET review_collection_pending=0 WHERE task_id=? AND write_seq=? "
+                                "AND review_collection_pending=1", (str(task_id), stamp[0])).rowcount == 1
+
+
 def review_collection_candidates(root: Any, *, stop: Optional[Callable[[], bool]] = None) -> Iterable[str]:
-    """Possible acceptance collection/late-notice work and other surfaces' open liveness
-    pointers; unrelated plans stay out."""
+    """Tasks holding an open review operation pointer (``obligations.review_collection_pending``);
+    unrelated plans stay out."""
     from ouroboros.obligations import review_collection_pending
 
     yield from _collection_candidates(root, "review_collection_pending", review_collection_pending, stop)

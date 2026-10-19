@@ -11,6 +11,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -352,6 +353,7 @@ def test_a_kept_folder_names_its_reason_and_the_next_run_frees_it(tmp_path, monk
     ("task_result_unreadable", "unreadable_record"),
     ("custody_error: ValueError('torn')", "unreadable_record"),
     ("generation_closed", "restart"),
+    ("store_busy", "busy"),  # a store still leased inside the drive: busy right now, tried next pass
     ("not_own_drive", "other"),  # a code with no owner-facing group stays "for another reason"
 ])
 def test_the_fail_closed_mailbox_and_call_inventory_codes_name_their_owner_facing_reason(code, reason):
@@ -447,9 +449,47 @@ def test_removed_bytes_follow_the_trash_and_the_row_carries_the_same_numbers(tmp
     assert row["free_after"] == 100, "the event records completion; the UI reads current free space"
 
 
-def test_a_trash_entry_the_child_could_not_delete_is_stuck_until_it_changes(tmp_path, monkeypatch):
-    from ouroboros import maintenance, maintenance_jobs
-    from ouroboros.task_custody import custody_trash_entries
+_REAL_SCANDIR = os.scandir
+
+
+class _WindowsListing:
+    """``os.scandir`` of one folder as Windows hands it out: ``DirEntry.stat`` there carries no inode,
+    device or link count, so an identity read from the listing never equals an ``lstat`` of the entry."""
+
+    def __init__(self, path):
+        self._listing = _REAL_SCANDIR(path)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self._listing.close()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        entry = next(self._listing)
+        info = entry.stat(follow_symlinks=False)
+        listed = SimpleNamespace(st_mode=info.st_mode, st_size=info.st_size, st_mtime_ns=info.st_mtime_ns,
+                                 st_ino=0, st_dev=0, st_nlink=0)
+        return SimpleNamespace(name=entry.name, path=entry.path, is_dir=entry.is_dir, is_symlink=entry.is_symlink,
+                               stat=lambda follow_symlinks=True: listed)
+
+
+def _windows_listing_of(monkeypatch, folder):
+    """Every ``os.scandir`` of FOLDER returns a Windows-shaped listing; any other folder its real one."""
+    monkeypatch.setattr(os, "scandir", lambda path=".": _WindowsListing(path) if isinstance(path, (str, os.PathLike))
+                        and Path(path) == folder else _REAL_SCANDIR(path))
+
+
+def _stuck_trash_entry(tmp_path, monkeypatch):
+    """A freed drive whose trash entry the maintenance child could not remove (a file in it is held
+    open): the job records the entry's identity as it saw it, and both the job's due check and the
+    run view compare the entry against that very record. The trash folder is listed the way Windows
+    lists it (no inode), so an identity read from the listing would never match. Returns the data
+    root, the storage owner and the real removal (the hold released)."""
+    from ouroboros import maintenance
 
     root = tmp_path / "data"
     probes = _drives(root, [("gone", "direct", "completed", OLD)])
@@ -459,17 +499,58 @@ def test_a_trash_entry_the_child_could_not_delete_is_stuck_until_it_changes(tmp_
     _preview(owner, root, tmp_path)
     view = _run(owner, root, tmp_path)
     assert (view["run"]["removed"], view["run"]["deleting"], view["run"]["stuck"]) == (0, 1, 0)
-    [(name, identity)] = custody_trash_entries(root)
-    # The maintenance child's custody_trash job recorded that this very entry survived its removal.
-    maintenance_jobs.record(root, "custody_trash", state="failed", stuck={name: identity}, removed=0)
+
+    def held_open(entry):
+        raise PermissionError(13, "a file in it is held open", str(entry))
+
+    released = task_custody._remove_entry
+    _windows_listing_of(monkeypatch, root / "state" / "custody_trash")
+    monkeypatch.setattr(task_custody, "_remove_entry", held_open)
+    assert maintenance.run_job(root, "custody_trash") == {"state": "failed", "items": 0}
+    assert "custody_trash" not in maintenance.due(root), "a stuck entry is no reason to spawn the child"
     view = owner.projection(root)
     assert (view["run"]["removed"], view["run"]["deleting"], view["run"]["stuck"]) == (0, 0, 1)
+    return root, owner, released
+
+
+def test_a_stuck_trash_entry_is_retried_whenever_the_child_runs(tmp_path, monkeypatch):
+    """A released handle changes neither the entry's inode nor its time (Windows, an antivirus
+    scan), so the entry stays honestly stuck and is no reason to spawn the child; the child still
+    retries it whenever it runs for another job, and then it is removed."""
+    from ouroboros import maintenance, maintenance_jobs
+
+    root, owner, released = _stuck_trash_entry(tmp_path, monkeypatch)
+    # Still held: the child's retry walks the entry again but commits nothing (the store does not move,
+    # so no job that waits on a store write is re-armed by it).
+    revision, row = maintenance._store_facts(root)["revision"], maintenance_jobs.job(root, "custody_trash")
+    assert maintenance.run_job(root, "custody_trash") == {"state": "failed", "items": 0}
+    assert maintenance._store_facts(root)["revision"] == revision and maintenance_jobs.job(root, "custody_trash") == row
+    monkeypatch.setattr(task_custody, "_remove_entry", released)  # the hold is gone; nothing in the entry changed
+    assert "custody_trash" not in maintenance.due(root)
+    assert owner.projection(root)["run"]["stuck"] == 1
+    assert maintenance.run_job(root, "custody_trash") == {"state": "done", "items": 1}
+    view = owner.projection(root)
+    assert (view["run"]["removed"], view["run"]["deleting"], view["run"]["stuck"]) == (1, 0, 0)
+    assert maintenance.run_job(root, "custody_trash") is None, "an empty trash rests"
+
+
+def test_a_trash_entry_the_child_could_not_delete_is_stuck_until_it_changes(tmp_path, monkeypatch):
+    from ouroboros import maintenance
+
+    root, owner, _released = _stuck_trash_entry(tmp_path, monkeypatch)
     # The entry changed (the owner released a file): the child will retry, so it is deleting again.
+    [name] = [entry.name for entry in (root / "state" / "custody_trash").iterdir()]
     (root / "state" / "custody_trash" / name / "released.bin").write_bytes(b"x")
+    assert "custody_trash" in maintenance.due(root)
     view = owner.projection(root)
     assert (view["run"]["removed"], view["run"]["deleting"], view["run"]["stuck"]) == (0, 1, 0)
     row = json.loads((root / "logs" / "supervisor.jsonl").read_text().splitlines()[-1])
     assert (row["type"], row["deleting"], row["stuck"]) == ("storage_free", 1, 0)
+    # Still held, the retry fails again; it records the entry's new identity, so the job rests instead of
+    # spawning the child on every maintenance tick (a state-only write condition would keep the old one).
+    from ouroboros import maintenance as maintenance_module
+    assert maintenance_module.run_job(root, "custody_trash") == {"state": "failed", "items": 0}
+    assert "custody_trash" not in maintenance_module.due(root), "a retried stuck entry is no reason to spawn again"
 
 
 # ------------------------------------------------------------------- B11

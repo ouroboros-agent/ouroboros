@@ -16,6 +16,7 @@ import pytest
 from ouroboros import platform_layer, store, task_store, usage_store
 from ouroboros.store import StoreBusy, StoreLost, StoreMigrating, StoreRetired
 from ouroboros.utils import machine_json
+from tests._store_shared import release_store_handles
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
@@ -110,6 +111,7 @@ def test_a_missing_store_is_migrating_while_imported_and_lost_beside_its_stamp(t
     with store.open_store(tmp_path, write=True) as txn:  # first touch: the import ran, the store is published
         assert txn.load("t1")["status"] == "completed"
     assert store.probe(tmp_path)[0] == "present" and store.store_ready(tmp_path) is True
+    release_store_handles(store.store_path(tmp_path))  # this test's own reads keep it open (Windows)
     store.store_path(tmp_path).unlink()
     assert store.generation_stamped(tmp_path)  # the import stamped the generation: a missing store is now LOST
     with pytest.raises(StoreLost):

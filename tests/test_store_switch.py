@@ -20,6 +20,7 @@ from ouroboros.store_import import ensure_current_store
 from ouroboros.task_results import task_result_path
 from ouroboros.usage_ledger import LEDGER_REL
 from ouroboros.utils import atomic_write_json
+from tests._store_shared import release_store_handles
 from tests._usage_store_testing import seed
 from tests.test_store_import import drives_of, fixture_root, load, meta, result, rows, snapshot
 
@@ -603,6 +604,7 @@ def test_the_stamp_is_cleared_before_the_store_is_renamed_aside(switch_root, tar
 def test_a_lost_drive_refuses_the_switch_instead_of_exporting_past_it(switch_root, target_repo):
     root, (repo, old, _new) = switch_root, target_repo
     drive = root / "state" / "headless_tasks" / "root1" / "data"
+    release_store_handles(store.store_path(root))  # the fixture's own reads keep it open (Windows)
     store.store_path(root).unlink()  # the canonical store lost beside its completed stamp
     intent(root, old)
     owner = Owner(repo)

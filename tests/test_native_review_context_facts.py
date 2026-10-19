@@ -47,13 +47,13 @@ class UsageReviewer(_ScriptedLLM):
         return (entry(kwargs) if callable(entry) else entry), next(self.usage)
 
 
-@pytest.mark.parametrize("surface", ["multi_model_review", "task_acceptance", "deep_self_review"])
+@pytest.mark.parametrize("surface", ["multi_model_review", "deep_self_review"])
 def test_large_initial_assignment_and_continuation_reach_transport(tmp_path, monkeypatch, surface):
     """Initial layout hints and every historical cap value leave dispatch intact."""
     monkeypatch.setenv("OUROBOROS_REVIEW_NATIVE_MAX_TRANSCRIPT_CHARS", "50000")
     task = 'Review all of these exact premises: "quoted" \\ line\n' * 20_000
     assert len(task) > 900_000
-    answer = json.dumps({"verdict": "PASS", "findings": []}) if surface == "task_acceptance" else _VERDICT
+    answer = _VERDICT
     llm = _ScriptedLLM([
         {"tool_calls": [_tool_call("read_file", {"path": "source.txt"}, "read")]},
         {"content": answer},

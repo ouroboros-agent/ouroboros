@@ -1,27 +1,13 @@
-// Pure presentation helpers for the sidebar activity dots.
+// Pure presentation helpers for the sidebar activity marks.
 //
-// The server's active_chat_activities census is the only source of liveness.
-// This module deliberately owns no timer, request, socket or durable state. A
-// caller supplies the previous projection when reconciling a partial census.
+// Each Project row reads its room in the server's work projection (`/api/state` `rooms`, keyed by the room's
+// chat id; ouroboros/gateway/work_status.py): the room's mark (moving dots, still dots, one dot or a ring), amber
+// while something waits for the owner, and its word with the reason of its first work. This module owns no timer,
+// request, socket or durable state and derives no mark of its own; a caller supplies the previous projection when
+// reconciling an incomplete body.
 
 import { activeModelWaits, mergeModelWaits } from './model_wait.js';
-import { censusTaskPhase } from './task_phase_chip.js';
-
-function activityId(row) {
-    return String(row?.activity_id || '').trim();
-}
-
-function projectId(row) {
-    return String(row?.project_id || '').trim();
-}
-
-function isChildActivity(row) {
-    if (row?.is_child === true || row?.child === true) return true;
-    const parent = String(row?.parent_task_id || '').trim();
-    if (!parent) return false;
-    const root = String(row?.root_task_id || '').trim();
-    return !root || root !== activityId(row);
-}
+import { activityWord, amberNote, reasonBesideWord, roomAmber } from './work_status.js';
 
 /** Whether a census row's own model waits are current (Activity reads the same rule). */
 export function waitingModel(row) {
@@ -34,85 +20,70 @@ export function waitingModel(row) {
     return activeModelWaits(admitted, false, Number(row?.task_attempt) || 0).length > 0;
 }
 
-/**
- * Summarize one or more census rows into one accessible marker state.
- *
- * The summary intentionally contains no counts. An independently working row
- * wins motion; a wait on that same row suppresses its motion while remaining in
- * the label so mixed projects keep both facts available to assistive
- * technology and the marker tooltip.
- */
-export function summarizeProjectActivities(rows = []) {
-    const phases = new Set();
-    const waits = new Set();
-    const unknown = new Set();
-    let motion = false;
-    let queued = false;
-    const order = ['working', 'thinking', 'finalizing', 'queued', 'budget_pausing', 'budget_paused', 'unknown'];
-    const ordered = (Array.isArray(rows) ? rows : []).filter(row => row && typeof row === 'object')
-        .sort((a, b) => order.indexOf(a.phase) - order.indexOf(b.phase));
-    for (const row of ordered) {
-        const view = censusTaskPhase(row, null, !row._activityUnconfirmed, waitingModel(row));
-        const label = [view.text, view.secondary].filter(Boolean).join(' · ');
-        (view.waiting ? waits : view.phase === 'unknown' ? unknown : phases).add(label);
-        motion ||= view.motion || Boolean(view.secondaryMotion);
-        queued ||= view.phase === 'queued';
-    }
-    const parts = [...phases, ...unknown, ...waits];
-    const waiting = waits.size > 0;
-    const state = motion ? 'working' : waiting ? 'waiting'
-        : queued ? 'queued' : parts.length ? 'unknown' : 'idle';
-    return {
-        state,
-        motion,
-        waiting,
-        label: parts.join(' · '),
-    };
-}
-
-/** Build project and direct-conversation summaries from census rows. */
-export function buildProjectActivityIndex(rows = []) {
-    const byProjectRows = new Map();
-    const seen = new Set();
-    for (const row of Array.isArray(rows) ? rows : []) {
-        const id = activityId(row);
-        if (!id || seen.has(id) || isChildActivity(row)) continue;
-        seen.add(id);
-        const pid = projectId(row);
-        if (pid) byProjectRows.set(pid, [...(byProjectRows.get(pid) || []), row]);
-    }
-    const byProject = new Map();
-    for (const [pid, projectRows] of byProjectRows) {
-        byProject.set(pid, summarizeProjectActivities(projectRows));
-    }
-    const aggregateSummary = summarizeProjectActivities([...byProjectRows.values()].flat());
-    return {
-        byProject,
-        aggregate: aggregateSummary,
-    };
-}
+/** A room with nothing to show. */
+export const IDLE_SUMMARY = Object.freeze({ state: 'idle', motion: false, amber: false, word: '', label: '' });
+// The room's mark as the marker's state: three moving dots, three still dots, one dot, a hollow ring.
+const MARK_STATES = { moving: 'working', still: 'queued', dot: 'dot', ring: 'unknown' };
+const STATE_RANK = ['working', 'queued', 'dot', 'unknown', 'idle'];
 
 /**
- * Reconcile a census against the previous rows. A complete supervisor-ready
- * response authorizes absence-based clearing. Partial, unavailable or
- * disconnected responses retain omitted rows as unknown, with no motion.
- * Positive rows in a partial census still describe their own observed state.
+ * One room as one marker: its mark, amber, and its word with the first work's reason (no counts). The row's
+ * accessible name also says what waits for the owner when the word does not, so amber is never told by colour alone.
  */
-export function reconcileProjectActivityCensus(previous = new Map(), data = {}) {
+export function summarizeRoom(room, works = []) {
+    if (!room || typeof room !== 'object' || room.activity === 'idle') return IDLE_SUMMARY;
+    const state = MARK_STATES[room.mark] || 'unknown';
+    const first = (Array.isArray(works) ? works : []).find((work) => work?.work_id === room.works?.[0]);
+    const word = activityWord(room);
+    const reason = state === 'unknown' ? '' : reasonBesideWord(first?.because?.[0], word);
+    const note = state === 'unknown' ? '' : amberNote(roomAmber(room));
+    return { state, motion: state === 'working', amber: Boolean(room.amber) && state !== 'unknown', word,
+        label: [word, reason, note].filter(Boolean).join(' · ') };
+}
+
+// A room an incomplete or unavailable body did not list again: still shown, never as confirmed motion.
+const unconfirmed = () => {
+    const word = activityWord({ activity: 'unknown' });
+    return { state: 'unknown', motion: false, amber: false, word, label: word };
+};
+
+/**
+ * Reconcile one body against the previous rooms. A complete supervisor-ready body (`works_complete`) proves that
+ * an unlisted room is idle; a partial, unavailable or disconnected one keeps every room it omitted, unconfirmed.
+ * Rooms it lists describe their own observed state.
+ */
+export function reconcileProjectRooms(previous = new Map(), data = {}) {
     const prior = previous instanceof Map ? previous : new Map();
-    const incoming = data?.active_chat_activities;
-    const complete = Array.isArray(incoming) && data.active_chat_activities_complete === true
+    const rooms = data?.rooms && typeof data.rooms === 'object' ? data.rooms : null;
+    const complete = Boolean(rooms) && Array.isArray(data.works) && data.works_complete === true
         && data.supervisor_ready === true;
     const next = new Map();
-    if (!complete) {
-        for (const [id, row] of prior) next.set(id, { ...row, _activityUnconfirmed: true });
+    if (!complete) for (const chat of prior.keys()) next.set(chat, unconfirmed());
+    for (const [chat, room] of Object.entries(rooms || {})) {
+        const summary = summarizeRoom(room, data.works);
+        if (summary.state !== 'idle') next.set(String(chat), summary);
     }
-    for (const row of Array.isArray(incoming) ? incoming : []) {
-        const id = activityId(row);
-        if (id && !isChildActivity(row)) next.set(id, { ...row, _activityUnconfirmed: false });
+    return { rooms: next, complete };
+}
+
+/**
+ * Index the Project rooms by chat id; the collapsed Projects header shows the strongest of their marks (moving over
+ * still over one dot over a ring), amber when any is, and their distinct words.
+ */
+export function buildProjectActivityIndex(rooms = new Map(), chatIds = []) {
+    const byChat = new Map();
+    for (const chat of chatIds) {
+        const summary = rooms instanceof Map ? rooms.get(String(chat)) : null;
+        if (summary) byChat.set(String(chat), summary);
     }
+    const summaries = [...byChat.values()];
+    const state = summaries.map((summary) => summary.state)
+        .sort((a, b) => STATE_RANK.indexOf(a) - STATE_RANK.indexOf(b))[0] || 'idle';
+    const words = [...new Set(summaries.map((summary) => summary.word).filter(Boolean))];
     return {
-        rows: next,
-        complete,
+        byChat,
+        aggregate: state === 'idle' ? IDLE_SUMMARY
+            : { state, motion: state === 'working', amber: summaries.some((summary) => summary.amber), word: words[0] || '',
+                label: words.join(' · ') },
     };
 }

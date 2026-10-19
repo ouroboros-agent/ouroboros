@@ -36,7 +36,7 @@ Review history keeps the operative contract, current author/critic statuses and 
 
 ### Invariant: Exact premises with explicit source ownership
 
-Plan from the complete retained room — both speakers, options and answers exact (`dialogue_evidence.py`, `plan_dialogue.py`) — with no independent dialogue byte cap, never from the bounded post-consolidation reader or the acceptance directive ledger (`review_evidence._accept_owner_directives`). JSONL records and chat line selectors split on physical LF only, never inside valid Unicode of a message. Enforcement: `tests/test_plan_dialogue_review_regressions.py`.
+Plan from the complete retained room — both speakers, options and answers exact (`dialogue_evidence.py`, `plan_dialogue.py`) — with no independent dialogue byte cap, never from the bounded post-consolidation reader or the owner-directive ledger (`review_evidence._accept_owner_directives`). JSONL records and chat line selectors split on physical LF only, never inside valid Unicode of a message. Enforcement: `tests/test_plan_dialogue_review_regressions.py`.
 
 ### Invariant: Compaction must earn its rewrite
 

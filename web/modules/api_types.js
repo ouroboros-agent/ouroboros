@@ -52,6 +52,11 @@
  * @property {Array<Object>=} main_attention Live human recovery owners, including children; the activity census stays root-only.
  * @property {boolean=} main_attention_complete False retains previously observed actions.
  * @property {Array<Object>=} main_attention_gaps Typed gaps in current action evidence.
+ * @property {import('./work_types.js').Work[]} works  // one row per work: a request with its Continue episodes and live members
+ * @property {Object<string, import('./work_types.js').RoomStatus>} rooms  // one status per room (chat_id), from its works
+ * @property {import('./work_types.js').WorkSummary} work_summary  // the tray's one line
+ * @property {boolean} works_complete  // false: a source was unreadable; keep what was seen, never read it as empty
+ * @property {Array<Object>} works_gaps  // typed gaps of the work projection
  * @property {import('./client_contract_types.js').ServedUiState=} served_ui  // this generation's main interface; absent on older cores
  */
 /**
@@ -734,6 +739,7 @@
  * @typedef {Object} ProjectEntry
  * @property {string} id
  * @property {string=} name
+ * @property {boolean=} pinned  // absent on legacy rows means unpinned
  * @property {number=} chat_id
  * @property {string=} working_dir
  * @property {string=} provenance   // attached | cloned | genesis | none (historical fact)

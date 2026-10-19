@@ -643,12 +643,12 @@ def apply_skill_publish_receipt_veto(
     objective.update(
         {
             "status": "fail",
-            # Keep the existing objective-authority source vocabulary: the receipt is
-            # a veto over an acceptance result, not a second positive oracle.  The
-            # normalizer intentionally rejects every positive/negative objective whose
-            # source is not task_acceptance_review, so the host veto is carried as a
-            # typed negative fact alongside that source rather than minting authority.
-            "source": "task_acceptance_review",
+            # Keep the objective-authority source vocabulary: the receipt is a veto over
+            # the reviewed result, not a second positive oracle. The normalizer rejects
+            # every objective whose source is not a review's (``result_review``, or a
+            # recorded task acceptance on older records), so the host veto is carried as
+            # a typed negative fact under that source rather than minting authority.
+            "source": "result_review",
             "outcome_tier": "blocked_with_evidence",
             "reason": reason,
             "receipt_veto": {

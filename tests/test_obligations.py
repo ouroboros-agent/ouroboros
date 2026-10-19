@@ -246,10 +246,6 @@ def test_recovery_reads_open_members_among_2000_completed(tmp_path, monkeypatch)
     monkeypatch.setattr(results, "read_document", counted)
     monkeypatch.setattr(results, "list_task_results", lambda *a, **kw: pytest.fail("history enumeration"))
     monkeypatch.setattr(status, "effective_task_result", lambda root, row, **kw: row)
-    from ouroboros import post_task_synthesis as synthesis
-    from supervisor import owner_pause_control
-    monkeypatch.setattr(synthesis, "revoke_late_phase_grant", lambda *a, **kw: None)
-    monkeypatch.setattr(owner_pause_control, "retain_late_phase_latch", lambda *a: None)
     monkeypatch.setattr(pipeline, "_settle_terminal_projection", lambda *a, **kw: None)
     monkeypatch.setattr(projection, "settle_terminal_projection", lambda *a, **kw: "settled")
     status.reconcile_orphaned_running_tasks(tmp_path)

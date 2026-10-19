@@ -522,6 +522,8 @@ def pytest_cmdline_main(config):
 @pytest.hookimpl(tryfirst=True)
 def pytest_configure(config):
     config.addinivalue_line("markers", "scale: storage operation-count acceptance measurements")
+    config.addinivalue_line("markers", "starter_skills: the test runs the real starter-skill installer "
+                                       "(conftest `_starter_skills_stay_off`); its skill sources are local fixtures")
     evidence = os.environ.get("OUROBOROS_TEST_EVIDENCE_ROOT")
     if evidence and _PYTEST_ROOT is not None and not getattr(config.option, "ci_evidence_dir", None):
         config.option.ci_evidence_dir = str(pathlib.Path(evidence) / ("pytest-" + _PYTEST_ROOT.name))
@@ -1097,6 +1099,32 @@ def _hide_bundled_skills(monkeypatch):
             "ouroboros.skill_loader._resolve_data_skills_dir",
             _hermetic_resolver,
         )
+
+
+@pytest.fixture(autouse=True)
+def _starter_skills_stay_off(request, monkeypatch):
+    """No ordinary test starts the starter-skill installer; a test of the installer opts in.
+
+    ``skill_starter.schedule_starter`` is the door of every background starter run: the boot of
+    a fresh data root with a ready provider and no onboarding stamp (#1995), a retry of a pending
+    run, every onboarding completion. That run clones the configured skill sources (by default
+    the Official hub on GitHub) and installs skills while the test goes on, so outside tests
+    marked ``starter_skills`` the door starts nothing. A server a test runs in its own
+    interpreter does not load this file: its harness closes the door itself (tests/_cost_driver.py
+    stubs it; the real-server shutdown tests configure no starter skills).
+    """
+    if request.node.get_closest_marker("starter_skills"):
+        yield
+        return
+    from ouroboros import skill_starter
+
+    def schedule_starter(drive_root, ids, *, origin, repo_dir=None):
+        thread = threading.Thread(target=lambda: None, name="starter-skills-off", daemon=True)
+        thread.start()
+        return thread
+
+    monkeypatch.setattr(skill_starter, "schedule_starter", schedule_starter)
+    yield
 
 
 @pytest.fixture(autouse=True)

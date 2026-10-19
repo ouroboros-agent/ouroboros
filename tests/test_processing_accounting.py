@@ -150,24 +150,6 @@ def test_loop_and_helper_display_keep_the_observed_price_qualifier(monkeypatch, 
     assert ctx.pending_events[0]["cost"] == cost == (None if expected == "unknown" else 0.1)
 
 
-def test_host_view_callback_is_invoked_but_never_recorded_as_a_model_argument(tmp_path, monkeypatch):
-    from ouroboros import llm_observability as observed
-
-    recorded, views = [], []
-    monkeypatch.setattr(observed, "persist_call", lambda *args, **kwargs: recorded.append(kwargs["payload"]) or {})
-    callback = lambda messages, schemas: views.append(messages)
-
-    class Client:
-        def chat(self, **kwargs):
-            kwargs["model_context_observer"](kwargs["messages"], kwargs.get("tools"))
-            return {"role": "assistant", "content": "done"}, {}
-
-    observed.chat_observed(Client(), drive_root=tmp_path, messages=[{"role": "user", "content": "exact"}],
-                           model="model", model_context_observer=callback)
-    assert len(views) == 1 and recorded
-    assert all("model_context_observer" not in payload.get("kwargs", {}) for payload in recorded)
-
-
 def test_usage_counts_or_a_tariff_quote_state_no_cash_fact():
     from ouroboros._usage_rows import _processing_summary
 
@@ -176,7 +158,6 @@ def test_usage_counts_or_a_tariff_quote_state_no_cash_fact():
     assert _processing_summary([quoted]) == {}
     unknown = {"cost_evidence": {"knowledge": "unknown"}}
     assert _processing_summary([quoted, unknown])["unknown_cash_rows"] == 1
-
 
 
 def test_audio_usage_is_kept_beside_the_counters_and_text_usage_is_not_copied(data_root):

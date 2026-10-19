@@ -84,7 +84,7 @@ def _settle(records, claim):
 def _publish(records, event_queue):
     # The same delivery owner called by cancel_publication._publish_cancelled_task.
     return delivery.deliver_unreviewed_salvage(
-        records.root, records.task, "task", outcome="cancelled", settled_status="cancelled",
+        records.root, records.task, "task", outcome="stopped", settled_status="cancelled",
         salvaged_text="retained intermediate result", event_queue=event_queue,
     )
 
@@ -218,7 +218,7 @@ def test_terminal_delivery_without_stop_keeps_ordinary_final_identity(records, s
         if status == "completed":
             return delivery.deliver_completed_result(records.root, records.task, "task", stored, event_queue=events)
         return delivery.deliver_unreviewed_salvage(
-            records.root, records.task, "task", outcome="cancelled", settled_status="cancelled",
+            records.root, records.task, "task", outcome="stopped", settled_status="cancelled",
             salvaged_text=stored["result"], event_queue=events,
         )
 

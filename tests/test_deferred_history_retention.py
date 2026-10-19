@@ -113,9 +113,10 @@ def test_gc_owes_unreferenced_physical_calls_including_old_and_cancelled_rows(tm
 
 
 def test_public_exact_review_reader_works_while_history_is_deferred(tmp_path):
+    """An old host acceptance record (nothing writes one any more) stays readable through
+    ``get_task_result(review_source_sha256=...)`` before and after deferred history placement."""
     from pathlib import Path
     from ouroboros.artifacts import store_actor_source_bytes, task_artifact_dir_path
-    from ouroboros.task_finalization import review_source_reader
     from ouroboros.tools.registry import ToolContext, ToolRegistry
 
     parent, task_id = tmp_path / "parent", "source-author"
@@ -134,7 +135,7 @@ def test_public_exact_review_reader_works_while_history_is_deferred(tmp_path):
     registry.set_context(ToolContext(repo_dir=Path.cwd(), drive_root=parent, task_id="next-owner",
                                     task_metadata={"budget_drive_root": str(parent)}))
     write_task_result(parent, "next-owner", "running", root_task_id="next-owner")
-    selector = review_source_reader(task_id, ref)
+    selector = {"tool": "get_task_result", "arguments": {"task_id": task_id, "review_source_sha256": ref["sha256"]}}
     result = registry.execute_result(selector["tool"], selector["arguments"])
     assert result.status == "ok"
     before = json.loads(result.text)["review_source"]

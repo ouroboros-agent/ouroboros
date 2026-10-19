@@ -136,11 +136,10 @@ def test_readers_resolve_loose_then_pack_and_blob_shared_with_active_task_stays_
     assert _loose(refs_c[0])  # an active task is never packed
     for ref in refs_a:
         assert obs.read_blob_ref(root, ref)["message"]["content"].startswith("answer task-a")
-    from ouroboros.repo_diff_capture import read_blob_bytes
-    packed_raw = read_blob_bytes(root, refs_a[2], expected_kind="json")
+    packed_raw = packs.blob_bytes(root, refs_a[2], expected_kind="json")
     assert hashlib.sha256(packed_raw).hexdigest() == refs_a[2]["sha256"]
     with pytest.raises(ValueError, match="unexpected kind"):
-        read_blob_bytes(root, refs_a[2], expected_kind="bin")
+        packs.blob_bytes(root, refs_a[2], expected_kind="bin")
     raw = read_actor_source_bytes(root, "task-a", handle_a)
     assert raw.startswith(b"# focus") and len(raw) == handle_a["size"]
     assert packs.handle_info(root, "task-a", handle_a["path"]) == {"size": handle_a["size"], "sha256": handle_a["sha256"], "loose": False}

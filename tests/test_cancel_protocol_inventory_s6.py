@@ -67,9 +67,6 @@ TERMINAL_WRITERS = {
     # Continue replay restores the exact stored status, or seeds scheduled;
     # its recovered admission cannot originate a new terminal transition.
     ('supervisor/continuation_admission.py::_replay', 'stored.get("status") or "scheduled"'): 'dynamic',
-    # A source-bound cap amendment preserves CURRENT lifecycle in its locked
-    # projector; it changes money authority only and never revives the task.
-    ('ouroboros/acceptance_history.py::prepare_owner_historical_review', 'accounting["status"]'): 'dynamic',
     ('ouroboros/agent.py::_task_exception_terminal', 'STATUS_FAILED'): 'terminal',
     ('ouroboros/agent_task_pipeline.py::_store_task_result', 'status'): 'dynamic',
     ('ouroboros/delegate_terminal.py::record_terminal_reconciliation', 'str(existing.get("status") or STATUS_RUNNING)'): 'dynamic',
@@ -87,10 +84,9 @@ TERMINAL_WRITERS = {
     # Both retain CURRENT lifecycle status rather than authoring completion.
     ('ouroboros/headless.py::_retry_child_task_refs_locked', 'source["status"]'): 'dynamic',
     ('ouroboros/headless.py::prepare_terminal_task_files', 'existing["status"]'): 'dynamic',
-    # Existing task custody/projection enrichment only: both locked field
-    # projectors preserve CURRENT lifecycle status rather than ending a task.
+    # Existing task custody/projection enrichment only: its locked field
+    # projector preserves CURRENT lifecycle status rather than ending a task.
     ('ouroboros/history_retention.py::call_inventory_custodied', 'current["status"]'): 'dynamic',
-    ('ouroboros/review_operation.py::_remember_legacy_notice', '"running"'): 'dynamic',
     ('ouroboros/headless.py::_finalize_task_artifacts_locked', 'status'): 'dynamic',
     ('ouroboros/headless.py::_finalize_task_artifacts_locked', 'str(existing.get("status") or status or "completed")'): 'terminal',
     ('ouroboros/mutation_attribution.py::advance_mutation_baseline', 'status'): 'dynamic',
@@ -127,9 +123,6 @@ TERMINAL_WRITERS = {
     ('ouroboros/terminal_projection.py::append_terminal_projection', 'status'): 'dynamic',
     ('ouroboros/terminal_projection.py::clear_terminal_projection_obligation', 'str(expected.get("status") or "completed")'): 'terminal',
     ('ouroboros/project_naming.py::spawn_turn_namer._work', 'status'): 'dynamic',
-    # The locked field projector preserves the existing status, including a
-    # terminal one; publishing review evidence never completes the task itself.
-    ('ouroboros/review_projection.py::publish_acceptance_checkpoint', '"running"'): 'dynamic',
     # Rebinds a proven legacy child start before existing orphan materialization;
     # write_task_result still preserves any terminal status under its locked reducer.
     ('ouroboros/startup_task_files.py::recover_terminal_task_files', '"running"'): 'dynamic',

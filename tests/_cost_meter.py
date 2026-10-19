@@ -17,7 +17,8 @@ What is counted, per tag:
   class creation, so they are wrapped separately), ``os.walk`` and ``glob`` included;
 - ``open`` (and per category): ``io.open``/``builtins.open``/``Path.open``; ``os_open`` for
   raw ``os.open``; ``read_bytes`` (and per category): bytes delivered by files opened for
-  reading through those doors (``os.read``/``os.pread`` on a counted descriptor included);
+  reading through those doors (``os.read``/``os.pread`` on a counted descriptor included; ``os.pread``
+  exists only on POSIX);
 - ``json_loads`` and ``json_chars``: every ``json.loads``/``json.load`` and its input length;
 - ``popen`` (argv[0] names kept in ``popen_names``) and ``thread_start`` (thread names).
 
@@ -70,7 +71,7 @@ _ACTIVE: Optional["CostMeter"] = None
 _LOCAL = threading.local()
 
 
-_DOORS = ("tests._cost_meter", "subprocess", "pathlib", "os", "genericpath", "posixpath", "io", "json",
+_DOORS = ("tests._cost_meter", "subprocess", "pathlib", "os", "genericpath", "posixpath", "ntpath", "io", "json",
           "json.decoder", "sqlite3", "contextlib", "threading", "glob", "shutil", "fnmatch")
 
 
@@ -116,6 +117,7 @@ class CostMeter:
         self._lock = threading.Lock()
         self._fd_category: Dict[int, str] = {}
         self._rebound: List[Tuple[Any, str, Any]] = []
+        self._patched: List[Tuple[Any, str, Any]] = []
 
     # ---- attribution and recording -------------------------------------------------
     def category(self, path: Any) -> str:
@@ -444,27 +446,46 @@ _ACCESSOR = getattr(pathlib, "_NormalAccessor", None)
 _ACCESSOR_PATCHES = (("stat", _w_stat), ("scandir", _w_scandir), ("listdir", _w_listdir),
                      ("open", _w_accessor_open)) if _ACCESSOR is not None else ()
 _SKIP_REBIND = {"os", "posix", "nt", "io", "_io", "builtins", "json", "sqlite3", "pathlib", __name__}
+_WRAPPERS = {wrapper for *_rest, wrapper in _MODULE_PATCHES} | {wrapper for _attr, wrapper in _ACCESSOR_PATCHES} \
+    | {_w_popen_init, _w_thread_start, _w_bootstrap_inner}
 
 
 def install(meter: CostMeter) -> None:
+    """Replace every counted door; an install that fails part-way puts back what it replaced (a door left
+    wrapped would be recorded as its own original by the next install and recurse in every later caller)."""
     global _ACTIVE
     if _ACTIVE is not None:
         raise RuntimeError("one cost meter at a time")
     _ORIG["cwd"] = os.getcwd()
+    try:
+        _install(meter)
+    except BaseException:
+        _undo(meter)
+        raise
+    _ACTIVE = meter
+
+
+def _replace(meter: CostMeter, owner: Any, attr: str, value: Any) -> Any:
+    original = vars(owner)[attr]
+    if getattr(original, "__func__", original) in _WRAPPERS:
+        raise RuntimeError(f"{getattr(owner, '__name__', owner)}.{attr} is still the meter's wrapper")
+    setattr(owner, attr, value)
+    meter._patched.append((owner, attr, original))  # only a replacement that took place is put back
+    return original
+
+
+def _install(meter: CostMeter) -> None:
     originals = {}
     for module, attr, key, wrapper in _MODULE_PATCHES:
-        _ORIG[key] = getattr(module, attr)
+        if not hasattr(module, attr):  # ``os.pread`` is POSIX-only: Windows has no such door to count
+            continue
+        _ORIG[key] = _replace(meter, module, attr, wrapper)
         originals[id(_ORIG[key])] = wrapper
-        setattr(module, attr, wrapper)
     for attr, wrapper in _ACCESSOR_PATCHES:
-        _ORIG["accessor." + attr] = _ACCESSOR.__dict__[attr]
-        setattr(_ACCESSOR, attr, staticmethod(wrapper))
-    _ORIG["Popen.__init__"] = subprocess.Popen.__init__
-    subprocess.Popen.__init__ = _w_popen_init
-    _ORIG["Thread.start"] = threading.Thread.start
-    threading.Thread.start = _w_thread_start
-    _ORIG["Thread._bootstrap_inner"] = threading.Thread._bootstrap_inner
-    threading.Thread._bootstrap_inner = _w_bootstrap_inner
+        _ORIG["accessor." + attr] = _replace(meter, _ACCESSOR, attr, staticmethod(wrapper))
+    _ORIG["Popen.__init__"] = _replace(meter, subprocess.Popen, "__init__", _w_popen_init)
+    _ORIG["Thread.start"] = _replace(meter, threading.Thread, "start", _w_thread_start)
+    _ORIG["Thread._bootstrap_inner"] = _replace(meter, threading.Thread, "_bootstrap_inner", _w_bootstrap_inner)
     for name, module in list(sys.modules.items()):
         if module is None or name in _SKIP_REBIND:
             continue
@@ -475,9 +496,8 @@ def install(meter: CostMeter) -> None:
         for attr, value in items:
             wrapper = originals.get(id(value))
             if wrapper is not None and not isinstance(value, (int, str)):
+                setattr(module, attr, wrapper)  # a module may refuse: then there is nothing to put back
                 meter._rebound.append((module, attr, value))
-                setattr(module, attr, wrapper)
-    _ACTIVE = meter
 
 
 def uninstall(meter: CostMeter) -> None:
@@ -485,16 +505,21 @@ def uninstall(meter: CostMeter) -> None:
     if _ACTIVE is not meter:
         return
     _ACTIVE = None
-    for module, attr, key, _wrapper in _MODULE_PATCHES:
-        setattr(module, attr, _ORIG[key])
-    for attr, _wrapper in _ACCESSOR_PATCHES:
-        setattr(_ACCESSOR, attr, _ORIG["accessor." + attr])
-    subprocess.Popen.__init__ = _ORIG["Popen.__init__"]
-    threading.Thread.start = _ORIG["Thread.start"]
-    threading.Thread._bootstrap_inner = _ORIG["Thread._bootstrap_inner"]
-    for module, attr, value in reversed(meter._rebound):
-        setattr(module, attr, value)
+    _undo(meter)
+
+
+def _undo(meter: CostMeter) -> None:
+    """Put every replaced door back, past any that refuses, then name every refusal at once."""
+    refused = []
+    for owner, attr, original in [*reversed(meter._rebound), *reversed(meter._patched)]:
+        try:
+            setattr(owner, attr, original)
+        except Exception as exc:  # the other doors still go back; this one is named below
+            refused.append(f"{getattr(owner, '__name__', owner)}.{attr} ({exc})")
     meter._rebound.clear()
+    meter._patched.clear()
+    if refused:
+        raise RuntimeError(f"the cost meter could not put back {', '.join(refused)}")
 
 
 def tagged(tag: str, call: Callable[[], Any]) -> Any:

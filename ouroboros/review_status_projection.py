@@ -3,9 +3,8 @@
 Boundary: this leaf reads ``review_state`` records (runs, commit attempts,
 obligations, commit-readiness debts) and renders the semantic read-model plus the
 human-facing ``review_status`` payload and one-line message. It knows nothing
-about task-acceptance packets and must never import ``ouroboros.review_evidence``
-— the dependency runs the other way, which keeps the module a leaf like
-``review_evidence_refs``. It also owns the read-only join of a split-drive task's
+about other evidence and must never import ``ouroboros.review_evidence`` — the
+dependency runs the other way, which keeps the module a leaf. It also owns the read-only join of a split-drive task's
 canonically held ``review_change`` attempts that ``review_evidence`` shares.
 """
 
@@ -439,6 +438,9 @@ def _review_status_message(projection: Dict[str, Any]) -> str:
             "review_late_result_pending": (
                 f"Review NOT_PERFORMED: {NOT_PERFORMED_PHRASES['review_late_result_pending']}; no verdict is counted yet. "
                 "The pending result settles into the ledger when it lands; retry the commit afterwards."),
+            "result_unanswered": (
+                f"Review NOT_PERFORMED: {NOT_PERFORMED_PHRASES['result_unanswered']}. A result review counts only a "
+                "PASS/FAIL answer; each seat's error is recorded in the attempt."),
             "critical_findings": "Reviewers found critical issues. Repair or rebut (review_rebuttal) the findings listed, then re-run commit_reviewed.",
             "review_quorum": "Not enough review models responded. Retry — usually transient.",
             "parse_failure": "Review models could not produce parseable output. Retry the commit.",
@@ -451,12 +453,19 @@ def _review_status_message(projection: Dict[str, Any]) -> str:
             "overlap_guard": "Another reviewed attempt is still active. Wait or expire it before retrying.",
             "attempt_cap_reached": "The same staged diff was review-blocked repeatedly. Change the diff or rebut via review_rebuttal.",
             "identical_diff_refused": "This exact staged diff was already review-blocked. Change the diff or supply a NEW review_rebuttal (identical bytes are never re-reviewed for pay).",
-            "review_cycles_exhausted": "This task tree spent its paid review cycles (OUROBOROS_REVIEW_MAX_CYCLES). Finalize honestly or ask the owner to raise the cap.",
+            "review_cycles_exhausted": "This task tree spent its paid review cycles (OUROBOROS_REVIEW_MAX_CYCLES). Under Advisory decide whether what was reviewed is enough; under Blocking only the owner may raise the cap.",
             "review_subject_binding_mismatch": "The reviewed managed subject is not the tree this commit would write. Re-stage the intended candidate and retry so review and commit describe the same tree.",
         }
         label = "BLOCKED" if ca.status == "blocked" else "FAILED"
+        what = "result review" if getattr(ca, "tool_name", "") == "review_result" else "commit"
+        if what == "result review":  # a result is revised and delivered again, never committed
+            reason_map.update(
+                critical_findings="Reviewers found critical issues in the result. Revise it or answer the findings, then deliver again.",
+                review_late_result_pending=(
+                    f"Review NOT_PERFORMED: {NOT_PERFORMED_PHRASES['review_late_result_pending']}; no verdict is counted yet. "
+                    "The next delivery of the same result collects it at $0."))
         current = (
-            f"Last commit {label} ({ca.block_reason or 'unclassified'}): "
+            f"Last {what} {label} ({ca.block_reason or 'unclassified'}): "
             f"{reason_map.get(ca.block_reason, ca.block_reason or 'unknown')}"
             f"  |  {current}"
         )

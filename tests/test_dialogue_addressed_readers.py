@@ -1,5 +1,6 @@
 """Addressed readers use SQL truth, preserve owner bytes, and disclose incomplete import."""
 from contextlib import contextmanager
+import pathlib
 
 import pytest
 
@@ -333,7 +334,7 @@ def test_initialization_reads_existing_dialogue_evidence_and_never_creates_a_sto
     ds.append(tmp_path, "progress", {"chat_id": 1, "text": "scaffolding alone is not owner history"})
     assert supervisor_evidence(tmp_path) == ("none", "")
     ds.append(tmp_path, "chat", owner())
-    assert supervisor_evidence(tmp_path) == ("present", "state/dialog.sqlite")
+    assert supervisor_evidence(tmp_path) == ("present", str(pathlib.Path("state", "dialog.sqlite")))  # OS separators
     assert initialization_decision(tmp_path)["reason"] == "prior_history_without_state"
     store.close_connections()
     ds.path(tmp_path).write_bytes(b"unreadable dialogue store")

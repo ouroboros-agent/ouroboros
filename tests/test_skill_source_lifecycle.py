@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 
 import pytest
 
@@ -112,7 +114,19 @@ def test_review_install_waits_for_review_and_blockers_keep_it_off(drive, hub, mo
     # From a source that reviews each skill, blockers keep it off even under Advisory enforcement.
     save_review_state(drive, "notes", SkillReviewState(status="blockers", content_hash=loaded.content_hash))
     assert reconcile_turn_on_when_ready(drive, "notes", repo_path="")["action"] == "not_ready"
-    save_review_state(drive, "notes", SkillReviewState(status="warnings", content_hash=loaded.content_hash))
+    from ouroboros.skill_review import review_skill
+    from ouroboros.tools.registry import ToolContext
+    from tests._skill_review_shared import _make_actor, _pass_array_for_script_skill
+    from tests.review_pool_rosters import pool_roster, pool_seat, set_review_pool
+    set_review_pool(monkeypatch, pool_roster(pool_seat("a", "openai/a"), pool_seat("b", "openai/b")))
+    calls = []
+    def run(_ctx, **kwargs):
+        calls.append(kwargs["row_plan"]["slot_ids"])
+        return json.dumps({"results": [{**_make_actor("openai/a", _pass_array_for_script_skill()), "slot_id": "a"}]})
+    monkeypatch.setattr("ouroboros.tools.review._handle_multi_model_review", run)
+    outcome = review_skill(ToolContext(repo_dir=drive, drive_root=drive), "notes", reviewers=["a"], reason="verify the repair")
+    assert outcome.status == "clean" and outcome.panel["assigned"] == ["a"]
+    assert calls == [["a"]], "a re-review after blockers obeys ordinary Advisory composition"
     assert reconcile_turn_on_when_ready(drive, "notes", repo_path="")["action"] == "enabled"
 
 
@@ -494,6 +508,22 @@ def test_probe_reads_a_hub_a_plain_repo_and_a_folder(drive, hub, tmp_path):
     assert catalog.probe_source(drive, path=str(folder)) == {"kind": "local", "suggested_name": "folder", "found": ["x"]}
     assert "error" in catalog.probe_source(drive, url="https://user:secret@example.invalid/r")
     assert "error" in catalog.probe_source(drive, url=str(tmp_path / "missing.git"))
+    assert not list((drive / "state" / "skill_sources" / ".scratch").iterdir())
+
+
+def test_a_probe_leaves_no_clone_where_read_only_files_refuse_deletion(drive, hub, monkeypatch):
+    """Windows refuses to delete a read-only file, and a clone's git objects are read-only: the
+    probe's scratch clone still goes instead of staying in the scratch folder forever."""
+    real_unlink = os.unlink
+
+    def windows_unlink(path, *, dir_fd=None):
+        if not os.lstat(path, dir_fd=dir_fd).st_mode & stat.S_IWRITE:
+            raise PermissionError(13, "Access is denied", path)
+        return real_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "unlink", windows_unlink)
+    monkeypatch.setattr(os, "remove", windows_unlink)
+    assert catalog.probe_source(drive, url=str(hub.bare))["kind"] == "hub"
     assert not list((drive / "state" / "skill_sources" / ".scratch").iterdir())
 
 

@@ -1,6 +1,6 @@
 // Pure chat-activity helpers shared by chat.js and dependency-free node tests:
 // live-card presentation projections (moved verbatim from chat.js) plus the
-// in-flight direct/ephemeral turn status reducer and snapshot hydration.
+// census snapshot hydration. The room's status word is the server's (work_status.js).
 import { META_PART_SEPARATOR, executorIdentityMarkup } from './harness_presentation.js';
 import { effortChipMarkup } from './effort_chip.js';
 import { resultFilesItemHtml } from './result_files.js';
@@ -9,11 +9,10 @@ import { compactModel, formatLogDuration, modelExecutionLabel } from './log_even
 import { fitText, fullText } from './text_fit.js';
 import { delegatedActivityBodyHtml, delegatedHeadline, delegatedLineView } from './delegated_activity.js';
 import { REUSABLE_TASK_IDS } from './task_control_menu.js';
-import { activityWaitPhase, pausePhaseLabel, modelActivityPresentation, paintLiveDetail, taskActivityPresentation } from './task_phase_chip.js';
+import { paintLiveDetail } from './task_phase_chip.js';
 import { fmt, tr, tx } from './i18n.js';
 import { formatMsgTime } from './utils.js';
 import { hostRowDisplayText } from './host_notice_text.js';
-import { startingStatus } from './host_starting_status.js';
 export { bootPhase, startingStatus, supervisorReady } from './host_starting_status.js';
 import {
     joinMarkdownHeadings, MARKDOWN_FENCED_CODE, accountedUpperBound,
@@ -820,7 +819,7 @@ export function clearStickyCardState(record) {
     // A recycled slot must not inherit the previous cycle's finalizing hold —
     // nor the outcome observed under it (#1110), which would otherwise paint the
     // new cycle's chip with the old cycle's Failed.
-    Object.assign(record, { finalizingHold: false, censusPhase: '', observedOutcome: '' });
+    Object.assign(record, { finalizingHold: false, censusPhase: '', observedOutcome: '', workView: null });
     // The activity clock is cycle state too: a recycled slot ('active') would
     // otherwise open showing the previous cycle's "updated" time.
     record.latestActivityTs = '';
@@ -925,12 +924,12 @@ export function isTerminalTaskPhase(phase = '', terminal = false) {
  * into ONE follow-up read that starts when the in-flight read settles — the
  * first forced caller receives that request, the others resolve to null once
  * the follow-up has applied or failed. Gated requests settle via `apply`/`fail` even if a callback throws.
- * Only `fail` (a read failed, in any window) fans out `onUnavailable`; socket open/close `retire()` older bodies.
+ * Only `fail` fans out `onUnavailable`; socket changes and confirmed mutations `retire()` older bodies.
  */
 export function createStateSnapshotSequencer(onApply, now = () => Date.now(), onUnavailable = () => {}) {
     let requestedGeneration = 0;
     let appliedGeneration = 0;
-    // Newest applied body until an unavailable read retires it (late-mount seed).
+    // Newest applied body until a failed read or retire() clears it (late-mount seed).
     let latest = null;
     let inflight = null;
     let settled = null;
@@ -1068,93 +1067,6 @@ export function positiveTaskTerminalFact(row) {
  */
 export function unkeyedFrameEndsTurn(row) {
     return String(row?.role || '') !== 'system';
-}
-
-/**
- * One header producer: the word, its tone (live, queued, wait for the owner's own question, held, unknown, starting,
- * offline, online) and its dots together; a call's operation, never its word, picks the tone. Precedence: offline >
- * active managed work > pausing > direct turns > pending submissions > finalizing wrap-up (ended work in its post-task
- * work) > access wait > queued > answer wait > unknown > paused > Project hold > idle, which says Starting until the
- * supervisor confirms readiness: neither admission nor a connected socket proves execution. Tasks are counted
- * independently, so one paused task never hides another working; `showDots` is the transcript's typing row.
- */
-export function computeDerivedChatStatus({
-    isConnected = true,
-    hasActiveLiveCard = false,
-    activeDirectCount = 0, activeManagedCount = 0,
-    queuedManagedCount = 0, pausingManagedCount = 0,
-    pausedManagedCount = 0, finalizingCount = 0, hasFinalizingLiveCard = false,
-    pausedCause = '',
-    waitingOwnerCount = 0, unknownActivityCount = 0,
-    waitingModelCount = 0,
-    projectWaitLabel = '',
-    pendingSubmissionsCount = 0,
-    supervisorStarting = false,
-    bootPhase: boot = null,
-    modelActivity = null,
-} = {}) {
-    const view = (kind, text, tone, showDots = false) => ({ kind, text, tone, showDots, dots: tone === 'live' ? 'moving' : tone === 'queued' ? 'still' : 'one' });
-    if (!isConnected) return view('offline', 'Reconnecting…', 'offline');
-    const observed = modelActivity && view(modelActivity.waiting ? 'online' : 'thinking', modelActivity.text, ['unknown', 'queued'].includes(modelActivity.operation) ? modelActivity.operation : modelActivity.waiting ? 'held' : 'live', modelActivity.motion);
-    if (hasActiveLiveCard || activeManagedCount > 0) return (activeManagedCount > 0 && observed) || view('thinking', taskActivityPresentation({ phase: 'working' }).text, 'live', !hasActiveLiveCard);
-    if (pausingManagedCount > 0) return view('thinking', pausePhaseLabel('budget_pausing'), 'held', true); // settling under the owner's Pause
-    if (activeDirectCount > 0) return observed || view('thinking', taskActivityPresentation({ phase: 'working' }).text, 'live', true);
-    if (pendingSubmissionsCount > 0) return view('thinking', tr('task.chip.sending', 'Sending'), 'live', true);
-    if (finalizingCount > 0 || hasFinalizingLiveCard) return view('thinking', taskActivityPresentation({ phase: 'finalizing' }).text, 'live', true);
-    if (waitingModelCount > 0) return view('online', tr('task.chip.waiting_for_access', 'Waiting for access'), 'held');
-    if (queuedManagedCount > 0) return view('thinking', taskActivityPresentation({ phase: 'queued' }).text, 'queued', true);
-    if (waitingOwnerCount > 0) return view('online', tr('task.chip.waiting_for_answer', 'Waiting for your answer'), 'wait');
-    if (unknownActivityCount > 0) return view('online', tr('task.chip.activity_unconfirmed', 'Activity unconfirmed'), 'unknown');
-    if (pausedManagedCount > 0) return view('online', pausePhaseLabel('budget_paused', pausedCause), 'held'); // never claims Running
-    if (projectWaitLabel) return view('online', projectWaitLabel, 'held');
-    if (supervisorStarting) return { ...view('starting', 'Starting…', 'starting'), ...startingStatus(boot) };
-    return view('online', 'Online', 'online');
-}
-
-// Count census activity and unfinished cards; parked/waiting rows retain their own state.
-export function chatStatusCounts(activities, records, isWaiting = () => false) {
-    const counts = { activeDirectCount: 0, activeManagedCount: 0, queuedManagedCount: 0, pausingManagedCount: 0,
-        pausedManagedCount: 0, unknownActivityCount: 0, hasActiveLiveCard: false, waitingModelCount: 0, finalizingCount: 0, hasFinalizingLiveCard: false,
-        projectWaitLabel: '', waitingOwnerCount: 0, pausedCause: '' };
-    const pauseCauses = new Set(), calls = new Map();
-    for (const [id, entry] of activities) {
-        // A Project verification hold is a static wait: never queued or working,
-        // while its pause/pausing/unknown census phase still counts as itself.
-        const projectHold = entry?.project_admission_hold?.label;
-        if (projectHold) counts.projectWaitLabel = projectHold;
-        else if (isWaiting(id)) continue;
-        const waitPhase = activityWaitPhase(entry);
-        if (entry?._activityUnconfirmed || entry?.phase === 'unknown') counts.unknownActivityCount += 1;
-        else if (entry?.phase === 'budget_pausing') counts.pausingManagedCount += 1;
-        else if (entry?.phase === 'budget_paused') { counts.pausedManagedCount += 1; pauseCauses.add(entry.pause_cause || ''); }
-        else if (waitPhase === 'unknown') counts.unknownActivityCount += 1;
-        else if (waitPhase === 'owner_wait') counts.waitingOwnerCount += 1;
-        else if (projectHold) continue;
-        else if (String(entry?.kind || '') !== 'managed_task' && entry?.phase !== 'finalizing') counts.activeDirectCount += 1;
-        else if (String(entry?.phase || '') === 'queued') counts.queuedManagedCount += 1;
-        else counts[String(entry?.phase || '') === 'finalizing' ? 'finalizingCount' : 'activeManagedCount'] += 1;
-        if (!entry?._activityUnconfirmed && ['preparing', 'thinking', 'working'].includes(entry?.phase)
-            && !waitPhase && !projectHold) calls.set(id, modelActivityPresentation(
-                entry.phase === 'preparing' ? { phase: 'preparing' } : entry.model_activity)
-                || (entry.kind !== 'managed_task' ? taskActivityPresentation({ phase: entry.phase }) : null));
-    }
-    if (pauseCauses.size === 1) counts.pausedCause = [...pauseCauses][0];
-    for (const record of records) {
-        if (!isForegroundLiveCard(record)) continue;
-        if (record.projectHold) {
-            counts.projectWaitLabel ||= record.projectHold;
-            continue;
-        }
-        if (activities.get(record.groupId)?.project_admission_hold) continue;
-        if (record.cancelPendingPolicy && calls.has(record.groupId)) calls.set(record.groupId,
-            taskActivityPresentation({ phase: 'working', stopPolicy: record.cancelPendingPolicy }));
-        if (record.modelWaiting) counts.waitingModelCount += 1;
-        else if ((record.finalizingHold || !record.direct) && !record.parkedPhase) counts[record.finalizingHold ? 'hasFinalizingLiveCard' : 'hasActiveLiveCard'] = true;
-    }
-    const views = [...calls.values()];
-    if (views.length && views.length === counts.activeDirectCount + counts.activeManagedCount
-        && views.every(view => view && view.text === views[0]?.text)) counts.modelActivity = views[0];
-    return counts;
 }
 
 /**
@@ -1320,13 +1232,13 @@ export function reconcileHydratedDirectActivities(
 }
 
 /**
- * Card-set durable-truth reconcile (stuck "Working..." pill class). The header
- * reducer reads hasActiveLiveCard — a pure DOM scan of mounted unfinished
- * foreground cards — so a card minted by a replayed frame whose own terminal
- * row never reached this client (lost task_done, lineage-only subagent final
- * re-minting a finished parent) kept the pill on "Working..." forever: every
- * existing terminal path keys on the card's OWN id reaching a snapshot or
- * frame first. This selector closes the gap from the card side: given the
+ * Card-set durable-truth reconcile (stuck "Working..." card class). A card
+ * minted by a replayed frame whose own terminal row never reached this client
+ * (lost task_done, lineage-only subagent final re-minting a finished parent)
+ * kept its chip on "Working..." forever: every existing terminal path keys on
+ * the card's OWN id reaching a snapshot or frame first, and such a card never
+ * sets the room's status (the server's work projection does). This selector
+ * closes the gap from the card side: given the
  * compact card projection `{id, finished, isSubagent, connected}` and the set
  * of ids the GLOBAL /api/state snapshot confirms live, it returns the mounted
  * unfinished foreground card ids the snapshot does NOT vouch for. Each one is

@@ -86,9 +86,19 @@ def _cue(mod, host, client, warnings=None):
                          client_factory=lambda: client, warn=(warnings if warnings is not None else []).append)
 
 
-async def _start(cue):
+async def _until(condition, timeout=2.0):
+    """Wait for what the cue does, not for a guessed pause: its reads hop through a worker thread, which
+    on a coarse timer (Windows ticks about every 15.6 ms) takes longer than any short fixed sleep."""
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "the cue never got there"
+        await asyncio.sleep(0.005)
+
+
+async def _start(cue, until=None):
+    """Start the cue; with ``until``, wait for its first cycle to show it (a read, an action on the wire)."""
     task = asyncio.get_running_loop().create_task(cue.run())
-    await asyncio.sleep(0.01)
+    await (_until(until) if until is not None else asyncio.sleep(0.01))
     return task
 
 
@@ -157,19 +167,18 @@ def test_a_wake_rediscovers_preparation_and_reload_reads_once_at_start(mod):
 
     async def scenario():
         cue = _cue(mod, host, rec)
-        task = await _start(cue)
+        task = await _start(cue, until=lambda: host.reads >= 1)
         assert host.reads == 1 and rec.actions == []
         host.chats = {5}  # e.g. a warm resume: the host now prepares, an event wakes the cue
         cue.wake()
-        await asyncio.sleep(0.05)
-        assert 5 in rec.actions
+        await _until(lambda: 5 in rec.actions)
         await _stop(task)
         reads = host.reads
         cue.wake()  # unloaded: a late wake is a no-op
         await asyncio.sleep(0.05)
         assert host.reads == reads
         fresh, before = _cue(mod, host, rec), len(rec.actions)  # a reload: no event at all
-        task = await _start(fresh)
+        task = await _start(fresh, until=lambda: len(rec.actions) > before)
         assert host.reads > reads and rec.actions[before:] == [5]
         await _stop(task)
 
@@ -265,14 +274,13 @@ def test_a_chat_muted_by_rejection_idles_the_cue_until_a_message_reaches_it(mod)
 
     async def scenario():
         cue = _cue(mod, host, rec)
-        task = await _start(cue)
-        await asyncio.sleep(0.1)
+        task = await _start(cue, until=lambda: rec.actions)
+        await asyncio.sleep(0.1)  # the rejection settles
         reads = host.reads
         await asyncio.sleep(0.2)
         assert host.reads == reads and rec.actions == [9], "a muted-only chat keeps no reader busy"
         await _deliver(cue, 9, rec)  # the bracket wakes the cue after a delivered message
-        await asyncio.sleep(0.05)
-        assert rec.actions.count(9) >= 2
+        await _until(lambda: rec.actions.count(9) >= 2)
         await _stop(task)
 
     asyncio.run(scenario())
@@ -280,19 +288,20 @@ def test_a_chat_muted_by_rejection_idles_the_cue_until_a_message_reaches_it(mod)
 
 def test_a_delivered_message_lets_the_next_read_renew_at_once(mod, monkeypatch):
     """A message clears the chat's indicator on the client: a still-prepared reply gets its
-    action back on the next read instead of a full spacing later; a failed one keeps the spacing."""
-    monkeypatch.setattr(mod, "_REFRESH_SEC", 0.5)
+    action back on the next read instead of a full spacing later; a failed one keeps the spacing.
+    The spacing is far longer than the wait for the renewal, so a cue that waited it out would fail."""
+    monkeypatch.setattr(mod, "_REFRESH_SEC", 5.0)
     host, rec = _Host({4}), _Rec()
 
     async def scenario():
         cue = _cue(mod, host, rec)
-        task = await _start(cue)
+        task = await _start(cue, until=lambda: rec.actions)
         assert rec.actions == [4]
         await _deliver(cue, 4, rec, delivered=False)
         await asyncio.sleep(0.1)
         assert rec.actions == [4], "an undelivered message keeps the per-chat spacing"
         await _deliver(cue, 4, rec)
-        await asyncio.sleep(0.1)
+        await _until(lambda: len(rec.actions) > 1)
         assert rec.calls[-2:] == [("message", 4), ("typing", 4)], rec.calls
         await _stop(task)
 
@@ -306,7 +315,7 @@ def test_an_answer_waits_for_an_in_flight_action_and_is_never_followed_by_one(mo
 
     async def scenario():
         cue = _cue(mod, host, rec)
-        task = await _start(cue)
+        task = await _start(cue, until=lambda: rec.actions)
         assert rec.actions == [4]  # in flight, held by the gate
         answer = asyncio.get_running_loop().create_task(_deliver(cue, 4, rec))
         await asyncio.sleep(0.02)
@@ -327,7 +336,7 @@ def test_no_action_starts_while_a_message_is_on_its_way(mod, monkeypatch):
 
     async def scenario():
         cue = _cue(mod, host, rec)
-        task = await _start(cue)
+        task = await _start(cue, until=lambda: rec.actions)
         async with cue.message(4) as mark:
             before = len(rec.actions)
             for _ in range(5):
@@ -336,7 +345,7 @@ def test_no_action_starts_while_a_message_is_on_its_way(mod, monkeypatch):
             assert len(rec.actions) == before, rec.calls
             rec.calls.append(("message", 4))
             mark()
-        await asyncio.sleep(0.05)
+        await _until(lambda: len(rec.calls) >= 3)
         assert rec.calls[:3] == [("typing", 4), ("message", 4), ("typing", 4)], rec.calls
         await _stop(task)
 
@@ -350,8 +359,10 @@ class _Telegram:
         self.log, self.server = [], threading.Event()
 
     def accepted_after(self, kind):
-        times = {k: t for k, t in self.log}
-        return times.get("accepted") is not None and times["accepted"] > times[kind]
+        """Accepted after ``kind`` by the log's order: two stamps within one tick of the clock compare equal
+        (Python 3.10's monotonic clock ticks every 15.6 ms on Windows)."""
+        kinds = [k for k, _ in self.log]
+        return "accepted" in kinds and kind in kinds and kinds.index("accepted") > kinds.index(kind)
 
     async def send_chat_action(self, chat_id, action="typing"):
         self.log.append(("written", time.monotonic()))
@@ -370,7 +381,7 @@ def test_a_hung_action_delays_the_answer_only_for_the_bound_and_may_still_land_a
     async def scenario():
         cue = mod.TypingCue(read_state=host.read, targets=lambda s: {r["chat_id"] for r in s["chats"]},
                             client_factory=lambda: telegram, warn=lambda _t: None)
-        task = await _start(cue)
+        task = await _start(cue, until=lambda: 4 in cue._inflight)
         inflight = cue._inflight[4]
         host.chats = set()  # the answer was handed off
         started = time.monotonic()
@@ -381,7 +392,7 @@ def test_a_hung_action_delays_the_answer_only_for_the_bound_and_may_still_land_a
         await asyncio.sleep(0)
         assert inflight.cancelled(), "the client stopped waiting for the hung action"
         telegram.server.set()  # Telegram processes the request it already had
-        await asyncio.sleep(0.1)
+        await _until(lambda: any(kind == "accepted" for kind, _ in telegram.log))  # on its own server thread
         assert telegram.accepted_after("message"), "an accepted action after the answer stays possible"
         assert [kind for kind, _ in telegram.log].count("written") == 1, "no new action started after the answer"
         await _stop(task)
@@ -423,7 +434,7 @@ def test_unload_cancels_in_flight_sends(mod):
 
     async def scenario():
         cue = _cue(mod, host, rec)
-        task = await _start(cue)
+        task = await _start(cue, until=lambda: cue._inflight)
         inflight = list(cue._inflight.values())
         assert inflight and not inflight[0].done()
         await _stop(task)

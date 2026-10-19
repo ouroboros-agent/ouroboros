@@ -415,16 +415,6 @@ def _get_task_result(
     except Exception:
         receipts = []
     outcome_summary = _subtask_outcome_summary(data, receipts=receipts)
-    debt = data.get("acceptance_debt")
-    if isinstance(debt, dict) and debt.get("source_ref"):
-        from ouroboros.acceptance_history import historical_source_reference
-
-        summary = json.loads(outcome_summary)
-        summary["acceptance_debt"] = {key: debt.get(key) for key in (
-            "debt_id", "task_id", "accounting_root_task_id", "delivery_status")}
-        summary["acceptance_debt"]["source_ref"] = historical_source_reference(
-            status_drive_root, str(data.get("task_id") or task_id), debt["source_ref"], subject=True)
-        outcome_summary = json.dumps(summary, ensure_ascii=False, indent=2)
     from ouroboros.tools.join_ledger import _child_result_sha256
 
     child_result_sha256 = _child_result_sha256(data)

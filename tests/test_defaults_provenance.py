@@ -115,9 +115,16 @@ def test_an_explicit_route_without_access_stays_unavailable_not_rerouted(install
         assert model_has_credentials("google/gemini-3.8-flash") is False
 
 
-def test_spelling_migration_onto_the_exclusive_provider_is_not_a_generation_replacement(install):
-    _write(install, {"ANTHROPIC_API_KEY": "k", "OUROBOROS_MODEL": "anthropic/claude-opus-4.6"})
-    assert _task_start().settings["OUROBOROS_MODEL"] == "anthropic::claude-opus-4-6"
+@pytest.mark.parametrize("dotted, direct", [("4.6", "4-6"), ("5.5", "5-5")])
+def test_spelling_migration_onto_the_exclusive_provider_is_not_a_generation_replacement(install, dotted, direct):
+    from ouroboros.llm import LLMClient
+
+    _write(install, {"ANTHROPIC_API_KEY": "k", "OUROBOROS_MODEL": f"anthropic/claude-opus-{dotted}"})
+    assert _task_start().settings["OUROBOROS_MODEL"] == f"anthropic::claude-opus-{direct}"
+    assert LLMClient()._resolve_remote_target(f"anthropic::claude-opus-{dotted}")["resolved_model"] == (
+        f"claude-opus-{direct}")
+    assert LLMClient()._resolve_remote_target(f"anthropic/claude-opus-{dotted}")["resolved_model"] == (
+        f"anthropic/claude-opus-{dotted}"), "the router keeps its own slug"
 
 
 def test_saved_blank_light_and_fallbacks_keep_their_meaning_end_to_end(install, monkeypatch):
@@ -561,8 +568,8 @@ def test_the_legacy_openai_compatible_pair_still_routes(monkeypatch):
 
 # --- 1A / A: subscription presets ------------------------------------------------------
 #
-# A partial session refresh: Claude sessions take Opus 5.5, Codex sessions keep gpt-5.6-sol — the
-# installed engine's Codex catalog lists no gpt-6.1-sol, and a preset names exact discovery ids only.
+# A partial session refresh: Claude sessions take Opus 5.5, Codex sessions gpt-6.1-sol when discovered,
+# else gpt-5.6-sol (the installed engine's catalog); a preset names exact discovery ids only.
 
 INSTALLED_CODEX = ("gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini")
 

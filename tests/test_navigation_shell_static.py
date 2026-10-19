@@ -63,7 +63,8 @@ def test_navigation_state_and_mobile_drawer_are_first_class():
     assert "#primary-sidebar.open" in css
     assert ".nav-drawer-backdrop" in css
     assert ".mobile-nav-toggle" in css
-    assert "grid-template-columns: var(--sidebar-width) minmax(0, 1fr);" in css
+    # The sidebar's column follows the sidebar's own box.
+    assert "grid-template-columns: auto minmax(0, 1fr);" in css.split("\n#app {", 1)[1].split("}", 1)[0]
     assert "#app > #divider { display: none; }" in css
     assert "#content {\n    grid-column: 2;" in css
     # One client-side route, read once on load and validated against the DOM
@@ -90,7 +91,7 @@ def test_navigation_state_and_mobile_drawer_are_first_class():
 def test_page_header_is_shared_foundation_for_top_pages():
     header_js = _read("web/modules/page_header.js")
     css = _read("web/style.css")
-    assert "export function renderMobileNavToggle()" in header_js
+    assert "export function renderMobileNavToggle({ inComposer = false } = {})" in header_js  # one ☰, a page's or a room's
     assert "toolbarHtml" in header_js
     assert "trailingHtml" in header_js
     # Actual toolbar class composition/escaping is exercised by page_header.test.js.
@@ -180,7 +181,8 @@ def test_project_panel_composer_and_welcome_contracts():
     assert ".project-panel-backdrop" in css
     assert "transition: transform 180ms ease, opacity 180ms ease;" in css
     assert ".project-panel.open" in css
-    assert "left: var(--sidebar-width);" in css  # sidebar stays clickable under backdrop
+    # The sidebar stays clickable beside the backdrop: docked, the dimmed room is the columns after the sidebar's.
+    assert 'html[data-layout="docked"] .project-panel-backdrop,' in css and "grid-column: 2 / -1;" in css
     assert ".chat-header-actions {\n        display: none;" not in css
     # Gateway Boundary: Turn into project (work_portal.js, the card's move) consumes the endpoint via
     # the api_client wrapper, and the raw route lives in api_client.js (no raw fetch in a chat module).

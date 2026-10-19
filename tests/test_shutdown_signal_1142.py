@@ -199,6 +199,9 @@ def _check_real_shutdown(tmp_path, *, launcher_pipe):
         "OUROBOROS_MODEL": model, "OUROBOROS_MODEL_LIGHT": model, "OUROBOROS_MODEL_FALLBACKS": model,
         "OUROBOROS_MAX_WORKERS": 1,
         "OUROBOROS_RUNTIME_MODE": "light",
+        # A fresh root with a ready provider runs the starter installer at boot; an explicit empty
+        # list keeps it from cloning the skill sources from GitHub and installing skills mid-test.
+        "OUROBOROS_STARTER_SKILLS": "[]",
     }), encoding="utf-8")
     # An owner chat is bound, so the false alarm WOULD be written if the crash counter fired.
     from devtools.benchmarks.common.server_runner import seed_owner_state

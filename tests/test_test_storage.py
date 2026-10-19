@@ -79,8 +79,9 @@ def test_arbitrary_unique_command_content_and_debug_are_not_declared_garbage(tmp
 
 def test_explicit_env_keeps_outer_containment_membership(monkeypatch):
     from tests.conftest import _isolated_child_env
-    monkeypatch.setenv("OURO_PROC_CONTAINER_outer_probe", "1")
-    assert _isolated_child_env({})["OURO_PROC_CONTAINER_outer_probe"] == "1"
+    # Upper case: Windows stores every environment name upper-cased.
+    monkeypatch.setenv("OURO_PROC_CONTAINER_OUTER_PROBE", "1")
+    assert _isolated_child_env({})["OURO_PROC_CONTAINER_OUTER_PROBE"] == "1"
     assert _isolated_child_env({"OUROBOROS_TEST_EVIDENCE_ROOT": "/selected"})["OUROBOROS_TEST_EVIDENCE_ROOT"] == "/selected"
 
 
@@ -189,8 +190,9 @@ def test_evidence_failure_retains_source_without_changing_test_verdict(tmp_path,
     assert 'PREFLIGHT_EVIDENCE_INCOMPLETE' in text
     # The retained worktree is discoverable through Git as well as the marker.
     worktrees = subprocess.check_output(['git', 'worktree', 'list', '--porcelain'], cwd=repo, text=True)
-    scratch = [Path(line.removeprefix('worktree ')) for line in worktrees.splitlines()
-               if line.startswith('worktree ') and line != 'worktree ' + str(repo)]
+    # Git prints C:/... on Windows: compare the resolved paths, never the spellings.
+    scratch = [path for path in (Path(line.removeprefix('worktree ')) for line in worktrees.splitlines()
+                                 if line.startswith('worktree ')) if path.resolve() != repo.resolve()]
     assert len(scratch) == 1 and (scratch[0].parent / 'OUROBOROS_RETAINED.txt').is_file()
     # Synthetic negative cleanup after asserting process outcome and preserving
     # its complete source/logs. This test alone created this exact registration.
@@ -282,12 +284,13 @@ def test_stdlib_launcher_refuses_pending_adoption_before_package_import(tmp_path
 def test_nested_safe_test_retains_inner_evidence_after_outer_release(tmp_path):
     probe = tmp_path / 'probe'
     probe.mkdir()
+    temp_parent = '/tmp' if os.name == 'posix' else str(tmp_path)
     (probe / 'test_nested.py').write_text(f'''import os, subprocess, sys
 from pathlib import Path
 
 def test_nested():
     run = subprocess.run([sys.executable, '-I', '-S', {str(REPO / 'scripts/safe_test.py')!r},
-        '--temp-parent', '/tmp', '--', sys.executable, '-c', 'print("INNER_EVIDENCE_TAIL")'],
+        '--temp-parent', {temp_parent!r}, '--', sys.executable, '-c', 'print("INNER_EVIDENCE_TAIL")'],
         capture_output=True, text=True, timeout=60)
     assert run.returncode == 0, run.stderr
     print(run.stderr, flush=True)

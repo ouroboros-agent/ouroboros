@@ -157,9 +157,9 @@ def test_exceptions_are_counted_and_stale_rows_fail():
 # typed annotation on it, and a landed act publishes no row. A standalone System row exists only
 # where nothing else can carry the fact. Each literal host type: (class, number of producer sites).
 # Two types are mixed and disclosed: `deep_self_review_queued` also echoes the model's own request,
-# `skill_repair` also the host's automatic repair after a marketplace install.
+# `skill_repair` also the host's automatic repair after a marketplace install. Nothing produces an
+# `acceptance_late_settlement` row since the review fold; the old rows still render as card rows.
 HOST_ROW_CLASSES = {
-    "acceptance_late_settlement": ("card_row", 1),
     "budget_notice": ("runtime_state", 1),
     "call_heard": ("signed_words", 1),  # heard meeting speech, never attributed to the owner
     "cancel_receipt": ("owner_act_receipt", 2),

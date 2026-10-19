@@ -42,8 +42,9 @@ explicit work-order review obligations.
   index, syntax of staged `.py` files), the tests preflight under its own policy
   (`skip_tests` is the one exemption, a documentation-only diff included; a
   managed resolution always runs it; a matching unsigned receipt of a complete run
-  counts), then the named row's look, then ONE review wave in which every pool seat,
-  shown the same test execution fact, answers both parts of the brief. The commit
+  counts), then the named row's look, then ONE review wave in which every seat on the panel (every pool
+  seat under Blocking; the pool seats Ouroboros named with a reason under
+  Advisory), shown the same test execution fact, answers both parts of the brief. The commit
   records its preflight fact: `performed` with the record id, `skipped` for an
   explicit `skip_advisory_review=True`, `not_performed` when no row was named.
   `preflight_reviewer` and `skip_advisory_review=True` are opposite choices
@@ -64,8 +65,8 @@ explicit work-order review obligations.
   missing advisory provider) leaves a durable trace: a `review_advisory_override`
   event in `events.jsonl` plus the persistent `advisory_overrides_count` /
   recent-overrides fields in `review_status`. Silent advisory is forbidden.
-- **Author finality remains evidence, not reviewer PASS:** task acceptance,
-  skill, and commit owners may record an explicit author disposition against the
+- **Author finality remains evidence, not reviewer PASS:** the authors of a task
+  result, a skill and a commit may record an explicit author disposition against the
   exact current subject after received feedback or a disclosed unavailable review under Advisory.
   Advisory and Cyber commit outcomes return before Git; explicit continuation uses
   the returned `review_reference` and author disposition, with independent current
@@ -85,8 +86,9 @@ explicit work-order review obligations.
   feedback can support Advisory choice without cancelling the other actors.
   Main judges semantic criteria and material evidence after acknowledging the
   observed owner source; source generation alone is not semantic supersession.
-  Historical feedback remains independently addressable. For Main's acceptance
-  decision, a queued outcome or predeclared stance is not proof of exposure.
+  Historical feedback remains independently addressable. For Main's finish over a
+  result review's findings, only findings actually shown to it count; a queued
+  outcome is not proof of exposure.
 **Obligation tracking:**
 - Every blocked `commit_reviewed` verdict mints "open obligations" — a structured
   list of the unresolved findings, synthesized to canonical issues
@@ -411,7 +413,7 @@ Ownership` section is delivered beside them.
 | 17 | evolution_durability | If the diff can change how self-modification is tested, committed or interrupted (preflight, commit, restart and reset paths, evolution scheduling, tests): do tests and preflight never mutate the live repository or live `data/`, does a local commit succeed without a remote, and does interrupted self-modification end in a reviewed commit or a preserved rescue/transaction pointer? | critical |
 | 18 | context_budget_ssot | If the diff changes context budgets, the context layout or a section's tier, or the ContextFit deficit/reclaim contract: is there still one budget SSOT that both context profiles, the docs and the drift-guard tests read; does the always-full core (BIBLE, SYSTEM, identity, scratchpad, marks) stay in view in every mode, with the knowledge index resident whole or as its outline (every active note named, people's summaries kept) and the sealed story resident; does only the physical window turn content into addresses — people's words last (ARCHITECTURE `memory_floor.py`, §6 "Context fitting") — with every degraded span named by a visible on-demand pointer (P1), and does an owner-selected smaller target bound host material only; and does the coupling question stay independent of the context mode (coupling the two is an immune-system change under P3)? Outside Cyber Pro the owner selects the context mode. (PASS with "Not applicable" if no context-budget/layout change.) | critical |
 | 19 | delegated_transport | If the diff touches delegated execution or review transport (ARCHITECTURE §6 "Delegated subagents" and the session executors of `review_execution.py`, matched by role, not by a file list): (a) does the exact selected `subagent_id` route start with custody-durable requested→effective evidence, or return a typed refusal — never a host-chosen substitute, any fallback being a new explicit LLM choice? (b) does a capability reduction reach the durable envelope, the child prompt and the parent result? (c) is a result received only after a hash-bound read to EOF, and does a retry replay the recorded bytes? (d) is quota exhaustion judged only on positive evidence for the route's own model (unknown stays usable), and does spend settle through custody with root/parent lineage, unknown never shown as zero? (e) does the work order carry the complete assignment and host authority once, with no arbitrary size cap, compulsory file/question transport or duplicate objective, do plan normalization and reviewer inputs keep full content and tail-sensitive identity, and do real route limits keep the original input, cause and execution state? (f) does a legacy partial request stay recoverable byte-for-byte (exact selector, digest and range validation, durable source coverage) and refuse apply until complete, with reject still available? No vendor or harness name is branched on in core; source availability never proves reading. (PASS with "Not applicable" if no delegated-transport surface changed.) | critical |
-| 20 | source_completeness | Partial views and source truth: if the diff adds or changes a bounded view (projection, summary, omission marker, status count) or review evidence (plan, change review, preflight, acceptance): (a) does every cut say so in band — a marker naming what was cut and a reference to the existing file, blob, record or range the deciding actor can still open after the real merge, promotion and cleanup? A new store, copy or sidecar is not required when such a reference exists; (b) does a consumer that can authorize PASS, a destructive rewrite or replacement of a full contract read the named sources first, or abstain with the existing typed incomplete/degraded outcome? A marker or host claim alone is never sufficient; (c) do review records keep exact artifact bodies and source selectors, candidate SHA, reviewer route continuity and every omission, with continuity, transport and coverage discrepancies as typed facts beside them, so a failed or truncated delivery stays DEGRADED/NOT_RUN rather than PASS? File-read coverage is diagnostic (BIBLE P3), never a reason to discard a received verdict or drop its reviewer from quorum; no disclosure discards, blanks or relabels a body or its cause. | critical when applicable |
+| 20 | source_completeness | Partial views and source truth: if the diff adds or changes a bounded view (projection, summary, omission marker, status count) or review evidence (plan, change review, preflight, result review): (a) does every cut say so in band — a marker naming what was cut and a reference to the existing file, blob, record or range the deciding actor can still open after the real merge, promotion and cleanup? A new store, copy or sidecar is not required when such a reference exists; (b) does a consumer that can authorize PASS, a destructive rewrite or replacement of a full contract read the named sources first, or abstain with the existing typed incomplete/degraded outcome? A marker or host claim alone is never sufficient; (c) do review records keep exact artifact bodies and source selectors, candidate SHA, reviewer route continuity and every omission, with continuity, transport and coverage discrepancies as typed facts beside them, so a failed or truncated delivery stays DEGRADED/NOT_RUN rather than PASS? File-read coverage is diagnostic (BIBLE P3), never a reason to discard a received verdict or drop its reviewer from quorum; no disclosure discards, blanks or relabels a body or its cause. | critical when applicable |
 | 21 | canonical_memory_fork | If the diff touches Project/fork/execution roots, summaries, memory, or GC, does it preserve one canonical identity and distinguish authority/biography from execution-local state? Are referenced canonical artifacts promoted or retained before a child/root is collected, with missing legacy bytes represented as gaps? | critical when applicable |
 | 22 | context_building | Context inputs: does a new data/memory file that should reach LLM context appear there (`context.py`), and does a changed knowledge-base topic update `memory/knowledge/index-full.md`? | advisory |
 | 23 | gateway_parity | If the diff changes any browser-facing endpoint, WebSocket message, or frontend API call, are `ouroboros/gateway/contracts.py`, `ouroboros/gateway/router.py`, `web/modules/api_client.js`, `web/modules/api_types.js`, and `tests/test_gateway_parity.py` still aligned? Missing alignment is advisory unless it also breaks a frozen contract, safety guard, release metadata, or runtime behavior. | advisory |
@@ -700,7 +702,7 @@ review wave, both parts, still runs.
 Self-authored skills carry payload-local `.self_authored.json` and
 owner-state `data/state/skills/<skill>/self_authored.json` provenance,
 but outside Cyber Pro they do not bypass review on the agent's own initiative. `skill_review` routes them
-through the same tri-model skill review as marketplace and user-managed
+through the same review-pool skill review as marketplace and user-managed
 skills; no deterministic PASS or enablement is written automatically.
 EXCEPTION (owner attestation, "Skip review" / "Turn on anyway"): the OWNER may skip the
 LLM review for the exact bytes of a skill from any origin via the owner-only
@@ -933,7 +935,7 @@ without the audit record).
 
 ### Skill review vs. repo review
 
-These are **separate surfaces** with separate models, prompts, and state:
+These are **separate surfaces** with separate prompts and state, drawn from the same review pool:
 
 - Repo review (the review pool's one wave, both parts, plus any preflight)
   protects the self-modifying `~/Ouroboros/repo/`. Its attempt state lives in
@@ -984,7 +986,7 @@ goal · done_when[] {id, claim, support} · affected_paths[] (files the work wil
 plan (prose: the reading of the ask and its bar, approach, constraints, decisions that are
       expensive to reverse with their alternatives, risks)
 ```
-`done_when` is what acceptance will judge: each `claim` an observable outcome, its `support` how it
+`done_when` is what the task's result review will judge: each `claim` an observable outcome, its `support` how it
 will be shown (run a check, inspect the artifact, a judgment and by whom). Ids are the mind's and
 stay stable across revisions.
 
@@ -1040,6 +1042,30 @@ Nobody votes, and whether an open objection holds is the host's fact, not part o
   is an objection only when leaving it open is expensive to reverse.
 - A plan with no file paths at all (a trip, a deck, a research question) is a first-class subject:
   the same questions apply, and repository conventions are irrelevant to it.
+
+---
+
+## Result Review Checklist
+
+Used by `review_change(subject="result")`: the mind asks for it, and under task review Required the host
+asks for it at a root delivery whose result carries produced work; task review Off refuses it. You review
+the RESULT of one task, not a code change. The host builds the subject, frozen at the call, in four parts:
+what was asked (the task, its owner's words and the claims it was held to, the latest accepted plan's
+`done_when` among them), the reply the task gives, what the task produced (files and effects, named by path
+and content hash) and the host-attested verification receipts.
+
+**One question: does this result do what was asked?**
+- Judge the result, never the method: how the work was done is not under review.
+- A partial result that says plainly what it did not do is honest, not a defect. A result that silently
+  narrows what was asked, claims what it did not do, or contradicts its own material is a defect.
+- Read the produced files you can reach; a claim about a file must match its content.
+- A finding names the concrete gap, where it is, and what would close it.
+
+### Severity rules
+
+- **critical** — the result fails what was asked or misstates what it delivers, so it should not be
+  delivered as it is.
+- **advisory** — a real improvement that does not block delivery.
 
 ---
 

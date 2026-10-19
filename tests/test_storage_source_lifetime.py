@@ -95,8 +95,8 @@ def test_atomic_record_keeps_prior_bytes_on_failed_publication(tmp_path, monkeyp
 
 @pytest.mark.parametrize('outcome', ['raised', 'gap'])
 def test_failed_source_export_retains_untested_source(tmp_path, monkeypatch, capsys, outcome):
-    import shutil
     from ouroboros import preflight_runner, test_evidence
+    from ouroboros.force_remove import force_rmtree
     from tests.test_test_storage import _repo
     envelope = tmp_path / 'envelope'
     envelope.mkdir()
@@ -124,9 +124,11 @@ def test_failed_source_export_retains_untested_source(tmp_path, monkeypatch, cap
     assert (envelope / 'OUROBOROS_RETAINED.txt').is_file()
     subprocess.run(['git', 'worktree', 'remove', '--force', str(scratch / 'repo')], cwd=repo, check=True)
     # No lane started. These exact synthetic roots have no worker/descendant;
-    # all failed-export metadata is already outside them.
-    shutil.rmtree(scratch)
-    shutil.rmtree(envelope)
+    # all failed-export metadata is already outside them. The source's Git objects
+    # are read-only, which a plain rmtree cannot delete on Windows.
+    for root in (scratch, envelope):
+        force_rmtree(root)
+        assert not root.exists(), root
 
 
 def test_debug_retention_keeps_real_test_verdict(tmp_path, monkeypatch, capsys):

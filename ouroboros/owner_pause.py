@@ -184,15 +184,11 @@ def _resume_outstanding(current: Dict[str, Any], fence: Dict[str, Any]) -> bool:
     (``reopen_for_resume``); that grant would release whatever shares its fence.
     """
     from ouroboros.budget_pause import STATE_RESUME_GRANTED, STATE_RESUMED
-    from ouroboros.post_task_checkpoint import late_phase_pause_record
 
     row = current.get("budget_pause") if isinstance(current.get("budget_pause"), dict) else {}
     grant = row.get("grant") if isinstance(row.get("grant"), dict) else {}
-    late = late_phase_pause_record(current).get("grant") or {}
-    return bool(fence.get("fence_id") and (
-        grant.get("owner_pause_fence_id") == fence["fence_id"]
-        and not grant.get("revoked_at") and row.get("state") in {STATE_RESUME_GRANTED, STATE_RESUMED}
-        or late.get("fence_id") == fence["fence_id"] and not late.get("revoked_at")))
+    return bool(fence.get("fence_id") and grant.get("owner_pause_fence_id") == fence["fence_id"]
+                and not grant.get("revoked_at") and row.get("state") in {STATE_RESUME_GRANTED, STATE_RESUMED})
 
 
 def install_fence(root_drive: Any, root_task_id: str, *, request_id: str,
@@ -208,11 +204,11 @@ def install_fence(root_drive: Any, root_task_id: str, *, request_id: str,
     retry's ``actor_id`` is revalidated under the logical launch lock; its
     physical row carries the grant, while the fence stays on the logical root. A
     terminal root refuses: a finished tree has nothing to pause — unless its
-    answered task still owns late work (D10): an open post-task checkpoint
-    read under this lock, or a live review operation the caller attests
-    (``late_work``). Raises ``OwnerPauseRefused`` without any write on
-    refusal; any write failure propagates, so the caller never acknowledges
-    an undurable Pause.
+    answered task still owns late work: an open post-task checkpoint read
+    under this lock (the Pause ends that upkeep at once), or a live review
+    operation the caller attests (``late_work``). Raises
+    ``OwnerPauseRefused`` without any write on refusal; any write failure
+    propagates, so the caller never acknowledges an undurable Pause.
     """
     from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
     from ouroboros.task_results import (
@@ -360,11 +356,6 @@ def reopen_for_resume(root_drive: Any, root_task_id: str, task_id: str, *,
             if not fence_closed(current) or current.get("supersedes_fence_id") != fence_id:
                 raise ValueError("owner_pause_fence_changed")
         elif root_actor(root_drive, root_task_id, task_id):
-            if fence_closed(current):
-                # One root Resume restores every saved unsent owner before opening
-                # their shared fence, including acceptance beside post-task work.
-                from ouroboros.acceptance_late import resume_paused_acceptance_preparations
-                resume_paused_acceptance_preparations(root_drive, root_task_id, current)
             try:
                 release_fence(root_drive, root_task_id, reason="owner_resume_consumed")
             except StoreBusy as exc:
@@ -377,9 +368,9 @@ def reopen_for_resume(root_drive: Any, root_task_id: str, task_id: str, *,
 
 def _finish_resume_publication(root_drive: Any, root_task_id: str, task_id: str, fence_id: str, grant_id: str,
                                error: StoreBusy | LaunchBusy) -> None:
-    """Retry only the root fence write after preparation handoff, outside its lock.
+    """Retry only the root fence write, outside its lock.
 
-    The preparation is already owned and must never restart here. Each try
+    Nothing the Resume already started restarts here. Each try
     rechecks the physical actor's grant under its logical root lock; unknown
     rollback or the existing STORE_WAIT_SEC physical acquisition bound leaves
     the caller's hold intact; no task/review lifetime is extended.
@@ -387,7 +378,6 @@ def _finish_resume_publication(root_drive: Any, root_task_id: str, task_id: str,
     from ouroboros.store import STORE_WAIT_SEC
     from ouroboros._usage_wait import ACQUISITION_SLICE_SEC
     from ouroboros.cancel_intents import _validated_single_cancel_target, cancel_pending
-    from ouroboros.post_task_checkpoint import late_phase_pause_record
     from ouroboros.task_results import load_task_result
 
     started = time.monotonic()
@@ -409,10 +399,9 @@ def _finish_resume_publication(root_drive: Any, root_task_id: str, task_id: str,
                 if task_id != root_task_id and _validated_single_cancel_target(root_drive, root_task_id) != task_id:
                     raise OwnerPauseRefused("root_resume_authority_changed")
                 row = load_task_result(root_drive, task_id, strict=True) or {}
-                grants = (((row.get("budget_pause") or {}).get("grant") or {}, "owner_pause_fence_id"),
-                          (late_phase_pause_record(row).get("grant") or {}, "fence_id"))
-                if not grant_id or not any(grant.get("grant_id") == grant_id and grant.get(key) == fence_id
-                                            and not grant.get("revoked_at") for grant, key in grants):
+                grant = (row.get("budget_pause") or {}).get("grant") or {}
+                if (not grant_id or grant.get("grant_id") != grant_id
+                        or grant.get("owner_pause_fence_id") != fence_id or grant.get("revoked_at")):
                     raise OwnerPauseRefused("root_resume_authority_changed")
                 if (any(cancel_pending(root_drive, member, strict=True) for member in {root_task_id, task_id})
                         or row.get("status") == "cancelled"):
@@ -562,7 +551,7 @@ def admit_delegated_start(drive_root: Any, payload: Dict[str, Any]) -> bool:
     from ouroboros._usage_wait import retry_presend
     from ouroboros.delegate_custody import emit, START_REQUESTED
     from ouroboros.model_wait import current_model_wait
-    from ouroboros.usage_admission import effective_billing_fields, task_billing_fields
+    from ouroboros.usage_admission import task_billing_fields
     from ouroboros.utils import utc_now_iso
 
     source = SimpleNamespace(drive_root=drive_root, task_id=str(payload.get("task_id") or ""),
@@ -578,8 +567,7 @@ def admit_delegated_start(drive_root: Any, payload: Dict[str, Any]) -> bool:
     elif bound is not None and bound.non_task_operation is True and str(bound.root_task_id or "") == source.root_task_id:
         binding = {"billing_group_id": source.root_task_id, "billing_group_limit_usd": None}
     else:
-        binding = effective_billing_fields(drive_root, source.root_task_id,
-            task_billing_fields({"id": source.task_id}, source.root_task_id, None, drive_root))
+        binding = task_billing_fields({"id": source.task_id}, source.root_task_id, None, drive_root)
     payload = {"ts": utc_now_iso(), "event_id": uuid.uuid4().hex, **payload}
     payload["billing_group"] = {k: v for k, v in binding.items() if k.startswith("billing_group_")}
     retrying = False

@@ -68,15 +68,23 @@ def conversation(root):
     return room
 
 
+def _unrooted(text, root):
+    # The v2 event id is a JSON array naming the root, so there the root is JSON-escaped:
+    # a Windows root's backslashes are doubled.
+    for spelling in (json.dumps(str(root))[1:-1], str(root)):
+        text = text.replace(spelling, "<root>")
+    return text
+
+
 def _normalize(value, root):
     if isinstance(value, list):
         return [_normalize(item, root) for item in value]
     if isinstance(value, dict):
-        return {key.replace(str(root), "<root>"): "<chain witness>" if key == "chain" else
+        return {_unrooted(key, root): "<chain witness>" if key == "chain" else
                 "<root-dependent view>" if key == "view" and value.get("v") == 2 else _normalize(item, root)
                 for key, item in value.items()}
     if isinstance(value, str):
-        return re.sub(r"snapshot=[0-9a-f]{64}", "snapshot=<snapshot>", value.replace(str(root), "<root>"))
+        return re.sub(r"snapshot=[0-9a-f]{64}", "snapshot=<snapshot>", _unrooted(value, root))
     return value
 
 

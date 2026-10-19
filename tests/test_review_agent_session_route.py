@@ -48,9 +48,13 @@ from tests._review_session_route_shared import (
 # ---------------------------------------------------------------------------
 
 
-def test_schema_conformant_clean_verdict_survives(tmp_path, fake_route):
+@pytest.mark.parametrize("elapsed_before_dispatch", [0, 2])
+def test_schema_conformant_clean_verdict_survives(tmp_path, fake_route, monkeypatch, elapsed_before_dispatch):
     """The full clean path: schema asked, conformance passed, empty findings —
     the actor's raw text is the bare `[]` the constitutional predicate accepts."""
+    # Account for time before dispatch deterministically; runner load is not a route failure.
+    monkeypatch.setattr("ouroboros.review_custody.monotonic_now", lambda *_args: 1_000.0)
+    monkeypatch.setattr("ouroboros.review_execution.monotonic_now", lambda: 1_000.0 + elapsed_before_dispatch)
     llm = FakeLLM()
     result = run_review_request(_agent_request(), slots=[_agent_slot()],
                                 drive_root=tmp_path, llm=llm)
@@ -67,8 +71,7 @@ def test_schema_conformant_clean_verdict_survives(tmp_path, fake_route):
     assert start["access"] == "readonly" and start["mode"] == "ask"
     assert start["primaryHarness"] == "fake-review"
     assert start["model"] == "fake-small" and start["effort"] == "low"
-    # Remaining-horizon rounding may add one second on a coarse Windows clock.
-    assert 30 <= start["maxSeconds"] <= 31
+    assert start["maxSeconds"] == 30 - elapsed_before_dispatch
     assert "unwrapped substantive deliverable" in start["prompt"]
     # The manifest declared a non-interactive structured-output transport, so
     # the schema was asked on the EFFECTIVE route (D19).

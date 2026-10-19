@@ -78,7 +78,7 @@ from typing import Any, Callable, ContextManager, Dict, Iterator, List, Optional
 from ouroboros.task_results import load_task_result, validate_task_id, write_task_result
 from ouroboros.utils import utc_now_iso
 from ouroboros.owner_mailbox import _mailbox_path, _MAILBOX_DIR as _OWNER_MAILBOX_DIR
-from ouroboros.store import StoreError
+from ouroboros.store import StoreBusy, StoreError, close_connections_under
 
 log = logging.getLogger(__name__)
 
@@ -1117,7 +1117,7 @@ def _recheck_occupant(canonical: pathlib.Path, drive: pathlib.Path, prepared: Di
 # (a live or unknown owner, a busy lock, a closed generation, a race, an unreadable row, an
 # I/O error) is attempted again on the next pass.
 TRANSIENT_RETENTIONS = frozenset({"liveness_unknown", "task_live", "generation_closed", "custody_busy",
-                                   "mailbox_busy", "canonical_changed", "drive_occupant_changed",
+                                   "mailbox_busy", "store_busy", "canonical_changed", "drive_occupant_changed",
                                    "call_inventory_changed", "task_result_unreadable"})
 
 
@@ -1233,6 +1233,10 @@ def settle_child_drive(canonical_root: Any, task_id: str, drive: Any, *, live: O
                     _recheck_occupant(canonical, drive, item)
                 trash = canonical / _TRASH_DIR / f"{tid}-{uuid.uuid4().hex[:12]}"
                 trash.parent.mkdir(parents=True, exist_ok=True)
+                try:  # this pass itself read the drive's store; Windows moves no folder with an open file
+                    close_connections_under(base)
+                except StoreBusy as exc:
+                    raise _Retained("store_busy") from exc
                 os.replace(base, trash)
         outcome.update(status="removed")  # the moved drive is deleted by the maintenance child (remove_custody_trash)
     except _Retained as retained:
@@ -1282,7 +1286,7 @@ def sweep_custody_leftovers(canonical_root: Any, *, min_age_sec: float = 3600.0)
 
 
 def custody_trash_entries(canonical_root: Any) -> List[Tuple[str, List[int]]]:
-    """``(name, identity)`` of each drive a settlement moved aside (one directory read)."""
+    """``(name, identity)`` of each drive a settlement moved aside (one directory read, an ``lstat`` each)."""
     root = pathlib.Path(canonical_root) / _TRASH_DIR
     entries: List[Tuple[str, List[int]]] = []
     try:
@@ -1291,7 +1295,7 @@ def custody_trash_entries(canonical_root: Any) -> List[Tuple[str, List[int]]]:
         with os.scandir(root) as listing:
             for entry in listing:
                 with contextlib.suppress(OSError):
-                    stat = entry.stat(follow_symlinks=False)
+                    stat = os.lstat(entry.path)  # remove_custody_trash's identity, not a Windows listing's copy
                     entries.append((entry.name, [stat.st_ino, stat.st_mtime_ns]))
     except (FileNotFoundError, NotADirectoryError):
         pass
@@ -1300,9 +1304,9 @@ def custody_trash_entries(canonical_root: Any) -> List[Tuple[str, List[int]]]:
 
 def remove_custody_trash(canonical_root: Any, *, stop: Optional[Callable[[], bool]] = None) -> Dict[str, Any]:
     """Delete the drives settlements moved aside: each was fully custodied before its move, and
-    nothing serves or references it, so no age or liveness applies. The maintenance child runs
-    this, off the serving process. Returns the count removed and each entry that survived its
-    removal (``name -> identity``: it waits for that identity to change)."""
+    nothing serves or references it, so no age or liveness applies. The maintenance child runs this,
+    off the serving process. Returns the count removed and each entry that survived its removal
+    (``name -> identity``; the child retries it at its next run, a changed identity makes the job due)."""
     report: Dict[str, Any] = {"removed": 0, "stuck": {}}
     root = pathlib.Path(canonical_root) / _TRASH_DIR
     try:

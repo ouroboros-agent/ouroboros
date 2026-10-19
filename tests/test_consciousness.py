@@ -241,10 +241,12 @@ def test_inventory_source_failure_never_advances_accepted_boundary(clock, monkey
 
 
 @pytest.mark.parametrize('version', [1, 2])
-def test_inline_inventory_migrates_and_retains_closed_task_late_review(clock, version):
+def test_inline_inventory_migrates_to_the_source_bound_transitions(clock, version):
+    """A v1 inline inventory migrates to the v2 source-bound record (a late-review wake of a
+    closed task left with the acceptance machine; the migration stays)."""
     from ouroboros import consciousness_wake as wake
     from ouroboros.consciousness import OBSERVATION_STATE_KEY
-    from tests.test_consciousness_wake import _late_panel, _write
+    from tests.test_consciousness_wake import _write
 
     _write(clock.root, 'old', status='completed', ts=_iso(T0 - 86400))
     prior = wake.observe_wake(clock.root, boundary=None, since=T0 - 10, now=T0).boundary
@@ -255,13 +257,6 @@ def test_inline_inventory_migrates_and_retains_closed_task_late_review(clock, ve
     assert ('task old completed' in clock.launches[-1]['text']) is (version == 1)
     accepted = clock.store[OBSERVATION_STATE_KEY]['transitions']
     assert set(accepted) == {'version', 'source_ref'} and accepted['version'] == 2
-    projection, _ref = _late_panel(clock.root, 'old', settled_at=T0 - 70000)
-    _write(clock.root, 'old', review_projection=projection)
-    for index in (2, 3):
-        clock.receipt['task_id'] = f'wake000{index}'
-        clock.clock._next_wake_at = T0 + index * FLOOR
-        assert clock.clock.tick(T0 + index * FLOOR) == 'launched'
-        assert ('late review settled for task old' in clock.launches[-1]['text']) is (index == 2)
 
 
 @pytest.mark.parametrize('failure', ['write', 'readback', 'bootstrap_write'])

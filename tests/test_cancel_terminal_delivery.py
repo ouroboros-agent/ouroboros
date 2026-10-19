@@ -149,12 +149,12 @@ def test_completed_outcome_reads_as_result_not_salvage(tmp_path):
     queue = _CaptureQueue()
     td.deliver_unreviewed_salvage(
         tmp_path, {"chat_id": 3}, "task-b",
-        outcome="completed before the cancellation (result preserved)",
+        outcome="completed before the stop (result preserved)",
         salvaged_text="the finished answer", settled_status="completed",
         event_queue=queue,
     )
     (event,) = queue.events
-    assert event["text"].startswith("✅ Task task-b completed before the cancellation")
+    assert event["text"].startswith("✅ Task task-b completed before the stop")
     assert "WITHOUT review" not in event["text"]
 
     # Prose that merely STARTS with "completed" no longer forges the ✅ frame:
@@ -338,7 +338,7 @@ def test_finalize_on_miss_delivers_the_unreviewed_salvage(qenv, monkeypatch):
     assert qenv.tl.cancel_task_custody("miss-del") == qenv.tl.CANCEL_CANCELLED
     (row,) = delivered
     assert row["task_id"] == "miss-del"
-    assert row["outcome"] == "cancelled"
+    assert (row["outcome"], row["settled_status"]) == ("stopped", "cancelled")
 
 def test_finalize_on_miss_completion_wins_delivers_the_completed_result(qenv, monkeypatch):
     """AR2-5b: the completion-wins branch of the miss lane delivers the KEPT
@@ -457,7 +457,7 @@ def test_one_cancel_leaves_exactly_one_salvaged_paragraph_in_the_chat(tmp_path, 
     assert f"{SALVAGE_EXCERPT_LABEL}." in row["text"]
     assert salvage not in row["text"]
     assert "get_task_result" not in row["text"]
-    assert row["text"].startswith("Cancelled. Root task stopped-one.")
+    assert row["text"].startswith("Stopped. Root task stopped-one.")
 
 
 @pytest.mark.serial
@@ -707,10 +707,10 @@ _UNREVIEWED_LEAD = (" Below is the last persisted intermediate model message, pr
 
 @pytest.mark.parametrize("files", ["none", "present", "unknown"])
 @pytest.mark.parametrize("settled,outcome,salvage", [
-    ("cancelled", "cancelled", "partial draft of the report"),
-    ("cancelled", "cancelled", ""),
-    ("completed", "completed before the cancellation (result preserved)", "the finished answer"),
-    ("completed", "completed before the cancellation (result preserved)", ""),
+    ("cancelled", "stopped", "partial draft of the report"),
+    ("cancelled", "stopped", ""),
+    ("completed", "completed before the stop (result preserved)", "the finished answer"),
+    ("completed", "completed before the stop (result preserved)", ""),
 ])
 def test_cancel_receipt_promises_a_preview_only_when_it_carries_one(tmp_path, settled, outcome, salvage, files):
     """#1403: the framing promises a message "below" only when the receipt carries one. A

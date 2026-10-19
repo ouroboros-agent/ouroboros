@@ -1098,7 +1098,7 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
             created = _api(args.ouroboros_url, "POST", "/api/tasks", {
                 "description": prompt, "memory_mode": "empty",
                 "disabled_tools": _effective_disabled_tools(args.allow_a11y),
-                # The task-acceptance panel already runs on every OSWorld task and was, until now,
+                # Required mode runs a result review on every OSWorld task, and its panel was once
                 # given no criteria at all (acceptance_claims was [] on all 361 tasks of the
                 # v6.81.0 run while the panel returned clean_pass on 324 of them). These four
                 # claims cost no extra model call: they tell the reviewer that already runs what

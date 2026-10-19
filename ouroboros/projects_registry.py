@@ -111,6 +111,7 @@ def _load(drive_root: Any, *, strict: bool = False,
         except (TypeError, ValueError):
             row["visible_revision"] = 0
         row["delete_error"] = str(row.get("delete_error") or "")
+        row["pinned"] = row.get("pinned") is True
     return data
 
 
@@ -992,6 +993,7 @@ def create_project(
             "routing_generation": 0,
             "routing_incarnation": uuid.uuid4().hex,
             "visible_revision": 0,
+            "pinned": False,
             "delete_error": "",
         }
         data["projects"].append(entry)
@@ -1015,7 +1017,7 @@ def update_project(
     if not pid:
         return None
     allowed = {
-        "name", "working_dir", "last_active_at", "provenance", "clone_url", "trusted_at",
+        "name", "pinned", "working_dir", "last_active_at", "provenance", "clone_url", "trusted_at",
         # Retained legacy activity fact; current activity comes from dialogue rooms.
         "thread_activity_seen",
         # Durable pointer to the project's newest finalized task result
@@ -1036,6 +1038,8 @@ def update_project(
                     continue
                 if key == "name":
                     value = _validated_name(value, str(entry.get("id") or ""))
+                if key == "pinned" and type(value) is not bool:
+                    raise ValueError("pinned must be a boolean")
                 if key == "working_dir" and value != entry.get(key):
                     entry["routing_generation"] = int(entry.get("routing_generation") or 0) + 1
                 entry[key] = value
@@ -1316,7 +1320,8 @@ def _with_dialogue_facts(project: Dict[str, Any], room: Optional[dict]) -> Dict[
             "last_active_at": max(str(project.get("last_active_at") or ""), str(facts.get("activity_at") or ""))}
 
 
-def projects_summary(drive_root: Any, *, limit: int = 50, chat_id: Any = None) -> List[Dict[str, Any]]:
+def projects_summary(drive_root: Any, *, limit: int = 50, chat_id: Any = None,
+                     include_pinned: bool = False) -> List[Dict[str, Any]]:
     """Sidebar or strict addressed room, with unread/activity from dialogue room facts.
 
     Registry reads retain lifecycle and binding authority. An unproved inactive room
@@ -1340,7 +1345,11 @@ def projects_summary(drive_root: Any, *, limit: int = 50, chat_id: Any = None) -
         facts = {room["chat_id"]: room for room in ds.rooms(drive_root)} if projects else {}
     projects = [_with_dialogue_facts(project, facts.get(project["chat_id"])) for project in projects]
     projects.sort(key=lambda project: str(project.get("last_active_at") or ""), reverse=True)
-    if chat_id is None:
+    if chat_id is None and include_pinned:
+        # Pins remain reachable without starving the ordinary recent-room slice.
+        projects = ([p for p in projects if p.get("pinned") is True]
+                    + [p for p in projects if p.get("pinned") is not True][:max(1, int(limit))])
+    elif chat_id is None:
         projects = projects[:max(1, int(limit))]
     absence_covered = False
     for project in projects:
@@ -1368,6 +1377,7 @@ def projects_summary(drive_root: Any, *, limit: int = 50, chat_id: Any = None) -
         out.append({
             "id": project.get("id"),
             "name": project.get("name"),
+            "pinned": project.get("pinned") is True,
             "chat_id": project.get("chat_id"),
             "working_dir": project.get("working_dir") or "",
             "cognition": project_cognition(project, cognition),

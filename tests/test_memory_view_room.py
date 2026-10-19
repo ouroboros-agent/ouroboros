@@ -234,7 +234,7 @@ def _rows(rooms):
         m(_ts(25), "Task root6 was cancelled. Below is the last persisted model message: UNREVIEWED DRAFT",
           direction="system", type="cancel_receipt", task_id="root6"),
         m(_ts(26), "custody text", direction="system", type="custody_notice", task_id="root6"),
-        m(_ts(27), "Project X › root6 · Cancelled", direction="system", type="project_completion_summary",
+        m(_ts(27), "Project X › root6 · Stopped", direction="system", type="project_completion_summary",
           task_id="root6", status="cancelled"),
     ]
 
@@ -329,7 +329,7 @@ def test_lane_two_is_one_host_line_per_root_task_with_typed_facts_by_address(tmp
     assert by_task["root5"].startswith(f"[{_ts(22)}; host; task root5] running or unreported; last row task_summary "
                                        f"by Light (legacy retelling), 15 chars, {_addr(rows[21])}; children 1;")
     assert "outgoing, author not recorded" in by_task["pre1"]  # before the epoch: not mine
-    assert by_task["root6"] == (f"[{_ts(25)}; host; task root6] Project X › root6 · Cancelled; rows 3; "
+    assert by_task["root6"] == (f"[{_ts(25)}; host; task root6] Project X › root6 · Stopped; rows 3; "
                                 f"get_task_result(task_id='root6'); {_addr(rows[23])}..{_addr(rows[25])}; "
                                 f"cancel receipt: {_addr(rows[23])}; custody notice: {_addr(rows[24])}")
     joined = "\n".join(lane2)
@@ -348,7 +348,7 @@ def test_an_old_task_summary_without_a_kind_is_model_prose_and_never_a_status(tm
     assert root7.startswith(f"[{_ts(28)}; host; task root7] running or unreported; last row task_summary by ")
     assert "OLD MODEL PROSE" not in text
     root6 = next(line for line in lane2 if "; host; task root6]" in line)
-    assert root6.startswith(f"[{_ts(25)}; host; task root6] Project X › root6 · Cancelled; ")
+    assert root6.startswith(f"[{_ts(25)}; host; task root6] Project X › root6 · Stopped; ")
 
 def test_a_page_seals_rows_only_in_its_room_and_a_row_in_two_rooms_stays_open_in_the_other(tmp_path):
     from ouroboros.tools.chronicle import page_covers

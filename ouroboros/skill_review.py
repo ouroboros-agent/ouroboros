@@ -142,6 +142,7 @@ class SkillReviewOutcome:
     replayed_from_ts: str = ""
     # Foreground call outcome, not the skill's pending status or recorded history.
     dispatch_refusal_code: str = ""
+    panel: Dict[str, Any] = field(default_factory=dict)
 
 
 def _apply_auto_grant_outcome(outcome: SkillReviewOutcome, skill: Any, auto_grant: Any) -> None:
@@ -187,7 +188,7 @@ def _run_deterministic_preflight(
     persist: bool,
     binding: ResolvedResourceBinding | None = None,
 ) -> Optional[SkillReviewOutcome]:
-    """Run deterministic checks before spending tri-model review tokens.
+    """Run deterministic checks before spending panel review tokens.
 
     FAIL-CLOSED (ABI-1): an exception or unparseable output from the
     preflight machinery is a structural failure of the gate itself, never a
@@ -433,6 +434,7 @@ def _skill_quorum_failure_outcome(
     review_contract_fingerprint: str = "",
     rebuttal_sha256: str = "",
     wave_id: str = "",
+    panel: Optional[Dict[str, Any]] = None,
 ) -> SkillReviewOutcome:
     """PENDING outcome for a skill review that missed the adaptive reviewer quorum,
     preserving the single-reviewer degraded marker on the outcome AND the durable
@@ -456,6 +458,8 @@ def _skill_quorum_failure_outcome(
         raw_actor_records=[record.to_dict() for record in parsed_review.actor_records],
         advisory_result=advisory_evidence,
     )
+    from ouroboros.review_ledger import panel_not_reached
+    outcome.panel = {**dict(panel or {}), "not_reached": panel_not_reached(outcome.raw_actor_records)}
     if persist and not lifecycle_owns_history:
         _append_skill_review_history(
             drive_root,
@@ -468,7 +472,7 @@ def _skill_quorum_failure_outcome(
             paid=paid,
             review_contract_fingerprint=review_contract_fingerprint,
             rebuttal_sha256=rebuttal_sha256,
-            wave_id=wave_id,
+            wave_id=wave_id, panel=outcome.panel,
         )
     return outcome
 
@@ -507,7 +511,36 @@ def _skill_payload_packs(skill: Any, binding: ResolvedResourceBinding, content_h
                                          error=error, dispatch_refusal_code=code)
 
 
-def review_skill(
+def review_skill(ctx: Any, skill_name: str, *, persist: bool = True, review_rebuttal: str = "",
+                 _resolved_binding: ResolvedResourceBinding | None = None,
+                 reviewers: Optional[List[str]] = None, reason: str = "") -> SkillReviewOutcome:
+    """Admit one skill panel before preflight or review spend; preserve the job's snapshot."""
+    from ouroboros.reviewer_slot_config import PanelCompositionError, compose_review_panel, composed_review_pool
+
+    prior = getattr(ctx, "_skill_review_panel", None)
+    try:
+        panel = None if prior is not None else compose_review_panel(reviewers or (), reason, surface="skill")
+    except PanelCompositionError as exc:
+        return SkillReviewOutcome(skill_name=skill_name, status=STATUS_PENDING, error=str(exc),
+                                  dispatch_refusal_code="TOOL_ARG_ERROR")
+    except ValueError:
+        panel = None  # an invalid pool reaches the review's own typed configuration refusal
+    import contextlib
+    with composed_review_pool(panel.seats) if panel is not None else contextlib.nullcontext():
+        if panel is not None:
+            ctx._skill_review_panel = panel.facts
+        try:
+            outcome = _review_skill(ctx, skill_name, persist=persist, review_rebuttal=review_rebuttal,
+                                    _resolved_binding=_resolved_binding)
+            if not outcome.panel:
+                outcome.panel = dict(getattr(ctx, "_skill_review_panel", {}) or {})
+            return outcome
+        finally:
+            if panel is not None:
+                del ctx._skill_review_panel
+
+
+def _review_skill(
     ctx: Any,
     skill_name: str,
     *,
@@ -515,7 +548,7 @@ def review_skill(
     review_rebuttal: str = "",
     _resolved_binding: ResolvedResourceBinding | None = None,
 ) -> SkillReviewOutcome:
-    """Run tri-model review on one skill, optionally persisting the verdict."""
+    """Run the admitted panel on one skill, optionally persisting its verdict."""
     from ouroboros.tools.review import _handle_multi_model_review
     try:
         binding = _resolved_binding or build_resolved_resource_binding(
@@ -576,8 +609,9 @@ def review_skill(
     }, ensure_ascii=False, indent=2)
     history = _load_skill_review_history(drive_root, skill.name, group_id=str(
         getattr(ctx, "_skill_review_group_id", "") or ""))
+    composition_error = str((getattr(ctx, "_skill_review_panel", None) or {}).get("composition_error") or "")
     preflight_outcome = _run_deterministic_preflight(
-        ctx, drive_root, skill, content_hash, persist=persist, binding=binding)
+        ctx, drive_root, skill, content_hash, persist=persist and not composition_error, binding=binding)
     try:
         current_hash = compute_content_hash(
             skill.skill_dir, manifest_entry=skill.manifest.entry,
@@ -590,7 +624,10 @@ def review_skill(
             error="Skill payload changed during deterministic preflight; review did not dispatch.")
     early_outcome, contract_fp, rebuttal_sha, review_profile = _skill_cycles_gate(
         ctx, skill, drive_root, models, delivery, review_rebuttal, content_hash, persist=persist,
-        file_packs=file_packs, resume_only=preflight_outcome is not None or bool(slot_err), previous=previous)
+        file_packs=file_packs, resume_only=preflight_outcome is not None or bool(slot_err or composition_error), previous=previous)
+    if composition_error and not getattr(ctx, "_skill_review_resume", None):
+        return SkillReviewOutcome(skill_name=skill.name, status=STATUS_PENDING, content_hash=content_hash,
+                                  error=composition_error, dispatch_refusal_code="TOOL_ARG_ERROR")
     if early_outcome is not None or (preflight_outcome is not None and not getattr(ctx, "_skill_review_resume", None)):
         return early_outcome or preflight_outcome
     if slot_err and not getattr(ctx, "_skill_review_resume", None):
@@ -641,6 +678,10 @@ def review_skill(
     )
 
     def _paid_facts(outcome: SkillReviewOutcome) -> SkillReviewOutcome:
+        from ouroboros.review_ledger import panel_not_reached
+        resume = getattr(ctx, "_skill_review_resume", None) or {}
+        outcome.panel = {**dict(resume.get("panel") or getattr(ctx, "_skill_review_panel", {}) or {}),
+                         "not_reached": panel_not_reached(outcome.raw_actor_records)}
         return _stamp_paid_facts(outcome, contract_fp, rebuttal_sha, stamp)
 
     from ouroboros.skill_lifecycle_queue import lend_lifecycle_lane
@@ -703,11 +744,13 @@ def review_skill(
         ))
 
     models = list(result_json["recorded_models"]) if getattr(ctx, "_skill_review_resume", None) else models
-    parsed_review = parse_model_review_results(result_json, required_items=_SKILL_REVIEW_ITEMS)
+    advisers = list(result_json.get("additional") or []) if getattr(ctx, "_skill_review_resume", None) else [
+        sid for sid, extra in zip(delivery.get("slot_ids") or [], delivery.get("additional") or []) if extra]
+    parsed_review = parse_model_review_results(result_json, required_items=_SKILL_REVIEW_ITEMS, additional=advisers)
     emit_review_model_error_events(ctx, parsed_review, source="skill_review", skill_name=skill.name)
     findings, responded_models = parsed_review.findings, parsed_review.responsive_models
-    required_quorum = adaptive_quorum(len(models))
-    single_reviewer_no_diversity = len(models) < 2
+    required_quorum = adaptive_quorum(len(models) - len(advisers))
+    single_reviewer_no_diversity = len(models) - len(advisers) < 2
     if single_reviewer_no_diversity:
         # Skill review is an executable TRUST gate; a single configured reviewer
         # is honored but the lost diversity is recorded loudly AND durably (Bible
@@ -733,6 +776,7 @@ def review_skill(
             review_contract_fingerprint=contract_fp,
             rebuttal_sha256=rebuttal_sha,
             wave_id=str(getattr(stamp, "wave_id", "") or ""),
+            panel=(getattr(ctx, "_skill_review_resume", None) or {}).get("panel") or getattr(ctx, "_skill_review_panel", {}),
         ))
 
     # review_profile was resolved ONCE in _skill_cycles_gate (it is part of
@@ -824,7 +868,7 @@ def _persist_reviewed_outcome(
         raw_result=outcome.raw_result,
         raw_actor_records=list(outcome.raw_actor_records or []),
         advisory_result=dict(outcome.advisory_result or {}),
-        review_profile=outcome.review_profile,
+        review_profile=outcome.review_profile, panel=dict(outcome.panel),
     )
     save_review_state(drive_root, skill.name, persisted_state)
     if not getattr(ctx, "_skill_review_lifecycle_guard", False):
@@ -834,7 +878,7 @@ def _persist_reviewed_outcome(
             raw_actor_records=list(outcome.raw_actor_records or []),
             single_reviewer_no_diversity=outcome.single_reviewer_no_diversity,
             paid=outcome.paid, review_contract_fingerprint=contract_fp,
-            rebuttal_sha256=rebuttal_sha, wave_id=outcome.wave_id,
+            rebuttal_sha256=rebuttal_sha, wave_id=outcome.wave_id, panel=outcome.panel,
         )
     _persist_rebuttal_flips(
         drive_root, skill.name,

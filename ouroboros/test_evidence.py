@@ -146,14 +146,15 @@ def retain_uncaptured_source(repo, reason) -> None:
     while owner is not None:
         if retain_tree(owner, f"test source evidence incomplete: {reason}"):
             if failed:
-                report_diagnostic(f"TEST_SOURCE_RETENTION_FALLBACK {failed}: retained enclosing owner {owner}")
+                report_diagnostic(f"TEST_SOURCE_RETENTION_FALLBACK {', '.join(failed)}: retained enclosing owner {owner}")
             return
         failed.append(str(owner))
         # A read-only inner fixture may have a writable enclosing session owner.
         # Its existing marker protects the whole subtree from ordinary cleanup.
         owner = _disposable_owner(owner.parent) if owner.parent != owner else None
     if failed:
-        raise OSError(f"cannot retain uncaptured source at declared owners {failed}: {reason}")
+        # Named as the OS spells them: a list's repr would double every Windows backslash.
+        raise OSError(f"cannot retain uncaptured source at declared owners {', '.join(failed)}: {reason}")
 
 
 def _alternates(common: Path) -> list[str]:

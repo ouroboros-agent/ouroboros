@@ -53,7 +53,8 @@ def test_stack_header_is_one_row_of_at_most_56px_with_restart_and_budget_inside_
     assert "bar.clientWidth < HEADER_FULL_ROW_MIN_WIDTH" in header_js and "new Observer(place)" in header_js
     # The ☰ and the × share the shell's one icon-control recipe; the Project's × is that recipe too.
     assert 'class="shell-icon-control project-panel-close"' in _read("web/app.js")
-    assert 'class="shell-icon-control mobile-nav-toggle"' in _read("web/modules/page_header.js")
+    header_js = _read("web/modules/page_header.js")
+    assert "'shell-icon-control mobile-nav-toggle composer-menu ui-hit-area' : 'shell-icon-control mobile-nav-toggle'" in header_js
     assert ".project-panel-title" not in css, "one title style"
 
 

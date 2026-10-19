@@ -215,7 +215,7 @@ def test_sidebar_is_three_zones_with_the_projects_list_as_the_one_scroller():
     app_js = _read("web/app.js")
     assert "kebab.innerHTML = SHELL_ICONS.more;" in app_js and "kebab.textContent = '⋯'" not in app_js
     assert "navProjectsToggle?.classList.toggle('active'" not in _read("web/app.js")
-    assert "openProjectPanel(project, { openOnly: true })" in _read("web/app.js")
+    assert "openProjectPanel(item.project, { openOnly: true })" in _read("web/app.js")
 
 
 # ---------------------------------------------------------------------------

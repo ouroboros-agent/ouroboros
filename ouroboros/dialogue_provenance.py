@@ -326,7 +326,7 @@ def dialogue_text(entry: Mapping[str, Any]) -> str:
     message = _mapping(transport.get("message"))
     if entry.get("type") == "presence_delivery" and message:
         text += "\n[Delivery details: " + json.dumps(dict(message), ensure_ascii=False, sort_keys=True) + "]"
-    evidence = entry.get("late_evidence")
+    evidence = entry.get("late_evidence")  # an old task-acceptance late-settlement row; nothing writes one now
     if entry.get("type") == "acceptance_late_settlement" and isinstance(evidence, Mapping):
         text += "\n[Late review evidence: " + json.dumps(dict(evidence), ensure_ascii=False, sort_keys=True) + "]"
     source = entry.get("context_source_ref")

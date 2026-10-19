@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from ouroboros import test_evidence
+from ouroboros.force_remove import force_rmtree
 from ouroboros.test_environment import declare_scratch
 from tests.test_test_storage import _repo
 
@@ -106,7 +107,8 @@ def test_disposable_recipe_recovers_index_live_untracked_modes_without_source(tm
     assert run_hermetic_pytest(source, pytest_args=['tests', '-q'], timeout=60) is None
     evidence = Path(next(line.split(' ', 1)[1] for line in capsys.readouterr().err.splitlines() if line.startswith('PREFLIGHT_EVIDENCE '))) / 'source'
     record = json.loads((evidence / 'source.json').read_bytes())
-    shutil.rmtree(envelope)  # The only source/object owner was this test's stopped synthetic repo.
+    force_rmtree(envelope)  # The only source/object owner was this test's stopped synthetic repo.
+    assert not envelope.exists(), 'read-only Git objects (Windows) kept the source alive'
     recovered = tmp_path / 'recovered'
     recovered.mkdir()
     _git(recovered, 'init', '-q')
@@ -191,7 +193,8 @@ def _borrowing_base(tmp_path, source, pack):
         store.mkdir()
         _git(store, 'init', '-q')
         if alternate is not None:
-            (store / '.git/objects/info/alternates').write_text(str(alternate) + '\n')
+            # LF bytes: Git reads the whole line as the path, and Windows text mode would add a CR.
+            (store / '.git/objects/info/alternates').write_bytes(os.fsencode(alternate) + b'\n')
         with pack.open('rb') as stream:
             subprocess.run(['git', 'unpack-objects', '-q'], cwd=store, stdin=stream, check=True)
         stores.append(store)
@@ -252,14 +255,19 @@ def test_a_seat_clone_recipe_names_where_its_referenced_base_lives(tmp_path, mon
 
 def test_persistent_unmerged_recipe_keeps_stage_blobs_missing_from_base(tmp_path, monkeypatch):
     source = _repo(tmp_path / 'persistent', 'def test_probe():\n    assert True\n')
-    commit = ['-c', 'user.name=Fixture', '-c', 'user.email=f@example.invalid', 'commit', '-qam']
+    identity = ['-c', 'user.name=Fixture', '-c', 'user.email=f@example.invalid']
+    commit = [*identity, 'commit', '-qam']
     _git(source, 'checkout', '-qb', 'side')
     (source / 'tests/test_probe.py').write_text('def test_probe():\n    assert "side"\n')
     _git(source, *commit, 'side')
     _git(source, 'checkout', '-q', '-')
     (source / 'tests/test_probe.py').write_text('def test_probe():\n    assert "ours"\n')
     _git(source, *commit, 'ours')
-    assert subprocess.run(['git', 'merge', '-q', 'side'], cwd=source, capture_output=True).returncode
+    # The test environment has no global identity (GIT_CONFIG_GLOBAL=/dev/null): without one a
+    # host that cannot guess it (Linux, Windows) refuses the merge (128) before any stage exists.
+    merged = subprocess.run(['git', *identity, 'merge', '-q', 'side'], cwd=source, capture_output=True)
+    assert merged.returncode == 1, merged
+    assert _git(source, 'ls-files', '-u').decode().count('\ttests/test_probe.py\n') == 3
     destination = tmp_path / 'evidence'
     record, pack = _persistent_recipe(source, destination, monkeypatch)
     assert record['index']['unmerged'] is True and record['index']['tree'] is None

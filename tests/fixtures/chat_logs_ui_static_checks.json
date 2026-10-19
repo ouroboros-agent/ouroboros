@@ -93,7 +93,7 @@
     "id": "test_chat_progress_updates_route_into_live_card",
     "path": "web/modules/chat.js",
     "kind": "contains",
-    "value": "...chatStatusCounts(activeDirectActivities, liveCardRecords.values(), (id) => modelWaits.waiting(id))"
+    "value": "return roomStatusView(workState, { connected: ws.isConnected ? ws.isConnected() : true, ready: hostStart.ready(),"
   },
   {
     "id": "test_chat_progress_updates_route_into_live_card",
@@ -1077,7 +1077,7 @@
     "id": "test_cancel_run_confirm_and_cascade",
     "path": "web/modules/chat.js",
     "kind": "contains",
-    "value": "openTaskControls(btn, record.groupId, {"
+    "value": "openCardControls(btn, record, cardControls(workState, record.groupId).work, {"
   },
   {
     "id": "test_cancel_run_confirm_and_cascade",

@@ -117,7 +117,7 @@ function largestHtml(free) {
 const button = (label, data, tone = 'btn-default', key = '') => `<button type="button" class="btn ${tone} btn-sm" ${data} data-key="${attr(data)}"${key ? ` data-i18n-fmt="${attr(key)}"` : ''}>${text(label)}</button>`;
 
 const deletingSentence = (run) => (run?.deleting ? plural(run.deleting, '{n} is still being deleted.', '{count} are still being deleted.') : '');
-const stuckSentence = (run) => (run?.stuck ? plural(run.stuck, '{n} could not be deleted yet; the app retries once it changes.', '{count} could not be deleted yet; the app retries once they change.') : '');
+const stuckSentence = (run) => (run?.stuck ? plural(run.stuck, '{n} could not be deleted yet; the app retries at its next maintenance run.', '{count} could not be deleted yet; the app retries at its next maintenance run.') : '');
 
 function runningHtml(run, total) {
     const sentence = fmt('Freeing space · {size} removed · {done} of {total} folders · You can leave this tab.', {

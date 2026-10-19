@@ -70,10 +70,11 @@ export async function continueTaskAction(taskId, { request = continueTask, stora
             const reason = typeof ack?.error === 'string' && ack.error ? ack.error : 'no acknowledgement';
             throw Object.assign(new Error(reason), { body: {} });
         }
-        // A held successor names what the census observed (#1721), never a generic wait.
+        // A held successor names what the census observed (#1721), never a generic wait. It starts by itself once
+        // that work settles: nothing for the owner to resume; Stop earlier attempt ends it sooner.
         toast(ack?.held
-            ? `Continue accepted and held: ${heldWorkFacts(ack.blockers) || 'earlier work is not proven settled'}. `
-                + 'Resume in Activity checks it again.'
+            ? `Continue accepted; it starts by itself when the earlier attempt's work finishes: ${
+                heldWorkFacts(ack.blockers) || 'earlier work is not proven settled'}.`
             : 'Continue accepted.', 'ok');
         return successor;
     } catch (exc) {

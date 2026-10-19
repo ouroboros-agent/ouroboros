@@ -74,7 +74,7 @@ CORE_TOOL_NAMES: frozenset[str] = frozenset({
     "escalate",
     "switch_model",
     "request_restart", "promote_to_stable", "prepare_self_change",
-    "preflight_review", "advisory_review", "review_change", "review_status", "task_acceptance_review",
+    "preflight_review", "advisory_review", "review_change", "review_status",
     "verify_and_record",
     # Skill discovery and review are core capabilities; installing, updating and source changes
     # load on demand (enable_tools) after a search found something worth it.
@@ -242,7 +242,6 @@ UNTRUNCATED_TOOL_RESULTS: frozenset[str] = frozenset({
     "commit_reviewed",
     "vcs_commit_reviewed",
     "plan_task",
-    "task_acceptance_review",
     "preflight_review",
     "advisory_review",
     "review_change",
@@ -474,14 +473,9 @@ OBSERVE_WORLD_MUTATION_TOOLS: frozenset[str] = frozenset({
 })
 
 
-def completion_control_call(name: str, args: object = None) -> bool:
+def completion_control_call(name: str) -> bool:
     """Host-owned local completion identity, independent of presentation or success."""
-    if name in {"finish_task", "presence_finish"}:
-        return True
-    return name == "task_acceptance_review" and isinstance(args, dict) and (
-        args.get("author_action") in {"finish", "stop"}
-        or args.get("agent_disposition") in {"accepted", "rejected", "partial", "deferred"}
-    )
+    return name in {"finish_task", "presence_finish"}
 
 
 def substantive_tool_calls(calls: object) -> list:

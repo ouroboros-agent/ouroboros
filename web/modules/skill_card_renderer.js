@@ -368,7 +368,9 @@ export function renderReviewFindingsList(skill) {
     const rows = findings.map((f) => {
         const preflight = preflightFindingText(f);
         const reason = preflight || f.reason || f.message || JSON.stringify(f);
-        return `<li><strong>${escapeHtml(f.verdict || f.severity || '')}</strong> ${escapeHtml(f.item || f.check || f.title || 'finding')}: ${escapeHtml(reason)}</li>`;
+        // An adviser's seat (`additional`) is heard beside the ticked reviewers and never counted.
+        const adviser = f.additional === true ? ' (adviser, not counted)' : '';
+        return `<li><strong>${escapeHtml(f.verdict || f.severity || '')}</strong>${adviser} ${escapeHtml(f.item || f.check || f.title || 'finding')}: ${escapeHtml(reason)}</li>`;
     }).join('');
     return `<ul>${rows}</ul>`;
 }

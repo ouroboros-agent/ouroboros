@@ -33,25 +33,20 @@ ADVISORY_PLAN_DECISION = {
 }
 
 
-@pytest.mark.parametrize("change", ["generation", "superseded", "replaced_panel"])
+@pytest.mark.parametrize("change", ["generation", "released"])
 def test_equal_evidence_fields_cannot_revive_changed_owner_authority(tmp_path, monkeypatch, change):
     _loop, tools, ctx, trace = _forced_test_context(tmp_path)
     old = loop._replace_delivery_candidate(tools, ctx, trace, ANSWER, control="candidate")
-    prior = _bind_host_pass(loop, tools, trace, old)
+    _bind_host_pass(loop, tools, trace, old)
     before = old.evidence_revision, old.evidence_fingerprint
     if change == "generation":
         tools._ctx._task_acceptance_owner_generation = 1
         tools._ctx.owner_message_admission_agent = SimpleNamespace(_owner_message_generation=2)
-    elif change == "superseded":
+    else:
         # The release notification follows real ingress; it is no longer a
         # declaration that the task's meaning changed by itself.
         tools._ctx._owner_directives = [{"content": "Use the newly supplied source."}]
-        loop._supersede_task_acceptance_for_owner_followup(tools._ctx, trace)
-    else:
-        prior["superseded_by_revision"] = True
-        trace["review_runs"].append({**prior, "superseded_by_revision": False,
-                                   "panel_id": "new-panel", "binding_hash": "new-binding", "aggregate_signal": "FAIL"})
-        trace["review_decision"].update(panel_id="new-panel", binding_hash="new-binding")
+        loop._release_for_owner_followup(tools._ctx, trace)
     assert loop._current_delivery_candidate(ctx, trace) is None
     assert (old.evidence_revision, old.evidence_fingerprint) == before
     monkeypatch.setattr(loop, "call_llm_with_retry", lambda *_a, **_kw: (None, 0.0))
@@ -62,7 +57,6 @@ def test_equal_evidence_fields_cannot_revive_changed_owner_authority(tmp_path, m
     assert text == ANSWER and current is not old
     assert current.acceptance_binding["authoritative"] is False
     assert current.acceptance_binding["stale_evidence"] is True
-    assert prior["superseded_by_revision"] is True
     assert "STALE-EVIDENCE NOTICE" in usage["terminal_host_notice"]
 
 
@@ -108,7 +102,7 @@ def test_simultaneous_plan_and_deferred_limitations_stay_one_notice_beside_a_cle
     monkeypatch.setattr(loop_mod, "_compute_subagent_handoff", lambda *_a, **_k: None)
     monkeypatch.setattr(loop_mod, "_maybe_inject_finalization_nudges", lambda *_a, **_k: False)
     monkeypatch.setattr(loop_mod, "_force_plan_disclosure", lambda *_a, **_k: plan_suffix)
-    monkeypatch.setattr(loop_mod, "_run_task_acceptance_review_once", lambda **_kw: False)
+    monkeypatch.setattr("ouroboros.tools.review_result.result_review_at_delivery", lambda *_a, **_kw: False)
 
     result = loop_mod._no_tool_final_answer(
         ANSWER, ctx, trace, registry, queue.Queue(), set(), lambda _text: None,
@@ -146,70 +140,29 @@ def test_simultaneous_plan_and_deferred_limitations_stay_one_notice_beside_a_cle
 
 
 @pytest.mark.parametrize("verdict", ["FAIL", "PASS"])
-def test_host_notice_does_not_replace_or_supersede_an_unchanged_answer(tmp_path, monkeypatch, verdict):
-    import ouroboros.review_substrate as rs
+def test_a_delivery_warning_keeps_the_bound_result_reviews_assessment(tmp_path, monkeypatch, verdict):
+    """#533: a delivery warning (a degraded candidate beside its host notice) is a fact of its
+    own; it never erases the assessment of the result review bound to the delivered answer, in
+    the loop outcome, the stored task result and the terminal event alike."""
     from ouroboros.contracts.task_contract import build_task_contract
+    from ouroboros.outcomes import derive_loop_outcome, normalize_outcome_axes, public_task_result
+    from ouroboros.tools.review_result import _bind_review_run
 
     _loop, tools, ctx, trace = _forced_test_context(tmp_path)
     tools._ctx.task_contract = build_task_contract({"id": "parent1", "expected_output": "A report"})
     write_task_result(tmp_path, "parent1", "running", task_contract=tools._ctx.task_contract)
-    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "auto")
-    monkeypatch.setattr(rs, "triad_delivery_slots", lambda **_kw: [object()])
-    monkeypatch.setattr(loop, "_maybe_inject_finalization_nudges", lambda *_a, **_kw: False)
-    monkeypatch.setattr(loop, "_force_plan_disclosure", lambda *_a, **_kw: NOTICE)
-    subjects = []
-
-    def review(request, **_kwargs):
-        subjects.append(request.subject)
-        return rs.ReviewRunResult(
-            request={"surface": "task_acceptance", "policy": {"min_successful_slots": 1}},
-            actors=[{"slot_id": "s0", "signal": verdict, "parsed": {
-                "verdict": verdict, "outcome_tier": "solved" if verdict == "PASS" else "best_effort",
-                "criteria_used": [{"criterion": "report", "status": "supported", "evidence_refs": ["artifact:1"]}],
-            }}], parsed_findings=[], aggregate_signal=verdict,
-        )
-
-    monkeypatch.setattr(rs, "run_review_request", review)
-    # Auto reviews the author's typed nomination, never the declared expected_output (#1731).
-    from tests.test_loop_acceptance_gate import _nominate_acceptance
-
-    _nominate_acceptance(trace, task_id="parent1", subject=ANSWER)
-
-    def finalize():
-        result = loop._no_tool_final_answer(ANSWER, ctx, trace, tools, queue.Queue(), set(), lambda _t: None)
-        if result is not None:
-            assert result[0] == ANSWER
-            assert result[1]["terminal_host_notice"] == NOTICE
-        return result
-
-    first = finalize()
-    # A real FAIL still requests its ordinary improvement; a clean PASS also reaches
-    # the author once before delivery (G1 #1737/D12: review before decision).
-    assert first is None
-    from ouroboros.acceptance_settlement import expose_acceptance_feedback
-
-    expose_acceptance_feedback(trace, ctx.messages, "parent1")  # the next Main request carried it
-    candidate = tools._ctx._delivery_candidate
-    assert finalize() is not None  # An unchanged answer reuses the verdict; its notice cannot demand a rewrite.
-    binding = dict(candidate.acceptance_binding)
-    assert finalize() is not None
-    assert subjects == [ANSWER]
-    assert tools._ctx._delivery_candidate is candidate
-    assert candidate.content_sha256 == hashlib.sha256(ANSWER.encode()).hexdigest()
-    assert candidate.revision == 1 and candidate.acceptance_binding == binding
-    assert not trace["review_runs"][0].get("superseded_by_revision")
-    assert trace["acceptance_decision"]["status"] == ("accepted" if verdict == "PASS" else "finalized_unaccepted")
-
-    # #533: transport/finalization warning must not erase the bound assessment.
-    from ouroboros.outcomes import derive_loop_outcome, normalize_outcome_axes, public_task_result
-    from ouroboros.task_results import load_task_result
+    loop._replace_delivery_candidate(tools, ctx, trace, ANSWER, control="candidate")
+    # The result review the delivery step bound to this answer (review_result.result_review_at_delivery).
+    findings = [{"severity": "critical", "item": "report", "reason": "the totals do not add up"}]
+    _bind_review_run(trace, {"record_id": "result-record-1", "verdict": {
+        "aggregate": verdict, "critical_findings": findings if verdict == "FAIL" else []}}, "b" * 64, "advisory")
 
     trace["delivery_candidate"].update(degraded=True, degraded_reason="advisory_plan_review_open")
     usage = {"terminal_host_notice": NOTICE}
     axes = derive_loop_outcome(ANSWER, usage, trace)["outcome_axes"]
     expected = "pass" if verdict == "PASS" else "fail"
     assert axes["objective"]["status"] == expected
-    assert axes["objective"]["source"] == "task_acceptance_review"
+    assert axes["objective"]["source"] == "result_review"
     assert axes["execution"]["status"] == "degraded"
     env = SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path)
     task = {"id": "parent1", "type": "task", "chat_id": 1, "text": "Produce a report",
@@ -217,20 +170,13 @@ def test_host_notice_does_not_replace_or_supersede_an_unchanged_answer(tmp_path,
     pipeline._store_task_result(env, task, ANSWER, usage, trace)
     stored = load_task_result(tmp_path, "parent1")
     assert stored["outcome_axes"]["objective"]["status"] == expected
-    assert normalize_outcome_axes(public_task_result(stored))["objective"]["source"] == "task_acceptance_review"
+    assert normalize_outcome_axes(public_task_result(stored))["objective"]["source"] == "result_review"
     pending = []
     pipeline.emit_task_results(env, None, None, pending, task, ANSWER, usage, trace,
                               start_time=0.0, drive_logs=tmp_path / "logs")
     terminal = next(row for row in pending if row["type"] == "task_done")
     assert terminal["outcome_axes"]["objective"]["status"] == expected
     assert load_task_result(tmp_path, "parent1")["outcome_axes"]["execution"]["status"] == "degraded"
-
-    # Real input changes still supersede the binding even when answer bytes match.
-    tools._ctx._owner_directives = [{"text": "Use the newly supplied source."}]
-    changed = loop._replace_delivery_candidate(tools, ctx, trace, ANSWER, control="candidate")
-    assert changed is not candidate and changed.revision > candidate.revision
-    assert changed.acceptance_binding["authoritative"] is False
-    assert trace["review_runs"][0]["superseded_by_revision"] is True
 
 
 def _emit_terminal(tmp_path, monkeypatch, *, direct=False, project=False, child=False, notice=NOTICE, answer=ANSWER):

@@ -156,7 +156,7 @@ def test_blocking_review_lifecycle_uses_single_progress_card(tmp_path, monkeypat
         if kwargs.get("is_progress")
         and str(kwargs.get("task_id") or "").startswith("skill_lifecycle_review_alpha_")
     ]
-    assert any("Running tri-model review" in message for message in progress_messages)
+    assert any("Running skill review" in message for message in progress_messages)
     assert any("Installing dependencies" in message for message in progress_messages)
     assert any("Reloading extension" in message for message in progress_messages)
     assert any("completed" in message and "Review executable (clean): PASS manifest_schema" in message for message in progress_messages)

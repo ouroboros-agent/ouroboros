@@ -248,7 +248,7 @@ def test_ui_results_and_required_question_journey(wait_clone, tmp_path, monkeypa
                     # correctly retire it; it is a replay metadata assertion,
                     # not a screenshot claim of a live finalizing process.
                     cancelled = page.locator('.chat-live-card[data-task-id="old-cancelled"]')
-                    cancelled.locator('[data-live-phase]').filter(has_text="Cancelled").wait_for(timeout=30000)
+                    cancelled.locator('[data-live-phase]').filter(has_text="Stopped").wait_for(timeout=30000)
                     assert page.get_by_text("Retained ordinary answer before cancellation", exact=True).count() == 1
                     cancelled.screenshot(animations="disabled", path=str(screenshots / f"{live_engine}-retained-cancelled.png"))
                     unknown = page.locator('.chat-live-card[data-task-id="old-unknown"]')

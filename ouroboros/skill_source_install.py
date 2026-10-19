@@ -359,13 +359,16 @@ def run_in_lane(drive_root: pathlib.Path, kind: str, target: str, runner: Callab
     )
 
 
-def start_review(drive_root: pathlib.Path, name: str, *, repo_dir: Optional[pathlib.Path] = None) -> None:
+def start_review(drive_root: pathlib.Path, name: str, *, repo_dir: Optional[pathlib.Path] = None,
+                 reviewers: Optional[List[str]] = None, reason: str = "", chosen_by: str = "owner", panel: Any = None) -> None:
     """Start the ordinary review job of an install in the background.
 
     The review lends the lifecycle lane out while its panel reads the frozen payload; when it leaves no
     blockers it grants, installs dependencies and turns the skill on as its record asks
     (``skill_review_runner``). An interrupted review stays an honest interrupted job, never an acceptance.
     """
+    from ouroboros.reviewer_slot_config import compose_review_panel
+    panel = panel or compose_review_panel(reviewers or (), reason, surface="skill", chosen_by=chosen_by)
     digest = str(((read_install_record(drive_root, name) or {}).get("release") or {}).get("digest") or "")
     def _run() -> None:
         try:
@@ -374,7 +377,7 @@ def start_review(drive_root: pathlib.Path, name: str, *, repo_dir: Optional[path
             from ouroboros.skill_review_runner import run_skill_review_lifecycle_blocking
 
             ctx = _MarketplaceReviewCtx(pathlib.Path(drive_root), pathlib.Path(repo_dir or REPO_DIR))
-            run_skill_review_lifecycle_blocking(ctx, name, source="skills", repo_path=get_skills_repo_path())
+            run_skill_review_lifecycle_blocking(ctx, name, source="skills", repo_path=get_skills_repo_path(), _panel=panel)
         except Exception:
             log.warning("Review after install failed for %s", name, exc_info=True)
         finally:

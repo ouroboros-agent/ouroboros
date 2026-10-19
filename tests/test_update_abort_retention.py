@@ -62,6 +62,10 @@ def _system(tmp_path, monkeypatch):
     monkeypatch.setattr(workers, "_repo_writer_gate_reason", "")
     monkeypatch.setattr(workers, "MAX_WORKERS", 1)
     monkeypatch.setattr(workers, "mp", SimpleNamespace(get_context=lambda _method: SimpleNamespace(Queue=stdqueue.Queue)))
+    # The real spawn_workers caches that fake context in the global ``workers._CTX``, which the
+    # ``mp`` patch does not restore: the next test in this process that starts the real event bus
+    # would build its manager on it (no ``Process``) and every task_done publish would fail.
+    monkeypatch.setattr(workers, "_CTX", None)
     monkeypatch.setattr(workers, "threading", SimpleNamespace(Thread=_InlineThread))
     processes, launches = {}, []
 

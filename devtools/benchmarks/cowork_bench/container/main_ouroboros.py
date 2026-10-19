@@ -206,7 +206,7 @@ def classify_outcome(result: Mapping[str, Any], truncation_codes: list[str]) -> 
 
     ``completed`` means the agent ended its work voluntarily, which is exactly the reference
     engines' ``success`` ("the model ended its turn"); the benchmark's evaluator, not the
-    acceptance panel, then judges the side effects. A runtime rail (round cap, budget, local
+    result review, then judges the side effects. A runtime rail (round cap, budget, local
     deadline) is the benchmark's ``max_turns_reached``. Provider/transport death is ``failed``
     AND flagged ``infra_failed`` so the launcher may re-run it without touching genuine misses.
     """

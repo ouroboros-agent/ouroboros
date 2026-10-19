@@ -88,6 +88,49 @@ def _on_the_known_spend_rule(name, result, expected):
     return result, expected
 
 
+# The task-acceptance flow's root-cap amendments retired with that flow (the review
+# fold): ``effective_billing_fields`` overlaid them and is gone, its callers read the
+# fields themselves, and no answer names an amendment as its source any more.
+_RETIRED_OVERLAY = "effective_billing_fields"
+_OVERLAY_KEYS = {f"{axis}_limit_{part}" for axis in ("root", "billing_group") for part in ("usd", "source", "revision")}
+
+
+def _amended(checkpoint):
+    return any("acceptance_root_cap_amendments" in _DOC["blobs"][blob] for blob in checkpoint["files"].values())
+
+
+def _without_the_retired_overlay(expected):
+    """A money projection's shipped answer less the provenance the amendment overlay
+    added (a recorded binding keeps what its row says); the limit itself is still
+    compared, so an answer whose cap came from an amendment stays red."""
+    if not isinstance(expected, dict):
+        return expected
+    for axis in ("root", "billing_group"):
+        if expected.get(f"{axis}_limit_source") == "owner_amendment":
+            expected = {key: value for key, value in expected.items()
+                        if key not in (f"{axis}_limit_source", f"{axis}_limit_revision")}
+    return expected
+
+
+def test_the_retired_overlay_changed_only_amended_bindings():
+    """Every journal-era question the overlay answered without a recorded amendment got
+    its own fields back, so reading the fields directly loses nothing there; an amended
+    answer differed only in the overlay's own keys."""
+    plain = amended = 0
+    for checkpoint in _CHECKPOINTS:
+        if checkpoint["function"] != _RETIRED_OVERLAY:
+            continue
+        fields = checkpoint["args"][2]
+        changed = {key for key, value in checkpoint["result"].items() if fields.get(key) != value}
+        assert changed <= _OVERLAY_KEYS, checkpoint["test"]
+        if _amended(checkpoint):
+            amended += bool(changed)
+        else:
+            assert not changed, checkpoint["test"]
+            plain += 1
+    assert plain and amended
+
+
 def test_the_fixture_covers_every_question_kind():
     assert {checkpoint["function"] for checkpoint in _CHECKPOINTS} == {
         "original_group_limit", "ledger_billing_binding", "task_billing_fields", "task_money_snapshot",
@@ -129,8 +172,12 @@ def _materialize_imported_seed(root, checkpoint, seeds):
             path.write_bytes(body)
 
 
-@pytest.mark.parametrize("checkpoint", _CHECKPOINTS,
-                         ids=[f"{index:03d}-{checkpoint['function']}" for index, checkpoint in enumerate(_CHECKPOINTS)])
+_LIVE = [(index, checkpoint) for index, checkpoint in enumerate(_CHECKPOINTS)
+         if checkpoint["function"] != _RETIRED_OVERLAY]
+
+
+@pytest.mark.parametrize("checkpoint", [checkpoint for _index, checkpoint in _LIVE],
+                         ids=[f"{index:03d}-{checkpoint['function']}" for index, checkpoint in _LIVE])
 def test_an_imported_journal_gives_the_shipped_answer(checkpoint, tmp_path, monkeypatch, imported_binding_seeds):
     from ouroboros import usage_accounting as ua
     from ouroboros import usage_admission as admission
@@ -173,6 +220,8 @@ def test_an_imported_journal_gives_the_shipped_answer(checkpoint, tmp_path, monk
         else:
             result = getattr(admission, name)(*args, **kwargs)
         result, expected = _on_the_known_spend_rule(name, _encode(result, root), checkpoint["result"])
+        if name == "usage_projection" and _amended(checkpoint):
+            expected = _without_the_retired_overlay(expected)
         minted = expected.get("billing_group_limit_revision") if isinstance(expected, dict) else None
         if isinstance(minted, str) and not any(minted in _DOC["blobs"][blob] for blob in checkpoint["files"].values()):
             # A revision the question itself minted (an initial or default pin): a fresh

@@ -10,6 +10,10 @@ from ouroboros import skill_starter
 from ouroboros.skill_install_record import read_install_record
 from tests._skill_source_fixtures import HubFixture, builtin_repo, join_source_refreshes
 
+# The installer's own tests run its real scheduling (sources are local fixtures); every other test
+# finds the door closed (conftest `_starter_skills_stay_off`).
+pytestmark = pytest.mark.starter_skills
+
 
 @pytest.fixture
 def setup(tmp_path, monkeypatch):
@@ -248,3 +252,26 @@ def test_shared_test_finalizer_joins_onboarding_work(tmp_path, monkeypatch, requ
         release.set()
         if thread is not None:
             thread.join(60)
+
+
+def test_shared_test_seam_keeps_the_starter_off_unless_a_test_opts_in(tmp_path, monkeypatch):
+    """Outside ``starter_skills`` an onboarding completion (or a fresh boot) schedules nothing that
+    runs, so no ordinary test clones the skill sources from GitHub; a marked test runs it for real."""
+    import threading
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from tests import conftest
+
+    ran = threading.Event()
+    monkeypatch.setattr(skill_starter, "run_starter", lambda *_a, **_k: ran.set())
+    seam = contextmanager(conftest._starter_skills_stay_off.__wrapped__)
+
+    def marked(*marks):  # the fixture's ``request``: a node that carries exactly ``marks``
+        return SimpleNamespace(node=SimpleNamespace(get_closest_marker=lambda name: name if name in marks else None))
+
+    with pytest.MonkeyPatch.context() as patch, seam(marked(), patch):
+        assert skill_starter.after_onboarding(tmp_path / "ordinary", None) == "scheduled"
+        assert skill_starter.join_starters(timeout=60) and not ran.is_set()
+    with pytest.MonkeyPatch.context() as patch, seam(marked("starter_skills"), patch):
+        assert skill_starter.after_onboarding(tmp_path / "opted-in", None) == "scheduled"
+        assert skill_starter.join_starters(timeout=60) and ran.is_set()

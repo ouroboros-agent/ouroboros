@@ -118,8 +118,8 @@ Every new or changed continuity surface is reviewed as one narrow chain:
   not permission to infer missing material. Every over-limit tool result persists its
   exact source, with no per-tool exemption; only `source_unavailable` (no
   actor-resolvable source at all) is an unresolved partial that withholds dispatch.
-- An `api_chat` acceptance reviewer has no tools to resolve `repo_diff_source_ref`;
-  a criterion depending on the unseen diff remains at most `partial`.
+- An `api_chat` result reviewer cannot open the produced files; a judgement on their
+  content stays at most `partial`.
 - A consumer that can authorize PASS, a destructive rewrite or replacement of a full
   contract materializes the named source first; a known `partial` marker and an
   unverified claim that some host might retrieve more are not equivalent.

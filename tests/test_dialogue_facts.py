@@ -324,6 +324,29 @@ def test_repeated_generation_signatures_keep_every_alias(tmp_path):
     assert ds.legacy_address(tmp_path, ds.append(tmp_path, "chat", owner("appended")).seq) is None
 
 
+@pytest.mark.parametrize("first", [
+    pytest.param(encoded(owner("s1")) + b"\n", id="ordinary"),
+    pytest.param(b"\r\n" + encoded(owner("s1")) + b"\r\n", id="blank_line_then_crlf"),
+    pytest.param(encoded(owner("s1", text="pasted\u2028from a PDF")) + b"\n", id="u2028"),
+    pytest.param(encoded(owner("s1", text="one paragraph\u2029the next")) + b"\n", id="u2029"),
+    pytest.param(encoded(owner("s1", text="cp1252 read as latin-1\x85")) + b"\n", id="u0085"),
+])
+def test_a_generation_is_signed_as_its_old_cursors_signed_it(tmp_path, first):
+    """``append_jsonl`` writes U+2028, U+2029 and U+0085 raw (``ensure_ascii=False``) and the text-mode
+    reader of ``jsonl_generation_signature`` ends a line only at ``\\n``/``\\r``: the import signs a
+    generation the same way, or every old cursor naming it (the frozen consolidation cursor, a parked
+    Presence cursor, a wake boundary) stops resolving after the cutover."""
+    name = "chat_20261001T000000.jsonl"
+    seed(tmp_path, archives={name: [first, owner("s2")]}, live={"chat": [owner("live-1")]})
+    gen = gen_of(tmp_path, name)
+    di.cutover(tmp_path)
+    di.run_dialogue_import(tmp_path)
+    assert (ds.legacy_generation(tmp_path, gen) or {}).get("name") == name
+    assert ds.legacy_address(tmp_path, ds.rows_by_client_id(tmp_path, "s2")[0].seq) == (gen, first.count(b"\n") + 1)
+    assert chat_chain.generation_cursor(tmp_path, {"chat_log_signature": {"first_line_sha256": gen},
+                                                   "last_consolidated_offset": 1}) == (1, False)
+
+
 # ---- fact 4: task aliases --------------------------------------------------------------------------
 
 def test_rows_whose_only_task_identifier_is_subagent_task_id_are_found_by_the_task_probes(tmp_path, monkeypatch):

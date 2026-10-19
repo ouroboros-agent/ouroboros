@@ -4,6 +4,7 @@ import { createChatInstance } from '../modules/chat.js';
 import { fetchTaskDetailStrict } from '../modules/api_client.js';
 import { createReviewHydrator } from '../modules/review_presentation.js';
 import { installDom, restoreDom, walkCard } from './chat_dom_fixture.js';
+import { projection, room, work } from './work_fixture.js';
 
 const chatId = 77;
 const taskId = 'context-analysis';
@@ -128,22 +129,34 @@ for (const kind of ['direct_chat', 'managed_task']) {
             try {
                 const activity = fx.snapshot.active_chat_activities[0];
                 Object.assign(activity, { kind, phase: 'budget_paused', pause_cause: 'owner', finishing_reviews: true });
+                // The server's work for that row: paused by the owner, its launched reviews finishing beside the Pause,
+                // and the Resume its door accepts (gateway/work_status.classify_member, controls_for).
+                const project = () => Object.assign(fx.snapshot, projection(activity.chat_id ?? 1, [work(activity,
+                    activity.phase === 'budget_paused' ? { activity: 'paused', paused_by: 'owner',
+                        because: [{ code: 'paused_by_owner', text: 'Paused by you' },
+                            ...(activity.finishing_reviews ? [{ code: 'review_work_finishing', text: 'Review work finishing' }] : [])],
+                        controls: [{ action: 'resume', target: taskId }, { action: 'stop', target: taskId }] }
+                        : { controls: [{ action: 'stop', target: taskId }] })],
+                    room(activity.phase === 'budget_paused' ? 'paused' : 'working')));
+                project();
                 if (censusFirst) fx.hydrate();
                 await fx.replay();
                 if (!censusFirst) fx.hydrate();
                 const phase = () => fx.card().querySelector('[data-live-phase]').textContent;
-                assert.equal(phase(), 'Paused · owner pause · review work finishing');
+                assert.equal(phase(), 'Paused · by you · review work finishing');
                 assert.ok(findDescendant(fx.card(), '[data-resume-run]'), 'Resume is available while reviews finish');
                 assert.equal(fx.card().querySelector('[data-live-typing]').style.display, 'none');
                 for (const finishing of [true, false, true, undefined]) {
                     if (finishing === undefined) delete activity.finishing_reviews;
                     else activity.finishing_reviews = finishing;
+                    project();
                     fx.hydrate();
-                    assert.equal(phase(), finishing ? 'Paused · owner pause · review work finishing'
-                        : 'Paused · owner pause', 'each census replaces the fact, including false or absence');
+                    assert.equal(phase(), finishing ? 'Paused · by you · review work finishing'
+                        : 'Paused · by you', 'each body replaces the fact, including false or absence');
                     assert.ok(findDescendant(fx.card(), '[data-resume-run]'));
                 }
                 Object.assign(activity, { phase: 'working', finishing_reviews: true });
+                project();
                 fx.hydrate();
                 assert.equal(phase(), 'Working', 'a stale fact cannot keep the resumed task paused');
                 assert.equal(findDescendant(fx.card(), '[data-resume-run]'), null);

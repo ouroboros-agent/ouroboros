@@ -18,7 +18,7 @@ from ouroboros.gateway.claudexor_contracts import (  # noqa: F401 -- public re-e
     ClaudexorReadState, ClaudexorStatusReads, ClaudexorPassiveReadError, ClaudexorQuotaResponse,
     ClaudexorStatusResponse,
 )
-
+from ouroboros.gateway.work_contracts import WorkStateFields
 from ouroboros.gateway.history_contracts import ChatHistoryResponse  # noqa: F401 -- public re-export
 from ouroboros.gateway.health_contracts import BootDocument, BootJob, BootStep, HealthResponse  # noqa: F401 -- public re-exports
 from ouroboros.gateway.attachment_contracts import (  # noqa: F401 -- public re-exports
@@ -633,6 +633,7 @@ class ProjectEntry(TypedDict, total=False):
     name: str
     chat_id: int
     working_dir: str
+    pinned: bool  # absent on legacy rows means unpinned; no routing/activity effect
     cognition: ProjectCognition
     provenance: str
     clone_url: str
@@ -761,7 +762,7 @@ class ActiveChatActivity(ActiveDirectTurn):  # global root census; phase and con
     project_admission_hold: NotRequired[Dict[str, Any]]
     pause_cause: NotRequired[str]  # budget | owner | restart | sleep | authority | unknown; display only
     finishing_reviews: NotRequired[bool]  # review work an owner Pause lets finish runs on; display only, no count
-    late_work: NotRequired[Dict[str, Any]]  # answered root with an open late phase (D10): title, answered_at; display only
+    late_work: NotRequired[Dict[str, Any]]  # answered root whose late work remains: title, answered_at; display only
     can_resume: NotRequired[bool]
     cancelable: NotRequired[bool]
 
@@ -783,8 +784,8 @@ class OwnerEffortRangeResponse(TypedDict):
     cognition: ProjectCognition
 
 
-class StateResponse(TypedDict):
-    """Shape of ``GET /api/state`` (happy path)."""
+class StateResponse(WorkStateFields):
+    """Shape of ``GET /api/state`` (happy path); the work projection fields come from ``WorkStateFields``."""
 
     uptime: int
     workers_alive: int

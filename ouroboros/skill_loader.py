@@ -85,6 +85,7 @@ class SkillReviewState:
     # Host-owned acceptance facts read beside review.json, never persisted in it
     # (install basis + release digest, owner edit digest: skill_acceptance).
     acceptance: Dict[str, Any] = field(default_factory=dict)
+    panel: Dict[str, Any] = field(default_factory=dict)
 
     def is_stale_for(self, current_hash: str) -> bool:
         return not current_hash or (self.reviewed_content_hash or self.content_hash) != current_hash
@@ -106,6 +107,7 @@ class SkillReviewState:
             "cost_usd": float(self.cost_usd or 0.0),
             "raw_result": self.raw_result,
             "raw_actor_records": list(self.raw_actor_records),
+            "panel": dict(self.panel),
         }
         if self.review_profile:
             data["review_profile"] = str(self.review_profile)
@@ -620,11 +622,7 @@ def _read_review_record(
         if isinstance(data.get("reviewer_models"), list)
         else []
     )
-    raw_actor_records = (
-        data.get("raw_actor_records")
-        if isinstance(data.get("raw_actor_records"), list)
-        else []
-    )
+    raw_actor_records = data.get("raw_actor_records") if isinstance(data.get("raw_actor_records"), list) else []
     advisory_result = (
         data.get("advisory_result")
         if isinstance(data.get("advisory_result"), dict)
@@ -652,7 +650,7 @@ def _read_review_record(
         raw_result=str(data.get("raw_result") or ""),
         raw_actor_records=[r for r in raw_actor_records if isinstance(r, dict)],
         advisory_result=dict(advisory_result),
-        review_profile=review_profile,
+        review_profile=review_profile, panel=dict(data.get("panel") or {}),
         author_disposition=author_disposition,
         reviewed_content_hash=str(data.get("reviewed_content_hash") or ""),
         legacy_content_hashes=[str(item) for item in (data.get("legacy_content_hashes") or []) if item][:4],

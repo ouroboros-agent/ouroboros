@@ -1,28 +1,50 @@
 /** The drawer follows the finger (owner Q1=A; docs/DESIGN.md "Shell").
  *
- * A horizontal drag that starts on the room opens the drawer; a drag on the open drawer (or its scrim) closes it.
- * Pointer Events only, transform-only motion driven by one number (`--drawer-p`, 0 closed … 1 open) that the scrim's
- * opacity follows; the owner of the drawer's state commits the result (so history, focus and inert stay the
- * layer stack's), and a gesture that does not commit leaves no trace. The drag is a shortcut: every gesture has a
- * visible control (☰ and ×). One constant switches it off in one line: DRAWER_DRAG. */
+ * A horizontal drag that starts anywhere on the room, the screen's edge and its controls included, opens the
+ * drawer; a drag on the open drawer (or its scrim) closes it. Only a field, a slider, media, selected text and
+ * anything that scrolls sideways keep their own touch (owner 19.10: from the edge, and from where the thumb is).
+ *
+ * Touch Events, so the finger stays on the drawer (owner 19.10: it came off halfway). Once the axis is decided,
+ * every touchmove is cancelled, so the browser cannot start a scroll mid-drag: iOS WebKit would, and then cancel
+ * the finger (WebKit 203335). That listener sits on the root element from the start, because iOS decides whether a
+ * touch waits for the page when it begins (WebKit 184251). The gesture itself is tracked on the element it started
+ * on, which keeps receiving its touch even after a re-render removes it from the page (a live card, a new message).
+ * If the system still takes the touch, the drawer settles from where the finger left it, never stranded halfway.
+ *
+ * Motion is transform-only and driven by one number (`--drawer-p`, 0 closed … 1 open) that the scrim's opacity
+ * follows. On release the drawer settles at the finger's speed (`--drawer-settle`). The owner of the drawer's state
+ * commits the result, so history, focus and inert stay the layer stack's, and a gesture that does not commit leaves
+ * no trace. The drag is a shortcut: every gesture has a visible control (☰ and ×). One constant switches it off in
+ * one line: DRAWER_DRAG. */
 
 export const DRAWER_DRAG = true;
 
 export const DRAG = Object.freeze({
-    edgeStart: 24,       // px: a start closer to the left edge belongs to the OS back-swipe
     slop: 10,            // px of movement before the axis is decided
-    axisRatio: 1.3,      // |dx| > ratio·|dy| locks the horizontal axis
+    axisRatio: 1,        // |dx| > ratio·|dy| locks the horizontal axis: a thumb's arc is a sideways drag
     minTravel: 24,       // px of travel before a fling may commit
     flingVelocity: 0.3,  // px/ms
     openPast: 0.5,       // a slow release opens past this progress
     closePast: 0.3,      // a slow release closes once this much of the drawer has gone
     sampleWindow: 100,   // ms of velocity samples
     clickGuard: 400,     // ms after a drag during which the click that ends it is not a tap
+    // The settle (style.css's curve starts at 2.25× its average speed): a fling keeps the finger's speed, a slow
+    // release moves at least `settleSpeed`, within `settleMin`…`settleMax` (Ionic's iOS menu takes 400 ms).
+    settleSpeed: 1.2,    // px/ms
+    settleMin: 180,      // ms
+    settleMax: 400,      // ms
+    // Past fully open the drawer gives like a rubber band (Apple's curve, as in use-gesture): d·M·c / (M + c·d), which
+    // keeps giving with every pixel of pull and approaches `rubberMax` px without reaching it. style.css paints the
+    // drawer's surface 64 px past its edge to fill that gap.
+    rubber: 0.15,
+    rubberMax: 48,
 });
 
-// What a drag may not start on: controls, editable text, the Shade's and the cards' own sliders.
-export const INTERACTIVE_SELECTOR = 'input, textarea, select, button, a[href], summary, label, details, video, audio, '
-    + '[role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="slider"], [contenteditable]:not([contenteditable="false"])';
+// What a drag may not start on: a field (the finger moves its caret or picks), a slider, media (the finger scrubs).
+// A button, a link or a summary under the finger is fine: a drag is not a tap, and the click that ends it is
+// swallowed (onClick).
+export const FIELD_SELECTOR = 'input, textarea, select, video, audio, [role="slider"], '
+    + '[contenteditable]:not([contenteditable="false"])';
 // What scrolls sideways itself: code, tables, tab strips, anything that declares it.
 export const SIDEWAYS_SELECTOR = 'pre, code, table, .md-table-wrap, .app-tab-strip, [data-scroll-x]';
 // What lies over the room and owns the finger while it is open (shown, not merely mounted): a dialog, the reader,
@@ -30,13 +52,34 @@ export const SIDEWAYS_SELECTOR = 'pre, code, table, .md-table-wrap, .app-tab-str
 export const BLOCKING_SELECTOR = 'dialog[open], .marketplace-modal-backdrop, .ui-popup, .task-control-menu, '
     + '.chat-photo-menu, .rw-shade:not([hidden]), details.chat-header-more[open]';
 
-const clamp = (value) => Math.min(1, Math.max(0, value));
+/** Progress for a finger that pulled the drawer `raw` of its width: 0…1 as is, a damped give past fully open. */
+export function stretch(raw, width) {
+    const p = Math.max(0, Number(raw) || 0);
+    if (p <= 1 || !(width > 0)) return Math.min(1, p) || 0;
+    const d = (p - 1) * width;
+    const give = (d * DRAG.rubberMax * DRAG.rubber) / (DRAG.rubberMax + DRAG.rubber * d);  // px, under rubberMax
+    return 1 + give / width;
+}
+const touchIn = (list, id) => {
+    for (let i = 0; i < (list?.length || 0); i += 1) if (list[i]?.identifier === id) return list[i];
+    return null;
+};
+
+/** How long the drawer takes to cover `remaining` px after a release at `velocity` px/ms. */
+export function settleMs(remaining, velocity) {
+    const speed = Math.max(Math.abs(Number(velocity) || 0), DRAG.settleSpeed);
+    return Math.round(Math.min(DRAG.settleMax, Math.max(DRAG.settleMin, (2.25 * Math.abs(remaining)) / speed)));
+}
 
 export function bindDrawerDrag({
     sidebar, scrim, isOpen, setOpen, isStack, isCoarse,
+    // The drag takes the scrim: whoever fades it out after a close (app.js) lets go of it.
+    onGrab = () => {},
+    // The layout owner's change notification (layout.js onLayoutChange): returns its disposer.
+    onLayout = () => () => {},
     win = globalThis.window, doc = globalThis.document, enabled = DRAWER_DRAG,
     // The eligibility of a start, injectable for tests; the defaults read the real DOM.
-    isInteractive = (el) => Boolean(el?.closest?.(INTERACTIVE_SELECTOR)),
+    isField = (el) => Boolean(el?.closest?.(FIELD_SELECTOR)),
     isSideways = (el) => Boolean(el?.closest?.(SIDEWAYS_SELECTOR)),
     isBlocked = () => [...(doc?.querySelectorAll?.(BLOCKING_SELECTOR) || [])].some((el) => el.getClientRects?.().length),
     hasSelection = () => Boolean(String(win?.getSelection?.()?.toString?.() || '').length),
@@ -44,7 +87,11 @@ export function bindDrawerDrag({
     if (!enabled || !sidebar || !scrim) return () => {};
     let g = null;
     let suppressUntil = 0;
+    let settleTimer = 0;
+    let scrimTimer = 0;
     const now = () => (typeof win?.performance?.now === 'function' ? win.performance.now() : Date.now());
+    const later = (ms, fn) => (typeof win?.setTimeout === 'function' ? win.setTimeout(fn, ms) : 0);
+    const cancel = (timer) => { if (timer && typeof win?.clearTimeout === 'function') win.clearTimeout(timer); };
 
     // The chain under the finger: a `touch-action: none` element (the effort strip) or a scroller that can move
     // sideways keeps its gesture.
@@ -59,18 +106,15 @@ export function bindDrawerDrag({
         return false;
     }
 
-    function eligibleOpenStart(event) {
-        const target = event.target;
-        if (event.clientX < DRAG.edgeStart) return false;
+    function eligibleOpenStart(target) {
         if (sidebar.contains?.(target) || scrim.contains?.(target)) return false;
-        if (isInteractive(target) || isSideways(target) || hasSelection()) return false;
+        if (isField(target) || isSideways(target) || hasSelection()) return false;
         if (isBlocked()) return false;
         if (chainKeepsGesture(target)) return false;
         return true;
     }
 
-    function eligibleCloseStart(event) {
-        const target = event.target;
+    function eligibleCloseStart(target) {
         if (!(sidebar.contains?.(target) || scrim.contains?.(target))) return false;
         return !target?.closest?.('input, textarea, select, [role="slider"]');
     }
@@ -86,68 +130,140 @@ export function bindDrawerDrag({
             if (!on) el.style.removeProperty('--drawer-p');
         }
     };
+    // The settle runs at the finger's speed; a tap on ☰ or × keeps style.css's own duration.
+    function settle(ms) {
+        cancel(settleTimer);
+        for (const el of [sidebar, scrim]) el.style.setProperty('--drawer-settle', `${ms}ms`);
+        settleTimer = later(ms + 60, () => {
+            for (const el of [sidebar, scrim]) el.style.removeProperty('--drawer-settle');
+        });
+    }
+    // A scrim that faded out with a closed drawer leaves the page (unless the drawer opened meanwhile).
+    function hideScrimAfter(ms) {
+        cancel(scrimTimer);
+        scrimTimer = later(ms, () => { if (!g && !isOpen()) scrim.hidden = true; });
+    }
 
-    function onDown(event) {
-        if (g && event.pointerId !== g.id) { restore(); return; }  // a second finger: back to where we started
-        if (!event.isPrimary || event.pointerType !== 'touch') return;
-        if (!isStack() || !isCoarse()) return;
+    // The gesture's own listeners, on the element the touch started on.
+    function listen(target) {
+        target?.addEventListener?.('touchmove', onMove, { passive: false });
+        target?.addEventListener?.('touchend', onEnd);
+        target?.addEventListener?.('touchcancel', onCancel);
+    }
+    function unlisten(target) {
+        target?.removeEventListener?.('touchmove', onMove);
+        target?.removeEventListener?.('touchend', onEnd);
+        target?.removeEventListener?.('touchcancel', onCancel);
+    }
+    function end() {
+        const gg = g;
+        g = null;
+        if (gg) unlisten(gg.target);
+        return gg;
+    }
+
+    function onStart(event) {
+        syncGuard();
+        const count = event.touches?.length || 0;
+        // A second finger, or a new touch after a gesture whose end never came: back to the start.
+        if (g) { restore(); if (count > 1) return; }
+        if (count !== 1 || !isStack() || !isCoarse()) return;
+        const touch = event.changedTouches?.[0] || event.touches?.[0];
+        const target = event.target;
+        if (!touch || !target) return;
         const open = Boolean(isOpen());
-        if (open ? !eligibleCloseStart(event) : !eligibleOpenStart(event)) return;
-        g = { id: event.pointerId, startOpen: open, x0: event.clientX, y0: event.clientY, mode: 'wait', samples: [],
-            target: event.target, lockX: 0, width: 0, p: open ? 1 : 0 };
+        if (open ? !eligibleCloseStart(target) : !eligibleOpenStart(target)) return;
+        g = { id: touch.identifier, target, startOpen: open, x0: touch.clientX, y0: touch.clientY, mode: 'wait',
+            samples: [], lockX: 0, width: 0, p: open ? 1 : 0, viewWidth: win?.innerWidth || 0 };
+        listen(target);
     }
 
     function onMove(event) {
-        if (!g || event.pointerId !== g.id) return;
-        const dx = event.clientX - g.x0;
-        const dy = event.clientY - g.y0;
+        if (!g) return;
+        if ((event.touches?.length || 0) > 1) { restore(); return; }
+        const touch = touchIn(event.changedTouches, g.id) || touchIn(event.touches, g.id);
+        if (!touch) return;
+        const dx = touch.clientX - g.x0;
+        const dy = touch.clientY - g.y0;
         if (g.mode === 'wait') {
-            if (Math.abs(dy) >= DRAG.slop && Math.abs(dy) >= Math.abs(dx)) { g = null; return; }  // the page scrolls
+            if (Math.abs(dy) >= DRAG.slop && Math.abs(dy) >= Math.abs(dx)) { end(); return; }  // the page scrolls
             if (Math.abs(dx) < DRAG.slop || Math.abs(dx) <= DRAG.axisRatio * Math.abs(dy)) return;
-            if ((dx > 0) === g.startOpen) { g = null; return; }  // the wrong way: nothing to move
+            if ((dx > 0) === g.startOpen) { end(); return; }  // the wrong way: nothing to move
+            if (event.cancelable === false) { end(); return; }  // the browser already scrolls: the finger is its
+            if (isBlocked()) { end(); return; }  // a menu opened under the still finger (a long press) keeps it
+            event.preventDefault();
             g.mode = 'drag';
-            g.lockX = event.clientX;
+            g.lockX = touch.clientX;
             g.width = sidebar.getBoundingClientRect?.().width || 320;
-            try { g.target?.setPointerCapture?.(g.id); } catch { /* a synthetic pointer */ }
+            cancel(settleTimer);
+            cancel(scrimTimer);
+            for (const el of [sidebar, scrim]) el.style.removeProperty('--drawer-settle');
+            onGrab();
             if (!g.startOpen) scrim.hidden = false;
             paint(true);
             setProgress(g.startOpen ? 1 : 0);
             return;
         }
+        if (event.cancelable !== false) event.preventDefault();
         const t = event.timeStamp ?? now();
-        g.samples.push([t, event.clientX]);
+        g.samples.push([t, touch.clientX]);
         g.samples = g.samples.filter((sample) => t - sample[0] <= DRAG.sampleWindow);
-        setProgress(clamp((g.startOpen ? 1 : 0) + (event.clientX - g.lockX) / g.width));
+        g.lastX = touch.clientX;
+        setProgress(stretch((g.startOpen ? 1 : 0) + (touch.clientX - g.lockX) / g.width, g.width));
     }
 
-    function onUp(event) {
-        if (!g || event.pointerId !== g.id) return;
-        const gg = g;
-        g = null;
-        if (gg.mode !== 'drag') return;  // a tap, not a drag
-        try { gg.target?.releasePointerCapture?.(gg.id); } catch { /* released already */ }
+    function onEnd(event) {
+        if (!g) return;
+        const touch = touchIn(event.changedTouches, g.id);
+        if (touch) release(touch.clientX);
+    }
+
+    /** The finger left at `x` (an end, or the system taking the touch): settle at the nearest state the finger's
+     * speed points to, never stranded halfway. */
+    function release(x) {
+        const gg = end();
+        if (!gg || gg.mode !== 'drag') return;  // a tap, not a drag
         const first = gg.samples[0];
         const last = gg.samples[gg.samples.length - 1];
         const velocity = first && last && last[0] > first[0] ? (last[1] - first[1]) / (last[0] - first[0]) : 0;
-        const travel = Math.abs(event.clientX - gg.x0);
+        const travel = Math.abs((Number.isFinite(x) ? x : gg.lastX ?? gg.x0) - gg.x0);
         let open;
         if (Math.abs(velocity) >= DRAG.flingVelocity && travel >= DRAG.minTravel) open = velocity > 0;
         else open = gg.startOpen ? gg.p > 1 - DRAG.closePast : gg.p >= DRAG.openPast;
+        const ms = settleMs((open ? 1 - gg.p : gg.p) * gg.width, velocity);
+        settle(ms);
         paint(false);
         if (open !== gg.startOpen) setOpen(open);
-        else if (!open) scrim.hidden = true;  // sprang back closed
+        else if (!open) hideScrimAfter(ms);  // sprang back closed: the scrim fades with it
         suppressUntil = now() + DRAG.clickGuard;
     }
 
-    /** Multitouch, pointercancel, lost capture, a resize: back to the starting state, no history change. */
-    function restore() {
+    // The system took the touch (an incoming call, Telegram's edge, an iOS gesture): the drawer still settles from
+    // where the finger left it.
+    function onCancel(event) {
         if (!g) return;
-        const gg = g;
-        g = null;
-        if (gg.mode !== 'drag') return;
-        try { gg.target?.releasePointerCapture?.(gg.id); } catch { /* gone */ }
+        const touch = touchIn(event.changedTouches, g.id);
+        if (touch) release(touch.clientX ?? g.lastX);
+    }
+
+    /** A second finger or a new width: back to the start, no history change. */
+    function restore() {
+        const gg = end();
+        if (!gg || gg.mode !== 'drag') return;
+        const ms = settleMs((gg.startOpen ? 1 - gg.p : gg.p) * gg.width, 0);
+        settle(ms);
         paint(false);
-        if (!gg.startOpen) scrim.hidden = true;
+        if (!gg.startOpen) hideScrimAfter(ms);
+    }
+
+    // The page itself never scrolls under a dragged drawer (registered up front: see the module comment).
+    function onPageMove(event) {
+        if (g?.mode === 'drag' && event.cancelable !== false) event.preventDefault();
+    }
+    // A height-only change is a browser bar or the keyboard moving (Safari, Telegram); a new width is a new layout.
+    function onResize() {
+        syncGuard();
+        if (g && (win?.innerWidth || 0) !== g.viewWidth) restore();
     }
 
     // The click that ends a drag is not a tap on whatever lies under the finger.
@@ -158,21 +274,35 @@ export function bindDrawerDrag({
         event.preventDefault();
     }
 
-    doc.addEventListener('pointerdown', onDown, { passive: true });
-    doc.addEventListener('pointermove', onMove, { passive: true });
-    doc.addEventListener('pointerup', onUp);
-    doc.addEventListener('pointercancel', restore);
-    doc.addEventListener('lostpointercapture', restore);
+    // On the root element, not window, document or body: iOS treats those as passive by default (WebKit 182521).
+    // The blocking move listener is there only where a drag can start (a phone layout under a finger), mounted
+    // when the layout changes, before any touch in it: elsewhere a touch's first move never waits for the page.
+    const root = doc.documentElement || doc;
+    let guarded = false;
+    function syncGuard() {
+        const want = Boolean(isStack() && isCoarse());
+        if (want === guarded) return;
+        guarded = want;
+        if (want) root.addEventListener('touchmove', onPageMove, { passive: false });
+        else root.removeEventListener('touchmove', onPageMove);
+    }
+    root.addEventListener('touchstart', onStart, { passive: true });
+    syncGuard();
+    // theme.js switches the layout on its own media-query change, after a resize handler has run: the guard follows
+    // that switch; resize and the first touch are fallbacks.
+    const unwatchLayout = onLayout(syncGuard);
     doc.addEventListener('click', onClick, true);
-    win.addEventListener('resize', restore);
+    win.addEventListener('resize', onResize);
     return () => {
         restore();
-        doc.removeEventListener('pointerdown', onDown);
-        doc.removeEventListener('pointermove', onMove);
-        doc.removeEventListener('pointerup', onUp);
-        doc.removeEventListener('pointercancel', restore);
-        doc.removeEventListener('lostpointercapture', restore);
+        end();
+        cancel(settleTimer);
+        cancel(scrimTimer);
+        root.removeEventListener('touchstart', onStart);
+        root.removeEventListener('touchmove', onPageMove);
+        guarded = false;
+        unwatchLayout?.();
         doc.removeEventListener('click', onClick, true);
-        win.removeEventListener('resize', restore);
+        win.removeEventListener('resize', onResize);
     };
 }

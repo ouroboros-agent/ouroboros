@@ -568,8 +568,9 @@ class _InPlaceFill:
         self.size += len(chunk)
 
 
-def _fill_private_copy(source: Path, checkout: Path, copy_root: Path) -> None:
-    """Give one file Git checked out into a not-yet-returned copy the source's exact bytes.
+def _fill_private_copy(source: Path, checkout: Path, copy_root: Path) -> bool:
+    """Give one file Git checked out into a not-yet-returned copy the source's exact bytes; True when
+    checkout wrote it (its index row then carries checkout's stat).
 
     Nothing reads or runs in the copy before provisioning returns, and the
     whole-tree diff after population binds every byte to the baseline, so the
@@ -593,7 +594,7 @@ def _fill_private_copy(source: Path, checkout: Path, copy_root: Path) -> None:
         if not os.path.lexists(copy_root / ".git"):
             raise
         copy_artifact_file(source, checkout)
-        return
+        return False
     if not stat.S_ISREG(info.st_mode):
         raise OSError(f"snapshot checkout is not a regular file: {checkout}")
     if info.st_mode & 0o600 != 0o600:  # an owner-unwritable umask; copystat restores the mode
@@ -603,6 +604,7 @@ def _fill_private_copy(source: Path, checkout: Path, copy_root: Path) -> None:
         stream_artifact_file(source, sink)
         handle.truncate(sink.size)
     shutil.copystat(source, checkout)
+    return True
 
 
 def provision_execution_snapshot(
@@ -838,6 +840,7 @@ def _provision_git_copy(
         # Read the existing tree inventory so deletions, links and gitlinks
         # keep Git's semantics and excluded paths can never enter the copy.
         copied: List[bytes] = []
+        checked_out: List[bytes] = []
         for item in manifest_raw.split(b"\0"):
             metadata, separator, raw_path = item.partition(b"\t")
             if separator and metadata.split()[0] in (b"100644", b"100755"):
@@ -845,15 +848,19 @@ def _provision_git_copy(
                 original = target / relative
                 if original.is_symlink():
                     raise OSError(f"snapshot input changed from a regular file: {relative}")
-                _fill_private_copy(original, wt_path / relative, wt_path)
+                if _fill_private_copy(original, wt_path / relative, wt_path):
+                    checked_out.append(item)
                 copied.append(raw_path)
-        # The checkout recorded each entry's stat for the bytes IT wrote; a
-        # CRLF/smudge rewrite (core.autocrlf=true is Git for Windows' default)
-        # then differs in size from the copied source bytes, and git trusts a size
-        # mismatch as a modification without re-hashing — every such file would
-        # read as modified in the child's `git status` for the run's whole life.
-        # One update-index re-hashes the copied bytes through the same clean
-        # filters the baseline used (identical blob) and re-records their stat.
+        # The checkout recorded each entry's stat for the bytes IT wrote, and git trusts that stat: a
+        # CRLF/smudge rewrite (core.autocrlf=true is Git for Windows' default) differs in size and would
+        # read as modified for the run's whole life, and a same-size source edit since the baseline keeps
+        # checkout's blob when its time matches to the second (copystat puts the source's mtime back; Git
+        # for Windows' ctime is the creation time), so the diff below would miss it. Those rows go back to
+        # the baseline without stat, and one update-index hashes every copied byte through the same clean
+        # filters the baseline used (identical blob) and records its stat.
+        if checked_out:
+            _git_env(wt_path, "update-index", "-z", "--index-info", env=dict(os.environ),
+                     input_bytes=b"\0".join(checked_out) + b"\0")
         if copied:
             _git_env(wt_path, "update-index", "-z", "--stdin", env=dict(os.environ),
                      input_bytes=b"\0".join(copied) + b"\0")
@@ -1165,7 +1172,7 @@ def payload_capture_git_env(exec_root: Path):
         env["GIT_INDEX_FILE"] = str(index)
         yield env
     finally:
-        shutil.rmtree(control, ignore_errors=True)
+        _force_rmtree(control)  # the capture's git objects are read-only; a plain rmtree leaves them on Windows
 
 
 def _reproduce_confined_link(target_root: Path, src_link: Path, dest_link: Path) -> bool:

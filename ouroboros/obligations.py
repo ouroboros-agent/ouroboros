@@ -34,72 +34,21 @@ _FACT_COLUMNS = ("task_id", "headless_child_drive_root", "child_drive_root", "dr
 
 
 def review_collection_pending(row: dict) -> bool:
-    """Conservative body-only selection for free acceptance collection, not a packer duty.
-    Live controllers remain candidates; actor death needs no body rewrite. Closed
-    legacy panels acquire no notice unless their own matching receipt already owes it.
-    Another surface's open pointer is a candidate too: the collector removes it once its
-    controller is proven dead (``review_operation.recover_orphaned_acceptance_operations``)."""
-    from ouroboros.review_projection import _actor_pending
-
+    """The ``tasks.review_collection_pending`` column's predicate, kept with the store schema: the
+    task holds an open review operation pointer (a malformed one counts). Its agent-session reader may
+    hold a retained handle's absolute path, so the packer keeps the task's loose files
+    (``evidence_packs.row_packable``), and the maintenance pass removes the pointer once its controller
+    is proven dead (``review_operation.retire_dead_review_pointers``). What the retired task acceptance
+    left (closed pointers, panels, ``acceptance-late:`` receipts) is history, never open work."""
     operations = row.get("review_operations", {})
-    projection = row.get("review_projection", {})
     if operations is None:
         operations = {}
-    if projection is None:
-        projection = {}
-    if not isinstance(operations, dict) or not isinstance(projection, dict):
+    if not isinstance(operations, dict):
         return True
-    pointed = set()
     for entry in operations.values():
         if not isinstance(entry, dict):
             return True
-        key = entry.get("retry_key")
-        if key is not None and not isinstance(key, str):
-            return True
-        pointed.add(key)
-        if entry.get("control_only"):
-            continue
-        if entry.get("surface") != "task_acceptance":
-            if entry.get("state") in {"preparing", "retained", "dispatched"}:
-                return True
-            continue
-        state = entry.get("state")
-        if not isinstance(state, str) or state not in {"closed", "collected", "preparation_unknown", "preparation_refused"}:
-            return True
-    panels, receipts = projection.get("panels", []), projection.get("late_notice_receipts", {})
-    if panels is None:
-        panels = []
-    if receipts is None:
-        receipts = {}
-    if not isinstance(panels, list) or not isinstance(receipts, dict):
-        return True
-    for panel in panels:
-        if not isinstance(panel, dict):
-            return True
-        if panel.get("surface") != "task_acceptance" or panel.get("authority") != "host_root":
-            continue
-        actors = panel.get("actors") or []
-        if not isinstance(actors, list) or any(not isinstance(actor, dict) for actor in actors):
-            return True
-        try:
-            pending = any(_actor_pending(actor) for actor in actors)
-        except TypeError:  # a malformed actor state cannot certify settled work
-            return True
-        if pending:
-            return True  # only the retained source can identify its retry key
-        late = panel.get("late_settlement")
-        if late is None:
-            continue
-        if not isinstance(late, dict) or not isinstance(late.get("reviewed_subject", {}), dict):
-            return True
-        key = str((late.get("reviewed_subject") or {}).get("retry_key") or "")
-        if not key or key in pointed:
-            continue
-        receipt = receipts.get(f"acceptance-late:{key}")
-        if receipt is None or isinstance(receipt, dict) and receipt.get("panel_id") != panel.get("panel_id"):
-            continue
-        if not isinstance(receipt, dict) or receipt.get("custody") != "terminal_outbox" \
-                or receipt.get("settled_at") != late.get("settled_at"):
+        if not entry.get("control_only") and entry.get("state") in {"preparing", "retained", "dispatched"}:
             return True
     return False
 

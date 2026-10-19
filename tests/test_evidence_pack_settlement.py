@@ -97,16 +97,15 @@ def test_a_terminal_task_under_an_open_review_waits_like_a_live_one_until_the_re
     reviewer was handed the absolute path of the retained packet), so the task is neither packed nor its
     shared blob unlinked, the packet path stays, and the task rests; the pointer closing moves its stamp,
     and the next pass packs and unlinks everything, the packet still readable through the resolver."""
-    from ouroboros.acceptance_retrieving import PACKET_SOURCE_ID, _source_path
-    from ouroboros.artifacts import store_actor_source_bytes
+    from ouroboros.artifacts import store_actor_source_bytes, task_artifact_dir_path
 
     raw = b'{"shared": "evidence"}'
     done, _ = _task(root, "done", blobs=1, payloads=[raw])
     refs, handle = _task(root, "reviewed", blobs=2, payloads=[raw, b'{"own": true}'])
     packet = b'{"goal": "accept the delivered answer", "evidence": "' + b"y" * 4000 + b'"}'
-    ref = store_actor_source_bytes(root, "reviewed", category="context_checkpoints", source_id=PACKET_SOURCE_ID,
+    ref = store_actor_source_bytes(root, "reviewed", category="context_checkpoints", source_id="review-packet",
                                    data=packet, extension="json")
-    path = pathlib.Path(_source_path(root, "reviewed", ref))
+    path = (task_artifact_dir_path(root, "reviewed") / ref["path"]).resolve()  # the absolute path a session reads
     pointer = {"surface": surface, "state": "dispatched", "retry_key": "task_acceptance:d1",
                "controller": {"pid": 1, "birth": "b", "session": "s"}}
     _result(root, "reviewed", acceptance_debt={"debt_id": "d1"}, review_operations={"owner-1": pointer})

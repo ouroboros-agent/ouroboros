@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { bindHeaderControlPlacement, renderPageHeader } from '../modules/page_header.js';
+import { bindHeaderControlPlacement, renderMobileNavToggle, renderPageHeader } from '../modules/page_header.js';
 
 test('page headers retain their toolbar contract with an optional chrome recipe', () => {
     for (const field of ['toolbarHtml', 'actionsHtml']) {
@@ -29,9 +29,12 @@ test('one header: no icon, no caption line, the tabs are a sibling after the row
     assert.match(project, /<h2 class="app-page-title" id="project-panel-title"><\/h2>/);
     assert.doesNotMatch(project, /data-sidebar-names|data-empty/, 'a Project is named by its owner: its name stays');
     assert.match(project, /app-page-trailing/);
-    assert.match(project, /data-mobile-nav-toggle/, '☰ is in every header, the Project included');
+    assert.match(project, /data-mobile-nav-toggle/, 'a header shows ☰ unless its room carries it in the composer');
     assert.match(renderPageHeader({ title: 'x', titleId: '"><i>' }), /id="&quot;&gt;&lt;i&gt;"/);
     assert.doesNotMatch(renderPageHeader({ title: 'x', showMobileNav: false }), /data-mobile-nav-toggle/);
+    // A room's ☰ (owner 19.10, 1A): the composer row's first control, capsule-sized with the finger's hit area.
+    assert.match(renderMobileNavToggle({ inComposer: true }), /class="shell-icon-control mobile-nav-toggle composer-menu ui-hit-area"/);
+    assert.match(renderMobileNavToggle(), /class="shell-icon-control mobile-nav-toggle"/);
 });
 
 test('Restart and the budget are the same nodes, placed by layout: the row on a desk, the ⋯ menu on a phone', () => {

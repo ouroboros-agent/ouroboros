@@ -52,6 +52,17 @@ def chat(root: pathlib.Path, rows) -> list:
     return list(rows)
 
 
+def chat_bulk(root: pathlib.Path, rows) -> list:
+    """The same canonical rows for a root that holds no dialogue yet, stored in one pass: their
+    chain file cut over by the explicit import. ``chat`` commits a synchronous transaction per row;
+    10 002 of them outlasted the 300-s test bound on a Windows runner, whose timeout then ended the
+    whole xdist worker."""
+    assert not dialogue_store.present(root)
+    dialogue_test.seed(root, live={"chat": rows})
+    dialogue_test.import_all(root)
+    return list(rows)
+
+
 def addr(row) -> str:
     return chat_chain.format_address(chat_chain.row_address(row))
 
@@ -451,7 +462,7 @@ def test_every_read_mode_stays_within_the_limit_names_its_continuation_and_write
     side = project_chat(tmp_path, "giant-room")
     giant = {"chat_id": side, "direction": "out", "ts": ts(1), "text": "G" * (LIMIT * 2 + 17)}
     after_giant = {"chat_id": side, "direction": "in", "ts": ts(2), "text": "after the giant"}
-    chat(tmp_path, [*room, giant, after_giant])
+    chat_bulk(tmp_path, [*room, giant, after_giant])
     store = ChronicleStore(tmp_path)
     sizes = [61_000, 47_500, 33_000, 21_000, 12_310, 9_000, 4_000, 2_000, 1_000]  # 190 810 chars of Main
     for block, size in enumerate(sizes):

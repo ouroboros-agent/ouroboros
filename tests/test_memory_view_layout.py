@@ -369,7 +369,7 @@ def test_the_task_trace_keeps_the_view_fact_of_its_request(tmp_path, monkeypatch
 
     monkeypatch.setattr(loop, "call_llm_with_retry",
                         lambda *_a, **_kw: ({"role": "assistant", "content": "done"}, 0.0))
-    monkeypatch.setattr(loop, "_run_task_acceptance_review_once", lambda **_kw: False)
+    monkeypatch.setattr("ouroboros.tools.review_result.result_review_at_delivery", lambda *_a, **_kw: False)
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
     facts = {"role": "integrator", "room_id": "1", "floor": {"steps": {}}, "story_status": {"folded": 0, "total": 2}}
     for given in (facts, None):

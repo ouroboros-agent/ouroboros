@@ -397,6 +397,28 @@ def task_has_live_queue_ownership(drive_root: pathlib.Path, task_id: str) -> boo
         return True
 
 
+def task_subtree_has_live_queue_rows(drive_root: pathlib.Path, task_id: str) -> bool:
+    """Worker-side twin of the owner Stop's live-subtree check for a settled root.
+
+    A RUNNING or PENDING snapshot row whose ``root_task_id`` is the target is a
+    live member of its tree (the target's own row is the ownership half above):
+    an ended root's helpers still spend. Fail-OPEN exactly like
+    ``task_has_live_queue_ownership``: only a FRESH snapshot without such a row
+    answers False.
+    """
+    try:
+        snapshot = _load_queue_snapshot(pathlib.Path(drive_root))
+        if snapshot.get("_snapshot_missing") or snapshot.get("_snapshot_invalid") or _snapshot_is_stale(snapshot):
+            return True
+        target = str(task_id or "").strip()
+        return any(isinstance(row, dict) and isinstance(row.get("task"), dict)
+                   and str(row["task"].get("root_task_id") or "") == target
+                   and str(row.get("id") or row["task"].get("id") or "") != target
+                   for lane in ("running", "pending") for row in snapshot.get(lane) or [])
+    except Exception:
+        return True
+
+
 def _queue_task_status(snapshot: Dict[str, Any], task_id: str) -> tuple[str, Dict[str, Any]]:
     if snapshot.get("_snapshot_missing") or snapshot.get("_snapshot_invalid"):
         return "unknown", {}

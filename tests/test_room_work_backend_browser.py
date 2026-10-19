@@ -330,7 +330,8 @@ def test_main_sheet_follows_real_roots_through_pause_resume_and_finish(direct_se
 
                 trigger.click()
                 opened = _wait_facts(page, "main", lambda f: f["surfaceHidden"] is False and len(f["rows"]) == 3
-                                     and all(r["name"] for r in f["rows"]), "the sheet with three named roots")
+                                     and all(r["name"] and r["target"] == "card" for r in f["rows"]),
+                                     "the sheet with three named roots, each on its card")
                 evidence.record("opened", opened)
                 ids = [row["id"] for row in opened["rows"]]
                 assert sorted(ids) == sorted([ALPHA, BRAVO, CHARLIE]), opened
@@ -346,7 +347,8 @@ def test_main_sheet_follows_real_roots_through_pause_resume_and_finish(direct_se
                 for task_id in ids:
                     row = _row(opened, task_id)
                     assert row["target"] == "card", row
-                    assert cards[task_id] and row["name"] == cards[task_id], ("a row names its card", row, cards)
+                    # A row names its work by the request's title; its card shows the same work.
+                    assert row["name"] == TITLE[task_id] and TITLE[task_id] in cards[task_id], ("a row names its work", row, cards)
                 assert alpha["more"] and alpha["moreId"] == ALPHA, alpha
                 # One Shade unfolds under Main's bar, which marks itself open (DESIGN "Room work status").
                 assert page.locator("#page-chat .chat-page-header[data-rw-open] .rw-shade:not([hidden])").count() == 1
@@ -377,7 +379,8 @@ def test_main_sheet_follows_real_roots_through_pause_resume_and_finish(direct_se
                 evidence.record("paused", paused_facts)
                 assert [row["id"] for row in paused_facts["rows"]] == ids, "order holds while open"
                 alpha = _row(paused_facts, ALPHA)
-                assert alpha["tone"] == "wait" and alpha["word"].startswith("Paused"), alpha
+                # The owner's own Pause: neutral ink (amber is only what waits for the owner), and it says who paused.
+                assert (alpha["tone"], alpha["word"], alpha["secondary"]) == ("held", "Paused", "by you"), alpha
                 assert alpha["more"], "a paused root keeps its shared controls"
                 evidence.shot(page, "04-main-paused-open")
 
@@ -403,7 +406,7 @@ def test_main_sheet_follows_real_roots_through_pause_resume_and_finish(direct_se
                 evidence.record("finished_open", finished)
                 assert [row["id"] for row in finished["rows"]] == ids
                 for row in finished["rows"]:
-                    assert row["name"] == cards[row["id"]], row
+                    assert row["name"] == TITLE[row["id"]], row
                     assert not (row["more"] or row["resume"] or row["question"]), row
                     assert row["tone"] == "done" and row["target"] == "card", row
                 assert not finished["surfaceHidden"], "work that ends never closes the list"

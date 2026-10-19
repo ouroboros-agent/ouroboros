@@ -20,6 +20,7 @@ const CHIP = {
     cancelling: () => tr('task.chip.cancelling', 'Cancelling…'),
     paused: () => tr('task.chip.paused', 'Paused'),
     pausing: () => tr('task.chip.pausing', 'Pausing…'),
+    waiting: () => tr('task.chip.waiting', 'Waiting'),
     unconfirmed: () => tr('task.chip.activity_unconfirmed', 'Activity unconfirmed'),
     waitingAccess: () => tr('task.chip.waiting_for_access', 'Waiting for access'),
     working: () => tr('task.chip.working', 'Working'),
@@ -34,14 +35,31 @@ const CHIP = {
     background: () => tr('task.fact.in_background', 'in background'),
 };
 
+/** One chip word by its name (the room and the work rows say the cards' own words). */
+export const chipWord = (name) => CHIP[name]?.() || '';
+
+// The short reasons beside Paused or Waiting: who or what holds the work, keyed by the server's reason code
+// (gateway/work_status.py). A code without one is said in its sentence.
+const APP_STOPPED = () => tr('work.short.app_stopped', 'app stopped');
+const SHORT_REASON = {
+    paused_by_owner: () => tr('work.short.by_you', 'by you'),
+    paused_by_mind: () => tr('work.short.by_ouroboros', 'by Ouroboros'),
+    paused_by_host: APP_STOPPED, saved_on_stop: APP_STOPPED, after_restart: APP_STOPPED,
+    spending_limit: () => tr('work.short.spending_limit', 'spending limit'),
+    technical_pause: () => tr('work.short.technical_problem', 'technical problem'),
+    sleeping: () => tr('work.short.sleeping', 'sleeping'),
+};
+export const shortReason = (code) => SHORT_REASON[code]?.() || '';
+
+// A census pause cause read in the same words. The census's `owner` cause also covers Ouroboros's own Pause,
+// so only the work projection may say who paused: its reason code (paused_by_owner, …) may stand as the cause.
+const CAUSE_REASON = { budget: 'spending_limit', restart: 'after_restart', authority: 'technical_pause', sleep: 'sleeping' };
+
 export function pausePhaseLabel(phase, cause = '', finishingReviews = false) {
-    const label = phase === 'budget_pausing' ? CHIP.pausing() : CHIP.paused();
-    const reasons = { budget: ['budget', 'budget limit'], owner: ['owner', 'owner pause'],
-        restart: ['restart', 'after restart'], sleep: ['sleep', 'sleep'],
-        authority: ['authority', 'technical issue'] };
-    const reason = reasons[cause];
-    const text = reason ? fmt('{state} · {reason}', { state: label,
-        reason: tr(`task.pause_cause.${reason[0]}`, reason[1]) }) : label;
+    // A cold sleep continues by itself when it is woken: it waits, it is not paused.
+    const label = phase === 'budget_pausing' ? CHIP.pausing() : cause === 'sleep' ? CHIP.waiting() : CHIP.paused();
+    const reason = shortReason(CAUSE_REASON[cause] || cause);
+    const text = reason ? fmt('{state} · {reason}', { state: label, reason }) : label;
     // Owner 2026-10-08: reviewers already launched finish separately and visibly.
     // The census names tasks and model sends alike, so the chip names no count.
     return finishingReviews ? fmt('{state} · {finishing}', { state: text,
@@ -95,7 +113,7 @@ export function modelActivityPresentation(activity) {
 // never animates merely because the task still has post-task work.
 export function taskActivityPresentation({ phase = 'working', outcome = '', ended = false,
     finalizing = false, ownerWait = '', modelWaiting = false, hold = '', pauseCause = '', stopPolicy = '',
-    finishingReviews = false, modelActivity = null } = {}) {
+    finishingReviews = false, modelActivity = null, workView = null } = {}) {
     if (ended) return outcomeView(outcome);
     if (stopPolicy) {
         const motion = ['working', 'thinking', 'finalizing'].includes(phase) && !modelWaiting && !ownerWait && !hold;
@@ -105,6 +123,9 @@ export function taskActivityPresentation({ phase = 'working', outcome = '', ende
     let current;
     const modelPhase = modelActivityPresentation(modelActivity);
     if (phase === 'unknown') current = phaseView('unknown', CHIP.unconfirmed(), 'warn');
+    // The card of a work's current episode says the work's word and reason (work_status.cardWorkView).
+    else if (workView) current = { ...phaseView(workView.phase, workView.text, workView.classes, workView.motion,
+        workView.waiting), ...(workView.secondary ? { secondary: workView.secondary } : {}) };
     else if (['budget_paused', 'budget_pausing'].includes(phase)) {
         // Only a settled Pause names the reviews it lets finish (owner 2026-10-08).
         const finishing = phase === 'budget_paused' && Boolean(finishingReviews);
@@ -169,7 +190,7 @@ function recordPhase(record = {}, terminalPhase = 'done') {
         modelWaiting: Boolean(record.modelWaiting), hold: record.projectHold,
         pauseCause: record.pauseCause, stopPolicy: record.cancelPendingPolicy,
         finishingReviews: Boolean(record.finishingReviews),
-        modelActivity: record.modelActivity,
+        modelActivity: record.modelActivity, workView: record.workView,
     });
 }
 

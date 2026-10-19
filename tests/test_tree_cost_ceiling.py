@@ -1280,41 +1280,6 @@ class TestOneCeilingPerTree:
         assert "in-task cost ceiling" in line and "$50.00 hard tree cap" in line
         assert task_pacing.tree_spend_line({"settled_usd": None, "accounted_usd": 3.0}, active) == ""
 
-    def test_the_rails_line_names_the_binding_bound(self):
-        ceiling_binds = task_pacing._headroom_phrase(40.0, 10.0, 2.0)
-        wallet_binds = task_pacing._headroom_phrase(3.0, 40.0, 2.0)
-
-        assert ceiling_binds == "$8.00 unreserved budget left (in-task cost ceiling binds)"
-        assert wallet_binds == "$3.00 unreserved shared budget left (wallet binds)"
-        assert task_pacing._headroom_phrase(None, None, None) == "budget left unknown"
-
-    def test_acceptance_rails_use_global_wallet_and_tree_spend(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("TOTAL_BUDGET", "50")
-        from ouroboros.task_results import write_task_result
-        write_task_result(tmp_path, 'root', 'running', billing_group={
-            'billing_group_id': 'root', 'billing_group_limit_usd': 100.0,
-            'billing_group_limit_source': 'initial_task_admission', 'billing_group_limit_revision': 'fixture'})
-        for task_id, root_id, cost in (("child", "root", 42.0), ("other", "other", 7.0)):
-            with usage_accounting.usage_scope(usage_accounting.UsageScope(
-                drive_root=tmp_path, task_id=task_id, root_task_id=root_id,
-                global_limit_usd=50.0, root_limit_usd=100.0,
-            )):
-                reservation = usage_accounting.reserve_attempt(_request(reservation_usd=cost))
-                usage_accounting.mark_dispatched(reservation)
-                usage_accounting.settle_attempt(reservation, {}, cost_usd=cost, cost_final=True)
-        with usage_accounting.usage_scope(usage_accounting.UsageScope(
-            drive_root=tmp_path, task_id="child", root_task_id="root",
-            global_limit_usd=50.0, root_limit_usd=100.0,
-        )):
-            line = task_pacing._acceptance_rails_line_inner(
-                SimpleNamespace(has_deadline=False), self._profile(), 0,
-                {"task_cost_usd": 2.0, "cost_ceiling_usd": 47.0},
-                required_blocking=False,
-            )
-
-        assert "$2.00 spent this task" in line
-        assert "$1.00 unreserved shared budget left (wallet binds)" in line
-
 
 class TestGlobalBudgetDefault:
     """One number for the global budget, whatever the reader."""

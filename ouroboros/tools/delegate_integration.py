@@ -808,12 +808,12 @@ def _payload_selector_refusal(selector_root: str, retry_of: Any, bucket: Any,
 def payload_host_instructions(text: str, skill_name: str) -> str:
     """The payload-run variant of the host instructions (gate fix 3).
 
-    The generic text bans touching the host's "skills" — for a payload run that
+    The generic text bans modifying the host's skills — for a payload run that
     blanket ban would contradict the assignment itself, so it is narrowed and an
     explicit, truthful permission block is appended.
     """
     adjusted = text.replace(
-        "do not touch the host's runtime controls, skills, or memory",
+        "do not touch the host's runtime controls or memory, or modify its skills",
         "do not touch the host's runtime controls or memory")
     return adjusted + (
         "\nPAYLOAD ASSIGNMENT: this working tree is a PRIVATE standalone copy of "

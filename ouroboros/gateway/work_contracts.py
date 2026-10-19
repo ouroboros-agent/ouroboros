@@ -1,0 +1,113 @@
+"""``/api/state`` work projection contracts (v1, additive): one row per work, one rollup per room.
+
+Descriptive, not runtime validation. The browser twin is ``web/modules/work_types.js``; the frozen census
+(``active_chat_activities``) stays beside these fields unchanged (docs/architecture/11-frozen-contracts-v1.md).
+"""
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
+try:  # Python 3.11+
+    from typing import NotRequired, TypedDict  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover - CI supports Python 3.10.
+    from typing_extensions import NotRequired, TypedDict  # type: ignore[assignment]
+
+
+class WorkReason(TypedDict):
+    """One typed reason: ``code`` is closed per release, ``text`` its English sentence (unknown codes stay raw)."""
+
+    code: str
+    text: str
+    count: NotRequired[int]
+    ids: NotRequired[List[str]]
+    since: NotRequired[Any]
+
+
+class WorkTurn(TypedDict):
+    """What waits for the owner: an unanswered question or an action only the owner takes."""
+
+    kind: str
+    task_id: str
+    quiz_id: NotRequired[str]
+    wait_id: NotRequired[str]
+    code: NotRequired[str]
+
+
+class WorkControl(TypedDict):
+    """An action the named door accepts now, on its exact target."""
+
+    action: str
+    target: str
+    scope: NotRequired[str]
+
+
+class WorkEpisode(TypedDict):
+    task_id: str
+    live: bool
+
+
+class WorkMembers(TypedDict):
+    working: int
+    waiting: int
+    delegated: int
+    ids: List[str]
+
+
+class WorkFocus(TypedDict):
+    text: str
+    at: Any
+
+
+class Work(TypedDict):
+    """One request with its Continue episodes and live members."""
+
+    work_id: str
+    room: Any
+    name: str
+    kind: str
+    project_id: str
+    episode: WorkEpisode
+    activity: str
+    transition: str
+    call: str
+    because: List[WorkReason]
+    turn: List[WorkTurn]
+    release: str
+    paused_by: Optional[str]
+    members: WorkMembers
+    controls: List[WorkControl]
+    since: Any
+    confirmed: bool
+    outcome: NotRequired[str]
+    focus: NotRequired[WorkFocus]
+    gaps: NotRequired[List[Dict[str, Any]]]
+    client_message_id: NotRequired[str]
+
+
+class RoomStatus(TypedDict):
+    """One room's status from its works: the most active work speaks; ``amber`` while something waits for the owner."""
+
+    activity: str
+    transition: str
+    call: str
+    turn: List[Dict[str, Any]]
+    amber: bool
+    mark: str
+    confirmed: bool
+    works: List[str]
+
+
+class WorkSummary(TypedDict):
+    counts: Dict[str, int]
+    turn: int
+    confirmed: bool
+
+
+class WorkStateFields(TypedDict):
+    """The work projection's ``/api/state`` fields, inherited by ``contracts.StateResponse``."""
+
+    works: List[Work]
+    rooms: Dict[str, RoomStatus]
+    work_summary: WorkSummary
+    works_complete: bool
+    works_gaps: List[Dict[str, Any]]

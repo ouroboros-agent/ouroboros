@@ -334,7 +334,7 @@ def test_the_loop_does_not_report_predicted_max_as_a_lowered_start(tmp_path, mon
             return "test-model"
 
     monkeypatch.setattr(loop, "call_llm_with_retry", lambda *_a, **_kw: ({"role": "assistant", "content": "done"}, 0.0))
-    monkeypatch.setattr(loop, "_run_task_acceptance_review_once", lambda **_kw: False)
+    monkeypatch.setattr("ouroboros.tools.review_result.result_review_at_delivery", lambda *_a, **_kw: False)
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
     core, plan = _built(tmp_path / "w", monkeypatch)
     for name, window in (("tight", 1), ("roomy", 10_000_000)):

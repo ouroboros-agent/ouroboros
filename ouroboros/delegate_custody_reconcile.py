@@ -1,7 +1,7 @@
 """Reconciliation of delegated runs: the settle-or-cancel sweeps and their recovery.
 
 The open-run and pending-invocation projections, the loop-exit release, the
-kill-path and orphan sweeps and the per-run settle-or-cancel core. Extracted
+kill-path, tree-Stop and orphan sweeps and the per-run settle-or-cancel core. Extracted
 from delegate_custody.py (v7 DEL1 split); delegate_custody.py re-exports every
 name, so every existing reference — the tools, the supervisor sweeps, the
 tests and monkeypatch targets — still finds them there.
@@ -47,6 +47,37 @@ def open_runs(drive_root: Any, state: Optional[Dict[str, "RunCustody"]] = None) 
 
         state = current_runs(drive_root, "state=?", ("held",))
     return [custody for custody in state.values() if not custody.settled]
+
+
+def run_tree_id(custody: RunCustody) -> str:
+    """The task tree a run belongs to: its recorded root, else its own task (the custody store's tree key)."""
+    return str(custody.root_task_id or custody.task_id or "")
+
+
+def tree_open_runs(drive_root: Any, task_id: str) -> List[RunCustody]:
+    """The open runs a cascade Stop of ``task_id`` reaches (``stop_tree_runs``): the task's own and, when it is a
+    tree's root, every run of that tree, which the work projection counts as that root's live members."""
+    target = str(task_id or "")
+    return [custody for custody in open_runs(drive_root)
+            if target and target in {run_tree_id(custody), str(custody.task_id or "")}]
+
+
+def stop_tree_runs(drive_root: Any, task_id: str, *,
+                   gateway_factory: Optional[Callable[[], Any]] = None) -> List[Dict[str, Any]]:
+    """Cancel the open runs a cascade Stop of ``task_id`` reaches (``tree_open_runs``), behind the owner's verdict.
+
+    A run outlives every owner terminal that was not a verdict (``_reconcile_one``'s inverted floor), so
+    the open runs of a settled tree waited for exactly this one: the owner's cancellation, which also
+    speaks for a review panel's run. A Stop is a release surface: attach-only, no daemon is started and no
+    pending invocation is replayed (exit does not admit). An unconfirmed cancel leaves the run open.
+    """
+    from ouroboros.task_results import STATUS_CANCELLED
+
+    runs = tree_open_runs(drive_root, task_id)
+    if not runs:
+        return []
+    return _reconcile_each(drive_root, runs, gateway_factory or attach_only_gateway,
+                           deliberate_terminal=STATUS_CANCELLED)
 
 
 def pending_invocations(drive_root: Any,

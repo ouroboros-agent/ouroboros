@@ -334,22 +334,19 @@ class TestPartialWritesAndRetry:
 
 
 class TestRestartRecovery:
-    def test_startup_keeps_paused_synthesis_on_its_existing_resume_path(self, tmp_path, monkeypatch):
+    def test_startup_leaves_a_pause_an_earlier_version_saved_for_the_maintenance_pass(self, tmp_path, monkeypatch):
         from ouroboros import agent_task_pipeline as pipeline, post_task_synthesis
-        from supervisor import owner_pause_control
 
         _store(tmp_path, phase="paused")
-        calls = []
-        monkeypatch.setattr(post_task_synthesis, "revoke_late_phase_grant",
-                            lambda root, tid, **kw: calls.append(("revoke", tid, kw["reason"])))
-        monkeypatch.setattr(owner_pause_control, "retain_late_phase_latch",
-                            lambda root, tid: calls.append(("retain", tid)))
         monkeypatch.setattr(pipeline, "_settle_terminal_projection",
                             lambda *_a, **_kw: pytest.fail("paused synthesis has not settled"))
         monkeypatch.setattr(pipeline, "_run_post_task_processing_async",
-                            lambda *_a, **_kw: pytest.fail("Pause needs an explicit Resume"))
+                            lambda *_a, **_kw: pytest.fail("a saved Pause never runs"))
+        monkeypatch.setattr(post_task_synthesis, "end_saved_late_phase_pause",
+                            lambda *_a, **_kw: pytest.fail("boot never converts; the maintenance pass does"))
         assert pipeline.recover_pending_root_post_task_synthesis(tmp_path) == 0
-        assert calls == [("revoke", "root-1", "restart_no_resume"), ("retain", "root-1")]
+        checkpoint = pipeline.load_task_result(tmp_path, "root-1")["root_phase_checkpoint"]
+        assert checkpoint["post_task_synthesis"] == "paused"
 
     @pytest.mark.parametrize("ready", [False, True])
     def test_startup_selects_publication_debt_before_mail_capture(self, project_root, monkeypatch, ready):
@@ -595,7 +592,7 @@ def test_canonical_cancel_keeps_existing_artifact_readiness_exception(project_ro
         project_id='launch', workspace_root=str(project_root.root/'workspace'),
         artifact_status='pending', result='Cancelled by custody')
     assert settle_terminal_projection(project_root.root, 'root-1') == SETTLEMENT_SETTLED
-    assert _project_rows(project_root.root, 'root-1')[0]['outcome'] == 'Cancelled'
+    assert _project_rows(project_root.root, 'root-1')[0]['outcome'] == 'Stopped'
 
 
 def test_split_root_uses_stored_adoption_facts_without_task_argument(project_root):

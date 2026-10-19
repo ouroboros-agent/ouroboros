@@ -183,7 +183,7 @@ def test_ui_projects_sidebar_unread_and_keyboard_menu(direct_server_with_data):
                 kebab.press("Enter")
                 menu = page.locator('.project-row-menu[role="menu"]')
                 menu.wait_for(state="visible", timeout=5_000)
-                assert page.locator(':focus').get_attribute("data-prm") == "rename"
+                assert page.locator(':focus').get_attribute("data-prm") == "pin"  # the menu's first action
                 box = menu.bounding_box()
                 assert box is not None
                 assert box["x"] >= 0 and box["y"] >= 0
@@ -3611,7 +3611,7 @@ def test_ui_smoke_cancel_run_button_eligibility_and_cancelled_state(direct_serve
     """v6.82 P5 / S3 Q2: the stop control renders ONLY on live marker-attested
     root cards (never marker-less direct-turn cards, subagent children, or the
     reusable background slot), opens the dropdown, and a cancelled root
-    replays as an honest warn-toned "Cancelled" — never a generic "Done"."""
+    replays as an honest warn-toned "Stopped" — never a generic "Done"."""
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import sync_playwright
@@ -3646,19 +3646,12 @@ def test_ui_smoke_cancel_run_button_eligibility_and_cancelled_state(direct_serve
     (logs_dir / "progress.jsonl").write_text(
         "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8",
     )
-    task_results = data_dir / "task_results"
-    task_results.mkdir(parents=True, exist_ok=True)
-    (task_results / "gone-root.json").write_text(json.dumps({
-        "_schema_version": 1,
-        "task_id": "gone-root",
-        "status": "cancelled",
-        "reason_code": "cancelled",
-        "outcome_axes": {
-            "lifecycle": {"status": "cancelled"},
-            "execution": {"status": "cancelled"},
-        },
-    }) + "\n", encoding="utf-8")
+    from tests._store_shared import seed_result
     from tests.test_s3_task_control_browser import _hold_live_root, _release_mock_model
+
+    # Through the store, as a writer leaves it: a raw file waits for the store's reconcile pass.
+    seed_result(data_dir, "gone-root", {"status": "cancelled", "reason_code": "cancelled", "outcome_axes": {
+        "lifecycle": {"status": "cancelled"}, "execution": {"status": "cancelled"}}})
 
     _hold_live_root(data_dir, "live-root")
     direct_server_with_data["start_server"]()
@@ -3680,15 +3673,22 @@ def test_ui_smoke_cancel_run_button_eligibility_and_cancelled_state(direct_serve
                     card = page.locator(f'.chat-live-card[data-task-id="{absent_id}"]')
                     card.wait_for(state="attached", timeout=30_000)
                     assert card.locator('[data-cancel-run]').count() == 0, absent_id
-                # The cancelled root replays as an honest Cancelled state.
+                # The cancelled root replays as an honest Stopped state.
                 gone_phase = page.locator('.chat-live-card[data-task-id="gone-root"] [data-live-phase]')
                 page.wait_for_function(
                     "() => document.querySelector('.chat-live-card[data-task-id=\"gone-root\"]"
-                    " [data-live-phase]')?.textContent === 'Cancelled'",
+                    " [data-live-phase]')?.textContent === 'Stopped'",
                     timeout=30_000,
                 )
                 assert "cancelled" in (gone_phase.get_attribute("class") or "")
-                # Dropdown wiring (S3 Q2): open, then dismiss = keep running.
+                # Dropdown wiring (S3 Q2): open, then dismiss = keep running. Wrap up is a running
+                # root's control: the server starts the root first, then the page reads that state.
+                deadline = time.monotonic() + 60
+                while time.monotonic() < deadline and not any(w.get("work_id") == "live-root" and w.get("activity") == "working"
+                                                              for w in json.load(urllib.request.urlopen(url + "/api/state", timeout=10))["works"]):
+                    time.sleep(0.25)
+                with page.expect_response("**/api/state*", timeout=15_000):
+                    pass
                 cancel_btn.click()
                 menu = page.locator('body > .task-control-menu')
                 menu.wait_for(state="visible", timeout=10_000)

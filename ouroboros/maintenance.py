@@ -124,22 +124,27 @@ def _legacy_run(root: pathlib.Path, should_stop: Callable[[], bool]) -> Dict[str
 
 
 def _trash_due(root: pathlib.Path, row: Dict[str, Any], facts: Dict[str, Any], child: bool) -> bool:
-    """Drives a settlement moved aside (``state/custody_trash``) wait for their deletion; an entry
-    the last run could not remove waits for its identity to change."""
+    """Drives a settlement moved aside (``state/custody_trash``) wait for their deletion. An entry
+    the last run could not remove is no reason to spawn the child until its identity changes, and
+    the child retries it whenever it runs for another job: a released handle (Windows, a scanner)
+    changes neither its inode nor its time."""
     from ouroboros.task_custody import custody_trash_entries
 
-    stuck = row.get("stuck") or {}
-    return any(stuck.get(name) != identity for name, identity in custody_trash_entries(root))
+    stuck, entries = row.get("stuck") or {}, custody_trash_entries(root)
+    return bool(entries) if child else any(stuck.get(name) != identity for name, identity in entries)
 
 
 def _trash_run(root: pathlib.Path, should_stop: Callable[[], bool]) -> Dict[str, Any]:
     """Delete the moved drives (each was custodied under the queue lock before its move; nothing
-    serves or references it), so a child drive's tree is removed off the serving process."""
+    serves or references it), so a child drive's tree is removed off the serving process. The row is
+    written only when something changed: a retry that leaves the same entries stuck commits nothing."""
     from ouroboros.task_custody import remove_custody_trash
 
     report = remove_custody_trash(root, stop=should_stop)
     state = "failed" if report["stuck"] else "done"
-    maintenance_jobs.record(root, "custody_trash", state=state, stuck=report["stuck"], removed=report["removed"])
+    row = maintenance_jobs.job(root, "custody_trash") or {}
+    if report["removed"] or (row.get("state"), row.get("stuck") or {}) != (state, report["stuck"]):
+        maintenance_jobs.record(root, "custody_trash", state=state, stuck=report["stuck"], removed=report["removed"])
     return {"state": state, "items": report["removed"]}
 
 

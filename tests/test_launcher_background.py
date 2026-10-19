@@ -513,31 +513,48 @@ def test_turning_background_off_removes_the_icon_only_while_the_window_is_visibl
     assert ("dispose", 0.0) in background.events and not background.indicator.ready.is_set()
 
 
-READY = {"supervisor_ready": True, "supervisor_error": None, "active_chat_activities_complete": True}
+READY = {"supervisor_ready": True, "supervisor_error": None, "works_complete": True}
 
 
-def census(*phases, **facts):
-    return {**READY, "active_chat_activities": [{"phase": phase} for phase in phases], **facts}
+def projection(*works, confirmed=True, **facts):
+    """A /api/state work projection: each work is (activity, transition, has_turn)."""
+    rows = [{"work_id": f"w{index}", "activity": activity, "transition": transition,
+             "turn": [{"kind": "question", "task_id": f"w{index}"}] if turn else []}
+            for index, (activity, transition, turn) in enumerate(works)]
+    return {**READY, "works": rows, "work_summary": {"counts": {}, "turn": 0, "confirmed": confirmed}, **facts}
+
+
+def work(activity, transition="none", turn=False):
+    return (activity, transition, turn)
 
 
 @pytest.mark.parametrize("body,line", [
     (OSError("refused"), "Ouroboros: not responding"),  # refused, timed out (a busy server is not "stopped")
     (b"<html>", "Ouroboros: not responding"),
-    (census(), "Ouroboros: waiting"),
-    (census("queued"), "Ouroboros: waiting"),
-    (census("working", "finalizing", "thinking", "queued"), "Ouroboros: working on 3 tasks"),
-    (census("working"), "Ouroboros: working on 1 task"),
-    (census("budget_paused"), "Ouroboros: paused"),
-    (census("budget_pausing", "budget_paused"), "Ouroboros: pausing"),  # settling a Pause is not work (page)
-    (census("working", "budget_pausing"), "Ouroboros: working on 1 task"),
+    (projection(), "Ouroboros: waiting"),
+    (projection(work("queued")), "Ouroboros: queued"),
+    (projection(work("queued"), work("paused")), "Ouroboros: queued"),  # the server's order: queued before paused
+    (projection(work("working", "finalizing")), "Ouroboros: finalizing"),  # an answer's upkeep is not a new task
+    (projection(work("working", "finalizing"), work("working")), "Ouroboros: working on 2 tasks"),
+    (projection(work("working", "pausing"), work("working", "finalizing")), "Ouroboros: pausing"),  # as the room says
+    (projection(work("working"), work("working", "finalizing"), work("working"), work("queued")),
+     "Ouroboros: working on 3 tasks"),
+    (projection(work("working")), "Ouroboros: working on 1 task"),
+    (projection(work("paused")), "Ouroboros: paused"),
+    (projection(work("working", "pausing"), work("paused")), "Ouroboros: pausing"),  # settling a Pause is not work
+    (projection(work("working"), work("working", "pausing")), "Ouroboros: working on 1 task"),
+    # A direct turn preparing its request is work, not an unknown phase (it used to read "unconfirmed").
+    (projection(work("working")), "Ouroboros: working on 1 task"),
+    # What waits for the owner is counted on the same line.
+    (projection(work("working"), work("waiting", turn=True)), "Ouroboros: working on 1 task · 1 waits for you"),
+    (projection(work("paused", turn=True), work("waiting", turn=True)), "Ouroboros: waiting · 2 wait for you"),
     # What the server says it does not know is neither "waiting" nor "working" (review r1).
-    (census(supervisor_ready=False, supervisor_error="Supervisor init failed: boom"),
+    (projection(supervisor_ready=False, supervisor_error="Supervisor init failed: boom"),
      "Ouroboros: error, tasks are not running"),
-    (census(supervisor_ready=False), "Ouroboros: starting"),
-    (census(active_chat_activities_complete=False), "Ouroboros: activity unconfirmed"),
-    (census("unknown", active_chat_activities_complete=False), "Ouroboros: activity unconfirmed"),
-    (census("unknown"), "Ouroboros: activity unconfirmed"),
-    (census("working", active_chat_activities_complete=False), "Ouroboros: activity unconfirmed"),
+    (projection(supervisor_ready=False), "Ouroboros: starting"),
+    (projection(works_complete=False), "Ouroboros: activity unconfirmed"),
+    (projection(work("unknown")), "Ouroboros: activity unconfirmed"),
+    (projection(work("working"), confirmed=False), "Ouroboros: activity unconfirmed"),
 ])
 def test_the_state_line_reads_the_servers_own_activity(monkeypatch, body, line):
     def urlopen(url, timeout):

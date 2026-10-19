@@ -307,7 +307,8 @@ def test_late_owner_mail_at_delivery_close_survives_failure_of_the_next_round(tm
     monkeypatch.setattr(loop, "_dispatch_round_model", lambda *a, **k: (
         {"role": "assistant", "content": "candidate before new instruction", "tool_calls": []}, 0.0))
 
-    def late_mail(**kwargs):
+    def late_mail(*_args, **_kwargs):
+        # Mail written at the delivery's result-review step, right before the admission close.
         assert write_owner_message(tmp_path, "late instruction", "t-wait", msg_id="late-mail")
         return False
 
@@ -318,7 +319,7 @@ def test_late_owner_mail_at_delivery_close_survives_failure_of_the_next_round(tm
             raise RuntimeError("next round interrupted")
         return real_compaction(messages, ctx)
 
-    monkeypatch.setattr(loop, "_run_task_acceptance_review_once", late_mail)
+    monkeypatch.setattr("ouroboros.tools.review_result.result_review_at_delivery", late_mail)
     monkeypatch.setattr(loop, "_run_round_compaction", next_round_failure)
     monkeypatch.setattr("ouroboros.llm.LLMClient.chat", lambda *a, **k: pytest.fail("no provider call"))
     with pytest.raises(RuntimeError, match="next round interrupted"):

@@ -41,20 +41,29 @@ def test_ineligible_engine_or_tier_never_probes_filesystem(monkeypatch, tier, ve
     assert store._journal_mode(pathlib.Path("store.sqlite"), tier) == "PERSIST"
 
 
+def _mountinfo_path(path: pathlib.Path) -> str:
+    """A mount point as the kernel writes it in mountinfo: space, tab, newline and backslash as octal
+    escapes. The parser only runs on Linux, but this test runs everywhere: a Windows tmp_path carries
+    backslashes and a drive anchor, so its root mount is that anchor rather than ``/``."""
+    return str(path).translate({ord(" "): r"\040", ord("\t"): r"\011", ord("\n"): r"\012", ord("\\"): r"\134"})
+
+
 @pytest.mark.parametrize("kind,expected", [
     ("ext4", "ext4"), ("xfs", "xfs"), ("nfs", "nfs"), ("nfs4", "nfs4"), ("cifs", "cifs"),
     ("smb3", "smb3"), ("fuse", "fuse"), ("fuseblk", "fuseblk"), ("fuse.drive", "fuse.drive"), ("9p", "9p")])
 def test_linux_uses_longest_mount_including_bind_and_escaped_names(tmp_path, kind, expected):
-    mount = tmp_path / "nested mount"
+    mount = tmp_path.resolve() / "nested mount"
     mount.mkdir()
-    escaped = str(mount).replace(" ", r"\040")
-    table = f"1 0 8:1 / / rw - ext4 /dev/root rw\n2 1 0:2 /bind {escaped} rw - {kind} source rw\n"
+    root, escaped = _mountinfo_path(pathlib.Path(mount.anchor)), _mountinfo_path(mount)
+    table = f"1 0 8:1 / {root} rw - ext4 /dev/root rw\n2 1 0:2 /bind {escaped} rw - {kind} source rw\n"
     assert store._linux_filesystem(mount / "store.sqlite", table) == expected
     assert store._linux_filesystem(tmp_path / "elsewhere.sqlite", table) == "ext4"
     assert store._linux_filesystem(mount, "bad mountinfo") is None
     assert store._linux_filesystem(mount, "") is None
 
 
+@pytest.mark.skipif(os.name == "nt", reason="overlay options separate directories with ':', which a Windows "
+                    "drive path carries; this parser runs only on Linux")
 @pytest.mark.parametrize("backing", ["ext4", "nfs", "fuse.drive", "missing"])
 def test_overlay_requires_every_backing_directory_to_be_known_local(tmp_path, backing):
     overlay, lower, upper = [tmp_path / part for part in ("overlay", "lower", "upper")]

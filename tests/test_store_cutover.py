@@ -187,7 +187,6 @@ def runtime_reads(root):
         ("read_document", lambda: task_store.read_document(root, "t5")),
         ("signature", lambda: task_store.signature(root, "t5")),
         ("owner-held members", lambda: obligations.members(root, "custody_open")),
-        ("review collection candidates", lambda: list(task_store.review_collection_candidates(root))),
     ]
 
 
