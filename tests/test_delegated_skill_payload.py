@@ -1266,6 +1266,32 @@ def test_child_added_gitattributes_and_crlf_file_transport_raw(tmp_path, monkeyp
     custody._CUSTODY.clear()
 
 
+@pytest.mark.parametrize("note,bucket", [(".self_authored.json", "external"),
+                                         (".ouroboroshub.json", "ouroboroshub"), (".clawhub.json", "clawhub")])
+def test_payload_carrying_its_buckets_install_note_integrates(tmp_path, monkeypatch, note, bucket):
+    """The snapshot copy sits outside data/skills/<bucket>/: the CAS hashes the bucket's
+    per-install note there and in the live folder alike, so the edit still integrates."""
+    from ouroboros.tools.delegate import _capture_terminal_patch
+    from ouroboros.tools.delegate_integration import payload_content_hash
+    from ouroboros.tools.subagent_integration import _integrate_delegated_patch
+
+    ctx = _payload_ctx(tmp_path, monkeypatch)
+    skill = _seed_skill(tmp_path / "data", bucket=bucket)
+    (skill / note).write_text('{"origin": "host"}\n', encoding="utf-8")
+    handle = provision_payload_snapshot(target_root=skill, task_id="t-payload", snapshot_id="snapP")
+    custody._CUSTODY.clear()
+    (pathlib.Path(handle.path) / "notes.txt").write_text("DONE\n", encoding="utf-8")
+    entry = _payload_entry(handle, skill)
+    entry.resource_ref["source"] = bucket
+    capture = _capture_terminal_patch(ctx, entry)
+    assert capture["status"] == "ready_with_changes", capture
+    out = _integrate_delegated_patch(ctx, "run-p1", "apply", "")
+    assert "✅ Integrated" in out, out
+    assert (skill / "notes.txt").read_text(encoding="utf-8") == "DONE\n"
+    assert payload_content_hash(skill) == _capture_manifest(capture)["result_content_hash"]
+    custody._CUSTODY.clear()
+
+
 @pytest.mark.skipif(
     os.name == "nt",
     reason="Windows has no POSIX executable bit: os.chmod cannot flip 0644->0755, "

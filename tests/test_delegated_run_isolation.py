@@ -108,13 +108,15 @@ class TestRemoveAndGC:
         assert find_execution_snapshot("snapR", data_dir=data) is None
         assert _git(target, "rev-parse", handle.baseline_ref, check=False).returncode != 0
 
-    def test_gc_keeps_open_snapshots_and_removes_closed_ones(self, tmp_path):
+    def test_gc_keeps_open_snapshots_and_removes_closed_ones(self, tmp_path, monkeypatch):
         target = _seed_target(tmp_path)
         snaps, data = tmp_path / "snaps", tmp_path / "data"
         provision_execution_snapshot(target_root=target, task_id="t1",
                                      snapshot_id="open1", worktree_root=snaps, data_dir=data)
         provision_execution_snapshot(target_root=target, task_id="t1",
                                      snapshot_id="closed1", worktree_root=snaps, data_dir=data)
+        write_task_result(data, "t1", "completed")
+        monkeypatch.setattr("supervisor.queue.task_settlement_liveness", lambda _task: False)
         report = prune_execution_snapshots({"open1"}, worktree_root=snaps, data_dir=data)
         assert report["kept"] == ["open1"] and report["removed"] == ["closed1"]
         assert find_execution_snapshot("open1", data_dir=data) is not None
@@ -620,7 +622,7 @@ class TestOrphanReconciliation:
         # Blocker 1: the worker died between the accepted POST and record_started.
         # Recovery used to rebuild custody WITHOUT the C1 binding, so the recovered
         # run replayed bindingless, open_snapshot_ids went empty the moment the
-        # invocation stopped being pending, and the startup GC deleted the snapshot
+        # invocation stopped being pending, and the custody GC deleted the snapshot
         # holding the child's ONLY copy of its work.
         target, data, handle = self._stranded(
             tmp_path, snapshot_id="inv-lost", task_id="t-dead", started=False)
@@ -638,7 +640,7 @@ class TestOrphanReconciliation:
         assert replayed.baseline_sha == handle.baseline_sha
         assert replayed.target_root == handle.target_root
         assert replayed.authority_source == "acting_constraint"
-        # Undisposed -> still OPEN to custody, so the startup GC keeps everything.
+        # Undisposed -> still OPEN to custody, so custody GC keeps everything.
         assert "inv-lost" in custody.open_snapshot_ids(data)
         report = prune_execution_snapshots(custody.open_snapshot_ids(data),
                                            worktree_root=tmp_path / "snaps", data_dir=data)
@@ -705,10 +707,8 @@ class TestOrphanReconciliation:
                     / "workspace.patch").exists()
         custody._CUSTODY.clear()
 
-    def test_gc_requires_a_closed_run_and_a_recorded_disposition(self, tmp_path):
-        # The GC predicate, end to end against real snapshots: settled+disposed is
-        # the ONLY disposable combination; settled-but-undisposed (the orphan
-        # shape) is preserved.
+    def test_gc_requires_a_closed_run_and_a_recorded_disposition(self, tmp_path, monkeypatch):
+        # Even for a task proven over, its settled but undisposed snapshot stays.
         target, data, handle = self._stranded(
             tmp_path, snapshot_id="inv-und", task_id="t-und")
         done = provision_execution_snapshot(
@@ -719,6 +719,8 @@ class TestOrphanReconciliation:
         custody.record_started(data, entry)
         custody.emit(data, custody.SETTLED, {"run_id": "run-done", "task_id": "t-done"})
         custody.record_patch_disposed(data, entry, disposition="applied")
+        write_task_result(data, "t-done", "completed")
+        monkeypatch.setattr("supervisor.queue.task_settlement_liveness", lambda _task: False)
         custody.reconcile_orphaned_runs(
             data, {"t-done"}, gateway_factory=lambda: _TerminalSweepGateway("run-inv-und"))
         custody._CUSTODY.clear()
@@ -1161,12 +1163,10 @@ class TestCaptureHonesty:
 
 
 class TestStartupGCFailClosed:
-    """CR1-1: the startup GC must not destroy open snapshots when the custody
-    log is unreadable. `_iter_rows` swallows OSError (right for the fail-soft
-    readers), so an unreadable log replayed as "no open runs", the keep-set
-    went empty, and `prune_execution_snapshots` deleted live, never-captured
-    work. GC deletes only over PROVEN settled && patch_disposed; UNKNOWN
-    custody state skips the destructive prune and says so loudly."""
+    """CR1-1: each custody pass fails closed when snapshot custody is unreadable.
+    A fail-soft keep-set alone can read unknown as empty. Retirement needs both
+    proven-over task ownership and closed/disposed custody; disclose a skipped pass.
+    """
 
     def _server_gc(self, tmp_path, monkeypatch):
         data, snaps = tmp_path / "data", tmp_path / "snaps"
@@ -1255,6 +1255,8 @@ class TestStartupGCFailClosed:
         custody.record_started(data, done)
         custody.emit(data, custody.SETTLED, {"run_id": "run-done", "task_id": "t-gc2"})
         custody.record_patch_disposed(data, done, disposition="applied")
+        write_task_result(data, "t-gc2", "completed")
+        monkeypatch.setattr("supervisor.queue.task_settlement_liveness", lambda _task: False)
         custody._CUSTODY.clear()
         srv._prune_delegated_snapshots()
         assert find_execution_snapshot("gc-done", data_dir=data) is None

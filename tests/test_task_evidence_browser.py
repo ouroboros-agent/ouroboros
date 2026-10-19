@@ -89,7 +89,7 @@ def test_speechless_history_and_direct_resume(direct_server_with_data, engine):
                 assert page.locator('[role="menuitem"]', has_text="Stop now").is_visible()
                 page.keyboard.press("Escape")
                 page.screenshot(path=str(diagnostic_directory(root.parent, "task-evidence") / f"task-evidence-{engine}-{width}-paused.png"), full_page=True)
-                card.locator(":scope > [data-live-summary-button]").click()
+                card.locator(":scope > [data-live-summary-button] [data-live-disclosure]").click()
                 assert card.locator(".chat-live-line").count() == 1
                 assert "24 tool calls" in card.locator(".chat-live-line").inner_text()
                 page.screenshot(path=str(diagnostic_directory(root.parent, "task-evidence") / f"task-evidence-{engine}-{width}-expanded.png"), full_page=True)
@@ -149,7 +149,7 @@ def test_pause_notice_translation_and_historical_wake_status(direct_server_with_
             card = page.locator('.chat-live-card[data-task-id="with-card"]')
             card.wait_for(state="visible")
             if card.get_attribute("data-expanded") != "1":
-                card.locator(":scope > [data-live-summary-button]").click()
+                card.locator(":scope > [data-live-summary-button] [data-live-disclosure]").click()
             expect(card).to_contain_text(translated)
             expect(card).to_contain_text("Model words stay unchanged")
             fallback = page.locator('.chat-bubble.system[data-task-id="without-card"]')

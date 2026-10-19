@@ -637,7 +637,12 @@ test('Main completion has one Project reference, its caveat and time, without re
             assert.equal(bubble.querySelector('.project-answer-files'), null);
             assert.equal(bubble.querySelector('[data-answer-fold]'), null);
             assert.equal(Boolean(bubble.querySelector('.project-answer-limitation')), role === 'assistant');
-            assert.ok(bubble.children.some(node => node.classList.contains('msg-provenance')), 'time note survives');
+            // One compact time line (owner 17.10, Q7 A): the row's own time carries the end, no second note.
+            const time = bubble.querySelector('.msg-time');
+            assert.equal(time.title, 'Task end time not recorded');
+            assert.equal(time.children[0].textContent, 'End time not recorded');
+            assert.equal(bubble.children.filter(node => node.classList.contains('msg-provenance')).length,
+                role === 'assistant' ? 1 : 0);
         }
     } finally { restoreDom(env.prior); }
 });

@@ -210,8 +210,8 @@ def test_a_crashed_continuing_author_is_shown_interrupted_and_never_rerun(host):
     replay = turn(h, 42).json()
     assert replay["status"] == "continuing" and replay["continuation_ref"] == task_id
     view = poll(h, task_id)
-    assert view.status_code == 200 and view.json()["status"] == "unresolved" and "text" not in view.json()
-    assert view.json()["disposition"] == "retained"
+    assert view.status_code == 200 and view.json()["status"] == "failed" and view.json()["text"] == ""
+    assert view.json()["code"] == "presence_attempt_outcome_unknown" and view.json()["work_ref"] == task_id
     legacy = turn(h, 42, version=None)
     assert legacy.status_code == 409 and legacy.json()["code"] == "presence_attempt_outcome_unknown"
     assert h.calls == 0

@@ -390,61 +390,6 @@ SCRATCHPAD_CONSOLIDATION_THRESHOLD_CHARS = 30_000
 # is AND'd with this cap (single-pass eviction), not replaced by it.
 SCRATCHPAD_MAX_CONTENT_CHARS = 60_000
 
-# --- Hot-store growth thresholds (health invariant; bytes) -------------------
-# Deterministic tripwires for the append-only stores whose interactive readers
-# degrade with file size (BIBLE P2: the class was caught by the owner, not by
-# any instrument — these thresholds are the instrument). Same family as
-# SCRATCHPAD_BLOAT_WARN_CHARS above: a health-invariant WARNING, not a gate.
-# The money record (state/usage.sqlite) is not one of them: its readers address
-# summary rows and single attempts, so its size does not reach them.
-# events/tools/supervisor/task_reflections logs are ROTATION-BOUNDED since the
-# CPL4-C1..C4 rotation train (800KB rotator and supervisor tick).
-# 8MB = 10x the rotation cap: these warnings fire only if
-# rotation is broken or missing — deliberate regression tripwires, not size
-# preferences (the pre-train 100MB values watched for replay degradation of
-# the then-unbounded live files; that duty moved to the archive-chain watch
-# below).
-EVENTS_LOG_WARN_BYTES = 8_000_000
-TOOLS_LOG_WARN_BYTES = 8_000_000
-SUPERVISOR_LOG_WARN_BYTES = 8_000_000
-TASK_REFLECTIONS_LOG_WARN_BYTES = 8_000_000
-# state/scheduled_tasks.json is a whole-document store the scheduler READS AND
-# REWRITES on every tick under the queue lock (supervisor/queue.py::
-# check_scheduled_tasks), and consumed one-shot follow-ups are RETAINED as
-# durable receipts (enabled=False + completed_at) — so it now grows with every
-# fired follow-up. 2MB ≈ thousands of ~1KB records: the point where a
-# per-tick full parse + atomic rewrite under the lock stops being free.
-SCHEDULED_TASKS_WARN_BYTES = 2_000_000
-# Compact root-task -> skill review index used by acceptance packet assembly.
-SKILL_REVIEW_ROOT_TASKS_WARN_BYTES = 20_000_000
-# memory/chronicle/records.jsonl is my memory's only authority and is never rotated
-# (records are never rewritten). Every task context decodes each acting page and part
-# body from its index (memory_view._story_pages), and an owner's install imports about
-# 4.4 MB of legacy memory at activation (measured on a copy, 2026-10-04). 64MB is ~15x that: past
-# it, decoding the story on every task context stops being free and a projection of the
-# acting records is due. Observability, never a retention gate: nothing is cut.
-CHRONICLE_JOURNAL_WARN_BYTES = 64_000_000
-# ``chat_history`` can deliberately replay the archive chain, while the memory
-# view reads only rows after the retold-memory frontier.  Warn before an
-# explicit full-history read becomes seconds-scale; this is observability, not
-# a retention gate and never shortens the memory horizon.
-CHAT_ARCHIVE_SCAN_WARN_BYTES = 100_000_000
-# Review ledger index chain (state/review_ledger/index*.jsonl): the hot index rotates
-# itself at review_ledger.INDEX_MAX_BYTES and task context reads only that hot index;
-# readers that walk the rotated segments (recent_records without hot_only) replay the
-# whole chain, so its total size is enrolled here like the chat archive chain.
-REVIEW_LEDGER_INDEX_WARN_BYTES = 64_000_000
-# Current custody is read from the store's rows (``custody_runs``); only the
-# importer's one fold and the explicit forensic replays walk the WHOLE events
-# chain — live file plus archive/events_*.jsonl. This inherits the pre-rotation
-# 100MB replay-degradation signal, now measured over the chain; archives stay
-# durable history (never GC'd), so the remediation is never deletion.
-EVENTS_ARCHIVE_SCAN_WARN_BYTES = 100_000_000
-# Warn before the observed 242-of-253 retained-drive corpus becomes routine;
-# count only direct child directories of state/headless_tasks and task_drives
-# (no recursive sizing) because startup health is an interactive path.
-RETAINED_EXECUTION_DRIVES_WARN_COUNT = 200
-
 
 def estimate_message_chars(messages: Any) -> int:
     """Message chars with image blocks at the provider-billing proxy.

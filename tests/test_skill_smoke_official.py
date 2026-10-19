@@ -1,7 +1,8 @@
 # tests/test_skill_smoke_official.py — official OuroborosHub skill install smoke.
 #
-# The `skill_smoke` lane: real-network install of the nine pinned official
-# skills + preflight/deps/command probes + the Tier 6 review→grant→
+# The `skill_smoke` lane: real-network install of the pinned official skills
+# through the hub's git source (one live fetch of the hub repository) +
+# preflight/deps/command probes + the Tier 6 review→grant→
 # enable-persistence flow (CI review step only). Canonical lane description (purpose,
 # triggers, red-means-investigate posture): docs/DEVELOPMENT.md "Pytest marker
 # lanes". No fallback-skip on network failure (owner directive); bounded
@@ -21,7 +22,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import http.client
 import importlib.util
@@ -35,11 +35,10 @@ from typing import Any, Dict
 import pytest
 
 from ouroboros import config
-from ouroboros.config import DATA_DIR, get_ouroboroshub_skills_dir
+from ouroboros.config import DATA_DIR
 from ouroboros.contracts.skill_manifest import parse_skill_manifest_text
 from ouroboros.extension_isolated_deps import isolated_site_dirs_scope
-from ouroboros.gateway.marketplace import _apply_hub_review_and_deps
-from ouroboros.marketplace import ouroboroshub
+from ouroboros.marketplace.install import _run_skill_review
 from ouroboros.marketplace.install_specs import install_specs_hash
 from ouroboros.marketplace.isolated_deps import (
     install_isolated_dependencies,
@@ -87,24 +86,12 @@ DEPS_IMPORT_CHECK = {
 
 _TRANSIENT_RETRY_SLEEP_SEC = 10
 
-# Deterministic install() failure markers — never retried. Each literal is
-# owned by ouroboros/marketplace/ouroboroshub.py (sha mismatch :210, missing
-# sha :205, unsafe/opaque paths in _safe_rel, staging escape :215, missing
-# SKILL.md :219, unknown slug :265, already-installed :287); a rewording there
-# must update this tuple or the affected error gains one wasted retry.
-_DETERMINISTIC_INSTALL_ERRORS = (
-    "sha256 mismatch",
-    "missing sha256",
-    "unsafe catalog file path",
-    "review-opaque dependency directory",
-    "generated or binary artifact",
-    "escapes staging dir",
-    "did not include SKILL.md",
-    "skill not found",
-    "already installed",
-    "has no files",
-    "is not an object",
-)
+# Deterministic install refusals (SkillInstallError codes) — never retried: a digest
+# mismatch is hub corruption, an unknown or withdrawn entry is a catalog fact.
+_DETERMINISTIC_INSTALL_CODES = frozenset({
+    "digest_mismatch", "not_found", "withdrawn", "no_release", "payload_refused", "payload_unreadable",
+    "name_taken", "update_instead",
+})
 
 # urllib transport errors are OSError subclasses; http.client raises its own
 # transient shapes (IncompleteRead/BadStatusLine) outside that hierarchy.
@@ -133,64 +120,81 @@ def _retry_transient(fn, *, describe: str, attempts: int = 2):
 # ---------------------------------------------------------------------------
 
 
+def _hub_rows():
+    from ouroboros.skill_sources import load_sources
+
+    return [row for row in load_sources() if row["kind"] == "hub"]
+
+
 @pytest.fixture(scope="session")
 def hub_catalog():
-    """Fetch the LIVE catalog exactly once, then serve every install from a cache.
+    """Fetch the LIVE hub repository exactly once through its git source.
 
-    The single real load_catalog() exercises _fetch_bytes + the host allowlist +
-    raw_base_url derivation. The digest/version log line makes a red run
-    reconstructible against the exact catalog revision that was tested.
+    The fetch exercises the real transport (shallow clone, snapshot). The v1
+    ``catalog.json`` the hub keeps for older clients carries per-file hashes,
+    which Tier 1 re-verifies on disk; its digest line makes a red run
+    reconstructible against the exact hub commit that was tested.
     """
-    catalog = _retry_transient(ouroboroshub.load_catalog, describe="load_catalog")
-    digest = hashlib.sha256(
-        json.dumps(catalog, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    ).hexdigest()
+    from ouroboros.skill_source_catalog import refresh_source
+    from ouroboros.skill_source_git import clone_dir
+
+    rows = _hub_rows()
+    assert rows, "no hub source is connected"
+    meta = {}
+    for attempt in (1, 2):
+        meta = refresh_source(DATA_DIR, rows[0])
+        if not meta.get("error"):
+            break
+        print(f"hub fetch attempt {attempt} failed ({meta.get('error')}); retrying once")
+        time.sleep(_TRANSIENT_RETRY_SLEEP_SEC)
+    assert not meta.get("error"), f"hub fetch failed: {meta.get('error')}"
+    catalog = json.loads((clone_dir(DATA_DIR, rows[0]) / "catalog.json").read_text(encoding="utf-8"))
     slugs = {
         str(item.get("slug") or ""): str(item.get("version") or "")
         for item in catalog.get("skills") or []
         if isinstance(item, dict)
     }
-    # "normalized": hashed over the client-parsed dict (incl. the injected
-    # raw_base_url), not the raw catalog.json bytes — do not compare to
-    # `sha256sum catalog.json`.
-    print(f"OuroborosHub normalized-catalog digest sha256={digest}")
+    print(f"OuroborosHub commit={meta.get('commit')}")
     print("catalog versions: " + ", ".join(f"{s}={slugs.get(s, '?')}" for s in OFFICIAL_SKILLS))
     missing = [slug for slug in OFFICIAL_SKILLS if slug not in slugs]
-    assert not missing, f"official catalog is missing expected skills: {missing}"
-
-    patch = pytest.MonkeyPatch()
-    cached = catalog
-
-    def _cached_catalog() -> Dict[str, Any]:
-        return json.loads(json.dumps(cached))
-
-    patch.setattr(ouroboroshub, "load_catalog", _cached_catalog)
-    try:
-        yield cached
-    finally:
-        patch.undo()
+    assert not missing, f"hub catalog is missing expected skills: {missing}"
+    yield catalog
 
 
 @pytest.fixture(scope="session")
 def install_skill(hub_catalog):
-    """Memoizing installer: each slug is installed at most once per session.
+    """Memoizing installer through the shared source lifecycle: each slug at most once per session.
 
-    Only a fully successful atomic install is cached (landing is atomic via
-    land_staged_tree; a failed attempt removes its own staging). A transient
-    failure gets one retry; a sha256 mismatch is deterministic hub corruption
-    and is never retried.
+    The item comes from whichever hub row offers it (Official or Community). A transient fetch failure
+    gets one retry; deterministic refusals (a digest mismatch first) are never retried.
     """
-    results: Dict[str, ouroboroshub.HubInstallResult] = {}
+    from ouroboros.skill_source_install import SkillInstallError, install_item
 
-    def _ensure(slug: str) -> ouroboroshub.HubInstallResult:
+    results: Dict[str, Dict[str, Any]] = {}
+
+    def _install(slug: str) -> Dict[str, Any]:
+        last: Exception | None = None
+        for row in _hub_rows():
+            try:
+                return install_item(DATA_DIR, f"{row['id']}/{slug}", turn_on_when_ready=False)
+            except SkillInstallError as exc:
+                if exc.code != "not_found":
+                    raise
+                last = exc
+        raise AssertionError(f"{slug} is offered by no hub row: {last}")
+
+    def _ensure(slug: str) -> Dict[str, Any]:
         if slug in results:
             return results[slug]
-        result = ouroboroshub.install(slug)
-        if not result.ok and not any(m in result.error for m in _DETERMINISTIC_INSTALL_ERRORS):
-            print(f"install({slug}): non-deterministic failure ({result.error}); retrying once")
+        try:
+            result = _install(slug)
+        except SkillInstallError as exc:
+            if exc.code in _DETERMINISTIC_INSTALL_CODES:
+                raise AssertionError(f"install({slug}) refused: {exc.code}: {exc}") from exc
+            print(f"install({slug}): transient failure ({exc}); retrying once")
             time.sleep(_TRANSIENT_RETRY_SLEEP_SEC)
-            result = ouroboroshub.install(slug)
-        assert result.ok, f"install({slug}) failed: {result.error}"
+            result = _install(slug)
+        assert result["ok"], f"install({slug}) failed: {result}"
         results[slug] = result
         return result
 
@@ -237,7 +241,7 @@ def _catalog_entry(hub_catalog: Dict[str, Any], slug: str) -> Dict[str, Any]:
 
 
 def _skill_dir(slug: str) -> pathlib.Path:
-    return get_ouroboroshub_skills_dir() / _sanitize_skill_name(slug)
+    return DATA_DIR / "skills" / "ouroboroshub" / _sanitize_skill_name(slug)
 
 
 def _load_manifest(slug: str):
@@ -253,10 +257,13 @@ def _load_manifest(slug: str):
 @pytest.mark.timeout(300)
 @pytest.mark.parametrize("slug", OFFICIAL_SKILLS)
 def test_install_lands_payload_with_verified_provenance(slug, hub_catalog, install_skill):
+    from ouroboros.skill_identity import is_release_digest
+    from ouroboros.skill_install_record import read_install_record
+
     result = install_skill(slug)
     sanitized = _sanitize_skill_name(slug)
     target = _skill_dir(slug)
-    assert result.target_dir == target and target.is_dir()
+    assert result["name"] == sanitized and target.is_dir()
     assert (target / "SKILL.md").is_file()
 
     entry = _catalog_entry(hub_catalog, slug)
@@ -268,24 +275,25 @@ def test_install_lands_payload_with_verified_provenance(slug, hub_catalog, insta
         actual_sha = hashlib.sha256(on_disk.read_bytes()).hexdigest()
         assert actual_sha == expected_sha, f"{slug}: sha256 mismatch for {rel}"
 
-    provenance = json.loads((target / ".ouroboroshub.json").read_text(encoding="utf-8"))
-    assert provenance["schema_version"] == 1
-    assert provenance["source"] == "ouroboroshub"
-    assert provenance["slug"] == slug
-    assert provenance["sanitized_name"] == sanitized
-    assert provenance["version"] == str(entry.get("version") or "")
-    assert provenance["files"] == entry.get("files")
+    # The install record replaces the payload sidecar: nothing per-install lands in the payload.
+    assert not (target / ".ouroboroshub.json").exists()
+    record = read_install_record(DATA_DIR, sanitized)
+    assert record is not None and record["entry"] == slug
+    assert record["release"]["version"] == str(entry.get("version") or "")
+    assert is_release_digest(record["release"]["digest"]) and record["release"]["commit"]
+    assert record["basis"] in {"trusted", "review"}
+    loaded = find_skill(DATA_DIR, sanitized)
+    declared = auto_install_specs_for_skill(DATA_DIR, loaded)
     if slug in DEPS_SKILLS:
-        specs = provenance.get("install_specs") or {}
-        assert specs.get("auto"), f"{slug}: expected auto install specs in provenance"
+        assert declared, f"{slug}: expected auto install specs declared by its manifest"
     else:
-        assert not (provenance.get("install_specs") or {}).get("auto"), (
+        assert not declared, (
             f"{slug}: unexpected auto install specs — the smoke lane's deps coverage "
-            f"(DEPS_SKILLS) no longer matches the catalog"
+            f"(DEPS_SKILLS) no longer matches the hub"
         )
 
-    staging = get_ouroboroshub_skills_dir() / ".staging"
-    leftovers = [p.name for p in staging.glob("ouroboroshub_skill_*")] if staging.is_dir() else []
+    staging = DATA_DIR / "skills" / "ouroboroshub" / ".staging"
+    leftovers = [p.name for p in staging.iterdir()] if staging.is_dir() else []
     assert not leftovers, f"install left staging directories behind: {leftovers}"
 
 
@@ -529,9 +537,8 @@ def test_backlog_manager_summary_offline(install_skill, tmp_path):
 # Tier 6 as two separate pytest invocations and only the Tier 6 step carries
 # the secret. Missing key = hard red, not a skip (owner directive).
 #
-# Review call goes through the production gateway wrapper
-# `_apply_hub_review_and_deps` (review first, dependency install only after
-# an executable review — the production ordering; auto-grant runs inside
+# Review call follows the production ordering (review first, dependency
+# install only after an executable review; auto-grant runs inside
 # review_skill). Enforcement is pinned to `blocking` so auto-grant can only
 # happen on a clean/warnings verdict — under the production default
 # `advisory` even a `blockers` verdict is executable and would auto-grant
@@ -559,16 +566,6 @@ _REVIEW_EXPECTED_KEYS = {
     "duckduckgo": set(),
     "perplexity": {"OPENROUTER_API_KEY"},
 }
-
-
-class _ProgressStub:
-    """Duck-typed JobProgressTarget: records progress lines for diagnostics."""
-
-    def __init__(self) -> None:
-        self.lines: list[str] = []
-
-    def set(self, text: str) -> None:
-        self.lines.append(str(text))
 
 
 # Session scope on purpose: session fixtures instantiate before any
@@ -608,18 +605,16 @@ def _skill_state_dir(name: str) -> pathlib.Path:
 
 
 def _run_review_flow(slug: str, name: str) -> tuple[str, str, str, Dict[str, Any]]:
-    payload: Dict[str, Any] = {}
-    status, error, deps_status = asyncio.run(
-        _apply_hub_review_and_deps(
-            payload,
-            drive_root=DATA_DIR,
-            repo_dir=REPO_ROOT,
-            skill_name=name,
-            progress=_ProgressStub(),
-            review_log_label=f"skill_smoke review {slug}",
-            deps_log_label=f"skill_smoke deps {slug}",
-        )
-    )
+    """Review first, dependencies only after an executable review (the production ordering)."""
+    from ouroboros.skill_loader import review_status_allows_execution
+    from ouroboros.skill_review_runner import _reconcile_deps_after_pass_review
+
+    status, findings, error = _run_skill_review(DATA_DIR, REPO_ROOT, name)
+    payload: Dict[str, Any] = {"review_status": status, "review_findings": findings, "review_error": error}
+    deps_status = "not_required"
+    if review_status_allows_execution(status) and not error:
+        deps_status, deps_error = _reconcile_deps_after_pass_review(DATA_DIR, name)
+        payload.update({"deps_status": deps_status, "deps_error": deps_error})
     return str(status), str(error or ""), str(deps_status), payload
 
 
@@ -725,10 +720,9 @@ def test_review_grants_and_enable(slug, review_secret, install_skill, review_env
     # by the shared review substrate, while the model id remains the contract.
     model_id = models[0].split(" [", 1)[0].rsplit("#", 1)[0]
     assert model_id == _REVIEW_MODEL, models
-    # Hash-verified official payloads get the official_hub profile (the
-    # severity-downgrade that stabilizes verdicts); losing it silently would
-    # change what this lane proves.
-    assert review.get("review_profile") == "official_hub", review.get("review_profile")
+    # The official_hub reduced-noise profile is retired: Official is the trusted
+    # source row's install basis now, so an explicit review is an ordinary one.
+    assert review.get("review_profile") in (None, ""), review.get("review_profile")
 
     # Auto-grant ran inside review_skill (blocking enforcement ⇒ only on
     # clean/warnings). Grants are request-keyed: a requested key grants with an

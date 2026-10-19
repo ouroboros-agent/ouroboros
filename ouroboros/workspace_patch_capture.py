@@ -24,6 +24,7 @@ import threading
 from hashlib import sha256
 from typing import Any, BinaryIO, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from ouroboros.artifact_storage import compress_in_place
 from ouroboros.contracts.task_constraint import normalize_task_constraint
 from ouroboros.headless_status import (
     ARTIFACT_STATUS_FAILED,
@@ -75,6 +76,8 @@ def write_workspace_patch_artifacts(
     task: Dict[str, Any],
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Stream workspace patch and manifest artifacts into ``artifact_dir``."""
+
+    from ouroboros.artifacts import stream_artifact_file
 
     root = pathlib.Path(workspace_root).resolve(strict=False)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -215,7 +218,6 @@ def write_workspace_patch_artifacts(
             )
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             errors.append({"type": "file_capture_failed", "message": f"{type(exc).__name__}: {exc}"})
-    hasher = sha256()
     total_size = 0
     with patch_path.open("wb") as fh:
         if not errors:
@@ -235,24 +237,21 @@ def write_workspace_patch_artifacts(
                 ["git", "diff", "--binary", "--no-ext-diff", "--no-color", base_ref, *tracked_pathspec],
                 root,
                 fh,
-                hasher,
                 allow_rc={0},
                 errors=errors,
                 diagnostics=diagnostics,
             )
             for rel in included_untracked:
                 if total_size:
-                    total_size += _write_patch_separator(fh, hasher)
+                    total_size += _write_patch_separator(fh)
                 total_size += _append_git_output(
                     ["git", "diff", "--no-index", "--binary", "--no-ext-diff", "--no-color", "--", os.devnull, rel],
                     root,
                     fh,
-                    hasher,
                     allow_rc={0, 1},
                     errors=errors,
                     diagnostics=diagnostics,
                 )
-    digest = hasher.hexdigest()
     head_errors: List[Dict[str, Any]] = []
     current_head = _git_stdout(["git", "rev-parse", "--verify", "HEAD"], root, allow_rc={0}, errors=head_errors).strip()
     # Only isolated copies keep HEAD fixed to their provisioned baseline.
@@ -282,6 +281,10 @@ def write_workspace_patch_artifacts(
         except OSError:
             pass
         digest = ""
+    else:
+        compress_in_place(patch_path)
+        measured = stream_artifact_file(patch_path)
+        total_size, digest = measured["size"], measured["sha256"]
     manifest = {
         "schema_version": 1,
         "created_at": utc_now_iso(),
@@ -322,7 +325,6 @@ def write_workspace_patch_artifacts(
         "errors": errors,
     }
     atomic_write_json(manifest_path, manifest, trailing_newline=True)
-    from ouroboros.artifacts import stream_artifact_file
 
     # Published with its measured identity, like the patch beside it (#1969).
     artifacts = [
@@ -557,7 +559,6 @@ def _append_git_output(
     cmd: Sequence[str],
     cwd: pathlib.Path,
     fh: BinaryIO,
-    hasher: Any,
     *,
     allow_rc: set[int],
     errors: List[Dict[str, Any]],
@@ -582,7 +583,6 @@ def _append_git_output(
                         if not chunk:
                             break
                         fh.write(chunk)
-                        hasher.update(chunk)
                         written_box["value"] += len(chunk)
                 except Exception as exc:
                     read_errors.append(f"{type(exc).__name__}: {exc}")
@@ -634,10 +634,9 @@ def _append_git_output(
     return written
 
 
-def _write_patch_separator(fh: BinaryIO, hasher: Any) -> int:
+def _write_patch_separator(fh: BinaryIO) -> int:
     data = b"\n"
     fh.write(data)
-    hasher.update(data)
     return len(data)
 
 

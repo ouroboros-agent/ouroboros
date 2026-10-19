@@ -6,7 +6,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { promptUpdateVersion } from '../modules/marketplace.js';
 import { promptCampaignObjective } from '../modules/evolution.js';
 import { confirmAndSendPanic, shouldFirePanic } from '../modules/chat_activity.js';
 import { chooseAndSendReview } from '../modules/review_command.js';
@@ -17,43 +16,6 @@ import {
     nextJobPollDelay,
 } from '../modules/harness_login_cards.js';
 import { ALLOW_EMPTY_REVIEW_POOL, availableSubagentsSavePayload } from '../modules/subagents_settings.js';
-
-// ---------------------------------------------------------------------------
-// marketplace: update-to-version prompt (window.prompt was dead on desktop).
-// ---------------------------------------------------------------------------
-
-test('promptUpdateVersion preserves the prompt() contract: cancel skips, empty means latest', async () => {
-    const calls = [];
-    const confirmed = await promptUpdateVersion('my-skill', '2.1.0', {
-        dialogImpl: async (options) => { calls.push(options); return { confirmed: true, value: ' 2.0.0 ' }; },
-    });
-    assert.deepEqual(confirmed, { confirmed: true, version: '2.0.0' });
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0].input, true);
-    // The latest version is pre-filled exactly as window.prompt pre-filled it.
-    assert.equal(calls[0].initialValue, '2.1.0');
-    assert.ok(calls[0].body.includes('Leave empty for latest (2.1.0)'));
-
-    // Confirmed-empty = latest (the caller then POSTs {} — server contract).
-    const latest = await promptUpdateVersion('my-skill', '2.1.0', {
-        dialogImpl: async () => ({ confirmed: true, value: '' }),
-    });
-    assert.deepEqual(latest, { confirmed: true, version: '' });
-
-    // Cancel (and Escape/backdrop — the dialog resolves the same shape) skips.
-    const cancelled = await promptUpdateVersion('my-skill', '2.1.0', {
-        dialogImpl: async () => ({ confirmed: false, value: '2.0.0' }),
-    });
-    assert.deepEqual(cancelled, { confirmed: false, version: '' });
-
-    // An unknown latest is said, not rendered as an empty parenthesis.
-    const unknown = [];
-    await promptUpdateVersion('my-skill', '', {
-        dialogImpl: async (options) => { unknown.push(options); return { confirmed: false }; },
-    });
-    assert.ok(unknown[0].body.includes('latest (unknown)'));
-    assert.equal(unknown[0].initialValue, '');
-});
 
 // ---------------------------------------------------------------------------
 // evolution: campaign objective (cancel = do NOT start, owner-approved Б1-8).

@@ -740,7 +740,7 @@ def _supervisor_harness(monkeypatch, tmp_path, steps):
     monkeypatch.setattr("ouroboros.upgrade_notices.startup_upgrade_notices", noop)
     for name in (
         "_resume_interrupted_project_deletions", "_startup_prune_sweeps", "_startup_custody_sweep",
-        "_startup_worktree_prune", "_prune_delegated_snapshots", "_periodic_supervisor_maintenance",
+        "_prune_worktrees", "_prune_delegated_snapshots", "_periodic_supervisor_maintenance",
         # Its own owner notice is another startup side effect, asserted by
         # tests/test_retired_settings_chat_notice.py; here it would be a
         # crash alert (this harness's send_with_budget double records every

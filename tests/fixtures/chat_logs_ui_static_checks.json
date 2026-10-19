@@ -777,7 +777,7 @@
     "id": "test_skill_review_click_guard_prevents_duplicate_posts",
     "path": "web/modules/skills.js",
     "kind": "contains",
-    "value": "if (reviewingSkills.has(name)) return;"
+    "value": "if (reviewingSkills.has(name)) return null;"
   },
   {
     "id": "test_skill_review_click_guard_prevents_duplicate_posts",

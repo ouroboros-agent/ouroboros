@@ -366,18 +366,19 @@ class OuroborosAgent:
     def _fence_request(self, accept: Tuple[str, ...], **request: Any) -> Dict[str, Any]:
         """The ONE transport seam of the queue-owned acceptance fence.
 
-        A direct turn runs inside the supervisor process: built with the queue's own
-        transition (``fence_transition``), it applies the fence in-process — no event,
-        no ack file, no wait (lock order: admission lock, then ``_queue_lock``). A pooled
+        An agent in the process that holds the queue (a process fact, whoever built it:
+        a direct turn, a Presence turn) applies the fence in-process — no event, no ack
+        file, no wait (lock order: admission lock, then ``_queue_lock``). A pooled
         worker cannot share ``_queue_lock``: it sends the event, polls its own one-shot
         ack and re-sends the SAME transition once — a read (``inspect``, asked many times a
         turn) is never re-sent, its loss is harmless; no answer raises ``TimeoutError`` (a
         gap), a refusal raises ``RuntimeError``. The ack is transport, not an authority.
         """
         request.setdefault("task_id", str(self._current_task_id or ""))
-        transition = getattr(self, "fence_transition", None)
-        if transition is not None:
-            ack = transition(**request)
+        if self._fence_in_process():
+            from supervisor import queue as task_queue  # the queue's public surface, resolved per call
+
+            ack = task_queue.transition_acceptance_fence(**request)
         elif self._event_queue is None:
             raise RuntimeError("acceptance fence requires a supervisor event queue")
         else:
@@ -401,6 +402,12 @@ class OuroborosAgent:
         if not ack.get("ok", True) or status not in accept:  # the row's typed state is the reason; only a malformed request keeps its error text
             raise RuntimeError(status if status not in ("", "error") else str(ack.get("error") or f"acceptance fence {request['action']} failed"))
         return ack
+
+    def _fence_in_process(self) -> bool:
+        """Whether this process holds the queue that owns this agent's data root (a process fact)."""
+        from supervisor.queue import owns_live_queue
+
+        return owns_live_queue(self.env.budget_drive_root or self.env.drive_root)
 
     def _send_fence_event(self, event: Dict[str, Any]) -> Dict[str, Any]:
         """Send one pooled fence event and poll ITS OWN ``<token>.<req>.json`` ack; ``{}`` = unanswered."""

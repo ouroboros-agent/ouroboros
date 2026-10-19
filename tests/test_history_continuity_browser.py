@@ -177,13 +177,19 @@ def test_terminal_publication_timing_and_answer_copy(direct_server_with_data, br
                 # One compact limitation beside each non-clean final; the clean one stays unadorned.
                 assert [row.locator('.project-answer-limitation').all_inner_texts() for row in rows.all()] == [
                     [], ['Failed'], ['Failed']]
-                notes = rows.locator('.msg-provenance:not(.project-answer-limitation)').all_inner_texts()
-                assert 'Task ended' in notes[0] and 'Sep 25, 2026' in notes[0]
-                assert 'Sep 24, 2026' in notes[1] and 'Notification added Sep 26, 2026' in notes[1]
-                assert notes[2].startswith('Task end time not recorded')
-                assert 'Notification added Sep 26, 2026' in notes[2]
-                assert rows.nth(1).evaluate("node => !node.querySelector('.message').contains(node.querySelector('.msg-provenance'))")
-                return notes
+                # One compact time line (owner 17.10, Q7 A): the row's own time also says when its task ended, both
+                # facts only when their minutes differ; the full instants are its title and spoken text, no second note.
+                times = rows.locator(':scope > .msg-time').evaluate_all("""ns => ns.map(n => [
+                    n.querySelector('[aria-hidden="true"]').textContent, n.title, n.querySelector('.msg-time-full').textContent])""")
+                assert [shown for shown, _, _ in times] == [
+                    'Sep 25, 15:19', 'Ended Sep 24, 18:18 · added Sep 26, 19:21', 'End time not recorded · added Sep 26, 19:21']
+                assert all(title == spoken for _, title, spoken in times), times
+                # ICU spells the date/time joint differently per engine; the facts are fixed.
+                assert re.search(r'^Task ended Sep 25, 2026\D+03:19 PM · Notification added Sep 25, 2026\D+03:19 PM$', times[0][1])
+                assert re.search(r'^Task ended Sep 24, 2026\D+06:18 PM · Notification added Sep 26, 2026\D+07:21 PM$', times[1][1])
+                assert re.search(r'^Task end time not recorded · Notification added Sep 26, 2026\D+07:21 PM$', times[2][1])
+                assert rows.locator(':scope > .msg-provenance:not(.project-answer-limitation)').count() == 0
+                return times
             before = check()
             _screenshot(page, tmp_path, f'terminal-times-{browser_engine}')
             page.reload(wait_until='domcontentloaded')
@@ -236,7 +242,7 @@ def test_project_room_terminal_lines_separate_end_and_notification(direct_server
                     card = page.locator(f'{feed} .chat-live-card[data-task-id="{task_id}"]')
                     card.wait_for(state='attached')
                     if card.get_attribute('data-expanded') != '1':
-                        card.locator(':scope > [data-live-summary-button]').click()
+                        card.locator(':scope > [data-live-summary-button] [data-live-disclosure]').click()
                     found[task_id] = card.locator(':scope > [data-live-timeline]').inner_text()
                 return found
 
@@ -451,7 +457,7 @@ def _open_nested_full_output(page, url, project):
     for card in (parent, child):
         card.wait_for(state='attached')
         if card.get_attribute('data-expanded') != '1':
-            card.locator(':scope > [data-live-summary-button]').click()
+            card.locator(':scope > [data-live-summary-button] [data-live-disclosure]').click()
     line = child.locator(':scope > [data-live-timeline] > .chat-live-line.expandable')
     line.locator('[data-live-line-toggle]').click()
     body = line.locator(':scope > .chat-live-line-body-full')

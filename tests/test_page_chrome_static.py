@@ -175,11 +175,47 @@ def test_skills_and_widgets_use_inner_scroll_regions():
     assert ".widgets-scroll" in css and "overflow-y: auto" in css
 
 
-def test_sidebar_projects_list_is_a_bounded_scroll_region():
-    """The sidebar's one variable-length collection owns a bounded window with
-    its own scroll, so the navigation column cannot grow with the project count."""
-    rule = _read("web/style.css").split(".nav-projects-list {", 1)[1].split("}", 1)[0]
-    assert "max-height: var(--nav-projects-list-max-height)" in rule and "overflow-y: auto" in rule, rule
+def test_sidebar_is_three_zones_with_the_projects_list_as_the_one_scroller():
+    """The sidebar is a pinned head (Main Chat), the Projects list as the ONE scroller (no inner cap, no outer
+    scroll wrapper) and the tools right after it: the Projects zone is as tall as its rows and shrinks to scroll
+    them, so free room stays under the last row, never between the zones (docs/DESIGN.md "Shell").
+    A too-short window falls back to the whole column scrolling with the head sticky."""
+    css = _read("web/style.css")
+    html = _read("web/index.html")
+    zone = css.split("\n.nav-projects {", 1)[1].split("}", 1)[0]
+    assert "flex: 0 1 auto" in zone and "min-height: 0" in zone, zone
+    assert "flex: 1 1 auto" not in zone, "a zone that takes the free height leaves a hole when the list is short"
+    rule = css.split("\n.nav-projects-list {", 1)[1].split("}", 1)[0]  # the base rule, not the short-window fallback
+    assert "flex: 1 1 auto" in rule and "min-height: 0" in rule and "overflow-y: auto" in rule, rule
+    assert "overscroll-behavior: contain" in rule and "max-height" not in rule, rule
+    # Too short for the zones: the column is the one scroller and the list flows (no second scroller).
+    # A finger's 44px rows run out of room sooner, so a touch column falls back at a taller window.
+    fallback = css.split("@media (max-height: 540px), (pointer: coarse) and (max-height: 600px) {", 1)[1].split("}\n}", 1)[0]
+    assert "#primary-sidebar .nav-projects-list { flex: 0 0 auto; overflow-y: visible;" in fallback
+    assert "--nav-projects-list-max-height" not in css and "--nav-projects-list-max-height" not in _read("web/ui.css")
+    assert ".sidebar-scroll" not in css and "sidebar-scroll" not in html
+    head = css.split(".sidebar-head {", 1)[1].split("}", 1)[0]
+    assert "position: sticky" in head and "top: 0" in head
+    assert html.index('class="sidebar-head"') < html.index('id="nav-projects"') < html.index('class="sidebar-foot"')
+    # The zones are filled from the page registry: Main into the head, the tools into the foot (pages.js).
+    pages_js = _read("web/modules/pages.js")
+    assert "id: 'chat', label: 'Main Chat', icon: 'chat', zone: 'head'" in pages_js
+    for page in ("files", "skills", "widgets", "dashboard", "settings"):
+        assert f"id: '{page}'," in pages_js and "zone: 'foot'" in pages_js.split(f"id: '{page}',", 1)[1].split("}", 1)[0]
+    assert "Utilities" not in html and "nav-section-label" not in html
+    # A finger gets 44px rows, ⋯ and +; the version reads at the meta size; unread is a red dot in a soft ring.
+    assert "#primary-sidebar { --nav-item-h: 44px; --nav-control-h: 44px; }" in css
+    version = css.split("#nav-version {", 1)[1].split("}", 1)[0]
+    assert "font-size: var(--type-meta)" in version and "opacity" not in version
+    dot = css.split(".nav-unread-dot {", 1)[1].split("}", 1)[0]
+    assert "background: var(--red)" in dot and "box-shadow: 0 0 0 2px var(--accent-18)" in dot
+    # Working dots take the row's ink, so they never out-shout the name; the row's ⋯ is the shell's one More glyph.
+    assert ".nav-activity-marker.chat-live-typing span { background: currentColor; }" in css
+    assert '.nav-activity-marker[data-state="working"] span { background' not in css
+    app_js = _read("web/app.js")
+    assert "kebab.innerHTML = SHELL_ICONS.more;" in app_js and "kebab.textContent = '⋯'" not in app_js
+    assert "navProjectsToggle?.classList.toggle('active'" not in _read("web/app.js")
+    assert "openProjectPanel(project, { openOnly: true })" in _read("web/app.js")
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +278,7 @@ def test_server_navigation_and_chat_static_contracts():
     assert "export async function cleanupUploadedAttachments" in media_source
     assert "method: 'DELETE'" in media_source
     assert "Promise.allSettled" in media_source
-    assert '>Loading…</span>' in chat_source
+    assert '>Loading…</span>' in _read("web/modules/chat_header.js")
     assert "syncHeaderControlState({ accounting: { available: false } });" in chat_source
     assert "budget_text: 'Connecting...'" not in chat_source
     assert "send(msg, options = {})" in _read("web/modules/ws.js")

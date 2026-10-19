@@ -19,7 +19,7 @@ _CHILD_WORDS = """(messages, taskId) => {
     const card = messages.querySelector(`.chat-live-card[data-task-id="${taskId}"]`);
     if (!card) return null;
     for (let node = card; node; node = node.parentElement?.closest('.chat-live-card')) {
-        if (node.dataset.expanded !== '1') node.querySelector('[data-live-summary-button]').click();
+        if (node.dataset.expanded !== '1') node.querySelector('[data-live-disclosure]').click();
     }
     card.scrollIntoView({block: 'center'});
     return [...card.querySelectorAll('.chat-live-line')].filter(line => line.closest('.chat-live-card') === card)

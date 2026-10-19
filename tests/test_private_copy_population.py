@@ -172,17 +172,26 @@ def test_a_copy_whose_provisioning_has_not_returned_is_never_a_ready_copy(tmp_pa
         # The provisional row is light: no completion facts, and its bytes are checkout's, not the source's.
         assert row["provisioning_sec"] == 0 and row["file_baseline"] == {} and row["untracked_baseline"] == {}
         assert (copy / "lines.txt").read_bytes() == b"alpha\r\nbeta\r\n" != (target / "lines.txt").read_bytes()
-        if consumer == "startup_gc":  # custody holds nothing open for a start that has not returned
+        if consumer == "startup_gc":  # custody is not open yet, but the task has not been proved over
             assert trees.prune_execution_snapshots(set(), worktree_root=tmp_path / "snapshots",
-                                                   data_dir=tmp_path / "data")["removed"] == ["fill"]
+                                                   data_dir=tmp_path / "data") == {"removed": [], "kept": ["fill"]}
         else:
             assert trees.remove_execution_snapshot("fill", worktree_root=tmp_path / "snapshots",
                                                    data_dir=tmp_path / "data")
     finally:
         release.set()
         worker.join(_WAIT_SEC)
-    assert "handle" not in outcome  # the run never receives the removed copy as ready
-    assert isinstance(outcome["error"], (OSError, subprocess.CalledProcessError)), outcome
+    if consumer == "startup_gc":
+        from ouroboros.task_results import write_task_result
+        assert "error" not in outcome and outcome["handle"].path == str(copy)
+        assert (copy / "lines.txt").read_bytes() == (target / "lines.txt").read_bytes()
+        write_task_result(tmp_path / "data", "fill-task", "completed")
+        monkeypatch.setattr("supervisor.queue.task_settlement_liveness", lambda _task: False)
+        assert trees.prune_execution_snapshots(set(), worktree_root=tmp_path / "snapshots",
+                                               data_dir=tmp_path / "data")["removed"] == ["fill"]
+    else:
+        assert "handle" not in outcome  # explicit disposition cannot return a removed copy as ready
+        assert isinstance(outcome["error"], (OSError, subprocess.CalledProcessError)), outcome
     nothing_left(tmp_path, target, "fill")  # nothing resurrected after the removal
 
 

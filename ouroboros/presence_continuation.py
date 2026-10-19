@@ -778,28 +778,29 @@ def turn_response(result: Any, version: int) -> dict:
     return body
 
 
-def continuation_status(stored: Mapping[str, Any]) -> str:
-    """A lost parked stack is interrupted only with positive controller-loss evidence.
+def continuation_status(stored: Mapping[str, Any], drive_root: Path | None = None) -> str:
+    """A parked author is interrupted once its attempt positively ended (``attempt_ended``),
+    before and after the reconciler records that end.
 
-    Generic inline ownership deliberately cannot infer death from a missing local
-    registry. The review park retains the controller's PID/birth/session witness;
-    old records without it and unobservable processes keep their recorded status.
-    This projection never reopens a task or changes its write-once envelope.
+    Missing or unobservable controller evidence keeps the recorded status. This
+    context fact for the next turn never reopens a task or changes its write-once envelope.
     """
-    from ouroboros.review_operation import controller_state
+    from ouroboros.presence_recovery import attempt_ended
 
     status = str(stored.get("status") or "unreadable")
-    record = stored.get("presence_continuation")
-    if (status == "running" and isinstance(record, dict)
-            and controller_state(record.get("author_controller")) == "dead"):
+    settled_lost = status == "failed" and str(stored.get("status_reconciled_from") or "") in {"running", "interrupted"}
+    if isinstance(stored.get("presence_continuation"), dict) and (
+            settled_lost or (status == "running" and attempt_ended(stored, drive_root))):
         return "interrupted"
     return status
 
 
 def work_view(stored: Mapping[str, Any], ref: str) -> tuple[int, dict] | None:
-    """The continuation poll of one Presence turn; None for any other work reference."""
+    """The continuation poll of one Presence turn; None for any other work reference.
+
+    Whether the author can still change it is decided by ``presence_recovery.retained_work_view``.
+    """
     from ouroboros.presence_runner import presence_result_from_stored
-    from ouroboros.task_results import STATUS_INTERRUPTED, is_reconciled_presence_placeholder
 
     record = stored.get("presence_continuation")
     if not isinstance(record, dict) or not isinstance(record.get("initial"), dict):
@@ -809,10 +810,7 @@ def work_view(stored: Mapping[str, Any], ref: str) -> tuple[int, dict] | None:
               "child_work_ref": str(record.get("child_work_ref") or record["initial"].get("work_ref") or ""),
               "outputs": [dict(row) for row in record.get("outputs") or [] if isinstance(row, dict)],
               "delivery_reporting_version": int(presence.get("delivery_reporting_version") == 1)}
-    status = continuation_status(stored)
-    if is_reconciled_presence_placeholder(stored) or status == STATUS_INTERRUPTED:
-        # The author's stack is gone and is never restarted automatically: unfinished, visible.
-        return 200, {**common, "status": "interrupted", "outcome": "silent", "text": "", "output_ref": ""}
+    status = str(stored.get("status") or "")
     if status not in {"completed", "failed", "cancelled"}:
         return 202, {**common, "status": "pending"}
     result = presence_result_from_stored(stored, ref)

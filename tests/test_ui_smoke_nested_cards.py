@@ -29,9 +29,11 @@ ROOT = '#page-chat .chat-live-card[data-task-id="nest-root"]'
 CHILD = '#page-chat .chat-live-card.subagent[data-task-id="%s"]'
 FACTS = """sel => {
     const card = document.querySelector(sel);
-    const button = card.querySelector(':scope > .chat-live-summary-button');
-    // The summary holds chip, title and line; the meta line and the Reviews count lead the card's own foot.
-    const q = (s) => button.querySelector(s) || card.querySelector(`:scope > [data-live-foot] ${s}`);
+    const summary = card.querySelector(':scope > .chat-live-summary-button');
+    // The summary holds chip, title, line and the card's one disclosure; the meta line and the Reviews count
+    // lead the card's own foot.
+    const q = (s) => summary.querySelector(s) || card.querySelector(`:scope > [data-live-foot] ${s}`);
+    const disclosure = q('[data-live-disclosure]');
     const style = (el) => getComputedStyle(el);
     const rect = (el) => el.getBoundingClientRect();
     const title = q('[data-live-title]');
@@ -54,8 +56,9 @@ FACTS = """sel => {
         reviewsText: q('[data-live-review-summary]')?.textContent || '', reviewsHidden: q('[data-live-review-summary]')?.hidden ?? true,
         reviewsDisplay: q('[data-live-review-summary]') ? style(q('[data-live-review-summary]')).display : 'none',
         reviewsTop: q('[data-live-review-summary]') ? rect(q('[data-live-review-summary]')).top : -1,
-        toggleDisplay: style(q('[data-live-toggle]')).display,
-        ariaExpanded: button.getAttribute('aria-expanded'),
+        toggleShown: rect(q('[data-live-toggle]')).width > 1,
+        disclosureTag: disclosure.tagName, disclosureName: disclosure.textContent.replace(/\\s+/g, ' ').trim(),
+        ariaExpanded: disclosure.getAttribute('aria-expanded'),
         cardRight: rect(card).right, cardHScroll: card.scrollWidth > card.clientWidth + 1,
         sideRight: rect(q('.chat-live-summary-side')).right,
         titleClipped: title.scrollWidth > title.clientWidth + 1,
@@ -132,8 +135,9 @@ def test_ui_smoke_nested_cards_are_one_identity_row_and_text_selects(direct_serv
                     assert facts["activityDisplay"] != "none" and facts["activityLines"] <= 1.2, facts
                     assert facts["metaDisplay"] != "none", facts
                     assert "updated" in facts["metaText"], facts
-                    # The `Show details` label is the root's; a child keeps notes + chevron.
-                    assert facts["toggleDisplay"] == "none", facts
+                    # The `Show details` words are the root's; a child keeps notes + chevron, and the
+                    # words stay its button's name.
+                    assert not facts["toggleShown"] and "Show details" in facts["disclosureName"], facts
                     # Quieter than the root: weight 400 and the secondary ink.
                     assert facts["titleWeight"] in ("400", "normal"), facts
                     assert facts["titleColor"] != root["titleColor"], (facts, root)
@@ -147,7 +151,7 @@ def test_ui_smoke_nested_cards_are_one_identity_row_and_text_selects(direct_serv
                 # duplicate activity reserves no band, while metadata stays visible.
                 assert root["activityDisplay"] == "none" and root["activityLines"] == 0, root
                 assert root["metaDisplay"] != "none", root
-                assert root["toggleDisplay"] != "none", root
+                assert root["toggleShown"] and root["disclosureTag"] == "BUTTON", root
                 # The summary outranks the details: body-size activity line.
                 assert root["activityFont"] == "14px", root
                 # A long identity ellipsizes inside the row; the side controls stay inside the card.
@@ -245,7 +249,7 @@ def test_ui_smoke_nested_cards_are_one_identity_row_and_text_selects(direct_serv
                 assert reviewed["expanded"] == "0" and not reviewed["reviewsHidden"] and reviewed["reviewsDisplay"] != "none", reviewed
                 assert reviewed["reviewsTop"] >= reviewed["metaTop"] - 2, reviewed
                 # Expanding a child reveals its narration line (metadata was already there).
-                page.locator(CHILD % "nest-review").locator(":scope > [data-live-summary-button]").click()
+                page.locator(CHILD % "nest-review").locator(":scope > [data-live-summary-button] [data-live-disclosure]").click()
                 page.wait_for_timeout(200)
                 opened = page.evaluate(FACTS, CHILD % "nest-review")
                 assert opened["expanded"] == "1" and opened["activityDisplay"] != "none", opened
@@ -283,14 +287,18 @@ def test_ui_smoke_nested_cards_are_one_identity_row_and_text_selects(direct_serv
                 assert selected.strip(), (selected, box)
                 after_drag = page.evaluate(FACTS, ROOT)
                 assert after_drag["ariaExpanded"] == root["ariaExpanded"], (root, after_drag)
-                # A plain click still toggles.
+                # The summary is reading content: a plain click on the title opens nothing (owner 17.10).
                 page.evaluate("() => window.getSelection().removeAllRanges()")
+                title.click()
+                page.wait_for_timeout(200)
+                assert page.evaluate(FACTS, ROOT)["ariaExpanded"] == root["ariaExpanded"]
+                # The one disclosure, "Show details", toggles by pointer...
                 page.locator(f"{ROOT} > .chat-live-summary-button [data-live-toggle]").click()
                 page.wait_for_timeout(200)
                 toggled = page.evaluate(FACTS, ROOT)["ariaExpanded"]
                 assert toggled != root["ariaExpanded"]
-                # Keyboard activation on the div[role=button] summary toggles it back.
-                page.locator(f"{ROOT} > .chat-live-summary-button").focus()
+                # ...and by keyboard on the same button.
+                page.locator(f"{ROOT} > .chat-live-summary-button [data-live-disclosure]").focus()
                 page.keyboard.press("Enter")
                 page.wait_for_timeout(200)
                 assert page.evaluate(FACTS, ROOT)["ariaExpanded"] == root["ariaExpanded"]

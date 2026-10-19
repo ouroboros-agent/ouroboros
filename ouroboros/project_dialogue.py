@@ -1459,25 +1459,22 @@ def project_completion_delivery_outcome(
             return MAIN_MIRROR_INELIGIBLE, False
         # Only the salvage excerpt survives in the TEXT: the model's own answer is
         # never cut into it (it rides whole in the typed key below, or not at all),
-        # while salvaged bytes exist nowhere else. The text's only pointer is the
-        # invitation, so a salvage may never displace it — preserved bytes named
-        # with no way to reach them are worse than the plain invitation.
+        # while salvaged bytes exist nowhere else. The row's door is its Project
+        # reference (the UI builds it from `project_id`), so the text invites nothing:
+        # a sentence promising an action only the capsule performs is a second door.
         excerpt = _completion_excerpt(result, chat_id=1, salvage_only=True)
         delivery = source_delivery or {}
         clause = terminal_delivery_clause(delivery.get("state", ""), delivery.get("preserved_path", ""))
         verdict = _join_cause_clauses([_completion_verdict(result, task_done_event),
                                       f"Source Project: {clause}" if clause else ""])
-        lead = f"{verdict} " if verdict else ""
-        if excerpt:
-            excerpt = f"{excerpt} Open the Project for details."
+        detail = " ".join(part for part in (verdict, excerpt) if part)
         from ouroboros.terminal_time import terminal_time_fact
         from ouroboros.terminal_projection import completion_notice
         from ouroboros.project_completion_facts import completion_facts
         event = {
             "type": "send_message", "chat_id": 1, "task_id": tid,
-            "text": (f"{snapshot['target_label']} · "
-                     f"{completion_status_label(result, task_done_event)}\n"
-                     f"{lead}{excerpt or 'Open the Project for details.'}"),
+            "text": (f"{snapshot['target_label']} · {completion_status_label(result, task_done_event)}"
+                     + (f"\n{detail}" if detail else "")),
             "role": "system", "system_type": "project_completion_summary",
             "delivery_id": f"project-completion:{tid}",
             "progress_meta": {

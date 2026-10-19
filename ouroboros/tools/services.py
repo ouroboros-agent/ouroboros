@@ -1032,6 +1032,8 @@ def prune_service_logs(
     *,
     now: float | None = None,
 ) -> Dict[str, Any]:
+    """Archive old logs only after local and durable process custody release their writers."""
+    from ouroboros import body_candidate
     from ouroboros.retention import age_cutoff, get_gc_retention_days
 
     # Explicit overrides are honored as-is (age_cutoff floors at 0 => explicit 0
@@ -1066,6 +1068,14 @@ def prune_service_logs(
                 except OSError:
                     continue
                 if stat.S_ISREG(child_stat.st_mode) and child_stat.st_mtime < cutoff:
+                    facts = service_execution_facts(f"{task_dir.name}:{child.stem}")
+                    if facts is None and child.stem.endswith(".executor"):
+                        facts = service_execution_facts(f"{task_dir.name}:{child.stem.removesuffix('.executor')}")
+                    # A kept service can outlive its task or live in another worker's registry.
+                    if (facts is not None and facts.get("state") != "exited") or body_candidate.live_lineage_processes(
+                            drive_root, task_dir.name):
+                        report["retained_files"] += 1
+                        continue
                     archive_result = _archive_stale_service_log(pathlib.Path(drive_root), child)
                     if archive_result.get("archived"):
                         report["archived_files"] += 1

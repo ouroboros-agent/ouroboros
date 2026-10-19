@@ -268,7 +268,9 @@ def _dispose_delegated(drive: Any, entry: Any, snapshot_key: str, reason: str,
             removed = remove_execution_snapshot(snapshot_key)
         except Exception:
             removed = False
-        note = "" if removed else " (snapshot cleanup deferred to the startup GC.)"
+        note = "" if removed else (
+            " (snapshot cleanup deferred to custody GC at boot or a later custody pass, "
+            "once the owning task is proven over.)")
     return True, note
 
 

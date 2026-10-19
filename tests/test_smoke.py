@@ -142,6 +142,7 @@ EXPECTED_TOOLS = [
     "run_command", "run_script",
     "list_skills", "skill_review", "skill_exec", "toggle_skill", "skill_owner_action",
     "skill_preflight", "submit_skill_to_hub",
+    "skill_sources", "skill_search", "skill_install", "skill_update",
     "list_available_tools", "enable_tools",
     "analyze_screenshot", "vlm_query", "view_image",
     "ocr_pdf", "youtube_transcript", "extract_video_frames",

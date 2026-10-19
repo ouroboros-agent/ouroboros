@@ -313,7 +313,7 @@ def test_upgrade_keeps_token_grant_and_local_proxy(
 ):
     """The proxy is skill-local state: reseeding changes payload, not credentials or grants."""
     import ouroboros.config as config
-    from ouroboros.launcher_bootstrap import _per_skill_version_resync
+    from ouroboros.skill_builtin import reseed_changed_builtins
     from ouroboros.skill_loader import (
         load_skill,
         load_skill_grants,
@@ -346,7 +346,7 @@ def test_upgrade_keeps_token_grant_and_local_proxy(
                       requested_permissions=permissions)
 
     log = logging.getLogger("tests.telegram_proxy")
-    assert _per_skill_version_resync(_ROOT.parent, native, log, drive_root=drive) == 1
+    assert reseed_changed_builtins(drive, seed_dir=_ROOT.parent, log_obj=log) == 1
     new = load_skill(installed, drive)
     grants = load_skill_grants(drive, "telegram")
     assert new.manifest.version == current_version and new.content_hash != old.content_hash

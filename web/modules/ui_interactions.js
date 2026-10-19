@@ -33,7 +33,7 @@ export function bindDialogFocus(dialog, {
         // An independently mounted nested dialog owns its own keyboard cycle.
         if (event.target.closest('[aria-modal="true"]') !== dialog) return;
         if (event.key === 'Escape' && onEscape) {
-            event.preventDefault();
+            event.preventDefault();  // layers.back() relies on it: Back closes this dialog and keeps the layer under it
             event.stopPropagation();
             onEscape();
         } else if (event.key === 'Tab') {

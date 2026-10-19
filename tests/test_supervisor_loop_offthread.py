@@ -242,6 +242,10 @@ def test_a_closed_generation_stops_the_sweep_before_its_next_mutation(quiet_tick
                         lambda root, **kw: done.append("reap") or stop.set() or [])
     monkeypatch.setattr(sm, "_reconcile_delegated_runs", lambda live, **kw: done.append("reconcile"))
     monkeypatch.setattr(sm, "_cursor_refresh_settled_terminals", lambda live=None: done.append("cursor"))
+    monkeypatch.setattr(sm, "_prune_worktrees", lambda: done.append("worktrees"))
+    monkeypatch.setattr(sm, "_prune_delegated_snapshots", lambda: done.append("snapshots"))
+    monkeypatch.setattr(sm, "_prune_engine_runtimes", lambda: done.append("engine"))
+    monkeypatch.setattr(sm, "_prune_review_checkouts", lambda stop_event=None: done.append("review_checkouts"))
 
     assert sm._CUSTODY_SWEEP_LOCK.acquire(blocking=False)
     sm._run_periodic_custody_sweep(stop)
@@ -252,7 +256,8 @@ def test_a_closed_generation_stops_the_sweep_before_its_next_mutation(quiet_tick
     monkeypatch.setattr(pc, "reap_orphaned_processes", lambda root, **kw: done.append("reap") or [])
     assert sm._CUSTODY_SWEEP_LOCK.acquire(blocking=False)
     sm._run_periodic_custody_sweep(threading.Event())
-    assert done == ["reap", "reconcile", "cursor"], "an open generation runs every step"
+    assert done == ["reap", "reconcile", "cursor", "worktrees", "snapshots", "engine", "review_checkouts"], \
+        "an open generation runs every step, the working copies' retirers after the delegated runs"
 
     done.clear()
     closed = threading.Event()
@@ -361,6 +366,7 @@ def _quiet_reconcile_steps(monkeypatch, sm, done: list, *, heal=None):
     monkeypatch.setattr("ouroboros.task_status.reconcile_orphaned_running_tasks", heal or step("orphans"))
     monkeypatch.setattr("ouroboros.projects_registry.reconcile_projects", step("projects"))
     monkeypatch.setattr(sm, "_resume_interrupted_project_deletions", step("deletions"))
+    monkeypatch.setattr(sm, "_run_reconcile_prunes", step("prunes"))
     monkeypatch.setattr(sm, "_run_drive_custody_pass", step("drives"))
     monkeypatch.setattr(sm, "_tick_maintenance_child", step("maintenance"))
     from ouroboros import maintenance
@@ -403,7 +409,7 @@ def test_a_slow_reconcile_block_never_holds_the_loop_tick(quiet_tick, monkeypatc
             thread.join(5)
     assert all(not thread.is_alive() for thread in threads)
     assert healed == ["reconcile-maintenance"]
-    assert [name for name, _ in done] == ["review_jobs", "projects", "deletions", "drives", "maintenance"]
+    assert [name for name, _ in done] == ["review_jobs", "projects", "deletions", "prunes", "drives", "maintenance"]
     assert {thread for _, thread in done} == {"reconcile-maintenance"}
     assert marker[0] > 0.0 and not sm._RECONCILE_SWEEP_LOCK.locked(), "stamped, then released"
 
@@ -432,7 +438,7 @@ def test_history_sized_steps_stay_off_the_cancel_sweep(quiet_tick, monkeypatch):
     sm._periodic_supervisor_maintenance([time.time()], [0.0])  # the 300 s block alone
     for thread in threads:
         thread.join(5)
-    assert [name for name, _ in done] == ["review_jobs", "orphans", "projects", "deletions", "drives", "maintenance"]
+    assert [name for name, _ in done] == ["review_jobs", "orphans", "projects", "deletions", "prunes", "drives", "maintenance"]
     assert [thread.name for thread in threads if thread.name not in {"cold-custody", "schedule-admission"}] == ["cancel_intent_sweep", "terminal_delivery_replay", "question_delivery_replay", "pause_notice_replay", "abandoned_usage_reconciliation", "post_task_synthesis_recovery", "reconcile-maintenance"]
 
 
@@ -461,7 +467,7 @@ def test_a_closed_generation_stops_the_reconcile_block_before_its_next_mutation(
     _quiet_reconcile_steps(monkeypatch, sm, done)
     assert sm._RECONCILE_SWEEP_LOCK.acquire(blocking=False)
     sm._run_periodic_reconcile_sweep(marker, threading.Event())
-    assert [n for n, _ in done] == ["review_jobs", "orphans", "projects", "deletions", "drives", "maintenance"]
+    assert [n for n, _ in done] == ["review_jobs", "orphans", "projects", "deletions", "prunes", "drives", "maintenance"]
 
     done.clear()
     closed = threading.Event()

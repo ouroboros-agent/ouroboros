@@ -160,9 +160,8 @@ def test_skill_and_marketplace_reads_answer_their_published_shapes(client):
     assert bad_toggle.status_code == 400 and assert_bound("POST /api/skills/{skill}/toggle", bad_toggle)
     history = client.get("/api/skills/nothing/review-history/job-1")
     assert history.status_code == 404 and assert_bound("GET /api/skills/{skill}/review-history/{job_id}", history)
-    for market in ("clawhub", "ouroboroshub"):
-        token = f"GET /api/marketplace/{market}/installed"
-        assert assert_bound(token, client.get(f"/api/marketplace/{market}/installed")) == "MarketplaceInstalledResponse"
+    token = "GET /api/marketplace/clawhub/installed"
+    assert assert_bound(token, client.get("/api/marketplace/clawhub/installed")) == "MarketplaceInstalledResponse"
     missing = client.post("/api/marketplace/clawhub/install", json={})
     assert missing.status_code == 400 and assert_bound("POST /api/marketplace/clawhub/install", missing)
 
@@ -256,7 +255,7 @@ def test_every_published_and_owned_shape_has_one_field_identical_browser_twin():
 def test_every_request_and_header_fact_is_published_for_the_journeys():
     requests = {token: entry.get("request", {}).get("schemas") for token, entry in BY_TOKEN.items()}
     for token in ("POST /api/files/write", "POST /api/projects/from-task", "POST /api/skills/{skill}/toggle",
-                  "POST /api/claudexor/login", "POST /api/marketplace/ouroboroshub/install", "POST /api/command",
+                  "POST /api/claudexor/login", "POST /api/skill-catalog/install", "POST /api/command",
                   "POST /api/schedules", "POST /api/owner/context-mode", "DELETE /api/chat/upload"):
         assert requests[token] and requests[token] != [], token
     assert BY_TOKEN["POST /api/claudexor/maintenance/operations"]["headers"] == ["Idempotency-Key!"]

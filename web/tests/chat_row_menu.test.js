@@ -14,6 +14,7 @@ function fixture() {
     const started = [];
     const replies = {
         bubbleRef: (row) => (row.dataset.rowAddress ? { address: row.dataset.rowAddress } : null),
+        cardRef: (record) => (record.replyable ? { address: `task:${record.groupId}` } : null),
         start: (ref) => started.push(ref.address),
     };
     const copied = [];
@@ -53,8 +54,9 @@ function workCard(f, { resume = false, stop = true, cancelPending = false } = {}
         actions.append(node);
         return node;
     };
-    const record = { groupId: 't-1', root: card, titleEl: title, activityEl: line,
-        cardReplyEl: button('Reply', 'reply'), resumeRunBtn: resume ? button('Resume', 'resume') : null,
+    // A work card draws no Reply of its own (owner 17.10, Q9 B): the menu's Reply calls the reply path directly.
+    const record = { groupId: 't-1', root: card, titleEl: title, activityEl: line, replyable: true,
+        resumeRunBtn: resume ? button('Resume', 'resume') : null,
         cancelRunBtn: stop ? button('Stop…', 'stop') : null, cancelPendingPolicy: cancelPending ? 'finalize' : '' };
     const footer = el('button', { className: 'chat-live-bound-pointer', attrs: { 'data-intent': 'open-project' } });
     footer.addEventListener('click', () => pressed.push('project'));
@@ -215,7 +217,8 @@ test('a work card offers Reply, Copy, Open project, Resume, Pause and Stop… ex
             f.openMenu().children.find((node) => node.dataset.rowAction === kind).click();
         };
         press('reply'); press('project'); press('resume'); press('stop');
-        assert.deepEqual(pressed.splice(0), ['reply', 'project', 'resume', 'stop'], 'each item presses the card\'s own control');
+        assert.deepEqual(pressed.splice(0), ['project', 'resume', 'stop'], 'each item presses the card\'s own control');
+        assert.deepEqual(f.started.splice(0), ['task:t-1'], 'Reply quotes the work by its task address');
         // A nested child is part of its root's work: its press opens the root's menu, and its own reference is not the root's.
         child.emit('contextmenu', { clientX: 1, clientY: 1 });
         assert.deepEqual(f.items(), ['reply', 'copy', 'project', 'resume', 'pause', 'stop']);
@@ -232,9 +235,9 @@ test('a work card offers Reply, Copy, Open project, Resume, Pause and Stop… ex
         assert.deepEqual(f.items(), ['reply', 'copy', 'project', 'stop'], 'a pending stop offers only its escalation');
         f.openMenu().emit('keydown', { key: 'Escape', target: f.openMenu().children[0] });
         record.cancelRunBtn.remove();
-        record.cardReplyEl.hidden = true;
+        record.replyable = false;
         summary.emit('contextmenu', { clientX: 1, clientY: 1 });
-        assert.deepEqual(f.items(), ['copy', 'project'], 'a settled card without its Reply and Stop…');
+        assert.deepEqual(f.items(), ['copy', 'project'], 'a card that offers no Reply, settled without Stop…');
         assert.equal(card.contains(f.openMenu()), false, 'the menu is portalled outside the card');
     } finally { f.close(); }
 });

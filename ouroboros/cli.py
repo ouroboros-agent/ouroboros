@@ -475,26 +475,39 @@ def _skills_command(args: argparse.Namespace) -> int:
 def _marketplace_command(args: argparse.Namespace) -> int:
     client = _client(args)
     hub = args.hub
+    query, slug, name = (getattr(args, key, "") or "" for key in ("query", "slug", "name"))
     if hub == "clawhub":
         paths = {
-            "search": f"/api/marketplace/clawhub/search?q={urllib.parse.quote(args.query or '')}",
+            "search": f"/api/marketplace/clawhub/search?q={urllib.parse.quote(query)}",
             "installed": "/api/marketplace/clawhub/installed",
-            "preview": f"/api/marketplace/clawhub/preview/{urllib.parse.quote(args.slug)}",
+            "preview": f"/api/marketplace/clawhub/preview/{urllib.parse.quote(slug)}",
             "install": "/api/marketplace/clawhub/install",
-            "update": f"/api/marketplace/clawhub/update/{urllib.parse.quote(args.name)}",
-            "uninstall": f"/api/marketplace/clawhub/uninstall/{urllib.parse.quote(args.name)}",
+            "update": f"/api/marketplace/clawhub/update/{urllib.parse.quote(name)}",
+            "uninstall": f"/api/marketplace/clawhub/uninstall/{urllib.parse.quote(name)}",
         }
-    else:
+    else:  # ouroboroshub is the compatibility spelling of sources
+        if args.marketplace_command in {"install", "preview"} and "/" not in slug:
+            offered = client.request("GET", f"/api/skill-catalog/search?q={urllib.parse.quote(slug)}")
+            item = next((item for item in offered.get("items", []) if item.get("name") == slug and
+                         item.get("source_id") in {"ouroboros", "ouroboros-community"}), None)
+            if item is None:
+                raise CLIError(f"The public hub does not offer {slug!r}; use a catalog id <source>/<name>.")
+            slug = item["id"]
+        item = urllib.parse.quote(slug, safe="/")
         paths = {
-            "search": f"/api/marketplace/ouroboroshub/catalog?q={urllib.parse.quote(args.query or '')}",
-            "installed": "/api/marketplace/ouroboroshub/installed",
-            "preview": f"/api/marketplace/ouroboroshub/preview/{urllib.parse.quote(args.slug)}",
-            "install": "/api/marketplace/ouroboroshub/install",
-            "update": f"/api/marketplace/ouroboroshub/update/{urllib.parse.quote(args.name)}",
-            "uninstall": f"/api/marketplace/ouroboroshub/uninstall/{urllib.parse.quote(args.name)}",
+            "search": f"/api/skill-catalog/search?q={urllib.parse.quote(query)}",
+            "installed": "/api/marketplace/ouroboroshub/installed" if hub == "ouroboroshub" else "/api/extensions",
+            "preview": f"/api/skill-catalog/item/{item}",
+            "install": "/api/skill-catalog/install",
+            "update": f"/api/skills/{urllib.parse.quote(name)}/update",
+            "uninstall": f"/api/skills/{urllib.parse.quote(name)}/uninstall",
         }
     method = "GET" if args.marketplace_command in {"search", "installed", "preview"} else "POST"
-    body = {"slug": getattr(args, "slug", "")} if args.marketplace_command == "install" else {}
+    body: dict = {}
+    if args.marketplace_command == "install":
+        body = {"slug": slug} if hub == "clawhub" else {"id": slug}
+    elif args.marketplace_command == "update" and hub != "clawhub":
+        body = {"mode": "replace"}
     _print_json(client.request(method, paths[args.marketplace_command], body if method == "POST" else None))
     return 0
 
@@ -688,7 +701,7 @@ def _add_skills_parser(subparsers: argparse._SubParsersAction) -> None:
 
 def _add_marketplace_parser(subparsers: argparse._SubParsersAction) -> None:
     market = subparsers.add_parser("marketplace", help="marketplace wrappers")
-    market.add_argument("hub", choices=["clawhub", "ouroboroshub"])
+    market.add_argument("hub", choices=["clawhub", "sources", "ouroboroshub"], help="ouroboroshub is an alias of sources")
     sub = market.add_subparsers(dest="marketplace_command", required=True)
     search = sub.add_parser("search")
     search.add_argument("query", nargs="?")

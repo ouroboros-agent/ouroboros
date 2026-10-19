@@ -169,7 +169,7 @@ def schedule_transaction(drive_root: pathlib.Path | None = None):
     The transaction takes BOTH locks ITSELF — the queue lock first, the table's
     sidecar file lock second — so no caller can compose the pair in the other
     order. Asking callers to order them was the bug: ``schedule_followup`` wraps
-    its cap-read and its write in one transaction, then ``upsert_scheduled_task``
+    its pending read and its write in one transaction, then ``upsert_scheduled_task``
     reached for the queue lock INSIDE that hold, against the scheduler tick's
     queue-then-table order. Owning the order here is what makes every caller
     provably consistent instead of individually audited.

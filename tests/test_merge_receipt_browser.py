@@ -73,7 +73,7 @@ def test_merge_card_stays_current_after_outbox_delivery_and_reload(request, worl
             page.evaluate("row => receiptSend(row)", row)
         card = page.locator('.chat-live-card[data-task-id="merge-task"]')
         if card.get_attribute("data-expanded") != "1":
-            card.locator('[data-live-summary-button]').click()
+            card.locator('[data-live-disclosure]').click()
         page.screenshot(path=str(output / f"merge-receipt-live{suffix}.png"), full_page=True)
         line = card.locator('.chat-live-line.result')
         assert line.count() == 1 and "merge: merged" in line.inner_text()
@@ -82,7 +82,7 @@ def test_merge_card_stays_current_after_outbox_delivery_and_reload(request, worl
         assert replay["painted"], "receipt history must paint successfully"
         card = page.locator('.chat-live-card[data-task-id="merge-task"]')
         if card.get_attribute("data-expanded") != "1":
-            card.locator('[data-live-summary-button]').click()
+            card.locator('[data-live-disclosure]').click()
         page.screenshot(path=str(output / f"merge-receipt-replay{suffix}.png"), full_page=True)
         assert not page.get_by_role("button", name="Retry loading messages").is_visible()
         line = card.locator('.chat-live-line.result')
@@ -136,7 +136,7 @@ def test_cold_bounded_receipt_renders_without_a_prior_live_revision(request, wor
             page.screenshot(path=str(output / "merge-receipt-cold-orphan.png"), full_page=True)
             return
         if card.get_attribute("data-expanded") != "1":
-            card.locator('[data-live-summary-button]').click()
+            card.locator('[data-live-disclosure]').click()
         page.screenshot(path=str(output / f"merge-receipt-cold-{placement}.png"), full_page=True)
         assert page.locator('.chat-live-line').filter(has_text="merge: merged").count() == 1
         line = card.locator('.chat-live-line.result')

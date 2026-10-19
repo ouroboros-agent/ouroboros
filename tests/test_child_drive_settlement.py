@@ -229,6 +229,40 @@ def test_a_settled_drive_leaves_only_unserved_trash_for_the_maintenance_child(tm
     assert list(trash.iterdir()) == []
 
 
+def test_read_only_folders_in_custody_leftovers_never_strand_them(tmp_path):
+    """A moved drive or a crashed settlement's staging carrying read-only folders and files (a Git
+    object store, a tool's own modes) is removed whole by the permission-granting removal, so no
+    trash entry waits forever for its identity to change; a staging entry younger than an hour (a
+    settlement may still be running) is still left alone."""
+    import stat
+
+    data = tmp_path / "data"
+    sealed = []
+
+    def read_only_tree(entry: Path) -> Path:
+        objects = entry / "data" / ".git" / "objects" / "ab"
+        objects.mkdir(parents=True)
+        (objects / "cdef").write_bytes(b"object")
+        os.chmod(objects / "cdef", stat.S_IREAD)
+        os.chmod(objects, stat.S_IREAD | stat.S_IEXEC)
+        sealed.append(objects)
+        return entry
+
+    moved = read_only_tree(data / "state" / "custody_trash" / f"{TASK}-0123456789ab")
+    staging = read_only_tree(data / "state" / "custody_staging" / f"{TASK}-fedcba987654")
+    try:
+        task_custody.sweep_custody_leftovers(data, min_age_sec=3600)
+        assert staging.exists(), "a young staging entry may belong to a running settlement"
+        task_custody.sweep_custody_leftovers(data, min_age_sec=0)
+        assert not staging.exists()
+        assert task_custody.remove_custody_trash(data) == {"removed": 1, "stuck": {}}
+        assert not moved.exists()
+    finally:
+        for objects in sealed:
+            if objects.exists():
+                os.chmod(objects, stat.S_IRWXU)
+
+
 @pytest.mark.parametrize("probe", [None, lambda _task: True, lambda _task: None])
 def test_unknown_or_live_ownership_deletes_nothing(tmp_path, probe):
     data, drive, record = _cancelled_with_capture(tmp_path)

@@ -102,8 +102,14 @@ class _PacketSource:
 
 
 def _source_path(root: Any, task_id: str, ref: Dict[str, Any]) -> str:
+    """The packet's loose absolute path, the address a session's ordinary file tools read. A packet
+    the packer has already moved into the task's evidence pack (a review that opens after the task was
+    packed: its byte-identical packet IS the packed handle, so the write-once store writes no file) is
+    written back beside its name from the pack's verified bytes; the open review keeps it loose."""
     from ouroboros.artifacts import task_artifact_dir_path
+    from ouroboros.evidence_packs import materialize_handle
 
+    materialize_handle(root, task_id, ref["path"])  # absent everywhere: the verifying read refuses, typed
     return str((task_artifact_dir_path(root, task_id) / ref["path"]).resolve())
 
 
@@ -384,7 +390,8 @@ def retain_review_source(request: Any, slot_id: str, custody_root: pathlib.Path)
 
 
 def prepare_session_source(delivery: Optional[Dict[str, Any]], *, task_id: str) -> str:
-    """Verify the retained source and return its ordinary filesystem read address.
+    """Verify the retained source and return its ordinary filesystem read address
+    (a packet packed since retention is written back beside its name first).
 
     No engine calls, uploads, capability inference or filesystem grants. The
     selected session's actual reads may still fail; coverage is diagnostic and

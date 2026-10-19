@@ -43,7 +43,7 @@ Files named `SHA256SUMS`, `release-evidence.json`, `release-smoke-*.json`, and `
 
 1. Click [**Download for macOS (.dmg)**][download-macos-arm64]. The current file is named `Ouroboros-<version>.dmg`.
 2. Open the DMG and drag `Ouroboros.app` onto the **Applications** shortcut.
-3. Open Ouroboros from Applications. If Gatekeeper asks, right-click the app and choose **Open**.
+3. Open Ouroboros from Applications. If macOS refuses to open it, choose **Open Anyway** in **System Settings → Privacy & Security** (on macOS 14 and earlier, right-clicking the app and choosing **Open** also works).
 
 <p align="center">
   <img src="assets/install-macos.png" width="760" alt="Ouroboros DMG window with a large arrow from Ouroboros.app to the Applications shortcut and Install CLI.command below">

@@ -94,7 +94,7 @@ def test_two_native_accounting_waits_in_chat_logs_and_reload(subscription_ui, ro
                 first = pump("entered")
                 page.locator('#chat-messages .chat-live-card').first.wait_for(state="attached")
                 card = page.locator('#chat-messages .chat-live-card').first
-                card.locator('.chat-live-summary-button').click()
+                card.locator('.chat-live-summary-button [data-live-disclosure]').click()
                 capture(page, "chat-first-entered")
                 release.set()
                 pump("ended")
@@ -131,7 +131,7 @@ def test_two_native_accounting_waits_in_chat_logs_and_reload(subscription_ui, ro
         capture(page, "logs-two-complete")
         page.reload()
         page.click('[data-nav-page="chat"]')
-        page.locator('#chat-messages .chat-live-card').first.locator('.chat-live-summary-button').click()
+        page.locator('#chat-messages .chat-live-card').first.locator('.chat-live-summary-button [data-live-disclosure]').click()
         page.wait_for_function("() => document.querySelectorAll('#chat-messages .chat-live-line-title').length === 4")
         assert labels(chat_lines) == expected
         capture(page, "chat-history-reloaded")

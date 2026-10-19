@@ -224,8 +224,10 @@ def test_reworded_host_rows_live_and_after_reload(subscription_ui, tmp_path, mon
     def check(phase):
         page.evaluate(FRAMES)
         for card in page.locator(".chat-live-card").all():
-            if card.get_attribute("data-expanded") != "1" and card.locator("[data-live-summary-button]").count():
-                card.locator("[data-live-summary-button]").first.click()
+            # A card opens by its own Show details (a portal has none: its room holds the details).
+            disclosure = card.locator(":scope > [data-live-summary-button] [data-live-disclosure]")
+            if card.get_attribute("data-expanded") != "1" and disclosure.is_visible():
+                disclosure.click()
         page.evaluate(FRAMES)
         body = page.locator("#page-chat").inner_text()
         found = {key: text in body for key, text in texts.items()}

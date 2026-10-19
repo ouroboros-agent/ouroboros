@@ -80,7 +80,7 @@ from ouroboros.review_model_routes import (
     resolved_review_model_target,  # noqa: F401
 )
 from ouroboros.runtime_limits import (
-    EXTERNAL_PLATFORM_UPDATE_TIMEOUT_SEC, WORKER_SPAWN_GRACE_SEC,  # noqa: F401
+    ARTIFACT_COMPRESSION_TIMEOUT_SEC, EXTERNAL_PLATFORM_UPDATE_TIMEOUT_SEC, WORKER_SPAWN_GRACE_SEC,  # noqa: F401
     WORKER_READY_WINDOW_SEC,  # noqa: F401
     WORKER_READY_MAX_ATTEMPTS, WORKER_READY_CEILING_SEC,  # noqa: F401
     SUPERVISOR_EVENT_BATCH_MAX_EVENTS, SUPERVISOR_EVENT_BATCH_MAX_SEC, BUDGET_PROJECTION_RETRY_SEC,  # noqa: F401
@@ -399,8 +399,13 @@ def get_auto_grant_enabled() -> bool:
 
 
 def get_trust_native_seeded_skills() -> bool:
-    """Whether launcher-seeded native skills get the hash-pinned trust verdict."""
+    """Whether built-ins install trusted when the source list has no built-in row (the derived row reads it too)."""
     return _settings_flag_enabled("OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS")
+
+
+def get_starter_skills_turn_on() -> bool:
+    """Whether the build's starter installs request first enablement when ready."""
+    return _settings_flag_enabled("OUROBOROS_STARTER_SKILLS_TURN_ON")
 
 
 def get_runtime_mode() -> str:
@@ -572,14 +577,8 @@ def resolve_data_skills_dir(data_dir: pathlib.Path) -> Optional[pathlib.Path]:
 
 
 def get_ouroboroshub_catalog_url() -> str:
-    """Return the official OuroborosHub static catalog URL."""
+    """The public hub's v1 catalog URL: the derived hub source rows and the publish fallback read it."""
     return str(runtime_settings().get("OUROBOROS_HUB_CATALOG_URL") or SETTINGS_DEFAULTS["OUROBOROS_HUB_CATALOG_URL"]).strip()
-
-
-def get_ouroboroshub_skills_dir() -> pathlib.Path:
-    """Return ``<DATA_DIR>/skills/ouroboroshub/`` (created on demand by
-    ``ensure_data_skills_dir``, which makes every source subdir)."""
-    return ensure_data_skills_dir(DATA_DIR) / SKILL_SOURCE_OUROBOROSHUB
 
 
 def get_clawhub_registry_url() -> str:

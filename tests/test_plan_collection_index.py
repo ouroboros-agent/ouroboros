@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from ouroboros import evidence_packs, late_review_marks, obligations, plan_record, store, store_import, task_store
+from ouroboros import evidence_packs, late_review_marks, plan_record, store, store_import, task_store
 from tests import test_late_review_marks as late
 from tests.test_late_review_marks import council as council
 from tests.test_plan_record import _participant, _record
@@ -186,11 +186,12 @@ def test_known_plan_work_uses_its_own_index_before_unknown_history(tmp_path, mon
                for statement, params in selected)
     assert list(task_store.review_collection_candidates(tmp_path)) == ["acceptance"]
     assert _flags(tmp_path, "old-0") == (0, None, 1)
-    assert "plan_collection_pending" not in {*store.FLAG_COLUMNS.values(), *obligations.DUTY_SETS}
+    assert "plan_collection_pending" not in store.FLAG_COLUMNS.values()
     publish(tmp_path / "packer", document("quiet"))
     with store.open_store(tmp_path / "packer", write=True) as txn:
         txn.conn.execute("UPDATE tasks SET plan_collection_pending=1 WHERE task_id='quiet'")
-    assert evidence_packs.task_settled(tmp_path / "packer", "quiet"), "selector is not a new retention duty"
+    with store.open_store(tmp_path / "packer", write=False) as txn:
+        assert evidence_packs.task_packable(txn, "quiet"), "selector is not a new retention duty"
 
 
 def test_stopped_plan_classification_keeps_unknown_rows_for_next_pass(tmp_path, monkeypatch):

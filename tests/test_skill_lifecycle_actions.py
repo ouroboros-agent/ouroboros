@@ -114,7 +114,7 @@ def test_owner_action_refuses_unproven_source_or_changed_request(skill_actor, in
     assert load_skill_grants(ctx.drive_root, "demo")["granted_permissions"] == []
 
 
-def test_auto_repair_cannot_enable_from_its_generated_request(skill_actor):
+def test_selected_skill_task_without_enable_needs_the_owners_words_to_enable(skill_actor):
     ctx, _skill, revision = skill_actor
     ctx.task_constraint = TaskConstraint(skill_name="demo", payload_root="skills/external/demo", allow_enable=False)
     assert run_skill_action(ctx, "demo", "enable")["status_code"] == 403

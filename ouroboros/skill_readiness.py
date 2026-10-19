@@ -245,16 +245,16 @@ def _skill_names_from_review_history(
 
 
 def _dependency_action(skill: Any, review_reason: str) -> Dict[str, str]:
-    """Where an unready dependency set is reconciled. A launcher-trusted native
-    seed has no review row to replay, so skill_review would buy a paid panel;
-    its enable runs the same post-PASS dependency step instead."""
-    from ouroboros.launcher_bootstrap import native_seed_trusted
+    """Where an unready dependency set is reconciled. Bytes accepted without a review
+    (trusted source, self-check, owner skip or edit) have no review row to replay, so
+    skill_review would buy a paid panel; their enable runs the same post-PASS step."""
+    from ouroboros.skill_acceptance import accepted_without_review
 
-    if native_seed_trusted(skill):
+    if accepted_without_review(skill):
         return {"phase": "dependencies", "tool": "toggle_skill", "reason": (
-            "Launcher-trusted native seed: there is no review to replay, so skill_review would buy a "
+            "Accepted without a review: there is no review to replay, so skill_review would buy a "
             "paid panel. toggle_skill enabled=true installs the declared dependencies in the same step "
-            "(restart retries them for an enabled seed); enable only where owner intent covers it, "
+            "(restart retries them for an enabled built-in); enable only where owner intent covers it, "
             "never over an owner's OFF.")}
     return {"phase": "dependencies", "tool": "skill_review", "reason": review_reason}
 

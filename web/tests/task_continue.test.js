@@ -226,6 +226,25 @@ test('an event row never erases the offer; a root that ended without an answer r
     }
 });
 
+test('a child card never shows Continue, even when a replayed row carries its parent\'s offer', () => {
+    const { prior } = installDom();
+    try {
+        // A rejected subagent's notice rides under the parent's task id and can carry the parent's offer.
+        const row = { is_progress: true, task_terminal_status: 'cancelled',
+            continuation_offer: { eligible: true, cause: 'snapshot_restore' } };
+        const parent = settledRootCard('parent-probe');
+        syncContinueAction(parent, row);
+        assert.equal(parent.root.querySelector('[data-continue-task]')?.textContent, 'Continue', 'the root keeps its offer');
+        const child = settledRootCard('child-probe', { isSubagent: true });
+        syncContinueAction(child, row);
+        assert.equal(child.root.querySelector('[data-continue-task]'), null);
+        syncContinueAction(child, { ...row, continuation_offer: { eligible: false, refusal: 'not_a_root_task' } });
+        assert.equal(child.root.querySelector('[data-continue-refusal]'), null, 'no refusal line on a child either');
+    } finally {
+        restoreDom(prior);
+    }
+});
+
 for (const failure of ['reject', 'null', 'missing-offer', 'null-offer']) {
 test(`an unusable detail read (${failure}) lets the next terminal row retry without polling`, async () => {
     const { prior } = installDom();

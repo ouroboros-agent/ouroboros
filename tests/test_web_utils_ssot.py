@@ -99,22 +99,6 @@ def test_render_markdown_safe_strips_dangerous_tags_and_attrs():
     assert "'rel', 'noopener noreferrer'" in block
 
 
-def test_marketplace_does_not_redeclare_shared_helpers():
-    """marketplace.js must import shared helpers, not redeclare them."""
-    src = _read("marketplace.js")
-    # Marketplace no longer renders package markdown after Details removal.
-    assert "renderMarkdownSafe" not in src
-    assert "safeExternalHrefAttr" in src
-    assert "boundedText" in src
-    assert "fetchJson" in src
-    # No local function declarations of the SSOT helpers.
-    assert "function boundedText(" not in src, "marketplace.js must use utils.boundedText"
-    assert "async function fetchJson(" not in src, "marketplace.js must use utils.fetchJson"
-    # ``safeExternalUrl`` may exist as a local *alias* (`const safeExternalUrl = safeExternalHrefAttr`)
-    # but not as a function definition.
-    assert "function safeExternalUrl(" not in src, "marketplace.js must alias to utils.safeExternalHrefAttr"
-
-
 def test_skills_does_not_redeclare_shared_helpers():
     src = _read("skills.js")
     renderer = _read("skill_card_renderer.js")
@@ -123,14 +107,13 @@ def test_skills_does_not_redeclare_shared_helpers():
     assert "safeExternalHrefAttr as safeExternalUrl" in renderer
     assert "function boundedText(" not in src
     assert "function safeExternalUrl(" not in src + renderer
-    assert "source === 'self_authored' || source === 'external'" in renderer
-    assert "payloadRoot.startsWith('skills/external/')" in renderer
+    # Delete is offered only for a skill made here, inside the editable external bucket.
+    assert "['external', 'self_authored'].includes(sourceTag(skill)) && String(skill.payload_root || '').startsWith('skills/external/')" in renderer
     assert "skills-delete-local" in renderer
-    assert "apiClient.deleteSkill(name, payloadRoot, current.content_hash)" in src
+    assert "apiClient.deleteSkill(name, payloadRoot || skill.payload_root, skill.content_hash)" in src
     assert "/api/skills/${encodeURIComponent(skill)}/delete" in api_client
     assert "payload_root: payloadRoot" in api_client
     assert "expected_content_hash: expectedContentHash" in api_client
-    assert "data/state/skills/${name}" in src
 
 
 def test_widgets_uses_shared_render_markdown():
@@ -138,13 +121,6 @@ def test_widgets_uses_shared_render_markdown():
     assert "renderMarkdownSafe" in src
     # Local declaration removed in v5.8.3-rc.5.
     assert "function renderMarkdownSafe(" not in src
-
-
-def test_ouroboroshub_uses_shared_fetch_json():
-    src = _read("ouroboroshub.js")
-    assert "fetchJson" in src
-    # Local async fetchJson removed in v5.8.3-rc.5.
-    assert "async function fetchJson(" not in src
 
 
 def test_onboarding_wizard_is_loaded_as_an_es_module():

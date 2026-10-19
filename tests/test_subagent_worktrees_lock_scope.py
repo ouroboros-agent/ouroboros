@@ -6,7 +6,7 @@ machine-wide ``.worktree_ops.lock`` for 40 minutes, and every other mutating
 classifying, hashing, populating, copying and deleting a snapshot's files now run
 OUTSIDE the lock; the registry row, the baseline pin and the worktree admin dir
 are the only things written under it — row first, so everything after it is
-nameable by the startup GC. A held lock is a typed refusal that names its holder,
+nameable by custody GC. A held lock is a typed refusal that names its holder,
 a dead holder is evicted at once, and a pre-POST refusal is definitely unrun.
 """
 
@@ -426,12 +426,15 @@ def test_a_failure_after_the_provisional_row_leaves_nothing_and_a_crash_is_gc_re
     assert not list(snaps.glob("dlg_*"))
 
     # A worker killed between the provisional row and the final row: the row is
-    # registered, custody never opened -> the startup GC removes checkout, ref, row.
+    # registered, custody never opened -> GC can remove it once the task is proven over.
     monkeypatch.setattr(wt, "_discard_snapshot_checkout", lambda *a, **k: None)
     with pytest.raises(OSError, match="copy failed"):
         _provision(target, snaps, data, snapshot_id="snapCrash")
     assert wt.find_execution_snapshot("snapCrash", data_dir=data) is not None
     assert "refs/ouroboros/delegated/snapCrash" in _git(target, "for-each-ref", "refs/ouroboros/").stdout
+    from ouroboros.task_results import write_task_result
+    write_task_result(data, "t1", "failed")
+    monkeypatch.setattr("supervisor.queue.task_settlement_liveness", lambda _task: False)
     report = wt.prune_execution_snapshots(set(), worktree_root=snaps, data_dir=data)
     assert report["removed"] == ["snapCrash"]
     assert wt.find_execution_snapshot("snapCrash", data_dir=data) is None

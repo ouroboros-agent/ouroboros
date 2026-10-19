@@ -573,14 +573,6 @@ def test_skill_review_projection_retry_finds_identity_before_bounded_tail(tmp_pa
     ) == 1
 
 
-def test_skill_review_projection_is_enrolled_as_a_hot_store():
-    from ouroboros.agent_startup_checks import _hot_store_thresholds
-
-    assert "state/skill_review_root_tasks.jsonl" in {
-        relative for relative, _threshold, _remediation in _hot_store_thresholds()
-    }
-
-
 def test_acceptance_slot_fit_uses_packet_density():
     from ouroboros.review_dispatch import acceptance_slot_fit
 

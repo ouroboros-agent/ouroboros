@@ -31,7 +31,7 @@ export function createHistoryControls(messagesDiv, statusHost = null) {
     root.className = 'chat-load-older';
     const button = doc.createElement('button');
     button.type = 'button';
-    button.className = 'chat-load-older-btn';
+    button.className = 'chat-load-older-btn ui-hit-area';
     const note = doc.createElement('span');
     note.className = 'chat-load-older-note';
     root.append(button, note);
@@ -279,7 +279,7 @@ export function captureLiveCardProjection(record) {
         record.titleEl?.textContent, record.activityEl?.textContent,
         record.metaEl?.innerHTML, record.countEl?.hidden, record.countEl?.textContent,
         record.inlineTypingEl?.style?.display, record.toggleEl?.textContent,
-        record.summaryButtonEl?.getAttribute?.('aria-expanded'),
+        record.disclosureEl?.getAttribute?.('aria-expanded'),
         root.querySelector?.('.chat-live-actions')?.innerHTML || '',
     ];
 }
@@ -290,15 +290,16 @@ export function liveCardProjectionChanged(before, record) {
     return before.some((value, index) => value !== after[index]);
 }
 
+// The expanded state belongs to the card's one disclosure, the "Show details" button; the summary band
+// above it is reading content and states nothing (a Main portal hides the button: work_portal.js).
 export function syncLiveCardToggle(record) {
     if (!record?.toggleEl) return;
     const expanded = record.root.dataset.expanded === '1';
     const text = expanded ? 'Hide details' : 'Show details';
     const ariaExpanded = expanded ? 'true' : 'false';
     if (record.toggleEl.textContent !== text) record.toggleEl.textContent = text;
-    // A Main portal's summary is content, not a disclosure (work_portal.js): it states no expanded state.
-    if (record.root.dataset.portal !== '1' && record.summaryButtonEl?.getAttribute('aria-expanded') !== ariaExpanded) {
-        record.summaryButtonEl?.setAttribute('aria-expanded', ariaExpanded);
+    if (record.disclosureEl && record.disclosureEl.getAttribute('aria-expanded') !== ariaExpanded) {
+        record.disclosureEl.setAttribute('aria-expanded', ariaExpanded);
     }
 }
 

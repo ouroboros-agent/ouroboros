@@ -28,6 +28,7 @@ from ouroboros.presence_capabilities import (
 )
 from ouroboros.presence_runtime import EXECUTION_CALL, EXECUTION_EVENT
 from ouroboros.tool_capabilities import COGNITIVE_MEMORY_TOOL_NAMES
+from ouroboros.contracts.task_contract import canonical_tool_name
 
 PRESENCE_CEILING_SCHEMA_VERSION = 1
 _SHA256_LEN = 64
@@ -387,7 +388,7 @@ def build_presence_capability_ceiling(
 
 
 def presence_ceiling_allows_tool(ceiling: PresenceCapabilityCeiling, tool_name: str) -> bool:
-    return any(grant.name == tool_name for grant in ceiling.tool_grants)
+    return any(canonical_tool_name(grant.name) == tool_name for grant in ceiling.tool_grants)  # frozen old spellings
 
 
 def presence_ceiling_allows_delegated_surface(ctx: Any, surface: str, workspace_root: str = "") -> bool:
@@ -491,7 +492,7 @@ def apply_presence_argument_bindings(ctx: Any, tool_name: str, args: Mapping[str
     result = dict(args or {})
     if ceiling is None:
         return result
-    grant = next((item for item in ceiling.tool_grants if item.name == tool_name), None)
+    grant = next((item for item in ceiling.tool_grants if canonical_tool_name(item.name) == tool_name), None)
     if grant is None:
         return result
     for binding in grant.bindings:

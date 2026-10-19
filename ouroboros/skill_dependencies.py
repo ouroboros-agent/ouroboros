@@ -150,7 +150,7 @@ def skill_deps_not_ready(drive_root: pathlib.Path, loaded: Any, *, strict: bool 
     """``(status, reason)`` of unready dependencies; ``("", "")`` when ready.
 
     A probe failure reads as ready for execution readers; ``strict`` re-raises it so a
-    caller certifying completion (the native-seed receipt) cannot mistake it for ready.
+    caller certifying completion (the built-in receipt) cannot mistake it for ready.
     """
     try:
         from ouroboros.marketplace.install_specs import install_specs_hash as _specs_hash

@@ -26,6 +26,7 @@ ROTATED_LOG_NAMES = [
     ("supervisor.jsonl", "supervisor"),
     ("events.jsonl", "events"),
     ("tools.jsonl", "tools"),
+    ("task_reflections.jsonl", "task_reflections"),
 ]
 
 
@@ -42,7 +43,7 @@ def _seed_log(root, name, rows=50):
 
 @pytest.mark.parametrize(("name", "prefix"), ROTATED_LOG_NAMES)
 def test_rotation_moves_live_to_archive(tmp_path, name, prefix):
-    """A >max_bytes file for chat/progress/events/tools rotates to
+    """A threshold-sized runtime log rotates to
     archive/<prefix>_<ts>.jsonl, the live file is recreated empty, and no
     line is lost (v6.109.29)."""
     live = _seed_log(tmp_path, name)

@@ -200,8 +200,6 @@ def completion_event_view(root: Any, event: dict, record: dict) -> dict:
         # Source delivery is independent registry truth, not a field of the result.
         source_delivery = _delivery_disposition(root, str(event.get("task_id") or ""))
         salvage = _completion_excerpt(record, chat_id=event.get("chat_id"), salvage_only=True)
-        if salvage:
-            salvage += " Open the Project for details."
         return {**event, "progress_meta": {**meta, "completion_notice": {
             **completion_notice({**record, "terminal_delivery": source_delivery}), "salvage": salvage}}}
     except Exception:

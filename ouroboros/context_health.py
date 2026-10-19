@@ -695,16 +695,6 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "",
     except Exception:
         pass
 
-    try:
-        # Probe body lives beside the other live-reused startup checks
-        # (the check_stray_server_processes pattern); thresholds are the
-        # justified constants in ouroboros/context_budget.py.
-        from ouroboros.agent_startup_checks import hot_store_growth_notes
-
-        checks.extend(hot_store_growth_notes(env))
-    except Exception:
-        pass
-
     _collect_log_analysis_checks(env, checks)
     if not checks:
         return ""

@@ -17,6 +17,7 @@ import pathlib
 import re
 import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -777,8 +778,9 @@ class TestMacOSSigning:
     """The CI build job and build.sh together implement optional macOS code
     signing and notarization. The contracts here prevent
     regression of the GitHub Actions `secrets.*`-in-step-`if:` pitfall, the
-    build-script env override / optional-notarytool gate, the keychain
-    cleanup guard, and the stapler-failure-as-soft-warning behaviour.
+    build-script env override, the keychain cleanup guard, and the
+    notarization contract: off without Apple credentials, otherwise the app
+    and the DMG each get a validated stapled ticket or the build stops.
 
     See docs/DEVELOPMENT.md::"GitHub Actions: secrets in step-level if
     conditions" for the rationale.
@@ -998,66 +1000,125 @@ class TestMacOSSigning:
             "`security find-identity` instead."
         )
 
-    def test_build_sh_notarization_optional(self):
-        """build.sh must include an optional notarization block guarded on
-        APPLE_ID + APPLE_TEAM_ID + APPLE_APP_SPECIFIC_PASSWORD, calling
-        `xcrun notarytool submit` followed by `xcrun stapler staple`."""
-        src = _read("build.sh")
-        assert "xcrun notarytool submit" in src, (
-            "build.sh must call `xcrun notarytool submit` to upload the "
-            "DMG for Apple notarization when credentials are configured"
-        )
-        assert "xcrun stapler staple" in src, (
-            "build.sh must call `xcrun stapler staple` after a successful "
-            "notarytool submission so the ticket is attached to the DMG"
-        )
-        # The notarization block must be guarded on the three notarytool
-        # credential env vars, otherwise builds without an Apple ID hard-fail.
-        for var in ("APPLE_ID", "APPLE_TEAM_ID", "APPLE_APP_SPECIFIC_PASSWORD"):
-            assert var in src, (
-                f"build.sh notarization block must reference {var} so it "
-                f"is gated on the full credential set"
-            )
+    @staticmethod
+    def _shell_function(src: str, name: str) -> str:
+        """Return one top-level shell function of build.sh, verbatim."""
+        start = src.index(f"\n{name}() {{\n") + 1
+        return src[start:src.index("\n}\n", start) + 3]
 
-    def test_build_sh_stapler_failure_is_soft(self):
-        """`xcrun stapler staple` must be wrapped in an `if/then/else`
-        (or paired with `||`) so a transient stapler failure becomes a
-        warning instead of aborting the build under `set -e`.
-
-        Apple's stapler service can fail intermittently after a successful
-        `notarytool submit` (CDN propagation lag, transient 5xx). A
-        signed-and-notarized-but-unstapled DMG is still functional —
-        Gatekeeper fetches the ticket online on first launch — so a
-        stapler hiccup must not delete the macOS artifact from the
-        release.
-        """
+    def _run_notarization(self, tmp_path, *, status: str, staple_rc: int = 0):
+        """Execute build.sh's own notarize/staple functions against a fake xcrun."""
+        bash = shutil.which("bash")
+        if not bash:
+            pytest.skip("build.sh functions need bash")
         src = _read("build.sh")
-        # Find the stapler invocation and check it is inside an `if` head
-        # (i.e. `if xcrun stapler staple ...; then`) OR followed by `||`.
-        # The simplest robust check: locate the line, then verify either
-        # (a) it begins with `if ` after stripping leading whitespace, or
-        # (b) it ends with ` || ...` style continuation.
-        # Only inspect actual code lines — strip both whole-line bash comments
-        # (`# …`) and inline trailing comments (`code # …`) before testing.
-        stapler_lines = []
-        for raw in src.splitlines():
-            code = raw.split("#", 1)[0]
-            if "xcrun stapler staple" in code:
-                stapler_lines.append(code)
-        assert stapler_lines, (
-            "build.sh must call `xcrun stapler staple` (notarization step)"
+        fake = tmp_path / "bin"
+        fake.mkdir()
+        (fake / "xcrun").write_text(
+            "#!/bin/sh\n"
+            'echo "$*" >> "$XCRUN_LOG"\n'
+            'case "$1 $2" in\n'
+            '  "notarytool submit") printf \'{"id": "sub-1", "status": "%s"}\' "$FAKE_STATUS" ;;\n'
+            '  "stapler staple"|"stapler validate") exit "$FAKE_STAPLE_RC" ;;\n'
+            "esac\n",
+            encoding="utf-8", newline="\n",  # bash rejects CRLF on the Windows shards
         )
-        for line in stapler_lines:
-            stripped = line.strip()
-            wrapped_in_if = stripped.startswith("if ") and stripped.endswith("; then")
-            soft_or = "||" in stripped
-            assert wrapped_in_if or soft_or, (
-                "build.sh `xcrun stapler staple` invocation must be guarded "
-                "(`if xcrun stapler staple ...; then ... else WARN ... fi` "
-                "or `xcrun stapler staple ... || echo WARN`) so a transient "
-                "stapler failure does not abort the build under `set -e` and "
-                f"silently drop the macOS DMG. Offending line: {stripped!r}"
-            )
+        (fake / "xcrun").chmod(0o755)
+        script = (
+            "set -e\nsleep() { :; }\n"
+            + self._shell_function(src, "notarize")
+            + self._shell_function(src, "staple")
+            + 'notarize dist/app.zip\nstaple dist/Ouroboros.app\necho DONE\n'
+        )
+        log = tmp_path / "xcrun.log"
+        env = dict(os.environ, PATH=f"{fake}{os.pathsep}{os.environ['PATH']}", XCRUN_LOG=str(log),
+                   FAKE_STATUS=status, FAKE_STAPLE_RC=str(staple_rc), APPLE_ID="dev@example.test",
+                   APPLE_TEAM_ID="TEAM", APPLE_APP_SPECIFIC_PASSWORD="secret")
+        result = subprocess.run([bash, "--noprofile", "--norc", "-c", script], env=env,
+                                capture_output=True, text=True, check=False)
+        return result, log.read_text(encoding="utf-8") if log.exists() else ""
+
+    def test_build_sh_notarization_accepts_only_apples_accepted_status(self, tmp_path):
+        """notarytool can exit 0 on "Invalid": build.sh reads the JSON status,
+        prints the developer log, staples and validates, and stops otherwise."""
+        accepted, calls = self._run_notarization(tmp_path, status="Accepted")
+        assert accepted.returncode == 0 and "DONE" in accepted.stdout, accepted.stderr
+        assert "notarytool log sub-1" in calls
+        assert "stapler staple dist/Ouroboros.app" in calls
+        assert "stapler validate dist/Ouroboros.app" in calls
+
+        (tmp_path / "invalid").mkdir()
+        invalid, calls = self._run_notarization(tmp_path / "invalid", status="Invalid")
+        assert invalid.returncode != 0 and "DONE" not in invalid.stdout
+        assert "status 'Invalid'" in invalid.stderr
+        assert "notarytool log sub-1" in calls and "stapler" not in calls
+
+    def test_build_sh_staple_failure_stops_the_build(self, tmp_path):
+        """A notarized build that cannot staple a validated ticket is not shipped:
+        v7.7.0 published a DMG whose app Gatekeeper rejected."""
+        failed, calls = self._run_notarization(tmp_path, status="Accepted", staple_rc=1)
+        assert failed.returncode != 0 and "DONE" not in failed.stdout
+        assert "no validated notarization ticket" in failed.stderr
+        assert calls.count("stapler staple dist/Ouroboros.app") == 3
+
+    def test_build_sh_notarizes_the_app_before_the_dmg_and_only_with_credentials(self):
+        src = _read("build.sh")
+        gate = src[src.index("NOTARIZE=0"):src.index("notarize() {")]
+        for var in ("SIGN_MODE", "APPLE_ID", "APPLE_TEAM_ID", "APPLE_APP_SPECIFIC_PASSWORD"):
+            assert var in gate, f"notarization must stay off without {var}"
+        order = [
+            src.index("=== Signing Ouroboros.app ==="),
+            src.index('ditto -c -k --keepParent "$APP_PATH" "$APP_ZIP"'),
+            src.index('notarize "$APP_ZIP"'),
+            src.index('staple "$APP_PATH"'),
+            src.index('ditto "$APP_PATH" "$DMG_STAGE_DIR/Ouroboros.app"'),
+            src.index("hdiutil create"),
+            src.index('codesign -s "$SIGN_IDENTITY" --timestamp "$DMG_PATH"'),
+            src.index('notarize "$DMG_PATH"'),
+            src.index('staple "$DMG_PATH"'),
+        ]
+        assert order == sorted(order), "the stapled app must be what the DMG contains"
+
+    def test_build_sh_drops_debug_symbols_and_pyobjc_tests_before_pyinstaller(self, tmp_path):
+        """Executes build.sh's own payload prune: debug-symbol bundles and pyobjc's
+        test suite go, runtime extensions stay, and it happens before PyInstaller."""
+        src = _read("build.sh")
+        marker = "--- Removing stale WebKit, debug-symbol and test payloads"
+        assert src.index(marker) < src.index("python3 -m PyInstaller")
+        body = src[src.index("python3 - <<'PY'\n", src.index(marker)) + len("python3 - <<'PY'\n"):]
+        body = body[:body.index("\nPY\n")]
+        site = tmp_path / "python-standalone" / "lib" / "python3.10" / "site-packages"
+        dsym = site / "objc" / "_objc.cpython-310-darwin.so.dSYM" / "Contents" / "Resources" / "DWARF"
+        dsym.mkdir(parents=True)
+        (dsym / "_objc.cpython-310-darwin.so").write_bytes(b"dwarf")
+        (site / "objc" / "_objc.cpython-310-darwin.so").write_bytes(b"runtime")
+        (site / "PyObjCTest" / "NULL.cpython-310-darwin.so.dSYM").mkdir(parents=True)
+        (site / "PyObjCTest" / "test_null.py").write_text("", encoding="utf-8")
+        (site / "AppKit").mkdir()
+        (site / "AppKit" / "__init__.py").write_text("", encoding="utf-8")
+
+        result = subprocess.run([sys.executable, "-c", body], cwd=tmp_path,
+                                capture_output=True, text=True, check=False)
+
+        assert result.returncode == 0, result.stderr
+        assert not (site / "PyObjCTest").exists()
+        assert not (site / "objc" / "_objc.cpython-310-darwin.so.dSYM").exists()
+        assert (site / "objc" / "_objc.cpython-310-darwin.so").read_bytes() == b"runtime"
+        assert (site / "AppKit" / "__init__.py").exists()
+        assert "Removed 1 test package(s) and 2 debug-symbol bundle(s)" in result.stdout
+
+    def test_macos_smoke_proves_gatekeeper_on_the_copied_out_app(self):
+        """codesign passed v7.7.0; the release proof must ask Gatekeeper about the
+        app a user drags out (the decision itself is executed in
+        tests/test_release_proof_macos.py)."""
+        src = _read(self._CI_PATH)
+        smoke = src[src.index("- name: Smoke final macOS DMG"):src.index("- name: Smoke final Linux archive")]
+        assert 'xcrun stapler validate "$DMG"' in smoke
+        assert 'xcrun stapler validate "$SBOM_ROOT/Ouroboros.app"' in smoke
+        assert 'spctl --assess --type exec -vv "$SBOM_ROOT/Ouroboros.app"' in smoke
+        assert "--context context:primary-signature" in smoke
+        assert smoke.count("grep -q 'source=Notarized Developer ID'") == 2
+        assert smoke.index('ditto "$MOUNT" "$SBOM_ROOT"') < smoke.index("spctl --assess")
 
 
 # ===========================================================================

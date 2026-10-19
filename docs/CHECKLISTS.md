@@ -230,7 +230,7 @@ Ouroboros binds Ouroboros as the author, never the subject repository.
 | 6 | cross_platform | Does the diff use platform-specific APIs (`os.kill`, `os.setsid`, `os.killpg`, `os.getpgid`, `fcntl`, `msvcrt`, `signal.SIGKILL`, `signal.SIGTERM`, `subprocess` with `start_new_session`/`creationflags`, hardcoded `/` or `\\` in filesystem paths) outside the subject's platform abstraction layer, when it has one? Does it import Unix-only or Windows-only modules (`fcntl`, `msvcrt`, `winreg`, `resource`) at any level without a platform guard (a `sys.platform` check or the subject's equivalent)? | critical |
 | 7 | capability_regression | Does the diff REMOVE or NARROW a previously-supported user-facing behavior or capability — a tool/flag/mode/path that worked before now errors or is gated tighter (e.g. a new `is_dir`/existence guard that blocks a legitimate create, a tightened allowlist that drops a real path, a removed fallback)? If so, is it INTENTIONAL and disclosed as a breaking/capability change in the commit message + changelog? Accidental capability removal is the failure class this item names. Ask whether a golden "from zero" test would have caught it. **Guard-change trigger (executable requirements, not an essay):** ADDING or TIGHTENING a guard, filter, allowlist, or deny rule IS a capability change and fires this item. For such a diff the reviewer must verify two things: (a) the diff names and runs a positive test, existing or newly staged, that walks a legitimate flow THROUGH the new guard and proves it still succeeds — a negative "it blocks X" test alone is insufficient (a gate can pass its own probe while breaking every real run); (b) the diff or its disclosure NAMES THE SURVIVING POSITIVE PATH — the concrete actor and flow that still work after the change. A guard change without passing surviving-path evidence is a capability-regression finding, not a safety improvement; a missing *new* test is not. A guard keyed on model or provider identity (id, prefix, family, provider name) always fires this item; its positive test uses an identity that the diff's own literals do not contain, and a test that proves only refusal is insufficient. **Owner acceptance:** a narrowing counts as OWNER-ACCEPTED only when the subject's owner actually decided it (the owner's words or answer for this work, or a standing disclosure the subject keeps for this purpose) or it lies within authority the owner had already delegated for this work; the plan council's answers are the reviewers' view, not the owner's consent. Owner acceptance makes the finding advisory (disclosed, non-blocking). Intent wording, a commit-message disclosure, or a changelog row alone is disclosure, NOT acceptance. This names who accepts a narrowing; it adds no approval step. Severity follows the `Critical surface whitelist` below — silently removing a documented user-facing capability or a release contract is critical; removing or loosening an internal guard, proof or re-check is advisory and needs one line naming the residual; an owner-accepted narrowing or an internal-only refactor is advisory. | advisory |
 | 8 | changelog_accuracy | Do the exact wording, test counts, and minor description details in the subject's changelog or release-notes entry match what the diff actually does? Wording drift, off-by-one test counts, minor inaccuracies in descriptive prose — these belong here, NOT in a release-metadata or consistency item. This item exists so reviewers have a dedicated advisory bucket for prose-level changelog imprecision that does not affect release metadata, runtime behavior, or safety contracts. (PASS with "Not applicable" when the subject keeps no changelog.) | advisory |
-| 9 | perf_lifecycle | If the diff changes data readers or an endpoint, poller, subscription, timer, startup, shutdown or other batch operation: evaluate the total read cost as history, object count and project size grow, including nested repeats, cold caches and contention for shared resources. Where that growth can materially hurt responsiveness, is there proportionate evidence at representative scale, and was redundant work or within-operation reuse considered before adding infrastructure? This remains advisory, with no universal time limit, mandatory heavy benchmark or new approval gate. Does any interaction-path read scan an unbounded store per request/message/tick (a full-table read filtered in code is such a scan)? Is a subscription/observer/interval/listener added without a paired disposer? Does O(history) work run on a poll/stream path? Does a GET handler perform new steady-state durable writes? Where the subject documents these invariants, check against its definitions rather than re-deriving them here. (PASS with "Not applicable" if the diff touches none of these surfaces.) | advisory |
+| 9 | perf_lifecycle | If the diff changes data readers or an endpoint, poller, subscription, timer, startup, shutdown or other batch operation: evaluate the total read cost as history, object count and project size grow, including nested repeats, cold caches and contention for shared resources. Where that growth can materially hurt responsiveness, is there proportionate evidence at representative scale, and was redundant work or within-operation reuse considered before adding infrastructure? This remains advisory, with no universal time limit, mandatory heavy benchmark or new approval gate. Does any interaction-path read scan an unbounded store per request/message/tick (a full-table read filtered in code is such a scan)? Is a subscription/observer/interval/listener added without a paired disposer? Does each observed or non-terminal state name which live producer can still change it and which fact ends the observation (an unknown past is a fact on a terminal, not an open state)? Does O(history) work run on a poll/stream path? Does a GET handler perform new steady-state durable writes? Where the subject documents these invariants, check against its definitions rather than re-deriving them here. (PASS with "Not applicable" if the diff touches none of these surfaces.) | advisory |
 
 ### Severity rules
 
@@ -660,40 +660,40 @@ the prerequisite for trusting opaque bytes as EXECUTABLE payload inside
 the skill tree — the WASM there is a host-side WebAssembly runtime, a
 separate future topic from the browser-sandboxed `.wasm` above.
 
-Skills default to **disabled** and cannot be executed by `skill_exec`
-until review produces a fresh executable verdict. Skill review output is persisted
+A skill runs through `skill_exec` only when its exact current bytes are accepted
+(by a fresh executable review verdict or by one of the exact-byte bases below) and
+it is enabled (by the owner, or by an install's turn-on-when-ready request, never
+over an explicit Off). Skill review output is persisted
 to `~/Ouroboros/data/state/skills/<name>/review.json` with a content
 hash so an edit to the skill invalidates the previous verdict.
-`review.json`, `enabled.json`, `grants.json`, and marketplace/self-authored
-provenance are skill trust/control-plane state: they are mutated only
-through the review, toggle, launcher-grant, self-authored finalize,
-native launcher-seed trust, and marketplace paths, not through generic
-agent/browser file writes.
+`review.json`, `enabled.json`, `grants.json`, `install.json`, `owner_edit.json`,
+`update_backup.json` and marketplace/self-authored provenance are skill
+trust/control-plane state:
+they are mutated only through the review, toggle, launcher-grant, self-authored
+finalize, installer and owner-edit paths, not through generic agent/browser
+file writes.
 
-Native launcher-seed trust (v6.31.0) is a hash-pinned, audited first-review
-exception: the LAUNCHER writes bundled payloads (bootstrap, new seed or
-version resync, marked by `.seed-origin`) and stamps
-`review.json` with `status=clean`, `reviewer_models=["repo_commit_gate"]`,
-and `review_profile="native_seed"`: those bytes passed the repo review wave.
-The verdict pins the post-seed hash (control files excluded); edits stale
-it as with ordinary reviews. Removing the marker reclassifies ownership
-as user-managed and makes this verdict pending at LOAD, not executable.
-Zero-grant seeds (no secret keys or privileged permissions, only
-tool/subprocess, or the default-on bundled computer-use seeds) auto-enable
-only where their manifest `os` applies and no owner choice exists;
-resync never overrides OFF. Foreign seeds
-are resynced but not newly offered or auto-enabled. Discovery hides them
-except a Windows Unix-remote choice: resync records `legacy_remote_platform=win32`
-in `.seed-origin` for an enabled, formerly unrestricted Unix seed (not recorded
-`native_seed` auto-ON). Actor-less ON, including inherited early auto-ON,
-cannot be distinguished from manual ON and is retained. Eligibility survives
-OFF/resync for intentional ON; it grants no trust or local Windows backend.
-Declared isolated dependencies use the post-PASS step at boot for enabled
-seeds or at enable, without model review. Owner opt-out:
-`OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS=false`; the trust never extends to
-clawhub/external/self-authored skills. Packaged installs bind native-seed
-trust to SHA-pinned `repo.bundle`; source mode copies worktree bytes,
-without that packaged-byte provenance.
+A source the owner trusts is the named, digest-pinned exception to a first
+review: the installer (built-ins included) writes the host-owned
+`install.json` with basis `trusted` and the exact release digest, and the
+gate admits those bytes only (`trusted_source`); any later edit leaves the
+release and is unreviewed again. No synthetic `clean` verdict is written;
+the deterministic preflight still gates the bytes an install or update lands (a
+built-in re-seeded with an app update carries the app's own release); a source's
+trust never rewrites earlier installs. A skill installed from a source that
+reviews each skill keeps blocker findings non-executable even under Advisory
+until the owner skips the review. Enablement of such installs is the
+owner's choice or the install's turn-on-when-ready request, never over an
+explicit Off. The Built in row of the source list sets built-in trust;
+`OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS=false` only seeds that row while no list is saved.
+A built-in whose manifest `os` excludes this host is neither offered nor newly
+installed; an installed copy is still re-seeded and discovery hides it, except a
+Windows Unix-remote choice: the re-seed records `legacy_remote_platform=win32` in
+`.seed-origin` for an enabled, formerly unrestricted Unix copy whose ON was not
+recorded as automatic. Declared isolated dependencies of bytes accepted without a
+review install at acceptance, at enable, or at boot for an enabled built-in, never
+through a paid review. Packaged installs take built-ins from the SHA-pinned
+`repo.bundle`; source mode copies worktree bytes, without that provenance.
 `skip_advisory_review` records only the commit's skipped preflight: the repo
 review wave, both parts, still runs.
 
@@ -702,12 +702,9 @@ owner-state `data/state/skills/<skill>/self_authored.json` provenance,
 but outside Cyber Pro they do not bypass review on the agent's own initiative. `skill_review` routes them
 through the same tri-model skill review as marketplace and user-managed
 skills; no deterministic PASS or enablement is written automatically.
-EXCEPTION (C1, v6.39; narrowed hub extension in v6.43 — owner attestation): the OWNER
-may explicitly skip the EXPENSIVE LLM review for their OWN skill (`source=external` or
-self-authored) or for a hash-verified official OuroborosHub payload (fresh sidecar +
-live-catalog hash match, no extra runtime-reachable files) via the owner-only
-`POST /api/owner/skills/<skill>/attest-review`. Native, ClawHub, and unverified
-OuroborosHub payloads are not attestable. The DETERMINISTIC preflight floor still runs
+EXCEPTION (owner attestation, "Skip review" / "Turn on anyway"): the OWNER may skip the
+LLM review for the exact bytes of a skill from any origin via the owner-only
+`POST /api/owner/skills/<skill>/attest-review`. The DETERMINISTIC preflight floor still runs
 (409 on failure); only the LLM phase is skipped. The result is a durable `clean` verdict
 with `review_profile=owner_attested`, `reviewer_models=[owner_attestation]`, bound to
 `content_hash` (a content edit stales it) and valid only while the owner-issued
@@ -717,15 +714,20 @@ configuration does not turn a self-authored decision into an owner attestation. 
 expressed owner instruction through `skill_owner_action`; the shared host owner
 checks the actual caller, resolved member source, selected revision and source
 eligibility before invoking this same attestation. The model interprets the
-owner's words; a formatted reference alone grants nothing. This remains the
-only owner-issued review bypass.
+owner's words; a formatted reference alone grants nothing. Without a review
+panel, exact bytes are accepted only by: a trusted source (`trusted`); Ouroboros's
+own recorded check of that release, only in Cyber Pro (`self_check`, its notes in
+`install.json`; outside Cyber Pro it admits nothing); the owner's Skip review or "Update without
+review" of that release (owner attestation, `owner_skip`); and an owner edit: the
+admitted selected-skill task the owner's own door started records `owner_edit.json`
+for each revision it writes. Each binds to exact bytes; any later edit leaves it.
 `OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS` is default-on as of v6.10.0 (the owner
 may disable it), in which case a fresh executable review grants only
 manifest-declared settings keys and host permissions for that exact content
 hash; when disabled, key and permission grants remain explicit.
 
-The Skills UI Repair affordance and automatic repair both start ordinary managed
-development tasks. Keep the selected skill, source request and admitted payload
+The Skills UI Repair affordance starts an ordinary managed development task; no
+automatic repair exists. Keep the selected skill, source request and admitted payload
 revision; a legacy `task_constraint.mode="skill_repair"` record remains readable
 as a selected-resource binding, never a reduced execution profile. Ordinary file,
 shell, browser, delegation and functional skill operations remain available

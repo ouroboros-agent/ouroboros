@@ -89,6 +89,7 @@ def _producers(monkeypatch, data_dir: Path, repo_dir: Path) -> SimpleNamespace:
                             ("QUEUE_SEQ_COUNTER_REF", sequence)):
             monkeypatch.setattr(module, name, value)
     monkeypatch.setattr(queue, "INITIALIZED", True)
+    monkeypatch.setattr(queue, "OWNER_PID", os.getpid())
     monkeypatch.setattr(queue, "QUEUE_SNAPSHOT_PATH", data_dir / "state" / "queue_snapshot.json")
     for name in ("ADMISSION_RESERVATIONS", "ACCEPTANCE_FENCES", "BUDGET_ROOT_FENCES"):
         monkeypatch.setattr(queue, name, {})

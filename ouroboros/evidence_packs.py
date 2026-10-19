@@ -606,116 +606,23 @@ def pending_restore_bytes(root: Any) -> int:
 
 
 
-def settlement_obligations(root: Any, *, txn: Optional[store.Txn] = None, cache: Optional[dict] = None) -> dict:
-    """Read every set once but the declared ``obligations.RECORD_SETS`` (an undeclared stored set owes too), indexed
-    by all recorded task owners. Reuse for a candidate pass or fresh unlink census; task-local rows form its revision key."""
-    from ouroboros import obligations
-
-    if txn is None:
-        with store.open_store(root, write=False) as txn:
-            return settlement_obligations(root, txn=txn, cache=cache)
-    revision = (str(txn.root), txn.revision())
-    if cache is not None and cache.get("revision") == revision:
-        return cache["rows"]
-    by_task: dict = {}
-    for name in sorted((set(obligations.DUTY_SETS) | set(txn.set_names())) - set(obligations.RECORD_SETS)):
-        for identity, entry in obligations.members_in(txn, name).items():
-            owners = {str(identity)} | {str(f.get("task_id") or "") for f in
-                                      (entry, entry.get("custody") or {}, entry.get("request") or {})}
-            for owner in owners - {""}:
-                by_task.setdefault(owner, {}).setdefault(name, {})[identity] = entry
-    if cache is not None:
-        cache.update(revision=revision, rows=by_task)
-    return by_task
-
-
-def task_settlement_facts(root: Any, task_id: str, *, obligation_rows: Optional[dict] = None,
-                          external: Optional[dict] = None, txn: Optional[store.Txn] = None) -> Dict[str, Any]:
-    """The facts the settle predicate reads, through the current store: terminal status,
-    every obligation flag, open review operations / undischarged acceptance debt, and unresolved
-    money attempts (``None`` = unknown, which never settles). No timer anywhere."""
-    from ouroboros.review_operation import _OPEN_STATES
-    from ouroboros.review_projection import _actor_pending
-    from ouroboros.task_store import read_document
+def row_packable(status: Any, review_pending: Any) -> bool:
+    """The packing rule over a row's two indexed facts: the status is terminal, and no review of the
+    task may still read its loose files (``review_collection_pending`` 1 names an open review
+    operation of any surface or an acceptance not yet collected, whose agent-session reader holds a
+    retained handle's absolute path; NULL is a row no body with the selector ever wrote, so no such
+    reader exists, and the selector stays a derived fact, never a retention duty). No duty, money or
+    delivery fact is consulted (packing moves verified bytes, never content: a later write becomes
+    the next generation)."""
     from ouroboros.task_status import SETTLED_STATUSES
 
-    root = pathlib.Path(root)
-    row, owed = {}, set()
-    try:
-        with (store.open_store(root, write=False) if txn is None else contextlib.nullcontext(txn)) as txn:
-            row = read_document(root, task_id, txn=txn) or {}
-            if obligation_rows is None:
-                obligation_rows = settlement_obligations(root, txn=txn)
-            owed.update(obligation_rows.get(str(task_id), {}))
-    except (store.StoreError, OSError, ValueError, TypeError, AttributeError):
-        owed.add("unknowns")
-    operations = row.get("review_operations") if isinstance(row.get("review_operations"), dict) else {}
-    debt = row.get("acceptance_debt") if isinstance(row.get("acceptance_debt"), dict) else {}
-    projection = row.get("review_projection") or {}
-    panels = [p for p in projection.get("panels") or [] if isinstance(p, dict)]
-    open_debt = False
-    if debt.get("debt_id"):
-        wanted = "task_acceptance:" + hashlib.sha256(str(debt["debt_id"]).encode()).hexdigest()
-        open_debt = not any(((p.get("late_settlement") or {}).get("reviewed_subject") or {}).get("retry_key") == wanted
-                            for p in panels)
-    late_open = any(_actor_pending(actor) for p in panels for actor in p.get("actors") or [] if isinstance(actor, dict))
-    for receipt in (projection.get("late_notice_receipts") or {}).values():
-        panel = next((p for p in panels if p.get("panel_id") == receipt.get("panel_id")), {})
-        late_open |= (receipt.get("custody") != "terminal_outbox"
-                      or receipt.get("settled_at") != (panel.get("late_settlement") or {}).get("settled_at"))
-    external = settlement_external(root) if external is None else external
-    if external["delivery"] is None:
-        owed.add("unknowns")
-    else:
-        late_open |= str(task_id) in external["delivery"]
-    return {
-        "status": str(row.get("status") or ""),
-        "terminal": bool(row) and str(row.get("status") or "") in SETTLED_STATUSES,
-        "obligations": sorted(owed),
-        "open_operations": any(isinstance(e, dict) and e.get("state") in _OPEN_STATES for e in operations.values()),
-        "open_acceptance": open_debt,
-        "open_late_receipts": late_open,
-        "money_open": None if external["money"] is None else str(task_id) in external["money"],
-    }
+    return status is not None and str(status) in SETTLED_STATUSES and review_pending != 1
 
 
-def settlement_external(root: Any, *, timeout_sec: Optional[float] = None) -> dict:
-    """One money query and outbox read per pass. A bounded advisory read propagates
-    unavailability to defer discovery; ordinary child reads keep unknown as None."""
-    from ouroboros import usage_store
-    from ouroboros.usage_ledger import LEDGER_REL
-    from supervisor.terminal_delivery import pending_deliveries
-
-    root = pathlib.Path(root)
-    money = set()
-    if (root / usage_store.STORE_REL).exists() or (root / LEDGER_REL).exists():
-        try:
-            with usage_store.hold(root, write=False, migrate=False,
-                                  **({"timeout_sec": timeout_sec} if timeout_sec is not None else {})) as txn:
-                money = {row[0] for row in txn.conn.execute(
-                    "SELECT DISTINCT task_id FROM attempts WHERE kind='attempt' "
-                    "AND state IN ('reserved','dispatched','unresolved')")}
-        except Exception:
-            if timeout_sec is not None:
-                raise
-            money = None
-    try:
-        delivery = {str(event.get("task_id") or "") for event in pending_deliveries(root, strict=True)}
-    except Exception:
-        if timeout_sec is not None:
-            raise
-        delivery = None
-    return {"money": money, "delivery": delivery}
-
-
-def facts_settled(facts: Dict[str, Any]) -> bool:
-    return bool(facts["terminal"] and not facts["obligations"] and not facts["open_operations"]
-                and not facts["open_acceptance"] and not facts["open_late_receipts"] and facts["money_open"] is False)
-
-
-def task_settled(root: Any, task_id: str, *, obligation_rows: Optional[dict] = None,
-                 external: Optional[dict] = None, txn: Optional[store.Txn] = None) -> bool:
-    return facts_settled(task_settlement_facts(root, task_id, obligation_rows=obligation_rows, external=external, txn=txn))
+def task_packable(txn: store.Txn, task_id: str) -> bool:
+    """``row_packable`` over the task's row (``False`` without one)."""
+    row = txn.row(str(task_id), "status", "review_collection_pending")
+    return row is not None and row_packable(*row)
 
 
 
@@ -773,9 +680,10 @@ def manifest_blob_refs(root: Any, task_id: str) -> List[Tuple[str, str, int]]:
     return out
 
 
-def loose_members(root: Any, task_id: str) -> List[Dict[str, Any]]:
+def loose_members(root: Any, task_id: str, *, missing: Optional[list] = None) -> List[Dict[str, Any]]:
     """The task's members whose bytes are at hand (loose checkpoint handles first, then the manifest
-    blobs that are loose or already held by some pack on this root), each with its loose source path."""
+    blobs that are loose or already held by some pack on this root), each with its loose source path;
+    a referenced blob that is neither is appended to ``missing`` as ``(kind, sha256, size)``."""
     from ouroboros.artifacts import task_artifact_dir_path
 
     root = pathlib.Path(root)
@@ -791,6 +699,8 @@ def loose_members(root: Any, task_id: str) -> List[Dict[str, Any]]:
         loose = root / "observability" / "blobs" / f"{sha256}.{kind}.gz"
         if loose.is_file() or _locate(root, sha256=sha256, kind=kind) is not None:  # a shared sha is duplicated per pack
             members.append({"sha256": sha256, "kind": kind, "size": size, "source": loose})
+        elif missing is not None:
+            missing.append((kind, sha256, size))
     return members
 
 
@@ -889,8 +799,9 @@ def _unlink_phase(root: Any) -> Iterator[tuple]:
 
 def unlink_loose(root: Any, task_id: str, sidecars: List[Dict[str, Any]], *, keep_shas: set, revision: str,
                  sweep, members: list) -> Dict[str, int]:
-    """Remove loose files whose bytes a VERIFIED pack holds; a blob some non-settled task's
-    manifests still reference (``keep_shas``) stays loose. A busy file is retried next pass."""
+    """Remove loose files whose bytes a VERIFIED pack (``sidecars``) holds; a blob a live task's
+    manifests still reference (``keep_shas`` and the sweep's keep-set) stays loose. A busy file is
+    retried next pass."""
     from ouroboros.evidence_packer import task_stamps
     from ouroboros.task_custody import task_custody_lock
 
@@ -899,22 +810,17 @@ def unlink_loose(root: Any, task_id: str, sidecars: List[Dict[str, Any]], *, kee
     report = {"unlinked": 0, "kept": 0, "busy": 0, "deferred": 1}
 
     def remove(txn, todo: list, until: float) -> Optional[list]:
-        """One section under both locks: the O(1) staleness recheck and the journal suffix, then
-        unlinks until ``until``; the members left, or ``None`` when the candidate went stale."""
+        """One section under both locks: this task's own recheck (its row is still terminal and its
+        evidence directories are as the census saw them: the stamp carries both) and the journal
+        suffix, then unlinks until ``until``; the members left, or ``None`` when the candidate went stale."""
         nonlocal revision
-        if not sweep.current(txn):
-            return None
-        duties, external = sweep.duties, sweep.external
-        if (task_stamps(root, task_id, obligation_rows=duties, external=external, txn=txn) != revision
-                or not task_settled(root, task_id, obligation_rows=duties, external=external, txn=txn)):
+        if task_stamps(root, task_id, txn=txn) != revision:
             return None
         keep = sweep.refresh_keep()
-        if not sweep.current(txn):
-            return None
         for index, member in enumerate(todo):
             if index and time.monotonic() >= until:
                 # Still under the locks: this section's own unlinks are the only change to the stamps.
-                revision = task_stamps(root, task_id, obligation_rows=duties, external=external, txn=txn)
+                revision = task_stamps(root, task_id, txn=txn)
                 return todo[index:]
             if not member["source"].is_file():
                 continue
@@ -932,12 +838,11 @@ def unlink_loose(root: Any, task_id: str, sidecars: List[Dict[str, Any]], *, kee
 
     # Compression precedes custody -> store write -> manifest publication locks. A section holds
     # the store write lock (a rollback barrier) and the publication lock for one UNLINK_SECTION_SEC
-    # budget; model calls and every store writer wait on them. Between sections the census refreshes
-    # outside both, and a waiting writer gets a poll-length gap. A stale check defers the candidate.
+    # budget; model calls and every store writer wait on them. Inside, only this task's recheck;
+    # between sections a waiting writer gets a poll-length gap. A stale check defers the candidate.
     todo: Optional[list] = [m for m in members if _member_key(m) in packed]
     with task_custody_lock(root, task_id) as acquired:
         while acquired and todo:
-            sweep.refresh()  # outside the locks; inside, only this task and an O(1) staleness check
             left: Optional[list] = None
             with _unlink_phase(root) as (allowed, txn):
                 until = time.monotonic() + UNLINK_SECTION_SEC
@@ -960,24 +865,33 @@ def unlink_loose(root: Any, task_id: str, sidecars: List[Dict[str, Any]], *, kee
 def pack_task(root: Any, task_id: str, *, keep_shas: set, listing: Optional[list] = None, revision: Optional[str] = None,
               sweep=None) -> Dict[str, Any]:
     """The per-task steps, each idempotent: new loose members -> next generation (write, publish,
-    re-read + verify every member, index), then unlink loose files held by verified packs."""
+    re-read + verify every member, index), then unlink loose files held by verified packs. Only the
+    generations an unlink relies on are re-read: the new one, and an older one while it still holds a
+    member whose loose file exists now (a busy retry); the rest stay closed. Referenced records that
+    are neither loose nor packed are counted (``missing``), never invented."""
     root = pathlib.Path(root)
-    from ouroboros.evidence_packer import pack_sweep, task_stamps
+    from ouroboros.evidence_packer import _loose_task_ids, pack_sweep, task_rows, task_stamps
 
     if sweep is None:
         with pack_sweep(root) as sweep:
-            sweep.collect_keep({})
+            sweep.collect_keep(task_rows(root, _loose_task_ids(root)))
             return pack_task(root, task_id, keep_shas=keep_shas, listing=listing, revision=revision, sweep=sweep)
     if revision is None:
-        revision = task_stamps(root, task_id, obligation_rows=sweep.duties, external=sweep.external)
+        revision = task_stamps(root, task_id)
     generations = published_generations(root, task_id, listing)
     already = {_member_key(m) for s in generations for m in s["members"]}
-    members = loose_members(root, task_id)
+    missing: list = []
+    members = loose_members(root, task_id, missing=missing)
     fresh = [m for m in members if _member_key(m) not in already]
     report: Dict[str, Any] = {"task_id": str(task_id), "generation": None, "members": 0, "raw": 0, "packed": 0,
-                              "verified_bytes": 0}
-    if not fresh and not any(m["source"].is_file() for m in members):
+                              "verified_bytes": 0, "missing": len(missing),
+                              "missing_bytes": sum(size for _, _, size in missing)}
+    loose = {_member_key(m) for m in members if m["source"].is_file()}
+    if not fresh and not loose:
+        if missing:  # nothing to pack, but the gap is a fact of this task: recorded, never silent
+            record_storage_pack(root, phase="packed", **report)
         return report  # nothing can be unlinked: do not decompress historical generations
+    relied = [s for s in generations if any(_member_key(m) in loose for m in s["members"])]
     if fresh:
         generation = 1 + max((int(s["generation"]) for s in generations), default=0)
         while any((packs_dir(root) / name).exists() for name in
@@ -985,18 +899,18 @@ def pack_task(root: Any, task_id: str, *, keep_shas: set, listing: Optional[list
             generation += 1
         pack_path, sidecar = write_pack(root, task_id, generation, fresh)
         report.update(generation=generation, members=len(fresh), raw=sidecar["raw_total"], packed=sidecar["packed_total"])
-        generations.append(sidecar)
+        relied.append(sidecar)
         if listing is not None:
             listing.append((pack_path.with_name(sidecar_name(task_id, generation)), sidecar))
-    for sidecar in generations:
+    for sidecar in relied:
         pack_path = packs_dir(root) / pack_name(task_id, sidecar["generation"])
-        verify_pack(pack_path, sidecar)  # from disk, EVERY member, before any unlink
+        verify_pack(pack_path, sidecar)  # from disk, EVERY member of a relied-on generation, before any unlink
         index_upsert(root, pack_path, {**sidecar, "verified_at": utc_now_iso()})
         report["verified_bytes"] += int(sidecar["raw_total"])
     write_unpacker(root)
-    report.update(unlink_loose(root, task_id, generations, keep_shas=keep_shas, revision=revision,
+    report.update(unlink_loose(root, task_id, relied, keep_shas=keep_shas, revision=revision,
                                sweep=sweep, members=members))
-    if report["members"] or report["unlinked"]:  # a row records production, never a re-visit
+    if report["members"] or report["unlinked"] or missing:  # a row records production or a gap, never a re-visit
         record_storage_pack(root, phase="packed", **report)
     return report
 

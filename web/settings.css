@@ -1,5 +1,6 @@
 .settings-shell {
     flex: 1;
+    min-width: 0;
     min-height: 0;
     display: flex;
     flex-direction: column;
@@ -14,12 +15,9 @@
     backdrop-filter: none;
 }
 
-.settings-mobile-back {
-    display: none;
-}
-
 .settings-scroll {
     flex: 1;
+    min-width: 0;
     min-height: 0;
     overflow-y: auto;
     display: flex;
@@ -30,6 +28,8 @@
 
 .settings-panel {
     display: none;
+    min-width: 0;
+    overflow-wrap: anywhere;
     flex-direction: column;
     gap: 18px;
 }
@@ -45,6 +45,7 @@
     font-size: var(--type-body);
     line-height: var(--line-body);
     max-width: 900px;
+    overflow-wrap: anywhere;
 }
 
 .settings-shell .form-section,
@@ -228,7 +229,7 @@
 
 .settings-shell .form-row {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr));
     gap: 14px;
     margin-bottom: 0;
 }
@@ -239,11 +240,11 @@
 }
 
 .settings-shell .form-grid.two {
-    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
 }
 
 .settings-shell .form-grid.four {
-    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr));
 }
 
 .settings-shell .form-field {
@@ -923,19 +924,17 @@
     line-height: var(--line-meta);
     color: var(--text-meta);
     cursor: pointer;
-    white-space: nowrap;
+    min-width: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
 }
 
 .local-toggle input[type="checkbox"] {
+    flex-shrink: 0;
     accent-color: var(--accent);
     width: var(--local-toggle-box);
     height: var(--local-toggle-box);
     cursor: pointer;
-}
-
-[data-autostart-settings] .local-toggle {
-    white-space: normal;
-    flex-wrap: nowrap;
 }
 
 /* Startup & background: a row's note starts where its checkbox label's text starts, and a
@@ -1040,20 +1039,8 @@
 }
 
 @media (max-width: 640px) {
-    /* Mobile settings keep horizontal tab pills; back element remains hidden compat. */
     .settings-shell {
         padding: 0 10px 10px;
-    }
-
-    .settings-tabs-bar {
-        padding: 0;
-    }
-
-    .settings-tabs {
-        flex-wrap: nowrap;
-        gap: 8px;
-        padding: 8px 2px 10px;
-        overflow-x: auto;
     }
 
     .settings-tab {
@@ -1063,10 +1050,6 @@
         font-size: var(--pill-font-size);
         white-space: nowrap;
         border-radius: 999px;
-    }
-
-    .settings-mobile-back {
-        display: none !important;
     }
 
     .settings-shell .form-section {

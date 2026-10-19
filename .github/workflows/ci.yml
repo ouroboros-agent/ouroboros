@@ -1781,9 +1781,10 @@ jobs:
               echo "WARNING: no codesigning identity found in temp keychain — build.sh will auto-detect or fail with no identity."
           fi
 
-      # —— macOS build (signed + optionally notarized when secrets are
-      #         present, otherwise unsigned). Notarization values exist only
-      #         inside this first-party build step.
+      # —— macOS build (signed + notarized when secrets are present,
+      #         otherwise unsigned; the smoke stops a signed stable build that
+      #         is not notarized). Notarization values exist only inside this
+      #         first-party build step.
       - name: Build macOS app
         if: matrix.os == 'macos-latest'
         env:
@@ -1795,7 +1796,7 @@ jobs:
             echo "Pre-release tag detected — building unsigned DMG for artifact validation"
             OUROBOROS_SIGN=0 bash build.sh
           elif [ "$HAS_APPLE_SIGNING" = "true" ]; then
-            echo "Signing certificate detected — building with codesign + (optional) notarization"
+            echo "Signing certificate detected — building with codesign + notarization (required for a signed stable release)"
             bash build.sh
           else
             echo "No signing secrets — building unsigned (OUROBOROS_SIGN=0)"
@@ -1887,6 +1888,24 @@ jobs:
           test -L "$SBOM_ROOT/Applications"
           unlink "$SBOM_ROOT/Applications"
           echo "sbom_path=$SBOM_ROOT" >> "$GITHUB_OUTPUT"
+          # Gatekeeper, not codesign, decides whether a Mac opens the app. A signed
+          # stable build must carry both stapled tickets and be accepted as copied
+          # out of the DMG; any failure here stops the release, never relabels it.
+          DMG="${{ steps.release_asset.outputs.path }}"
+          if [ "${{ needs.release-preflight.outputs.is_prerelease }}" != "true" ] \
+              && [ "$HAS_APPLE_SIGNING" = "true" ]; then
+            xcrun stapler validate "$DMG"
+            xcrun stapler validate "$SBOM_ROOT/Ouroboros.app"
+            spctl --assess --type open --context context:primary-signature -vv "$DMG" 2>&1 \
+              | tee "$RUNNER_TEMP/gatekeeper-dmg.txt"
+            spctl --assess --type exec -vv "$SBOM_ROOT/Ouroboros.app" 2>&1 \
+              | tee "$RUNNER_TEMP/gatekeeper-app.txt"
+            grep -q 'source=Notarized Developer ID' "$RUNNER_TEMP/gatekeeper-dmg.txt"
+            grep -q 'source=Notarized Developer ID' "$RUNNER_TEMP/gatekeeper-app.txt"
+            echo "macos_notarization=notarized" >> "$GITHUB_OUTPUT"
+          else
+            echo "macos_notarization=not_notarized" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Smoke final Linux archive
         id: smoke_linux
@@ -2081,6 +2100,11 @@ jobs:
           EXTRA_CHECKS=()
           if [ "${{ matrix.proof_id }}" = "macos-arm64" ]; then
             EXTRA_CHECKS+=(--check applications_shortcut --check install_cli_command --check arm64_main_executable)
+            NOTARIZATION="${{ steps.smoke_macos.outputs.macos_notarization }}"
+            if [ "$NOTARIZATION" = "notarized" ]; then
+              EXTRA_CHECKS+=(--check stapled_app --check stapled_dmg --check gatekeeper_app --check gatekeeper_dmg)
+            fi
+            EXTRA_CHECKS+=(--macos-notarization "$NOTARIZATION")
           fi
           python scripts/release_proof.py record-smoke \
             --proof-id "${{ matrix.proof_id }}" \

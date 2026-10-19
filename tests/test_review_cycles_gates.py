@@ -789,7 +789,6 @@ def _wire_review_skill(
                         lambda *a, **k: None)
     monkeypatch.setattr(skill_review, "reviewer_slot_config_error", lambda: "")
     monkeypatch.setattr(skill_review, "_build_skill_file_packs", lambda *a, **k: ["pack"])
-    monkeypatch.setattr(skill_review, "_official_hub_review_profile", lambda s: "")
     monkeypatch.setattr(skill_review, "_review_wave_budget_block",
                         lambda *a, **k: None)
     default_delivery = {

@@ -962,7 +962,7 @@ test('a child folds its own live calls and host counters', () => {
         f.log({ type: 'tool_call_finished', task_id: CHILD, tool: 'read_file', tool_call_id: 'k1', duration_sec: 0.2 });
         f.log({ type: 'tool_call_started', task_id: CHILD, tool: 'web_search', tool_call_id: 'k2' });
         // A child card renders its timeline only while it is open.
-        f.card(CHILD).querySelector('[data-live-summary-button]').listeners.get('click')[0]({ detail: 0 });
+        f.card(CHILD).querySelector('[data-live-disclosure]').listeners.get('click')[0]({ detail: 0 });
         const folded = () => f.rows(CHILD).filter((n) => /tool call/.test(n.innerHTML));
         assert.equal(folded().length, 1, 'three frames about two calls are the child\'s one evidence row');
         assert.match(folded()[0].innerHTML, /2 tool calls/);
@@ -983,7 +983,7 @@ test('#931 a typed checkpoint is a real expanded row without stealing narration'
         const title = card.querySelector('[data-live-title]').textContent;
         f.log({ type: 'task_checkpoint', checkpoint_kind: 'context_view', round: 3 });
         if (card.dataset.expanded !== '1') {
-            card.querySelector('[data-live-summary-button]').listeners.get('click')[0]({ detail: 0 });
+            card.querySelector('[data-live-disclosure]').listeners.get('click')[0]({ detail: 0 });
         }
         assert.ok(f.rows().some((row) => row.innerHTML.includes('Context inspected')));
         assert.equal(card.querySelector('[data-live-title]').textContent, title);
@@ -1026,7 +1026,7 @@ for (const order of ['wait-first', 'settlement-first']) for (const failed of [fa
             const wait = { type: 'tool_call_timeout', ...identity };
             const result = { type: 'tool_call', ...identity, status: failed ? 'error' : 'ok', is_error: failed };
             for (const row of order === 'wait-first' ? [wait, result] : [result, wait]) f.log(row);
-            f.card('kid').querySelector('[data-live-summary-button]').listeners.get('click')[0]({ detail: 0 });
+            f.card('kid').querySelector('[data-live-disclosure]').listeners.get('click')[0]({ detail: 0 });
             const rows = f.rows('kid').map(row => row.innerHTML).join(' ');
             assert.match(rows, /1 tool call/);
             assert.match(rows, /wait ended/);
@@ -1047,7 +1047,7 @@ test('a terminal child drops a late non-tool frame while its late tool fact stil
         f.emit('chat', { role: 'assistant', is_progress: true, content: 'Child finished', subagent_event: 'completed', ...lineage });
         f.log({ type: 'llm_round_error', task_id: 'kid', error: 'late child noise' });
         f.log({ type: 'tool_call_timeout', task_id: 'kid', tool: 'read_file', invocation_id: 'kid-late' });
-        f.card('kid').querySelector('[data-live-summary-button]').listeners.get('click')[0]({ detail: 0 });
+        f.card('kid').querySelector('[data-live-disclosure]').listeners.get('click')[0]({ detail: 0 });
         const rows = f.rows('kid').map(row => row.innerHTML).join(' ');
         assert.doesNotMatch(rows, /late child noise|Thinking step failed/);
         assert.match(rows, /wait ended/);
@@ -1068,7 +1068,7 @@ for (const child of [false, true]) test(`cold Chat merges canonical settlement w
         ] } }]);
     try {
         await f.instance.refreshHistory({ revision: 1 });
-        if (child) f.card(id).querySelector('[data-live-summary-button]').listeners.get('click')[0]({ detail: 0 });
+        if (child) f.card(id).querySelector('[data-live-disclosure]').listeners.get('click')[0]({ detail: 0 });
         const rows = f.rows(id).map(row => row.innerHTML).join(' ');
         assert.match(rows, /1 tool call.*wait ended/);
         assert.doesNotMatch(rows, /1 error|operation may still settle/);

@@ -6,7 +6,6 @@
 import { tr } from './i18n.js';
 import { showToast } from './toast.js';
 import { isStoreMigrating } from './api_client.js';
-import { ensureLiveActionsEl } from './chat_activity.js';
 import { authorOf, createRelayQuote, createReplyQuote, normalizeReplyRef, replySnippet } from './chat_reply_quote.js';
 import { fullText } from './text_fit.js';
 import { revealTimelineNode } from './chat_render_batch.js';
@@ -209,7 +208,7 @@ export function createChatReplies({ chatId, feed, input, key = '', reading, hist
         if (!bubbleRef(bubble)) return null;
         const button = document.createElement('button');
         button.type = 'button';
-        button.className = 'chat-message-reply';
+        button.className = 'chat-message-reply ui-hit-area';
         button.innerHTML = REPLY_ICON;
         button.title = tr('chat.reply.reply', 'Reply');
         button.setAttribute('aria-label', tr('chat.reply.reply', 'Reply'));
@@ -231,10 +230,12 @@ export function createChatReplies({ chatId, feed, input, key = '', reading, hist
     } catch { staged = null; }
 
     /**
-     * What a reply to a work card quotes: the work itself (its task id is its durable address; for a Continue
-     * card, the current episode's), named by its title, with its latest line or, settled, its chip's words.
+     * What a reply to a work card quotes, or null while the card offers none: the work itself (its task id is its
+     * durable address; for a Continue card, the current episode's), named by its title, with its latest line or,
+     * settled, its chip's words.
      */
     function cardRef(record) {
+        if (!record?.replyable) return null;
         const line = fullText(record.activityEl).trim();
         const chip = record.phaseEl?.textContent?.trim() || '';
         return {
@@ -245,33 +246,15 @@ export function createChatReplies({ chatId, feed, input, key = '', reading, hist
     }
 
     /**
-     * The card's own Reply (docs/DESIGN.md "Replies"): neutral, never the primary, first in the card's action row,
-     * on running and settled work alike. `wanted` is false for anything that is not a root work card.
-     * The card becomes a quote's jump target by the same address.
+     * A root work card is answered from its row menu (docs/DESIGN.md "Replies"; owner 17.10, Q9 B): its action row
+     * holds only commands over the work, so it draws no Reply of its own. `wanted` is false for anything that is not
+     * a root work card. The card becomes a quote's jump target by the same address.
      */
     function syncCard(record, wanted) {
-        const existing = record?.cardReplyEl;
-        if (!wanted) {
-            if (existing) { existing.remove(); record.cardReplyEl = null; return true; }
-            return false;
-        }
+        if (!record?.root) return;
+        record.replyable = Boolean(wanted);
         const address = `task:${record.groupId}`;
-        if (record.root.dataset.rowAddress !== address) record.root.dataset.rowAddress = address;
-        const actions = ensureLiveActionsEl(record);
-        if (!actions) return false;
-        let button = existing;
-        if (!button) {
-            button = document.createElement('button');
-            button.type = 'button';
-            button.className = 'btn btn-sm btn-default';
-            button.dataset.cardReply = '1';
-            button.textContent = tr('chat.reply.reply', 'Reply');
-            button.setAttribute('aria-label', tr('chat.reply.reply_to_work', 'Reply to this work'));
-            button.addEventListener('click', () => start(cardRef(record)));
-            record.cardReplyEl = button;
-        }
-        if (actions.firstElementChild !== button) { actions.prepend(button); return true; }
-        return !existing;
+        if (wanted && record.root.dataset.rowAddress !== address) record.root.dataset.rowAddress = address;
     }
 
     /**
@@ -340,6 +323,8 @@ export function createChatReplies({ chatId, feed, input, key = '', reading, hist
         },
         /** What the row menu's Reply on this bubble quotes, or null. */
         bubbleRef,
+        /** What the row menu's Reply on this root work card quotes, or null. */
+        cardRef,
         start,
         syncCard,
         syncDerivedQuotes,

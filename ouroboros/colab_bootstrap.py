@@ -489,9 +489,10 @@ def ensure_native_telegram_live(
     request: Optional[Callable[..., tuple]] = None,
     alive: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, Any]:
-    """Grant, enable, and configure the bundled native Telegram skill.
+    """Grant, enable, and configure the built-in Telegram skill.
 
-    The native payload is seeded and hash-trusted by the launcher. Headless
+    The starter selection installs the built-in with its install record (trusted
+    by default, so the gate admits exactly those bytes). Headless
     Colab only performs the same owner-policy steps the Skills UI would perform:
     grant the API-projected missing items when persisted auto-grant is enabled,
     enable the skill, then save its Telegram settings. It never installs from a
@@ -517,9 +518,9 @@ def ensure_native_telegram_live(
 
     quoted = urllib.parse.quote("telegram")
 
-    # 2. Discover the launcher-seeded native skill and read its authoritative
-    #    grant/conflict projection. Missing native payloads are packaging errors,
-    #    not a reason to fall back to a Hub install.
+    # 2. Discover the built-in skill (installed by the starter selection) and read
+    #    its authoritative grant/conflict projection. A missing built-in is a
+    #    packaging or starter-selection error, not a reason to fall back to a Hub install.
     skill = None
     while deadline is None or time.time() < deadline:
         if alive is not None and not alive():
@@ -543,15 +544,13 @@ def ensure_native_telegram_live(
             and code < 400
             and candidate is not None
             and str(candidate.get("source") or "").lower() == "native"
-            and str(candidate.get("review_profile") or "") == "native_seed"
             and candidate.get("executable_review") is True
-            and candidate.get("review_stale") is False
         ):
             skill = candidate
             break
         time.sleep(1.0)
     if skill is None:
-        status["error"] = "bundled native skill 'telegram' did not reach a fresh executable native-trust verdict"
+        status["error"] = "built-in skill 'telegram' is not installed with an executable acceptance basis"
         return status
     conflict = skill.get("conflict") if isinstance(skill.get("conflict"), dict) else None
     if conflict:

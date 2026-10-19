@@ -1,12 +1,11 @@
-"""Real isolated Skills page: native platform visibility and retained OFF.
+"""Real isolated Skills page: built-in platform visibility and retained OFF.
 
 This is a macOS/Linux UI consumer, not native Windows/COM qualification. A
-Windows seed left by an old unfiltered launcher is deliberately present on disk.
+Windows copy left by an old unfiltered launcher is deliberately present on disk.
 """
 from __future__ import annotations
 
 import json
-import logging
 import os
 import shutil
 import sys
@@ -22,14 +21,16 @@ from tests.test_ui_smoke_playwright import direct_server_with_data  # noqa: F401
 @pytest.mark.serial
 @pytest.mark.skipif(sys.platform not in {"darwin", "linux"}, reason="Unix-host visibility journey")
 def test_skills_shows_native_unix_and_keeps_owner_off(direct_server_with_data, tmp_path):  # noqa: F811
-    from ouroboros.launcher_bootstrap import _seed_skills_into
-    from ouroboros.skill_loader import load_enabled
+    from ouroboros.skill_builtin import ensure_builtin_skills, install_builtin_skill
+    from ouroboros.skill_loader import load_enabled, save_enabled
 
     pw = pytest.importorskip("playwright.sync_api")
     host = direct_server_with_data
     drive, repo, url = host["data_dir"], host["repo_dir"], host["url"]
     host["stop_server"]()
-    _seed_skills_into(repo / "skills", drive / "skills", logging.getLogger(__name__))
+    assert install_builtin_skill("unix_computer_use", drive_root=drive, seed_dir=repo / "skills",
+                                 installed_by="owner")["ok"]
+    save_enabled(drive, "unix_computer_use", True, actor="owner_ui")
     foreign = drive / "skills" / "native" / "windows_computer_use"
     shutil.copytree(repo / "skills" / "windows_computer_use", foreign, dirs_exist_ok=True)
     (foreign / ".seed-origin").write_text("seeded by an earlier launcher\n", encoding="utf-8")
@@ -62,9 +63,9 @@ def test_skills_shows_native_unix_and_keeps_owner_off(direct_server_with_data, t
                 card.locator("label.skills-switch").click()
             assert saved.value.ok and saved.value.json()["enabled"] is False
             assert load_enabled(drive, "unix_computer_use") is False
-            # A subsequent launcher seed must not reinterpret OFF as no choice.
+            # The next startup's built-in pass must not reinterpret OFF as no choice.
             host["stop_server"]()
-            _seed_skills_into(repo / "skills", drive / "skills", logging.getLogger(__name__))
+            ensure_builtin_skills(drive, repo_dir=repo, dependency_pass=False)
             host["start_server"]()
             page.goto(url + "/#skills")
             card.wait_for(timeout=30000)

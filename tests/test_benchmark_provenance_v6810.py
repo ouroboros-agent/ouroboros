@@ -592,6 +592,9 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
     "migrating": (False, "gateway/_helpers.py: a write door (create, Cancel, Pause, Presence) answered 503 inside the boot import window of state/current.sqlite (retry); no task attempt was truncated"),
     "budget_pausing_no_extraction": (False, "review_verdict_extraction.py: Light verdict extraction refused while the task's exact budget pause is closing dispatch (#1196); the review row stays undispatched and the attempt is paused, not truncated"),
     "owner_pause": (False, "tools/skill_publish.py: publication tool returns its completed stages after owner Pause interrupts the formatter; the task is retained for Resume, not terminalized or scored"),
+    "github_actor_unavailable": (False, "skill_publish_github.py: the GitHub account behind the token cannot be read before any publication mutation; a typed publication refusal, not a task terminal"),
+    "fork_prepare_failed": (False, "skill_publish_github.py: the account's fork could not be prepared; the publication result is partial and retryable, not a task terminal"),
+    "fork_sync_failed": (False, "skill_publish_github.py: a 422-only fork synchronization failed; the publication result is partial and retryable, not a task terminal"),
     # -- truncating: the rail stopped the attempt, so reward 0 is not a capability fact ----
     "budget_exhausted": (True, "loop.py:287 per-task USD reservation rail"),
     "round_limit": (True, "loop.py:3128 _handle_round_limit, the round cap"),

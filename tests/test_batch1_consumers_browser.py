@@ -321,12 +321,12 @@ def _card_lines(page, task_id):
 
 def _expand(page, task_id):
     """Open a live card's timeline, so a screenshot shows its rows, not only the summary."""
-    button = _card(page, task_id).locator("[data-live-summary-button]")
+    button = _card(page, task_id).locator(":scope > [data-live-summary-button] [data-live-disclosure]")
     button.wait_for(state="attached", timeout=30000)
     if button.get_attribute("aria-expanded") != "true":
         button.click()
     page.wait_for_function("id => document.querySelector(`#page-chat .chat-live-card[data-task-id=\"${id}\"] "
-                           "[data-live-summary-button]`)?.getAttribute('aria-expanded') === 'true'",
+                           "> [data-live-summary-button] [data-live-disclosure]`)?.getAttribute('aria-expanded') === 'true'",
                            arg=task_id, timeout=15000)
 
 

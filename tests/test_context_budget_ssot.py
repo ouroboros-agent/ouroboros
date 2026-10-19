@@ -27,7 +27,6 @@ def test_agent_context_budget_values_pinned():
         assert not hasattr(cb, retired), retired  # a wake-up is a Main turn under Main's budgets
     assert cb.LARGE_CONTEXT_SECTION_CHARS == 200_000
     assert not hasattr(cb, "MAX_RECENT_CHAT_TAIL")  # the request reads no chat tail: the memory view holds the open conversation
-    assert cb.CHAT_ARCHIVE_SCAN_WARN_BYTES == 100_000_000
     assert not hasattr(cb, "CONTEXT_SOFT_CAP_TOKENS")
     # Structural low-water divisor of the automatic reclaim pass (12.5 % of the
     # binding boundary): a disclosed design choice, not a setting.

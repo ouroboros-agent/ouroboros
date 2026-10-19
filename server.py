@@ -93,6 +93,7 @@ from ouroboros.server_maintenance import (  # noqa: F401
     _periodic_supervisor_maintenance,
     _periodic_zombie_reconcile,
     _prune_delegated_snapshots,
+    _prune_worktrees,
     _reconcile_delegated_runs,
     _resume_interrupted_project_deletions,
     _run_startup_task_recovery,
@@ -101,7 +102,6 @@ from ouroboros.server_maintenance import (  # noqa: F401
     _startup_review_pool_notice,
     _startup_custody_sweep,
     _startup_prune_sweeps,
-    _startup_worktree_prune,
 )
 from ouroboros.ui_translation import start_background as _start_ui_translation
 from supervisor.workspace_preparation import start_generation as _start_preparation_generation
@@ -1456,7 +1456,7 @@ async def lifespan(app):
         ("owned_stops", lambda: live and finish_unconfirmed_stops(lifespan_drive_root)),  # before any extension/replacement process (§9)
         ("inherited_records", lambda: live and start_inherited_import(lifespan_drive_root)),  # the one-time disk walk, off the ready path
         ("usage_store", _usage_store),
-        ("skills", lambda: live and server_boot.seed_skills()),
+        ("skills", lambda: live and server_boot.seed_skills(lifespan_drive_root, settings, provider_ready=startup_provider_ready)),
         ("projects", lambda: live and server_boot.reconcile_projects(lifespan_drive_root)),
         ("services", lambda: server_boot.start_background_services(
             settings, local_model=has_local, boot_managed_update=_boot_managed_update_tasks, warm_daemon=live)),
@@ -1602,7 +1602,11 @@ def _emergency_process_cleanup() -> dict:
     """Kill child processes, workers and companions; the kill census. The main and
     Host Service listeners close with this process: no port is swept."""
     from ouroboros.maintenance import child as maintenance_child
+    from ouroboros.storage import count as storage_count
+    from ouroboros.storage_free import free as storage_free
     maintenance_child.stop()
+    storage_count.stop()
+    storage_free.stop()
     begin_owned_stop(DATA_DIR)  # the grace starts here; pending stops are recorded before any wait
     worker_exits = None  # the pool's own PID census; None until kill_workers ran to its end
     try:
@@ -1639,14 +1643,18 @@ def _emergency_process_cleanup() -> dict:
         except Exception:
             pass
     if _restart_requested.is_set():  # only the restart that carried an adoption can arm it; never a wait
-        body_adoption.arm(DATA_DIR, worker_exits=worker_exits, live_children=multiprocessing.active_children() + maintenance_child.live_children(),
+        body_adoption.arm(DATA_DIR, worker_exits=worker_exits,
+                          live_children=multiprocessing.active_children() + maintenance_child.live_children()
+                          + storage_count.live_children() + storage_free.live_children(),
                           owned_stop=owned_stop, owner_restart=_owner_restart_requested.is_set())
     try:
         from ouroboros.extension_companion import panic_kill_all
         panic_kill_all()
     except Exception:
         pass
-    return {"worker_exits": worker_exits, "live_children": multiprocessing.active_children() + maintenance_child.live_children(), "owned_stop": owned_stop}
+    return {"worker_exits": worker_exits, "owned_stop": owned_stop,
+            "live_children": multiprocessing.active_children() + maintenance_child.live_children()
+            + storage_count.live_children() + storage_free.live_children()}
 
 def main() -> int:
     from ouroboros.delegate_recovery import observe_restart_parent

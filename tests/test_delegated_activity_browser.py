@@ -43,7 +43,7 @@ VISIBLE, SNAPSHOT = ("""ids => ids.map(id => Array.from(document.querySelectorAl
     .filter(line => !line.hidden).map(line => line.%s.replace(/\\s+/g, ' ').trim()))""" % key for key in ("innerText", "textContent"))
 EXPAND = """ids => { for (const id of ids) {
     const card = document.querySelector(`.chat-live-card[data-task-id="${id}"]`);
-    if (card && card.dataset.expanded !== '1') card.querySelector('[data-live-summary-button]').click();
+    if (card && card.dataset.expanded !== '1') card.querySelector('[data-live-disclosure]').click();
 } }"""
 
 
@@ -226,10 +226,10 @@ def test_delegated_rows_live_reconnect_reload_root_child_source_and_final_gap(en
 
     root_card = page.locator(f'#chat-messages .chat-live-card[data-task-id="{ROOT}"]').first
     root_card.wait_for()
-    root_card.locator("[data-live-summary-button]").first.click()
+    root_card.locator("[data-live-disclosure]").first.click()
     kid_card = page.locator(f'.chat-live-card[data-task-id="{KID}"]').first
     kid_card.wait_for()
-    kid_card.locator("[data-live-summary-button]").first.click()
+    kid_card.locator("[data-live-disclosure]").first.click()
     page.wait_for_function(f"() => document.querySelector('#chat-live-timeline-{KID} .chat-delegated-final')")
 
     texts = page.evaluate(VISIBLE, [ROOT, KID])

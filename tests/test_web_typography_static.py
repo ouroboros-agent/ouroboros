@@ -340,7 +340,7 @@ def test_migrated_region_markers_do_not_swallow_unmigrated_surfaces() -> None:
     assert ".updates-status" in region
     assert ".updates-restore-row" in region
     # Dashboard -> Storage (#1418) was written on the scale; its slice stays guarded.
-    assert ".storage-row-label" in region
+    assert ".storage-place-label" in region
     # Chat migrated on 2026-09-01 (frontend sprint, Q1=B): page chrome,
     # transcript/bubbles/live cards/composer, and the structured-delivery +
     # quiz-card slice, executor chip now included.
@@ -349,10 +349,15 @@ def test_migrated_region_markers_do_not_swallow_unmigrated_surfaces() -> None:
     assert ".chat-live-title" in region
     assert ".chat-live-executor-chip" in region
     assert ".chat-quiz-card" in region
+    # The Skills page (Installed, Browse, Sources, the detail sheet and its
+    # dialogs) migrated with the skill-sources redesign; its region stays guarded.
+    assert ".skills-installed-card" in region
+    assert ".skills-head-card" in region
+    assert ".skills-source-row" in region
     # Unmigrated neighbours stay out until their own pass. (`.log-entry` and
     # `.evo-runtime-pill` are NOT in this list: the shared status-tone rules
     # inside the chat region legitimately name them as co-selectors.)
-    for selector in (".skills-card", ".marketplace-card", ".widgets-card", ".evo-runtime-card"):
+    for selector in (".widgets-card", ".evo-runtime-card"):
         assert selector not in region, (
             f"{selector} is an unmigrated surface; a marker crept over it"
         )
@@ -581,7 +586,9 @@ def test_chat_transcript_reserves_composer_space_as_one_flex_spacer():
     assert len(bases) == 1
     assert "content: '';" in bases[0]
     assert "flex: 0 0 calc(var(--chat-input-reserve, 108px) - 8px);" in bases[0]
-    mobile = [body for _, body in spacers if "env(safe-area-inset-bottom" in body]
+    # The stack layout's spacer adds the shell's bottom inset (ui.css --inset-bottom: the system safe area and,
+    # inside Telegram, the host's), never a raw env() of its own.
+    mobile = [body for _, body in spacers if "var(--inset-bottom)" in body]
     assert len(mobile) == 1
     assert "- 8px" in mobile[0]
     panel = [body for selector, body in spacers if selector == ".chat-instance-panel .chat-messages::after"]

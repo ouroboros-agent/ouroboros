@@ -715,7 +715,7 @@ def test_continue_after_a_crash_rejoins_a_lost_answer_and_survives_reload(direct
                 expect(button).to_have_text("Continued", timeout=30_000)
                 expect(button).to_have_attribute("data-continue-successor", successor)
                 expect(button).to_be_disabled()
-                assert card.locator(":scope > [data-live-summary-button]").get_attribute("aria-expanded") != "true"
+                assert card.locator(":scope > [data-live-summary-button] [data-live-disclosure]").get_attribute("aria-expanded") != "true"
                 assert page.evaluate(f"localStorage.getItem('ouro_continue_nonce:{DELTA}')") == nonce
                 shot("05-continue-after-reload")
                 admitted = [row["task_id"] for row in _events(data_dir, "owner_continue_admitted")

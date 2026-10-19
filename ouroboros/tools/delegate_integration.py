@@ -396,7 +396,8 @@ def _provision_snapshot(ctx: ToolContext, drive: pathlib.Path, target_root: str,
             "delegated run executes only in its own snapshot, never in the shared tree.",
             target_root=target_root, definitely_unrun=True, **lock_busy_facts(exc))
     if folder.parts and not (pathlib.Path(handle.path) / folder).is_dir():
-        try:  # unclaimed: nothing else names it, and the startup GC reconciles a failed release
+        # Unclaimed; custody GC retries a failed release once the owning task is proven over.
+        try:
             remove_execution_snapshot(handle.snapshot_id)
         except Exception:
             log.warning("Failed to release snapshot %s without its starting folder", handle.snapshot_id, exc_info=True)
@@ -730,12 +731,14 @@ from ouroboros.tool_access import (
 
 
 def payload_content_hash(payload_root: Any) -> str:
-    """The whole-payload CAS hash — the existing skill-loader inventory hash.
-    One definition for snapshot baseline, capture result, and apply-time CAS;
-    raises ``SkillPayloadUnreadable`` (fail-closed) exactly like the loader."""
-    from ouroboros.skill_loader import compute_content_hash
+    """The whole-payload CAS hash over the skill-loader inventory, the bucket's
+    per-install notes included: the snapshot copy sits outside data/skills/<bucket>/,
+    so it and the live folder hash the same bytes. One definition for snapshot
+    baseline, capture result, and apply-time CAS; raises ``SkillPayloadUnreadable``
+    (fail-closed) exactly like the loader."""
+    from ouroboros.skill_identity import payload_digest
 
-    return compute_content_hash(pathlib.Path(str(payload_root)))
+    return payload_digest(pathlib.Path(str(payload_root)), bucket="")
 
 
 def _payload_delegation_busy(drive: pathlib.Path, target: pathlib.Path) -> str:

@@ -786,12 +786,28 @@ def scan_data_paths(root: pathlib.Path = REPO) -> frozenset[str]:
 # (``__extension_imports/*``, ``.extension-*.lock``), ``state/dialog.sqlite`` and its name-tier lock
 # ``state/dialog.lock`` (``ouroboros/dialogue_store.py``; one section-3 row that also names the cutover
 # and import-job locks).
-# 387 -> 389 (live calls): the direct-route price catalog cache ``state/pricing/litellm.json``
+# 386 -> 401 (skill sources): the git transport's caches under ``state/skill_sources`` (repository
+# and pointer clones, their locks, meta and snapshots, probe/merge scratch), the starter marker
+# ``state/skill_starter.json`` and the per-bucket install staging ``skills/*/.staging/*-*``.
+# 401 -> 402 (source views): ``state/skill_sources/repos/*/views/*`` holds per-path
+# snapshots; ``catalog.json`` now has either the repository root or a view as its parent.
+# 402 -> 404 (update retention): ``state/skills/*/update_backup.json`` and the
+# now-derived existing rollback location ``skills/*/.rollback/*.*``.
+# 387 -> 412: both changes together (the skill-source paths above on the startup-architecture
+# count; ``state/native_seed.json`` is now written by ``ouroboros/skill_builtin.py``).
+# 412 -> 413 (computer use on by default): the one-time offer reads the earlier launcher's
+# ``skills/native/.post-bootstrap-seed-*`` markers so a default the owner removed stays removed.
+# 413 -> 414: the saved storage count ``state/storage_measurement.json`` (``ouroboros/storage.py``;
+# the last two finished counts the Dashboard gauge and the mind's storage fact read) has its own row
+# in section 2.
+# 414 -> 416 (live calls): the direct-route price catalog cache ``state/pricing/litellm.json``
 # (``ouroboros/pricing_catalog.py``; a section-2 row) and the small-window section captures
 # ``state/context_views/*/*/*.md`` (``ouroboros/section_floor.py``; a section-4 row).
-# 389 -> 390 (live calls): the recognition languages a call's voice recorded,
+# 416 -> 417 (live calls): the recognition languages a call's voice recorded,
 # ``state/call_languages.json`` (``ouroboros/call_languages.py``; a section-2 row).
-EXPECTED_SCAN_PATHS = 391
+# 417 -> 418 (live calls): the captures' sweep reads their base ``state/context_views``
+# (``section_floor.prune_context_views``; the same section-4 row).
+EXPECTED_SCAN_PATHS = 418
 
 # Scanned paths that must always be present — guards the scanner itself
 # against a silent regression that would shrink coverage while keeping counts
@@ -842,8 +858,8 @@ UNRESOLVED_SPELLINGS = frozenset({
     "logs/*",
     # skill payload roots resolved from a validated relpath (bucket + name):
     # config.py, contracts/skill_payload_policy.py, skill_payload_binding.py,
-    # tools/core.py — the `skills/<source>/<name>/**` row owns them.
-    "skills/*",
+    # tools/core.py — the `skills/<source>/<name>/**` row owns them. (`skills/*`
+    # itself is named by that row's per-bucket install staging spelling.)
     "skills/*/*",
 })
 
@@ -948,6 +964,34 @@ def _covers(scan_path: str, pattern: str, scan_prefix_ok: bool = True) -> bool:
 
 
 # --- tests -----------------------------------------------------------------
+
+
+def test_update_backup_inventory_names_its_pending_and_partial_restore_lifetime():
+    row = next(line for line in DOC.read_text(encoding="utf-8").splitlines()
+               if line.startswith("| `state/skills/<name>/` owner state"))
+    assert "`update_backup.json`" in row
+    assert "only while a review-basis update is pending" in row
+    assert "removed when it settles or the skill is uninstalled" in row
+    assert "kept as evidence after a partial restore" in row
+    assert "state/skills/*/update_backup.json" in scan_data_paths()
+
+
+def test_skill_architecture_keeps_the_authority_rationales():
+    text = (REPO / "docs/architecture/13-external-skills-layer.md").read_text(encoding="utf-8")
+    for rationale in (
+        "because collapsing any two turns a UI toggle into execution authority",
+        "Discovery confers no trust",
+        "a review PASS installs no dependencies; `enabled=true` does not prove readiness",
+        "so retry history stays explainable without a UI counter becoming review authority",
+    ):
+        assert rationale in text
+
+
+def test_skill_update_docs_name_all_rejection_reasons():
+    for filename in ("CREATING_SKILLS.md", "CLIENT_CONTRACT.md"):
+        text = (REPO / "docs" / filename).read_text(encoding="utf-8")
+        for reason in ("review_blockers", "review_unfinished", "preflight_failed", "landing_failed"):
+            assert f"`{reason}`" in text, (filename, reason)
 
 
 def test_scan_is_populated_and_pinned():

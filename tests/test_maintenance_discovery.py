@@ -45,8 +45,7 @@ def test_reconcile_pass_reserves_the_child_and_walks_no_stamp_in_the_server(root
     monkeypatch.setattr(server_maintenance, "_periodic_zombie_reconcile", lambda **_: None)
     monkeypatch.setattr(server_maintenance, "_run_drive_custody_pass", lambda *_: None)
     monkeypatch.setattr(server_maintenance, "_step_recovered", calls.append)
-    for name in ("_STARTUP_PRUNES_OWED", "_STARTUP_TREES_OWED", "_STARTUP_SOURCE_PRUNES_OWED"):
-        monkeypatch.setattr(server_maintenance, name, [False])
+    monkeypatch.setattr(server_maintenance, "_run_reconcile_prunes", lambda *_a: None)
     monkeypatch.setattr("supervisor.workspace_preparation.recover_interrupted_preparations", lambda *a, **k: None)
     monkeypatch.setattr("ouroboros.late_review_marks.replay_owed_late_reviews", lambda *a, **k: None)
     monkeypatch.setattr("ouroboros.review_operation.collect_orphaned_operations_softly", lambda *a, **k: None)
@@ -126,12 +125,10 @@ def test_discovery_does_not_rebuild_a_missing_index(root, monkeypatch):
     assert not (packs.packs_dir(root) / packs.INDEX_NAME).exists()
 
 
-@pytest.mark.parametrize("busy", ["facts", "packs", "packs_sql", "packs_sql_cached", "money"])
+@pytest.mark.parametrize("busy", ["facts", "packs", "packs_sql", "packs_sql_cached"])
 def test_real_contention_never_waits_and_discovery_defers_without_recording(root, monkeypatch, busy):
     """The server's look never waits on a held store (it defers the spawn); in the child,
     discovery under contention defers too and records nothing, so the job stays due."""
-    from ouroboros import usage_store
-
     _task(root, "candidate", blobs=1)
     with packs.open_index(root):
         pass
@@ -139,16 +136,13 @@ def test_real_contention_never_waits_and_discovery_defers_without_recording(root
         with packs.open_index(root):
             pass
         assert str(packs.packs_dir(root) / packs.INDEX_NAME) in packs._VALIDATED
-    if busy == "money":
-        with usage_store.hold(root, write=True):
-            pass
     spawns = []
     monkeypatch.setattr(maintenance, "spawn_maintenance_job", lambda *a: spawns.append(a) or _FakeChild(_QUIET))
     unit = maintenance.MaintenanceChild()
 
     def held():
-        if busy in {"facts", "packs_sql", "packs_sql_cached", "money"}:
-            path = {"facts": root / "state/current.sqlite", "money": root / usage_store.STORE_REL,
+        if busy in {"facts", "packs_sql", "packs_sql_cached"}:
+            path = {"facts": root / "state/current.sqlite",
                     "packs_sql": packs.packs_dir(root) / packs.INDEX_NAME}[busy.removesuffix("_cached")]
             conn = sqlite3.connect(path, timeout=0)
             conn.execute("BEGIN EXCLUSIVE")

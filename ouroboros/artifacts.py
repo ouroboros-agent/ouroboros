@@ -10,13 +10,13 @@ import stat
 import pathlib
 import re
 import shutil
-import uuid
 import zipfile
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Any, Dict, Iterable, List, Optional, Union
 
+from ouroboros.artifact_storage import clone_file, temporary_sibling
 from ouroboros.utils import atomic_write_json, read_json_dict, update_json_locked, write_bytes_atomic
 from ouroboros.headless import ARTIFACT_STATUS_FAILED, ARTIFACT_STATUS_READY, SCRATCH_MANIFEST_NAME, task_artifacts_dir
 from ouroboros.outcome_receipt_store import is_verification_receipts_path
@@ -1227,17 +1227,25 @@ def stream_artifact_file(path: Any, sink: Any = None, *, expected: Any = None) -
 
 def copy_artifact_file(source: Any, destination: pathlib.Path, *, expected: Any = None) -> Dict[str, Any]:
     """Publish a verified file copy atomically; preserve any prior bytes on failure. Inside a
-    ``task_custody.publication_fence`` a closed generation starts no copy."""
-    source_path = pathlib.Path(source) if isinstance(source, (str, os.PathLike)) else None
-    destination = pathlib.Path(destination)
+    ``task_custody.publication_fence`` a closed generation starts no copy. A block-sharing clone
+    (``artifact_storage``) is taken where the filesystem gives one, its own bytes verified; else streamed."""
+    source_path, destination = (pathlib.Path(source) if isinstance(source, (str, os.PathLike)) else None), pathlib.Path(destination)
     if source_path is not None and not destination.is_symlink() and source_path.resolve(strict=False) == destination.resolve(strict=False):
         return stream_artifact_file(source, expected=expected)
     fence_publication()
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(f".{uuid.uuid4().hex}.tmp")
+    temporary = temporary_sibling(destination)  # the atomic signature the temp sweep reaps after a hard kill
     try:
-        with temporary.open("xb") as sink:
-            measured = stream_artifact_file(source, sink, expected=expected)
+        if source_path is not None and clone_file(source_path, temporary):
+            try:
+                measured = stream_artifact_file(temporary, expected=expected)
+            except ArtifactIdentityError:
+                # Retention watches the source's stable failure, never a disposable clone's inode.
+                stream_artifact_file(source_path, expected=expected)
+                raise
+        else:
+            with temporary.open("xb") as sink:
+                measured = stream_artifact_file(source, sink, expected=expected)
         if source_path is not None:
             shutil.copystat(source_path, temporary)
         temporary.replace(destination)
@@ -1247,13 +1255,9 @@ def copy_artifact_file(source: Any, destination: pathlib.Path, *, expected: Any 
 
 
 def artifact_record(path: pathlib.Path, *, kind: str = "task_artifact", source_path: str = "") -> Dict[str, Any]:
-    record: Dict[str, Any] = {
-        "kind": kind, "name": pathlib.Path(path).name, "path": str(path),
-        **stream_artifact_file(path), "status": ARTIFACT_STATUS_READY, "errors": [],
-    }
-    if source_path:
-        record["source_path"] = source_path
-    return record
+    return {"kind": kind, "name": pathlib.Path(path).name, "path": str(path),
+            **stream_artifact_file(path), "status": ARTIFACT_STATUS_READY, "errors": [],
+            **({"source_path": source_path} if source_path else {})}
 
 
 def store_task_artifact_bytes(
@@ -1269,7 +1273,7 @@ def store_task_artifact_bytes(
         raise ValueError("task artifact name is reserved")
     artifact_dir = task_artifact_dir_path(drive_root, task_id, create=True)
     path = artifact_dir / safe_name
-    temporary = path.with_name(f".{uuid.uuid4().hex}.tmp")
+    temporary = temporary_sibling(path)
 
     def publish(_current):
         try:
@@ -1278,11 +1282,10 @@ def store_task_artifact_bytes(
             if (exc.errno not in {errno.EEXIST, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EPERM, errno.EXDEV, errno.ENOSYS}
                     and getattr(exc, "winerror", None) != 50):
                 raise
-            if path.exists():
-                if path.read_bytes() != data:
-                    raise ValueError(f"task artifact collision: {safe_name}")
-            else:
+            if not path.exists():
                 temporary.replace(path)
+            elif path.read_bytes() != data:
+                raise ValueError(f"task artifact collision: {safe_name}")
     try:
         write_bytes_atomic(temporary, data)
         update_json_locked(artifact_dir / _ARTIFACT_MANIFEST, publish)
@@ -1290,8 +1293,7 @@ def store_task_artifact_bytes(
         temporary.unlink(missing_ok=True)
     record = {**artifact_record(path, kind=kind), "immutable": True}
     _register_task_artifact_records(artifact_dir, [record])
-    return {"root": "artifact_store", "path": safe_name, "sha256": record["sha256"],
-            "bytes": record["size"], "kind": kind}
+    return {"root": "artifact_store", "path": safe_name, "sha256": record["sha256"], "bytes": record["size"], "kind": kind}
 
 
 def _register_task_artifact_records(artifact_dir: pathlib.Path, records: Iterable[Dict[str, Any]]) -> None:
@@ -1454,8 +1456,8 @@ def copy_directory_to_task_artifacts(
         members = sorted(pathlib.Path(p) for p in member_paths)
     file_records: List[Dict[str, Any]] = []
     tree_hasher = sha256(str(source).encode("utf-8", errors="replace") + b"\0")
-    tmp_zip_path = artifact_dir / f".directory.{uuid.uuid4().hex}.tmp"
-    tmp_ledger_path = artifact_dir / f".directory.{uuid.uuid4().hex}.json.tmp"
+    tmp_zip_path = temporary_sibling(artifact_dir / "directory.zip")
+    tmp_ledger_path = temporary_sibling(artifact_dir / "directory.json")
     try:
         with zipfile.ZipFile(tmp_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for path in members:
@@ -1491,8 +1493,7 @@ def copy_directory_to_task_artifacts(
     except Exception:
         for tmp_path in (tmp_zip_path, tmp_ledger_path):
             try:
-                if tmp_path.exists():
-                    tmp_path.unlink()
+                tmp_path.unlink(missing_ok=True)
             except OSError:
                 pass
         raise
@@ -1566,7 +1567,6 @@ def collect_task_artifact_records(
 
 def merge_artifact_records(*groups: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     merged: Dict[str, Dict[str, Any]] = {}
-    order: List[str] = []
     for group in groups:
         for item in group:
             if not isinstance(item, dict):
@@ -1575,7 +1575,6 @@ def merge_artifact_records(*groups: Iterable[Dict[str, Any]]) -> List[Dict[str, 
             if not key:
                 continue
             if key not in merged:
-                order.append(key)
                 merged[key] = dict(item)
                 continue
             existing = merged[key]
@@ -1594,4 +1593,4 @@ def merge_artifact_records(*groups: Iterable[Dict[str, Any]]) -> List[Dict[str, 
                     merged[key][meta_key] = existing[meta_key]
             if existing.get("name") and fresh.get("kind") == "task_artifact":
                 merged[key]["name"] = existing["name"]
-    return [merged[key] for key in order]
+    return list(merged.values())

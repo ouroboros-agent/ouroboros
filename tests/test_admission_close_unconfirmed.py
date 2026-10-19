@@ -255,7 +255,7 @@ def _seal_context(tmp_path, owner_changed=False):
     ("blocking", "clean_pass", "unknown", False, True, NOTE),
     ("blocking", "clean_pass_obligations_closed", "unknown", False, True, NOTE),
     ("blocking", "clean_pass", "sealed", False, True, "clean_pass"),  # the worker's own earlier seal
-    ("blocking", "clean_pass", "active", False, False, "owner_followup"),  # another holder: today's revision path
+    ("blocking", "clean_pass", "active", False, True, NOTE),  # another holder is not owner mail: disclosed
     ("blocking", "clean_pass", "unknown", True, False, "owner_followup"),  # a locally seen owner change is real
     ("advisory", "clean_pass", "unknown", False, True, "clean_pass"),  # soft install: the row, not the note
     ("blocking", "identical_acceptance_refused", "unknown", False, True, "identical_acceptance_refused"),
@@ -356,11 +356,14 @@ def test_an_advisory_author_finish_survives_a_silent_supervisor_but_not_a_refusa
     ("begin", {"ok": False, "status": "error", "error": "invalid acceptance fence event"}, "invalid acceptance fence event"),
     ("inspect", {"ok": True, "status": "released", "token": "t", "row_absent": True}, "released"),
 ])
-def test_the_seam_refuses_with_the_rows_typed_status(tmp_path, op, ack, reason):
+def test_the_seam_refuses_with_the_rows_typed_status(tmp_path, monkeypatch, op, ack, reason):
     """A refusal carries the row's typed state (`sealed`, `active`, `released`) as its reason;
     only a malformed request keeps the error text. The worker reads the state, never the prose."""
+    from supervisor import queue as task_queue
+
     agent = _pooled_agent(tmp_path, stdqueue.Queue())
-    agent.fence_transition = lambda **_kwargs: ack
+    agent._fence_in_process = lambda: True
+    monkeypatch.setattr(task_queue, "transition_acceptance_fence", lambda **_kwargs: ack)
     with pytest.raises(RuntimeError) as refused:
         if op == "begin":
             agent._begin_acceptance_fence(root_task_id="root-1", task_id="root-1")

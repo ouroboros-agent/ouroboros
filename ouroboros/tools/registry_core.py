@@ -315,7 +315,7 @@ class ToolRegistry:
         "project_journal", "presence",
         "recent_tasks",
         "query_code", "query_data", "review", "review_change", "search", "services", "shell", "skill_exec", "skill_publish",
-        "skill_preflight", "subagent_integration", "task_tree", "tool_discovery", "verify", "vision",
+        "skill_preflight", "skill_source_tools", "subagent_integration", "task_tree", "tool_discovery", "verify", "vision",
     ]
 
     def _load_modules(self) -> _ToolCatalog:

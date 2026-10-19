@@ -394,13 +394,16 @@ DRIVE_RETENTION_BATCH = 64  # bounds directory-name selection and one classifica
 
 
 def drive_retention_facts(root: Any, task_ids: Iterable[str], *,
-                          stop: Optional[Callable[[], bool]] = None) -> Dict[str, Dict[str, Any]]:
+                          stop: Optional[Callable[[], bool]] = None, record: bool = True) -> Dict[str, Dict[str, Any]]:
     """Cheap facts for one bounded batch of drive names, never a scan of task history.
 
     A missing row/body or NULL projection stays a strict-read candidate. Legacy
     classification reads coherent bodies outside the selector transaction and
     commits only still-NULL write_seq matches, without changing bodies/signatures.
     An old body's REPLACE clears the nullable projection even after schema upgrade.
+    ``record=False`` is the read-only reader (the free-space preview): the facts a
+    legacy body yields fill the answer but no column, and a store behind the current
+    schema answers nothing rather than upgrading (the next prune does both).
     """
     from ouroboros.retention import task_result_retention_at
     from ouroboros.task_results import load_task_result
@@ -412,6 +415,8 @@ def drive_retention_facts(root: Any, task_ids: Iterable[str], *,
     with open_store(root, write=False) as txn:
         schema = txn.meta("schema_version")
     if schema is not None and int(schema) < store.SCHEMA_VERSION:
+        if not record:
+            return {}
         from ouroboros.store_import import upgrade_current_schema
 
         upgrade_current_schema(root)
@@ -443,7 +448,7 @@ def drive_retention_facts(root: Any, task_ids: Iterable[str], *,
         except (store.StoreError, ValueError, TypeError, AttributeError):
             # Leave NULL: the pruner's strict read retains the original diagnostic.
             continue
-    if classified and not stopped():
+    if record and classified and not stopped():
         with open_store(root, write=True) as txn:
             txn.conn.executemany(
                 "UPDATE tasks SET drive_retention_at=? WHERE task_id=? AND write_seq=? "
@@ -513,7 +518,8 @@ def _collection_candidates(root: Any, column: str, predicate: Callable[[dict], b
 
 
 def review_collection_candidates(root: Any, *, stop: Optional[Callable[[], bool]] = None) -> Iterable[str]:
-    """Possible acceptance collection/late-notice work; unrelated plans stay out."""
+    """Possible acceptance collection/late-notice work and other surfaces' open liveness
+    pointers; unrelated plans stay out."""
     from ouroboros.obligations import review_collection_pending
 
     yield from _collection_candidates(root, "review_collection_pending", review_collection_pending, stop)

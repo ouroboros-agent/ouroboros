@@ -91,7 +91,7 @@ def test_historical_supplement_live_reload_reconnect_and_full_source(tmp_path, m
                 page.evaluate('row => lateEvent("chat", row)', row)
             card = page.locator(f'.chat-live-card[data-task-id="{f.tid}"]')
             if card.get_attribute('data-expanded') != '1':
-                card.locator('[data-live-summary-button]').click()
+                card.locator('[data-live-disclosure]').click()
             section = card.locator('[data-review-section-toggle]')
             section.click()
             group = card.locator('[data-review-group-toggle]')

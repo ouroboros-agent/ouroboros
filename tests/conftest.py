@@ -1100,6 +1100,23 @@ def _hide_bundled_skills(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _join_starter_threads(monkeypatch, _os_environ_isolation):
+    """Every onboarding completion owns its starter work until this test ends.
+
+    Fixture dependencies keep data/config bindings and the environment in force
+    until the starter finishes. Join its source refreshes afterwards: it can start them
+    after a module-local source fixture has already finalized.
+    """
+    yield
+    starter = sys.modules.get("ouroboros.skill_starter")
+    if starter is not None:
+        assert starter.join_starters(timeout=240), "starter skill installation did not finish"
+        from tests._skill_source_fixtures import join_source_refreshes
+
+        join_source_refreshes(timeout=120)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_evolution_stop_latch(monkeypatch):
     """A received evolution Stop is a process-lifetime latch (#1307); no test inherits one."""
     from supervisor import evolution_lifecycle

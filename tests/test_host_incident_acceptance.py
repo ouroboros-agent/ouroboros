@@ -8,6 +8,7 @@ whether automatic/explicit late acceptance reaches it at all.
 from __future__ import annotations
 
 import hashlib
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -118,6 +119,7 @@ def _deliver(f, monkeypatch, event, *, legacy):
         row = _store(f, RAW, {}, event)
     assert row["acceptance_debt"]["delivery"]["text_sha256"] == hashlib.sha256(event["text"].encode()).hexdigest()
     monkeypatch.setattr(task_queue, "INITIALIZED", True)
+    monkeypatch.setattr(task_queue, "OWNER_PID", os.getpid())
     monkeypatch.setattr(task_queue, "DRIVE_ROOT", f.root)
     monkeypatch.setattr(chat, "_bound_project_chat_id", lambda *_a: 0)
     prepared: list = []

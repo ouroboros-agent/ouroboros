@@ -6,6 +6,7 @@ import contextlib
 import contextvars
 import logging
 import math
+import os
 import pathlib
 import queue as _stdqueue  # noqa: F401 — re-exported for the test suite's reap-queue isolation
 import threading
@@ -77,15 +78,31 @@ OBJECTIVE_REPEAT_CAP: int = 3
 
 # Whether THIS process owns the supervisor's live maps (``init`` ran): a process that merely
 # imports the module sees empty maps, which prove nothing (``task_settlement_liveness``).
+# OWNER_PID names that process: a child forked after ``init`` inherits INITIALIZED, not the pid.
 INITIALIZED = False
+OWNER_PID: Optional[int] = None
 QUEUE_PUBLICATION = None  # Structural documents and their successfully published generation.
 
 
+def owns_live_queue(drive_root: Any) -> bool:
+    """Whether THIS process holds the live queue of ``drive_root``: a process fact, never an
+    actor's flag. A worker never does (its maps are empty or a forked copy), so it asks over the
+    bus, where only the current RUNNING attempt may open a fence (#1183)."""
+    from ouroboros.utils import in_worker_process
+
+    if in_worker_process() or not INITIALIZED or OWNER_PID != os.getpid():
+        return False  # a worker, never initialized here, or a child forked with a copy of the maps
+    try:
+        return pathlib.Path(DRIVE_ROOT).resolve() == pathlib.Path(drive_root).resolve()
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def init(drive_root: pathlib.Path) -> None:
-    global DRIVE_ROOT, FINALIZATION_GRACE_SEC, INITIALIZED, QUEUE_SNAPSHOT_PATH, QUEUE_PUBLICATION
+    global DRIVE_ROOT, FINALIZATION_GRACE_SEC, INITIALIZED, OWNER_PID, QUEUE_SNAPSHOT_PATH, QUEUE_PUBLICATION
     QUEUE_PUBLICATION = None
     DRIVE_ROOT = drive_root
-    INITIALIZED = True
+    INITIALIZED, OWNER_PID = True, os.getpid()
     QUEUE_SNAPSHOT_PATH = drive_root / "state" / "queue_snapshot.json"
     FINALIZATION_GRACE_SEC = get_finalization_grace_sec()
     BUDGET_ROOT_FENCES.clear()

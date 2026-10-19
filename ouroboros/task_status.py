@@ -272,7 +272,10 @@ def execution_owner_record(drive_root: Any, task: Dict[str, Any], kind: str) -> 
     Assignment replaces this fact when an inline turn resumes in the pool; it
     is ownership provenance, never a process-death or replay authorization. A
     direct turn lives only inside the server process that runs it, so its record
-    also names that process generation (``direct_roots.owner_process_ended``).
+    also names that process generation (``direct_roots.owner_process_ended``). A
+    Presence turn runs on a thread of whichever process admitted it (the Host, or
+    an initiating tool's worker): its record names that controller, so its end is
+    a fact rather than a guess (``presence_recovery.attempt_ended``).
     """
     record = {"kind": kind, "data_root": str(pathlib.Path(drive_root).resolve()),
               "task_id": str(task.get("id") or task.get("task_id") or ""),
@@ -281,6 +284,10 @@ def execution_owner_record(drive_root: Any, task: Dict[str, Any], kind: str) -> 
         from ouroboros.process_custody import current_custody_session_id
 
         record["process"] = current_custody_session_id()
+    elif kind == "presence":
+        from ouroboros.review_operation import controller_identity
+
+        record["controller"] = controller_identity()
     return record
 
 
@@ -585,10 +592,55 @@ def _is_stale_orphan_running_task(
     return bool(latest_worker_boot and latest_worker_boot > latest_task_event)
 
 
+PRESENCE_ATTEMPT_LOST = "presence_attempt_lost"
+
+
+def _project_lost_attempt(merged: Dict[str, Any], reason: str, prior_status: str, notice: str) -> None:
+    """Project a non-terminal row whose executor positively ended as an infra failure, in place."""
+    merged.update(status=STATUS_FAILED, reason_code=reason, outcome_axes=infra_failed_axes(reason),
+                  status_reconciled_from=prior_status)
+    merged["result"] = (str(merged.get("result") or "Task was interrupted before a terminal result was recorded.")
+                        + "\n\n⚠️ " + notice)
+    if str(merged.get("artifact_status") or "").strip().lower() in ARTIFACT_NONTERMINAL_STATUSES:
+        merged["artifact_status"] = ARTIFACT_STATUS_FAILED
+        bundle = dict(merged["artifact_bundle"]) if isinstance(merged.get("artifact_bundle"), dict) else {}
+        merged["artifact_bundle"] = _fail_nonterminal_artifact_bundle(bundle, "task interrupted before artifact finalization")
+
+
+def _presence_attempt_lost(drive_root: pathlib.Path, result: Dict[str, Any],
+                           queue_snapshot: Optional[Dict[str, Any]] = None) -> bool:
+    """A non-terminal row of a Presence turn whose attempt can no longer change.
+
+    The positive end facts are one rule shared with the Host work view
+    (``presence_recovery.attempt_ended``); age, absence and worker boots prove nothing.
+    """
+    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+    if (str(result.get("status") or "").lower() not in {STATUS_RUNNING, STATUS_INTERRUPTED}
+            or not isinstance(metadata.get("presence"), dict)):
+        return False
+    observation = task_execution_observation(drive_root, result, queue_snapshot=queue_snapshot)
+    if observation["kind"] != "presence" or observation["state"] == "active":
+        return False
+    from ouroboros.presence_recovery import attempt_ended
+
+    return attempt_ended(result, drive_root)
+
+
+def _inline_presence_turn(result: Dict[str, Any]) -> bool:
+    """A Presence turn's own row, run by its runner; a promoted or follow-up root that speaks
+    from the same ``metadata.presence`` carrier is ordinary managed work."""
+    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+    owner = result.get("execution_owner") if isinstance(result.get("execution_owner"), dict) else {}
+    return isinstance(metadata.get("presence"), dict) and (
+        owner.get("kind") == "presence" or bool(result.get("_is_direct_chat")) or metadata.get("source") == "presence")
+
+
 def _normalize_workspace_artifact_status(result: Dict[str, Any]) -> Dict[str, Any]:
     metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
     if not (str(result.get("workspace_root") or "").strip() or str(metadata.get("workspace_root") or "").strip()):
         return result
+    if _inline_presence_turn(result):
+        return result  # its runner has no workspace artifact finalization: its terminal is final
     task_constraint = result.get("task_constraint") if isinstance(result.get("task_constraint"), dict) else {}
     if not task_constraint and isinstance(metadata.get("task_constraint"), dict):
         task_constraint = metadata.get("task_constraint") or {}
@@ -809,6 +861,11 @@ def reconcile_orphaned_running_tasks(
                         expired_quizzes.extend((task_id, quiz_id) for quiz_id in expired)
                 except Exception:
                     log.debug("owner_quiz reconcile failed for healed %s", task_id, exc_info=True)
+            if persist_fields.get("reason_code") == PRESENCE_ATTEMPT_LOST:
+                # Outside the write guard: the room learns once that this turn ended unanswered.
+                from ouroboros.presence_runner import _notify_unresolved_turn
+
+                _notify_unresolved_turn(root, task_id)
         except Exception:
             continue
     return healed
@@ -1043,7 +1100,13 @@ def effective_task_result(
                 if not merged.get(key) and queue_task.get(key):
                     merged[key] = queue_task.get(key)
         else:
-            if queue_status == "unknown":
+            if _presence_attempt_lost(pathlib.Path(drive_root), merged, queue_snapshot):
+                # The queue never owns a Presence turn; its own end fact decides, as the work view does.
+                terminal_projection = "presence_attempt_lost"
+                _project_lost_attempt(merged, PRESENCE_ATTEMPT_LOST, parent_status, (
+                    "PRESENCE_ATTEMPT_LOST: this Presence turn's executor ended without a terminal result; "
+                    "whether its reply or tools took effect is unknown, and it is never re-run."))
+            elif queue_status == "unknown":
                 merged["queue_reconciliation_warning"] = "queue snapshot missing or invalid"
             elif _terminal_failure_from_outcome(merged):
                 terminal_projection = "recorded_outcome"
@@ -1067,23 +1130,9 @@ def effective_task_result(
                     if parent_status == STATUS_INTERRUPTED
                     else "orphaned_running_after_worker_restart"
                 )
-                merged["status"] = STATUS_FAILED
-                merged["reason_code"] = orphan_reason
-                merged["outcome_axes"] = infra_failed_axes(orphan_reason)
-                merged["status_reconciled_from"] = parent_status
-                merged["result"] = (
-                    str(merged.get("result") or "Task was interrupted before a terminal result was recorded.")
-                    + "\n\n⚠️ TASK_ORPHAN_RECONCILED: queue is empty and worker restarted after this task; "
-                    f"marking the stale {parent_status} task as infra_failed."
-                )
-                artifact_status = str(merged.get("artifact_status") or "").strip().lower()
-                if artifact_status in ARTIFACT_NONTERMINAL_STATUSES:
-                    merged["artifact_status"] = ARTIFACT_STATUS_FAILED
-                    bundle = dict(merged.get("artifact_bundle") or {}) if isinstance(merged.get("artifact_bundle"), dict) else {}
-                    merged["artifact_bundle"] = _fail_nonterminal_artifact_bundle(
-                        bundle,
-                        "task interrupted before artifact finalization",
-                    )
+                _project_lost_attempt(merged, orphan_reason, parent_status, (
+                    "TASK_ORPHAN_RECONCILED: queue is empty and worker restarted after this task; "
+                    f"marking the stale {parent_status} task as infra_failed."))
     # Typed public cancel projection (phase A): an ACTIVE durable cancel intent
     # rides every effective read as ``cancel_state: "pending"`` — status itself
     # stays honest (running/scheduled) until the supervisor settles the teardown.

@@ -47,7 +47,7 @@ def _browser_missing(exc) -> bool:
 
 def _open_review_checkpoint(card, *, open_card=True):
     if open_card:
-        card.locator(":scope > [data-live-summary-button]").click()
+        card.locator(":scope > [data-live-summary-button] [data-live-disclosure]").click()
     assert card.is_visible()
     section = card.locator(":scope > [data-live-reviews-host] [data-review-section]")
     section.wait_for(state="visible", timeout=5_000)
@@ -1128,7 +1128,7 @@ def test_ui_smoke_collapsed_activity_line_named_vs_unnamed(
                     assert all(not bands[task_id]["clipped"] for task_id in bands), bands
                     assert all("Reviews" not in bands[task_id]["reviews"] for task_id in bands), bands
 
-                    named.locator(':scope > [data-live-summary-button]').click()
+                    named.locator(':scope > [data-live-summary-button] [data-live-disclosure]').click()
                     line_toggle = named.locator(':scope > [data-live-timeline] .chat-live-line-toggle').first
                     line_toggle.wait_for(state="visible", timeout=5_000)
                     line_toggle.click()
@@ -1717,8 +1717,8 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
 
                 assert child.get_attribute("data-expanded") == "0"
                 assert grandchild.get_attribute("data-expanded") == "0"
-                child_summary = child.locator(":scope > [data-live-summary-button]").first
-                child_summary.click()
+                child_disclosure = child.locator(":scope > [data-live-summary-button] [data-live-disclosure]").first
+                child_disclosure.click()
                 _open_review_checkpoint(child, open_card=False)
                 assert "panel_child_review" in child.inner_text()
                 assert "claude-fable-5" in child.inner_text()
@@ -1743,7 +1743,7 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
                 assert "Scheduled subagent child1" not in expanded_text
                 assert "Subagent child1 running" not in expanded_text
                 assert child.locator('[data-live-line-key="terminal-subagent-lifecycle-child1"]').count() == 1
-                assert child_summary.get_attribute("aria-expanded") == "true"
+                assert child_disclosure.get_attribute("aria-expanded") == "true"
                 assert child.locator("[data-live-timeline]").first.get_attribute("id")
                 assert result_toggle.get_attribute("aria-controls")
 
@@ -2022,10 +2022,10 @@ def _mobile_keyboard_drawer_assertions(page, url: str, screenshot_path: pathlib.
     # surface even though the keyboard touch lock was active one frame earlier.
     scroll = page.evaluate(
         """() => {
-            const scroller = document.querySelector('#primary-sidebar .sidebar-scroll');
+            const scroller = document.querySelector('#primary-sidebar #nav-projects-list');
             for (let i = 0; i < 60; i += 1) {
                 const row = document.createElement('button');
-                row.className = 'nav-row';
+                row.className = 'nav-row nav-project-row';
                 row.type = 'button';
                 row.textContent = `Drawer overflow probe ${i}`;
                 scroller.appendChild(row);
@@ -2458,7 +2458,7 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
         assert deepest.locator(':scope > .chat-live-summary-button [data-live-title]').inner_text() == "pty-tests"
         assert "Agent model: gemini-3.6-flash" in deepest.locator(
             ':scope > .chat-live-foot [data-live-meta]').inner_text()
-        deepest.locator(":scope > [data-live-summary-button]").click()
+        deepest.locator(":scope > [data-live-summary-button] [data-live-disclosure]").click()
         line_toggle = deepest.locator(":scope > [data-live-timeline] .chat-live-line-toggle").last
         line_toggle.wait_for(state="visible", timeout=5_000)
         line_toggle.click()
@@ -2742,9 +2742,9 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
 
 @pytest.mark.ui_browser
 def test_ui_smoke_v639_skip_review_button(direct_server_with_data):
-    # C1: the owner-only "Skip review" action is offered for the owner's OWN (external)
-    # skill and hash-verified official-hub payloads that still need review, and NEVER for
-    # native/ClawHub/unverified marketplace payloads.
+    # C1: the owner-only "Skip review" action follows the host's attestability fact for the exact
+    # bytes (any origin may be attested by its owner; the endpoint repeats every check), is never
+    # offered for bytes already attested, and an attested skill says so in words.
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import sync_playwright
@@ -2759,23 +2759,27 @@ def test_ui_smoke_v639_skip_review_button(direct_server_with_data):
     mk = data_dir / "skills" / "clawhub" / "markettool"
     mk.mkdir(parents=True, exist_ok=True)
     (mk / "SKILL.md").write_text(manifest.format(n="markettool"), encoding="utf-8")
-    # A real marketplace skill carries clawhub provenance -> resolves to source=clawhub
-    # (without it, an unprovenanced clawhub-bucket payload is treated as owner-own external).
+    # A real marketplace skill carries clawhub provenance -> resolves to source=clawhub.
     (mk / ".clawhub.json").write_text(
         json.dumps({"slug": "markettool", "version": "0.1.0"}), encoding="utf-8")
-    # An already owner-attested skill: must show the distinct 'owner-attested' badge.
+    # An owner-attested skill (the attestation bound to these exact bytes): says "You skipped the
+    # review" and offers no second Skip.
+    from ouroboros.skill_loader import compute_content_hash
+
     att = data_dir / "skills" / "external" / "attestedtool"
     att.mkdir(parents=True, exist_ok=True)
     (att / "SKILL.md").write_text(manifest.format(n="attestedtool"), encoding="utf-8")
+    attested_hash = compute_content_hash(att)
     att_state = data_dir / "state" / "skills" / "attestedtool"
     att_state.mkdir(parents=True, exist_ok=True)
     (att_state / "review.json").write_text(json.dumps({
-        "status": "clean", "content_hash": "seed", "review_profile": "owner_attested",
+        "status": "clean", "content_hash": attested_hash, "review_profile": "owner_attested",
         "reviewer_models": ["owner_attestation"],
         "findings": [{"item": "owner_attestation", "verdict": "PASS", "severity": "info", "reason": "owner attested"}],
     }), encoding="utf-8")
     (att_state / "owner_attestation.json").write_text(
-        json.dumps({"attested_at": "now", "content_hash": "seed"}), encoding="utf-8")
+        json.dumps({"attested_at": "now", "content_hash": attested_hash}), encoding="utf-8")
+    skip = '[data-skill-action="attest_review"]'
 
     try:
         with sync_playwright() as pw:
@@ -2786,18 +2790,22 @@ def test_ui_smoke_v639_skip_review_button(direct_server_with_data):
                 page.click('[data-nav-page="skills"]')
                 page.wait_for_selector("#page-skills", timeout=30_000)
                 page.wait_for_selector('.skills-card[data-skill="owntool"]', timeout=30_000)
+                listing = {row["name"]: row for row in page.request.get(f"{url}/api/extensions").json()["skills"]}
                 own = page.locator('.skills-card[data-skill="owntool"]').first
                 market = page.locator('.skills-card[data-skill="markettool"]').first
-                # owner-own external skill that still needs review -> Skip review offered.
-                assert own.locator(".skills-attest-review").count() == 1
-                assert "Skip review" in (
-                    own.locator(".skills-attest-review").first.text_content() or "")
-                # ClawHub marketplace skill -> never attestable, no Skip review action.
-                assert market.locator(".skills-attest-review").count() == 0
-                # owner-attested skill -> distinct 'owner-attested' badge (review_profile surfaced).
+                # The owner's own skill that still needs review -> Skip review offered, in words.
+                assert own.locator(skip).count() == 1
+                assert "Skip review" in (own.locator(skip).first.text_content() or "")
+                # Every origin follows the host's fact for its exact bytes, in both directions.
+                attestable = listing["markettool"].get("owner_attestable") is not False
+                assert market.locator(skip).count() == (1 if attestable else 0), listing["markettool"].get("owner_attestable")
+                # An attested skill: the review sentence and chip say so, and no second Skip.
                 page.wait_for_selector('.skills-card[data-skill="attestedtool"]', timeout=30_000)
                 att_card = page.locator('.skills-card[data-skill="attestedtool"]').first
-                assert att_card.locator(".skills-badge").filter(has_text="owner-attested").count() >= 1
+                att_card.locator(".skills-details > summary").click()
+                assert "You skipped the review; it runs unreviewed." in att_card.inner_text()
+                assert att_card.locator(".ui-chip").filter(has_text="review skipped by you").count() >= 1
+                assert att_card.locator(skip).count() == 0
                 # The backend is the sole publication classifier. Owner-attested review is
                 # not publication-ready, but the selected flow may start an ordinary task
                 # that repairs/reviews the bytes before opening a PR.
@@ -2819,57 +2827,32 @@ def test_ui_smoke_v639_skip_review_button(direct_server_with_data):
                 assert 'data-submit-disabled="false"' in submit_html
                 assert 'data-publication-ready="false"' in submit_html
                 assert 'data-submit-state="needs_attention"' in submit_html
-                assert "owner-attested" in submit_html.lower()
-                # Defense-in-depth (mirrors the backend source gate): a marketplace skill
-                # mislabeled self-authored must STILL NOT offer Skip review.
-                market_self_html = page.evaluate(
+                assert "review skipped by you" in submit_html
+                assert 'data-skill-action="attest_review"' not in submit_html
+                # The host's attestability fact decides; a fresh attestation is never offered again.
+                cards = page.evaluate(
                     """async () => {
                         const m = await import('/static/modules/skill_card_renderer.js');
-                        return m.renderInstalledSkillCard(
+                        const row = (extra) => m.renderInstalledSkillCard(
                             { name: 'mk2', type: 'instruction', version: '0.1.0', source: 'clawhub',
-                              is_self_authored: true, review_status: 'pending',
-                              review_gate: { executable_review: false }, review_stale: false,
-                              review_profile: '', grants: {}, permissions: [],
-                              payload_root: 'skills/clawhub/mk2', enabled: false },
+                              review_status: 'pending', review_gate: { executable_review: false },
+                              review_stale: false, review_profile: '', grants: {}, permissions: [],
+                              payload_root: 'skills/clawhub/mk2', enabled: false, ...extra },
                             new Set(), new Set(), {}, {});
-                    }"""
-                )
-                assert "skills-attest-review" not in market_self_html
-                # Unverified OuroborosHub payloads also stay blocked; only the official_hub
-                # profile is a cheap UI hint, and the backend still re-verifies.
-                hub_html = page.evaluate(
-                    """async () => {
-                        const m = await import('/static/modules/skill_card_renderer.js');
                         return {
-                          unverified: m.renderInstalledSkillCard(
-                            { name: 'hub1', type: 'instruction', version: '0.1.0', source: 'ouroboroshub',
-                              is_self_authored: false, review_status: 'pending',
-                              review_gate: { executable_review: false }, review_stale: false,
-                              review_profile: '', grants: {}, permissions: [],
-                              payload_root: 'skills/ouroboroshub/hub1', enabled: false },
-                            new Set(), new Set(), {}, {}),
-                          verified: m.renderInstalledSkillCard(
-                            { name: 'hub2', type: 'instruction', version: '0.1.0', source: 'ouroboroshub',
-                              is_self_authored: false, review_status: 'pending',
-                              review_gate: { executable_review: false }, review_stale: false,
-                              review_profile: '', owner_attestable: true, official_hub_verified: true,
-                              grants: {}, permissions: [],
-                              payload_root: 'skills/ouroboroshub/hub2', enabled: false },
-                            new Set(), new Set(), {}, {}),
-                          staleProfile: m.renderInstalledSkillCard(
-                            { name: 'hub3', type: 'instruction', version: '0.1.0', source: 'ouroboroshub',
-                              is_self_authored: false, review_status: 'pending',
-                              review_gate: { executable_review: false }, review_stale: true,
-                              review_profile: 'official_hub', owner_attestable: false,
-                              official_hub_verified: false, grants: {}, permissions: [],
-                              payload_root: 'skills/ouroboroshub/hub3', enabled: false },
-                            new Set(), new Set(), {}, {})
+                          refused: row({ owner_attestable: false }),
+                          allowed: row({ owner_attestable: true }),
+                          attested: row({ owner_attestable: true, review_profile: 'owner_attested',
+                                          review_gate: { executable_review: true } }),
+                          staleAttestation: row({ owner_attestable: true, review_profile: 'owner_attested',
+                                                  review_stale: true }),
                         };
                     }"""
                 )
-                assert "skills-attest-review" not in hub_html["unverified"]
-                assert "skills-attest-review" in hub_html["verified"]
-                assert "skills-attest-review" not in hub_html["staleProfile"]
+                assert 'data-skill-action="attest_review"' not in cards["refused"]
+                assert 'data-skill-action="attest_review"' in cards["allowed"]
+                assert 'data-skill-action="attest_review"' not in cards["attested"]
+                assert 'data-skill-action="attest_review"' in cards["staleAttestation"]
             finally:
                 browser.close()
     except PlaywrightError as exc:

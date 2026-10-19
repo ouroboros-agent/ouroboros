@@ -136,9 +136,9 @@ def list_skills_payload(summary: dict, *, name: str = "", offset: int = 0,
         return out
     if not rows:
         out["hint"] = (
-            "No skills are installed. Install skills into the data plane, or point "
-            "OUROBOROS_SKILLS_REPO_PATH at a local checkout in Settings → "
-            "Behavior → External Skills Repo."
+            "No skills are installed. skill_search finds skills in the connected sources and "
+            "skill_install installs one by its catalog id; a local folder (OUROBOROS_SKILLS_REPO_PATH, "
+            "Settings → Behavior → External Skills Repo) is read in place."
         )
     # Whole records only; the reserve leaves room for host notes on the result.
     budget = tool_result_limit("list_skills") - 1000 - len(

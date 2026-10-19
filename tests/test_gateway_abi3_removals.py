@@ -199,7 +199,7 @@ class TestAliasProducerFanOutSweep:
         ("ouroboros/triad_review.py", "cost_usd", "to_dict"): ("triad review receipt serialization", 1),
         ("ouroboros/triad_review.py", "cost_usd", "_actor_record"): ("triad review actor record", 1),
         ("ouroboros/skill_loader.py", "cost_usd", "to_dict"): ("skill review outcome receipt serialization", 1),
-        ("ouroboros/skill_loader.py", "cost_usd", "load_review_state"): ("skill review state load", 1),
+        ("ouroboros/skill_loader.py", "cost_usd", "_read_review_record"): ("skill review state load", 1),
         ("ouroboros/skill_review.py", "cost_usd", "_run_deterministic_preflight"): ("skill review preflight receipt", 1),
         ("ouroboros/skill_review.py", "cost_usd", "_persist_reviewed_outcome"): ("skill review outcome receipt", 1),
         ("ouroboros/skill_owner_attestation.py", "cost_usd", "run_owner_attestation"): ("owner attestation review receipt", 1),

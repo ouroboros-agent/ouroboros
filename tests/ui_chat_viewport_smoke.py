@@ -737,7 +737,7 @@ def run_chat_viewport_smoke(
                 # The reader is inside a child. Naming the parent and growing its
                 # visible timeline above that child must keep the child stationary.
                 parent = page.locator('.chat-live-card[data-task-id="vp-parent"]')
-                parent.locator(':scope > [data-live-summary-button]').click()
+                parent.locator(':scope > [data-live-summary-button] [data-live-disclosure]').click()
                 child_selector = '.chat-live-card[data-task-id="vp-child-2"] > [data-live-summary-button]'
                 mid = put_at_viewport_top(page, child_selector)
                 page.evaluate(_SETTLE_TWO_FRAMES)
@@ -1138,7 +1138,7 @@ def run_chat_viewport_smoke(
                 put_at_viewport_top(page, anchor_selector)
                 anchor_before = card_top(page, anchor_id)
                 assert jump_state(page)["dotHidden"]
-                review_child.locator(":scope > [data-live-summary-button]").evaluate("el => el.click()")
+                review_child.locator(":scope > [data-live-summary-button] [data-live-disclosure]").evaluate("el => el.click()")
                 page.evaluate(_SETTLE_TWO_FRAMES)
                 assert review_child.get_attribute("data-expanded") == "1"
                 assert review_child.evaluate("card => card.getBoundingClientRect().height") > review_before + 20

@@ -1,6 +1,7 @@
 """Late acceptance through the registered owner tool and existing paid engine."""
 import copy
 import json
+import os
 import queue
 import threading
 from types import SimpleNamespace
@@ -69,6 +70,7 @@ def delivered(tmp_path, monkeypatch, *, retry=False, receipt='exact', cap='finit
     f = _fixture(tmp_path, split=True, retry=retry, cap=cap)
     from supervisor import queue as task_queue
     monkeypatch.setattr(task_queue, 'INITIALIZED', True)
+    monkeypatch.setattr(task_queue, 'OWNER_PID', os.getpid())
     monkeypatch.setattr(task_queue, 'DRIVE_ROOT', f.root)
     if deadline:
         f.task['task_contract']['deadline_at'] = deadline
@@ -203,14 +205,17 @@ def test_delayed_quorum_callback_keeps_one_final_historical_notice(
     release = {kind: threading.Event() for kind in entered}
     returned = {kind: threading.Event() for kind in entered}
     announce = settlement.announce_acceptance_settlement
-    waves = {}
+    waves, released = {}, []
 
     def held_announcement(usage_ctx, request, wave):
+        # Runs on a review worker thread: a wait that times out is recorded and judged on the test
+        # thread below. An assertion raised here would end the worker with its registration in place
+        # and leave the operation live for every later test of this worker.
         kind = 'complete' if all(wave['slots'].values()) else 'quorum'
         waves[kind] = copy.deepcopy(wave)
         entered[kind].set()
         try:
-            assert release[kind].wait(10)
+            released.append(release[kind].wait(10))
             return announce(usage_ctx, request, wave)
         finally:
             returned[kind].set()
@@ -234,6 +239,7 @@ def test_delayed_quorum_callback_keeps_one_final_historical_notice(
             gate.set()
         until(lambda: not review_operation._LIVE)
 
+    assert released == [True, True], released
     assert waves['quorum']['slots']['2'] == ''
     assert waves['complete']['verdicts']['2']['verdict'] == last_verdict
     after = load_task_result(f.root, f.tid)
@@ -290,17 +296,18 @@ def test_drain_and_last_slot_callback_settling_one_wave_queue_one_live_notice(la
     complete, drain_entered, drain_done = threading.Event(), threading.Event(), threading.Event()
     announce, settle = settlement.announce_acceptance_settlement, settlement.settle_acceptance_operation
     collect, met, barrier = review_dispatch.collect_task_acceptance_run, [], threading.Barrier(2, timeout=10)
+    waited = []  # each wait's outcome, judged on the test thread: a worker that raises stays registered
 
     def last_slot_callback(usage_ctx, request, wave):
         if all(wave['slots'].values()):
             complete.set()
-            assert (drain_done if order == 'drain_first' else drain_entered).wait(10)
+            waited.append((drain_done if order == 'drain_first' else drain_entered).wait(10))
         return announce(usage_ctx, request, wave)
 
     def drain_settlement(usage_ctx, **kwargs):
         if threading.current_thread() is not drain:
             return settle(usage_ctx, **kwargs)
-        assert complete.wait(10)  # every slot is already in custody
+        waited.append(complete.wait(10))  # every slot is already in custody
         drain_entered.set()
         try:
             return settle(usage_ctx, **kwargs)
@@ -323,6 +330,7 @@ def test_drain_and_last_slot_callback_settling_one_wave_queue_one_live_notice(la
             gate.set()
         until(lambda: not review_operation._LIVE)
 
+    assert waited and all(waited), waited
     assert result['status'] in {'announced', 'published'}, result
     assert len(met) == (2 if order == 'together' else 0), met
     notices = [row for row in list(ctx.event_queue.queue) if row.get('system_type') == 'acceptance_late_settlement']

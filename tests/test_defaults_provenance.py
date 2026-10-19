@@ -295,11 +295,19 @@ AGENTS_EDITS = {  # the owner's edit of the shown factory catalog in Settings â†
 @pytest.mark.parametrize("origin", [*AGENTS_EDITS, "saved-equal-to-factory", "wizard-finish"])
 def test_an_authored_catalog_stays_the_owners_through_a_main_and_access_change(install, monkeypatch, origin):
     from ouroboros.configured_subagents import canonical_subagents
+    from ouroboros.gateway import onboarding
+    from ouroboros import skill_starter
 
     client = _settings_client(monkeypatch)
     if origin == "wizard-finish":  # Finish saves the catalog the wizard displayed
+        starters, scheduled = [], []
+        # This settings test never launches background work (including a real hub fetch).
+        monkeypatch.setattr(skill_starter, "schedule_starter", lambda *a, **kw: scheduled.append((a, kw)))
+        monkeypatch.setattr(onboarding, "after_onboarding", lambda root, ids: starters.append((root, ids)))
         catalog = client.post("/api/onboarding/subagents/preview", json=WIZARD).json()["available_subagents"]
         response = client.post("/api/onboarding/complete", json={**WIZARD, SUBAGENTS: catalog})
+        assert len(starters) == 1 and starters[0][1] is None
+        assert scheduled == []
     else:
         _write(install, {"ANTHROPIC_API_KEY": "sk-ant-present-key"})
         catalog = json.loads(client.get("/api/settings").json()[SUBAGENTS])

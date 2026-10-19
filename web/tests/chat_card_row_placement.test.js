@@ -163,7 +163,7 @@ test('history replay places stamped rows on their cards and keeps unplaceable on
         assert.equal(bubbles.length, 1, 'only the row with no card in this page stayed a System row');
         assert.match(bubbles[0].innerHTML, /Open delegated execution: run-y\./);
         if (card.dataset.expanded !== '1') {
-            card.querySelector('[data-live-summary-button]').listeners.get('click')[0]({ detail: 0 });
+            card.querySelector('[data-live-disclosure]').listeners.get('click')[0]({ detail: 0 });
         }
         assert.equal(phasedLines(card, 'warn').length, 1,
             'the replayed custody row is a timeline item of its card');
@@ -222,7 +222,7 @@ const lifecycle = (event, ts, chatId) => ({ chat_id: chatId, role: 'assistant', 
     text: event, content: event, subagent_event: event, ts, ...CHILD });
 const expand = (card) => {
     if (card.dataset.expanded !== '1') {
-        card.querySelector('[data-live-summary-button]').listeners.get('click')[0]({ detail: 0 });
+        card.querySelector('[data-live-disclosure]').listeners.get('click')[0]({ detail: 0 });
     }
 };
 

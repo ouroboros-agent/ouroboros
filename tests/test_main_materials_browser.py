@@ -288,7 +288,7 @@ def test_main_live_completion_opens_project_answer_documents_and_task_files(wait
                         expect(full).to_contain_text('Paragraph 8')
                         expect(panel.locator('.chat-file-card')).to_have_count(2)
                         card = panel.locator(f'.chat-live-card[data-task-id="{task_id}"]')
-                        card.locator(':scope > [data-live-summary-button]').click()
+                        card.locator(':scope > [data-live-summary-button] [data-live-disclosure]').click()
                         files = card.locator('[data-result-files]')
                         detail = _api(server.base_url, 'GET', f'/api/tasks/{task_id}')
                         # Retention also publishes its own memory export; it is not a third sent document.

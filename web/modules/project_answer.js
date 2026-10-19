@@ -92,12 +92,25 @@ export function decorateProjectRow(bubble, { role = 'system', projectId = '', pr
             warning.title = limitation;
             bubble.insertBefore(warning, actions);
         }
-        const note = bubble.ownerDocument.createElement('div');
-        note.className = 'msg-provenance';
-        note.textContent = terminalTimeNote(terminalTime, addedAt);
-        bubble.insertBefore(note, actions);
+        paintTerminalTime(bubble, terminalTimeNote(terminalTime, addedAt));
     }
     return actions;
+}
+
+// One compact time line (owner 17.10, Q7 A): the row's own time also says when its task ended, both facts only
+// when their minutes differ; the full instants are its tooltip and what a screen reader hears.
+function paintTerminalTime(bubble, { short, full }) {
+    const doc = bubble.ownerDocument;
+    const time = bubble.querySelector('.msg-time') || bubble.appendChild(doc.createElement('div'));
+    time.className = 'msg-time';
+    time.title = full;
+    const shown = doc.createElement('span');
+    shown.setAttribute('aria-hidden', 'true');
+    shown.textContent = short;
+    const spoken = doc.createElement('span');
+    spoken.className = 'msg-time-full';
+    spoken.textContent = full;
+    time.replaceChildren(shown, spoken);
 }
 
 /** Kept beside the authored body; adoption never replaces the selected text. */

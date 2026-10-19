@@ -1009,14 +1009,23 @@ def _prepare_occupant(canonical: pathlib.Path, drive: pathlib.Path, task_id: str
     if _pending_refs_under(current, drive):
         raise _Retained("child_refs_pending")  # retry_pending_child_ref_promotions owns the retry
     from ouroboros.history_retention import call_inventory_custodied
+    calls = _calls_revision(drive, task_id)  # read BEFORE the check judges it: any later change keeps the drive
     if not call_inventory_custodied(canonical, drive, task_id, current, stop=stop):
         raise _Retained("call_inventory_pending")
     if not unread_mail_rows(drive, task_id)[1]:
         raise _Retained("unread_mailbox_unreadable")  # a torn mailbox stages nothing (the closure is Phase A's)
     plan = _child_store_plan(canonical, drive, task_id, current, child, staging / task_id)
     return {"task_id": task_id, "current": current, "plan": plan, "basis": attempt_basis(current), "live": live,
-            "revision": custody_revision(current),
-            "call_inventory_mtime_ns": (current.get("child_ref_promotion") or {}).get("call_inventory_mtime_ns")}
+            "revision": custody_revision(current), "call_inventory_mtime_ns": calls}
+
+
+def _calls_revision(drive: pathlib.Path, task_id: str) -> Optional[int]:
+    """THIS drive's call inventory revision (its calls folder's mtime), None when it has none. The
+    row's recorded revision may be another drive's: a task can own a helper and a direct drive."""
+    try:
+        return (drive / "observability" / "calls" / task_id).stat().st_mtime_ns
+    except FileNotFoundError:
+        return None
 
 
 def _receipts_identity(drive: pathlib.Path, task_id: str) -> Optional[tuple]:
@@ -1100,11 +1109,7 @@ def _recheck_occupant(canonical: pathlib.Path, drive: pathlib.Path, prepared: Di
         raise _Retained("verification_receipts_uncustodied")
     if _pending_refs_under(current, drive):
         raise _Retained("child_refs_pending")
-    try:
-        call_revision = (drive / "observability" / "calls" / task_id).stat().st_mtime_ns
-    except FileNotFoundError:
-        call_revision = None
-    if call_revision != prepared["call_inventory_mtime_ns"]:
+    if _calls_revision(drive, task_id) != prepared["call_inventory_mtime_ns"]:
         raise _Retained("call_inventory_changed")  # The next pass re-arms retention outside the queue lock.
 
 
@@ -1250,8 +1255,12 @@ def settle_child_drive(canonical_root: Any, task_id: str, drive: Any, *, live: O
 
 
 def _remove_entry(entry: pathlib.Path) -> None:
+    """A moved drive or a crashed settlement's staging goes whole: the removal grants owner write and
+    list bits inside the tree (never through a link), so read-only folders do not strand it."""
     if entry.is_dir() and not entry.is_symlink():
-        shutil.rmtree(entry, ignore_errors=True)
+        from ouroboros.force_remove import force_rmtree as _force_rmtree
+
+        _force_rmtree(entry)
     else:
         entry.unlink(missing_ok=True)
 

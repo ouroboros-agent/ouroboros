@@ -71,7 +71,8 @@ function mount({ hover = false, save, win } = {}) {
         docMove: (x, y) => doc.fire('pointermove', { pointerType: 'mouse', clientX: x, clientY: y }),
         outside: () => doc.fire('pointerdown', { target: new ElementStub('div', doc) }),
         inside: () => doc.fire('pointerdown', { target: head }),
-        escape: () => doc.fire('keydown', { key: 'Escape' }),
+        escape: () => { const event = { key: 'Escape', defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+            doc.fire('keydown', event); return event; },
         settle: () => control.pendingSave(),
     };
 }
@@ -613,9 +614,14 @@ test('the context capsule: ring, Context and the mode; it opens into exactly thr
     assert.equal(m.contextHead.getAttribute('aria-expanded'), 'true');
     assert.deepEqual(segs.map((node) => node.tabIndex), [-1, -1, 0], 'one tab stop: the chosen mode');
     assert.equal(m.doc.activeElement, m.seg('max'), 'the keyboard lands on the chosen mode');
-    m.doc.fire('keydown', { key: 'Escape' });
+    const escape = { key: 'Escape', defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+    m.doc.fire('keydown', escape);
     assert.equal(m.contextEl.dataset.open, 'false');
+    assert.equal(escape.defaultPrevented, true, 'the capsule took the Escape: a Project room under it stays open');
     assert.equal(m.doc.activeElement, m.contextHead, 'Esc returns focus to the head');
+    const later = { key: 'Escape', defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+    m.doc.fire('keydown', later);
+    assert.equal(later.defaultPrevented, false, 'a closed capsule leaves Escape to the room');
     m.controls.syncState({ context_mode: 'nano' });
     assert.equal(m.contextEl.dataset.contextMode, 'nano', 'the Main composer reads Main mode');
     assert.equal(m.contextEl.querySelector('.chat-capsule-value').textContent, 'Nano');

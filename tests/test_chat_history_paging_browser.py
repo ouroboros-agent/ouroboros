@@ -464,7 +464,7 @@ def test_history_details_selection_replay_and_project_reopen(direct_server_with_
                     _open(page, url)
                     feed = _open_project(page, project)
                     card = page.locator(f'{feed} .chat-live-card[data-task-id="focus-root"]')
-                    card.locator(':scope > [data-live-summary-button]').click()
+                    card.locator(':scope > [data-live-summary-button] [data-live-disclosure]').click()
                     line = card.locator(':scope > [data-live-timeline] .chat-live-line.expandable').filter(has_text="Copyable heading").first
                     toggle = line.locator('[data-live-line-toggle]')
                     title = line.locator('.chat-live-line-title')
@@ -544,7 +544,7 @@ def test_history_details_selection_replay_and_project_reopen(direct_server_with_
                     child = page.locator(f'{feed} .chat-live-card[data-task-id="linked-child"]')
                     assert child.get_attribute("data-finished") == "1"
                     if child.get_attribute("data-expanded") != "1":
-                        child.locator(':scope > [data-live-summary-button]').click()
+                        child.locator(':scope > [data-live-summary-button] [data-live-disclosure]').click()
                     assert "EARLY_CHILD_NARRATION" in child.inner_text()
                     assert "TERMINAL_CHILD_RESULT" in child.inner_text()
                     assert child.locator(':scope > [data-live-summary-button] [data-live-phase]').inner_text() == "Done"

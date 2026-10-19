@@ -55,16 +55,15 @@ def test_chat_header_decoration_does_not_clip_menu_and_system_actions_keep_gap(s
     actions = page.locator("#chat-messages .system-message-actions")
     assert actions.count() == 2
     for action in actions.all():
-        # A completion row's terminal-time note sits between its prose and the actions.
+        # The actions follow the prose: a completion row's one time line is its own time below them (owner 17.10, Q7 A).
         metrics = action.evaluate("""el => {
-            const note = el.previousElementSibling, prose = note.previousElementSibling;
-            return {previous:note.className, prose:prose.classList.contains('message'), nested:!!el.closest('.message'),
-                note:note.getBoundingClientRect().top - prose.getBoundingClientRect().bottom,
-                gap:el.querySelector('button').getBoundingClientRect().top - note.getBoundingClientRect().bottom,
+            const prose = el.previousElementSibling, time = el.parentElement.querySelector(':scope > .msg-time');
+            return {prose:prose.classList.contains('message'), nested:!!el.closest('.message'),
+                time:!!time && Boolean(el.compareDocumentPosition(time) & Node.DOCUMENT_POSITION_FOLLOWING),
+                gap:el.querySelector('button').getBoundingClientRect().top - prose.getBoundingClientRect().bottom,
                 below:el.getBoundingClientRect().bottom - el.querySelector('button').getBoundingClientRect().bottom};
         }""")
-        assert metrics["previous"] == "msg-provenance" and metrics["prose"] and not metrics["nested"], metrics
-        assert metrics["note"] == pytest.approx(8, abs=0.5), metrics
+        assert metrics["prose"] and not metrics["nested"] and metrics["time"], metrics
         assert metrics["gap"] == pytest.approx(12, abs=0.5), metrics
         assert metrics["below"] == pytest.approx(12, abs=0.5), metrics
     header = page.locator(".chat-page-header")
@@ -244,15 +243,31 @@ def test_short_sidebar_bounds_projects_list_and_cost_cards_keep_local_table_over
     open_app(ui)
     page.wait_for_selector(".nav-project-row")
     sidebar = page.locator("#primary-sidebar")
-    scrolling = sidebar.evaluate("""el => [...el.querySelectorAll('*')].filter(e =>
-        ['auto','scroll'].includes(getComputedStyle(e).overflowY) && e.scrollHeight>e.clientHeight+1).map(e=>e.className)""")
-    # The projects list carries its own bounded window, so the column itself
-    # stays the same height whatever the project count.
-    assert set(scrolling) == {"sidebar-scroll", "nav-projects-list"}, scrolling
+    scrollers = """el => [...el.querySelectorAll('*')].filter(e =>
+        ['auto','scroll'].includes(getComputedStyle(e).overflowY) && e.scrollHeight>e.clientHeight+1).map(e=>e.className)"""
+    main_top = lambda: page.locator(".nav-row-main").evaluate("el => el.getBoundingClientRect().top")
+    # Three zones (DESIGN "Shell"): a window this short cannot hold the pinned zones, so the column itself is the
+    # ONE scroller with Main sticky at its top, and the Projects list shows every row in flow (no inner scroller).
+    assert set(sidebar.evaluate(scrollers)) == set(), sidebar.evaluate(scrollers)
+    assert sidebar.evaluate("el => el.scrollHeight > el.clientHeight + 1"), "the column is the fallback scroller"
+    top_before = main_top()
+    sidebar.evaluate("el => { el.scrollTop = el.scrollHeight; }")
+    page.wait_for_timeout(100)
+    assert abs(main_top() - top_before) <= 1, "Main stays pinned while the column scrolls"
     nav = page.locator('[data-nav-page="settings"]')
-    nav.scroll_into_view_if_needed()
     assert hit_box(nav)["reachable"]
     setup_browser.capture(page, "shell-sidebar-short-bottom")
+    # A window tall enough for the zones: the Projects list is the ONE scroller and the column does not scroll.
+    page.set_viewport_size({"width": 1280, "height": 720})
+    page.wait_for_timeout(200)
+    assert set(sidebar.evaluate(scrollers)) == {"nav-projects-list"}, sidebar.evaluate(scrollers)
+    assert not sidebar.evaluate("el => el.scrollHeight > el.clientHeight + 1")
+    top_before = main_top()
+    page.locator("#nav-projects-list").evaluate("el => { el.scrollTop = el.scrollHeight; }")
+    page.wait_for_timeout(100)
+    assert abs(main_top() - top_before) <= 1, "Main never scrolls away"
+    assert hit_box(page.locator('[data-nav-page="settings"]'))["reachable"]
+    page.set_viewport_size({"width": 844, "height": 320})
     page.locator('[data-nav-page="dashboard"]').click()
     page.locator('[data-dashboard-tab="costs"]').click()
     page.wait_for_function("document.querySelector('#cost-confirmed').textContent==='$25.00'")
@@ -538,12 +553,17 @@ def test_question_mirrors_full_form_settle_and_reload(subscription_ui, width, he
             taskListStyle: getComputedStyle(taskList).listStyleType,
             codeOverflow: getComputedStyle(code).overflowX,
             codeReachable: code.scrollWidth <= code.clientWidth || getComputedStyle(code).overflowX === 'auto',
-            sizes: [...new Set(cards.flatMap(el => [el.querySelector('.chat-quiz-status'), el.querySelector('.chat-quiz-project')])
-                .map(el => getComputedStyle(el).fontSize))]};
+            sizes: [...new Set(cards.map(el => getComputedStyle(el.querySelector('.chat-quiz-status')).fontSize))],
+            capsule: [...new Set(cards.map(el => el.querySelector('.chat-quiz-project')).map(el => JSON.stringify([
+                getComputedStyle(el).fontSize, getComputedStyle(el).borderTopWidth, getComputedStyle(el).borderRadius,
+                box(el).height >= parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--touch-target-min'))])))]};
     }""")
     print(json.dumps({'question_mirror_geometry': geometry, 'viewport': [width, height]}))
     assert geometry['overflow'] <= 1 and geometry['page'] <= 0 and geometry['right'] <= width, geometry
+    # The head's status is meta; its Project reference is the ONE inline capsule (owner 17.10, Q2 C): reading size,
+    # no outline, a capsule's radius and a full target, the same as under a System row or on a receipt line.
     assert geometry['chipInside'] and geometry['sizes'] == ['12px'], geometry
+    assert [json.loads(shape) for shape in geometry['capsule']] == [['14px', '0px', '999px', True]], geometry
     assert geometry['richHost'] and geometry['listPadding'] == '24px', geometry
     assert geometry['listTextOffset'] >= 20 and geometry['taskListStyle'] == 'none', geometry
     assert geometry['codeHasOverflow'] and geometry['codeReachable'] and geometry['codeOverflow'] == 'auto', geometry

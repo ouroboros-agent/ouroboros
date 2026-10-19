@@ -535,7 +535,7 @@ def test_cascade_receipt_dedups_the_actual_destination_and_preserves_main(qenv, 
     )
     summary = next(e for e in queue.events if e.get("system_type") == "project_completion_summary")
     assert summary["chat_id"] == 1 and text in summary["text"]
-    assert summary["text"].endswith("Open the Project for details.")
+    assert "Open the Project" not in summary["text"], "the row's Project reference is its door"
 
 
 @pytest.mark.serial

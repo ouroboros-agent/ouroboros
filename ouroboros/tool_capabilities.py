@@ -76,9 +76,10 @@ CORE_TOOL_NAMES: frozenset[str] = frozenset({
     "request_restart", "promote_to_stable", "prepare_self_change",
     "preflight_review", "advisory_review", "review_change", "review_status", "task_acceptance_review",
     "verify_and_record",
-    # Skill discovery and review are core authoring capabilities.
+    # Skill discovery and review are core capabilities; installing, updating and source changes
+    # load on demand (enable_tools) after a search found something worth it.
     "list_skills", "skill_review", "skill_preflight",
-    "submit_skill_to_hub",
+    "submit_skill_to_hub", "skill_search",
 })
 
 # Meta-tools: always visible alongside core tools
@@ -467,6 +468,7 @@ OBSERVE_WORLD_MUTATION_TOOLS: frozenset[str] = frozenset({
     "generate_evolution_stats",
     # the world beyond the repository: forms, skills, project notes
     "browser_action", "submit_skill_to_hub", "toggle_skill", "skill_owner_action",
+    "skill_install", "skill_update",
     "journal_write", "workpad_write",
     "create_github_issue", "comment_on_issue", "comment_on_pr", "close_github_issue", "pr_merge",
 })

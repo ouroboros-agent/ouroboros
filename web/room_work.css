@@ -13,8 +13,8 @@
 /* ---- the status control ---------------------------------------------------------------------------
    The short word in its status ink, then one mark (three dots or one), as on the sidebar's rows; nothing is
    filled. Pressing is the only fill: a neutral tint on hover and while open.
-   It follows the title, so a longer word takes the title's room, never a neighbour's; it stays whole until the
-   title reaches its floor, and is said whole in the control's name either way. */
+   It follows the title and takes only room the title leaves; on a short row it shows its mark alone, and the
+   control's name says the whole status either way. */
 .rw-trigger {
     --rw-dot: var(--text-disabled);
     gap: var(--space-2);
@@ -31,12 +31,13 @@
 .rw-trigger[hidden] { display: none; }
 .rw-trigger:disabled { cursor: default; opacity: 1; }
 .rw-trigger:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: 2px; }
-/* The status follows the room's title in its bar. The status never shrinks while the title can: the title
-   yields its ellipsis first and keeps a 5ch floor, because the status may never take more than the row less 5ch;
-   only past that floor does the status word ellipsize inside its cap. Neither moves the bar's other controls: the
-   bar decides its rows by the title block's basis, never by these words. */
+/* The status follows the room's title in its bar. The place's name wins (DESIGN "Shell"): when the row is short
+   the status word yields first (its dot and caret stay, and the control's name keeps the whole status), and only
+   then does the title ellipsize; the control never goes under the touch minimum. Neither moves the bar's other
+   controls: the bar decides its row by the title block's basis, never by these words. */
 :is(.chat-page-header, .project-panel-bar) .app-page-title-row > .rw-trigger {
-    flex: 0 0 auto; min-width: 0; max-width: calc(100% - 5ch); margin-left: var(--space-1); padding-inline: 10px;
+    flex: 0 1000 auto; min-width: var(--touch-target-min); max-width: 100%; justify-content: center;
+    margin-left: var(--space-1); padding-inline: 10px;
 }
 :is(.chat-page-header, .project-panel-bar) .app-page-title-row > .app-page-title {
     flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -56,7 +57,13 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     font-weight: 500;
+    /* The clip box reaches a little past the line so descenders (g, p, y) are not cut; the margin gives the room back. */
+    padding-block: 0.15em;
+    margin-block: -0.15em;
 }
+/* A row too short for the name, the word and the mark keeps the name and the mark: the word goes whole instead of
+   showing a cut fragment ("Wor…"); room_work.js measures it (fitWord). */
+.rw-trigger[data-word="off"] .status-badge { display: none; }
 /* (0,5,0) outranks the light theme's connection colours (0,4,0): the tone below owns the word's ink. */
 :root .rw-trigger[data-tone] .status-badge.status-badge { color: inherit; }
 /* Tones (one producer, chat_activity.js): crimson is live work, amber only the owner's own question, green the

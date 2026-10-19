@@ -39,7 +39,7 @@ def _direct_paused(tmp_path, monkeypatch, *, park="inline", rail="budget", chang
     monkeypatch.setattr(queue, "ACCEPTANCE_FENCES", {})
     monkeypatch.setattr(state, "budget_remaining", lambda *_a, **_k: 5.0)
     direct = _pooled_agent(tmp_path, None, TASK)
-    direct.fence_transition = queue.transition_acceptance_fence  # what workers._get_chat_agent injects
+    direct._fence_in_process = lambda: True  # a direct turn runs in the queue's process
     ctx, limit = _loop_ctx(tmp_path, TASK, direct=True)
     _bind(ctx, direct)
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "required")

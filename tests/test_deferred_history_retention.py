@@ -174,6 +174,46 @@ def test_gc_rechecks_call_inventory_after_preparation(tmp_path, monkeypatch):
     assert observability.read_blob_ref(parent, stored["full_payload_ref"]) == {"data": "late physical result"}
 
 
+@pytest.mark.parametrize("late", [False, True])
+def test_a_direct_drive_beside_a_helper_drive_is_judged_by_its_own_call_inventory(tmp_path, late):
+    """A root task's calls lived in its helper drive, so its row records THAT drive's call-inventory
+    revision; its direct drive has no calls folder. The direct drive is compared with its own (absent)
+    inventory and settles; a calls folder that appears there between preparation and the move keeps
+    it, and it settles once that inventory is promoted."""
+    import contextlib
+
+    parent, task_id = tmp_path / "parent", "two-drives"
+    helper = headless.prepare_task_drive(parent, task_id, "empty")
+    write_task_result(helper, task_id, "completed", result="saved", artifact_status="ready")
+    observability.persist_call(helper, task_id=task_id, call_id="first", call_type="tool_call", payload={"data": "first"})
+    headless.copy_child_task_result(parent, {"id": task_id, "drive_root": str(helper)})
+    headless.retry_child_task_refs(parent, helper, task_id)
+    promotion = load_task_result(parent, task_id)["child_ref_promotion"]
+    assert promotion["call_inventory_preserved"] is True and promotion["call_inventory_mtime_ns"]
+    assert settle_child_drive(parent, task_id, helper, live=lambda _: False)["status"] == "removed"
+    direct = parent / headless.TASK_DRIVES_DIR / task_id
+    (direct / "tmp_scripts").mkdir(parents=True)
+    calls = []
+
+    @contextlib.contextmanager
+    def interlock():
+        if late:  # a call recorded after preparation, before the move
+            calls.append(observability.persist_call(direct, task_id=task_id, call_id="late", call_type="tool_call",
+                                                    payload={"data": "late"})["manifest_ref"])
+        yield True
+
+    outcome = settle_child_drive(parent, task_id, direct, live=lambda _: False, guard=interlock)
+    if not late:
+        assert outcome["status"] == "removed" and not direct.exists(), outcome
+        return
+    assert (outcome["status"], outcome["reason"]) == ("retained", "call_inventory_changed") and direct.exists()
+    assert settle_child_drive(parent, task_id, direct, live=lambda _: False)["reason"] == "call_inventory_pending"
+    headless.retry_child_task_refs(parent, direct, task_id)
+    assert settle_child_drive(parent, task_id, direct, live=lambda _: False)["status"] == "removed"
+    stored = observability.read_call_manifest_ref(parent, calls[0], task_id=task_id)
+    assert observability.read_blob_ref(parent, stored["full_payload_ref"]) == {"data": "late"}
+
+
 def _shared_drive(parent, layout):
     """An owner's drive in which a timeout successor continued (it keeps its predecessor's
     drive) and wrote its own result, mailbox and one call whose blob is missing, so the

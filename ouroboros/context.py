@@ -313,6 +313,7 @@ from ouroboros.context_runtime_facts import (  # noqa: E402,F401 — re-exported
     _runtime_budget_info,
     task_execution_clock_fact,
     task_schedule_fact,
+    storage_fact,
 )
 
 
@@ -436,6 +437,10 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
     from ouroboros.settings_scales import effort_range
 
     runtime_data["effort_range"] = {**effort_range(), "binds": effort_range_binds(task.get("metadata"))}
+    # What Ouroboros owns on disk, from the last finished count (Dashboard -> Storage): a fact, no threshold.
+    storage = storage_fact(pathlib.Path(task.get("budget_drive_root") or getattr(env, "budget_drive_root", None) or env.drive_root))
+    if storage is not None:
+        runtime_data["storage"] = storage
     runtime_data.update(_task_authority_projection(env, task))
     if supplementary_messages_out is not None:
         from ouroboros.main_context_authority import predecessor_notes_message

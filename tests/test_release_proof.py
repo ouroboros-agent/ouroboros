@@ -45,7 +45,7 @@ GREEN_GATES = [f"{name}=success" for name in release_proof.RELEASE_GATES]
 
 
 def _fixture_release(
-    tmp_path: Path, version: str = "6.87.5", signer: str = ""
+    tmp_path: Path, version: str = "6.87.5", signer: str = "", notarized: bool = False
 ) -> tuple[Path, Path, Path]:
     release_dir = tmp_path / "release"
     release_dir.mkdir()
@@ -82,6 +82,13 @@ def _fixture_release(
                 receipt["authenticode"] = {
                     "status": "signed", "signerThumbprint": signer, "publisher": "Example Publisher",
                 }
+        if proof_id == release_proof.NOTARIZATION_PROOF_ID:
+            receipt["notarization"] = {"status": "not_notarized"}
+            if notarized:
+                receipt["checks"] = sorted(
+                    {*receipt["checks"], *release_proof.NOTARIZATION_SMOKE_CHECKS}
+                )
+                receipt["notarization"] = {"status": "notarized"}
         (release_dir / f"release-smoke-{proof_id}.json").write_text(
             json.dumps(receipt), encoding="utf-8"
         )
@@ -811,7 +818,8 @@ def test_windows_receipt_records_signing_state_and_android_callers_stay_compatib
     release_proof.command_record_smoke(argparse.Namespace(
         proof_id="android-apk", artifact=apk, output=tmp_path / "android.json",
         commit="a" * 40, tag="v6.87.5", check=["apk_signature"]))
-    assert "authenticode" not in json.loads((tmp_path / "android.json").read_text())
+    android = json.loads((tmp_path / "android.json").read_text())
+    assert "authenticode" not in android and "notarization" not in android
 
 
 @pytest.mark.parametrize("version", ["7.6.0", "7.6.1-rc.1"])

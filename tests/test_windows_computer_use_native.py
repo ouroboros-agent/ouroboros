@@ -2,8 +2,8 @@
 
 Opt-in: runs only on Windows with ``OUROBOROS_WINDOWS_DESKTOP_QA=1`` in an
 interactive desktop session, and needs network access for the real isolated
-``comtypes`` install. It drives the production path end to end - launcher seed
-and trust stamp, the native-seed dependency step, out-of-process extension load
+``comtypes`` install. It drives the production path end to end - built-in install
+and trusted acceptance, the startup dependency step, out-of-process extension load
 and tool dispatch through ``ToolRegistry`` - against a WinForms window and a WPF
 window this test creates in its own PowerShell process. Only those windows are
 read or acted on, and only that process is stopped; nothing else on the desktop
@@ -109,9 +109,9 @@ def owned_window(tmp_path):
 
 @pytest.fixture
 def host(tmp_path, monkeypatch):
-    """The production seed -> trust -> dependency -> out-of-process load path."""
+    """The production built-in install -> trust -> dependency -> out-of-process load path."""
     from ouroboros import extension_loader
-    from ouroboros.launcher_bootstrap import _native_seed_dependency_pass, _seed_skills_into
+    from ouroboros.skill_builtin import _dependency_pass, install_builtin_skill
     from ouroboros.skill_loader import find_skill, load_enabled
     from ouroboros.tools.registry import ToolContext, ToolRegistry
     from tests._shared import clean_extension_runtime_state
@@ -122,10 +122,12 @@ def host(tmp_path, monkeypatch):
     (data / "skills").mkdir(parents=True)
     monkeypatch.setattr("ouroboros.config.SETTINGS_PATH", data / "settings.json")
     clean_extension_runtime_state()
-    _seed_skills_into(REPO / "skills", data / "skills", log)
+    assert install_builtin_skill("unix_computer_use", drive_root=data, seed_dir=REPO / "skills")["code"] == "other_platform"
+    assert install_builtin_skill(SKILL, drive_root=data, seed_dir=REPO / "skills", turn_on_when_ready=True,
+                                 installed_by="owner")["ok"]
     assert find_skill(data, "unix_computer_use") is None
+    assert _dependency_pass(data, [SKILL], log) == [SKILL]
     assert load_enabled(data, SKILL) is True
-    assert _native_seed_dependency_pass(data, [SKILL], log) == [SKILL]
     state = json.loads((data / "state" / "skills" / SKILL / "deps.json").read_text(encoding="utf-8"))
     assert state["status"] == "installed", state
     tool = extension_loader.get_tool(extension_loader.extension_surface_name(SKILL, "window_list"))

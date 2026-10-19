@@ -23,11 +23,12 @@ from ouroboros.server_liveness import BOOT, BootDocument
 from ouroboros.server_process import _embedded_uvicorn_server, log
 
 
-def seed_skills() -> None:
-    """Source-mode must seed native skills too, matching the packaged launcher layout."""
-    from ouroboros.launcher_bootstrap import ensure_data_skills_seeded
+def seed_skills(root: pathlib.Path, settings: dict, *, provider_ready: bool) -> None:
+    """The skills part of startup: the built-in source's work on this data root, then the starter
+    installer for a new install that skips onboarding (``skill_starter.skills_startup``)."""
+    from ouroboros.skill_starter import skills_startup
 
-    ensure_data_skills_seeded()
+    skills_startup(root, settings, provider_ready=provider_ready)
 
 
 def reconcile_projects(root: pathlib.Path) -> None:

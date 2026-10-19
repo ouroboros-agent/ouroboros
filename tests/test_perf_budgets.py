@@ -31,34 +31,6 @@ from ouroboros import usage_accounting as ua
 from ouroboros import usage_store
 
 
-def test_retained_execution_drive_tripwire_counts_both_roots(tmp_path, monkeypatch):
-    from ouroboros import context_budget
-    from ouroboros.agent_startup_checks import hot_store_growth_notes
-    from ouroboros.headless import HEADLESS_TASKS_DIR, TASK_DRIVES_DIR
-    from supervisor.state import ISOLATED_BENCHMARK_SENTINEL
-
-    monkeypatch.setattr(context_budget, "RETAINED_EXECUTION_DRIVES_WARN_COUNT", 2)
-    env = types.SimpleNamespace(
-        drive_root=tmp_path,
-        drive_path=lambda rel: tmp_path / rel,
-    )
-    headless = tmp_path / HEADLESS_TASKS_DIR
-    task_drives = tmp_path / TASK_DRIVES_DIR
-    (headless / "headless-1").mkdir(parents=True)
-    (task_drives / "drive-1").mkdir(parents=True)
-
-    assert hot_store_growth_notes(env) == []
-
-    (task_drives / "drive-2").mkdir()
-    notes = hot_store_growth_notes(env)
-    assert len(notes) == 1
-    assert "retained execution drives" in notes[0]
-    assert "total 3 (threshold 2)" in notes[0]
-
-    (tmp_path / ISOLATED_BENCHMARK_SENTINEL).write_text("isolated\n", encoding="utf-8")
-    assert hot_store_growth_notes(env) == []
-
-
 def test_observability_write_failure_warns_once_and_stays_nonfatal(tmp_path, caplog):
     from ouroboros.llm_observability import persist_observed_call
 
@@ -466,41 +438,3 @@ def test_sse_follow_tick_reads_only_rows_stored_since_and_zero_artifact_work(
     assert sum(count for _stream, _after, count in progress_probes) == 3  # ONLY the rows stored since
     assert not any(path.endswith(("progress.jsonl", "chat.jsonl")) for path, _o, _e in reads), "no dialogue file is read"
     assert artifact_counters == {"collect": 0, "copy": 0, "disposition": 0}
-
-
-def test_the_chronicle_journal_is_an_enrolled_hot_store_that_warns_only_past_its_threshold(tmp_path, monkeypatch):
-    """The memory journal is read on every task context, so it
-    is enrolled in the hot-store tripwire (DEVELOPMENT 03 projection-over-replay rule): quiet
-    at or below its threshold, one WARNING past it."""
-    from ouroboros import context_budget
-    from ouroboros.agent_startup_checks import _hot_store_thresholds, hot_store_growth_notes
-
-    assert ("memory/chronicle/records.jsonl", context_budget.CHRONICLE_JOURNAL_WARN_BYTES) in {
-        (relative, threshold) for relative, threshold, _remediation in _hot_store_thresholds()}
-    monkeypatch.setattr(context_budget, "CHRONICLE_JOURNAL_WARN_BYTES", 10)
-    env = types.SimpleNamespace(drive_root=tmp_path, drive_path=lambda rel: tmp_path / rel)
-    journal = tmp_path / "memory" / "chronicle" / "records.jsonl"
-    journal.parent.mkdir(parents=True)
-    journal.write_bytes(b"x" * 10)
-    assert hot_store_growth_notes(env) == []
-    journal.write_bytes(b"x" * 11)
-    [note] = hot_store_growth_notes(env)
-    assert "memory/chronicle/records.jsonl" in note and "never delete records" in note
-
-
-def test_the_review_ledger_index_chain_is_an_enrolled_hot_store(tmp_path, monkeypatch):
-    """The ledger's hot index rotates itself; the rotated segments are replayed only by readers
-    that walk the chain, so the chain's total size is a tripwire like the chat archive chain."""
-    from ouroboros import context_budget
-    from ouroboros.agent_startup_checks import hot_store_growth_notes
-
-    monkeypatch.setattr(context_budget, "REVIEW_LEDGER_INDEX_WARN_BYTES", 10)
-    env = types.SimpleNamespace(drive_root=tmp_path, drive_path=lambda rel: tmp_path / rel)
-    ledger = tmp_path / "state" / "review_ledger"
-    ledger.mkdir(parents=True)
-    (ledger / "index.jsonl").write_bytes(b"x" * 10)
-    (ledger / "rl-not-an-index.json").write_bytes(b"x" * 100)
-    assert hot_store_growth_notes(env) == []
-    (ledger / "index.20261007T000000.jsonl").write_bytes(b"x")
-    [note] = hot_store_growth_notes(env)
-    assert "state/review_ledger/index*.jsonl" in note and "never delete the newest" in note

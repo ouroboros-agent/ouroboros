@@ -97,11 +97,9 @@ def test_completion_summary_event_text_is_plain_and_fully_normalized(
     assert enqueue_project_completion_summary(
         ctx.DRIVE_ROOT, {"status": "completed"}, "root-project", root, result, done,
     ) is True
-    assert queued[0]["text"] == (
-        "Launch 🚀 › Ship release · Done\nOpen the Project for details."
-    )
-    # The model's own answer already lives in the room this row points at, so
-    # Main states the outcome and the way in, never a cut of the same bytes.
+    assert queued[0]["text"] == "Launch 🚀 › Ship release · Done"
+    # The model's own answer already lives in the room this row points at, so Main states the outcome; its Project
+    # reference is the way in (owner 17.10: no sentence promising what only the capsule does), never a cut of the bytes.
     assert PLAIN_EXCERPT not in queued[0]["text"]
     for marker in ("#", "**", "`"):
         assert marker not in queued[0]["text"]
@@ -525,8 +523,7 @@ def test_host_verdict_leads_both_lifecycle_rows(tmp_path, monkeypatch):
     ) is True
     assert queued[0]["text"] == (
         "Launch 🚀 › Ship release · Done with warnings\n"
-        "The reviewers did not reach a verdict on this answer. "
-        "Open the Project for details."
+        "The reviewers did not reach a verdict on this answer."
     )
     assert "final_message" not in queued[0]["text"]
     assert "Release shipped." not in queued[0]["text"]
@@ -541,8 +538,7 @@ def test_host_verdict_leads_both_lifecycle_rows(tmp_path, monkeypatch):
     ) is True
     assert queued[1]["text"] == (
         "Launch 🚀 › Ship release · Done with warnings\n"
-        "The task ran out of budget before it could finish cleanly. "
-        "Open the Project for details."
+        "The task ran out of budget before it could finish cleanly."
     )
 
     assert append_terminal_task_projection(tmp_path, "root-project", root, result, done)
@@ -698,11 +694,11 @@ def test_a_cancelled_salvage_keeps_bytes_or_a_pointer_in_the_main_row(tmp_path, 
     ) is True
     text = queued[0]["text"]
     assert f"{SALVAGE_EXCERPT_LABEL}: Rewrote the atlas builder." in text
-    # Bytes AND the pointer: this writer has no other way back to the full copy.
-    assert text.endswith("… Open the Project for details.")
+    # The bytes, then the row's Project reference as the way back to the full copy (no invitation sentence).
+    assert text.endswith("…") and "Open the Project" not in text
 
     # A root whose own lineage chat IS Main: there the receipt is a real second
-    # copy, so the label stands, but never without the invitation.
+    # copy, so the label stands alone.
     queued.clear()
     main_bound = {**task, "chat_id": 1}
     main_result = {
@@ -712,6 +708,4 @@ def test_a_cancelled_salvage_keeps_bytes_or_a_pointer_in_the_main_row(tmp_path, 
     assert enqueue_project_completion_summary(
         tmp_path, {}, "salvage-root", main_bound, main_result, done,
     ) is True
-    assert queued[0]["text"].endswith(
-        f"{SALVAGE_EXCERPT_LABEL}. Open the Project for details."
-    )
+    assert queued[0]["text"].endswith(f"{SALVAGE_EXCERPT_LABEL}.")

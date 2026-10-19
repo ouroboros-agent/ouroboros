@@ -248,6 +248,18 @@ def clear_acceptance_fence_for_root(root_task_id: str) -> bool:
         return q.ACCEPTANCE_FENCES.pop(root_task_id, None) is not None
 
 
+def release_turn_acceptance_fence(drive_root: Any, root_task_id: str) -> bool:
+    """An in-process turn that sends no ``task_done`` (Presence) releases its own root's row at its end."""
+    try:
+        if not _queue_module().owns_live_queue(drive_root) or not clear_acceptance_fence_for_root(root_task_id):
+            return False
+        _queue_module().persist_queue_snapshot(reason="acceptance_fence_turn_ended")
+        return True
+    except Exception:
+        log.warning("Turn %s could not release its acceptance fence", root_task_id, exc_info=True)
+        return False
+
+
 def clear_budget_root_fence_for_settled_tree(task: dict) -> bool:
     """Release a root budget fence once its tree has no live members left.
 

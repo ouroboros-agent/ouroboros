@@ -157,7 +157,7 @@ def still_continuable(drive: Any, entry: Any, live_task_ids=None) -> bool:
     root = entry.root_task_id or entry.task_id
     pending, seen = [entry.task_id, root], set()
     try:
-        local_queue = queue.INITIALIZED and Path(queue.DRIVE_ROOT).resolve() == Path(drive).resolve()
+        local_queue = queue.owns_live_queue(drive)
         if local_queue:
             with queue._queue_lock:
                 live.update(str(row.get('id') or '') for row in queue.PENDING)

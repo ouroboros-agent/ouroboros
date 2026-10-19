@@ -42,7 +42,7 @@ def test_a_deep_place_with_an_open_review_and_line_reopens_at_the_newest_message
             card.wait_for(state='attached')
             _step(page, feed, automatic=True)  # read on past the card's page while it stays mounted
             if card.get_attribute('data-expanded') != '1':
-                card.locator(':scope > [data-live-summary-button]').click()
+                card.locator(':scope > [data-live-summary-button] [data-live-disclosure]').click()
             card.locator('[data-review-section-toggle]').click()
             card.locator('[data-review-group-toggle]').click()
             card.locator('[data-review-attempt-toggle]').first.click()
@@ -74,10 +74,13 @@ def test_a_deep_place_with_an_open_review_and_line_reopens_at_the_newest_message
 # spelling: with the note's words hidden, its box must paint the same while the messages beneath it
 # move by half a row; the words themselves keep the contrast floor on that backing.
 # Every layer the header paints itself with: its reading backing, and the light theme's own fill.
-_NO_HEADER_BACKING = """#page-chat .chat-page-header, #page-chat .chat-page-header::before {
+# Main's history note floats in its own strip under the bar (.chat-page-note, page_header lane L1), with the
+# bar's reading backing; the falsifier strips the backing of both the bar and the strip.
+_NO_HEADER_BACKING = """#page-chat .chat-page-header, #page-chat .chat-page-header::before,
+    #page-chat .chat-page-note, #page-chat .chat-page-note::before {
     background: transparent !important; backdrop-filter: none !important; -webkit-backdrop-filter: none !important; }"""
 _NOTE_GEOMETRY = """note => {
-    const feed = document.querySelector('#chat-messages'), header = note.closest('.chat-page-header');
+    const feed = document.querySelector('#chat-messages'), header = note.closest('.chat-page-note, .chat-page-header');
     const box = r => ({x: r.x, y: r.y, w: r.width, h: r.height, right: r.right, bottom: r.bottom});
     const n = note.getBoundingClientRect(), h = header.getBoundingClientRect();
     const middle = n.top + n.height / 2;
@@ -149,7 +152,7 @@ def _assert_note_readable(facts):
     assert facts['backingContent'] not in ('none', 'normal') and facts['backingAlpha'] == 1, (
         'history note reading backing: the header paints opaque page ink', facts)
     assert header['y'] - 0.5 <= note['y'] and note['bottom'] <= header['bottom'] + 0.5, (
-        'history note reading backing: the note lies inside the backed header', facts)
+        'history note reading backing: the note lies inside its backed strip', facts)
     assert facts['showThrough'] <= 0.002, ('history note reading backing: moving messages show through the note', facts)
     assert facts['contrast'] >= 4.5, ('history note words keep the contrast floor on their backing', facts)
 
@@ -174,7 +177,7 @@ def test_main_coverage_status_remains_readable_away_from_history_control(direct_
                 page.set_viewport_size({'width':width, 'height':850})
                 page.locator('#chat-messages').evaluate('n => { n.scrollTop = n.scrollHeight / 2; }')
                 page.evaluate(_FRAMES)
-                note = page.locator('#page-chat .chat-page-header .chat-history-status')
+                note = page.locator('#page-chat .chat-page-note .chat-history-status')  # the note floats under the bar
                 assert note.is_visible()
                 assert 'Shown messages may have gaps' in note.inner_text()
                 box = note.bounding_box()
@@ -371,7 +374,7 @@ def test_a_card_line_arrives_with_its_source_page_and_a_reopen_reads_only_the_ne
             assert not any(marker in row.get('text', '') for row in recent['messages'])
             card = page.locator(f'{feed} .chat-live-card[data-task-id="source-owner"]')
             if card.get_attribute('data-expanded') != '1':
-                card.locator(':scope > [data-live-summary-button]').click()
+                card.locator(':scope > [data-live-summary-button] [data-live-disclosure]').click()
             line = card.locator(':scope > [data-live-timeline] > .chat-live-line').filter(has_text=marker)
             if line_kind == 'receipt':
                 # A late live receipt already has the same revision as its archive row.
@@ -521,10 +524,10 @@ def test_a_live_line_keeps_its_node_through_history_adoption_and_reopens_from_it
             _emit_ws_frame(page, {**row, 'type': 'chat', 'role': 'assistant', 'is_progress': True})
             parent = page.locator(f'{feed} .chat-live-card[data-task-id="adopt-parent"]')
             if parent.get_attribute('data-expanded') != '1':
-                parent.locator(':scope > [data-live-summary-button]').click()
+                parent.locator(':scope > [data-live-summary-button] [data-live-disclosure]').click()
             owner = page.locator(f'{feed} .chat-live-card[data-task-id="{row["task_id"]}"]')
             if owner.get_attribute('data-expanded') != '1':
-                owner.locator(':scope > [data-live-summary-button]').click()
+                owner.locator(':scope > [data-live-summary-button] [data-live-disclosure]').click()
             line = owner.locator(':scope > [data-live-timeline] > .chat-live-line.expandable').last
             line.locator('[data-live-line-toggle]').click()
             if line_kind == 'full-result':
@@ -555,7 +558,7 @@ def test_a_live_line_keeps_its_node_through_history_adoption_and_reopens_from_it
             assert 'could not be restored exactly' not in page.locator(feed).locator('..').inner_text()
             for card in (parent, owner):
                 if card.get_attribute('data-expanded') != '1':
-                    card.locator(':scope > [data-live-summary-button]').click()
+                    card.locator(':scope > [data-live-summary-button] [data-live-disclosure]').click()
             assert line.get_attribute('data-live-line-key') != live_key, 'cold replay has its source-owned key'
             line.locator('[data-live-line-toggle]').click()
             assert line.get_attribute('data-expanded') == '1'
@@ -607,7 +610,7 @@ def test_a_live_receipt_survives_equal_replay_and_a_reopened_one_takes_only_newe
                 _emit_ws_frame(page, {**row, 'type': 'chat', 'role': 'system', 'is_progress': True, 'content': row['text']})
             card = page.locator(f'{feed} .chat-live-card[data-task-id="{task_id}"]')
             if card.get_attribute('data-expanded') != '1':
-                card.locator(':scope > [data-live-summary-button]').click()
+                card.locator(':scope > [data-live-summary-button] [data-live-disclosure]').click()
             lines = card.locator(':scope > [data-live-timeline] > .chat-live-line.result')
             assert lines.count() == 2, 'same text and time must not merge different receipts'
             line = lines.nth(1)
@@ -635,7 +638,7 @@ def test_a_live_receipt_survives_equal_replay_and_a_reopened_one_takes_only_newe
             _assert_at_newest(page, feed, 'Receipt context 59')
             assert 'could not be restored exactly' not in page.locator(feed).locator('..').inner_text()
             if card.get_attribute('data-expanded') != '1':
-                card.locator(':scope > [data-live-summary-button]').click()
+                card.locator(':scope > [data-live-summary-button] [data-live-disclosure]').click()
             assert lines.count() == 2
             assert line.get_attribute('data-live-line-key') != live_key
             _screenshot(page, tmp_path, f'receipt-bookmark-after-{browser_engine}')

@@ -170,6 +170,8 @@
  * @property {boolean=} skipSubscriptionPresets
  * @property {Object=} OUROBOROS_SUBAGENTS
  * @property {boolean=} allow_empty_review_pool  // confirms saving agents that leave no review row
+ * @property {string[]=} starter_skills  // catalog ids installed once after completion; absent: the default list
+ * @property {Object<string, string>=} skill_source_trust  // {hub row id: trusted|review}; marks them confirmed
  */
 /**
  * POST /api/onboarding/subagents/preview accepts the same open provider/local draft and subscription
@@ -922,18 +924,6 @@
 /**
  * @typedef {Object} WidgetsResponse
  * @property {WidgetTab[]} ui_tabs
- */
-
-/**
- * One `/api/marketplace/ouroboroshub/catalog` result row (additive hubflow fields).
- * `POST /api/marketplace/ouroboroshub/install` additionally accepts the adopt
- * body fields `{adopt: true, expected_content_hash: string}` (64 lowercase hex;
- * adopt forces auto_review and conflicts with overwrite).
- * @typedef {Object} HubCatalogRow
- * @property {string} slug
- * @property {string} sanitized_name
- * @property {string} latest_version
- * @property {boolean} identity_conflict
  */
 
 /**

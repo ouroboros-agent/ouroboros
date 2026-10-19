@@ -1,5 +1,4 @@
 import { renderPageHeader } from './page_header.js';
-import { PAGE_ICONS } from './page_icons.js';
 import {
     classifyWidgetJobStatus,
     isRetryableWidgetError,
@@ -54,9 +53,7 @@ function pageTemplate() {
     return `
         <section class="page app-page-glass" id="page-widgets">
             ${renderPageHeader({
-                title: 'Widgets',
-                icon: PAGE_ICONS.widgets,
-                description: 'Reviewed extension UI surfaces live here, separate from the skill catalogue.',
+                page: 'widgets',
             })}
             <div class="widgets-scroll scroll-fade-y">
                 <div id="widgets-list-error" class="skills-load-error" hidden><span data-widget-list-error></span> <button type="button" class="btn btn-default btn-sm" data-widget-list-retry>Retry</button></div>

@@ -1409,7 +1409,7 @@ def collect_orphaned_operations_softly(drive_root: Any, *, stop: Optional[Callab
     """The maintenance hook: one fail-soft pass that never stops the sweep around it."""
     try:
         report = recover_orphaned_acceptance_operations(drive_root, stop=stop)
-        if report.get("settled") or report.get("errors"):
+        if report.get("settled") or report.get("errors") or report.get("retired"):
             log.info("Orphaned acceptance operations: %s", report)
     except Exception:
         log.warning("Orphaned acceptance operation recovery failed", exc_info=True)
@@ -1423,7 +1423,8 @@ def recover_orphaned_acceptance_operations(drive_root: Any, *, stop: Optional[Ca
     pointer whose controller is proven dead (or is this process without a registration), or an
     ``unpublished`` one, is collected purely and published as a late settlement; only a publication
     read back marks it ``collected``. A controller that cannot be verified, a source that cannot be
-    read or a panel still in flight is reported and retried — never marked unavailable."""
+    read or a panel still in flight is reported and retried — never marked unavailable. Another
+    surface's open pointer only proved liveness: a proven-dead controller's is removed, never settled."""
     from ouroboros.acceptance_settlement import acceptance_actor_ended, settle_acceptance_operation
     from ouroboros.store import StoreError
     from ouroboros.task_results import load_task_result
@@ -1431,7 +1432,7 @@ def recover_orphaned_acceptance_operations(drive_root: Any, *, stop: Optional[Ca
 
     local_reviews_settled()  # a direct turn's closed operation needs no worker probe to publish
     root = pathlib.Path(drive_root)
-    report: Dict[str, Any] = {"settled": [], "pending": [], "deferred": [], "errors": []}
+    report: Dict[str, Any] = {"settled": [], "pending": [], "deferred": [], "errors": [], "retired": []}
     for task_id in review_collection_candidates(root, stop=stop):
         if stop is not None and stop():
             break
@@ -1445,12 +1446,18 @@ def recover_orphaned_acceptance_operations(drive_root: Any, *, stop: Optional[Ca
             continue
         for owner_id, entry in list((row.get(OPERATIONS_FIELD) or {}).items()):
             state = entry.get("state") if isinstance(entry, dict) else None
-            if state not in _OPEN_STATES | {OPERATION_UNPUBLISHED} or entry.get("surface") != "task_acceptance":
+            acceptance = isinstance(entry, dict) and entry.get("surface") == "task_acceptance"
+            liveness = state in _OPEN_STATES and not acceptance and not entry.get("control_only")
+            if not liveness and (state not in _OPEN_STATES | {OPERATION_UNPUBLISHED} or not acceptance):
                 continue
             with _LOCK:
                 registered = owner_id in _LIVE
             controller = ("dead" if not registered and entry.get("controller") == controller_identity()
                           else controller_state(entry.get("controller")))
+            if liveness:
+                if controller == "dead" and _mark_operation(root, task_id, owner_id, None, from_states=_OPEN_STATES):
+                    report["retired"].append({"task_id": task_id, "owner_id": owner_id})
+                continue
             if registered or (state != OPERATION_UNPUBLISHED and controller in {"alive", "unknown"}):
                 if controller == "unknown" and not registered:
                     report["deferred"].append({"task_id": task_id, "owner_id": owner_id,

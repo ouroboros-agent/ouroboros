@@ -2,7 +2,8 @@
 // without hover — a right-click, Shift+F10 or the ContextMenu key on the focused row, a long press (no movement)
 // on touch. Its items are the row's own doors, never second ones: Reply, Copy, Open project (when the row has
 // one) and, on a work card, Resume / Pause / Stop… exactly when the card itself offers them (Pause is the item of
-// the card's Stop… menu, offered by the same rule). Esc and an outside press close it; keyboard focus enters the
+// the card's Stop… menu, offered by the same rule). A work card's Reply lives only here (owner 17.10, Q9 B): the
+// card's action row holds commands over the work. Esc and an outside press close it; keyboard focus enters the
 // menu and returns to the row. A right-click on a link, a field or selected words keeps the browser's own menu,
 // so selected text stays copyable.
 import { tr } from './i18n.js';
@@ -50,7 +51,8 @@ export function createChatRowMenu({ feed, replies, cardOf, activityOf }) {
 
     function cardItems(row, record) {
         const items = [];
-        if (shown(record.cardReplyEl)) items.push(['reply', tr('chat.reply.reply', 'Reply'), () => record.cardReplyEl.click()]);
+        // A work card draws no Reply of its own (its action row holds only commands): the menu is its Reply.
+        if (replies.cardRef(record)) items.push(['reply', tr('chat.reply.reply', 'Reply'), () => replies.start(replies.cardRef(record))]);
         const words = [record.titleEl?.textContent, fullText(record.activityEl)].map((text) => String(text || '').trim());
         if (words.some(Boolean)) items.push(['copy', tr('code.copy', 'Copy'),
             () => copyTextWithToast(words.filter(Boolean).join('\n')), true]);

@@ -131,7 +131,9 @@ export function syncContinueAction(record, detail, { read = fetchTaskDetail } = 
         }
         return false;
     }
-    const view = continueOfferView(detail);
+    // Continue belongs to a root: the host refuses a child (not_a_root_task), so a child's card shows none, even
+    // when a parent's replayed row (a subagent's rejection notice) brings the parent's offer onto it.
+    const view = record?.isSubagent ? { kind: 'none' } : continueOfferView(detail);
     const actions = view.kind === 'none' ? ownLiveActionsEl(record) : ensureLiveActionsEl(record);
     const existing = actions?.querySelector('[data-continue-task]');
     const refusal = actions?.querySelector('[data-continue-refusal]');

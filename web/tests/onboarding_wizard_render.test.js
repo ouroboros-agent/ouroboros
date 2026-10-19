@@ -26,6 +26,8 @@ import test from 'node:test';
 const BOOTSTRAP = JSON.parse(readFileSync(
     new URL('./fixtures/onboarding_bootstrap.json', import.meta.url), 'utf8',
 ));
+// Reads that write nothing: the language list and the Summary's starter skills list.
+const PASSIVE_READS = new Set(['GET /api/ui/i18n', 'GET /api/onboarding/starter-skills']);
 
 function inertElement() {
     const listeners = new Map();
@@ -289,7 +291,8 @@ test('a 503 settings_save_timeout keeps the wizard open with "Check status", whi
     // page; settings_language.test.js pins that). This test is about the completion write, so the
     // memory read is left out of the request list it asserts.
     const calls = { filter: (fn) => requests.filter(fn) };
-    Object.defineProperty(calls, 'list', { get: () => requests.filter((call) => call !== 'GET /api/ui/i18n') });
+    // The two passive reads the summary makes for itself (language, starter skills) are not the completion story.
+    Object.defineProperty(calls, 'list', { get: () => requests.filter((call) => !PASSIVE_READS.has(call)) });
     const fetch = async (url, init = {}) => {
         requests.push(`${init.method || 'GET'} ${String(url)}`);
         if (String(url) === '/api/onboarding/complete') {
@@ -385,7 +388,7 @@ test('a staged language whose writer is still busy keeps the wizard open; the ne
     ];
     const fetch = async (url, init = {}) => {
         const call = `${init.method || 'GET'} ${String(url)}`;
-        if (call !== 'GET /api/ui/i18n') requests.push(call);
+        if (!PASSIVE_READS.has(call)) requests.push(call);
         if (String(url) === '/api/onboarding/complete') {
             return { ok: false, status: 503, text: async () => '', json: async () => ({ error: 'still running', code: 'settings_save_timeout', saved: null }) };
         }
@@ -437,7 +440,7 @@ test('a staged language the gateway refuses for good does not hold the finished 
     const requests = [];
     const fetch = async (url, init = {}) => {
         const call = `${init.method || 'GET'} ${String(url)}`;
-        if (call !== 'GET /api/ui/i18n') requests.push(call);
+        if (!PASSIVE_READS.has(call)) requests.push(call);
         if (String(url) === '/api/onboarding/complete') {
             return { ok: false, status: 503, text: async () => '', json: async () => ({ error: 'still running', code: 'settings_save_timeout', saved: null }) };
         }

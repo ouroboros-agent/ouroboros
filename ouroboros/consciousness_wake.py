@@ -415,7 +415,7 @@ def _transition_line(fact: Dict[str, Any], results: Dict[str, Dict[str, Any]], r
     kind, task_id, stamp = fact["kind"], fact["task_id"], fact["stamp"]
     ago = _ago(now - stamp) if stamp is not None else "at an unknown time"
     if kind == "late_review":
-        from ouroboros.artifacts import task_artifact_dir_path
+        from ouroboros.evidence_packs import handle_info
         from ouroboros.task_finalization import review_source_reader
 
         record = fact["fact"]
@@ -426,9 +426,8 @@ def _transition_line(fact: Dict[str, Any], results: Dict[str, Dict[str, Any]], r
                  f"emitted answer {emitted.get('state') or 'unknown'}",
                  f"{len(late.get('reviewer_outputs') or [])} reviewer outputs"]
         ref = record.get("source_ref") if isinstance(record.get("source_ref"), dict) else {}
-        try:
-            stored = task_artifact_dir_path(drive_root, task_id) / str(ref.get("path") or "")
-            present = bool(ref.get("path")) and stored.is_file()
+        try:  # loose or a verified pack member (the packer moves a settled task's handles); corrupt is absent
+            present = bool(ref.get("path")) and handle_info(drive_root, task_id, str(ref["path"])) is not None
         except (ValueError, OSError):
             present = False
         read = review_source_reader(task_id, ref)

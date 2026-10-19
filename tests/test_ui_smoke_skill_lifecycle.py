@@ -1,12 +1,10 @@
-"""Installed skill UI flows with the real browser modules and controlled HTTP."""
+"""Installed skill UI flows with the real browser modules against an isolated server."""
 
 from __future__ import annotations
 
 import json
-import mimetypes
 import os
 from pathlib import Path
-from urllib.parse import urlsplit
 
 import pytest
 
@@ -15,86 +13,6 @@ from tests._shared import producer_evidence_dir
 
 def _evidence_dir(tmp_path):
     return producer_evidence_dir(tmp_path, "skill-lifecycle", env="OUROBOROS_UI_SCREENSHOT_DIR")
-
-
-@pytest.mark.ui_browser
-@pytest.mark.parametrize("version", ["1.2.3", "", None])
-def test_marketplace_update_retries_selected_version(version, tmp_path):
-    """Two failed update responses never change the owner's selected version."""
-    playwright = pytest.importorskip("playwright.sync_api")
-    web = Path(__file__).resolve().parents[1] / "web"
-    posts = []
-    installed = {
-        "name": "demo", "version": "1.0.0", "type": "script", "enabled": False,
-        "review_status": "clean", "executable_review": True,
-        "provenance": {"slug": "demo", "version": "1.0.0"},
-    }
-
-    def serve(route):
-        path = urlsplit(route.request.url).path
-        data = None
-        if path == "/":
-            route.fulfill(content_type="text/html", body="""
-                <link rel="stylesheet" href="/style.css">
-                <link rel="stylesheet" href="/settings.css">
-                <main id="marketplace"></main>
-                <script type="module">
-                  import {initMarketplace} from '/modules/marketplace.js';
-                  initMarketplace(document.querySelector('#marketplace'));
-                </script>
-            """)
-            return
-        if path == "/api/marketplace/clawhub/search":
-            data = {"results": [{"slug": "demo", "latest_version": "2.0.0"}]}
-        elif path == "/api/marketplace/clawhub/installed":
-            data = {"skills": [installed]}
-        elif path == "/api/extensions":
-            data = {"skills": [installed]}
-        elif path == "/api/skills/lifecycle-queue":
-            data = {"events": []}
-        elif path == "/api/marketplace/clawhub/update/demo":
-            posts.append(route.request.post_data_json)
-            data = {"ok": len(posts) > 2, "error": "controlled update failure", "review_status": "clean"}
-        if data is not None:
-            route.fulfill(content_type="application/json", body=json.dumps(data))
-            return
-        target = (web / path.lstrip("/")).resolve()
-        if target.is_relative_to(web) and target.is_file():
-            route.fulfill(path=target, content_type=mimetypes.guess_type(target)[0] or "text/plain")
-        else:
-            route.fulfill(status=404)
-
-    with playwright.sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        try:
-            page = browser.new_page(viewport={"width": 1100, "height": 800})
-            page.add_init_script("""
-                window.skillEvents = [];
-                window.addEventListener('ouro:skill-lifecycle', event => window.skillEvents.push(event.detail));
-            """)
-            page.route("**/*", serve)
-            page.goto("http://skill-ui.test/")
-            page.locator('[data-mp-update="demo"]').click()
-            dialog = page.get_by_role("dialog")
-            if version is None:
-                dialog.get_by_role("button", name="Cancel", exact=True).click()
-                assert posts == []
-                return
-            dialog.locator("[data-confirm-input]").fill(version)
-            dialog.locator("[data-confirm-ok]").click()
-            retry = page.get_by_role("button", name="Retry update", exact=True)
-            retry.wait_for()
-            assert posts == [{"version": version} if version else {}]
-            retry.click()
-            retry.wait_for()
-            assert len(posts) == 2
-            screenshot_dir = _evidence_dir(tmp_path)
-            page.screenshot(path=str(screenshot_dir / f"update-retry-{'pinned' if version else 'latest'}.png"))
-            retry.click()
-            page.wait_for_function("() => window.skillEvents.some(e => e.action === 'update' && e.name === 'demo' && e.ok === true)")
-            assert posts == [{"version": version} if version else {}] * 3
-        finally:
-            browser.close()
 
 
 from tests.test_ui_smoke_playwright import direct_server_with_data as _direct_server_with_data

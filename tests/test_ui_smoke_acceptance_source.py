@@ -45,7 +45,7 @@ def test_applied_review_download_updates_before_task_terminal(direct_server_with
                                  "chat_id": 1, "state_revision": "a" * 64})
             card = page.locator(f'.chat-live-card[data-task-id="{ctx.task_id}"]')
             card.wait_for(state="visible")
-            card.locator("[data-live-summary-button]").click()
+            card.locator("[data-live-disclosure]").click()
             card.locator("[data-review-section-toggle]").click()
             card.locator("[data-review-group-toggle]").click()
             card.locator("[data-review-attempt-toggle]").click()

@@ -28,6 +28,8 @@ CLAUDEXOR_STOP_EXIT_WAIT_SEC = 5.0
 # Phone-native source compilation exceeds ten minutes; one contained platform
 # preparation may run for an hour, independently of ordinary tool/harness calls.
 EXTERNAL_PLATFORM_UPDATE_TIMEOUT_SEC = 3600.0
+# Transport bound for one optional ditto process; expiry leaves the original patch intact.
+ARTIFACT_COMPRESSION_TIMEOUT_SEC = 120.0
 
 
 EXTENSION_STREAM_CHUNK_BYTES = 64 * 1024

@@ -53,7 +53,7 @@ def test_ui_smoke_final_only_child_stays_inside_child_card(direct_server_with_da
                 # The final text lives INSIDE the child card: in its (collapsed-hidden)
                 # activity node, and on screen once the child is expanded.
                 assert sentinel in child.locator(":scope > [data-live-summary-button] [data-live-activity]").text_content()
-                child.locator(":scope > [data-live-summary-button]").click()
+                child.locator(":scope > [data-live-summary-button] [data-live-disclosure]").click()
                 assert sentinel in child.inner_text()
                 assert child.locator("xpath=ancestor::*[@data-subagents-for='parent-final-only']").count() == 1
                 assert page.locator(".chat-bubble", has_text=sentinel).count() == 0

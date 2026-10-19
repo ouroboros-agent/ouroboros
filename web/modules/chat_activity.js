@@ -10,7 +10,8 @@ import { fitText, fullText } from './text_fit.js';
 import { delegatedActivityBodyHtml, delegatedHeadline, delegatedLineView } from './delegated_activity.js';
 import { REUSABLE_TASK_IDS } from './task_control_menu.js';
 import { activityWaitPhase, pausePhaseLabel, modelActivityPresentation, paintLiveDetail, taskActivityPresentation } from './task_phase_chip.js';
-import { currentLanguage, fmt, isEnglish, tr, tx } from './i18n.js';
+import { fmt, tr, tx } from './i18n.js';
+import { formatMsgTime } from './utils.js';
 import { hostRowDisplayText } from './host_notice_text.js';
 import { startingStatus } from './host_starting_status.js';
 export { bootPhase, startingStatus, supervisorReady } from './host_starting_status.js';
@@ -1216,37 +1217,8 @@ export function reconnectBannerText(reason = '') {
     return '';
 }
 
-/** {short, full} presentation of a message timestamp, or null when unreadable. */
-export function formatMsgTime(isoStr) {
-    if (!isoStr) return null;
-    try {
-        const d = new Date(isoStr);
-        if (isNaN(d)) return null;
-        const now = new Date();
-        const pad = n => String(n).padStart(2, '0');
-        const hhmm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-        const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-        // English keeps this hand format byte for byte; an install language takes its month
-        // names from Intl and its two words from the catalog (web/modules/i18n.js).
-        const monthName = (date) => {
-            if (!isEnglish()) {
-                try { return new Intl.DateTimeFormat(currentLanguage(), { month: 'short' }).format(date); } catch { /* hand list below */ }
-            }
-            return months[date.getMonth()];
-        };
-        const todayStr = now.toDateString();
-        const yesterday = new Date(now);
-        yesterday.setDate(now.getDate() - 1);
-        let short;
-        if (d.toDateString() === todayStr) short = hhmm;
-        else if (d.toDateString() === yesterday.toDateString()) short = `${tr('time.yesterday', 'Yesterday')}, ${hhmm}`;
-        else short = `${monthName(d)} ${d.getDate()}, ${hhmm}`;
-        const full = `${monthName(d)} ${d.getDate()}, ${d.getFullYear()} ${tr('time.at', 'at')} ${hhmm}`;
-        return { short, full };
-    } catch {
-        return null;
-    }
-}
+// The message clock is the chat's one compact time format, shared with the terminal time line (utils.js).
+export { formatMsgTime };
 
 /**
  * Project one /api/state activity census onto the client's active-activity map.

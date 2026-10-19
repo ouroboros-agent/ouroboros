@@ -31,7 +31,7 @@ def test_model_phase_card_header_reconnect_and_terminal(project_chat, chat_id, t
     card.wait_for(state="visible")
     chip = card.locator("[data-live-phase]")
     title = card.locator("[data-live-title]")
-    summary = card.locator(":scope > [data-live-summary-button]")
+    disclosure = card.locator(":scope > [data-live-summary-button] [data-live-disclosure]")
     phase_detail = card.locator(":scope > .chat-live-details > [data-live-phase-detail]")
     cost_detail = card.locator(":scope > .chat-live-details > [data-live-cost-detail]")
     meta = card.locator(":scope > [data-live-foot] [data-live-meta]")  # the meta line leads the card's foot
@@ -45,13 +45,13 @@ def test_model_phase_card_header_reconnect_and_terminal(project_chat, chat_id, t
     def details(exact):
         """The card's details say exactly what the chip shortens: opened by pointer, closed by keyboard."""
         expect(phase_detail).to_be_hidden()
-        summary.click()
-        expect(summary).to_have_attribute("aria-expanded", "true")
+        disclosure.click()
+        expect(disclosure).to_have_attribute("aria-expanded", "true")
         expect(phase_detail).to_have_text(f"Model call: {exact}")
         expect(cost_detail).to_have_text("Cost: some steps have no price, so Tracked counts only the priced steps.")
-        summary.focus()
+        disclosure.focus()
         page.keyboard.press("Enter")
-        expect(summary).to_have_attribute("aria-expanded", "false")
+        expect(disclosure).to_have_attribute("aria-expanded", "false")
         expect(phase_detail).to_be_hidden()
 
     def plain(phase, text):
@@ -123,12 +123,12 @@ def test_model_phase_card_header_reconnect_and_terminal(project_chat, chat_id, t
         assert page.evaluate("document.documentElement.scrollWidth <= innerWidth + 1")
         assert card.evaluate("el => el.scrollWidth <= el.clientWidth + 1")
         page.screenshot(path=str(_evidence_dir(tmp_path) / f"phase-short-{suffix}-{width}.png"), animations="disabled")
-        summary.click()
+        disclosure.click()
         expect(phase_detail).to_have_text("Model call: Sending request / waiting for response")
         expect(cost_detail).to_be_visible()
         assert card.evaluate("el => el.scrollWidth <= el.clientWidth + 1")
         page.screenshot(path=str(_evidence_dir(tmp_path) / f"phase-details-{suffix}-{width}.png"), animations="disabled")
-        summary.click()
+        disclosure.click()
     page.set_viewport_size({"width": ui["width"], "height": 850})
     show("rejoining", "Rejoining", "Rejoining the same model operation")
     expect(chip).to_have_attribute("data-motion", "0")

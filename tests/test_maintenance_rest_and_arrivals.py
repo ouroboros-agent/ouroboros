@@ -9,9 +9,11 @@ calls ``evidence_packer.run_pass``. Once settled in, the
 repeated passes do nothing: no child spawn, no re-read or re-verified member, no daemon call, no
 ledger, result or log write, and every content projection (the parent's child lookup, the results,
 money, blob and handle bytes; the payload reader once) is equal, not merely counted. Late work is then
-handled by kind: a new child, a duty with new evidence on a packed task (committed while the pass's
-census stalls in a directory probe), a released owner, and an explicit late receipt for the ended call
-whose price the duty no longer searches; an UNKNOWN price is never zero.
+handled by kind: a new child, new evidence on a packed task (beside a duty committed while the pass's
+census stalls in a directory probe, which holds nothing), a released owner, and an explicit late receipt
+for the ended call whose price the duty no longer searches; an UNKNOWN price is never zero. Packing reads
+the terminal status alone: the undeclared duty, the live-owned attempt and the ended call's unknown
+price never keep their tasks' evidence loose.
 """
 from __future__ import annotations
 
@@ -185,19 +187,20 @@ def _settle_in(env):
     unpacked = _snapshot(env)
     assert env.unit.tick(root, REPO) is True
     env.unit._thread.join(60)
-    assert env.reports[-1]["packed"] == len(KIDS) and env.reports[-1]["faults"] == 0
+    # Every terminal row packs, whatever duty, owner or money state it carries; the running child waits.
+    assert env.reports[-1]["packed"] == len(KIDS) + 3 and env.reports[-1]["faults"] == 0
     assert _snapshot(env) == unpacked and unpacked["blobs"] == truth
     assert {tid: [obs.read_blob_ref(root, ref) for ref in refs] for tid, refs in env.refs.items()} == {
         tid: [json.loads(raw) for raw in raws] for tid, raws in truth.items()}  # the payload consumer too
-    for kid in KIDS:
+    for kid in (*KIDS, "kid-owed", "kid-live", "kid-ended"):
         assert packs.published_generations(root, kid) and not any(path.exists() for path in _loose_paths(env, kid))
-    for kid in DEBT:
-        assert not packs.published_generations(root, kid) and all(path.exists() for path in _loose_paths(env, kid))
+    assert not packs.published_generations(root, "kid-running")
+    assert all(path.exists() for path in _loose_paths(env, "kid-running"))
 
     # Pass 2. The owner is gone: the engine's answer pass 1 retained proves the call ended, offline (no
     # second daemon call). Its price is UNKNOWN: the bound is accounted, never zero, and the row keeps its
-    # one late-receipt right. Its money closed, so its evidence packs; the packed children get one look
-    # (their own unlinks moved their directories).
+    # one late-receipt right. Its evidence was packed in pass 1 (money never held it); the packed
+    # children get one look (their own unlinks moved their directories), and no generation is re-read.
     env.live.discard("kid-ended")
     env.gateway.continue_during_probe = False
     second = _pass(env)
@@ -207,13 +210,11 @@ def _settle_in(env):
     assert ended_row["cost_usd"] is None and not ended_row.get("late_receipt")
     projected = load_task_result(root, "kid-ended")
     assert projected["accounted_upper_bound_usd"] == 1.25 and projected["cost_final"] is False
-    [generation] = packs.published_generations(root, "kid-ended")
-    assert (second["packed"], second["examined"]) == (1, len(KIDS) + 1)
-    assert second["verified_bytes"] == generation["raw_total"]  # only the new pack is read back
+    assert len(packs.published_generations(root, "kid-ended")) == 1
+    assert (second["packed"], second["examined"], second["verified_bytes"], second["unlinked"]) == (0, len(KIDS) + 3, 0, 0)
 
-    # Pass 3: the last pack's own look; nothing read, verified or unlinked.
-    third = _pass(env)
-    assert (third["examined"], third["packed"], third["verified_bytes"], third["unlinked"]) == (1, 0, 0, 0)
+    # Pass 3: the terminal rows did not move and the last pass unlinked nothing: no child at all.
+    assert _pass(env) is None
     return ended, truth
 
 
@@ -281,9 +282,10 @@ def test_late_work_is_handled_by_kind_and_the_history_rests_again(env, monkeypat
     assert set(children) - set(before) == {"kid-late"}
     assert {tid: children[tid] for tid in KIDS} == {tid: before[tid] for tid in KIDS}
     assert packs.published_generations(root, "kid-late") and not _loose(env.refs["kid-late"][0])
-    # The duty arrived after the census and before the unlink: the new member stays loose.
-    assert arrival["faults"] == 0 and _loose(late[0]) and len(packs.published_generations(root, "kid-03")) == 2
-    assert not packs.task_settled(root, "kid-03")
+    # The duty arrived after the census and before the unlink: it holds nothing, the new member packs.
+    assert arrival["faults"] == 0 and not _loose(late[0]) and len(packs.published_generations(root, "kid-03")) == 2
+    with store.open_store(root, write=False) as txn:
+        assert packs.task_packable(txn, "kid-03")
 
     # The owners retire their work: kid-03's and kid-owed's duties, kid-running completes.
     obligations.remove(root, DUTY, "work:kid-03")

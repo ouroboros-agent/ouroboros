@@ -1,6 +1,7 @@
 """Real-reader counts for filtered storage reads; no wall-clock gates."""
 
 import json
+import os
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -78,3 +79,49 @@ def test_listing_does_not_write_to_runtime_or_inspected_root(tmp_path, monkeypat
     after = {path.relative_to(tmp_path): (path.read_bytes(), path.stat().st_mtime_ns)
              for path in tmp_path.rglob("*") if path.is_file()}
     assert after == before
+
+
+def test_a_listing_of_three_hundred_thousand_entries_is_walked_completely(tmp_path, monkeypatch):
+    """A1 at the scale the old entry bound (250 000) refused: the blob folder of a real install.
+    The walker's own loop meets 300 000 regular-file entries of one real folder (the listing is
+    served to it, its stats the shape of one real one-byte file) and counts every one: no entry,
+    time or depth bound. Seconds, not a disk full of files; the real-disk listing path is proved
+    by the dashboard tests' deep-and-wide tree."""
+    from ouroboros import storage
+
+    data = tmp_path / "data"
+    blobs = data / "observability" / "blobs"
+    blobs.mkdir(parents=True)
+    sample = blobs / "000000.gz"
+    sample.write_bytes(b"g")
+    shape = sample.lstat()
+    identity = (blobs.stat().st_dev, blobs.stat().st_ino)
+    real_scandir = os.scandir
+
+    class Entry:
+        __slots__ = ("name",)
+
+        def __init__(self, name):
+            self.name = name
+
+        def stat(self, follow_symlinks=True):
+            return shape
+
+    def served(target=None):
+        handle = "." if target is None else target
+        try:
+            own = os.fstat(handle) if isinstance(handle, int) else os.stat(handle)
+        except OSError:
+            return real_scandir(handle)
+        if (own.st_dev, own.st_ino) != identity:
+            return real_scandir(handle)
+        return (Entry(f"{index:06x}.gz") for index in range(300_000))  # next() and close(), as the walk uses them
+
+    monkeypatch.setattr(os, "scandir", served)
+    monkeypatch.setattr(storage, "_listing_stat", lambda entry, _fd: entry.stat(follow_symlinks=False))
+    table = [{"id": "model_calls", "group": "records", "roots": [(str(data), ("observability",))]}]
+    record = storage.measure(data, places=table, sleep=lambda _s: None)
+    [place] = record["places"]
+    assert (place["files"], place["logical_bytes"], place["unreadable"]) == (300_000, 300_000, 0)
+    assert place["parts"] == [{"name": "blobs", "bytes": place["bytes"], "files": 300_000}]
+    assert record["files"] == 300_000

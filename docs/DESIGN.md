@@ -34,7 +34,7 @@ Material 3 tonal colour; no gradient behind content, and no glows, textures, out
    one step off it. Never a gradient, glow, wash, texture or animation behind content.
 2. **Objects rest; they are not outlined.** A bubble, card or group is a filled shape
    on the *rest* shadow. What floats over moving content (the Shade, menus, the
-   composer field, dialogs, ↓ latest) takes the *float* shadow. Inside an object a
+   composer field, dialogs, the drawer, ↓ latest) takes the *float* shadow. Inside an object a
    group or row is a *tray*, a soft neutral fill without a shadow, and fills never
    stack. Only fields keep a hairline, because an editable box must read as editable;
    the composer's field floats instead, and focus gives it the field's ring. On a dark
@@ -244,7 +244,7 @@ Two failure modes this table exists to prevent, both observed in this codebase:
 The brand red is **one value**, `--accent`. Every appearance of it is either
 that token, the named roles built on it (`--accent-light` for accent text, the crimson ink on light,
 `--accent-dim` for a fill, `--focus-accent-border` / `--focus-accent-ring` for
-focus), or a rung of the accent alpha ladder (`--accent-04` … `--accent-65`; the crimson tone and its hover are `--accent-10` and `--accent-14`).
+focus), or a rung of the accent alpha ladder (`--accent-04` … `--accent-55`; the crimson tone and its hover are `--accent-10` and `--accent-14`).
 A new alpha is a rung added to the ladder, never an `rgba()` literal in a rule:
 the ladder is what makes "make the accent calmer" a one-line change instead of
 a grep.
@@ -610,8 +610,7 @@ Two shapes carry a tone, and they are not interchangeable:
   *is* the status and has nothing else to carry it.
 
 Surfaces whose tone is a class suffix rather than `data-tone`
-(`.skills-status-*`, `.skills-badge-*`, `.toast-*`, `.marketplace-state-*`,
-`.chat-live-phase`, `.log-phase`, `.evo-runtime-pill`, `.widget-table-status`,
+(`.toast-*`, `.chat-live-phase`, `.log-phase`, `.evo-runtime-pill`, `.widget-table-status`,
 `.widget-metric` / `.widget-callout`) name the same tokens. A surface that
 paints only its edge (a card tinted by its state, a callout's left rule) takes
 the border and leaves its own background alone; a toast keeps its glass
@@ -633,8 +632,8 @@ Project/task scope verification waits are static amber; `resumed` questions no
 longer wait. A wait on the same producer row suppresses its working motion; an
 independent working row keeps motion, and the row's accessible name states both
 facts. Unknown or unconfirmed census state stays static and explicitly
-unavailable. The dots take the row's own foreground, like the status-sentence
-dot, so they never out-shout the title and follow its hover and selected ink;
+unavailable. Unlike the room's live status, the sidebar's dots take the row's
+own foreground, so they never out-shout the title and follow its hover and selected ink;
 the wait is the one hue, and no row paints them in a saturated project colour of
 its own. In a Project row the dots and the unread dot each own a reserved
 trailing column, so both sit at one x across rows whether or not the other is
@@ -648,8 +647,9 @@ without the bounce.
 
 ### Project unread dot
 
-A Project row's unread dot, and the Projects count, mean *there is a new message
-in this Project's conversation that you have not read*, never *something moved*;
+A Project row's unread dot (a small red dot in a soft ring) and the Projects
+count mean *there is a new message in this Project's conversation that you have
+not read*, never *something moved*;
 activity dots, notifications, toasts, task controls and Stop/Panic keep their
 own meaning, unaffected by it.
 
@@ -712,14 +712,16 @@ this Project" came to be drawn six ways. The rule is therefore about intents.
   activity (the work card's chip does). Its accessible name says in words what
   the glyph and the arrow say in pixels (`Open project <name>`); nothing depends
   on hover.
-- **Its form follows the surface's job.** It is a bound work card's wide footer
-  (the body stays the work's); under a mirrored answer or a System lifecycle
-  row, a reading-size capsule in the shared `createSystemMessageActions` row
-  (token spacing, wrapping, focus-ring clearance, never a clipped line: a
-  composition, not a card framework or global button-margin rule); the same
-  capsule at the end of the owner's routed message's one receipt line ("Passed
-  on to «work» in", "Started as a task in"); a meta capsule in a question head.
-  Long names: two lines in the footer, ellipsis in capsules, no smaller type;
+- **Two forms, one recipe.** The reference is the full-width strip that closes a
+  work card bound to a Project (the body stays the work's), and a capsule
+  everywhere else: under a mirrored answer or a System lifecycle row (in the
+  shared `createSystemMessageActions` row, token spacing, wrapping, focus-ring
+  clearance), at the end of the owner's routed message's one receipt line
+  ("Passed on to «work» in", "Started as a task in"), and in a question head,
+  where the Project is named before the options. The whole capsule is the
+  target, with one fill whose hover and press deepen the whole capsule; no
+  border, ring or hairline, and no width that depends on where it sits. Long
+  names: two lines in the strip, ellipsis in the capsule, no smaller type;
   accessible names stay whole.
 - A **command** is a button: it changes or confirms something, or goes to a
   place that is not such a reference (`Load older messages`, `Open widgets`).
@@ -1411,8 +1413,8 @@ file (owner choice 1C/2A/3A/4A/5A/6A with mobile first-class).
 
 ### Replies
 
-A reply names the row meant; Ouroboros decides what to do, routing nothing by it. Saved rows offer Reply beside Copy on bubbles, first in root card actions, and
-in row menus; never on hover only. Reply stages one
+A reply names the row meant; Ouroboros decides what to do, routing nothing by it. Saved rows offer Reply beside
+Copy on bubbles and in row menus, a work card in its row menu only; never on hover only. Reply stages one
 composer strip (`Replying to`, quoted author, one line, ×; Esc cancels). Send
 carries only the address; the host makes the snippet. Answerable questions use their own field.
 
@@ -1871,13 +1873,14 @@ has migrated. Migrated today:
 - `web/style.css` regions paired by `design-system:migrated-begin` /
   `design-system:migrated-end`: harness accounts; Dashboard → Updates (status
   card, one action row, collapsed Recovery with one restore list) and Storage;
+  the Skills page (Installed, Browse, Sources, the detail sheet, its dialogs);
   chat typography, foreground and status colour. Chat geometry retains local
   literals per the viewport reserve contract; shared palette channels keep
   translucent glass coherent across themes.
 - the global `.muted`, `.form-section h3` and shared `.ui-status` tone rules
 
-The remaining page-specific typography in skills, marketplace, widgets, logs
-and evolution is historical. Their adopted common controls follow the shared
+The remaining page-specific typography in widgets, logs and evolution is
+historical. Their adopted common controls follow the shared
 family; unrelated page rules keep their literals until their own pass. Migrate
 each selected family completely and remove its replaced recipes in the same
 change. Do not introduce a half-tokenised second field family or describe a
@@ -2109,3 +2112,102 @@ notifications need the current app.
   notification settings, and a Linux server's optional actions (without them a
   click cannot open the source) and sound (without it the alert is silent);
   Settings names what that server lacks.
+
+## 10. Shell
+
+One interface serves the desktop window, browsers, phones and the Telegram Mini
+App. The phone layout is the same elements arranged by one rule, never a second
+set of screens, so a page added for the desktop works on a phone without phone
+code of its own.
+
+**One layout switch.** The shell has two layouts: *docked*, when the window is at
+least 720 px wide, with the navigation column beside the content, and *stack*,
+narrower, where the column becomes a drawer. `html[data-layout]` carries the
+choice, set before first paint from the one constant `web/theme.js` exposes and
+`web/modules/layout.js` reads; shell rules key off the attribute, components adapt
+to their own box with container queries, and no page adds a width breakpoint of
+its own. The surface fact sent with a message reads the same switch. On docked,
+the Project panel lies beside Main at its own width over the dimmed room; its
+handle resizes it apart from the sidebar's, and it is never wider than the
+content area.
+
+**Navigation.** Places come from one registry (`web/modules/pages.js`): it renders
+the navigation rows, names the titles and feeds the shell gate, so a new page is
+a registry row and its module, checked at phone widths with no further work. The column
+has a pinned head (Main Chat), one collection (Projects, the column's only
+scroller) and the tools right after it (Files, Skills, Widgets, Dashboard,
+Settings, then the version and the update), which reach the bottom edge only
+when the Projects do not fit: free room stays under the last row, never between
+them. Collapsed, the Projects keep the ones whose dots show (work running, queued
+or waiting), the open one and the one under the keyboard; the rest wait behind
+"Show all N". The order follows §5; no label is set
+in capitals. A short window first compacts rows (fine pointer only), then lets the
+whole column scroll with Main pinned; a tool never becomes an unlabelled icon. One
+place is chosen at a time, and pressing a place opens it, never closes it.
+
+**The drawer.** In the stack layout the same column slides over the room from the
+left and leaves a strip of the room visible. ☰ sits in the leading slot of every
+header, an open Project's included, and the drawer's × takes its place. The scrim,
+×, Escape, Back and choosing a place close it. A drag only speeds this up: a
+horizontal drag across the room, never from the screen's edge and never on a
+field, a control, selected text or anything that scrolls sideways, pulls the
+drawer with the finger, and dragging it back closes it (`web/modules/drawer_drag.js`,
+switched off by one constant). Every gesture has a visible control.
+
+**Layers and dismissal.** The drawer and the Project panel are layers in one
+stack (`web/modules/layers.js`); dialogs, menus and the Shade keep their own
+Escape and outside-press dismissal. Escape, ×, a press on the scrim close the
+topmost layer and only it; the system or browser Back and Telegram's Back close
+what is on top: a dialog over a layer first, then the layer. While a layer is
+open the page holds exactly one same-address history entry, so Back closes it
+instead of leaving the app; navigation itself is still never written into the
+address. A modal layer makes the rest of the shell inert (never what opens over
+it) and returns focus to its opener on close. The shell draws one close glyph and
+one More glyph (`web/modules/page_icons.js`).
+
+**Page header.** One component (`web/modules/page_header.js`) draws every page's
+header and the Project panel's, as one row that never wraps. No decorative icon.
+On docked, a page the column already names shows no title; status, actions and
+tabs remain, and a header with nothing to show draws no bar. A Project shows its
+name. In the stack layout the row is at most 56 px: ☰, the place's name, its
+status, then Panic and ⋯; the name wins over the status word, which a short row
+drops whole, keeping its mark. Whenever the bar itself is narrow, on a phone or in a narrow window,
+Restart and the budget move into ⋯ — the same controls, placed by the bar's
+width. Tabs sit under the row and a history note hangs under the bar, neither
+inside it; a page has no caption line, its sidebar row and its tabs name it.
+
+**Doors and containers.** An object whose only job is to take you somewhere is a
+door: the whole object is the target and one state layer covers all of it (a file
+card, a Files row, a navigation row, a Project reference). An object that carries
+reading content or several actions is a container: its body is text and never a
+target, and only its own controls react — a message, a question, a Working card
+whose "Show details" is its one disclosure, a work card bound to a Project whose
+footer strip is its door. Hover never tints part of an object, and hover paint
+applies only where a pointer can hover (`@media (hover: hover)`).
+
+**Touch and containment.** Under a coarse pointer every target is at least 44 px
+(`--touch-target-min`); a control whose look is smaller keeps its look and gains
+the invisible hit area of the one `.ui-hit-area` recipe in `web/ui.css`, which a
+link inside a sentence takes too so the sentence keeps its lines. Nothing that
+acts is hidden until hover there. No page scrolls sideways at any width; only
+code, tables and tab strips scroll sideways, inside themselves, with a fade where
+content hides. Text wraps before it widens a column.
+
+**Telegram.** Inside the Telegram Mini App the page tells Telegram it is ready,
+fills the screen, turns off Telegram's swipe-down so lists scroll, shows
+Telegram's Back while a layer is open and its Close otherwise, gives Telegram's
+header and bottom bar the room's colour, follows Telegram's light or dark as the
+System appearance, and respects Telegram's safe areas
+(`web/modules/host_telegram.js`). Everything else is the same page.
+
+Enforcement: `tests/test_design_system_gate_browser.py` visits every registered
+page and every Settings tab in WebKit and Chromium at 360, 390, a Telegram-like
+390 × 780, 719, 720, 721, 1280 and short windows (no page scrolls sideways, coarse
+targets reach 44 px, header bars stay one row, one scroller per sidebar, Projects
+scroll by touch); `tests/test_shell_layout_static.py`,
+`tests/test_shell_header_static.py`, `tests/test_shell_drawer_static.py`,
+`tests/test_shell_tokens_static.py`, `tests/test_pages_registry_static.py` and
+`tests/test_design_system_css_static.py` keep the one switch, the registry, the
+glyph set, the breakpoint ratchet and sentence case; `web/tests/layers.test.js`,
+`web/tests/drawer_drag.test.js` and `web/tests/host_telegram.test.js` pin the
+behaviour.

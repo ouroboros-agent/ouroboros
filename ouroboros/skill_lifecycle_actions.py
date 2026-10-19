@@ -4,6 +4,10 @@ HTTP, launcher and task adapters provide their actual caller context. The model
 interprets an owner's instruction; this owner verifies the referenced source,
 selected payload revision and existing execution prerequisites. There is no new
 permission store, inferred approval, or HTTP impersonation.
+
+``reconcile_turn_on_when_ready`` is the one place an install's "turn on when
+ready" request becomes enablement: after install, after a review or owner Skip
+ends, after grants. It never overrides an explicit choice.
 """
 
 from __future__ import annotations
@@ -20,7 +24,7 @@ from ouroboros.skill_review_status import executable_review_requirement
 from ouroboros.skill_loader import (
     discover_skills, find_skill, grant_status_for_skill, requested_core_setting_keys,
     requested_skill_permissions, save_enabled, save_skill_grants, skill_conflict_status,
-    skill_state_dir,
+    skill_state_dir, skill_state_dir_path,
 )
 from ouroboros.tool_access import active_tool_profile, canonical_data_root
 from ouroboros.utils import append_jsonl, read_json_dict, utc_now_iso
@@ -42,6 +46,10 @@ def _review_facts(skill: Any, drive_root: Path) -> dict[str, Any]:
         "grants": grant_status_for_skill(drive_root, skill),
     }
 
+
+def _strict_review(skill: Any) -> bool:
+    """A source that reviews each skill: its blockers need the owner (skill_acceptance)."""
+    return bool((getattr(skill.review, "acceptance", None) or {}).get("strict_review"))
 
 
 def _caller_action_error(ctx: Any, action: str, owner_actor: str, owner_source: Any) -> tuple[str, dict]:
@@ -112,16 +120,16 @@ def _toggle(skill: Any, drive_root: Path, repo_path: str, enabled: bool, actor: 
         if conflict:
             return _refusal("cannot enable while conflicting skills are enabled", conflict=conflict, **facts)
         if not facts["executable_review"]:
-            return _refusal("cannot enable until the review gate permits the current bytes: "
-                            f"{executable_review_requirement(facts['review_gate'])}", **facts)
+            need = executable_review_requirement(facts["review_gate"], strict_review=_strict_review(skill))
+            return _refusal(f"cannot enable until the review gate permits the current bytes: {need}", **facts)
         if not facts["grants"].get("all_granted", True):
             return _refusal("cannot enable until requested key and permission grants are approved", **facts)
-        from ouroboros.launcher_bootstrap import native_seed_dependencies
+        from ouroboros.skill_acceptance import accepted_release_dependencies
         from ouroboros.skill_dependencies import skill_deps_not_ready
 
         deps_status, deps_reason = skill_deps_not_ready(drive_root, skill)
-        if deps_reason and native_seed_dependencies(drive_root, skill, repo_path=repo_path)[0]:
-            # A launcher-trusted seed had no review job to install them; do it now.
+        if deps_reason and accepted_release_dependencies(drive_root, skill, repo_path=repo_path)[0]:
+            # Bytes accepted without a review had no review job to install them; do it now.
             deps_status, deps_reason = skill_deps_not_ready(drive_root, skill)
         if deps_reason:
             return _refusal("cannot enable until isolated dependencies are installed with a current fingerprint",
@@ -146,14 +154,79 @@ def _toggle(skill: Any, drive_root: Path, repo_path: str, enabled: bool, actor: 
     }
 
 
+# The only enablement writer whose Off is not a choice: a failed load reverts the toggle.
+_REVERSIBLE_DISABLE_ACTORS = frozenset({"load_error_revert"})
+
+
+def reconcile_turn_on_when_ready(
+    drive_root: Path, skill_name: str, *, repo_path: str | None = None, reason: str = "",
+) -> dict[str, Any]:
+    """Enable an installed skill whose install record asks to turn on when ready.
+
+    Call it inside a lifecycle job (the caller holds the lane; this never takes it).
+    Enables only when the acceptance gate admits the current bytes, every requested
+    grant is given, dependencies are ready and no enabled peer conflicts; never over
+    an explicit choice (``enabled.json`` absent, or left by a load-error revert).
+    Returns ``{skill, action, enabled, missing}``; never raises.
+    """
+    from ouroboros.config import get_skills_repo_path
+    from ouroboros.skill_install_record import read_install_record
+    from ouroboros.skill_loader import load_enabled
+
+    out: dict[str, Any] = {"skill": skill_name, "action": "not_requested", "enabled": False, "missing": []}
+    try:
+        drive = Path(drive_root)
+        record = read_install_record(drive, skill_name)
+        if not record or record.get("turn_on_when_ready") is not True:
+            return out
+        repo = get_skills_repo_path() if repo_path is None else repo_path
+        skill = find_skill(drive, skill_name, repo_path=repo)
+        if skill is None:
+            return {**out, "action": "not_found"}
+        if load_enabled(drive, skill.name):
+            return {**out, "action": "already_on", "enabled": True}
+        choice = read_json_dict(skill_state_dir_path(drive, skill.name) / "enabled.json")
+        if choice is not None and choice.get("actor") not in _REVERSIBLE_DISABLE_ACTORS:
+            return {**out, "action": "owner_choice"}
+        missing = _turn_on_missing(skill, drive, repo)
+        if missing:
+            return {**out, "action": "not_ready", "missing": missing}
+        result = _toggle(skill, drive, repo, True, "turn_on_when_ready", reason or "install requested turn on when ready")
+        if not result.get("ok"):
+            return {**out, "action": "load_error", "error": str(result.get("error") or "")}
+        return {**out, "action": "enabled", "enabled": True}
+    except Exception as exc:
+        log.warning("turn-on-when-ready reconcile failed for %s", skill_name, exc_info=True)
+        return {**out, "action": "error", "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _turn_on_missing(skill: Any, drive_root: Path, repo_path: str) -> list[str]:
+    """What still keeps an accepted install off: the same prerequisites as ``_toggle``."""
+    if skill.load_error:
+        return ["load_error"]
+    missing: list[str] = []
+    facts = _review_facts(skill, drive_root)
+    if not facts["executable_review"]:
+        missing.append("acceptance")
+    if not facts["grants"].get("all_granted", True):
+        missing.append("grants")
+    from ouroboros.skill_dependencies import skill_deps_not_ready
+
+    if skill_deps_not_ready(drive_root, skill)[1]:
+        missing.append("dependencies")
+    if skill_conflict_status(skill, discover_skills(drive_root, repo_path=repo_path)):
+        missing.append("conflict")
+    return missing
+
+
 def prepare_skill_grant(skill: Any, drive_root: Path, items: list[str]) -> dict:
     """Validate the exact request before a launcher confirmation or grant write."""
     facts = _review_facts(skill, drive_root)
     if not (skill.manifest.is_script() or skill.manifest.is_extension()):
         return _refusal("key and permission grants are supported for script and extension skills", 400)
     if not facts["executable_review"]:
-        return _refusal("key and permission grants need the review gate to permit the current bytes: "
-                        f"{executable_review_requirement(facts['review_gate'])}", **facts)
+        need = executable_review_requirement(facts["review_gate"], strict_review=_strict_review(skill))
+        return _refusal(f"key and permission grants need the review gate to permit the current bytes: {need}", **facts)
     allowed_keys = requested_core_setting_keys(list(skill.manifest.env_from_settings or []))
     allowed_permissions = requested_skill_permissions(skill.manifest.permissions, skill.manifest.subscribe_events)
     permissions = {value.lower(): value for value in allowed_permissions}
@@ -188,7 +261,9 @@ def _grant(skill: Any, drive_root: Path, repo_path: str, items: list[str], recon
     except Exception as exc:
         state = {"reason": "reconcile_call_failed", "load_error": str(exc)}
     _sync_schedules(drive_root, repo_path)
+    turn_on = reconcile_turn_on_when_ready(drive_root, skill.name, repo_path=repo_path, reason="grants approved")
     return {
+        "turn_on_when_ready": turn_on["action"],
         "ok": True, "skill": skill.name, "content_hash": skill.content_hash,
         "granted_keys": keys, "granted_permissions": granted_permissions,
         "extension_action": state.get("action"), "extension_reason": state.get("reason"),
@@ -286,7 +361,9 @@ def run_skill_action(
                 return SkillReviewOutcome(skill_name=name, status="pending", error=refusal["error"])
             return review_skill_owner_attest(review_ctx, name)
 
-        result = run_skill_review_lifecycle_blocking(ctx, skill_name, source="skills" if _owner_actor else "tool", review_impl=attest, repo_path=repo_path)
+        result = run_skill_review_lifecycle_blocking(ctx, skill_name, source="skills" if _owner_actor else "tool",
+                                                    review_impl=attest, repo_path=repo_path,
+                                                    owner_attestation=True)
         result["ok"] = result.get("status") == "clean"
         if not result["ok"]:
             result["status_code"] = 409

@@ -198,7 +198,7 @@ def test_ui_smoke_review_truth_is_visible_in_chat_and_logs(direct_server_with_da
                 # The Plan review group is hydrated from the task detail once the card opens; the helper
                 # opens the FIRST group, so open the card here and let the Plan group arrive (first)
                 # before the helper walks the section.
-                no_summary.locator(":scope > [data-live-summary-button]").click()
+                no_summary.locator(":scope > [data-live-summary-button] [data-live-disclosure]").click()
                 no_summary.locator('[data-review-group^="plan:"]').wait_for(state="attached", timeout=30_000)
                 _open_review_checkpoint(no_summary, open_card=False)
                 assert no_summary.locator('[data-live-phase]').first.get_attribute("data-phase") == "warn"

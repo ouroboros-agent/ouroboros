@@ -113,7 +113,7 @@ def _evidence(data_dir):
 
 def _open(card):
     if card.get_attribute("data-expanded") != "1":
-        card.locator(":scope > [data-live-summary-button]").click()
+        card.locator(":scope > [data-live-summary-button] [data-live-disclosure]").click()
 
 
 def _assert_running(card):

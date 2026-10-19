@@ -187,7 +187,7 @@ HOST_ROW_CLASSES = {
     "skill_lifecycle": ("card_row", 2),
     "skill_lifecycle_pointer": ("owner_act_receipt", 1),
     "skill_notice": ("signed_words", 1),
-    "skill_repair": ("owner_act_receipt", 2),
+    "skill_repair": ("owner_act_receipt", 1),  # the owner's Repair; marketplace auto-repair is retired
     "startup_notice": ("runtime_state", 2),
     "steer_not_delivered": ("not_started", 1),
     "storage_switch_notice": ("runtime_state", 1),

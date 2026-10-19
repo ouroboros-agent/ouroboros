@@ -1,7 +1,9 @@
 import { escapeHtmlAttr, escapeHtmlText as escapeHtml } from './utils.js';
 import { bindMarkdownTables, destroyChatMarkdown, enhanceChatMarkdown, mountChatMarkdown, renderChatMarkdown } from './chat_markdown.js';
-import { renderPageHeader } from './page_header.js';
-import { PAGE_ICONS } from './page_icons.js';
+import { bindHeaderControlPlacement, renderPageHeader } from './page_header.js';
+import { strokeIcon } from './page_icons.js';
+import { mainHeaderActionsHtml } from './chat_header.js';
+import { pageLabel } from './pages.js';
 import { showToast } from './toast.js';
 import { tx } from './i18n.js';
 import { hostRowDisplayText } from './host_notice_text.js';
@@ -131,7 +133,6 @@ import {
     loadChatInputHistory,
     markIngressSaved,
     liveLineRowToggleKey,
-    bindContentButton,
     bindLiveCardTimeline,
     subagentIdentityTitle,
     subagentTwin,
@@ -207,7 +208,7 @@ export function createChatInstance({
     ws, state, updateUnreadBadge, openSettingsTab, openDashboardTab,
     stateSnapshots,
     chatId = 1, projectId = '', idPrefix = 'chat', mountEl = null,
-    asPanel = false, title = 'Chat',
+    asPanel = false, title = pageLabel('chat'),
     // app.js signal "a project panel is opening right now" — Main
     // defers its first hydration to it (bounded by an unconditional deadline).
     isProjectOpening = null,
@@ -223,63 +224,42 @@ export function createChatInstance({
     const page = document.createElement('div');
     page.id = asPanel ? `panel-${idPrefix}` : 'page-chat';
     page.className = asPanel ? 'chat-instance-panel' : 'page active';
-    // A project panel reuses index.html's `.project-panel-bar` (title + close): a
-    // status-only header, never the page header's global agent chrome (Restart,
-    // Panic, budget). Main keeps the full header.
+    // A Project panel's bar comes from app.js (page_header.js); the instance seeds only its status badge.
     const headerHtml = asPanel
         ? `<div class="chat-panel-statusbar"><span id="chat-status" class="status-badge offline">Connecting…</span></div>`
         : renderPageHeader({
             title: title,
-            icon: PAGE_ICONS.chat,
             variant: 'overlay',
             className: 'chat-page-header',
             toolbarClass: 'ui-chrome-group',
-            actionsHtml: `
-                <div class="chat-header-actions" id="chat-header-actions">
-                    <button class="chat-header-btn ui-chrome-control" type="button" data-chat-command="restart" title="Restart agent">Restart</button>
-                    <button class="chat-header-btn danger ui-chrome-control" type="button" data-chat-command="panic" title="Stop all workers">Panic</button>
-                    <details class="chat-header-more">
-                        <summary class="chat-header-btn ui-chrome-control" title="More agent controls">More</summary>
-                        <div class="chat-header-menu">
-                            <button class="chat-header-menu-item" type="button" data-chat-command="bg" title="Toggle background consciousness">Consciousness</button>
-                            <button class="chat-header-menu-item" type="button" data-chat-command="evolve" title="Toggle evolution mode">Evolve</button>
-                            <button class="chat-header-menu-item" type="button" data-chat-command="review" title="Run review now">Review</button>
-                        </div>
-                    </details>
-                </div>
-                <button class="chat-budget-pill ui-chrome-control" id="chat-budget-pill" type="button" title="Open budget controls" aria-label="Open budget controls">
-                    <span class="chat-budget-text" id="chat-budget-text">Loading…</span>
-                    <div class="chat-budget-bar">
-                        <div class="chat-budget-bar-fill" id="chat-budget-bar-fill"></div>
-                    </div>
-                </button>
-                <span id="chat-status" class="status-badge offline">Connecting…</span>
-            `,
+            actionsHtml: mainHeaderActionsHtml(),
         });
+    // Main: the history note (gaps, a failed read, an approximate position) floats UNDER the bar as its own
+    // strip, never as a second row of it; the Project panel keeps its in-flow status bar.
     page.innerHTML = `
-        ${headerHtml}
+        ${headerHtml}${asPanel ? '' : '<div class="chat-page-note"></div>'}
         <div id="chat-messages"></div>
         <div id="chat-input-area">
             <div class="chat-input-wrap">
                 <button class="chat-scroll-bottom-btn" id="chat-scroll-bottom" type="button" aria-label="Scroll to latest message" title="Scroll to latest message">
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14"/><path d="M19 12l-7 7-7-7"/></svg>
+                    ${strokeIcon('<path d="M12 5v14"/><path d="M19 12l-7 7-7-7"/>', 16)}
                     <span class="chat-scroll-activity-dot" aria-hidden="true" hidden></span>
                 </button>
                 <div id="chat-attachment-preview" class="chat-attachment-preview"></div>
                 <div class="chat-toolbar-row">
                     <div class="chat-composer-pills" id="chat-composer-pills">
-                        <button class="chat-swarm" id="chat-swarm" type="button" data-armed="false" title="Swarm: route your next message into a new managed task, run a deep plan review with plan_task, then delegate when parallel work helps. Auto-disarms after sending.">Swarm</button>
+                        <button class="chat-swarm ui-hit-area" id="chat-swarm" type="button" data-armed="false" title="Swarm: route your next message into a new managed task, run a deep plan review with plan_task, then delegate when parallel work helps. Auto-disarms after sending.">Swarm</button>
                     </div>
                     <div class="chat-context-mode" id="chat-context-mode" data-context-mode="max"></div>
                 </div>
                 <div class="chat-text-row">
-                    <button class="chat-attach-btn" id="chat-attach" type="button" title="Attach file">
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+                    <button class="chat-attach-btn ui-hit-area" id="chat-attach" type="button" title="Attach file">
+                        ${strokeIcon('<path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>', 18)}
                     </button>
                     <input type="file" id="chat-file-input" class="chat-file-input-hidden" accept="*/*" multiple>
                     <textarea id="chat-input" placeholder="Message Ouroboros..." rows="1" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
                     <div class="chat-send-group">
-                        <button class="chat-send-inline" id="chat-send" title="Send message">Send</button>
+                        <button class="chat-send-inline ui-hit-area" id="chat-send" title="Send message">Send</button>
                     </div>
                 </div>
             </div>
@@ -304,7 +284,9 @@ export function createChatInstance({
     const statusBadge = byId('status');
     const headerActions = byId('header-actions');
     const pageHeader = page.querySelector('.chat-page-header');
+    const pageNote = page.querySelector('.chat-page-note');
     const budgetPill = byId('budget-pill');
+    const disposeHeaderPlacement = asPanel ? () => {} : bindHeaderControlPlacement({ headerActions, budgetPill });
     const attachBtn = byId('attach');
     const fileInput = byId('file-input');
     const attachmentPreview = byId('attachment-preview');
@@ -856,7 +838,7 @@ export function createChatInstance({
     }
 
     // Main blocks with work offer conversion unless their origin is bound (the same /api/state fact app.js
-    // reads); titles use the same work predicate. Every root work card offers Reply first (never the primary).
+    // reads); titles use the same work predicate. Every root work card offers Reply in its row menu.
     function syncBlockChrome(record) {
         replies.syncCard(record, !record.isSubagent && (isPortal(record) || blockHasWork(record)));
         // A child is never a convertible unit (it inherits its root's Project by
@@ -1242,8 +1224,10 @@ export function createChatInstance({
             ? explicitCardExpansion.get(normalizedGroupId)
             : Boolean(options.isSubagent && nestedSubagentsExpanded);
         root.dataset.expanded = initialExpanded ? '1' : '0';
+        // The summary band is reading content (selectable, never a control); its one disclosure is the
+        // "N notes · Show details" button (DESIGN §5 "A task card's summary outranks its details").
         root.innerHTML = `
-            <div class="chat-live-summary-button" role="button" tabindex="0" data-live-summary-button aria-expanded="false" aria-controls="${escapeHtmlAttr(timelineId)}">
+            <div class="chat-live-summary-button" data-live-summary-button>
                 <div class="chat-live-summary">
                     <div class="chat-live-summary-main">
                         <span class="chat-live-phase working" data-live-phase role="status" aria-live="polite" aria-atomic="true" aria-label="${options.isSubagent ? 'Subagent' : 'Task'} status: Working">Working</span>
@@ -1254,13 +1238,13 @@ export function createChatInstance({
                         </div>
                     </div>
                     <span class="chat-live-title" data-live-title>Waiting for work</span>
-                    <div class="chat-live-summary-side">
-                        <span class="chat-live-count" data-live-count hidden>2 notes</span>
+                    <button type="button" class="chat-live-summary-side ui-hit-area" data-live-disclosure aria-expanded="false" aria-controls="${escapeHtmlAttr(timelineId)}">
+                        <span class="chat-live-count" data-live-count hidden></span>
                         <span class="chat-live-toggle" data-live-toggle>Show details</span>
                         <svg class="chat-live-chevron" width="14" height="14" viewBox="0 0 20 20" fill="none" aria-hidden="true">
                             <path d="M5 7.5 10 12.5 15 7.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"></path>
                         </svg>
-                    </div>
+                    </button>
                 </div>
                 <div class="chat-live-episodes" data-live-episodes hidden></div>
                 <div class="chat-live-activity" data-live-activity></div>
@@ -1290,6 +1274,7 @@ export function createChatInstance({
             episodeHistoryEl: root.querySelector('[data-live-episode-history]'),
             activityEl: root.querySelector('[data-live-activity]'),
             countEl: root.querySelector('[data-live-count]'),
+            disclosureEl: root.querySelector('[data-live-disclosure]'),
             footEl: root.querySelector('[data-live-foot]'),
             footEndEl: root.querySelector('[data-live-foot-end]'),
             metaEl: root.querySelector('[data-live-meta]'),
@@ -1335,12 +1320,14 @@ export function createChatInstance({
             ),
             onDomWrite: withStableViewport,
         });
-        bindContentButton(record.summaryButtonEl, () => {
+        // A native button: Enter and Space press it. A portal hides it (its room holds what it would open).
+        record.disclosureEl?.addEventListener('click', () => {
+            if (isPortal(record)) return;
             const nowExpanded = record.root.dataset.expanded !== '1';
             explicitCardExpansion.set(record.groupId, nowExpanded);
             setLiveCardExpanded(record, nowExpanded);
             if (nowExpanded) hydrateCardReviews(record.groupId);
-        }, () => !isPortal(record));  // a portal's summary is content, not a disclosure
+        });
         record.timelineDispose = bindLiveCardTimeline(record.timelineEl, (lineKey) => {
             const nowExpanded = !record.expandedLineKeys.has(lineKey);
             if (nowExpanded) record.expandedLineKeys.add(lineKey);
@@ -1512,6 +1499,7 @@ export function createChatInstance({
             ? explicitCardExpansion.get(record.groupId)
             : Boolean(record.isSubagent && nestedSubagentsExpanded);
         setLiveCardExpanded(record, expanded);
+        syncLiveCardToggle(record);  // a card born expanded says so from its first paint
     }
 
     function ensureLiveCardVisible(
@@ -2973,8 +2961,15 @@ export function createChatInstance({
         const mutate = () => {
             let changed = false;
             if (pageHeader && messagesDiv) {
-                const headerReserve = Math.max(56, Math.ceil(pageHeader.offsetHeight || 0));
-                const value = `${headerReserve}px`;
+                // The bar's own height places the note under it; the transcript clears both.
+                const bar = Math.ceil(pageHeader.offsetHeight || 0);
+                const note = pageNote?.offsetParent ? Math.ceil(pageNote.offsetHeight || 0) : 0;
+                const barValue = `${bar}px`;
+                if (page.style.getPropertyValue('--chat-header-bar') !== barValue) {
+                    page.style.setProperty('--chat-header-bar', barValue);
+                    changed = true;
+                }
+                const value = `${Math.max(56, bar + note)}px`;
                 if (page.style.getPropertyValue('--chat-header-reserve') !== value) {
                     page.style.setProperty('--chat-header-reserve', value);
                     changed = true;
@@ -3015,6 +3010,7 @@ export function createChatInstance({
         chatResizeObserver = new ResizeObserver(schedule);
         chatResizeObserver.observe(messagesDiv);
         if (pageHeader) chatResizeObserver.observe(pageHeader);
+        if (pageNote) chatResizeObserver.observe(pageNote);
         if (inputArea) chatResizeObserver.observe(inputArea);
     }
 
@@ -3086,21 +3082,25 @@ export function createChatInstance({
     let documentKeydownHandler = null;
     if (!asPanel) {
         const collapseHeaderMenus = (predicate) => {
+            let collapsed = false;
             page.querySelectorAll('details.chat-header-more[open]').forEach((details) => {
-                if (predicate(details)) details.removeAttribute('open');
+                if (predicate(details)) { details.removeAttribute('open'); collapsed = true; }
             });
+            return collapsed;
         };
         documentClickHandler = (event) => {
             collapseHeaderMenus((details) => !details.contains(event.target));
         };
         document.addEventListener('click', documentClickHandler);
         documentKeydownHandler = (event) => {
-            if (event.key === 'Escape') collapseHeaderMenus(() => true);
+            // An open menu owns its Escape.
+            if (event.key === 'Escape' && !event.defaultPrevented && collapseHeaderMenus(() => true)) event.preventDefault();
         };
         document.addEventListener('keydown', documentKeydownHandler);
     }
 
     budgetPill?.addEventListener('click', () => {
+        budgetPill.closest('details')?.removeAttribute('open');
         if (typeof openDashboardTab === 'function') openDashboardTab('costs');
         else if (typeof openSettingsTab === 'function') openSettingsTab('costs');
     });
@@ -3214,7 +3214,7 @@ export function createChatInstance({
         }
     }
 
-    const historyControls = createHistoryControls(messagesDiv, pageHeader || page.querySelector('.chat-panel-statusbar'));
+    const historyControls = createHistoryControls(messagesDiv, pageNote || page.querySelector('.chat-panel-statusbar'));
     const { olderButton: loadOlderBtn } = historyControls;
 
     const historyPager = createChatHistoryPager({
@@ -3807,6 +3807,7 @@ export function createChatInstance({
             document.removeEventListener('visibilitychange', handlePageShown);
             if (documentClickHandler) document.removeEventListener('click', documentClickHandler);
             if (documentKeydownHandler) document.removeEventListener('keydown', documentKeydownHandler);
+            disposeHeaderPlacement();
             chatResizeObserver?.disconnect();
             chatResizeObserver = null;
             inputSizing.dispose();

@@ -927,7 +927,7 @@ def sweep_settled_owner_mailboxes(drive_root: pathlib.Path, *, stop: Any = None)
     """Off-loop sweep of canonical mailboxes whose task settled without a cleanup (CPL4-C18:
     a task that never reached the task_done dispatch - crash, lost event, hard kill - leaked
     its mailbox forever) or whose cleanup the loop thread declined because unread rows carry
-    inputs to verify or copy (carried here). Startup and the drive-custody pass call it. A
+    inputs to verify or copy (carried here). The drive-custody pass calls it. A
     mailbox goes only with a settled result, settled post-task work, no pending input copy and
     every unread row in verified canonical custody. No result keeps it. ``stop()`` (the
     maintenance generation) is asked before each mailbox and fences its cleanup's copies,

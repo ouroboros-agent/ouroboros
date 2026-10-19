@@ -81,13 +81,14 @@ echo "--- Skipping bundled WebKit on macOS ---"
 # simple embedded payload. WebKit remains available through browser.py's managed
 # Playwright cache on first engine=webkit use; Chromium stays bundled.
 
-echo "--- Removing stale bundled WebKit payloads from macOS package tree ---"
+echo "--- Removing stale WebKit, debug-symbol and test payloads from macOS package tree ---"
 python3 - <<'PY'
 import pathlib
 import shutil
 
+root = pathlib.Path("python-standalone")
 removed = 0
-for local_browsers in pathlib.Path("python-standalone").rglob(".local-browsers"):
+for local_browsers in root.rglob(".local-browsers"):
     for webkit_payload in local_browsers.glob("webkit-*"):
         if webkit_payload.is_dir():
             shutil.rmtree(webkit_payload)
@@ -95,6 +96,16 @@ for local_browsers in pathlib.Path("python-standalone").rglob(".local-browsers")
             webkit_payload.unlink(missing_ok=True)
         removed += 1
 print(f"Removed {removed} stale WebKit browser payload(s) from python-standalone")
+
+# pyobjc's own test suite: test extensions nothing imports at runtime.
+tests = list(root.glob("lib/python*/site-packages/PyObjCTest"))
+# Debug symbols are not runtime code, yet their Mach-O companions get sealed
+# as nested code and Apple's notary never tickets them, so Gatekeeper rejects
+# the whole app (v7.7.0 shipped 142 of them from pyobjc).
+dsyms = [path for path in root.rglob("*.dSYM") if path.is_dir()]
+for payload in tests + dsyms:
+    shutil.rmtree(payload, ignore_errors=True)
+print(f"Removed {len(tests)} test package(s) and {len(dsyms)} debug-symbol bundle(s)")
 PY
 
 echo "--- Normalizing python-standalone symlinks for PyInstaller ---"
@@ -240,13 +251,76 @@ else
     echo "=== Skipping signing (OUROBOROS_SIGN=0) ==="
 fi
 
+# Notarization runs only with signing and complete Apple credentials, and then it
+# is fail-closed: a DMG whose app Gatekeeper rejects is not a release (v7.7.0).
+NOTARIZE=0
+if [ "$SIGN_MODE" != "0" ] \
+        && [ -n "${APPLE_ID:-}" ] \
+        && [ -n "${APPLE_TEAM_ID:-}" ] \
+        && [ -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]; then
+    NOTARIZE=1
+fi
+
+# Submit one file and require Apple's "Accepted" (notarytool can exit 0 on
+# "Invalid"); the developer log is printed either way because it lists issues.
+notarize() {
+    local target="$1" result id status
+    echo "--- Notarizing $(basename "$target") (Apple ID: $APPLE_ID) ---"
+    result="$(xcrun notarytool submit "$target" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --wait --output-format json)" || true
+    echo "$result"
+    id="$(printf '%s' "$result" | python3 -c 'import json, sys; print(json.load(sys.stdin).get("id", ""))' 2>/dev/null || true)"
+    status="$(printf '%s' "$result" | python3 -c 'import json, sys; print(json.load(sys.stdin).get("status", ""))' 2>/dev/null || true)"
+    if [ -n "$id" ]; then
+        xcrun notarytool log "$id" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" || true
+    fi
+    if [ "$status" != "Accepted" ]; then
+        echo "ERROR: notarization of $target ended with status '${status:-unknown}'." >&2
+        exit 1
+    fi
+}
+
+# A fresh ticket can take a moment to reach Apple's CDN, so retry briefly.
+staple() {
+    local attempt
+    for attempt in 1 2 3; do
+        if xcrun stapler staple "$1" && xcrun stapler validate "$1"; then
+            return 0
+        fi
+        if [ "$attempt" -lt 3 ]; then
+            echo "WARNING: stapling $1 failed (attempt $attempt/3); retrying."
+            sleep 30
+        fi
+    done
+    echo "ERROR: no validated notarization ticket could be stapled to $1." >&2
+    exit 1
+}
+
+if [ "$NOTARIZE" = "1" ]; then
+    echo ""
+    echo "=== Notarizing Ouroboros.app ==="
+    # The app carries its own ticket so a copy dragged out of the DMG opens
+    # offline and on another Mac; the DMG submission below covers the image.
+    APP_ZIP="dist/Ouroboros-notarize.zip"
+    ditto -c -k --keepParent "$APP_PATH" "$APP_ZIP"
+    notarize "$APP_ZIP"
+    rm -f "$APP_ZIP"
+    staple "$APP_PATH"
+fi
+
 echo ""
 echo "=== Creating DMG ==="
 rm -f "$DMG_PATH"
 DMG_STAGE_DIR="dist/dmg-stage"
 rm -rf "$DMG_STAGE_DIR"
 mkdir -p "$DMG_STAGE_DIR"
-cp -R "$APP_PATH" "$DMG_STAGE_DIR/Ouroboros.app"
+ditto "$APP_PATH" "$DMG_STAGE_DIR/Ouroboros.app"
 ln -s /Applications "$DMG_STAGE_DIR/Applications"
 cp packaging/cli/install-ouroboros-cli-macos.command "$DMG_STAGE_DIR/Install CLI.command"
 chmod +x "$DMG_STAGE_DIR/Install CLI.command"
@@ -269,33 +343,11 @@ if [ "$SIGN_MODE" != "0" ]; then
     codesign -s "$SIGN_IDENTITY" --timestamp "$DMG_PATH"
 fi
 
-# Optional notarization only after signing and complete Apple credentials.
-# Outcome enum keeps final summary honest: success/staple_failed/submit_failed/unconfigured.
-NOTARIZE_OUTCOME="unconfigured"
-if [ "$SIGN_MODE" != "0" ] \
-        && [ -n "${APPLE_ID:-}" ] \
-        && [ -n "${APPLE_TEAM_ID:-}" ] \
-        && [ -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]; then
+if [ "$NOTARIZE" = "1" ]; then
     echo ""
-    echo "=== Notarizing DMG (Apple ID: $APPLE_ID) ==="
-    # Submit failures warn, not abort; signed DMG still ships with clear logs.
-    if xcrun notarytool submit "$DMG_PATH" \
-            --apple-id "$APPLE_ID" \
-            --team-id "$APPLE_TEAM_ID" \
-            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-            --wait; then
-        echo "--- Stapling notarization ticket ---"
-        # Stapler can fail after successful notarization; Gatekeeper can fetch online.
-        if xcrun stapler staple "$DMG_PATH"; then
-            NOTARIZE_OUTCOME="success"
-        else
-            NOTARIZE_OUTCOME="staple_failed"
-            echo "WARNING: stapler staple failed — DMG is notarized but ticket not embedded; receivers may briefly need right-click → Open until Apple's ticket propagates."
-        fi
-    else
-        NOTARIZE_OUTCOME="submit_failed"
-        echo "WARNING: notarytool submit failed — DMG is signed but not notarized; verify APPLE_ID / APPLE_TEAM_ID / APPLE_APP_SPECIFIC_PASSWORD are correct or check the notarytool log above."
-    fi
+    echo "=== Notarizing DMG ==="
+    notarize "$DMG_PATH"
+    staple "$DMG_PATH"
 fi
 
 echo ""
@@ -307,25 +359,10 @@ else
     echo "Unsigned app: $APP_PATH"
     echo "Unsigned DMG: $DMG_PATH"
 fi
-case "$NOTARIZE_OUTCOME" in
-    success)
-        echo "(Notarized + stapled — no right-click → Open required on first launch)"
-        ;;
-    staple_failed)
-        echo "(Notarized but ticket not stapled — Gatekeeper will fetch the ticket online; receivers need internet on first launch)"
-        ;;
-    submit_failed)
-        echo "(Signed but notarytool submit failed — DMG was not accepted by Apple; check the WARNING above for details)"
-        ;;
-    unconfigured)
-        if [ "$SIGN_MODE" != "0" ]; then
-            echo "(Signed but not notarized — set APPLE_ID / APPLE_TEAM_ID / APPLE_APP_SPECIFIC_PASSWORD to enable notarization)"
-        else
-            echo "(Not notarized — users need right-click → Open on first launch)"
-        fi
-        ;;
-    *)
-        # Surface future enum drift instead of omitting the summary.
-        echo "(Unknown notarization outcome: '$NOTARIZE_OUTCOME' — please report; likely a missing case arm in build.sh)"
-        ;;
-esac
+if [ "$NOTARIZE" = "1" ]; then
+    echo "(Notarized: the app and the DMG each carry a validated stapled ticket)"
+elif [ "$SIGN_MODE" != "0" ]; then
+    echo "(Signed but not notarized — set APPLE_ID / APPLE_TEAM_ID / APPLE_APP_SPECIFIC_PASSWORD to enable notarization; macOS 15+ users must choose Open Anyway in System Settings → Privacy & Security)"
+else
+    echo "(Not signed or notarized — macOS 15+ users must choose Open Anyway in System Settings → Privacy & Security)"
+fi

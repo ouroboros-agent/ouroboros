@@ -257,14 +257,12 @@ def _historical_writer_live(root: Path, task_id: str, operation_id: str) -> bool
     from ouroboros.review_operation import task_has_live_review_operation
     from ouroboros.task_results import load_task_result
     from ouroboros.task_status import task_has_live_queue_ownership, queue_snapshot_observation
-    from ouroboros.utils import in_worker_process
     from ouroboros.queue_observation import load_queue_document
     from supervisor import queue as task_queue
     from supervisor.direct_roots import FRAGMENT_NAME
 
     try:
-        if (not in_worker_process() and task_queue.INITIALIZED
-                and Path(task_queue.DRIVE_ROOT).resolve() == root.resolve()):
+        if task_queue.owns_live_queue(root):
             return task_queue.task_has_live_ownership(task_id, ignore_review_operation=operation_id)
         if task_has_live_review_operation(root, task_id, exclude_owner_id=operation_id):
             return True

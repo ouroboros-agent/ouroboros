@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from ouroboros import evidence_packs, obligations as o, store, task_store
+from ouroboros import obligations as o, store, task_store
 from ouroboros.task_results import write_task_result
 
 SET = "nonterminal"
@@ -128,12 +128,12 @@ def test_a_write_racing_the_pass_is_never_rested_over(root, monkeypatch):
 
 
 def test_a_rest_is_a_kept_fact_never_debt(root):
-    assert o.REST_SET in o.RECORD_SETS
     rest = o.DutyRest(root, "probe", candidates={"a": {}})
     rest.wait("a", "owner_resume")
     rest.commit()
-    owed = evidence_packs.settlement_obligations(root)
-    assert o.REST_SET not in owed.get("a", {}) and "nonterminal" in owed["a"]
+    with store.open_store(root, write=False) as txn:
+        assert "probe:a" in txn.set_rows(o.REST_SET)  # a row of its own kept set ...
+    assert o.REST_SET not in o.BOOT_SETS  # ... that no rebuild derives or erases
 
 
 # ---------------------------------------------------------------- question delivery (20 s duty)

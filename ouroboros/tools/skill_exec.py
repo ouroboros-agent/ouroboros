@@ -849,7 +849,7 @@ def _skill_deps_exec_block(drive_root: pathlib.Path, loaded: Any) -> str:
 
 
 def _non_executable_review_message(prefix: str, skill_name: str, status: str, *, stale: bool = False,
-                                   gate: Dict[str, Any] | None = None) -> str:
+                                   gate: Dict[str, Any] | None = None, strict_review: bool = False) -> str:
     gate = gate or skill_review_gate(status, stale=stale)
     normalized_status = normalize_skill_review_status(status)
     if gate["blocking_reason"] == "blocker_findings_under_blocking_enforcement":
@@ -862,7 +862,8 @@ def _non_executable_review_message(prefix: str, skill_name: str, status: str, *,
     stale_note = f", stale={stale}" if stale else ""
     return (
         f"⚠️ {prefix}: skill {skill_name!r} review status is {normalized_status!r}{stale_note}, "
-        f"not executable ({gate['blocking_reason']}). Execution needs {executable_review_requirement(gate)}. "
+        f"not executable ({gate['blocking_reason']}). "
+        f"Execution needs {executable_review_requirement(gate, strict_review=strict_review)}. "
         f"{gate['summary']}"
     )
 
@@ -983,14 +984,15 @@ def _handle_skill_exec(
         )
     stale = loaded.review.is_stale_for(current_hash)
     gate = loaded.review.gate_for(current_hash)
+    strict_review = bool((getattr(loaded.review, "acceptance", None) or {}).get("strict_review"))
     if stale and not gate["executable_review"]:
         return (
             f"⚠️ SKILL_EXEC_BLOCKED: skill {skill_name!r} was edited since "
-            f"the last review. Execution needs {executable_review_requirement(gate)}."
+            f"the last review. Execution needs {executable_review_requirement(gate, strict_review=strict_review)}."
         )
     if not gate["executable_review"]:
         return _non_executable_review_message("SKILL_EXEC_BLOCKED", skill_name, loaded.review.status, stale=stale,
-                                              gate=gate)
+                                              gate=gate, strict_review=strict_review)
     deps_block = _skill_deps_exec_block(drive_root, loaded)
     if deps_block:
         return deps_block
@@ -1403,8 +1405,8 @@ _TOGGLE_SCHEMA = {
         "skill's review_gate to permit the current bytes (outside Cyber Pro: "
         "a current executable reviewer verdict or a qualified Advisory author "
         "acceptance of these exact bytes), any requested key or "
-        "host-permission grants, and ready isolated dependencies. Enabling a trusted "
-        "launcher-seeded skill prepares its declared isolated dependencies first; "
+        "host-permission grants, and ready isolated dependencies. Enabling a skill "
+        "accepted without a review prepares its declared isolated dependencies first; "
         "other skills require them to be ready already. "
         "For selected-skill development, interpret the real owner request: "
         "Repair and run authorizes enabling and leaving the repaired skill running. "

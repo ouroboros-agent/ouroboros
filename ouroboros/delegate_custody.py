@@ -184,7 +184,7 @@ class RunCustody:
     # baseline commit, AUTHORITY target tree. ``snapshot_id`` keys the
     # worktree-service registry entry (= the provisioning invocation id). All
     # durable/replayed: retries reproduce the binding, terminal capture knows
-    # where to diff, startup GC tells live snapshots from disposable ones.
+    # where to diff; custody GC also requires proof that the owning task is over.
     snapshot_id: str = ""
     execution_root: str = ""
     execution_binding_fingerprint: str = ""
@@ -807,12 +807,12 @@ def record_patch_apply_resolved(drive_root: Any, custody: RunCustody, *, reason:
 
 
 def open_snapshot_ids(drive_root: Any) -> set:
-    """Snapshot ids custody still holds OPEN — the startup GC's keep-set.
+    """Snapshot ids custody still holds OPEN — the custody GC's keep-set.
 
     A snapshot is open while its run is unsettled OR its captured patch has no
     explicit disposition, and while a PENDING invocation names it (the POST may
-    have bound a live run the worker died before recording). Everything else is
-    disposable.
+    have bound a live run the worker died before recording). At boot and each
+    custody pass, GC may remove other ids only once their owning task is proven over.
     """
     from ouroboros.delegate_custody_current import runs as current_runs
 

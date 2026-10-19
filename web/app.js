@@ -28,7 +28,13 @@ import { initActivity } from './modules/activity.js';
 import { initUpdateStatus } from './modules/update_status.js';
 import { initDashboard } from './modules/dashboard.js';
 import { initStorage } from './modules/storage.js';
-import { hydrateNavIcons } from './modules/page_icons.js';
+import { SHELL_ICONS } from './modules/page_icons.js';
+import { renderNavRows, renderProjectsHeader } from './modules/pages.js';
+import { renderPageHeader } from './modules/page_header.js';
+import { isStackLayout, onLayoutChange } from './modules/layout.js';
+import { createLayerStack } from './modules/layers.js';
+import { createTelegramHost } from './modules/host_telegram.js';
+import { DRAWER_DRAG, bindDrawerDrag } from './modules/drawer_drag.js';
 
 import { fmt, markBootRead, pendingBootRead, refreshDictionary, setLanguage, storedLanguage, tr } from './modules/i18n.js';
 import { initOnboardingOverlay } from './modules/onboarding_overlay.js';
@@ -63,10 +69,31 @@ const navState = {
     projectsExpanded: true,
     mobileDrawerOpen: false,
 };
+// The one stack of layers over the room (layers.js): the drawer and the Project panel register here, so Escape,
+// the scrim, ×, the system Back and Telegram's Back all close exactly one layer, the top one.
+const layers = createLayerStack();
+// Loopback-only debug hook, like __ouroWs: browser tests read the stack through it.
+window.__ouroLayers = layers;
 const primarySidebar = document.getElementById('primary-sidebar');
+// The places come from the one registry (pages.js): Main into the pinned head, the tools into the foot that
+// follows the Projects, before the version. Nothing below looks a row up before this.
+primarySidebar?.querySelector('.sidebar-head')?.insertAdjacentHTML('beforeend', renderNavRows('head'));
+primarySidebar?.querySelector('.sidebar-foot-meta')?.insertAdjacentHTML('beforebegin', renderNavRows('foot'));
+const navProjectsHeader = primarySidebar?.querySelector('.nav-projects-header');
+if (navProjectsHeader) navProjectsHeader.innerHTML = renderProjectsHeader();
 const navDrawerBackdrop = document.getElementById('nav-drawer-backdrop');
 const projectPanelBackdrop = document.getElementById('project-panel-backdrop');
 const projectPanel = document.getElementById('project-panel');
+// The Project panel's header is the one page header (page_header.js): ☰ · name · status … ×. A Project is
+// named by its owner, not by the sidebar, so its name stays visible in every layout (owner Q3=A).
+projectPanel?.insertAdjacentHTML('afterbegin', renderPageHeader({
+    title: '',
+    titleId: 'project-panel-title',
+    named: false,
+    variant: 'project',
+    className: 'project-panel-bar project-inspector-header',
+    trailingHtml: `<button id="project-panel-close" class="shell-icon-control project-panel-close" type="button" title="Close project thread" aria-label="Close project thread">${SHELL_ICONS.close}</button>`,
+}));
 const projectPanelBody = document.getElementById('project-panel-body');
 const projectPanelTitle = document.getElementById('project-panel-title');
 const navProjects = document.getElementById('nav-projects');
@@ -74,6 +101,14 @@ const navProjectsToggle = document.getElementById('nav-projects-toggle');
 const navProjectsCount = document.getElementById('nav-projects-count');
 const navProjectsActivity = document.getElementById('nav-projects-activity');
 const navProjectsList = document.getElementById('nav-projects-list');
+// Collapsed, the list keeps the live Projects and the open one; the rest wait behind this one quiet row.
+const navProjectsShowAll = document.createElement('button');
+navProjectsShowAll.type = 'button';
+navProjectsShowAll.id = 'nav-projects-show-all';
+navProjectsShowAll.className = 'nav-row nav-projects-show-all';
+navProjectsShowAll.hidden = true;
+navProjectsShowAll.setAttribute('aria-controls', 'nav-projects-list');
+navProjectsList?.after(navProjectsShowAll);
 const projectInstances = new Map();
 const projectPaintRequests = new Map();
 // The question reveal the current showing is still making (revealProjectQuestion):
@@ -169,6 +204,14 @@ function syncNavigationState() {
         button.setAttribute('aria-expanded', drawerOpen ? 'true' : 'false');
     });
     if (navDrawerBackdrop) navDrawerBackdrop.hidden = !drawerOpen;
+    // In the stack layout the closed drawer is off screen: inert and out of the tab order.
+    if (primarySidebar) primarySidebar.inert = isStackLayout() && !drawerOpen;
+    // The drawer is a modal layer (its scrim stays live); the Project panel's layer, modal only where it covers the
+    // room (stack), is pushed below once the panel is shown.
+    if (drawerOpen) {
+        layers.push({ id: 'drawer', el: primarySidebar, modal: true, live: [navDrawerBackdrop].filter(Boolean),
+            onClose: () => setMobileDrawerOpen(false) });
+    } else layers.remove('drawer');
 
     document.querySelectorAll('[data-nav-page]').forEach((button) => {
         const isActive = !activeProjectId && button.dataset.navPage === state.activePage;
@@ -176,9 +219,8 @@ function syncNavigationState() {
         if (isActive) button.setAttribute('aria-current', 'page');
         else button.removeAttribute('aria-current');
     });
-    navProjectsToggle?.classList.toggle('active', Boolean(activeProjectId));
+    // One chosen row at a time: the open Project's row, never the Projects header (owner Q6).
     navProjectsToggle?.setAttribute('aria-expanded', navState.projectsExpanded ? 'true' : 'false');
-    navProjectsList.hidden = !navState.projectsExpanded;
     document.querySelectorAll('[data-project-id]').forEach((button) => {
         const isActive = button.dataset.projectId === activeProjectId;
         button.classList.toggle('active', isActive);
@@ -208,7 +250,20 @@ function syncNavigationState() {
         }
         document.body.classList.toggle('project-panel-open', Boolean(activeProjectId));
     }
+    // After the unhide, so focus can go into the panel when it opens.
+    if (activeProjectId) {
+        layers.push({ id: 'project', el: projectPanel, modal: isStackLayout(), live: [projectPanelBackdrop].filter(Boolean),
+            onClose: () => closeProjectPanel() });
+    } else layers.remove('project');
+    // Last: the open Project's row is marked, and a closed Project's focus is back on its row, which then stays.
+    syncProjectsCollapse();
 }
+
+// Crossing the switch: a drawer has no place in the docked layout; the Project layer changes its modality.
+onLayoutChange((layout) => {
+    if (layout === 'docked') navState.mobileDrawerOpen = false;
+    syncNavigationState();
+});
 
 document.querySelectorAll('[data-nav-page]').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -221,7 +276,17 @@ document.addEventListener('click', (event) => {
     setMobileDrawerOpen(!navState.mobileDrawerOpen);
 });
 navDrawerBackdrop?.addEventListener('click', () => setMobileDrawerOpen(false));
-hydrateNavIcons();
+// The drawer follows a finger (drawer_drag.js; DRAWER_DRAG switches it off); ☰ and × remain its controls.
+const disposeDrawerDrag = DRAWER_DRAG ? bindDrawerDrag({
+    sidebar: primarySidebar, scrim: navDrawerBackdrop,
+    isOpen: () => navState.mobileDrawerOpen, setOpen: (open) => setMobileDrawerOpen(open),
+    isStack: () => isStackLayout(), isCoarse: () => window.matchMedia('(pointer: coarse)').matches,
+}) : () => {};
+const navDrawerClose = document.getElementById('nav-drawer-close');
+if (navDrawerClose) {
+    navDrawerClose.innerHTML = SHELL_ICONS.close;
+    navDrawerClose.addEventListener('click', () => setMobileDrawerOpen(false));
+}
 
 // While a Project panel paints, Main defers first hydration (bounded in chat.js).
 let projectPanelOpeningSince = 0;
@@ -583,6 +648,42 @@ navProjectsToggle?.addEventListener('click', () => {
     navState.projectsExpanded = !navState.projectsExpanded;
     syncNavigationState();
 });
+navProjectsShowAll.addEventListener('click', () => {
+    navState.projectsExpanded = true;
+    syncNavigationState();
+});
+
+// Collapsed Projects keep what is alive (a Project whose dots show work running or waiting) and the open one; the
+// rest wait behind "Show all N" (docs/DESIGN.md "Shell"). Expanded, every row shows.
+function syncProjectsCollapse() {
+    if (!navProjectsList) return;
+    const collapsed = !navState.projectsExpanded;
+    const focused = document.activeElement;
+    navProjects?.toggleAttribute('data-collapsed', collapsed);
+    let total = 0;
+    let shown = 0;
+    for (const item of navProjectsList.children) {
+        if (!item.classList.contains('nav-project-item')) continue;
+        total += 1;
+        // A row under the keyboard or with its menu open stays until focus leaves it (the list's focusout below).
+        const keep = !collapsed || item.hasAttribute('data-live') || Boolean(item.querySelector('.nav-project-row.active'))
+            || item.contains(document.activeElement) || Boolean(item.querySelector('[aria-expanded="true"]'));
+        item.hidden = !keep;
+        if (keep) shown += 1;
+    }
+    navProjectsList.hidden = collapsed && shown === 0;
+    navProjectsShowAll.hidden = !collapsed || shown === total;
+    navProjectsShowAll.textContent = fmt('Show all {n}', { n: total });
+    navProjectsShowAll.setAttribute('aria-label', fmt('Show all {n} Projects', { n: total }));
+    // "Show all" hides itself as it expands the list: the keyboard goes on to the first row it revealed.
+    if (focused === navProjectsShowAll && navProjectsShowAll.hidden) {
+        navProjectsList.querySelector('.nav-project-item:not([hidden]) [data-project-id]')?.focus({ preventScroll: true });
+    }
+}
+// Focus leaving the Projects lets a row that stayed only for the keyboard go behind "Show all".
+navProjects?.addEventListener('focusout', (event) => {
+    if (!navProjects.contains(event.relatedTarget)) queueMicrotask(syncProjectsCollapse);
+});
 
 function renderProjectsNav(projects, projectChatIds, activityIndex = projectActivityIndex) {
     const all = projects || [];
@@ -659,6 +760,9 @@ function setActivityMarker(marker, summary) {
     marker.dataset.waiting = summary.waiting ? '1' : '0';
     marker.title = active ? label : '';
     marker.setAttribute('aria-hidden', 'true');
+    // A Project row whose dots show is live: a collapsed list keeps it.
+    const item = marker.closest?.('.nav-project-item');
+    if (item) item.toggleAttribute('data-live', active);
 }
 
 function setActivityOwnerName(owner, baseName, summary) {
@@ -687,6 +791,7 @@ function patchProjectActivityMarkers(activityIndex = projectActivityIndex) {
             : row._unread ? `${name} · Unread` : name;
         setActivityOwnerName(button, baseName, summary);
     }
+    syncProjectsCollapse();
 }
 
 // ACK exactly the revision painted. The server max-merges and clamps the cursor,
@@ -791,7 +896,7 @@ function paintProjectsNav() {
             const kebab = document.createElement('button');
             kebab.type = 'button';
             kebab.className = 'nav-project-kebab';
-            kebab.textContent = '⋯';
+            kebab.innerHTML = SHELL_ICONS.more;  // the shell's one ⋯ (page_icons.js)
             kebab.title = tr('project.kebab_title', 'Project actions');
             kebab.setAttribute('aria-label', fmt('Actions for {name}', { name: project.name || project.id }));
             kebab.addEventListener('click', (event) => {
@@ -816,7 +921,8 @@ function paintProjectsNav() {
             trailing = kebab;
         }
         if (project.id === navState.activeProjectId) btn.classList.add('active');
-        if (!deleting) btn.addEventListener('click', () => openProjectPanel(project));
+        // Pressing a row opens its Project; pressing the open one again keeps it open (like every reference).
+        if (!deleting) btn.addEventListener('click', () => openProjectPanel(project, { openOnly: true }));
         item.append(btn, trailing);
         navProjectsList.appendChild(item);
     }
@@ -885,7 +991,7 @@ window.addEventListener('ouro:open-project', (event) => {
 
 // Resizable side sections: edge drag-handles write --sidebar-width /
 // --project-panel-width on :root and persist (debounced) to /api/ui/preferences.
-// Disabled under the mobile drawer breakpoint. Width 0 = keep the CSS default.
+// Disabled in the stack layout (layout.js). Width 0 = keep the CSS default.
 // CW10 note: the DEVELOPMENT.md "no inline styles in JS" rule targets static styling
 // that belongs in a stylesheet — the drag's transient `userSelect:none` was that, and
 // is now the `.resizing-panels` class. Setting a custom property (`--sidebar-width`)
@@ -905,16 +1011,21 @@ function setupResizablePanels(prefs) {
     };
     if (Number(prefs?.sidebar_width) > 0) root.style.setProperty('--sidebar-width', `${prefs.sidebar_width}px`);
     if (Number(prefs?.project_panel_width) > 0) root.style.setProperty('--project-panel-width', `${prefs.project_panel_width}px`);
-    const isMobile = () => window.matchMedia('(max-width: 980px)').matches;
     const makeHandle = (target, cssVar, dir, prefKey, min, max) => {
         if (!target) return;
         const handle = document.createElement('div');
         handle.className = `resize-handle resize-handle-${dir}`;
         handle.title = 'Drag to resize';
         target.appendChild(handle);
-        let startX = 0, startW = 0, dragging = false;
+        let startX = 0, startW = 0, dragging = false, frame = 0, wanted = 0;
+        // One write per displayed frame: a mouse reports more often than the screen draws, and each write relays out
+        // the room.
+        const apply = () => {
+            frame = 0;
+            root.style.setProperty(cssVar, `${wanted}px`);
+        };
         handle.addEventListener('pointerdown', (e) => {
-            if (isMobile()) return;  // mobile uses the drawer, not a resizable column
+            if (isStackLayout()) return;  // the stack layout has a drawer, not a resizable column
             dragging = true; startX = e.clientX; startW = target.getBoundingClientRect().width;
             try { handle.setPointerCapture(e.pointerId); } catch {}
             document.body.classList.add('resizing-panels');  // CW10: class, not inline style
@@ -923,15 +1034,18 @@ function setupResizablePanels(prefs) {
         handle.addEventListener('pointermove', (e) => {
             if (!dragging) return;
             const delta = dir === 'right' ? (e.clientX - startX) : (startX - e.clientX);
-            const w = Math.max(min, Math.min(max, Math.round(startW + delta)));
-            root.style.setProperty(cssVar, `${w}px`);
+            wanted = Math.max(min, Math.min(max, Math.round(startW + delta)));
+            if (!frame) frame = requestAnimationFrame(apply);
         });
         const end = (e) => {
             if (!dragging) return;
+            if (frame) { cancelAnimationFrame(frame); apply(); }
             dragging = false; document.body.classList.remove('resizing-panels');  // CW10
             try { handle.releasePointerCapture(e.pointerId); } catch {}
-            const cur = parseInt(getComputedStyle(root).getPropertyValue(cssVar), 10) || 0;
-            persist({ [prefKey]: cur });
+            // Keep the width that is shown: a Project panel dragged past the content area's edge stops at it.
+            const shown = Math.round(target.getBoundingClientRect().width) || 0;
+            root.style.setProperty(cssVar, `${shown}px`);
+            persist({ [prefKey]: shown });
         };
         handle.addEventListener('pointerup', end);
         handle.addEventListener('pointercancel', end);
@@ -998,11 +1112,16 @@ initUpdateStatus(ctx);
 initOnboardingOverlay();
 
 const disposeScrollFades = Array.from(document.querySelectorAll('.scroll-fade-y'), bindScrollFade);
+// Inside Telegram the host's chrome follows the shell (host_telegram.js); a no-op elsewhere.
+const telegramHost = createTelegramHost({ layers });
+telegramHost.bind();
 window.addEventListener('pagehide', (event) => {
     if (event.persisted) return;
     disposeEvolution();
     disposeStorage?.destroy();
     disposeScrollFades.forEach((dispose) => dispose());
+    telegramHost.dispose();
+    disposeDrawerDrag();
 });
 loadVersion();
 syncNavigationState();
@@ -1120,7 +1239,7 @@ if (hashPage && hashPage !== state.activePage) showPage(hashPage);
 
     const updateVvh = () => {
         const h = viewportHeight();
-        if (window.innerWidth <= 640) {
+        if (isStackLayout()) {
             vvhStyle.textContent = ':root{--vvh:' + Math.max(320, Math.ceil(h)) + 'px}';
             if (!focusedKeyboardEditable()) {
                 applyKeyboardState(false);

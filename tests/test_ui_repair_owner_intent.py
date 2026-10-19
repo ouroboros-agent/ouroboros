@@ -1,4 +1,4 @@
-"""Repair and run: real UI ingress, managed worker, review and installed execution."""
+"""Ask Ouroboros to fix: real UI ingress, managed worker, review and installed execution."""
 
 from __future__ import annotations
 
@@ -85,17 +85,16 @@ def test_repair_button_records_owner_intent_and_runs_the_installed_skill(tmp_pat
                 browser = pw.chromium.launch(headless=True)
                 try:
                     page = browser.new_page(viewport={"width": 1280, "height": 850})
-                    page.route("**/api/marketplace/ouroboroshub/catalog*", lambda route: route.fulfill(json={"results": []}))
                     page.goto(server.base_url + "/#skills")
                     card = page.locator(f'.skills-card[data-skill="{name}"]')
-                    card.get_by_role("button", name="Repair and run", exact=True).wait_for()
+                    card.get_by_role("button", name="Ask Ouroboros to fix", exact=True).wait_for()
                     page.screenshot(path=str(evidence / "repair-and-run-card.png"))
-                    card.get_by_role("button", name="Repair and run", exact=True).click()
+                    card.get_by_role("button", name="Ask Ouroboros to fix", exact=True).click()
                     dialog = page.get_by_role("dialog")
-                    assert "stays running" in dialog.inner_text()
+                    assert "turns it on when it is ready" in dialog.inner_text()
                     page.screenshot(path=str(evidence / "repair-and-run-confirmation.png"))
                     with page.expect_request("**/api/command") as command:
-                        dialog.get_by_role("button", name="Repair and run", exact=True).click()
+                        dialog.get_by_role("button", name="Ask Ouroboros", exact=True).click()
                     request = command.value.post_data_json
                     assert "visible_text" not in request
                     assert request["task_constraint"]["allow_enable"] is False

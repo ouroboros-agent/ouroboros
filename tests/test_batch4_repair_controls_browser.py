@@ -264,7 +264,7 @@ def test_hard_bound_continue_reason_on_real_collapsed_chat_cards(tmp_path, monke
                     for card in cards.values():
                         expect(card).to_have_count(1)
                         if card.get_attribute('data-expanded') == '1':
-                            card.locator('[data-live-summary-button]').click()
+                            card.locator('[data-live-disclosure]').click()
                     page.screenshot(path=str(evidence / f'continue-{engine}-{width}-room{room}.png'))
                     for kind in ('budget', 'expired'):
                         cards[kind].screenshot(path=str(evidence / f'continue-{engine}-{width}-room{room}-{kind}.png'))

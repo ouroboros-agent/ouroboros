@@ -39,7 +39,7 @@ def test_ui_project_completion_pointer_keeps_project_history_scoped(direct_serve
     task_id = "tower-root-1"
     append_jsonl(logs / "chat.jsonl", {
         "ts": "2026-08-22T10:00:00+00:00", "direction": "out", "chat_id": 1,
-        "user_id": 1, "text": f"{target_label} · Completed\nOpen the Project for details.",
+        "user_id": 1, "text": f"{target_label} · Completed",
         "type": "project_completion_summary", "task_id": task_id,
         "project_id": project["id"], "project_name": project["name"],
         "target_label": target_label, "status": "completed",
@@ -73,9 +73,9 @@ def test_ui_project_completion_pointer_keeps_project_history_scoped(direct_serve
                 summary.wait_for(state="visible", timeout=30_000)
                 summary_text = summary.inner_text()
                 assert target_label in summary_text
-                # The Main row is a pointer: one status word and the shared cause sentence,
-                # never the answer excerpt (owner Q5=A); the answer stays in the Project.
-                assert "Open the Project for details." in summary_text
+                # The Main row is a pointer: one status line (and a cause sentence when there is one),
+                # never the answer excerpt (owner Q5=A) and no invitation: its Project reference is the door.
+                assert summary.locator(".message").inner_text().strip() == f"{target_label} · Completed"
                 assert "Release shipped." not in summary_text
                 # The row points at its Project with the one reference: the Project's name, never a
                 # button of its own and never the raw id.
@@ -100,7 +100,7 @@ def test_ui_project_completion_pointer_keeps_project_history_scoped(direct_serve
                 task_card = panel.locator(f'.chat-live-card[data-task-id="{task_id}"]')
                 task_card.wait_for(state="visible", timeout=10_000)
                 assert task_card.locator(".chat-live-phase").inner_text().strip() == "Done"
-                task_card.locator("[data-live-summary-button]").click()
+                task_card.locator("[data-live-disclosure]").click()
                 task_card.get_by_text(
                     "Project progress: nested delegation is running.",
                     exact=False,
@@ -143,15 +143,15 @@ def test_ui_project_completion_mirror_is_an_ordinary_folded_message(direct_serve
             "project_id": project["id"], "project_name": project["name"], "status": "completed"}
     append_jsonl(logs / "chat.jsonl", {
         **base, "ts": "2026-08-22T10:00:00+00:00", "task_id": "root-long",
-        "text": "P › Long · Done\nOpen the Project for details.", "target_label": "P › Long",
+        "text": "P › Long · Done", "target_label": "P › Long",
         "completion_answer": _LONG_ANSWER})
     append_jsonl(logs / "chat.jsonl", {
         **base, "ts": "2026-08-22T10:01:00+00:00", "task_id": "root-short",
-        "text": "P › Short · Done\nOpen the Project for details.", "target_label": "P › Short",
+        "text": "P › Short · Done", "target_label": "P › Short",
         "completion_answer": "All good, nothing to report."})
     append_jsonl(logs / "chat.jsonl", {
         **base, "ts": "2026-08-22T10:02:00+00:00", "task_id": "root-pointer", "status": "failed",
-        "text": "P › Broken · Failed\nOpen the Project for details.", "target_label": "P › Broken"})
+        "text": "P › Broken · Failed", "target_label": "P › Broken"})
 
     try:
         with sync_playwright() as pw:
@@ -189,7 +189,7 @@ def test_ui_project_completion_mirror_is_an_ordinary_folded_message(direct_serve
                 # The ending without an answer is still the System pointer, and it points at the
                 # Project with the SAME control as the answered ones: a row's voice never picks it.
                 assert "system" in pointer.get_attribute("class").split()
-                assert "Open the Project for details." in pointer.inner_text()
+                assert pointer.locator(".message").inner_text().strip() == "P › Broken · Failed"
                 shapes = [row.locator('[data-intent="open-project"]').evaluate(
                     "n => [n.className, n.getAttribute('aria-label'), [...n.children].map(c => c.className).join(' ')]")
                     for row in (long_row, pointer)]
@@ -229,7 +229,7 @@ def test_ui_project_completion_mirror_folds_after_mounting_on_a_hidden_page(dire
         "direction": "system", "chat_id": 1, "user_id": 1, "type": "project_completion_summary",
         "project_id": project["id"], "project_name": project["name"], "status": "completed",
         "ts": "2026-08-22T11:00:00+00:00", "task_id": f"root-hidden-{engine}",
-        "text": "Hidden mount › Long · Done\nOpen the Project for details.",
+        "text": "Hidden mount › Long · Done",
         "target_label": "Hidden mount › Long", "completion_answer": _LONG_ANSWER})
 
     try:
@@ -281,7 +281,7 @@ def test_ui_project_completion_mirror_has_one_project_door(direct_server_with_da
         "direction": "system", "chat_id": 1, "user_id": 1, "type": "project_completion_summary",
         "project_id": project["id"], "project_name": project["name"], "status": "completed",
         "ts": "2026-08-22T12:00:00+00:00", "task_id": "mirror-door",
-        "text": "Long report · Done with warnings\nOpen the Project for details.",
+        "text": "Long report · Done with warnings",
         "completion_answer": answer, "completion_reason": "Windows verification was not performed.",
         "terminal_time": {"v": 1, "source": "executor_terminal", "occurred_at": "2026-08-22T11:59:00Z"}})
     tab = "Alt+Tab" if engine == "webkit" else "Tab"
@@ -305,8 +305,11 @@ def test_ui_project_completion_mirror_has_one_project_door(direct_server_with_da
                 assert message.locator('[data-fold-stop]').count() == 1
                 assert message.locator('a').evaluate_all('ns => ns.every(n => n.tabIndex === -1)')
                 expect(row.locator('.project-answer-limitation')).to_have_text('Windows verification was not performed.')
-                assert row.locator(':scope > .msg-provenance').count() == 2
-                assert row.locator('.msg-time').inner_text()
+                # The caveat is the one note; the row's own time is its one compact time line (owner 17.10, Q7 A):
+                # it ended a minute before it was added, so both facts, the full instants in its title.
+                assert row.locator(':scope > .msg-provenance').count() == 1
+                assert re.fullmatch(r'Ended .+ · added .+', row.locator('.msg-time [aria-hidden="true"]').inner_text())
+                assert (row.locator('.msg-time').get_attribute('title') or '').startswith('Task ended ')
                 assert row.locator('.system-message-actions').locator('button').count() == 1
                 row.screenshot(path=str(evidence / f'{stage}.png'))
                 if stage == 'history':

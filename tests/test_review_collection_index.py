@@ -293,16 +293,18 @@ def test_combined_upgrade_keeps_question_duty_and_lazy_review_selection(tmp_path
             assert txn.body_text(tid) == raw and txn.row(tid, "write_seq") == 1
             assert txn.row(tid, "review_collection_pending") == (0 if shape == "review-v2" else None)
     assert set(obligations.members(tmp_path, "owner_questions")) == {"asked"}
-    assert "owner_questions" in obligations.DUTY_SETS
-    assert "review_collection_pending" not in {*store.FLAG_COLUMNS.values(), *obligations.DUTY_SETS}
-    # A conservative selector alone, even 1, grants no new authority to block packing.
+    assert "review_collection_pending" not in store.FLAG_COLUMNS.values()
+    # The upgraded rows pack (NULL or 0: no body with the selector recorded an open review); the
+    # owner-question duty grants no authority to block packing. A selector of 1 does, and only because
+    # it names a review that may still read the task's loose handles (evidence pack idiom).
+    with store.open_store(tmp_path, write=False) as txn:
+        assert evidence_packs.task_packable(txn, "quiet") and evidence_packs.task_packable(txn, "asked")
     with store.open_store(tmp_path, write=True) as txn:
         txn.conn.execute("UPDATE tasks SET review_collection_pending=1 WHERE task_id='quiet'")
-    assert evidence_packs.task_settled(tmp_path, "quiet")
-    assert not evidence_packs.task_settled(tmp_path, "asked")
+    with store.open_store(tmp_path, write=False) as txn:
+        assert not evidence_packs.task_packable(txn, "quiet") and evidence_packs.task_packable(txn, "asked")
     task_store.patch_document(tmp_path, "asked", lambda row: {**row, "owner_quiz": {"q": {"state": "closed"}}})
     assert obligations.members(tmp_path, "owner_questions") == {}
-    assert evidence_packs.task_settled(tmp_path, "asked")
 
 
 @pytest.mark.parametrize("shape", _SCHEMA_SHAPES)

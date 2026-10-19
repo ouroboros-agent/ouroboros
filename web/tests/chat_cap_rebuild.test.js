@@ -359,7 +359,7 @@ test('live overflow cleanup preserves every retained archive card and its DOM no
     const { instance, handlers, messages } = makeInstance(mount);
     try {
         await sync(instance, 1);
-        const button = created.find(node => node.className === 'chat-load-older-btn');
+        const button = created.find(node => node.classList?.contains?.('chat-load-older-btn'));
         assert.ok(button && !button.hidden);
         await button.listeners.get('click')[0]();
         assert.equal(new URL(calls.at(-1), 'http://local').searchParams.get('cursor'), 'opaque-older');

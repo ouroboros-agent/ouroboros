@@ -1339,7 +1339,7 @@ for (const order of ['final-first', 'done-first', 'cold']) {
             assert.equal(card.querySelector('[data-live-title]').textContent, 'Task activity');
             assert.match(card.querySelector('[data-live-meta]').innerHTML, /2 tool calls/);
             assert.match(card.querySelector('[data-live-meta]').innerHTML, /model-b/);
-            if (card.dataset.expanded !== '1') card.querySelector('[data-live-summary-button]').listeners.get('click')[0]({ detail: 0 });
+            if (card.dataset.expanded !== '1') card.querySelector('[data-live-disclosure]').listeners.get('click')[0]({ detail: 0 });
             const nodes = (node) => [node, ...node.children.flatMap(nodes)];
             const notes = nodes(card).filter((n) => n.classList.contains('chat-live-line') && n.classList.contains('done'));
             assert.equal(notes.length, 1);

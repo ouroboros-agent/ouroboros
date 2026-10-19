@@ -226,11 +226,11 @@ def _presentation(page, feed, task_id, answer, case, project, *, managed=False):
         if case == "unfinished_stop":
             assert card.locator(":scope > [data-live-summary-button] [data-live-phase]").inner_text() == "Failed"
             if card.get_attribute("data-expanded") != "1":
-                card.locator(":scope > [data-live-summary-button]").click()
+                card.locator(":scope > [data-live-summary-button] [data-live-disclosure]").click()
             assert _STOP_REASON in card.inner_text()
         if case == "invalid_finish":
             if card.get_attribute("data-expanded") != "1":
-                card.locator(":scope > [data-live-summary-button]").click()
+                card.locator(":scope > [data-live-summary-button] [data-live-disclosure]").click()
             fold = card.locator(':scope > [data-live-timeline] > .chat-live-line.expandable').filter(has_text="1 tool call · 1 error")
             fold.wait_for(state="visible", timeout=30000)
             if fold.get_attribute("data-expanded") != "1":
@@ -437,7 +437,7 @@ def test_unfinished_project_parent_preserves_running_child_and_full_output(
                         for card in (parent, child_card):
                             card.wait_for(state="attached", timeout=30000)
                             if card.get_attribute("data-expanded") != "1":
-                                card.locator(":scope > [data-live-summary-button]").click()
+                                card.locator(":scope > [data-live-summary-button] [data-live-disclosure]").click()
                         # The authored result precedes its lifecycle notification;
                         # the latter may repeat an explicitly shortened [RESULT].
                         line = child_card.locator(":scope > [data-live-timeline] > .chat-live-line.expandable").filter(has_text="CHILD_OUTPUT_HEAD").first

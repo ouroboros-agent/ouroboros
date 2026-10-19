@@ -945,7 +945,7 @@ def _presence_work_view(
                      "code": "presence_work_not_found", "disposition": "rejected"}
     from ouroboros.presence_recovery import retained_work_view
 
-    return retained_work_view(stored, work_ref)
+    return retained_work_view(stored, work_ref, ctx.data_dir)
 
 
 async def _api_presence_work(request: Request) -> JSONResponse:

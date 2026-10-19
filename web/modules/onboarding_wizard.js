@@ -18,6 +18,7 @@ import { PROCESSING_PREFERENCE_KEY, MODEL_PROCESSING_PREFERENCES_KEY, processing
 import { MODEL_CATALOG_TIMEOUT_MS, mergeModelCatalog, catalogReadState, summarizeReadErrors } from './settings_catalog.js';
 import { accountRows } from './claudexor_status_store.js';
 import { accountRowFacts } from './harness_accounts.js';
+import { createStarterSkillsRow } from './onboarding_starter_skills.js';
 
 (() => {
         // The served wizard document needs its own menu-key binding.
@@ -111,6 +112,7 @@ import { accountRowFacts } from './harness_accounts.js';
     let catalogGeneration = 0;
     const stepScrollPositions = new Map();
     let suggestedVisionModel = null;
+    const starterSkills = createStarterSkillsRow(); // the Summary's Starter skills row keeps its ticks across renders
     const modelRoles = createModelRolesEditor({ hostId: 'onboarding-model-roles', onChange: (settings, { slot } = {}) => {
         if (slot === 'vision') suggestedVisionModel = null;
         adoptModelSettings(settings);
@@ -970,7 +972,7 @@ import { accountRowFacts } from './harness_accounts.js';
     }
 
     function refreshSummary() {
-        const summary = root.querySelector('.summary-card');
+        const summary = root.querySelector('.summary-card-rows');
         if (summary) summary.innerHTML = summaryRowsHtml();
         syncCurrentStepActionState();
     }
@@ -983,7 +985,7 @@ import { accountRowFacts } from './harness_accounts.js';
                     <p class="step-copy">${escapeHtml(STEP_META.summary.copy)}</p>
                 </div>
             </div>
-            <div class="summary-card">${summaryRowsHtml()}</div>
+            <div class="summary-card"><div data-starter-skills></div><div class="summary-card-rows">${summaryRowsHtml()}</div></div>
             ${state.reviewEnforcement === 'blocking' && trim(state.runtimeMode) !== 'cyber_pro' && packetOnlyReviewPool(catalogDraft())
                 ? `<div class="wizard-inline-note" data-tone="warn" data-review-pool-warning>${escapeHtml(PACKET_ONLY_POOL_WARNING)}</div>` : ''}
             ${languageBlockHtml({ onboarding: true })}
@@ -1081,6 +1083,7 @@ import { accountRowFacts } from './harness_accounts.js';
             </div>
         `;
         bindEvents();
+        starterSkills.mount(root.querySelector('[data-starter-skills]'));
         disposeLanguage?.();   // the Language block lives on the summary step only; its binder owns its listeners
         disposeLanguage = state.currentStep === 'summary' && !state.completedRestartMode ? bindLanguageSettings(root, { staged: state.languageChoice, stage: (value) => { state.languageChoice = value; } }) : null;
         renderLocalStatus();
@@ -1512,9 +1515,11 @@ import { accountRowFacts } from './harness_accounts.js';
             // Completion validates this visible draft and never replaces it.
             OUROBOROS_SUBAGENTS: catalogDraft(),
             ...(agentsStep?.allowEmptyReviewPool ? { [ALLOW_EMPTY_REVIEW_POOL]: true } : {}),
+            ...starterSkills.payload(),
         };
         try {
             await saveWizardPayload(payload);
+            starterSkills.destroy();
         } catch (error) {
             // The wizard STAYS OPEN with the real reason. A typed preset refusal
             // wrote nothing, so the offered escape is honest: finish without the
@@ -1578,6 +1583,7 @@ import { accountRowFacts } from './harness_accounts.js';
         catalogGeneration += 1;
         catalogRequest?.controller.abort();
         modelRoles.destroy();
+        starterSkills.destroy();
     });
     render();
 })();

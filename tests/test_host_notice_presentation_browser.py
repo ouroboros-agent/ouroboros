@@ -205,7 +205,7 @@ def test_late_review_row_reads_in_words_and_downloads_its_record(direct_server_w
             card = page.locator(f'.chat-live-card[data-task-id="{ctx.task_id}"]')
             card.wait_for(state="visible")
             _emit_ws_frame(page, _late_row(ctx.task_id, note, evidence))
-            card.locator("[data-live-summary-button]").click()
+            card.locator("[data-live-disclosure]").click()
             row = card.locator(".chat-live-line", has_text="reviewers later passed it.")
             row.wait_for(state="visible")
             text = row.inner_text()
@@ -258,7 +258,7 @@ def test_late_review_row_reads_in_words_and_downloads_its_record(direct_server_w
             replayed_card = page.locator(f'.chat-live-card[data-task-id="{ctx.task_id}"]')
             replayed_card.wait_for(state="visible")
             if replayed_card.get_attribute("data-expanded") != "1":
-                replayed_card.locator("[data-live-summary-button]").click()
+                replayed_card.locator("[data-live-disclosure]").click()
             replayed = replayed_card.locator(".chat-live-line", has_text="reviewers later passed it.")
             replayed.wait_for(state="visible")
             replayed_link = replayed.get_by_role("link", name="Download the review record")
@@ -347,7 +347,7 @@ def test_settled_no_verdict_panel_heads_in_words_and_keeps_degraded_in_detail(di
             card = page.locator(f'.chat-live-card[data-task-id="{ctx.task_id}"]')
             card.wait_for(state="visible")
             if card.get_attribute("data-expanded") != "1":
-                card.locator("[data-live-summary-button]").click()
+                card.locator("[data-live-disclosure]").click()
             card.locator("[data-review-section-toggle]").click()
             meta = card.locator(".chat-review-group-meta")
             meta.wait_for(state="visible")

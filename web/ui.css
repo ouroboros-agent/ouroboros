@@ -50,7 +50,6 @@
     --accent-35: rgba(201, 53, 69, 0.35);
     --accent-45: rgba(201, 53, 69, 0.45);
     --accent-55: rgba(201, 53, 69, 0.55);
-    --accent-65: rgba(201, 53, 69, 0.65);
     /* Project identity (vivid fuchsia): a converted task card, its sidebar marker,
        and the project panel header share this so "this is a project" reads as a
        deliberate state — never the red task accent (looked like an error, P3) and
@@ -196,7 +195,6 @@
     /* App shell: persistent desktop sidebar + optional project detail pane. */
     --sidebar-width: 280px;
     --project-panel-width: clamp(340px, 36vw, 440px);
-    --nav-item-radius: 10px;
     /* One hover fill for an item in a popup menu or a picker list. Six menus
        used five different fills (0.04 / 0.06 / 0.08 / an accent tint / an
        undeclared --surface-2), so the same gesture looked like a different
@@ -220,7 +218,6 @@
        share of the visual viewport height below, so the navigation column keeps
        its height whatever the project count. Distinct from the fixed Updates
        window above: one is a page-local list, this one follows the viewport. */
-    --nav-projects-list-max-height: calc(var(--vvh) * 0.38);
     /* Chat media (DESIGN "Chat attachments"): a whole single photo keeps its own
        ratio up to this height, a bubble carrying several media stops at this
        width, and a staged composer file shows a thumbnail of this size. */
@@ -230,9 +227,36 @@
     --chat-photo-min-box: calc(var(--touch-target-min) + 14px);
     --chat-media-bubble-max: 520px;
     --chat-attach-thumb-size: 28px;
-    /* The smallest comfortable touch target for a coarse pointer (a phone). */
+    /* The smallest comfortable touch target; a coarse pointer (a phone) raises it to a finger's 44px (below). */
     --touch-target-min: 36px;
+    /* The hit extension's inset (the recipe below): out only on the sides that fall short of the touch minimum. The
+       percentage resolves where it is used, against the control's own box. */
+    --ui-hit-inset: min(0px, calc((100% - var(--touch-target-min)) / 2));
     --vvh: 100dvh;
+    /* The shell's insets (DESIGN "Shell"): the system's safe area, reported by the browser as env() and inside
+       Telegram as --tg-safe-area-inset-* (the SDK writes them inline; host_telegram.js mirrors its object; the same
+       inset, so the larger wins, never the sum), plus Telegram's own controls over the content
+       (--tg-content-safe-area-inset-*). Outside Telegram the Telegram tokens rest at 0. */
+    --tg-safe-area-inset-top: 0px;
+    --tg-safe-area-inset-bottom: 0px;
+    --tg-content-safe-area-inset-top: 0px;
+    --tg-content-safe-area-inset-bottom: 0px;
+    --inset-top: calc(max(env(safe-area-inset-top, 0px), var(--tg-safe-area-inset-top)) + var(--tg-content-safe-area-inset-top));
+    --inset-bottom: calc(max(env(safe-area-inset-bottom, 0px), var(--tg-safe-area-inset-bottom)) + var(--tg-content-safe-area-inset-bottom));
+    /* The shell's stacking order (DESIGN "Shell"), lowest first: Main's floating header, the sidebar column and
+       its resize handle, the Project panel over the content area (its scrim beneath it; the stack layout's
+       full-width Project a step above), the drawer (its scrim beneath it), the chat header's menu; popovers
+       (.ui-popup) stay the top of everything. */
+    --z-page-header: 5;
+    --z-sidebar: 10;
+    --z-resize-handle: 20;
+    --z-project-scrim: 55;
+    --z-project-panel: 58;
+    --z-project-layer: 60;
+    --z-drawer-scrim: 68;
+    --z-drawer: 70;
+    --z-header-menu: 90;
+    --z-popover: 1200;
     /* Quote panel glass (DESIGN "Replies"): the shell colour at one alpha, so a quote reads lighter than the bubble it sits in. */
     --quote-glass: rgba(var(--shell-rgb), 0.7);
 }
@@ -444,7 +468,7 @@
 
 
 .ui-chip,
-:where(.status-badge, .skills-status-chip, .mcp-server-status, .evo-runtime-pill, .evo-runtime-chip) {
+:where(.status-badge, .mcp-server-status, .evo-runtime-pill, .evo-runtime-chip) {
     display: inline-flex;
     align-items: center;
     gap: 6px;
@@ -459,7 +483,7 @@
 }
 
 .ui-status,
-:where(.settings-inline-status, .marketplace-status, .wizard-runtime-status) {
+:where(.settings-inline-status, .wizard-runtime-status) {
     color: var(--text-secondary);
     font-size: var(--type-meta);
     line-height: var(--line-meta);
@@ -474,8 +498,8 @@
        and make the loudest thing on the panel the one that says "connected".
      - `.ui-chip[data-tone]` — a status CHIP: the full triple, because the chip
        itself is the status and has nothing else to carry it.
-   Tone is a STATE and must outrank the `.muted` utility: `#mp-status` carries
-   both classes, so a :where()-wrapped tone (specificity 0) would lose to it. */
+   Tone is a STATE and must outrank the `.muted` utility: a status that carries
+   both classes would lose to it under a :where()-wrapped tone (specificity 0). */
 .ui-chip[data-tone="ok"] {
     color: var(--status-ok-fg);
     background: var(--status-ok-bg);
@@ -501,25 +525,21 @@
 
 .ui-status[data-tone="ok"],
 .settings-inline-status[data-tone="ok"],
-.settings-test-result[data-tone="ok"],
-.marketplace-status[data-tone="ok"] { color: var(--status-ok-fg); }
+.settings-test-result[data-tone="ok"] { color: var(--status-ok-fg); }
 .ui-status[data-tone="warn"],
 .settings-inline-status[data-tone="warn"],
-.settings-test-result[data-tone="warn"],
-.marketplace-status[data-tone="warn"] { color: var(--status-warn-fg); }
+.settings-test-result[data-tone="warn"] { color: var(--status-warn-fg); }
 .ui-status[data-tone="danger"],
 .ui-status[data-tone="error"],
 .settings-inline-status[data-tone="danger"],
 .settings-inline-status[data-tone="error"],
 .settings-test-result[data-tone="danger"],
-.settings-test-result[data-tone="error"],
-.marketplace-status[data-tone="danger"] { color: var(--status-error-fg); }
+.settings-test-result[data-tone="error"] { color: var(--status-error-fg); }
 /* `muted` is a tone the code emits but no rule named. */
 .ui-status[data-tone="neutral"],
 .ui-status[data-tone="muted"],
 .settings-inline-status[data-tone="neutral"],
-.settings-inline-status[data-tone="muted"],
-.marketplace-status[data-tone="muted"] { color: var(--status-neutral-fg); }
+.settings-inline-status[data-tone="muted"] { color: var(--status-neutral-fg); }
 
 /* Status sentences share one dot anatomy in every consumer. */
 .ui-status[data-tone]:not(:empty)::before,
@@ -619,7 +639,7 @@ textarea.ui-control { resize: vertical; }
     max-height: var(--ui-popup-max-height);
     overflow-y: auto;
     overscroll-behavior: contain;
-    z-index: 1200;
+    z-index: var(--z-popover);
 }
 .ui-model-chooser { display: block; min-width: 0; }
 .ui-model-chooser > .ui-control { width: 100%; }
@@ -703,9 +723,24 @@ textarea.ui-control { resize: vertical; }
    backing (Main: `.chat-page-header::before`), and what a bar discloses unfolds from the bar's bottom edge as one
    Shade (room_work.css), never as a box glued to one control or one group. */
 @media (pointer: coarse) {
-    /* A coarse pointer (a phone) raises the whole family together to the shared touch minimum. */
-    :root { --chrome-control-h: var(--touch-target-min); }
+    /* A coarse pointer (a phone) raises the shared touch minimum to a finger's 44px, and the whole family with it. */
+    :root { --touch-target-min: 44px; --chrome-control-h: var(--touch-target-min); }
 }
+/* ---- Touch hit extension ----------------------------------------------------------------------------------------
+   A small control keeps its look and, under a finger, gains an invisible hit area centred on it and at least the
+   touch minimum each way: the pseudo-element reaches out only on the sides that fall short (a 32px-tall capsule
+   gains 6px above and below, nothing sideways). Composition keeps at least that overshoot between neighbouring
+   controls, so hit areas never overlap (the composer rows part by --space-2). The one recipe, inset by the one
+   --ui-hit-inset; controls add the class, and style.css gives a page's links the same extension. */
+.ui-hit-area { position: relative; }
+@media (pointer: coarse) {
+    .ui-hit-area::after {
+        content: "";
+        position: absolute;
+        inset: var(--ui-hit-inset);
+    }
+}
+
 .ui-chrome-group {
     position: relative;
     box-sizing: border-box;

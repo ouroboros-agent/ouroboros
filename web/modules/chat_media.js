@@ -818,7 +818,7 @@ export function createChatMedia({
         if (!bubble || !String(rawText || '')) return null;
         const button = document.createElement('button');
         button.type = 'button';
-        button.className = 'chat-message-copy';
+        button.className = 'chat-message-copy ui-hit-area';
         button.innerHTML = COPY_ICON_SVG;
         button.title = tr('code.copy', 'Copy');
         button.setAttribute('aria-label', tr('media.copy_message', 'Copy message'));

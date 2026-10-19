@@ -460,7 +460,7 @@ test('R2 only fresh connected child activity releases disconnect uncertainty; re
         fx.state.census = { active_chat_activities: [root], active_chat_activities_complete: true, supervisor_ready: true };
         fx.open(); await fx.instance.refreshHistory({ revision: 1 }); await fx.settle();
         const replayed = fx.card('child');
-        if (replayed.dataset.expanded !== '1') replayed.querySelector('[data-live-summary-button]').listeners.get('click')[0]({});
+        if (replayed.dataset.expanded !== '1') replayed.querySelector('[data-live-disclosure]').listeners.get('click')[0]({});
         const rendered = node => [node.textContent, node.innerHTML, ...node.children.map(rendered)].join(' ');
         assert.match(rendered(replayed), /Retained history-only child evidence/,
             'the negative control must have admitted and rendered the historical row');

@@ -8,7 +8,8 @@ that owes it. The owner-held sets (``custody_open``, closing custody receipts of
 sets, ``unknowns``, witnesses) are rows of the ``obligations`` table. ``members``
 reads both halves in one transaction; no set is a file any more (the importer
 reads the old set files once, the exporter writes them back for an older body).
-Every set owes work except the declared ``RECORD_SETS``, which are kept facts.
+Each set is owed to, and retired by, its own owner; no reader derives a global
+settlement from them (the evidence packer packs a task once its row is terminal).
 
 A periodic duty passes over its members through ``DutyRest``: a member it cannot
 progress now gets a typed outcome in the ``duty_rest`` record set, and the next pass
@@ -27,17 +28,7 @@ from ouroboros.store import StoreError
 BOOT_SETS = ("nonterminal", "synthesis", "terminal_projection", "delegated_runs",
              "promotions", "custody_open", "pending_drives", "upgrade_notices", "unknowns",
              "pause_notices", "pause_notice_receipts", "owner_questions")
-# Owed work: a task with a row here is not settled (the evidence packer's predicate). A stored set declared
-# in neither tuple owes too (an older or newer body's duty, an imported set file): an unknown duty never packs.
-DUTY_SETS = ("nonterminal", "synthesis", "terminal_projection", "delegated_runs", "promotions", "custody_open",
-             "pending_drives", "unknowns", "pause_notices", "local_custody_witnesses", "owner_questions",
-             "late_review_marks")
-# Kept facts, never owed: chat notice receipts, custody marks, definite start refusals, duty rests and the
-# delegated invocation records (``delegate_invocation``: an invocation's first request and last start, the
-# first request of an operation/slot, each custody event's order); owed custody work is ``custody_open``.
-REST_SET = "duty_rest"
-RECORD_SETS = ("upgrade_notices", "pause_notice_receipts", "custody_marks", "custody_refused", REST_SET,
-               "custody_invocations", "custody_operation_invocations", "custody_event_ordinals")
+REST_SET = "duty_rest"  # the typed outcomes of ``DutyRest``: kept facts of a duty's pass, never debt
 ObligationsUnavailable = store.StoreError  # the sets are rows: unavailable exactly when the store is
 _FACT_COLUMNS = ("task_id", "headless_child_drive_root", "child_drive_root", "drive_root")
 
@@ -45,7 +36,9 @@ _FACT_COLUMNS = ("task_id", "headless_child_drive_root", "child_drive_root", "dr
 def review_collection_pending(row: dict) -> bool:
     """Conservative body-only selection for free acceptance collection, not a packer duty.
     Live controllers remain candidates; actor death needs no body rewrite. Closed
-    legacy panels acquire no notice unless their own matching receipt already owes it."""
+    legacy panels acquire no notice unless their own matching receipt already owes it.
+    Another surface's open pointer is a candidate too: the collector removes it once its
+    controller is proven dead (``review_operation.recover_orphaned_acceptance_operations``)."""
     from ouroboros.review_projection import _actor_pending
 
     operations = row.get("review_operations", {})
@@ -64,7 +57,11 @@ def review_collection_pending(row: dict) -> bool:
         if key is not None and not isinstance(key, str):
             return True
         pointed.add(key)
-        if entry.get("control_only") or entry.get("surface") != "task_acceptance":
+        if entry.get("control_only"):
+            continue
+        if entry.get("surface") != "task_acceptance":
+            if entry.get("state") in {"preparing", "retained", "dispatched"}:
+                return True
             continue
         state = entry.get("state")
         if not isinstance(state, str) or state not in {"closed", "collected", "preparation_unknown", "preparation_refused"}:

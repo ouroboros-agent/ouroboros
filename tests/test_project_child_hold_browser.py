@@ -100,7 +100,7 @@ def test_nested_child_wait_and_same_id_recovery(direct_server_with_data, tmp_pat
             frame(page, "parent", content="Inspecting the Project with a child researcher.")
             frame(page, "held", content="Child research scheduled", delegation_role="subagent", subagent_event="scheduled",
                   subagent_task_id="held", parent_task_id="parent", root_task_id="parent", subagent_role="researcher")
-            page.locator('.chat-live-card[data-task-id="parent"] > [data-live-summary-button]').click()
+            page.locator('.chat-live-card[data-task-id="parent"] > [data-live-summary-button] [data-live-disclosure]').click()
             child_card = page.locator(CHILD)
             child_card.wait_for(state="visible")
             # The scheduled receipt precedes the authoritative pending queue read.
@@ -129,7 +129,7 @@ def test_nested_child_wait_and_same_id_recovery(direct_server_with_data, tmp_pat
                 page.wait_for_function("text => document.querySelector('.chat-live-card[data-task-id=held] [data-live-phase]')?.textContent === text", arg=WAIT)
                 parent = page.locator('.chat-live-card[data-task-id="parent"]')
                 if parent.get_attribute("data-expanded") != "1":
-                    parent.locator(':scope > [data-live-summary-button]').click()
+                    parent.locator(':scope > [data-live-summary-button] [data-live-disclosure]').click()
                 assert not child_card.locator('[data-live-typing]').is_visible()
                 shot(page, episode)
             page.evaluate("() => window.__heldCard = document.querySelector('.chat-live-card[data-task-id=held]')")
@@ -278,7 +278,7 @@ def test_held_tree_header_updates_on_child_reply_without_detail_polling(direct_s
             frame(page, "parent", content="Inspecting the Project with a child researcher.")
             frame(page, "held", content="Child research scheduled", delegation_role="subagent", subagent_event="scheduled",
                   subagent_task_id="held", parent_task_id="parent", root_task_id="parent", subagent_role="researcher")
-            page.locator('.chat-live-card[data-task-id="parent"] > [data-live-summary-button]').click()
+            page.locator('.chat-live-card[data-task-id="parent"] > [data-live-summary-button] [data-live-disclosure]').click()
             child_card = page.locator(CHILD)
             child_card.wait_for(state="visible")
             assert child_card.locator('[data-live-phase]').inner_text() == "Working"

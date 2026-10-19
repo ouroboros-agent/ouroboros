@@ -25,7 +25,6 @@
  * @property {string=} reviewed_content_hash
  * @property {boolean=} executable_review
  * @property {string=} review_profile
- * @property {?boolean=} official_hub_verified  // null = no fresh hub catalog view yet (the page re-reads)
  * @property {?boolean=} owner_attestable
  * @property {{visible: boolean, publication_ready: boolean, task_start_allowed: boolean, disabled: boolean, state: string, reason: string}=} submit_hub
  * @property {?{code: "skill_conflict", skills: string[], omitted: number}=} conflict
@@ -46,6 +45,8 @@
  * @property {Object=} presence_runtime
  * @property {Object=} provenance
  * @property {boolean=} identity_collision
+ * @property {?Object=} install  // source, official (exact endorsed bytes), release, basis, base_known, modified, update_available, withdrawn ({reason, version} for a withdrawn release), left_source, turn_on_when_ready, installed_by, installed_at, reason?, task_id?, check?: {by, notes, at}, pending_update?: {version, digest}, update_rejected?: {version, digest, reason: review_blockers|review_unfinished|preflight_failed, at}
+ * @property {string[]=} category
  */
 
 /**
@@ -63,7 +64,6 @@
  * @property {string=} reviewed_content_hash
  * @property {boolean=} executable_review
  * @property {string=} review_profile
- * @property {?boolean=} official_hub_verified
  * @property {?boolean=} owner_attestable
  * @property {Object=} submit_hub
  */
@@ -252,8 +252,6 @@
  * @property {string=} version
  * @property {boolean=} auto_review
  * @property {boolean=} overwrite
- * @property {boolean=} adopt
- * @property {string=} expected_content_hash
  */
 
 /**
@@ -262,12 +260,11 @@
  */
 
 /**
- * Install, update or adopt result; `ok` stays true when review finds blockers.
+ * ClawHub install or update result; `ok` stays true when review finds blockers.
  * @typedef {Object} MarketplaceInstallResponse
  * @property {boolean} ok
  * @property {string=} sanitized_name
  * @property {?string=} error
- * @property {string=} code
  * @property {string=} target_dir
  * @property {?MarketplaceSkillSummary=} summary
  * @property {Object=} archive
@@ -279,15 +276,6 @@
  * @property {string=} deps_error
  * @property {string=} deps_fingerprint
  * @property {Object=} provenance
- * @property {boolean=} adopted
- * @property {*=} pre_adopt_retained
- * @property {string=} retention_error
- * @property {string=} live_content_hash
- * @property {string=} reason
- * @property {?string=} extension_action
- * @property {?string=} extension_reason
- * @property {boolean=} rolled_back
- * @property {string[]=} rollback_errors
  */
 
 /**
@@ -316,22 +304,10 @@
  */
 
 /**
+ * `GET /api/marketplace/{clawhub|ouroboroshub}/installed`; the hub route remains frozen.
  * @typedef {Object} MarketplaceInstalledResponse
  * @property {number} count
  * @property {MarketplaceInstalledSkill[]} skills
- */
-
-/**
- * @typedef {Object} HubCatalogResponse
- * @property {string} query
- * @property {number} count
- * @property {MarketplaceSkillSummary[]} results
- */
-
-/**
- * @typedef {Object} HubPreviewResponse
- * @property {MarketplaceSkillSummary} summary
- * @property {Object[]} files
  */
 
 /**

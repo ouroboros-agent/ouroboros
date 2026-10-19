@@ -832,7 +832,7 @@ def _retire_orphaned_registration(ctx: ToolContext, gateway: Any, project_id: st
             run.snapshot_id == snapshot_id for run in custody.replay(custody.custody_root(ctx)).values()):
         # The C1 execution snapshot THIS attempt provisioned. Only a definite refusal
         # proves no run can be live against it; an unknown outcome keeps it — the
-        # pending invocation names it durably, and the startup GC reconciles it.
+        # pending invocation names it durably; custody GC reconciles it once the owning task is proven over.
         try:
             from ouroboros.subagent_worktrees import remove_execution_snapshot
 

@@ -317,6 +317,44 @@ def _runtime_budget_info(env: Any, task: Dict[str, Any], ctx: Any = None) -> Dic
     return budget_info
 
 
+def storage_fact(data_root: Any) -> Optional[Dict[str, Any]]:
+    """The last finished storage count as one compact fact for the mind: when it was counted,
+    what Ouroboros owns and how many items it could not read, the growth since the count before
+    (flagged when either count had unreadable items), free and total space of the data folder's
+    disk. None when nothing was counted yet or the file is unreadable (never zero, never an
+    exception). No threshold, tier or warning stands in for judgment here: the mind reads the
+    numbers (``query_data(kind="storage")`` holds the per-place detail). The saved file is read
+    through the storage owner's identity cache; free space is read fresh."""
+    import shutil
+
+    from ouroboros import storage
+
+    try:
+        saved = storage.count.saved(data_root)
+        if not saved:
+            return None
+        count = storage.with_growth(saved["latest"], saved["previous"])
+    except Exception:  # an unreadable or malformed file is no fact, never a broken Runtime section
+        log.debug("storage count unreadable for the runtime fact", exc_info=True)
+        return None
+    try:
+        usage = shutil.disk_usage(str(data_root))
+        free, total = usage.free, usage.total
+    except OSError:
+        free = total = None
+    fact = {
+        "counted_at": count["finished_at"],
+        "bytes": count["bytes"],
+        "unreadable": count["unreadable"],  # items the count could not read: the headline excludes them
+        "basis": count.get("basis"),
+        "previous_at": count.get("growth_since"),
+        "growth_bytes": count.get("growth_bytes"),
+        "free_bytes": free,
+        "volume_total_bytes": total,
+    }
+    if count.get("growth_flag"):
+        fact["growth_flag"] = count["growth_flag"]  # either count had unreadable items: the growth is qualified
+    return fact
 
 
 def _delegation_capability_fact() -> Optional[Dict[str, Any]]:

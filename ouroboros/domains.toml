@@ -136,6 +136,7 @@ D20 = "Presence"
 "ouroboros/agent_task_pipeline.py" = "D01"
 "ouroboros/anthropic_native_custody.py" = "D02"
 "ouroboros/argv_budget.py" = "D13"
+"ouroboros/artifact_storage.py" = "D05"
 "ouroboros/artifacts.py" = "D05"
 "ouroboros/chat_uploads.py" = "D05"
 "ouroboros/repo_diff_capture.py" = "D05"
@@ -149,6 +150,7 @@ D20 = "Presence"
 "ouroboros/claudexor_daemon.py" = "D07"
 "ouroboros/claudexor_exit_facts.py" = "D07"
 "ouroboros/claudexor_runtime.py" = "D07"
+"ouroboros/claudexor_runtime_retention.py" = "D07"
 "ouroboros/claudexor_startup_failure.py" = "D07"
 "ouroboros/cli.py" = "D18"
 "ouroboros/client_surface.py" = "D11"
@@ -307,7 +309,10 @@ D20 = "Presence"
 "ouroboros/gateway/schedules.py" = "D11"
 "ouroboros/gateway/settings.py" = "D11"
 "ouroboros/gateway/settings_secrets.py" = "D11"
+"ouroboros/gateway/skill_my_skills.py" = "D11"
 "ouroboros/gateway/skill_publish.py" = "D11"
+"ouroboros/gateway/skill_source_contracts.py" = "D11"
+"ouroboros/gateway/skill_sources.py" = "D11"
 "ouroboros/gateway/state.py" = "D11"
 "ouroboros/gateway/reply_preparation.py" = "D11"
 "ouroboros/gateway/storage.py" = "D11"
@@ -389,7 +394,6 @@ D20 = "Presence"
 "ouroboros/marketplace/install.py" = "D14"
 "ouroboros/marketplace/install_specs.py" = "D14"
 "ouroboros/marketplace/isolated_deps.py" = "D14"
-"ouroboros/marketplace/ouroboroshub.py" = "D14"
 "ouroboros/marketplace/provenance.py" = "D14"
 "ouroboros/mcp_client.py" = "D05"
 "ouroboros/mcp_headers.py" = "D05"
@@ -428,6 +432,7 @@ D20 = "Presence"
 "ouroboros/owner_words.py" = "D17"  # the owner's words that caused a work tree, carried by value to helpers
 "ouroboros/packaged_cli.py" = "D18"
 "ouroboros/packaged_cli_install.py" = "D18"
+"ouroboros/force_remove.py" = "D18"  # the permission-granting recursive removal every retirer of a copied tree shares
 "ouroboros/platform_layer.py" = "D18"
 "ouroboros/platform_win32_abi.py" = "D18"
 "ouroboros/post_task_checkpoint.py" = "D01"
@@ -550,6 +555,10 @@ D20 = "Presence"
 "ouroboros/shell_parse.py" = "D13"
 "ouroboros/size_ratchet_manifest.py" = "D10"
 "ouroboros/skill_dependencies.py" = "D14"
+"ouroboros/skill_acceptance.py" = "D14"
+"ouroboros/skill_builtin.py" = "D14"
+"ouroboros/skill_identity.py" = "D14"
+"ouroboros/skill_install_record.py" = "D14"
 "ouroboros/skill_lifecycle_actions.py" = "D14"
 "ouroboros/skill_conflicts.py" = "D14"
 "ouroboros/skill_lifecycle_queue.py" = "D14"
@@ -561,6 +570,8 @@ D20 = "Presence"
 "ouroboros/skill_owner_attestation.py" = "D14"
 "ouroboros/skill_payload_binding.py" = "D14"
 "ouroboros/skill_publish_eligibility.py" = "D14"
+"ouroboros/skill_publish_client.py" = "D14"
+"ouroboros/skill_publish_destination.py" = "D14"
 "ouroboros/skill_publish_github.py" = "D14"
 "ouroboros/skill_publish_result.py" = "D14"
 "ouroboros/skill_publish_scanner.py" = "D14"
@@ -571,6 +582,11 @@ D20 = "Presence"
 "ouroboros/skill_review_output.py" = "D14"
 "ouroboros/skill_review_packs.py" = "D14"
 "ouroboros/skill_review_prompt.py" = "D14"
+"ouroboros/skill_source_catalog.py" = "D14"
+"ouroboros/skill_source_git.py" = "D14"
+"ouroboros/skill_source_install.py" = "D14"
+"ouroboros/skill_sources.py" = "D14"
+"ouroboros/skill_starter.py" = "D14"
 "ouroboros/skill_review_rebuttals.py" = "D14"
 "ouroboros/skill_review_collect.py" = "D14"
 "ouroboros/skill_review_cycles.py" = "D14"
@@ -587,6 +603,7 @@ D20 = "Presence"
 "ouroboros/subagent_runtime.py" = "D07"
 "ouroboros/subagent_work_order.py" = "D07"
 "ouroboros/subagent_worktrees.py" = "D07"
+"ouroboros/worktree_removal.py" = "D07"  # checkout deletion failure evidence and process-local retries
 "ouroboros/workspace_copies.py" = "D07"
 "ouroboros/body_candidate.py" = "D07"  # own-body authoring candidate: one more kind of task-owned isolated copy
 "ouroboros/body_adoption.py" = "D10"  # restart-bound adoption of one exact candidate commit (authorize/arm/finalize)
@@ -734,6 +751,7 @@ D20 = "Presence"
 "ouroboros/tools/skill_exec.py" = "D14"
 "ouroboros/tools/skill_preflight.py" = "D14"
 "ouroboros/tools/skill_publish.py" = "D14"
+"ouroboros/tools/skill_source_tools.py" = "D14"
 "ouroboros/tools/subagent_integration.py" = "D07"
 "ouroboros/tools/subagent_integration_delegated.py" = "D07"
 "ouroboros/tools/task_tree.py" = "D07"
@@ -757,7 +775,8 @@ D20 = "Presence"
 "ouroboros/usage_journal.py" = "D16"
 "ouroboros/usage_ledger.py" = "D16"
 "ouroboros/usage_store.py" = "D16"
-"ouroboros/storage.py" = "D16"  # Dashboard Storage: the bounded data-folder measurement behind gateway/storage.py
+"ouroboros/storage.py" = "D16"  # Dashboard Storage: the complete count of every owned place behind gateway/storage.py
+"ouroboros/storage_free.py" = "D16"  # Dashboard Storage: the owner's free-space preview and run over the existing retirers
 "ouroboros/jsonl_tail.py" = "D18"
 "ouroboros/temp_sweep.py" = "D18"
 "ouroboros/utils.py" = "D18"
@@ -1059,6 +1078,7 @@ allowed = [
   "D16->D18",
   "D17->D01",
   "D17->D04",
+  "D17->D05",
   "D17->D06",
   "D17->D08",
   "D17->D11",
@@ -1182,7 +1202,6 @@ lazy_only = [
   "D16->D09",
   "D16->D11",
   "D17->D02",
-  "D17->D05",
   "D17->D07",
   "D17->D09",
   "D17->D13",
@@ -1193,7 +1212,6 @@ lazy_only = [
   "D18->D14",
   "D18->D16",
   "D18->D17",
-  "D18->D19",
   "D19->D04",
   "D19->D08",
   "D19->D20",

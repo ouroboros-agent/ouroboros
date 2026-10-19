@@ -10,6 +10,7 @@ candidate, and a manifest waits up to ``PUBLICATION_WAIT_SEC``.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import pathlib
 import sqlite3
@@ -42,16 +43,18 @@ class _SlowUnlinks:
 
 
 def _between_sections(monkeypatch, hook):
-    """Run ``hook(n)`` before the n-th census refresh of a deletion (n >= 2: after section n-1)."""
-    refresh, calls = packer.PackSweep.refresh, []
+    """Run ``hook(n)`` before the n-th section of a deletion enters its phase gate (n >= 2: after section n-1)."""
+    phase, calls = packs._unlink_phase, []
 
-    def observed(self):
+    @contextlib.contextmanager
+    def observed(root):
         calls.append(None)
         if len(calls) >= 2:
             hook(len(calls))
-        return refresh(self)
+        with phase(root) as value:
+            yield value
 
-    monkeypatch.setattr(packer.PackSweep, "refresh", observed)
+    monkeypatch.setattr(packs, "_unlink_phase", observed)
     return calls
 
 

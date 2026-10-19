@@ -81,6 +81,7 @@ def collect_routes(
     from ouroboros.gateway.logs import api_logs_tail
     from ouroboros.gateway.storage import storage_routes
     from ouroboros.gateway.marketplace import (
+        api_hub_installed,
         api_marketplace_info,
         api_marketplace_install,
         api_marketplace_installed,
@@ -88,14 +89,9 @@ def collect_routes(
         api_marketplace_search,
         api_marketplace_uninstall,
         api_marketplace_update,
-        api_ouroboroshub_catalog,
-        api_ouroboroshub_install,
-        api_ouroboroshub_installed,
-        api_ouroboroshub_preview,
-        api_ouroboroshub_uninstall,
-        api_ouroboroshub_update,
-        api_ouroboroshub_clear_publication,
+        api_skill_publication_clear,
     )
+    from ouroboros.gateway.skill_my_skills import skill_source_routes
     from ouroboros.gateway.claudexor_accounts import (
         api_claudexor_credential_profile,
         api_claudexor_login,
@@ -214,26 +210,14 @@ def collect_routes(
         Route("/api/skills/{skill}/reconcile", endpoint=api_skill_reconcile, methods=["POST"]),
         Route("/api/marketplace/clawhub/search", endpoint=api_marketplace_search, methods=["GET"]),
         Route("/api/marketplace/clawhub/installed", endpoint=api_marketplace_installed, methods=["GET"]),
+        Route("/api/marketplace/ouroboroshub/installed", endpoint=api_hub_installed, methods=["GET"]),
         Route("/api/marketplace/clawhub/info/{slug:path}", endpoint=api_marketplace_info, methods=["GET"]),
         Route("/api/marketplace/clawhub/preview/{slug:path}", endpoint=api_marketplace_preview, methods=["GET"]),
         Route("/api/marketplace/clawhub/install", endpoint=api_marketplace_install, methods=["POST"]),
         Route("/api/marketplace/clawhub/update/{name}", endpoint=api_marketplace_update, methods=["POST"]),
         Route("/api/marketplace/clawhub/uninstall/{name}", endpoint=api_marketplace_uninstall, methods=["POST"]),
-        Route("/api/marketplace/ouroboroshub/catalog", endpoint=api_ouroboroshub_catalog, methods=["GET"]),
-        Route("/api/marketplace/ouroboroshub/installed", endpoint=api_ouroboroshub_installed, methods=["GET"]),
-        Route(
-            "/api/marketplace/ouroboroshub/preview/{slug:path}",
-            endpoint=api_ouroboroshub_preview,
-            methods=["GET"],
-        ),
-        Route("/api/marketplace/ouroboroshub/install", endpoint=api_ouroboroshub_install, methods=["POST"]),
-        Route("/api/marketplace/ouroboroshub/update/{name}", endpoint=api_ouroboroshub_update, methods=["POST"]),
-        Route("/api/marketplace/ouroboroshub/publication/{name}/clear", endpoint=api_ouroboroshub_clear_publication, methods=["POST"]),
-        Route(
-            "/api/marketplace/ouroboroshub/uninstall/{name}",
-            endpoint=api_ouroboroshub_uninstall,
-            methods=["POST"],
-        ),
+        Route("/api/skills/{skill}/publication/clear", endpoint=api_skill_publication_clear, methods=["POST"]),
+        *skill_source_routes(),
         *file_browser_routes(),
         # The onboarding wizard PAGE (one host for desktop/browser/overlay); the
         # /api/onboarding sibling below stays the readiness probe + legacy body.

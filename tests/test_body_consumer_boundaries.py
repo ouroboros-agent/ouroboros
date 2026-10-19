@@ -328,7 +328,9 @@ def test_own_body_child_copy_removal_disposes_its_sibling_environment(body, monk
         if removal == "remove_worktree":
             assert subagent_worktrees.remove_worktree(task_id="env-child") is True
         else:
-            assert subagent_worktrees.prune_orphans(retention_days=0)["removed"] == 1
+            from ouroboros.task_results import write_task_result
+            write_task_result(data, "env-child", "completed", result="done")  # the copy's task is proven over
+            assert subagent_worktrees.prune_orphans(retention_days=0, live=lambda _task: False)["removed"] == 1
         assert not pathlib.Path(root).exists()
         assert env_root.is_dir() is retained  # a nested teardown's retention marker keeps the scratch it names
     finally:

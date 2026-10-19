@@ -1,4 +1,11 @@
-"""Single FIFO lane for mutating skill install/review/dependency/enable work."""
+"""Single FIFO lane for mutating skill install/review/dependency/enable work.
+
+A job holds the lane (an in-process lock plus the cross-process
+``state/skill_lifecycle.lock``) while it mutates. A long read-only step inside a
+job (a review panel reading frozen candidates of a payload) lends the lane out
+with ``lend_lifecycle_lane`` and takes it back before persisting, so installs,
+grants and toggles do not wait for a review's model calls.
+"""
 
 from __future__ import annotations
 
@@ -117,6 +124,69 @@ _state_lock = threading.Lock()
 _dedupe_jobs: Dict[str, LifecycleJob] = {}
 _events: Deque[LifecycleJob] = deque(maxlen=_MAX_EVENTS)
 _active: Optional[LifecycleJob] = None
+
+
+@dataclass
+class _LaneHandle:
+    """The lane held by the lifecycle job running in this context."""
+
+    job: LifecycleJob
+    lock: threading.Lock
+    lock_file: Any = None  # open cross-process lock file, or None
+
+
+# Copied into the runner's worker thread with the context, so the job's own code
+# can lend the lane; any other caller sees None and lending is a no-op.
+_LANE_HANDLE: "contextvars.ContextVar[Optional[_LaneHandle]]" = contextvars.ContextVar(
+    "skill_lifecycle_lane", default=None,
+)
+
+
+@contextlib.contextmanager
+def lend_lifecycle_lane():
+    """Let other lifecycle jobs run during a long read-only step of this job.
+
+    The caller must not mutate skill state inside the block. The lane is taken back
+    (waiting as long as the current holder needs) before the block's caller goes on,
+    so whatever follows runs under the lane exactly as before. Outside a lane job
+    this is a no-op.
+    """
+    global _active
+    handle = _LANE_HANDLE.get()
+    if handle is None:
+        yield
+        return
+    from ouroboros.platform_layer import file_lock_exclusive_nb, file_unlock
+
+    _LANE_HANDLE.set(None)  # a nested lend inside the block is a no-op
+    if handle.lock_file is not None:
+        file_unlock(handle.lock_file.fileno())
+    with _state_lock:
+        if _active is handle.job:
+            _active = None
+    handle.lock.release()
+    try:
+        yield
+    finally:
+        # In-process: wait for the holder (the job owns this lock again before its own
+        # release runs). Cross-process: the lane's deadline, as when it was first taken.
+        handle.lock.acquire()
+        if handle.lock_file is not None:
+            deadline = time.monotonic() + _lifecycle_deadline_sec()
+            while True:
+                try:
+                    file_lock_exclusive_nb(handle.lock_file.fileno())
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            "skill_lifecycle.lock is held beyond the deadline — a "
+                            "previous job appears wedged. Restarting Ouroboros recovers it."
+                        )
+                    time.sleep(0.05)
+        with _state_lock:
+            _active = handle.job
+        _LANE_HANDLE.set(handle)
 
 
 class DuplicateLifecycleJobError(RuntimeError):
@@ -282,6 +352,7 @@ def _release_dedupe(job: LifecycleJob) -> None:
 
 @contextlib.asynccontextmanager
 async def async_skill_lifecycle_file_lock(drive_root: pathlib.Path):
+    """Hold ``state/skill_lifecycle.lock``; yields the open lock file."""
     from ouroboros.platform_layer import file_lock_exclusive_nb, file_unlock
 
     lock_dir = pathlib.Path(drive_root) / "state"
@@ -302,7 +373,7 @@ async def async_skill_lifecycle_file_lock(drive_root: pathlib.Path):
                     )
                 await asyncio.sleep(0.05)
         try:
-            yield
+            yield fh
         finally:
             if acquired:
                 file_unlock(fh.fileno())
@@ -389,10 +460,14 @@ async def run_lifecycle_job(
             else:
                 lock_root = pathlib.Path(opts.drive_root)
             try:
-                async with async_skill_lifecycle_file_lock(lock_root):
-                    if opts.on_started is not None:
-                        opts.on_started(job)
-                    result = await runner()
+                async with async_skill_lifecycle_file_lock(lock_root) as lock_file:
+                    lane = _LANE_HANDLE.set(_LaneHandle(job=job, lock=_get_lock(), lock_file=lock_file))
+                    try:
+                        if opts.on_started is not None:
+                            opts.on_started(job)
+                        result = await runner()
+                    finally:
+                        _LANE_HANDLE.reset(lane)
                 error = opts.result_error(result) if opts.result_error else ""
                 job.error = str(error or "")
                 job.status = "failed" if job.error else "succeeded"

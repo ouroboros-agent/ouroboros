@@ -6,12 +6,11 @@ from repo commit obligations. Tool registration lives in ``tools/skill_exec.py``
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import pathlib
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from ouroboros.config import adaptive_quorum, get_auto_grant_enabled
 from ouroboros.reviewer_slot_config import commit_triad_delivery, reviewer_slot_config_error
@@ -288,6 +287,25 @@ def _run_deterministic_preflight(
     return outcome
 
 
+def run_acceptance_preflight(ctx: Any, drive_root: pathlib.Path, skill_name: str) -> Dict[str, Any]:
+    """The deterministic floor for bytes a source's trust accepts without a review.
+
+    Installers call it after landing a trusted release, inside their lifecycle job.
+    A payload failure persists the ordinary PENDING preflight record for these bytes,
+    which the gate honours before the install basis; an infrastructure failure persists
+    nothing and returns ``ok: False`` so the installer keeps the release off.
+    """
+    from ouroboros.skill_loader import find_skill
+
+    skill = find_skill(pathlib.Path(drive_root), skill_name)
+    if skill is None or skill.load_error or not skill.content_hash:
+        return {"ok": False, "error": getattr(skill, "load_error", "") or f"skill {skill_name!r} not found"}
+    outcome = _run_deterministic_preflight(ctx, pathlib.Path(drive_root), skill, skill.content_hash, persist=True)
+    if outcome is not None:
+        return {"ok": False, "error": outcome.error, "content_hash": skill.content_hash}
+    return {"ok": True, "content_hash": skill.content_hash}
+
+
 def _admission_gate(
     ctx: Any, skill: Any, drive_root: pathlib.Path, content_hash: str, persist: bool,
 ) -> Optional[SkillReviewOutcome]:
@@ -306,94 +324,6 @@ def _admission_gate(
         admission_error=admission_error,
         persist=persist,
     )
-
-
-def _hub_file_hashes(files: Any) -> Dict[str, str]:
-    return {str(item.get("path") or ""): str(item.get("sha256") or "").strip().lower()
-            for item in (files or []) if isinstance(item, dict)}
-
-
-def _official_hub_review_profile(skill: Any) -> str:
-    """Return official_hub only when the payload matches the LIVE catalog (fresh read)."""
-    from ouroboros.marketplace import ouroboroshub
-
-    fresh = lambda slug: ouroboroshub.info(slug).files  # noqa: E731
-    return "official_hub" if hub_payload_matches(skill, fresh) else ""
-
-
-def hub_payload_matches(skill: Any, catalog_files_for: Callable[[str], Any]) -> bool:
-    """Sidecar, catalog row and local files agree on every path and SHA-256.
-
-    ``catalog_files_for(slug)`` supplies the catalog row's ``files``: review and
-    owner attestation pass a fresh read; the listing hint passes a display view."""
-    if str(getattr(skill, "source", "") or "") != "ouroboroshub":
-        return False
-    marker = pathlib.Path(skill.skill_dir) / ".ouroboroshub.json"
-    try:
-        data = json.loads(marker.read_text(encoding="utf-8"))
-    except Exception:
-        return False
-    if not isinstance(data, dict) or str(data.get("source") or "") != "ouroboroshub":
-        return False
-    marker_name = str(data.get("sanitized_name") or data.get("slug") or "").strip()
-    if marker_name and marker_name != str(getattr(skill, "name", "") or ""):
-        return False
-    slug = str(data.get("slug") or marker_name or getattr(skill, "name", "") or "").strip()
-    try:
-        catalog_files = _hub_file_hashes(catalog_files_for(slug))
-    except Exception:
-        return False
-    files = data.get("files") if isinstance(data.get("files"), list) else []
-    if not files or _hub_file_hashes(files) != catalog_files:
-        return False
-    root = pathlib.Path(skill.skill_dir).resolve()
-    for item in files:
-        if not isinstance(item, dict):
-            return False
-        rel = pathlib.PurePosixPath(str(item.get("path") or ""))
-        expected = str(item.get("sha256") or "").strip().lower()
-        if not rel.parts or rel.is_absolute() or ".." in rel.parts or not expected:
-            return False
-        path = (root / pathlib.Path(*rel.parts)).resolve(strict=False)
-        try:
-            path.relative_to(root)
-        except ValueError:
-            return False
-        if not path.is_file():
-            return False
-        if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
-            return False
-    # Reject any EXTRA local runtime-reachable file not covered by the catalog.
-    # Without this, a locally-added file (e.g. evil.py) would still earn the
-    # official_hub fast-path. Provenance/control sidecars are install-time
-    # artifacts, never catalog entries, so they are excluded from the compare.
-    from ouroboros.skill_loader import _iter_payload_files  # pylint: disable=W0212
-    from ouroboros.contracts.skill_payload_policy import SKILL_PAYLOAD_CONTROL_FILENAMES
-
-    manifest = getattr(skill, "manifest", None)
-    try:
-        local_files = _iter_payload_files(
-            root,
-            manifest_entry=str(getattr(manifest, "entry", "") or ""),
-            manifest_scripts=list(getattr(manifest, "scripts", []) or []),
-        )
-    except Exception:
-        return False
-    local_relset = set()
-    for path in local_files:
-        try:
-            rel = path.relative_to(root).as_posix()
-        except ValueError:
-            return False
-        if rel in SKILL_PAYLOAD_CONTROL_FILENAMES:
-            continue
-        local_relset.add(rel)
-    return local_relset == set(catalog_files)
-
-
-def is_official_hub_payload_verified(skill: Any) -> bool:
-    """Return whether a local OuroborosHub payload still matches the live catalog."""
-    return _official_hub_review_profile(skill) == "official_hub"
 
 
 # Public entry point
@@ -415,7 +345,10 @@ def _skill_cycles_gate(
 ) -> tuple[Optional["SkillReviewOutcome"], str, str, str]:
     """Select exact late reconciliation or free substantive replay before paid
     admission. The shared cap counts per root task, or per manual content hash.
-    Return (early outcome, contract fingerprint, rebuttal hash, shared profile)."""
+    Return (early outcome, contract fingerprint, rebuttal hash, shared profile).
+    New reviews carry no profile: a source's trust is an install basis read by
+    the gate, never a softer review (persisted ``official_hub`` verdicts keep
+    their recorded aggregation)."""
     from ouroboros.skill_review_cycles import (
         free_replay_outcome,
         skill_review_contract_fingerprint,
@@ -424,7 +357,7 @@ def _skill_cycles_gate(
     )
     from ouroboros.tools.commit_gate import compute_rebuttal_sha256
 
-    review_profile = _official_hub_review_profile(skill)
+    review_profile = ""
     contract_fp = skill_review_contract_fingerprint(
         models, required_items=_SKILL_REVIEW_ITEMS, review_profile=review_profile,
         delivery=delivery,
@@ -710,26 +643,32 @@ def review_skill(
     def _paid_facts(outcome: SkillReviewOutcome) -> SkillReviewOutcome:
         return _stamp_paid_facts(outcome, contract_fp, rebuttal_sha, stamp)
 
+    from ouroboros.skill_lifecycle_queue import lend_lifecycle_lane
+
     try:
-        prompt, advisory_evidence, result_json_text, infra_error = run_skill_review_passes(
-            ctx,
-            drive_root,
-            skill,
-            evidence={
-                "manifest_dump": manifest_dump,
-                "content_hash": content_hash,
-                "history": history,
-                "review_rebuttal": review_rebuttal,
-                "required_items": _SKILL_REVIEW_ITEMS,
-            },
-            file_packs=file_packs,
-            models=models,
-            row_plan=delivery,
-            session_root=str(_REPO_ROOT),
-            usage_attribution={"review_skill": skill.name, "review_wave_id": stamp.wave_id}, review_contract_fingerprint=contract_fp, rebuttal_sha256=rebuttal_sha,
-            build_prompt=_build_review_prompt_for_attempt,
-            run_review=_handle_multi_model_review,
-        )
+        # The panel reads the frozen candidate bound to content_hash and mutates no
+        # skill state, so other lifecycle work runs meanwhile; the lane is back
+        # before anything below persists (Astra A01).
+        with lend_lifecycle_lane():
+            prompt, advisory_evidence, result_json_text, infra_error = run_skill_review_passes(
+                ctx,
+                drive_root,
+                skill,
+                evidence={
+                    "manifest_dump": manifest_dump,
+                    "content_hash": content_hash,
+                    "history": history,
+                    "review_rebuttal": review_rebuttal,
+                    "required_items": _SKILL_REVIEW_ITEMS,
+                },
+                file_packs=file_packs,
+                models=models,
+                row_plan=delivery,
+                session_root=str(_REPO_ROOT),
+                usage_attribution={"review_skill": skill.name, "review_wave_id": stamp.wave_id}, review_contract_fingerprint=contract_fp, rebuttal_sha256=rebuttal_sha,
+                build_prompt=_build_review_prompt_for_attempt,
+                run_review=_handle_multi_model_review,
+            )
     finally:
         ctx._review_paid_stamp = _prior_stamp
     if infra_error:
@@ -841,8 +780,24 @@ def _persist_reviewed_outcome(
     rebuttal_sha: str,
 ) -> SkillReviewOutcome:
     """Persist one reviewed verdict (state, history, rebuttal flips, auto-grant)
-    — extracted whole from ``review_skill`` at the function-size gate."""
+    — extracted whole from ``review_skill`` at the function-size gate.
+
+    The panel ran with the lifecycle lane lent out, so the payload may have moved
+    on (an update, an edit, an uninstall): the verdict lands in review state only
+    while the installed bytes are still the reviewed bytes."""
     content_hash = outcome.content_hash
+    from ouroboros.skill_loader import SkillPayloadUnreadable
+
+    try:
+        current_hash = compute_content_hash(skill.skill_dir, manifest_entry=skill.manifest.entry,
+                                            manifest_scripts=skill.manifest.scripts)
+    except (OSError, SkillPayloadUnreadable):
+        current_hash = ""
+    if current_hash != content_hash:
+        outcome.status = STATUS_PENDING
+        outcome.error = ("review outcome was not persisted because the skill payload changed "
+                         "while the review ran; review the current bytes")
+        return outcome
     if getattr(ctx, "_skill_review_lifecycle_guard", False):
         from ouroboros.skill_review_runner import _can_persist_review_outcome
 
@@ -897,4 +852,5 @@ __all__ = [
     "SkillReviewOutcome",
     "render_skill_review_block",
     "review_skill",
+    "run_acceptance_preflight",
 ]

@@ -147,7 +147,7 @@ def test_a_visible_receipt_line_keeps_its_node_when_the_newest_window_moves_past
             feed = _open_project(page, project)
             card = page.locator(f'{feed} .chat-live-card[data-task-id="{task_id}"]')
             if card.get_attribute('data-expanded') != '1':
-                card.locator(':scope > [data-live-summary-button]').click()
+                card.locator(':scope > [data-live-summary-button] [data-live-disclosure]').click()
             # Reading moves on from the header: focus there would itself protect the page.
             page.evaluate('() => document.activeElement?.blur()')
             lines = card.locator(':scope > [data-live-timeline] > .chat-live-line.result')

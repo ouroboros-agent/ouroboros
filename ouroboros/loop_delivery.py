@@ -29,6 +29,7 @@ from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_FINALIZED_UNACCEP
 from ouroboros.task_finalization import set_terminal_host_notice
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.utils import sanitize_tool_result_for_log
+from ouroboros.task_carrier import execution_kind
 
 
 from typing import TYPE_CHECKING
@@ -1146,16 +1147,13 @@ def _plan_review_only_awaited(llm_trace: Dict[str, Any]) -> bool:
 
 @timed_phase("admission_seal")
 def _seal_admission_before_delivery(tools: ToolRegistry, limit_ctx: Any, llm_trace: Dict[str, Any]) -> bool:
-    """Seal root admission once more right before delivery; False arms the owner-revision round.
+    """Seal root admission once more right before delivery; False holds the answer.
 
-    The queue's typed answer decides. ``ok`` seals, and a generation mismatch (also one seen
-    locally while the transport was silent) is a real owner follow-up. A begin ``refused``
-    because the root is already ``sealed`` is the worker's own earlier seal whose ack was
-    lost. Any other refusal keeps the revision path. ``unknown`` is a gap — never a refusal,
-    a verdict or an owner message: the answer is delivered with ``admission_released=False``
-    (the durable ``supervisor_ack_unavailable`` row is the record) and a blocking install
-    whose reviewers approved this subject says so on the card (owner decision 2A).
-    """
+    Only owner facts revise: a generation mismatch (also one seen locally while the transport
+    was silent) or pending owner mail. A begin ``refused`` because the root is already ``sealed``
+    is the worker's own lost ack; a pooled attempt refused ``stale_attempt`` lost its queue
+    ownership and never publishes. Any other refusal, like ``unknown``, is the host's own state:
+    delivered with ``admission_released=False`` (``supervisor_ack_unavailable`` keeps the cause)."""
     tool_ctx = tools._ctx
     from ouroboros.loop_acceptance_review import _resolve_ctx_lineage
     if not _resolve_ctx_lineage(tool_ctx, limit_ctx.task_id)["is_root_task"]:
@@ -1171,7 +1169,8 @@ def _seal_admission_before_delivery(tools: ToolRegistry, limit_ctx: Any, llm_tra
 
     # The wait for a silent supervisor is long enough for the owner to write: their mail is durable
     # before any generation moves, so the local mailbox is read once more before a gap delivers.
-    gap = not answer and not own_seal and answer.status == "unknown" and not _pending_owner_input_kinds(tool_ctx)
+    superseded = answer.reason == "stale_attempt" and execution_kind(tool_ctx) == "pooled"  # lost its queue ownership
+    gap = not answer and not own_seal and not superseded and not _pending_owner_input_kinds(tool_ctx)  # owner facts revise
     if getattr(tool_ctx, "_task_acceptance_fence_generation_mismatch", False) or not (answer or own_seal or gap):
         _loop()._supersede_task_acceptance_for_owner_followup(tool_ctx, llm_trace)
         admission_lock = getattr(tool_ctx, "owner_message_admission_lock", None)

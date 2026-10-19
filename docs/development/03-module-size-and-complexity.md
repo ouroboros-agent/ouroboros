@@ -97,10 +97,7 @@ B3/B3w in `tests/test_cost_contract.py` fix visible questions while delivered hi
   transactional summaries (`usage_store.py`, `store.py`);
   indexed selects (`task_store.py`); task-event SSE v2 cursor (ARCHITECTURE §3).
 
-CHECKLISTS item 9 `perf_lifecycle` advises on changed readers, startup/shutdown, batches,
-endpoints, pollers, subscriptions and timers. A new interactive append-only store reader
-must enroll in `agent_startup_checks.py::hot_store_growth_notes` in the same commit,
-with a justified threshold in `context_budget.py`; unenrolled stores evade the tripwire.
+CHECKLISTS item 9 `perf_lifecycle` covers changed readers, startup/shutdown, batches, endpoints, pollers, subscriptions and timers. Runtime `storage` supplies the last count; `query_data(kind="storage")` its detail. The mind judges growth (P5). New growing stores name their `storage.PLACES` entry and PERSISTENCE retirer.
 
 `tests/test_store_boot.py` fixes `prepare_startup_state` at 50/500 frozen results and 20/200
 child stores (a clean boot is one read transaction, no history access or writes);
@@ -152,15 +149,12 @@ cost copy (ARCHITECTURE §3 "Chat and Projects"). Enforcement:
 
 #### Context and growth matrix
 
-The canonical continuity map is ARCHITECTURE §10 "Continuity data-flow map", which
-carries the source, projection and retention rule of chat and biography, plan/review
-authority and execution evidence. Record a new hot store there, add its growth proof
-here, and enroll it in `hot_store_growth_notes` in the same change.
+ARCHITECTURE §10 "Continuity data-flow map" owns sources, projections and retention for chat/biography, plan/review and execution. Add new hot stores there and their growth proof here together.
 
 | Store / surface | Complete source → interactive projection | Growth and retention proof |
 |---|---|---|
-| Chat and biography | `state/dialog.sqlite` (`dialogue_store.py`; the frozen archive imported once) and `memory/chronicle/records.jsonl` → the memory view (`memory_view.py`) and `chat_history` | Reads cost the page, never another room's history; import coverage is disclosed; pages and parts compress the horizon, never delete it; the journal warns at `CHRONICLE_JOURNAL_WARN_BYTES` |
-| Skill-review root tasks | Per-skill `state/skills/<name>/review_history.jsonl`; `skill_review_runner._append_terminal_history` projects terminal identities to `state/skill_review_root_tasks.jsonl` → `skill_readiness._skill_names_from_review_history` reads a bounded newest-first suffix | Append-only and idempotent by root/task/outcome identity; warns at `SKILL_REVIEW_ROOT_TASKS_WARN_BYTES` |
+| Chat and biography | `state/dialog.sqlite` (`dialogue_store.py`; the frozen archive imported once) and `memory/chronicle/records.jsonl` → the memory view (`memory_view.py`) and `chat_history` | Reads cost the page, never another room's history; import coverage is disclosed; pages and parts compress the horizon, never delete it; size appears in the storage count |
+| Skill-review root tasks | Per-skill `state/skills/<name>/review_history.jsonl`; `skill_review_runner._append_terminal_history` projects terminal identities to `state/skill_review_root_tasks.jsonl` → `skill_readiness._skill_names_from_review_history` reads a bounded newest-first suffix | Append-only and idempotent by root/task/outcome identity; size appears under App state |
 | Task/project execution | ARCHITECTURE §10.1, "Execution evidence" | Promotion and retention rules live in that row |
 
 ### Invariant: Continuation authority and bounded role projections

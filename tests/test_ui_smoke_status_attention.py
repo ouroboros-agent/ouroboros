@@ -300,10 +300,10 @@ def test_task_status_stays_factual_in_main_and_project_chat(
         assert page.locator("#toast-stack .toast").count() == 0
         assert page.locator('[data-nav-page="chat"] .unread-badge').count() == 0
 
-        child_summary = child.locator(":scope > [data-live-summary-button]")
+        child_disclosure = child.locator(":scope > [data-live-summary-button] [data-live-disclosure]")
         assert child.get_attribute("data-expanded") == "0"
-        child_summary.focus()
-        child_summary.press("Enter")
+        child_disclosure.focus()
+        child_disclosure.press("Enter")
         assert child.get_attribute("data-expanded") == "1"
         child_line_toggle = child.locator(
             ":scope > [data-live-timeline] [data-live-line-toggle]"
@@ -315,9 +315,9 @@ def test_task_status_stays_factual_in_main_and_project_chat(
         child_timeline = child.locator(":scope > [data-live-timeline]").inner_text()
         assert "The selected tool route was unavailable; the parent can continue." in child_timeline
         assert "Reason:" not in child_timeline
-        assert "delegated_route_unavailable" not in child_summary.inner_text()
+        assert "delegated_route_unavailable" not in child.locator(":scope > [data-live-summary-button]").inner_text()
         child_line_toggle.press("Space")
-        child_summary.press("Space")
+        child_disclosure.press("Space")
         assert child.get_attribute("data-expanded") == "0"
 
         emit_task_done(page, chat_id, continuing_root, "completed")
