@@ -8,8 +8,17 @@
  */
 import { followLevel } from './call_worklet.js';
 
-// A level above this is somebody's voice; it has stopped below half of it (hysteresis).
+// A level this far above the room is somebody's voice; it has stopped below half of it (hysteresis).
 const VOICE_GATE = 0.12;
+// A call is full duplex, so the owner's voice is a state that holds, not a flicker of the meter: it begins
+// once the voice has held a quarter of a second and ends after most of a second below the gate, so a pause
+// between words, a clatter or a cough moves the wave without changing the words or the colour.
+const OPEN_HOLD_S = 0.25;
+const CLOSE_HOLD_S = 0.9;
+// The room's own level falls with every quiet moment at once and creeps up this fast (level per second)
+// while the room stays loud: a voice keeps dipping between its words, a fan, a street or a far conversation
+// does not, so within a few seconds a steady background lifts the gate above itself.
+const ROOM_RISE_PER_S = 0.08;
 // What reduced motion shows for a voice: a fixed, calm brightness, faded by the stylesheet.
 const REDUCED_LEVEL = 0.6;
 // Playback levels waiting for their moment: 32 windows of 20 ms outlast any output latency.
@@ -28,6 +37,10 @@ export function createCallLight({ env = globalThis, visible = () => true, heard 
     let outTarget = 0;
     let playing = false;
     let ownerVoice = false;
+    let aboveSince = null;  // when the level last rose over the gate, while it stays there
+    let belowSince = null;  // when it last fell under the release, while it stays there
+    let room = 0;  // the room's own level, under the owner's voice
+    let roomAt = null;
     let frame = 0;
     let last = 0;
     const pending = [];
@@ -87,12 +100,32 @@ export function createCallLight({ env = globalThis, visible = () => true, heard 
         else last = 0;
     }
 
+    function roomLevel(at, heardLevel) {
+        // A call starts in a quiet room; the level so far is the room's until this moment joins it.
+        const before = room;
+        const dt = roomAt === null ? 0 : Math.max(0, at - roomAt) / 1000;
+        roomAt = at;
+        room = heardLevel <= room ? heardLevel : Math.min(heardLevel, room + ROOM_RISE_PER_S * dt);
+        return before;
+    }
+
+    function gate(at, voiced) {
+        // The words follow the gate (`owner`), never a caption; the gate holds through short gaps either way.
+        const over = voiced > VOICE_GATE && !playing;
+        const under = voiced < VOICE_GATE / 2;
+        aboveSince = over ? (aboveSince ?? at) : null;
+        belowSince = under ? (belowSince ?? at) : null;
+        if (!ownerVoice && over && at - aboveSince >= OPEN_HOLD_S * 1000) { ownerVoice = true; voice(); owner(true); }
+        else if (ownerVoice && under && at - belowSince >= CLOSE_HOLD_S * 1000) { ownerVoice = false; owner(false); }
+    }
+
     function level({ mic: nextMic = 0, out: nextOut = 0, playing: nextPlaying = false, latency = 0 }) {
         if (!active) return;
+        const at = now();
         micTarget = nextMic;
-        // The owner's voice opens and closes the gate at once; the words follow it (`owner`), never a caption.
-        if (!ownerVoice && nextMic > VOICE_GATE && !playing) { ownerVoice = true; voice(); owner(true); }
-        else if (ownerVoice && nextMic < VOICE_GATE / 2) { ownerVoice = false; owner(false); }
+        // The gate reads the voice above the room, so a steady background keeps the words and the colour calm;
+        // the wave itself still shows what the microphone hears.
+        gate(at, Math.max(0, nextMic - roomLevel(at, nextMic)));
         pending.push({ at: now() + latency * 1000, out: nextOut, playing: nextPlaying });
         if (pending.length > MAX_PENDING) pending.splice(0, pending.length - MAX_PENDING);
         if (visible()) schedule();
@@ -105,6 +138,9 @@ export function createCallLight({ env = globalThis, visible = () => true, heard 
         last = 0;
         mic = out = micTarget = outTarget = 0;
         pending.length = 0;
+        room = 0;
+        roomAt = null;
+        aboveSince = belowSince = null;
         if (ownerVoice) { ownerVoice = false; owner(false); }
         write();
         hear(false);

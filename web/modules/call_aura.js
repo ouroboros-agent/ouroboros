@@ -3,11 +3,13 @@
  * run as tapered ribbons across the capsule's width, after the words (a phone's chip has no room there: its
  * wave is the words' second line, under the state word, while a voice speaks or the line is empty).
  * The strands and a faint tint of the glass take the speaker's hue (owner blue, Ouroboros crimson) and
- * change it by a direct cross-fade: the new hue eases in while the old one eases out, so for a third of a
- * second both are lit. The glass's outline breathes with the heard level, a spring of a few
- * pixels that never moves the layout. Thinking is a soft travelling pulse; working draws the strands
- * in to the room's three dots and back; muted is one dashed neutral line; an error holds still in
- * amber. In the big view (`data-call-view="big"`) the same glass and wave are larger.
+ * change it by a slow direct cross-fade: the new hue eases in while the old one eases out, so for about a
+ * second both are lit. Whose hue is a held state (the light's gate and the words' voice), never the meter:
+ * a call is full duplex, and a noisy room or a pause between words must not flick it. The glass's outline
+ * breathes with the heard level, a spring of a few pixels that never moves the layout. Thinking is a soft
+ * travelling pulse that the wave eases into and out of; working draws the strands in to the room's three
+ * dots and back; muted is one dashed neutral line; an error holds still in amber. In the big view
+ * (`data-call-view="big"`) the same glass and wave are larger.
  *
  * A visual is one contract, so another replaces this module and its call.css block and nothing
  * else: `mount` fills the capsule's slot (here the wave's canvas and the work dots), may add layers
@@ -25,7 +27,9 @@ const HISTORY_STEP = 0.024;
 // After a change of size or a still state the visual paints its own frames this long, so springs settle.
 const SETTLE_SECONDS = 0.9;
 // A change of hue: the new one eases in while the old one eases out, with this time constant (seconds).
-const BLEND_SECONDS = 0.16;
+const BLEND_SECONDS = 0.45;
+// Listening's wave and thinking's pulse ease into each other with this time constant (seconds).
+const MODE_SECONDS = 0.35;
 const HUES = ['idle', 'owner', 'ouroboros', 'error'];
 const clamp = (value, low, high) => Math.min(high, Math.max(low, value));
 const ease = (current, target, dt, up, down) => current + (target - current) * (1 - Math.exp(-Math.max(0, dt) / (target > current ? up : down)));
@@ -45,9 +49,11 @@ const loud = level => Math.min(1, level * WAVE_GAIN);
 
 export function waveShape({ mic = 0, out = 0, time = 0, mode = 'listen', voice = 'owner', owner = false, reduced = false }) {
     const heardOuroboros = voice === 'ouroboros' && out > 0.02;
+    // Ouroboros keeps its hue through the pauses of an answer (the words' voice); the owner has theirs while the
+    // light's gate holds their voice. The meter alone, a room's noise included, only moves the wave.
     const colour = mode === 'error' ? 'error'
-        : heardOuroboros || mode === 'think' ? 'ouroboros'
-            : mode !== 'muted' && (owner || (mic > 0.08 && mic >= out)) ? 'owner' : 'idle';
+        : voice === 'ouroboros' || mode === 'think' ? 'ouroboros'
+            : mode !== 'muted' && owner ? 'owner' : 'idle';
     if (reduced || mode === 'error' || mode === 'still') return { colour, amp: 0, pulse: false };
     if (mode === 'muted') return { colour, amp: heardOuroboros ? loud(out) : 0, pulse: false };
     if (mode === 'think' || mode === 'trace') return { colour, amp: 0, pulse: true };
@@ -190,6 +196,7 @@ function mount({ slot, row, wrap, doc, env = globalThis }) {
     let velocity = 0;
     let phase = 0;        // the travelling phase
     let busy = 0;         // working: the strands draw in to the three dots
+    let pulsing = 0;      // thinking's pulse, eased in and out of listening's wave
     // Each colour's share of the strands and the glass: the one in use eases to 1, the others to 0.
     const weight = { idle: 1, owner: 0, ouroboros: 0, error: 0 };
     let glow = 0;         // the glass's tint level, shared by the voices in use
@@ -210,7 +217,7 @@ function mount({ slot, row, wrap, doc, env = globalThis }) {
     let settleUntil = 0;
 
     const points = [];
-    function line([alpha, cycles, offset], shape, cy, reach, spanScale, time) {
+    function line([alpha, cycles, offset], pulseShare, cy, reach, spanScale, time) {
         // One strand's centre line across the span, sampled every ~3 px.
         const span = x1 - x0;
         const n = Math.max(24, Math.min(260, Math.round(span / 3)));
@@ -220,13 +227,14 @@ function mount({ slot, row, wrap, doc, env = globalThis }) {
             const u = i / n;
             const uu = (u - 0.5) / spanScale + 0.5;  // working draws the span in to its middle
             const envelope = uu <= 0 || uu >= 1 ? 0 : Math.sin(Math.PI * uu) ** 2;
-            let y;
-            if (shape.pulse) {
-                y = Math.sin(uu * Math.PI * 2 * cycles * k - time * 7 + offset) * reach * envelope * alpha
+            let y = 0;
+            if (pulseShare > 0.001) {
+                y += pulseShare * Math.sin(uu * Math.PI * 2 * cycles * k - time * 7 + offset) * reach * envelope * alpha
                     * (0.14 + 0.2 * Math.max(0, Math.sin(uu * 6 - time * 5)));
-            } else {
+            }
+            if (pulseShare < 0.999) {
                 const local = amp * 0.42 + 0.58 * heardAt(Math.abs(uu - 0.5) * 2) * (amp > 0.005 ? 1 : 0);
-                y = Math.sin(uu * Math.PI * 2 * cycles * k + phase + offset) * reach * envelope * alpha * local;
+                y += (1 - pulseShare) * Math.sin(uu * Math.PI * 2 * cycles * k + phase + offset) * reach * envelope * alpha * local;
             }
             points.push(x0 + u * span, cy - y);
         }
@@ -276,11 +284,12 @@ function mount({ slot, row, wrap, doc, env = globalThis }) {
         historyClock += dt;
         while (historyClock >= HISTORY_STEP) { historyClock -= HISTORY_STEP; history.copyWithin(1, 0, HISTORY - 1); }
         history[0] = reduced ? 0 : level;
-        // A spring on the level: quick to rise, a little overshoot, lets go gently.
-        velocity += (220 * (level - amp) - 24 * velocity) * dt;
+        // A spring on the level: it rises within a few frames, barely overshoots and lets go gently.
+        velocity += (140 * (level - amp) - 22 * velocity) * dt;
         amp = reduced ? level : Math.max(0, amp + velocity * dt);
-        phase += reduced ? 0 : dt * (4 + 6 * amp);
+        phase += reduced ? 0 : dt * (4 + 4.5 * amp);
         busy = reduced ? (working ? 1 : 0) : ease(busy, working ? 1 : 0, dt, 0.28, 0.22);
+        pulsing = reduced ? Number(shape.pulse) : ease(pulsing, shape.pulse ? 1 : 0, dt, MODE_SECONDS, MODE_SECONDS);
 
         // A direct cross-fade: the new speaker's hue eases in while the old one eases out at the same pace,
         // so for a moment the strands and the glass carry both voices' colours.
@@ -289,14 +298,14 @@ function mount({ slot, row, wrap, doc, env = globalThis }) {
         const colours = palette();
         const hues = { idle: colours.neutral, owner: colours.owner, ouroboros: colours.ouroboros, error: colours.error };
         const ink = [0, 1, 2].map(i => HUES.reduce((sum, name) => sum + hues[name][i] * weight[name], 0));
-        const quiet = weight.idle > 0.5;
+        const rest = weight.idle;  // how far the strands have settled to the room's quiet ink, eased with the hue
 
         // The glass: tinted by the voices in use, its outline breathing with the level.
         const lit = clamp(amp * 1.4, 0, 1) * (working ? 0.5 : 1) * (1 - weight.idle);
-        glow = reduced ? 0.5 : ease(glow, working ? 0.2 : 0.18 + 0.82 * lit, dt, 0.25, 0.18);
+        glow = reduced ? 0.5 : ease(glow, working ? 0.2 : 0.18 + 0.82 * lit, dt, 0.4, 0.35);
         for (const name of ['owner', 'ouroboros']) tint[name] = glow * weight[name];
         const reach = reduced ? 0 : (large ? 8 : 4.5) * clamp(amp * 1.25, 0, 1);
-        breathVelocity += (260 * (reach - breath) - 20 * breathVelocity) * dt;
+        breathVelocity += (170 * (reach - breath) - 19 * breathVelocity) * dt;
         breath = reduced ? 0 : Math.max(0, breath + breathVelocity * dt);
         put(row, '--call-breath', breath.toFixed(2));
         put(row, '--call-tint-owner', tint.owner.toFixed(3));
@@ -320,7 +329,7 @@ function mount({ slot, row, wrap, doc, env = globalThis }) {
         const reachPx = large ? Math.min(height * 0.4, band) : place ? band : height * 0.4;
         const tip = large ? 0.9 : 0.7;
         if (input.mode === 'error') {
-            ribbon(line(STRANDS[0], { pulse: false }, cy, 0, 1, t), colours.error, 0.95, large ? 3.2 : 2.2, tip);
+            ribbon(line(STRANDS[0], 0, cy, 0, 1, t), colours.error, 0.95, large ? 3.2 : 2.2, tip);
             return;
         }
         if (input.mode === 'muted' && shape.amp === 0) {
@@ -342,21 +351,22 @@ function mount({ slot, row, wrap, doc, env = globalThis }) {
         const restBoost = reduced && weight.idle < 0.5 ? 1.5 : 1;
         for (let s = STRANDS.length - 1; s >= 0; s -= 1) {
             const strand = STRANDS[s];
-            const p = line(strand, shape, cy, reachPx, spanScale, t);
-            const alpha = strand[0] * (quiet ? colours.rest : 0.96) * gone;
+            const p = line(strand, pulsing, cy, reachPx, spanScale, t);
+            const alpha = strand[0] * (colours.rest * rest + 0.96 * (1 - rest)) * gone;
             // A phone's small wave draws slimmer strands with a narrower soft band, so it keeps clear of the words.
-            const body = ((large ? 2.1 : 1.35) + (large ? 3.6 : 2) * strand[0]) * restBoost * (quiet ? 0.9 : 1)
+            const body = ((large ? 2.1 : 1.35) + (large ? 3.6 : 2) * strand[0]) * restBoost * (1 - 0.1 * rest)
                 * (place ? 0.72 : 1);
-            if (!quiet && s === 0 && !shape.pulse) {
+            const lift = (1 - rest) * (1 - pulsing);  // a voice's soft light, faded in and out with its hue
+            if (s === 0 && lift > 0.01) {
                 // The glass's own light: a soft body between the main strand and its mirror.
                 context.beginPath();
                 for (let i = 0; i < p.length; i += 2) { if (i) context.lineTo(p[i], p[i + 1]); else context.moveTo(p[i], p[i + 1]); }
                 for (let i = p.length - 2; i >= 0; i -= 2) context.lineTo(p[i], cy + (cy - p[i + 1]));
                 context.closePath();
-                context.fillStyle = rgba(ink, 0.07 * lit * gone);
+                context.fillStyle = rgba(ink, 0.07 * lit * gone * lift);
                 context.fill();
             }
-            if (!quiet) ribbon(p, ink, alpha * colours.band * 1.6, body * (place ? 2.4 : 3.6), tip * 2);
+            if (rest < 0.99) ribbon(p, ink, alpha * colours.band * 1.6 * (1 - rest), body * (place ? 2.4 : 3.6), tip * 2);
             ribbon(p, ink, alpha, body, tip);
         }
     }

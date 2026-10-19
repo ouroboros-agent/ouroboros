@@ -380,7 +380,7 @@ function lightFixture({ reduce = false, shown = true } = {}) {
 test('the light answers the microphone at once and playback only when it leaves the speaker', () => {
     const f = lightFixture();
     f.light.level({ mic: 0.8, out: 0.7, playing: true, latency: 0.1 });
-    assert.equal(f.voices(), 1);  // the owner's voice began
+    assert.equal(f.voices(), 0);  // one loud moment moves the wave; the owner's voice is a state that holds (below)
     f.step(16);
     assert.ok(f.props['--call-mic'] > 0.2, f.props['--call-mic']);  // the first frame already moves
     assert.equal(f.props['--call-out'], 0);
@@ -399,12 +399,32 @@ test('the light answers the microphone at once and playback only when it leaves 
     assert.deepEqual([f.props['--call-mic'], f.props['--call-out']], [0, 0]);
     assert.equal(f.frames.length, 0);
     assert.deepEqual(f.heard, [true, false]);
-    // Echo while Ouroboros is heard is not the owner's voice.
+    // Echo while Ouroboros is heard is not the owner's voice, however long it lasts.
     const echo = lightFixture();
     echo.light.level({ mic: 0, out: 0.7, playing: true, latency: 0 });
     echo.step(16);
-    echo.light.level({ mic: 0.5, out: 0.7, playing: true, latency: 0 });
+    for (let t = 0; t < 600; t += 20) { echo.light.level({ mic: 0.5, out: 0.7, playing: true, latency: 0 }); echo.step(20); }
     assert.equal(echo.voices(), 0);
+});
+
+test('the owner\'s voice is a held state: a clatter or a pause changes nothing, a steady room stops counting', () => {
+    const f = lightFixture();
+    const feed = (mic, ms) => { for (let t = 0; t < ms; t += 20) { f.advance(20); f.light.level({ mic, out: 0, playing: false, latency: 0 }); } };
+    feed(0, 400);
+    feed(0.8, 100);  // a clatter moves the wave, but no voice begins
+    assert.equal(f.light.speaking(), false);
+    feed(0, 400);
+    feed(0.6, 400);  // a voice that holds a quarter of a second begins
+    assert.equal(f.light.speaking(), true);
+    assert.equal(f.voices(), 1);
+    feed(0, 500);  // a pause between words keeps it
+    assert.equal(f.light.speaking(), true);
+    feed(0, 600);  // most of a second of quiet ends it
+    assert.equal(f.light.speaking(), false);
+    feed(0.3, 8000);  // a steady background: within a few seconds the gate rises above it
+    assert.equal(f.light.speaking(), false);
+    feed(0.7, 400);  // and a voice over the background still begins
+    assert.equal(f.light.speaking(), true);
 });
 
 test('reduced motion shows whose voice in calm steps; an off-screen room runs no frames', () => {
@@ -510,7 +530,7 @@ test('the visual is one swappable contract: the wave in its slot, the glass behi
     const run = (state, seconds) => { for (let t = 0; t < seconds; t += 1 / 60) { clock += 1000 / 60; handle.draw(state); } };
     const tints = () => [Number(row.props['--call-tint-owner']), Number(row.props['--call-tint-ouroboros'])];
     // The owner speaks: blue ink, a blue tint, the outline breathing out a few pixels.
-    run({ mic: 0.8, out: 0, mode: 'listen', voice: 'owner', owner: true }, 1);
+    run({ mic: 0.8, out: 0, mode: 'listen', voice: 'owner', owner: true }, 2);  // the hue settles within about two seconds
     assert.ok(tints()[0] > 0.5 && tints()[1] === 0, String(tints()));
     assert.ok(Number(row.props['--call-breath']) > 1 && Number(row.props['--call-breath']) < 8, row.props['--call-breath']);
     const rgb = text => text.match(/[\d.]+/g).map(Number);
@@ -519,19 +539,19 @@ test('the visual is one swappable contract: the wave in its slot, the glass behi
     const strongest = fills.map(rgb).filter(([, , , alpha]) => alpha > 0.9);
     assert.ok(strongest.length && strongest.every(([r, g, b]) => Math.abs(r - 47) <= 8 && Math.abs(g - 107) <= 8 && Math.abs(b - 214) <= 8),
         'the main strand in the owner\'s blue');
-    // The turn passes: a direct cross-fade, blue out while crimson comes in, so both are lit only briefly
-    // and crimson holds the glass within about half a second.
+    // The turn passes: a slow direct cross-fade, blue out while crimson comes in, so both are lit for about
+    // a second (a full-duplex room never flicks between them) and crimson holds the glass within a second.
     let both = 0;
     let arrived = Infinity;
-    for (let t = 0; t < 1.5; t += 1 / 60) {
+    for (let t = 0; t < 3; t += 1 / 60) {
         clock += 1000 / 60;
         handle.draw({ mic: 0, out: 0.8, mode: 'listen', voice: 'ouroboros' });
         const [owner, ouroboros] = tints();
         if (owner > 0.1 && ouroboros > 0.1) both += 1;
         if (arrived === Infinity && ouroboros > 0.5) arrived = t;
     }
-    assert.ok(both > 0 && both < 30, String(both));
-    assert.ok(arrived < 0.6, String(arrived));
+    assert.ok(both > 30 && both < 90, String([both, arrived]));
+    assert.ok(arrived > 0.2 && arrived < 1, String([both, arrived]));
     assert.ok(tints()[1] > 0.5 && tints()[0] < 0.05, String(tints()));
     // Muted: one dashed line; an error: one still amber strand; reduced motion holds the outline still.
     fills.length = 0;
@@ -565,6 +585,10 @@ test('the wave: whose colour from the state, its height from the voice, a pulse 
     assert.deepEqual(shape({ mode: 'listen', mic: 0.7, owner: true }), ['owner', 0.77, false]);
     assert.deepEqual(shape({ mode: 'listen', mic: 0.95, owner: true }), ['owner', 1, false]);  // loud syllables reach the top
     assert.deepEqual(shape({ mode: 'listen', mic: 0.7, out: 0.6, voice: 'ouroboros' }), ['ouroboros', 0.66, false]);  // no echo
+    // Whose colour is a held state, never the meter: a noisy room moves the wave in the room's ink, and
+    // Ouroboros keeps its colour through a pause in its answer.
+    assert.deepEqual(shape({ mode: 'listen', mic: 0.5 }), ['idle', 0.55, false]);
+    assert.deepEqual(shape({ mode: 'listen', out: 0, voice: 'ouroboros' }), ['ouroboros', 0.07, false]);
     assert.deepEqual(shape({ mode: 'trace' }), ['idle', 0, true]);
     assert.deepEqual(shape({ mode: 'think' }), ['ouroboros', 0, true]);
     assert.deepEqual(shape({ mode: 'error', mic: 0.9 }), ['error', 0, false]);  // still, in amber
