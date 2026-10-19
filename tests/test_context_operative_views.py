@@ -53,13 +53,21 @@ def test_health_view_keeps_one_short_line_per_obligation_at_the_owners_scale(tmp
     monkeypatch.setattr(context_health, "_collect_log_analysis_checks", lambda _env, found: found.extend(other))
     section = context_health.build_health_invariants(_env(tmp_path), task_id="task-reader")
     full, view = section.full_text, section.operative_view
-    assert len(full) > 90_000  # the full section keeps every ownership rule and address
-    assert len(view) < len(full) / 4  # one short line per obligation under its kind, not its prose
+    # Another task's obligations fold into one full line per owner (owner decision Q3=A, 18.10): its run ids,
+    # the authority rule and the owner's record. The view keeps one short line per owner under one kind.
+    owners = sorted({run.task_id for run in [*runs, *held]})
+    assert len(view) < len(full) / 4
+    assert (f"- WARNING: ANOTHER TASK'S DELEGATED WORK — {len(owners)}: only each owner reads its results and "
+            "decides its patches while it lives;") in view
+    for owner in owners:
+        unread, patches = (sum(run.task_id == owner for run in group) for group in (runs, held))
+        counts = "; ".join(part for part in (unread and f"results not read to EOF: {unread}",
+                                             patches and f"patches awaiting apply/reject: {patches}") if part)
+        assert f"\n  - owner task {owner} — {counts}\n" in view
+        assert f"query_data(op='json', kind='task_result', ids=['{owner}'])" in full
     for run in [*runs, *held]:
-        assert f"\n  - run {run.run_id}, owner task {run.task_id}" in view
-    assert "- INFO: DELEGATED RESULT AVAILABLE — 119: its owner task reads each retained output.\n" in view
-    assert "- WARNING: DELEGATED RESULT NEVER READ — 53: its owner task reads each to EOF.\n" in view
-    assert "- WARNING: DELEGATED PATCH AWAITS DISPOSITION — 35: its owner task decides each while live" in view
+        assert run.run_id in full and run.run_id not in view
+    assert "Only the owner reads and acknowledges its results" in full and "Only the owner" not in view
     for fault in faults:
         assert (f"- CRITICAL: DELEGATED RUN MAY STILL BE LIVE — run {fault['run_id']} (stop_unverified), "
                 f"owner task {fault['task_id']}, since {fault['ts']}\n") in view
@@ -68,10 +76,6 @@ def test_health_view_keeps_one_short_line_per_obligation_at_the_owners_scale(tmp
         assert f"- {line}\n" in view
     passing = sum(line.startswith("- OK:") for line in full.splitlines())
     assert passing >= 12 and other[0] not in view and view.endswith(f"- {passing} passing checks; details retained.")
-    # The full section is unchanged: every exact address and rule is still there to read.
-    for run in runs:
-        assert run.output_artifact in full and run.output_artifact not in view
-    assert "apply requires the caller's active Git root" in full and "apply requires" not in view
 
 
 def test_health_view_names_the_reader_s_own_verb(tmp_path, monkeypatch):
@@ -82,8 +86,16 @@ def test_health_view_names_the_reader_s_own_verb(tmp_path, monkeypatch):
     assert (f"\n  - run {held[0].run_id}, owner task {held[0].task_id}, snapshot only, no patch captured: "
             "this task applies or rejects it\n") in own
     foreign = context_health.build_health_invariants(_env(tmp_path), task_id="task-reader").operative_view
-    assert f"\n  - run {runs[0].run_id}, owner task {runs[0].task_id}\n" in foreign
-    assert "this task" not in foreign
+    assert (f"\n  - owner task {runs[0].task_id} — results not read to EOF: 1; "
+            "patches awaiting apply/reject: 1\n") in foreign
+    assert "this task" not in foreign and "your active root" not in foreign
+    # A reader whose own root already satisfies a patch's recorded target is told so in its short line.
+    import ouroboros.delegate_shared as delegate_shared
+
+    monkeypatch.setattr(delegate_shared, "orphan_apply_target_ok", lambda _target, _root: True)
+    yours = context_health.build_health_invariants(_env(tmp_path), task_id="task-reader",
+                                                   active_root=str(tmp_path)).operative_view
+    assert f"patches awaiting apply/reject: 1; your active root matches the target of {held[0].run_id}\n" in yours
 
 
 def test_book_maps_keep_their_chapters_and_paths_and_retain_the_map(tmp_path):

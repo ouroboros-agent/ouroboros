@@ -280,7 +280,10 @@ _KIND_VERBS = {
     "OWN DELEGATED RUN ENDED": "this task reads each retained output",
     "DELEGATED PATCH AWAITS DISPOSITION": ("its owner task decides each while live, then a live top-level task "
                                            "may apply or reject it with integrate_delegated_patch"),
+    "ANOTHER TASK'S DELEGATED WORK": ("only each owner reads its results and decides its patches while it lives; "
+                                      "its full line holds the run ids, the rule and the owner's record"),
 }
+_SEVERITY = {"INFO": 0, "WARNING": 1, "CRITICAL": 2}
 
 
 def _brief(severity: str, kind: str, run: Any, *, state: str = "", verb: str = "") -> Brief:
@@ -314,6 +317,8 @@ def _health_view(heading: str, checks: List[str], briefs: Dict[str, Brief]) -> s
         if kind not in kinds:
             kinds[kind] = [severity, kind, []]
             rows.append(kinds[kind])
+        elif _SEVERITY.get(severity, 0) > _SEVERITY.get(kinds[kind][0], 0):
+            kinds[kind][0] = severity  # a kind's line carries the gravest of its obligations
         kinds[kind][2].append(line)
     rendered = [row if isinstance(row, str) else (
         f"{row[0]}: {row[1]} — {len(row[2])}: {_KIND_VERBS[row[1]]}." + "".join(f"\n  - {line}" for line in row[2]))
@@ -348,6 +353,16 @@ def _foreign_work_line(owner: str, work: Dict[str, List[str]]) -> str:
         line += (f" Your active root matches the target of {', '.join(work['yours'])}: once the owner is terminal, "
                  f"integrate_delegated_patch(run_id='{run_id}', decision='apply'|'reject').")
     return line
+
+
+def _foreign_work_brief(owner: str, work: Dict[str, List[str]]) -> Brief:
+    """Another task's folded obligations in the operative view: its owner and their counts, and the runs
+    this reader's own root could apply once the owner is terminal; the rest stays in the full line."""
+    counts = [f"{label}: {len(work[key])}" for key, label in (
+        ("unread", "results not read to EOF"), ("patches", "patches awaiting apply/reject")) if work[key]]
+    yours = f"; your active root matches the target of {', '.join(work['yours'])}" if work["yours"] else ""
+    return ("WARNING" if work["patches"] else "INFO", "ANOTHER TASK'S DELEGATED WORK",
+            f"owner task {owner} — " + "; ".join(counts) + yours)
 
 
 # One line per own settled run, bounded like ``terminal_custody_notice``.
@@ -655,7 +670,8 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "",
                        state="patch captured" if run.patch_captured else "snapshot only, no patch captured"))
     except Exception:
         pass
-    checks.extend(_foreign_work_line(owner, work) for owner, work in foreign.items())
+    for owner, work in foreign.items():
+        obligation(_foreign_work_line(owner, work), _foreign_work_brief(owner, work))
 
     try:
         from ouroboros.delegate_custody import open_containment_faults
