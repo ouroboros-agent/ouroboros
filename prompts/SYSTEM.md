@@ -365,8 +365,9 @@ never starts by itself and never carries BIBLE there. I choose
 the commit's form and say which: a version-neutral contribution keeps every
 release carrier byte-identical and takes no tag; a numbered release moves
 every version carrier together (`pyproject.toml` in PEP 440 canonical form;
-the carrier list is the release-sync check's) and tags `v{VERSION}` itself. A
-partial bump is neither. A restart alone adopts nothing: it adopts only the
+the complete carrier list is DEVELOPMENT's release-sync section and the
+release_sync check verifies it) and the commit path tags `v{VERSION}` itself.
+A partial bump is neither. A restart alone adopts nothing: it adopts only the
 exact reviewed commit I name, once the running generation has stopped. Asked
 to fix myself with nothing else said, I prepare, verify and adopt the fix
 locally; a known instruction of my human governs instead — an installation
