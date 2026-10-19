@@ -214,6 +214,13 @@ def _open(browser, url, *, width=1280, height=900, scheme="dark", touch=False, m
     return page, errors
 
 
+def _close(page) -> None:
+    """Close a test page's context. The page polls its state through ``_calls_key``'s route; a poll still in
+    flight would fail with the closed context and surface at the next page the test opens."""
+    page.unroute_all(behavior="ignoreErrors")
+    page.context.close()
+
+
 def _talk_ready(page, root=ROOM):
     from playwright.sync_api import expect
     send = page.locator(f"{root} .chat-send-inline")
@@ -630,7 +637,7 @@ def test_call_failures_say_what_happened_and_the_unavailable_sheet(direct_server
                     room.locator(".call-close").click()
                     page.evaluate("__callTest.deny = false")
                     assert not errors, errors
-                    page.context.close()
+                    _close(page)
 
                     # The old desktop app: no microphone; the sheet says so and copies the link for a browser.
                     old, old_errors = _open(browser, server["url"], width=width, height=900 if width > 400 else 844,
@@ -652,7 +659,7 @@ def test_call_failures_say_what_happened_and_the_unavailable_sheet(direct_server
                     old.locator(f"{ROOM} .call-close").click()
                     expect(old_send).to_have_text("Talk")
                     assert not old_errors, old_errors
-                    old.context.close()
+                    _close(old)
         finally:
             browser.close()
 
@@ -774,7 +781,7 @@ def test_reduced_motion_keeps_words_and_colour_and_telegram_has_no_talk(direct_s
             room.locator(".call-end").click()
             _ended(page)
             assert not errors, errors
-            page.context.close()
+            _close(page)
 
             telegram = browser.new_page()
             telegram.add_init_script("window.Telegram = {WebApp: {}};")
@@ -795,7 +802,7 @@ def test_reduced_motion_keeps_words_and_colour_and_telegram_has_no_talk(direct_s
             assert keyless.locator("#chat-send").get_attribute("data-call-entry") != "talk"
             expect(keyless.locator("#chat-send")).to_have_text("Send")
             assert not keyless_errors, keyless_errors
-            keyless.context.close()
+            _close(keyless)
         finally:
             browser.close()
 
@@ -948,6 +955,6 @@ def test_the_big_view_grows_from_the_chip_and_minimises_back(direct_server_with_
                     assert page.evaluate(lifted) is False and room.locator(".call-spacer").count() == 0
                     assert abs(page.evaluate(row_box)["height"] - idle["height"]) <= 1
                     assert not errors, errors
-                    page.context.close()
+                    _close(page)
         finally:
             browser.close()
