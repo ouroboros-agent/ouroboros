@@ -16,11 +16,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-python-env
-      - name: Interpreter facts
+      # The proof's children run on the base interpreter (a venv redirector would add a console client),
+      # with PYTHONPATH set to the checkout only, so the project's dependencies must live there too.
+      - name: Base interpreter dependencies
         shell: bash
         run: |
-          python -c "import sys; print('exe', sys.executable); print('base', getattr(sys, '_base_executable', None))"
-          python -c "import clr; print('pythonnet ok')" || echo "pythonnet missing"
+          base="$(python -c "import sys; print(getattr(sys, '_base_executable', sys.executable))")"
+          echo "base interpreter: $base"
+          uv pip install --python "$base" -e . pythonnet
+          "$base" -c "import sys; sys.path.insert(0, '.'); from ouroboros import launcher_bootstrap; import clr; print('base imports ok')"
       - name: Native launcher handoff and tray icon proof
         shell: bash
         env:
