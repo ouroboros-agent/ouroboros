@@ -5,6 +5,7 @@ name: Windows native QA
 on:
   push:
     branches: ["qa/win-native-*"]
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
