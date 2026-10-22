@@ -1,10 +1,11 @@
 # Temporary release qualification for razzant/ouroboros#2051 (lives only on a qa/ branch of the
-# ouroboros-agent fork; never merged). Runs the opt-in native launcher handoff and tray icon proof
+# ouroboros-agent fork and its draft PR; never merged). Runs the opt-in native launcher handoff and tray icon proof
 # on a hosted Windows desktop and fails when any case is skipped, so a green run means executed asserts.
 name: Windows native QA
 on:
   push:
     branches: ["qa/win-native-*"]
+  pull_request:
   workflow_dispatch:
 permissions:
   contents: read
