@@ -24,6 +24,7 @@ jobs:
           base="$(python -c "import sys; print(getattr(sys, '_base_executable', sys.executable))")"
           echo "base interpreter: $base"
           uv pip install --python "$base" -e . pythonnet
+          uv pip install pythonnet  # the icon case imports clr in the test process itself
           "$base" -c "import sys; sys.path.insert(0, '.'); from ouroboros import launcher_bootstrap; import clr; print('base imports ok')"
       - name: Native launcher handoff and tray icon proof
         shell: bash
