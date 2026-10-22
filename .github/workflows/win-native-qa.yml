@@ -1,0 +1,44 @@
+# Temporary release qualification for razzant/ouroboros#2051 (lives only on a qa/ branch of the
+# ouroboros-agent fork; never merged). Runs the opt-in native launcher handoff and tray icon proof
+# on a hosted Windows desktop and fails when any case is skipped, so a green run means executed asserts.
+name: Windows native QA
+on:
+  push:
+    branches: ["qa/win-native-*"]
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-python-env
+      - name: Interpreter facts
+        shell: bash
+        run: |
+          python -c "import sys; print('exe', sys.executable); print('base', getattr(sys, '_base_executable', None))"
+          python -c "import clr; print('pythonnet ok')" || echo "pythonnet missing"
+      - name: Native launcher handoff and tray icon proof
+        shell: bash
+        env:
+          OUROBOROS_WINDOWS_DESKTOP_QA: "1"
+        run: |
+          python -m pytest -o addopts="" -p no:cacheprovider -v -rA --junitxml=native-qa.xml tests/test_windows_launcher_handoff_native.py
+      - name: Every case executed
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse("native-qa.xml").getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          counts = {k: int(suite.get(k, 0)) for k in ("tests", "failures", "errors", "skipped")}
+          print(counts)
+          sys.exit(1 if counts["tests"] == 0 or counts["skipped"] or counts["failures"] or counts["errors"] else 0)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-qa
+          path: native-qa.xml
