@@ -1326,6 +1326,9 @@ def _forced_final_answer(
         )
     if TIMEOUT_REPEAT_KEY in ctx.accumulated_usage:  # owed or spent: no summary is bought for it
         return _timeout_repeat_final(ctx, llm_trace, fallback_text, reason_code, provider_terminal)
+    from ouroboros.loop_output_exhaustion import no_recap, finish
+    if no_recap(ctx.accumulated_usage):
+        return finish(ctx, reason=reason_code)
     tools_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
     _loop()._retire_main_reasoning(ctx)
     _loop()._append_or_merge_user_message(ctx.messages, prompt)

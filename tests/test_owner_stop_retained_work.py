@@ -933,7 +933,6 @@ def test_degraded_recapture_preserves_same_stop_membership_and_refs_without_fals
     and run refs for the same Stop while adding explicit gap disclosures, never union cleared root
     custody debt or mix different Stop requests, and never emit 'kept no saved text' when unknown."""
     from ouroboros import task_results
-    from supervisor import terminal_cascade
 
     write_task_result(tmp_path, "parent1", "running")
     for tid, words in (("kid-a", "kid-a saved words"), ("kid-b", "kid-b saved words")):

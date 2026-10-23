@@ -194,9 +194,15 @@ def authorize_row(data_dir: pathlib.Path, row: Dict[str, Any], commit: str, *, r
             "ADOPTION_PENDING", f"adoption {current.get('id')} is {current.get('phase')}; it must settle first.")
     from ouroboros.preflight_qualification import adoption_test_evidence
 
-    # Existing full green evidence of exactly this commit; adoption never runs the battery itself.
+    # Existing green evidence of exactly this commit; adoption never runs the battery itself. A
+    # selected run may qualify only a reviewed delta (Cyber Pro's unreviewed commits keep full).
+    try:  # an unreadable declared widening leaves full evidence only
+        local = None if unreviewed else {"onto": old, "paths": paths,
+                                         "widening": body_candidate.interval_widening(row, old, cand)}
+    except (OSError, subprocess.SubprocessError):
+        local = None
     try:
-        qualification = adoption_test_evidence(data_dir, candidate, cand, ctx=ctx)
+        qualification = adoption_test_evidence(data_dir, candidate, cand, ctx=ctx, local=local)
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
         raise AdoptionRefused("ADOPTION_TESTS_REQUIRED", str(exc)) from exc
     directory = helper_dir(data_dir)
@@ -274,7 +280,8 @@ def _archive(data_dir: Any, handoff: Dict[str, Any], outcome: str) -> None:
             _git(repo, "update-ref", "-d", f"{PIN_PREFIX}{handoff['id']}", check=False)
     if handoff:
         _log(data_dir, "body_adoption_closed", handoff, outcome=outcome, phase=handoff.get("phase"),
-             events=handoff.get("events"), interpreter_state=handoff.get("interpreter_state"))
+             events=handoff.get("events"), interpreter_state=handoff.get("interpreter_state"),
+             tests=handoff.get("tests"))
     if handoff and not pointer_gone:
         # The hook still finds the pointer: it must read a CLOSED record, never a missing helper
         # (which stops every boot).
@@ -462,7 +469,9 @@ def finalize_on_boot(data_dir: Any, repo_dir: Any, *, supervisor_ready: bool,
     body_switch.record(str(helper_dir(data_dir)), handoff, "adopted", f"ready on {head[:12]} (pid {os.getpid()})")
     _archive(data_dir, handoff, "adopted")
     kept = sorted({*(loaded.get("later_edits") or []), *(handoff.get("later_edit_kept") or [])})
-    return {"outcome": "adopted", "sha": head, "created_tag": str(handoff.get("created_tag") or ""),
+    return {"outcome": "adopted", "sha": head, "tests": dict(handoff.get("tests") or {}),
+            "created_tag": str(handoff.get("created_tag") or ""),
+            "adoption_id": handoff.get("id"), "previous": handoff.get("old"),
             "note": f"Adopted candidate commit {cand} on {handoff.get('branch')}; previous commit "
                     f"{str(handoff.get('old') or '')[:12]}."
                     + (f" Later local edits were kept at: {', '.join(kept)}." if kept else "")}
@@ -471,7 +480,8 @@ def finalize_on_boot(data_dir: Any, repo_dir: Any, *, supervisor_ready: bool,
 def settle_on_boot(data_dir: Any, repo_dir: Any, *, supervisor_ready: bool) -> Dict[str, Any]:
     """Boot's one call: settle the inherited handoff, then the follow-ups an adopted commit is owed.
 
-    The follow-ups are each best-effort: the handoff is already settled when they run.
+    The follow-ups are each best-effort: the handoff is already settled when they run. The
+    serving push follows only an adoption that full evidence qualified.
     """
     try:
         from supervisor.update_merge import external_host_restart_smoke
@@ -488,6 +498,19 @@ def settle_on_boot(data_dir: Any, repo_dir: Any, *, supervisor_ready: bool) -> D
 
         branch = _git(repo_dir, "symbolic-ref", "-q", "--short", "HEAD", check=False).stdout.strip()
         _record_checkout_facts({"current_branch": branch, "current_sha": result["sha"]})
+        tier = str(result["tests"].get("tier") or "")
+        if tier != "full":
+            # This boot's automatic push needs full evidence; ordinary later pushes are separate.
+            # Neither the branch nor a tag is pushed and nothing schedules it later: the intent stays
+            # on record, withheld rather than failed or done.
+            result["publication"] = {"status": "withheld", "branch": branch, "sha": result["sha"],
+                                     "tier": tier or "unrecorded",
+                                     **({"created_tag": result["created_tag"]} if result.get("created_tag") else {})}
+            result["note"] += (f" Publication withheld: this adoption rests on {tier or 'unrecorded'} test evidence "
+                               "and the automatic post-adoption push needs a full run, so nothing was pushed.")
+            _log(data_dir, "body_adoption_publication",
+                 {"id": result["adoption_id"], "cand": result["sha"], "old": result["previous"]}, **result["publication"])
+            return
         # The consumed handoff carries only this commit's operation-created tag.
         pushed, push_msg = push_to_remote(branch or None, created_tag=str(result.get("created_tag") or ""),
                                          expected_commit_sha=result["sha"])

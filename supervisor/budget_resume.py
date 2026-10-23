@@ -24,8 +24,7 @@ from typing import Any, Dict, List, Optional
 
 from ouroboros.control_actor import control_actor, observed_control_stop
 from ouroboros.delegate_recovery import owner_restart_in_progress
-from ouroboros.work_stop import clear_refusal, continuation_refusal, release_refusal
-from ouroboros.work_stop import SELECTION_KEY, retain_consumed_selection
+from ouroboros.work_stop import SELECTION_KEY, clear_refusal, continuation_refusal, release_refusal, retain_consumed_selection
 from ouroboros.utils import utc_now_iso
 
 log = logging.getLogger(__name__)
@@ -133,6 +132,30 @@ def _owner_pause_blockers(blockers: Any) -> List[Dict[str, Any]]:
     return [b for b in (blockers or []) if isinstance(b, dict) and not review_finishing(b)]
 
 
+def _restart_or_update_refusal(q: Any, task: Any, result_root: pathlib.Path, task_id: str) -> Optional[Dict[str, Any]]:
+    """No Resume while an owner Restart runs, or while an update holds repo-writer admission closed (#2191)."""
+    from ouroboros.task_results import load_task_result
+    from supervisor import workers
+    if owner_restart_in_progress(q.DRIVE_ROOT):
+        return {"ok": False, "error": "restart_no_resume", "action": "wait_or_cancel"}
+    reason = str(getattr(q, "repo_writer_admission_closed", workers.repo_writer_admission_closed)() or "")
+    if not reason or (isinstance(task, dict) and getattr(
+            q, "repo_writer_task_allowed", workers.repo_writer_task_allowed)(task)):
+        return None
+    chat_id = task.get("chat_id") if isinstance(task, dict) else None
+    try:  # the typed refusal stands even when the owner notice cannot be sent
+        if chat_id is None:
+            chat_id = (load_task_result(result_root, task_id, strict=False) or {}).get("chat_id")
+        if chat_id is not None:
+            from ouroboros.task_finalization import host_operation_reply_kwargs
+            getattr(q, "send_with_budget", workers.send_with_budget)(
+                int(chat_id), "🔒 An update is in progress; press Resume after the restart.",
+                **host_operation_reply_kwargs(None, "", ""), role="system", system_type="managed_update_notice")
+    except Exception:
+        log.warning("update-admission Resume notice for %s was not sent", task_id, exc_info=True)
+    return {"ok": False, "error": "update_in_progress", "reason": reason, "action": "resume_after_restart"}
+
+
 def resume_warm_owner_pause_root(task_id: str, *, selected_by: str = "") -> Optional[Dict[str, Any]]:
     """The owner's Resume of a tree whose ROOT parked WARM under its Pause; None when not one.
 
@@ -186,8 +209,8 @@ def resume_warm_owner_pause_root(task_id: str, *, selected_by: str = "") -> Opti
     if not (fence_closed(fence) or tree_selection) or not warm:
         return None
     fence_id = str(fence.get("fence_id") or "")
-    if owner_restart_in_progress(q.DRIVE_ROOT):
-        return {"ok": False, "error": "restart_no_resume", "action": "wait_or_cancel"}
+    if refusal := _restart_or_update_refusal(q, task, result_root, task_id):
+        return refusal
     try:
         # Cascade Stop belongs to the logical root; SINGLE Stop to the physical attempt.
         if any(cancel_pending(result_root, tid, strict=True) for tid in {root_task_id, task_id}):
@@ -377,8 +400,8 @@ def _grant_exact_resume(task: Dict[str, Any], pause: Dict[str, Any], *, selected
     if refusal := release_refusal(observed_control_stop(
             result_root, task, budget=q.BUDGET_ROOT_FENCES), control_actor()):
         return refusal
-    if owner_restart_in_progress(q.DRIVE_ROOT):
-        return {"ok": False, "error": "restart_no_resume", "action": "wait_or_cancel"}
+    if refusal := _restart_or_update_refusal(q, task, result_root, task_id):
+        return refusal
     try:
         result_row = load_task_result(result_root, task_id, strict=True) or {}
     except Exception:
@@ -889,8 +912,8 @@ def _late_phase_refusal(q: Any, root: pathlib.Path, task_id: str, row: Dict[str,
     from supervisor.events_budget import budget_hold_fact
     from supervisor.state import budget_remaining
 
-    if owner_restart_in_progress(q.DRIVE_ROOT):
-        return {"ok": False, "error": "restart_no_resume", "action": "wait_or_cancel"}
+    if refusal := _restart_or_update_refusal(q, row, root, task_id):
+        return refusal
     try:
         if has_active_intent(root, task_id, strict=True):
             return {"ok": False, "error": "cancel_intent_active"}

@@ -127,9 +127,7 @@ EXPECTED_TOOLS = [
     "vcs_pull_ff", "vcs_restore", "vcs_revert",
     "fetch_pr_ref", "create_integration_branch", "cherry_pick_pr_commits",
     "stage_adaptations", "stage_pr_merge", "vcs_rollback",
-    "list_github_prs", "get_github_pr", "get_github_checks", "comment_on_pr", "pr_merge",
-    "list_github_issues", "get_github_issue", "comment_on_issue",
-    "close_github_issue", "create_github_issue",
+    "github_read", "github_write", "pr_merge",
     "codebase_health", "knowledge_read", "knowledge_write", "knowledge_list",
     "chronicle_write", "memory_read", "memory_mark",
     "journal_read", "journal_write", "workpad_read", "workpad_write",
@@ -201,15 +199,16 @@ def test_tool_schemas_have_no_empty_enum_values(registry):
         _walk(schema.get("function", {}).get("parameters", {}), schema.get("function", {}).get("name", "?"))
 
 
-def test_github_create_issue_schema_fields(registry):
-    schema = registry.get_schema_by_name("create_github_issue")["function"]
+def test_github_write_schema_fields(registry):
+    schema = registry.get_schema_by_name("github_write")["function"]
     props = schema["parameters"]["properties"]
-    assert schema["parameters"]["required"] == ["title"]
+    assert schema["parameters"]["required"] == ["method"]
+    assert "create_issue" in props["method"]["enum"]
     assert props["title"]["type"] == "string"
     assert props["body"]["type"] == "string"
     assert props["body"]["default"] == ""
-    assert props["labels"]["type"] == "string"
-    assert props["labels"]["default"] == ""
+    assert props["labels"]["type"] == "array"
+    assert "default" not in props["labels"]  # Omitted keeps labels; only an explicit [] clears them.
 
 
 def test_tool_execute_basic(registry):
@@ -234,11 +233,10 @@ def test_frozen_registry_includes_packaged_tool_modules(monkeypatch):
         "review_status",
         "plan_task",
         "vcs_rollback",
-        # github.py is in _FROZEN_TOOL_MODULES — PR inspection tools must work in frozen builds
-        "list_github_prs",
-        "get_github_pr",
-        "get_github_checks",
-        "comment_on_pr",
+        # github.py is in _FROZEN_TOOL_MODULES — the GitHub tools must work in frozen builds
+        "github_read",
+        "github_write",
+        "pr_merge",
         "query_code",
     }
     missing = expected_subset - available

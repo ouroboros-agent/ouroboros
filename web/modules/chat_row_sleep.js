@@ -26,8 +26,8 @@ const ADDED_FRAMES = 2;     // a row added is laid out by the next frame; it sle
 const CHANGED_FRAMES = 30;  // a row that changes often (a streaming answer, a live card) stays awake while it does
 const HELD_FRAMES = 12;     // a width that held this long has stopped moving (chat_reading_position.js)
 // What changes a row's size besides its text and children: its classes, a part hidden or opened, an inline size,
-// a picture's source.
-const RESIZING = ['class', 'hidden', 'open', 'style', 'src'];
+// a picture's source, a note a deck tucks away or brings back (chat_relay_deck.js).
+const RESIZING = ['class', 'hidden', 'open', 'style', 'src', 'data-deck-tucked'];
 // What on the page's root restyles every row: the theme, the layout, the language and its direction.
 const RESTYLING = ['data-theme', 'data-layout', 'lang', 'dir'];
 const ROWS = '.chat-bubble, .chat-live-card';  // the rows that sleep; a history control or notice never does
@@ -106,11 +106,16 @@ export function createRowSleep({ feed, win = globalThis.window, onRestyle } = {}
         // width would keep a size that is not its own.
         const settled = !feed.hasAttribute('data-resizing') && ++held >= HELD_FRAMES;
         if (settled) {
+            const ready = [];
             for (const [row, at] of due) {
                 if (at > frame) continue;
                 due.delete(row);
-                if (row.parentElement === feed) sleep(row);
+                if (row.parentElement === feed) ready.push(row);
             }
+            // A row without a box (`display: none`, a deck's tucked note) has no size to remember: marked, it would wake at
+            // the placeholder. Every box is read before any mark is written, so the batch costs one layout, not one per row.
+            const boxed = ready.filter((row) => typeof row.getClientRects !== 'function' || row.getClientRects().length > 0);
+            for (const row of boxed) sleep(row);
         }
         if (due.size) win.requestAnimationFrame(tick);
         else ticking = false;

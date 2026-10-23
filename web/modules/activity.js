@@ -10,12 +10,13 @@ import { setInlineStatus } from './ui_helpers.js';
 import { openConfirmDialog } from './confirm_dialog.js';
 import { taskCancelPending } from './log_events.js';
 import { waitingModel } from './project_activity.js';
-import { memberState, openWorkControls, resumeTargets, workOfEpisode, workRowView } from './work_status.js';
+import { memberState, openWorkControls, resumeTargets, workLine, workOfEpisode, workRowView } from './work_status.js';
 import { censusTaskFacts, censusTaskPhase, paintTaskPhase } from './task_phase_chip.js';
 import {
     ACTION_HURRY,
     ACTION_RESUME,
     TASK_CONTROL_TRIGGER_LABEL,
+    heldWorkFacts,
     hurryTaskAction,
     isRootTaskRow,
     openTaskControlMenu,
@@ -320,8 +321,15 @@ export function initActivity({ mount, ws, openDashboardTab = null } = {}) {
             const parked = projected?.activity === 'paused';
             const kindLabel = view.word;
             const outcome = ownId && ownOutcomePhase(activities.find((entry) => entry?.activity_id === ownId),
-                projected?.activity === 'working' && projected.transition === 'none' ? '' : kindLabel);
-            const meta = `${outcome ? phaseSlot(outcome) : esc(kindLabel)}${view?.secondary ? ` · ${esc(view.secondary)}` : ''}${q.type ? ` · ${esc(q.type)}` : ''}${rt}`;
+                view.outcome || (projected?.activity === 'working' && projected.transition === 'none') ? '' : kindLabel);
+            // The chip already says Finalizing beside its outcome; retain only the work's other facts.
+            const secondary = outcome && view.outcome ? workLine(projected, kindLabel) : view.secondary;
+            // The projection owns the state; the current wait's recorded blockers
+            // keep its specific cause readable after the Continue toast expires.
+            const waiting = t._budget_pause_hold;
+            const heldFacts = projected?.confirmed !== false && projected?.because?.[0]?.code === 'earlier_work_unconfirmed'
+                && waiting?.reason === 'continuation_writer_unsettled' && !waiting.selected ? heldWorkFacts(waiting.blockers) : '';
+            const meta = `${outcome ? phaseSlot(outcome) : esc(kindLabel)}${secondary ? ` · ${esc(secondary)}` : ''}${heldFacts ? ` · ${esc(heldFacts)}` : ''}${q.type ? ` · ${esc(q.type)}` : ''}${rt}`;
             const hold = t.project_admission_hold;
             const projectWait = hold?.label ? ` · ${esc(hold.label)}: ${esc(hold.detail || hold.reason)}` : '';
             // The held cause is what the owner reads before Resume: it wraps, never ellipsized.

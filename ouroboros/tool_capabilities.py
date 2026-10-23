@@ -359,6 +359,7 @@ EXPLICIT_RANGE_ARGS: frozenset[str] = frozenset({
     RESULT_VIEW_HEAD_ARG, RESULT_VIEW_TAIL_ARG,
     "max_chars", "max_lines", "start_char", "start_line",
     "source_start_char", "source_end_char", "offset", "limit",
+    "from", "to", "start", "after_seq",  # chronicle row bounds and continuation pages
 })
 
 # Tools whose own affordance IS paging: selects the recovery WORDING of a
@@ -469,7 +470,7 @@ OBSERVE_WORLD_MUTATION_TOOLS: frozenset[str] = frozenset({
     "browser_action", "submit_skill_to_hub", "toggle_skill", "skill_owner_action",
     "skill_install", "skill_update",
     "journal_write", "workpad_write",
-    "create_github_issue", "comment_on_issue", "comment_on_pr", "close_github_issue", "pr_merge",
+    "github_write", "pr_merge",
 })
 
 

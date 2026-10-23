@@ -290,7 +290,7 @@ def test_configured_child_bootstrap_keeps_the_refusal_facts(tmp_path, monkeypatc
     refusal = _fail("delegate_start", "execution_snapshot_failed",
                     f"A private execution snapshot could not be provisioned ({busy}).",
                     definitely_unrun=True, **lock_busy_facts(busy))
-    monkeypatch.setattr(subagent_runtime, "delegate_start_entry", lambda ctx, prompt, **kw: refusal)
+    monkeypatch.setattr(subagent_runtime, "exact_start", lambda *_a, **_kw: refusal)
     monkeypatch.setattr(subagent_runtime, "current_subagent_alternatives", lambda selected: [])
 
     class _Ctx:

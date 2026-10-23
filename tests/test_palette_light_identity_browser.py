@@ -1,8 +1,8 @@
-"""The light theme keeps every value the dark voices changed (docs/DESIGN.md seed table: every light cell as it was).
+"""The light theme keeps its palette while System follows the selected borderless material.
 
 The real page and product renderers of tests/test_dark_voice_material_contrast_browser.py, in the light theme, in
-Chromium and WebKit: each reader the dark palette touched computes the light value it had before the dark voices
-(LIGHT below, read from that tree), the chosen answer's `Your choice` word takes no room on white while its spoken
+Chromium and WebKit: each reader the dark palette touched computes the light value in LIGHT below, with the
+deliberately removed System edge transparent. The chosen answer's `Your choice` word takes no room while its spoken
 name stays, and an app card's frame gets the same theme packet from its host as from the root.
 """
 from __future__ import annotations
@@ -67,7 +67,7 @@ READERS = {
     "routing words": ('[data-palette="owner"] .msg-routing-annotation', ("color",)),
     "System row": ('.chat-bubble.system', ("backgroundColor", "borderLeftColor")),
     "System name": ('.chat-bubble.system .sender', ("color",)),
-    "Panic": ('#page-chat .chat-header-btn.danger', COLOUR),
+    "Panic": ('#page-chat .chat-header-btn.danger', (*COLOUR, "backgroundImage")),
 }
 
 READ = """(readers) => Object.fromEntries(Object.entries(readers).map(([name, [selector, props, pseudo]]) => {
@@ -77,7 +77,7 @@ READ = """(readers) => Object.fromEntries(Object.entries(readers).map(([name, [s
     return [name, Object.fromEntries(props.map((prop) => [prop, style[prop]]))];
 }))"""
 
-# The light values before the dark voices (read from that tree in both engines; they agree).
+# The light values before the dark voices, with the chosen borderless System and floating Panic backing (#2193).
 REST = "rgba(28, 33, 51, 0.05) 0px 1px 2px 0px, rgba(28, 33, 51, 0.06) 0px 6px 18px 0px"
 LIGHT = {
     "Ouroboros answer": {"backgroundColor": "rgb(253, 242, 244)", "boxShadow": REST},
@@ -173,9 +173,10 @@ LIGHT = {
     "owner time": {"color": "rgb(98, 105, 119)"},
     "queued words": {"color": "rgb(137, 144, 155)"},
     "routing words": {"color": "rgb(137, 144, 155)"},
-    "System row": {"backgroundColor": "rgba(245, 158, 11, 0.12)", "borderLeftColor": "rgba(245, 158, 11, 0.45)"},
+    "System row": {"backgroundColor": "rgba(245, 158, 11, 0.12)", "borderLeftColor": "rgba(0, 0, 0, 0)"},
     "System name": {"color": "rgb(128, 80, 0)"},
-    "Panic": {"color": "rgb(180, 35, 50)", "backgroundColor": "rgba(239, 68, 68, 0.1)"},
+    "Panic": {"color": "rgb(180, 35, 50)", "backgroundColor": "rgb(255, 255, 255)",
+              "backgroundImage": "linear-gradient(rgba(239, 68, 68, 0.1), rgba(239, 68, 68, 0.1)), none"},
 }
 
 

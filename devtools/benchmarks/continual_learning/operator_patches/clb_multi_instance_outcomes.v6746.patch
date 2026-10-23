@@ -102,7 +102,7 @@
 +        # ever diverge again.
 +        "truncated": reason_code in (
 +            "budget_exhausted", "children_unabsorbed", "context_overflow", "deadline_local",
-+            "finalization_grace", "llm_api_error", "owner_requested_finalization",
++            "finalization_grace", "llm_api_error", "output_recovery_exhausted", "owner_requested_finalization",
 +            "provider_unavailable", "round_limit"),
 +        "degraded": bool(task_result.get("degraded") or loop_outcome.get("degraded")),
 +        "resource_limit": resource_limit,

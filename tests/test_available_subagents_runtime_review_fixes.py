@@ -119,10 +119,12 @@ def test_d24_adopts_unique_explicit_replacement_or_root_direct_holder(
         "status": "adopted",
         "run_id": "run-b",
         "cause": recovery.CAUSE_WORKER_CRASH,
+        "settled": False,
+        "terminal_state": "",
     }
 
 
-def test_d24_still_refuses_multiple_current_custody_holders(tmp_path):
+def test_d24_reserves_multiple_current_custody_holders_independently(tmp_path):
     from ouroboros import delegate_custody as custody
     import ouroboros.delegate_recovery as recovery
 
@@ -147,7 +149,7 @@ def test_d24_still_refuses_multiple_current_custody_holders(tmp_path):
                 work_order_fingerprint=suffix * 64,
             ),
         )
-    assert recovery.prepare_handoff(
+    handoff = recovery.prepare_handoff(
         tmp_path,
         task,
         cause=recovery.CAUSE_WORKER_CRASH,
@@ -155,7 +157,11 @@ def test_d24_still_refuses_multiple_current_custody_holders(tmp_path):
         new_attempt=2,
         worker_id=3,
         exitcode=1,
-    ) == {}
+    )
+    assert handoff["schema"] == 2
+    assert [(row["run_id"], row["selected_subagent_id"], row["status"])
+            for row in handoff["holders"]] == [
+                ("run-a", "session-a", "reserved"), ("run-b", "session-b", "reserved")]
 
 
 def test_d24_does_not_post_a_pending_replacement(monkeypatch, tmp_path):
@@ -192,7 +198,7 @@ def test_d24_does_not_post_a_pending_replacement(monkeypatch, tmp_path):
         "ouroboros.tools.delegate.exact_start",
         lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("must not POST")),
     )
-    assert recovery.prepare_handoff(
+    handoff = recovery.prepare_handoff(
         tmp_path,
         task,
         cause=recovery.CAUSE_WORKER_CRASH,
@@ -200,7 +206,13 @@ def test_d24_does_not_post_a_pending_replacement(monkeypatch, tmp_path):
         new_attempt=2,
         worker_id=3,
         exitcode=1,
-    ) == {}
+    )
+    assert len(handoff["holders"]) == 1
+    holder = handoff["holders"][0]
+    assert holder["pending_invocation_id"] == "invocation-b"
+    assert holder["selected_subagent_id"] == "session-b"
+    assert holder["work_order_fingerprint"] == "b" * 64
+    assert holder["status"] == "reserved"
 
 
 def test_terminal_custody_outcome_reads_the_canonical_budget_root(tmp_path):

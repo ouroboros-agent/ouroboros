@@ -346,6 +346,7 @@ def write_task_message(
     review_feedback: Optional[Dict[str, Any]] = None,
     relation: str = "",
     sender_origin: Optional[Dict[str, Any]] = None,
+    reply_to: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """Write an addressed task-tree message without forging owner provenance.
 
@@ -355,6 +356,9 @@ def write_task_message(
     room/event), never the author of the words it quotes.
     """
 
+    from ouroboros.delegate_reply import normalize_reply_to
+
+    address = normalize_reply_to(reply_to)
     if provenance not in TASK_MESSAGE_PROVENANCES:
         return False
     from ouroboros.install_identity import StoreForeign, require_owned_root
@@ -370,6 +374,8 @@ def write_task_message(
         "provenance": provenance,
         "source_task_id": str(source_task_id or ""),
     }
+    if address is not None:
+        entry["reply_to"] = address
     if relayed_from_task_id:
         entry["relayed_from_task_id"] = str(relayed_from_task_id)
     if str(relation or ""):
@@ -496,7 +502,11 @@ def deliver_task_message(
         prefix = f"[Message from peer task {source}{label}]"
     else:
         prefix = f"[Message from ancestor task {source}]"
-    append_message(f"{prefix}\n{entry.get('text') or ''}")
+    from ouroboros.delegate_reply import reply_instruction
+
+    address = entry.get("reply_to")
+    instruction = reply_instruction(address)
+    append_message(f"{prefix}\n{instruction + chr(10) if instruction else ''}{entry.get('text') or ''}")
     if event_queue is not None:
         try:
             event_queue.put_nowait({
@@ -504,6 +514,7 @@ def deliver_task_message(
                 "source_task_id": source, "provenance": provenance,
                 "relayed_from_task_id": relayed,
                 **({"relation": relation} if relation else {}),
+                **({"reply_to": address} if address else {}),
                 # A bounded preview for the receiver's visible timeline row
                 # (owner 5=A); the full text is in the receiver's transcript.
                 "text_preview": str(entry.get("text") or "")[:200],
@@ -788,6 +799,8 @@ def drain_owner_entries(
                 if attempt_key is not None and kind in {KIND_OWNER_TEXT, "relay_entry"}:
                     drained["_owner_attempt_key"] = attempt_key
                 if kind == KIND_TASK_MESSAGE:
+                    if isinstance(entry.get("reply_to"), dict):
+                        drained["reply_to"] = dict(entry["reply_to"])
                     drained["provenance"] = str(entry.get("provenance") or "ancestor_task")
                     if drained["provenance"] == "system" and isinstance(entry.get("review_feedback"), dict):
                         drained["review_feedback"] = dict(entry["review_feedback"])

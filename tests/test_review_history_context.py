@@ -168,14 +168,15 @@ def test_initial_projection_estimate_counts_full_large_tail_and_frozen_capture_h
 
 def test_mode_projection_and_rebind_preserve_actual_shortened_tail_without_reloading_raw(monkeypatch):
     body = {"role": "user", "content": "BIG_REVIEW_BODY " * 30_000, REVIEW_HISTORY_MESSAGE_KEY: {"binding": "exact"}}
-    initial = plan_for(core(extra=[body], memory=True), monkeypatch, window=120_000)
+    # The ~120k-token body must start beside its reply and work room (owner 7A), crowding memory to F5.
+    initial = plan_for(core(extra=[body], memory=True), monkeypatch, window=214_000)
     source_hash = initial.core_sha256
     actual = initial.messages_for("max")[:2] + [{"role": "assistant", "content": "My authored understanding"},
                                                {"role": "user", "content": "Later owner words remain exact"}]
     lowered = initial.reproject_transcript(actual, "low")
     assert lowered[1:] == actual[1:]
     assert "BIG_REVIEW_BODY" not in json.dumps(lowered)
-    rebound = initial.reproject_for_route(window_tokens=120_000, known_window=True, ratio=1.0, output_reserve=65_536,
+    rebound = initial.reproject_for_route(window_tokens=214_000, known_window=True, ratio=1.0, output_reserve=65_536,
                                           tool_schemas=[], current_messages=actual)
     assert rebound.core_sha256 == source_hash and rebound.core is initial.core
     for mode in ("max", "low", "nano"):
@@ -187,7 +188,7 @@ def test_mode_projection_and_rebind_preserve_actual_shortened_tail_without_reloa
         assert rebound.reproject_transcript(emitted, mode) == emitted
     # Even a subsequent rebind without a supplied newer transcript keeps the
     # already selected continuation rather than reverting to the initial tail.
-    again = rebound.reproject_for_route(window_tokens=130_000, known_window=True, ratio=1.0, output_reserve=65_536, tool_schemas=[])
+    again = rebound.reproject_for_route(window_tokens=224_000, known_window=True, ratio=1.0, output_reserve=65_536, tool_schemas=[])
     assert again.messages_for("max")[1:] == actual[1:]
     assert "F5" in initial.projection("max").memory_facts["floor"]["steps"]
     # The shorter tail on the same window unfolds nothing (owner 2A): the shown story keeps its bytes.

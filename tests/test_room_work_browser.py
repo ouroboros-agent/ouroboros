@@ -215,10 +215,20 @@ class Transport:
     def body(self, *, ready=True):
         """The ``/api/state`` body for the current census, with the server's own work projection of the same rows."""
         rows = json.loads(json.dumps(self.activities))
+        raw, fences = dict(self.raw), dict(self.fences)
+        # A phase alone grants no Resume and proves no execution. Supply the
+        # queue observation and current fence that the real census reads.
+        for item in rows:
+            if item.get("pause_cause") == "owner" and item["phase"] in {"budget_pausing", "budget_paused"}:
+                task_id = item["activity_id"]
+                pausing = item["phase"] == "budget_pausing"
+                raw[task_id] = {"running": pausing, **raw.get(task_id, {})}
+                fences.setdefault(item.get("root_task_id") or task_id, {
+                    "state": "requested" if pausing else "paused", "parked_members": [] if pausing else [task_id]})
         return {"sha": "room-work-fixture", "supervisor_ready": ready, "active_chat_activities": rows,
                 "active_chat_activities_complete": self.complete, "projects": self.projects,
                 "project_chat_ids": [p["chat_id"] for p in self.projects],
-                **work_fields(rows, self.raw, results=self.results, fences=self.fences, complete=self.complete)}
+                **work_fields(rows, raw, results=self.results, fences=fences, complete=self.complete)}
 
     def _state(self, route):
         self.state_reads += 1
@@ -655,9 +665,10 @@ FULL_MENU = ["finalize", "hurry", "pause", "stop_now"]
 @pytest.mark.parametrize("ending", ["finished", "offline"])
 @pytest.mark.parametrize("subject", ["card", "cardless"])
 def test_open_task_menu_never_outlives_its_census_state(room_ui, subject, ending):
-    """The shared menu opened from a row is for that row's state when it opened. Pausing and Paused offer
-    only Stop now (Resume is the row's own button); a finished or offline row offers nothing. A stale menu must go (or match) by the frame the row says its new state, and a
-    stale Pause or Hurry pressed in it must post nothing (the menu calls them before any caller guard)."""
+    """The shared menu opened from a row is for that row's state when it opened. Pausing keeps a retry of Pause;
+    Paused offers only Stop now (Resume is the row's own button); a finished or offline row offers nothing.
+    A stale menu must go (or match) by the frame the row says its new state, and a
+    withdrawn Pause or Hurry pressed in it must post nothing (the menu calls them before any caller guard)."""
     task_id = "rw-live" if subject == "card" else "rw-far"
     history = {1: [*reading(6), *([progress("rw-live", "Comparing the cited pages.", 30,
                                             suggested_name="Compare the cited pages")] if subject == "card" else [])]}
@@ -700,7 +711,8 @@ def test_open_task_menu_never_outlives_its_census_state(room_ui, subject, ending
 
     def press_stale(stage, menu_items):
         """A stale menu's consequence: its Hurry/Pause run before any caller guard and post."""
-        action = next((name for name in ("hurry", "pause") if name in (menu_items or [])), "")
+        forbidden = ("hurry",) if stage == "pausing" else ("hurry", "pause")
+        action = next((name for name in forbidden if name in (menu_items or [])), "")
         if not action:
             return
         posted = len(transport.posts)
@@ -712,13 +724,24 @@ def test_open_task_menu_never_outlives_its_census_state(room_ui, subject, ending
 
     try:
         assert open_menu() == FULL_MENU
-        # Pausing: the work's controls are Stop alone, so the menu opened for Working must go or match.
+        # Pausing retains the coalescing Pause retry, but withdraws Hurry and Wrap up.
         first, last = transition("pausing", lambda f: (f["word"], f["secondary"]) == ("Pausing…", ""),
                                  census(phase="budget_pausing", pause_cause="owner"))
-        if first["menu"] not in (None, ["stop_now"]) or last["menu"] not in (None, ["stop_now"]):
+        if first["menu"] not in (None, ["pause", "stop_now"]) or last["menu"] not in (None, ["pause", "stop_now"]):
             problems.append(f"pausing: a stale menu outlived Working → Pausing (first frame {first['menu']}, "
                             f"after {last['t']} ms {last['menu']})")
         press_stale("pausing", facts(page)["menu"])
+        assert open_menu() == ["pause", "stop_now"], "a fresh menu keeps the accepted Pause retry"
+        posted = len(transport.posts)
+        page.locator('body > .task-control-menu [data-task-control="pause"]').click()
+        page.wait_for_function("() => [...document.querySelectorAll('.toast')].some(t => t.textContent.includes('Pausing'))")
+        assert [path for path, _ in transport.posts[posted:]] == [f"/api/tasks/{task_id}/pause"]
+        assert transport.posts[-1][1].get("request_id"), transport.posts[-1]
+        # Hover pauses a toast's lifetime (#2193); move away so it expires while the Work list stays open.
+        notice = page.locator('#toast-stack .toast').filter(has_text="Pausing:")
+        page.mouse.move(0, 0)
+        notice.wait_for(state="detached")
+        assert open_menu() == ["pause", "stop_now"]
         # Paused: a fresh open offers only Stop now (Resume is the row's own button); the old menu must go or match.
         first, last = transition("paused", lambda f: (f["word"], f["secondary"]) == ("Paused", ""),
                                  census(phase="budget_paused"))
@@ -726,6 +749,7 @@ def test_open_task_menu_never_outlives_its_census_state(room_ui, subject, ending
             problems.append(f"paused: a stale menu outlived Pausing → Paused (first frame {first['menu']}, "
                             f"after {last['t']} ms {last['menu']})")
         press_stale("paused", facts(page)["menu"])
+        assert open_menu() == ["stop_now"]
         if facts(page)["menu"]:
             page.keyboard.press("Escape")
 

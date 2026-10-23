@@ -98,7 +98,8 @@ QUESTION_GEOMETRY = """() => {
     const card = bubble.querySelector('.chat-quiz-card');
     const head = card.querySelector('.chat-quiz-head');
     const frame = card.querySelector('.chat-quiz-comment-box');
-    const foot = bubble.querySelector('.chat-bubble-foot');
+    // The bubble's last line is its time alone (owner, refined A 21.10): no host sentence beside it.
+    const foot = bubble.querySelector(':scope > .msg-time');
     const capsule = bubble.querySelector('.chat-bubble-voice > .chat-quiz-project');
     return {voice: [...bubble.querySelector('.chat-bubble-voice').children].map(el => el.classList[0]),
         capsule: box(capsule), capsuleName: capsule.getAttribute('aria-label'), cardRight: box(card).right,
@@ -107,8 +108,11 @@ QUESTION_GEOMETRY = """() => {
         toQuestion: box(card.querySelector('.chat-quiz-question')).y - box(bubble).y,
         frame: box(frame), send: box(frame.querySelector('.chat-quiz-send')),
         field: frame.querySelector('.chat-quiz-comment').getAttribute('aria-label'),
-        foot: [...foot.children].filter(el => !el.hidden).map(el => el.className), footText: foot.textContent.replace(/\\s+/g, ' ').trim(),
-        factsInCard: !!card.querySelector('.chat-quiz-host-facts'), clear: !!bubble.querySelector('.chat-quiz-clear'),
+        parts: [...bubble.children].filter(el => !el.hidden).map(el => el.classList[0]), footText: foot.textContent.trim(),
+        bubbleText: bubble.textContent.replace(/\\s+/g, ' '), factsAnywhere: !!bubble.querySelector('.chat-quiz-host-facts'),
+        question: card.querySelector('.chat-quiz-question').textContent.replace(/\\s+/g, ' ').trim(),
+        assumption: card.querySelector('.chat-quiz-assumption')?.textContent || '',
+        clear: !!bubble.querySelector('.chat-quiz-clear'),
         bubble: box(bubble), footBox: box(foot), page: document.scrollingElement.scrollWidth - innerWidth};
 }"""
 
@@ -160,9 +164,13 @@ def test_question_card_voice_line_one_row_head_answer_frame_and_foot(engine_ui, 
         # Answer: one frame holding its words and Send at its trailing bottom edge.
         assert facts['field'] == 'Your answer' and not facts['clear'], facts
         assert facts['frame']['right'] - facts['send']['right'] <= 6 and facts['frame']['bottom'] - facts['send']['bottom'] <= 6, facts
-        # Foot: the host's sentence after the time, never inside the card; no edge line widens the bubble.
-        assert facts['foot'] == ['msg-time', 'chat-quiz-host-facts'] and FACTS in facts['footText'], facts
-        assert not facts['factsInCard'] and facts['footBox']['right'] <= facts['bubble']['right'] and facts['page'] <= 0, facts
+        # Foot (owner, refined A 21.10): the time alone ends the bubble; the host's sentence is gone from the bubble,
+        # and everything the card says (question, the owner's answer frame, the signature line) stays as it was.
+        assert facts['parts'] == ['chat-bubble-voice', 'chat-quiz-card', 'msg-time'], facts
+        assert facts['footText'] and FACTS not in facts['bubbleText'] and not facts['factsAnywhere'], facts
+        assert facts['question'].startswith('Which switch do you turn off when the sound keeps playing'), facts
+        assert facts['assumption'] == 'Continuing meanwhile: ' + BLOCK['assumption'], facts
+        assert facts['footBox']['right'] <= facts['bubble']['right'] and facts['page'] <= 0, facts
         # The other theme repaints the same card in place and moves no box of it.
         boxes = page.evaluate(BOXES)
         for scheme in ('dark' if theme == 'light' else 'light', theme):
@@ -191,7 +199,8 @@ def test_question_card_voice_line_one_row_head_answer_frame_and_foot(engine_ui, 
         own.wait_for()
         assert own.evaluate("el => [...el.querySelector('.chat-quiz-head').children].map(c => c.className)") == facts['headOrder']
         assert own.evaluate("el => el.closest('.chat-bubble').querySelector('.chat-bubble-voice')") is None
-        assert own.evaluate("el => el.closest('.chat-bubble').querySelector('.chat-bubble-foot').textContent").count(FACTS) == 1
+        assert own.evaluate("el => el.closest('.chat-bubble').textContent").count(FACTS) == 0
+        assert own.evaluate("el => !!el.closest('.chat-bubble').querySelector(':scope > .msg-time')")
         own.evaluate("el => el.scrollIntoView({block: 'center'})")
         setup_browser.capture(page, f'question-a-project-{engine}-{width}-{theme}')
     finally:
@@ -529,14 +538,18 @@ def test_files_location_keeps_every_folder_reachable_in_the_bar(engine_ui, width
             trail.hover()
             page.mouse.wheel(-4000, 0)
             page.wait_for_function("el => el.scrollLeft <= 1", arg=trail.element_handle())
+            page.wait_for_function(f"() => ({LOCATION})().seen[0]")
             assert page.evaluate(LOCATION)['seen'][0], 'the root is reachable by a pointer'
             page.mouse.wheel(4000, 0)
             page.wait_for_function("el => el.scrollLeft >= el.scrollWidth - el.clientWidth - 1", arg=trail.element_handle())
+            # Wait for hit-tested geometry too: the wheel's visual scroll can settle after its offset.
+            page.wait_for_function(f"() => ({LOCATION})().seen.at(-1)")
             assert page.evaluate(LOCATION)['seen'][-1]
             # The keyboard: each folder in turn comes into view where it can be pressed.
             crumbs = page.locator('#page-files .app-page-lead .files-crumb')
             for index in range(crumbs.count()):
                 crumbs.nth(index).focus()
+                page.wait_for_function(f"index => ({LOCATION})().seen[index]", arg=index)
                 assert page.evaluate(LOCATION)['seen'][index], (kind, index)
     finally:
         page.close()
@@ -642,5 +655,76 @@ def test_skills_tabs_and_existing_toolbar_survive_a_narrow_content_column(engine
         page.wait_for_function("document.querySelector('#page-skills .app-page-header').hasAttribute('data-lead')")
         assert page.locator('#page-skills .app-page-lead .app-tab-strip').evaluate('el => el === window.__skillsTabs')
         assert page.evaluate('document.scrollingElement.scrollWidth <= innerWidth')
+    finally:
+        page.close()
+
+
+ANSWERED = {'quiz_id': 'q-chosen', 'state': 'answered', 'asked_at': '2026-10-21T19:56:00Z', 'host_facts': FACTS,
+            'question': 'Who finishes the saved Codex work on SQLite?',
+            'options': ['A — keep it with the same Codex', 'B — hand the saved candidate to one Ouroboros author',
+                        'C — keep it saved, no continuation'],
+            'option_details': ['Keeps the original author and context.', 'Reconcile the base first, then tests and review.',
+                               'Code and results stay; nothing new runs.'],
+            'recommended_index': 0, 'answered_index': 1,
+            'assumption': 'Finishing the audit and keeping an exact handoff.'}
+WORDS = {**ANSWERED, 'quiz_id': 'q-words', 'asked_at': '2026-10-21T19:57:00Z', 'answered_index': None,
+         'comment': 'finish it yourself, but ask me questions after the review panel'}
+CHOICE_VIEW = """() => [...document.querySelectorAll('#chat-messages .chat-bubble')].filter(b => b.querySelector('.chat-quiz-card'))
+    .map(bubble => { const card = bubble.querySelector('.chat-quiz-card'); const options = [...card.querySelectorAll('.chat-quiz-option')];
+        return {id: card.dataset.quizId, state: card.dataset.state,
+            chosen: options.map(o => o.classList.contains('chosen')),
+            names: options.map(o => o.querySelector('.chat-quiz-option-chosen-name')?.textContent || ''),
+            fills: options.map(o => getComputedStyle(o).backgroundColor),
+            recommended: options.map(o => !!o.querySelector('.chat-quiz-option-recommended')),
+            details: options.map(o => o.querySelector('.chat-quiz-option-detail')?.textContent || ''),
+            answer: card.querySelector('.chat-quiz-answer')?.textContent || '',
+            assumption: card.querySelector('.chat-quiz-assumption')?.textContent || '',
+            parts: [...bubble.children].filter(el => !el.hidden).map(el => el.classList[0]),
+            text: bubble.textContent}; })"""
+
+
+def _seed_answered(page):
+    def row(block):
+        return {'role': 'assistant', 'msg_type': 'quiz', 'task_id': 'task-sqlite', 'chat_id': 1, 'ts': block['asked_at'],
+                'text': block['question'], 'quiz': {k: v for k, v in block.items() if k != 'question' and v is not None}}
+    page.route('**/api/projects', lambda r: r.fulfill(json={'projects': []}))
+    page.route('**/api/state', lambda r: r.fulfill(json={
+        'sha': 'browser-fixture', 'supervisor_ready': True, 'active_chat_activities': [], 'projects': [],
+        'project_chat_ids': [], 'current_questions': [], 'current_questions_complete': True,
+        'main_attention': [], 'main_attention_complete': True}))
+    page.route('**/api/chat/history*', lambda r: r.fulfill(json={'messages': [row(ANSWERED), row(WORDS)], 'progress': []}))
+    page.route('**/api/tasks/task-sqlite', lambda r: r.fulfill(json={
+        'task_id': 'task-sqlite', 'owner_quiz': {ANSWERED['quiz_id']: ANSWERED, WORDS['quiz_id']: WORDS}}))
+
+
+# Refined A (owner 21.10) changed only the bubble's last line: an answered question keeps every option, its details and
+# the recommendation, marks the recorded choice (`Your choice`, the chosen fill) and keeps the owner's own words and the
+# signature line, live and after a reload alike. Words without a chosen option mark no option.
+@pytest.mark.parametrize('theme', ['light', 'dark'])
+@pytest.mark.parametrize('width,height', [(1100, 750), (400, 800)])
+def test_answered_question_keeps_its_choice_and_words_after_reload_without_the_host_sentence(engine_ui, width, height, theme):
+    page = _open(engine_ui, width, height, theme, seed=_seed_answered)
+    try:
+        page.locator('#chat-messages .chat-quiz-card[data-quiz-id="q-words"]').wait_for()
+        for attempt in ('live', 'reload'):
+            if attempt == 'reload':
+                page.reload()
+                page.locator('#chat-messages .chat-quiz-card[data-quiz-id="q-words"]').wait_for()
+            views = {view['id']: view for view in page.evaluate(CHOICE_VIEW)}
+            chosen, words = views['q-chosen'], views['q-words']
+            print(json.dumps({'answered_question': views, 'attempt': attempt, 'engine': engine_ui['engine'],
+                              'viewport': [width, height], 'theme': theme}))
+            assert chosen['state'] == words['state'] == 'answered', views
+            assert chosen['chosen'] == [False, True, False] and chosen['names'] == ['', 'Your choice', ''], chosen
+            assert chosen['fills'][1] != chosen['fills'][0] == chosen['fills'][2], 'the recorded choice wears its own fill'
+            assert chosen['recommended'] == [True, False, False] and chosen['details'] == ANSWERED['option_details'], chosen
+            assert words['chosen'] == [False, False, False] and words['names'] == ['', '', ''], words
+            assert words['answer'] == "Owner's answer: " + WORDS['comment'], words
+            for view in (chosen, words):
+                assert view['assumption'], view
+                assert view['parts'][-1] == 'msg-time' and FACTS not in view['text'], view
+        page.locator('#chat-messages .chat-quiz-card[data-quiz-id="q-chosen"]').evaluate(
+            "el => el.scrollIntoView({block: 'center'})")
+        setup_browser.capture(page, f'question-answered-{engine_ui["engine"]}-{width}-{theme}')
     finally:
         page.close()

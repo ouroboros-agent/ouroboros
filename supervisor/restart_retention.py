@@ -625,8 +625,13 @@ def recover_aborted_update(drive_root: Any, running: Dict[str, Any], pending: Li
         if isinstance(meta, dict) and meta.get(RETAINED_FOR_BOOT) and (
                 task_id not in batch["rows"] or meta is not batch["rows"][task_id]["meta"]):
             return False
+    from supervisor.active_activity import get_direct_activity_registry
+
+    live_direct = {str(entry.activity_id) for entry in get_direct_activity_registry().actors()}
     selected = {}
     for task_id, captured in batch["rows"].items():
+        if task_id in live_direct:
+            continue
         meta = running.get(task_id)
         if meta is not captured["meta"] or not meta.get(RETAINED_FOR_BOOT):
             continue
@@ -740,8 +745,11 @@ def prepare_restart_returns(drive_root: Any, running: Dict[str, Any], pending: L
             returns.add(str(task_id))
     for record in direct or ():
         task_id = str((record or {}).get("id") or "")
-        if task_id and working_saved(pathlib.Path(record.get("budget_drive_root") or drive_root), task_id,
-                                     int(record.get("_attempt") or 1), task=record):
+        attempt = int((record or {}).get("_attempt") or 1)
+        root = pathlib.Path((record or {}).get("budget_drive_root") or drive_root)
+        if (task_id and task_id not in set(owner_wait_ids) and working_saved(root, task_id, attempt, task=record)
+                and pause_retention(root, task_id, attempt) not in {RETAIN_SAVED, RETAIN_UNUSED_GRANT, RETAIN_SLEEP,
+                                                                    RETAIN_OWNER_PAUSE}):
             returns.add(task_id)
     queue_ids = []
     for task in pending or ():

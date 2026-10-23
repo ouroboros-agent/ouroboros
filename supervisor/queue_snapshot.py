@@ -130,6 +130,7 @@ _PENDING_FIELDS = (
     'configured_subagent', 'memory_mode', 'drive_root', 'parent_cognitive_route',
     'subagent_availability', 'child_drive_root', 'budget_drive_root', 'task_constraint',
     'predecessor_authority_source', 'metadata', 'origin_message_ref', 'origin_message_text',
+    'image_source_ref', 'image_mime', 'image_caption',
     '_attempt', 'review_reason', 'review_source_task_id', '_budget_pause',
     'budget_resumed_at', '_terminalization_retry', '_cancel_intent_authority_hold', '_owner_wait_resume',
     '_budget_pause_resume', '_budget_pause_hold', '_resume_selection', '_continuation_prepared', '_admission_owner_token',
@@ -421,6 +422,9 @@ def _retain_snapshot_pending(snapshot_pending: list, running_rows: list, *, stal
                 unseen.add(str(task.get("id") or ""))
     direct_rows: list = []
     direct_saved: list = []
+    direct_wait_handoffs: list = []
+    tx_id = str(transaction.get("transaction_id") or "")
+    tx_task_ids = {str(tid) for tid in (transaction.get("task_ids") or [])}
     for task_id in direct_caught:
         task_id = str(task_id or "")
         if not task_id:
@@ -428,18 +432,28 @@ def _retain_snapshot_pending(snapshot_pending: list, running_rows: list, *, stal
         try:
             stored = load_task_result(_queue().DRIVE_ROOT, task_id, strict=True) or {}
             pause = budget_pause_row(_queue().DRIVE_ROOT, task_id)
+            wait = stored.get("owner_wait") if isinstance(stored.get("owner_wait"), dict) else {}
             if not pause:
-                wait, _ = saved_sleep_checkpoint(_queue().DRIVE_ROOT, task_id)
-                if wait:
-                    # The prior direct roster plus exact source is the locator;
-                    # park_saved_pause performs the same conversion as a worker.
+                if (wait.get("state") == "waiting" and wait.get("reason") == "owner_pause"
+                        and wait.get("source_ref")):
                     pause = {**wait, "is_direct_chat": True}
+                elif not (wait.get("state") == "waiting" and wait.get("reason") in {"owner", "review", "sleep"}
+                          and wait.get("source_ref") and tx_id and task_id in tx_task_ids
+                          and not (owner_restart and wait.get("reason") == "sleep")):
+                    sleep_wait, _ = saved_sleep_checkpoint(_queue().DRIVE_ROOT, task_id)
+                    if sleep_wait:
+                        # The prior direct roster plus exact source is the locator;
+                        # park_saved_pause performs the same conversion as a worker.
+                        pause = {**sleep_wait, "is_direct_chat": True}
         except Exception:
             continue
         saved_pause = bool(stored and pause and pause.get("source_ref") and pause.get("is_direct_chat"))
-        if not stored or not (saved_pause or stored.get("_is_direct_chat")):
+        saved_wait = bool(stored and not pause and wait.get("state") == "waiting"
+                          and wait.get("reason") in {"owner", "review", "sleep"} and wait.get("source_ref"))
+        if not stored or not (saved_pause or saved_wait or stored.get("_is_direct_chat")):
             continue
-        attempt = int(stored.get("task_attempt") or (pause or {}).get("task_attempt") or 1)
+        attempt = int(stored.get("task_attempt") or (pause or {}).get("task_attempt")
+                      or wait.get("task_attempt") or 1)
         record: dict = {
             "id": task_id, "type": "task", "chat_id": stored.get("chat_id"), "_is_direct_chat": True,
             "_attempt": attempt, "root_task_id": task_id, "depth": 0,
@@ -449,12 +463,17 @@ def _retain_snapshot_pending(snapshot_pending: list, running_rows: list, *, stal
                     "task_contract", "title", "text", "budget_drive_root"):
             if stored.get(key) not in (None, ""):
                 record[key] = stored[key]
-        (direct_rows if saved_pause else direct_saved).append({"task": record, "attempt": attempt})
+        if (saved_wait and int(wait.get("task_attempt") or 0) == attempt and tx_id
+                and task_id in tx_task_ids and not (owner_restart and wait.get("reason") == "sleep")):
+            record["_owner_wait_resume"] = {**wait, "restart_transaction_id": tx_id}
+            direct_wait_handoffs.append(record)
+        else:
+            (direct_rows if saved_pause else direct_saved).append({"task": record, "attempt": attempt})
     before_park = {str(row["task"].get("id") or ""): pause_ids(row["task"]) for row in running_rows
                    if isinstance(row, dict) and isinstance(row.get("task"), dict)}
     parked = _park_pausing_running_rows(list(running_rows) + direct_rows + direct_saved, snapshot_pending,
         sleep_hold_reason=sleep_hold_reason)
-    taken = {str(task.get("id") or "") for task in list(snapshot_pending) + parked}
+    taken = {str(task.get("id") or "") for task in list(snapshot_pending) + direct_wait_handoffs + parked}
     # Interrupted work whose state was saved returns (or waits) under its own id
     # instead of the shutdown fence's cancellation (#1563).
     recovered = recover_saved_running(
@@ -470,7 +489,7 @@ def _retain_snapshot_pending(snapshot_pending: list, running_rows: list, *, stal
                   if unseen_pause(task, before_park.get(str(task.get("id") or ""), ("", ""))))
     retained = []
     consumed: list = []
-    for task in list(snapshot_pending) + parked:
+    for task in list(snapshot_pending) + direct_wait_handoffs + parked:
         try:
             if resume_hold_requires_fence(task, _queue().DRIVE_ROOT):
                 consumed.append(str(task.get("id") or ""))

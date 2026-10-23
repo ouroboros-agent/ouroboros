@@ -555,7 +555,7 @@ def test_unreadable_ancestor_never_hides_a_retained_main_ask_as_unbound(tmp_path
     write_task_result(tmp_path, "child", "completed", chat_id=1, parent_task_id="unreadable", root_task_id="root")
     record_asked(tmp_path, "child", quiz_id="q", question="Still pending?", options=["Yes"], chat_id=1)
     record_publication(tmp_path, "child", "q", 1)
-    monkeypatch.setattr(projects_registry, "_read_lineage", lambda *a: None)
+    monkeypatch.setattr(projects_registry, "_read_lineage", lambda *a, **_kw: None)
     snapshot = main_decisions_snapshot(tmp_path, [], {})
     assert snapshot["current_questions_complete"] is False
     assert snapshot["current_questions_gaps"] == [{"reason": "question_source_unavailable", "task_id": "child"}]

@@ -47,6 +47,15 @@ def test_named_tool_exports_readable_immutable_files_without_github(tmp_path, mo
     import requests
     repo, remote, ctx, reg = _context(tmp_path, monkeypatch)
 
+    # Git emits UTF-8 even when Windows' default text pipe codec is CP1252.
+    git_run = evolution_stats.subprocess.run
+
+    def windows_default(*args, **kwargs):
+        kwargs.setdefault("encoding", "cp1252")
+        return git_run(*args, **kwargs)
+
+    monkeypatch.setattr(evolution_stats, "subprocess", SimpleNamespace(run=windows_default))
+
     def no_network(*a, **k):
         raise AssertionError("local stats must not publish or fetch over HTTP")
 

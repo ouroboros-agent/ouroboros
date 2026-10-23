@@ -129,6 +129,11 @@ test('native activation has one owner; external select is silent and never steal
     assert.equal(controller.select('three'), true);
     assert.equal(doc.activeElement, tabs[0]);
     assert.deepEqual(changed, ['two']);
+    strip.setAttribute('inert', '');
+    assert.equal(controller.select('one'), true, 'programmatic route selection succeeds while drawer closes over inert page');
+    strip.emit('click', { target: tabs[2] });
+    assert.equal(tabs[0].getAttribute('aria-selected'), 'true', 'user clicks on an inert strip are ignored');
+    strip.removeAttribute('inert');
     assert.equal(controller.select('unknown'), false);
     controller.destroy();
     assert.equal(controller.select('one', { focus: true }), false);

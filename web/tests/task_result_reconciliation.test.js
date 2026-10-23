@@ -92,9 +92,14 @@ for (const via of ['log', 'detail']) test(`child terminal ${via} retains the pro
             ...(via === 'log' ? {model_execution: observation} : {})}});
         await new Promise(resolve => setImmediate(resolve));
         const meta = fx.card('child').querySelector('[data-live-meta]').innerHTML;
-        assert.match(meta, /Last solve response: fallback/);
-        assert.match(meta, /Coordinator: initial/);
+        const facts = fx.card('child').querySelector('[data-live-facts]').innerHTML;
+        // The compact line names the executor and its own (requested) model; the coordinator's model and its
+        // solve evidence are labelled facts of the details, never the executor's.
         assert.match(meta, /Cursor/);
+        assert.match(meta, /requested cursor-model/);
+        assert.doesNotMatch(meta, /fallback|initial/);
+        assert.match(facts, /<dt>Last solve response<\/dt><dd>fallback/);
+        assert.match(facts, /<dt>Coordinator<\/dt><dd>initial<\/dd>/);
     } finally {fx.instance.destroy(); restoreDom(fx.prior);}
 });
 
@@ -114,13 +119,17 @@ for (const fresh of [false, true]) test(`pruned model history preserves current 
         }
         await fx.instance.refreshHistory({revision: 2});
         const meta = () => fx.card('past').querySelector('[data-live-meta]').innerHTML;
-        assert.doesNotMatch(meta(), /Last solve response: old-fallback/);
-        if (fresh) assert.match(meta(), /Last solve response: current-model/);
+        const facts = () => fx.card('past').querySelector('[data-live-facts]').innerHTML;
+        assert.doesNotMatch(facts(), /<dt>Last solve response<\/dt><dd>old-fallback/);
+        if (fresh) assert.match(facts(), /<dt>Last solve response<\/dt><dd>current-model/);
         fx.instance.hydrateStateSnapshot({active_chat_activities: [],
             active_chat_activities_complete: true, supervisor_ready: true}, Infinity, 2);
         await new Promise(resolve => setImmediate(resolve));
         assert.equal(fx.card('past').querySelector('[data-live-phase]').textContent, 'Done');
-        assert.match(meta(), fresh ? /Last solve response: current-model/ : /Last solve response: old-fallback/);
+        const kept = fresh ? 'current-model' : 'old-fallback';
+        assert.match(facts(), new RegExp(`<dt>Last solve response</dt><dd>${kept}`));
+        // The observed model is the compact line's model fact.
+        assert.match(meta(), new RegExp(`>${kept}<`));
     } finally {fx.instance.destroy(); restoreDom(fx.prior);}
 });
 
@@ -142,8 +151,13 @@ for (const external of [false, true]) test(`terminal child retains late lineage 
         fx.handlers.get('chat')({...child, subagent_event: 'running', content: 'planning', model: 'google/gemini-3.6-flash'});
         const card = fx.card('planner');
         const meta = card.querySelector('[data-live-meta]').innerHTML;
-        assert.match(meta, external ? /Coordinator: gemini-3\.6-flash/ : /Agent model: gemini-3\.6-flash/);
-        assert.match(meta, /Last solve response: actual-solver/);
+        const facts = card.querySelector('[data-live-facts]').innerHTML;
+        assert.match(facts, external ? /<dt>Coordinator<\/dt><dd>gemini-3\.6-flash<\/dd>/
+            : /<dt>Agent model<\/dt><dd>gemini-3\.6-flash<\/dd>/);
+        assert.match(facts, /<dt>Last solve response<\/dt><dd>actual-solver/);
+        // A delegated child's compact line never borrows the coordinator's model; a native one shows the solver.
+        if (external) assert.doesNotMatch(meta, /gemini|actual-solver/);
+        else assert.match(meta, />actual-solver</);
         assert.equal(card.dataset.finished, '1', 'late model evidence must not revive the terminal child');
     } finally {fx.instance.destroy(); restoreDom(fx.prior);}
 });

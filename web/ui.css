@@ -72,9 +72,8 @@
     --user-sender: #a0c6ff;
     --user-text: #efeff2;
     /* System / owner-control voice (system bubble + sender), tokenized so it tracks one source (C7.2): in dark a
-       neutral body with a gold rail and name, since gold goes olive as a dark fill; in light an amber tint. */
+       neutral body with a gold name, since gold goes olive as a dark fill; in light an amber tint. */
     --system-bubble-bg: rgba(255, 255, 255, 0.055);
-    --system-border: #f7cb58;
     --system-sender: #f7cb58;
     --system-text: #efeff2;
     /* Assistant / agent voice: the assistant bubble's sender + body tints,
@@ -191,8 +190,13 @@
     --radius-inner: 12px;
     --radius-sheet: 24px;
     --surface-object: rgba(255, 255, 255, 0.055);
+    /* The object's colour as one opaque paint (its veil over --bg-primary), for marks that must cover what they
+       cross: a chart's label halos and dot rings. */
+    --surface-object-opaque: #1c1c1f;
     --surface-capsule: rgba(255, 255, 255, 0.09);
     --surface-capsule-hover: rgba(255, 255, 255, 0.135);
+    --chip-float: linear-gradient(var(--surface-capsule), var(--surface-capsule)), rgba(var(--shell-rgb), 0.98);
+    --chip-float-hover: linear-gradient(var(--surface-capsule-hover), var(--surface-capsule-hover)), rgba(var(--shell-rgb), 0.98);
     --surface-float: rgba(32, 32, 34, 0.92);
     --surface-tray: rgba(var(--neutral-rgb), 0.045);
     --surface-side: #0f0f11;
@@ -376,8 +380,11 @@
     --elev-float: 0 2px 6px rgba(28, 33, 51, 0.06), 0 18px 44px rgba(28, 33, 51, 0.11);
     --row-lift-dim: rgba(16, 18, 28, 0.24);
     --surface-object: #ffffff;
+    --surface-object-opaque: var(--surface-object);
     --surface-capsule: #ffffff;
     --surface-capsule-hover: #f5f6f8;
+    --chip-float: var(--surface-capsule);
+    --chip-float-hover: var(--surface-capsule-hover);
     --surface-float: #ffffff;
     --surface-tray: rgba(var(--neutral-rgb), 0.03);
     --surface-side: #fafbfc;
@@ -409,7 +416,6 @@
     --user-bubble-from: rgba(80, 120, 190, 0.14);
     --user-bubble-to: rgba(55, 85, 155, 0.12);
     --system-bubble-bg: rgba(245, 158, 11, 0.12);
-    --system-border: rgba(245, 158, 11, 0.45);
     --accent: #c93545;
     --focus-accent-ring: var(--accent-10);
     --amber: #f59e0b;
@@ -500,6 +506,8 @@
     --text-disabled: var(--user-sender);
     --text-muted: var(--text-disabled);
 }
+/* Code stays on the room's neutral material inside either voice. */
+.md-code-block { --tone-quiet-hover: var(--bg-hover); }
 
 .ouro-ui { font-family: var(--font-sans); color-scheme: var(--native-color-scheme); }
 .muted { color: var(--text-meta); }
@@ -638,7 +646,7 @@
 
 
 .ui-chip,
-:where(.status-badge, .mcp-server-status, .evo-runtime-pill, .evo-runtime-chip) {
+:where(.status-badge, .mcp-server-status) {
     display: inline-flex;
     align-items: center;
     gap: 6px;
@@ -908,8 +916,8 @@ textarea.ui-control { resize: vertical; }
 /* ---- Floating chrome ----------------------------------------------------------------------------------------------
    Controls that float over scrolling content (Main's header group) share one box: height, baseline and the pill
    corner; words, width, weight and tone stay the control's own (DESIGN §5). The group is invisible at rest and its
-   padding is cancelled by an equal negative margin, so grouping moves no control. A room's bar keeps its own reading
-   backing (Main: `.chat-page-header::before`), and what a bar discloses unfolds from the bar's bottom edge as one
+   padding is cancelled by an equal negative margin, so grouping moves no control. A room's separate capsules keep
+   their own reading backing, and what a bar discloses unfolds from the bar's bottom edge as one
    Shade (room_work.css), never as a box glued to one control or one group. */
 @media (pointer: coarse) {
     /* A coarse pointer (a phone) raises the shared touch minimum to a finger's 44px, and the whole family with it. */
@@ -982,6 +990,15 @@ textarea.ui-control { resize: vertical; }
 :root[data-theme]:where(.ouro-ui) :is(.btn, .theme-choice):not(:disabled):active { transform: none; filter: var(--press); }
 :root[data-theme]:where(.ouro-ui) .btn-primary { --press: var(--press-solid); }
 :root[data-theme]:where(.ouro-ui) .btn-ghost:not(:disabled):active { box-shadow: none; }
+/* A capsule over content uses the same geometry, focus and disabled state, on glass. */
+:root[data-theme]:where(.ouro-ui) .btn-float {
+    background: var(--surface-float); color: var(--text-primary); box-shadow: var(--elev-float);
+    -webkit-backdrop-filter: var(--glass); backdrop-filter: var(--glass);
+}
+@media (hover: hover) {
+    :root[data-theme]:where(.ouro-ui) .btn-float:not(:disabled):hover { filter: var(--press); }
+}
+:root[data-theme]:where(.ouro-ui) .btn-float:not(:disabled):active { filter: var(--press) var(--press); }
 :root[data-theme]:where(.ouro-ui) .btn:disabled { box-shadow: none; }
 /* The Appearance choice is one control in both documents (the SPA and the served setup page load only this sheet
    in common): neutral capsules, the chosen one in the soft crimson, all standing. */

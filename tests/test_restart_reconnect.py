@@ -285,7 +285,7 @@ def test_task_done_live_summary_distinguishes_typed_failure():
     assert "if (severity === 'warn') return 'warn';" in source
     assert source.count("taskTerminalPhase(evt)") >= 2
     assert "const terminal = taskDoneIsTerminal(evt);" in source
-    assert "const presentation = taskPresentation(terminal || outcome === 'error' ? outcome : 'working');" in source
+    assert "const presentation = taskPresentation(terminal || outcome === 'error' ? outcome : 'working'," in source
     assert "headline: presentation.headline" in source
 
 

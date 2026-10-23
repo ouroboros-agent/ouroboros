@@ -143,7 +143,7 @@ def test_exception_shaped_rate_limit_blocks_unchecked_after_one_retry(monkeypatc
     _patch_llm_client(monkeypatch, stub)
     ctx = _DriveCtx(tmp_path)
 
-    ok, msg = check_safety("create_github_issue", {"title": "x"}, ctx=ctx)
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"}, ctx=ctx)
 
     assert ok is False, "an unchecked guarded call must not execute in full mode"
     assert msg.startswith("⚠️ SAFETY_UNAVAILABLE:"), "typed non-verdict outcome, not a verdict"
@@ -153,7 +153,7 @@ def test_exception_shaped_rate_limit_blocks_unchecked_after_one_retry(monkeypatc
 
     rows = _read_events(ctx, "safety_check_rate_limited")
     assert len(rows) == 1
-    assert rows[0]["tool"] == "create_github_issue"
+    assert rows[0]["tool"] == "github_write"
     assert rows[0]["action"] == "blocked_unchecked_after_retry"
     assert rows[0]["error"], "the audit row carries the sanitized bounded error"
     assert rows[0]["task_id"] == "t-safety"
@@ -234,7 +234,7 @@ def test_http200_body_rate_limit_blocks_unchecked_after_one_retry(monkeypatch, t
     _patch_llm_client(monkeypatch, stub)
     ctx = _DriveCtx(tmp_path)
 
-    ok, msg = check_safety("create_github_issue", {"title": "x"}, ctx=ctx)
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"}, ctx=ctx)
 
     assert ok is False
     assert msg.startswith("⚠️ SAFETY_UNAVAILABLE:") and "rate-limited" in msg
@@ -269,9 +269,9 @@ def test_storm_latch_short_circuits_without_new_provider_calls(monkeypatch, tmp_
     _patch_llm_client(monkeypatch, stub)
     ctx = _DriveCtx(tmp_path)
 
-    ok1, msg1 = check_safety("create_github_issue", {"title": "x"}, ctx=ctx)
+    ok1, msg1 = check_safety("github_write", {"method": "create_issue", "title": "x"}, ctx=ctx)
     calls_after_first = len(stub.calls)
-    ok2, msg2 = check_safety("create_github_issue", {"title": "y"}, ctx=ctx)
+    ok2, msg2 = check_safety("github_write", {"method": "create_issue", "title": "y"}, ctx=ctx)
 
     assert ok1 is False and ok2 is False
     assert msg2.startswith("⚠️ SAFETY_UNAVAILABLE:")
@@ -289,7 +289,7 @@ def test_expired_deadline_permits_no_second_rate_limit_attempt(monkeypatch, tmp_
     ctx = _DriveCtx(tmp_path)
     ctx.task_metadata = {"deadline_at": "2020-01-01T00:00:00Z"}
 
-    ok, msg = check_safety("create_github_issue", {"title": "x"}, ctx=ctx)
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"}, ctx=ctx)
 
     assert ok is False
     assert msg.startswith("⚠️ SAFETY_UNAVAILABLE:")
@@ -332,7 +332,7 @@ def test_single_rate_limit_then_success_returns_the_normal_verdict(monkeypatch, 
     _patch_llm_client(monkeypatch, stub)
     ctx = _DriveCtx(tmp_path)
 
-    ok, msg = check_safety("create_github_issue", {"title": "x"}, ctx=ctx)
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"}, ctx=ctx)
 
     assert ok is True
     assert msg == "", "a recovered check returns the ordinary SAFE verdict"
@@ -349,7 +349,7 @@ def test_structured_insufficient_quota_with_429_still_blocks(monkeypatch, tmp_pa
     _patch_llm_client(monkeypatch, stub)
     ctx = _DriveCtx(tmp_path)
 
-    ok, msg = check_safety("create_github_issue", {"title": "x"}, ctx=ctx)
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"}, ctx=ctx)
 
     assert ok is False
     assert msg == (
@@ -368,7 +368,7 @@ def test_non_rate_limit_exception_is_an_unavailable_hold(monkeypatch, tmp_path, 
     _patch_llm_client(monkeypatch, stub)
     ctx = _DriveCtx(tmp_path)
 
-    ok, msg = check_safety("create_github_issue", {"title": "x"}, ctx=ctx)
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"}, ctx=ctx)
 
     assert ok is False
     assert msg == (
@@ -419,7 +419,7 @@ def test_rate_limit_retry_scopes_each_attempt_before_backoff(monkeypatch, tmp_pa
     _patch_llm_client(monkeypatch, stub)
     ctx = _DriveCtx(tmp_path)
 
-    ok, _ = check_safety("create_github_issue", {"title": "x"}, ctx=ctx)
+    ok, _ = check_safety("github_write", {"method": "create_issue", "title": "x"}, ctx=ctx)
 
     assert ok is False, "double rate limit ends in the typed blocked outcome"
     assert state["acquired"] == 2, "one deadline scope per attempt"
@@ -460,7 +460,7 @@ def test_server_outage_is_not_a_rate_limit_and_still_blocks(monkeypatch, tmp_pat
     _patch_llm_client(monkeypatch, stub)
     ctx = _DriveCtx(tmp_path)
 
-    ok, msg = check_safety("create_github_issue", {"title": "x"}, ctx=ctx)
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"}, ctx=ctx)
 
     assert ok is False
     assert msg == (
@@ -482,7 +482,7 @@ def test_read_timeout_is_not_a_rate_limit_and_still_blocks(monkeypatch, tmp_path
     _patch_llm_client(monkeypatch, stub)
     ctx = _DriveCtx(tmp_path)
 
-    ok, msg = check_safety("create_github_issue", {"title": "x"}, ctx=ctx)
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"}, ctx=ctx)
 
     assert ok is False
     assert "SAFETY_UNAVAILABLE" in msg
@@ -504,7 +504,7 @@ def test_http200_body_transient_that_is_not_429_still_blocks(monkeypatch, tmp_pa
     _patch_llm_client(monkeypatch, stub)
     ctx = _DriveCtx(tmp_path)
 
-    ok, msg = check_safety("create_github_issue", {"title": "x"}, ctx=ctx)
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"}, ctx=ctx)
 
     assert ok is False
     assert "SAFETY_UNAVAILABLE" in msg
@@ -550,22 +550,23 @@ def test_local_fallback_lane_rate_limit_takes_the_audited_fail_open(monkeypatch,
 
 
 def test_marker_bearing_5xx_message_is_not_a_rate_limit_and_still_blocks(monkeypatch, tmp_path, _no_backoff):
-    """The markers are SUBSTRINGS, so `429`/`rpm`/`tpm` occur inside the request ids and
-    hostnames real outages carry. A KNOWN non-429 status must never reach the text
-    branch: this 503 carries `429` in its request id and must still block."""
+    """`429`/`rpm`/`tpm` still match separated request ids and hostnames real outages
+    carry. A KNOWN non-429 status must never reach the text branch: this 503 carries a
+    matching `429` in its request id and must still block."""
+    from ouroboros.loop_llm_call import is_rate_limit_text
     from ouroboros.safety import check_safety
 
-    stub = _ScriptedLLMClient([
-        _ServerError("503 Service Unavailable (request id: req_1f429ab0)"),
-    ])
+    message = "503 Service Unavailable (request id: req-429-ab0)"
+    assert is_rate_limit_text(message), "the fixture must reach the guard, not miss the text"
+    stub = _ScriptedLLMClient([_ServerError(message)])
     _patch_llm_client(monkeypatch, stub)
     ctx = _DriveCtx(tmp_path)
 
-    ok, msg = check_safety("create_github_issue", {"title": "x"}, ctx=ctx)
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"}, ctx=ctx)
 
     assert ok is False, "a marker inside a request id must not wave a 5xx outage through"
     assert "SAFETY_UNAVAILABLE" in msg
-    assert "req_1f429ab0" in msg
+    assert "req-429-ab0" in msg
     assert len(stub.calls) == 1
     assert _read_events(ctx, "safety_check_rate_limited") == []
 
@@ -581,7 +582,7 @@ def test_statusless_rate_limit_text_takes_the_typed_blocked_outcome(monkeypatch,
     _patch_llm_client(monkeypatch, stub)
     ctx = _DriveCtx(tmp_path)
 
-    ok, msg = check_safety("create_github_issue", {"title": "x"}, ctx=ctx)
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"}, ctx=ctx)
 
     assert ok is False
     assert msg.startswith("⚠️ SAFETY_UNAVAILABLE:") and "rate-limited" in msg
@@ -601,7 +602,7 @@ def test_body_shaped_quota_refusal_on_a_429_still_blocks(monkeypatch, tmp_path, 
     stub = _ScriptedLLMClient([("", usage), ("", dict(usage))])
     _patch_llm_client(monkeypatch, stub)
     ctx = _DriveCtx(tmp_path)
-    ok, msg = check_safety("create_github_issue", {"title": "x"}, ctx=ctx)
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"}, ctx=ctx)
     assert ok is False and "SAFETY_UNAVAILABLE" in msg
     # today's blocking path for an empty body IS the parse lane incl. its one repair
     # retry; the point here is the rate-limit fail-open lane must NOT engage.
@@ -618,7 +619,7 @@ def test_safe_verdict_with_invalid_reported_cost_stays_safe(monkeypatch, tmp_pat
     stub = _ScriptedLLMClient([('{"status":"SAFE","reason":"ok"}', {"cost": "abc", "prompt_tokens": 5})])
     _patch_llm_client(monkeypatch, stub)
     with caplog.at_level(logging.WARNING):
-        ok, msg = check_safety("create_github_issue", {"title": "x"}, ctx=_DriveCtx(tmp_path))
+        ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"}, ctx=_DriveCtx(tmp_path))
     assert ok is True and msg == ""
     assert "invalid reported cost" in caplog.text
 
@@ -635,10 +636,10 @@ def test_latched_short_circuit_does_not_extend_the_storm_window(monkeypatch, tmp
     _patch_llm_client(monkeypatch, stub)
     ctx = _DriveCtx(tmp_path)
 
-    check_safety("create_github_issue", {"title": "x"}, ctx=ctx)  # arms the latch
+    check_safety("github_write", {"method": "create_issue", "title": "x"}, ctx=ctx)  # arms the latch
     window = safety._SAFETY_STORM_UNTIL
     assert window > time.time()
-    check_safety("create_github_issue", {"title": "y"}, ctx=ctx)  # latched short-circuit
+    check_safety("github_write", {"method": "create_issue", "title": "y"}, ctx=ctx)  # latched short-circuit
 
     assert safety._SAFETY_STORM_UNTIL == window, "a latched outcome must not extend the window"
     rows = _read_events(ctx, "safety_check_rate_limited")
@@ -664,7 +665,7 @@ def test_unparseable_verdict_then_rate_limited_repair_takes_the_typed_outcome(
     _patch_llm_client(monkeypatch, stub)
     ctx = _DriveCtx(tmp_path)
 
-    ok, msg = check_safety("create_github_issue", {"title": "x"}, ctx=ctx)
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"}, ctx=ctx)
 
     assert ok is False
     assert msg.startswith("⚠️ SAFETY_UNAVAILABLE:")
@@ -693,7 +694,7 @@ def test_backoff_that_consumes_the_deadline_permits_no_second_attempt(monkeypatc
         safety.time, "sleep", lambda _d: clock.__setitem__("now", deadline + 1.0),
     )
 
-    ok, msg = check_safety("create_github_issue", {"title": "x"}, ctx=ctx)
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"}, ctx=ctx)
 
     assert ok is False and msg.startswith("⚠️ SAFETY_UNAVAILABLE:")
     assert len(stub.calls) == 1, "the sleep spent the deadline; no second paid call"
@@ -725,7 +726,7 @@ def test_oversized_subject_blocks_without_a_model_call(monkeypatch, tmp_path):
     ctx = _DriveCtx(tmp_path)
     huge = "x" * (safety._SAFETY_SUBJECT_CHAR_BUDGET + 1)
 
-    ok, msg = check_safety("create_github_issue", {"title": huge}, ctx=ctx)
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": huge}, ctx=ctx)
 
     assert ok is False, "an unreviewable guarded call must not execute"
     assert msg.splitlines()[0].startswith("⚠️ SAFETY_SUBJECT_TOO_LARGE_BLOCKED:")
@@ -741,7 +742,7 @@ def test_oversized_subject_blocks_without_a_model_call(monkeypatch, tmp_path):
 
     rows = _read_events(ctx, "safety_subject_too_large")
     assert len(rows) == 1
-    assert rows[0]["tool"] == "create_github_issue"
+    assert rows[0]["tool"] == "github_write"
     assert rows[0]["subject_chars"] > safety._SAFETY_SUBJECT_CHAR_BUDGET
     assert rows[0]["budget_chars"] == safety._SAFETY_SUBJECT_CHAR_BUDGET
 
@@ -761,7 +762,7 @@ def test_non_ascii_subject_near_cap_is_not_inflated(monkeypatch, tmp_path):
     ctx = _DriveCtx(tmp_path)
     big_cyrillic = "ы" * 200_000  # inflated 6x this would blow the 250k budget
 
-    ok, _msg = check_safety("create_github_issue", {"title": big_cyrillic}, ctx=ctx)
+    ok, _msg = check_safety("github_write", {"method": "create_issue", "title": big_cyrillic}, ctx=ctx)
 
     assert ok is True
     assert len(stub.calls) == 1, "the near-cap non-ASCII subject reached the model"

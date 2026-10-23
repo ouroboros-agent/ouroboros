@@ -472,3 +472,37 @@ for (const code of ['daemon_spawn_failed', 'daemon_starting', 'foreign_daemon_ho
         });
     }
 }
+// Refined A (owner 21.10): the program row says its state concisely — the operation status, a short cause only where
+// a typed source names it, and this view's own actionable sentence — while the engine's exact text, what an update
+// does and the version facts sit under one Details toggle whose open state the controller keeps across rebuilds.
+test('the state row is concise; exact engine text, the update note and version facts wait under Details', () => {
+    const failed = harnessMaintenanceMarkup(entry(), {
+        operation: operation({ state: 'failed', phase: 'settled', mutation: 'none', termination: 'confirmed',
+            problem: { message: 'the registry did not answer one exact latest version for @openai/codex (npm exit 1)' } }),
+    });
+    const state = failed.slice(failed.indexOf('harness-maintenance-state'), failed.indexOf('harness-maintenance-details"'));
+    assert.match(state, /role="status">Update failed</);
+    assert.doesNotMatch(state, /registry did not answer/, 'the exact engine text is not on the row');
+    assert.doesNotMatch(state, /harness-maintenance-cause/, 'an operation problem has no typed cause to paraphrase');
+    assert.match(state, /<button type="button" class="settings-disclosure ui-hit-area" data-maintenance-details aria-expanded="false" aria-controls="harness-maintenance-details-fixture">Details/);
+    const panel = failed.slice(failed.indexOf('harness-maintenance-details"'));
+    assert.match(panel, /^harness-maintenance-details" id="harness-maintenance-details-fixture" hidden>/);
+    assert.match(panel, /Exact message: <code>the registry did not answer one exact latest version for @openai\/codex \(npm exit 1\)<\/code>/);
+    assert.match(panel, /Program updates replace files in place and may interrupt new starts\./);
+    assert.match(panel, /Bundled baseline<\/dt><dd>1\.0\.0/);
+    assert.match(panel, /Install exact version…/, 'the rarer actions stay under Details');
+    // Only the inventory's problem with the latest version is a typed cause; its exact text still waits under Details.
+    const latest = harnessMaintenanceMarkup(entry({ availableProblem: { message: 'npm view exited 1' } }));
+    assert.match(latest, /<span class="harness-maintenance-cause">Latest version not determined<\/span>/);
+    assert.match(latest, /Exact message: <code>npm view exited 1<\/code>/);
+    // This view's own sentence says what to do next, so it stays on the row.
+    const unconfirmed = harnessMaintenanceMarkup(entry(), { request: { key: 'k', body: {} },
+        operationError: 'Update acceptance unconfirmed: offline. Retry the same request to recover its result.' });
+    const unconfirmedRow = unconfirmed.slice(0, unconfirmed.indexOf('harness-maintenance-details"'));
+    assert.match(unconfirmedRow, /Update acceptance unconfirmed: offline\. Retry the same request/);
+    assert.match(unconfirmedRow, /Retry same request/);
+    // Opened, the panel renders open, and the toggle says so.
+    const open = harnessMaintenanceMarkup(entry(), { expanded: true });
+    assert.match(open, /aria-expanded="true"/);
+    assert.match(open, /id="harness-maintenance-details-fixture">/);
+});

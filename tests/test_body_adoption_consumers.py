@@ -348,7 +348,7 @@ def test_boot_settlement_pushes_the_adopted_serving_line_and_tells_the_owner(sce
 
     settled = body_adoption.settle_on_boot(scene.data, scene.serving, supervisor_ready=True)
 
-    assert settled["outcome"] == "adopted"
+    assert settled["outcome"] == "adopted" and settled["tests"]["tier"] == "full" and "publication" not in settled
     assert facts == [{"current_branch": "ouroboros", "current_sha": scene.cand}]
     assert git(remote, "rev-parse", "refs/heads/ouroboros") == scene.cand  # the serving line, as after any commit
     assert sent and sent[0][0] == 7 and scene.cand[:12] in sent[0][1]
@@ -358,6 +358,39 @@ def test_boot_settlement_pushes_the_adopted_serving_line_and_tells_the_owner(sce
     assert "Publication: Pushed" in sent[0][1]
     assert body_adoption.settle_on_boot(scene.data, scene.serving, supervisor_ready=True) == {}
     assert len(sent) == 1  # consuming the handoff does not schedule another push
+
+
+@pytest.mark.parametrize("tests", [{"tier": "selected", "source": "proof", "head": "h"}, {}], ids=["selected", "unrecorded"])
+def test_boot_settlement_withholds_branch_and_tag_publication_without_full_evidence(scene, monkeypatch, tmp_path, tests):
+    from supervisor import git_ops, git_ops_reset, message_bus, state
+
+    remote = tmp_path / "origin.git"
+    git(tmp_path, "init", "-q", "--bare", str(remote))
+    git(scene.serving, "remote", "add", "origin", str(remote))
+    git(scene.serving, "tag", "-a", "v1.0.1", scene.cand, "-m", "v1.0.1: candidate release")  # reachable once adopted
+    monkeypatch.setattr(git_ops, "REPO_DIR", scene.serving)
+    monkeypatch.setattr(git_ops, "BRANCH_DEV", "ouroboros")
+    monkeypatch.setattr("ouroboros.preflight_qualification.adoption_test_evidence", lambda *a, **kw: dict(tests))
+    facts, sent = [], []
+    monkeypatch.setattr(git_ops_reset, "_record_checkout_facts", lambda value: facts.append(value))
+    monkeypatch.setattr(state, "load_state", lambda: {"owner_chat_id": 7})
+    monkeypatch.setattr(message_bus, "send_with_budget", lambda chat, text, **kw: sent.append(text))
+    finalize = body_adoption.finalize_on_boot  # sibling #1024 carries the operation-created tag in this result
+    monkeypatch.setattr(body_adoption, "finalize_on_boot", lambda *a, **kw: {**finalize(*a, **kw), "created_tag": "v1.0.1"})
+
+    _switch(scene)
+    settled = body_adoption.settle_on_boot(scene.data, scene.serving, supervisor_ready=True)
+
+    tier = tests.get("tier") or "unrecorded"
+    assert settled["outcome"] == "adopted" and facts == [{"current_branch": "ouroboros", "current_sha": scene.cand}]
+    assert git(remote, "for-each-ref") == ""  # neither the branch nor a tag reached the remote
+    assert settled["publication"] == {"status": "withheld", "branch": "ouroboros", "sha": scene.cand, "tier": tier,
+                                      "created_tag": "v1.0.1"}
+    assert f"Publication withheld: this adoption rests on {tier} test evidence" in sent[0]
+    events = [json.loads(line) for line in (scene.data / "logs/supervisor.jsonl").read_text().splitlines()]
+    [withheld] = [event for event in events if event["type"] == "body_adoption_publication"]
+    assert (withheld["status"], withheld["candidate"], withheld["base"]) == ("withheld", scene.cand, scene.old)
+    assert [event["tests"] for event in events if event["type"] == "body_adoption_closed"] == [tests]
 
 
 def test_runtime_fact_lists_retained_candidates_for_a_deliberate_resume(scene):

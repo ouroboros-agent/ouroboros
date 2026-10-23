@@ -41,6 +41,9 @@ test('#931 every typed checkpoint kind names itself; only a kindless one is peri
         assert.equal(taskCheckpointLabel({ checkpoint_kind: kind, round: 30 }), label);
         assert.equal(summarizeLogEvent({ type: 'task_checkpoint', checkpoint_kind: kind, round: 30 }).headline, label);
     }
+    const outputRecovery = { type: 'task_checkpoint', checkpoint_kind: 'context_reclaim_emergency', cause: 'output_exhaustion' };
+    assert.equal(taskCheckpointLabel(outputRecovery), 'Source-address recovery after empty length-limited replies (no model)');
+    assert.equal(summarizeLogEvent(outputRecovery).headline, taskCheckpointLabel(outputRecovery));
     // The mind's applied fold names what it saved; an inspection or a no-op stays an inspection.
     assert.equal(taskCheckpointLabel({ checkpoint_kind: 'context_view', status: 'applied', reclaimed_tokens: 129000 }),
         'Ouroboros folded its context (−129,000 tokens)');

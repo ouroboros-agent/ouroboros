@@ -1445,6 +1445,9 @@ def process_tool_results(
         if ctx is not None and published.get("sleep_question_notice") and not (is_error or result_partial):
             from ouroboros.model_sleep import acknowledge_question_delivery
             acknowledge_question_delivery(ctx, truncated_result)  # exposure needs the complete ready view
+        if ctx is not None and published.get("review_delivery") and not result_partial:
+            from ouroboros.review_waiting import acknowledge_delivery
+            acknowledge_delivery(ctx, published["review_delivery"])
         # Keyed on the wake the RESULT published, not on a tool name: a call that published none has nothing to ack.
         # A delivered refusal wake too: ``acknowledge_pending_wake`` itself verifies what the text carried.
         if ctx is not None and published.get("supervision_wake_id"):

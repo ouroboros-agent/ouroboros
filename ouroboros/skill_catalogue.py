@@ -107,6 +107,75 @@ def session_skill_index(ctx: Any) -> str:
             + guidance)
 
 
+def _serving_identities(root: Any, contents: dict) -> dict:
+    """``{path: identity}`` for exactly the bytes already read (``contents``): a commit is named
+    only when Git's blob of THOSE bytes is that commit's blob, otherwise they are dirty, so a file
+    changing between the reads never borrows a commit. ``{}`` when Git cannot say (identity
+    unknown), including a serving folder that is not itself a repository's top level."""
+    import os
+    import pathlib
+    import subprocess
+
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}  # a reader never takes the serving index lock
+
+    def git(*args: str, data: bytes = b"") -> str:
+        done = subprocess.run(["git", *args], cwd=str(root), env=env, input=data, capture_output=True, timeout=10)
+        if done.returncode:
+            raise OSError(done.stderr.decode("utf-8", "replace").strip() or f"git {args[0]} failed")
+        return done.stdout.decode("utf-8", "surrogateescape")
+
+    try:
+        if pathlib.Path(git("rev-parse", "--show-toplevel").strip()).resolve() != pathlib.Path(root).resolve():
+            return {}  # an enclosing repository's commit is not this folder's identity
+        head = git("rev-parse", "--verify", "HEAD").strip()
+        committed = {}
+        for row in git("ls-tree", "-z", head, "--", *contents).split("\0"):  # that commit, never a moved HEAD
+            meta, _tab, path = row.partition("\t")
+            if path:
+                committed[path] = meta.split()[2]
+        blobs = {path: git("hash-object", "--stdin", f"--path={path}", data=data).strip()
+                 for path, data in contents.items()}  # the path's own filters, the bytes we hashed
+    except (OSError, subprocess.SubprocessError, IndexError):
+        return {}
+    return {path: (f"serving commit {head}" if committed.get(path) == blob else
+                   f"dirty: these bytes are not the blob of serving commit {head}")
+            for path, blob in blobs.items()}
+
+
+def skill_contract_references(serving_root: Any) -> str:
+    """The serving host's skill contract for a payload builder (#818): the files skill review
+    judges a payload by (the paths owned by ``governance_context``), named, never copied.
+
+    Nothing enters the payload snapshot, its loader inventory, hash or apply. Each row carries
+    the byte digest and serving identity; an unreadable file is a named gap. Delivered for any
+    input selection, because building against this contract is the payload assignment; the
+    retained start request keeps exactly what was supplied.
+    """
+    import pathlib
+
+    from ouroboros.tools.governance_context import (
+        CREATING_SKILLS_PATH, SKILL_PLUGIN_API_PATH, SKILL_UI_VALIDATION_PATH,
+    )
+
+    root = pathlib.Path(serving_root)
+    rows, contents = [], {}
+    for rel in (CREATING_SKILLS_PATH, SKILL_PLUGIN_API_PATH, SKILL_UI_VALIDATION_PATH):
+        try:
+            contents[rel] = (root / rel).read_bytes()  # one read: digest and identity describe these bytes
+            rows.append((rel, sha256(contents[rel]).hexdigest()))
+        except OSError as exc:
+            rows.append((rel, f"unavailable ({type(exc).__name__}: {exc}); ask your host rather than reconstruct it"))
+    identities = _serving_identities(root, contents) if contents else {}
+    lines = [f"- {root / rel}: " + (f"sha256={value}; {identities.get(rel) or 'serving identity unknown'}"
+                                    if rel in contents else value) for rel, value in rows]
+    return ("\n\nHOST SKILL CONTRACT (read-only references to the serving host that loads this skill; "
+            "the files its skill review judges it by)\n"
+            "Build the manifest, tools, routes, UI tabs and lifecycle hooks against these files, not "
+            "from memory. You may read them although they are outside your workspace; never copy them "
+            "into the payload. A different digest when you read one means the installed contract "
+            "changed during your run: say so in your answer.\n" + "\n".join(lines))
+
+
 LIST_SKILLS_SCHEMA = {
     "name": "list_skills",
     "description": (

@@ -54,6 +54,7 @@ export const TASK_CAUSE_PHRASES = {
     finalization_grace: "The task hit a time limit and had to wrap up before it could finish cleanly",
     deadline_local: "The task reached its deadline before it could finish cleanly",
     context_overflow: "The task outgrew its context before it could finish cleanly",
+    output_recovery_exhausted: "Empty length-limited replies exhausted recovery; saved work remains available",
     children_unabsorbed: "Some sub-task results were never folded in, so the task had to wrap up",
     // The supervisor's timeout rails (queue_timeouts.TIMEOUT_TERMINAL_REASONS): the reaper's task_done reason_code.
     absolute_ceiling: "The task reached its maximum running time",

@@ -81,7 +81,7 @@ def test_maintenance_lost_reply_cancel_and_drafts(subscription_ui, width):
     expect(family.locator('[data-family-maintenance]')).to_have_count(1)
     expect(family.locator('.harness-account-row')).to_have_count(18)
     expect(family.locator('.harness-maintenance-line')).to_have_text("Program 2.0.0 · Managed · Latest not checked")
-    family.locator('summary').click()
+    family.get_by_role('button', name='Details', exact=True).click()
     expect(family.locator('dl > div').filter(has_text="Bundled baseline").locator('dd')).to_have_text("1.0.0")
     family.get_by_role('button', name='Install exact version…').click()
     modal = page.locator('[role="dialog"]')

@@ -200,7 +200,7 @@ def self_change_tool_entries() -> list:
                 "restart, after the running generation's readers have stopped."),
             "parameters": {"type": "object", "properties": {
                 "reason": {"type": "string"},
-                "adopt_commit": {"type": "string", "description": "Exact reviewed candidate commit SHA to adopt at this restart; it needs a full green test run of that commit on record (commit it with full_tests=true)."},
+                "adopt_commit": {"type": "string", "description": "Exact reviewed candidate commit SHA to adopt at this restart; it needs that commit's passing post-commit run on record: selected over the whole candidate delta, or full (verifier, cutover or broad changes, Cyber Pro's unreviewed commits). Only full evidence permits this adoption's automatic branch/tag push."},
             }, "required": ["reason"]},
         }, _request_restart),
     ]
@@ -827,7 +827,7 @@ def _effort_switch(ctx: ToolContext, requested: str) -> tuple[str, str]:
 def _finish_task(ctx: ToolContext, action: str, answer: str | None = None,
                  answer_sha256: str | None = None, rationale: str = "",
                  acceptance_subject: dict | None = None, pending_review: str | None = None,
-                 silent: bool = False) -> str:
+                 silent: bool = False, swarm_comparison: str | None = None) -> str:
     """Stage an author act; an own-clock or focused wake, or a schedule-born root, may choose silence."""
     allow_empty = False
     if silent:
@@ -857,6 +857,7 @@ def _finish_task(ctx: ToolContext, action: str, answer: str | None = None,
         "action": action, "answer": answer, "answer_sha256": answer_sha256,
         "rationale": rationale, "acceptance_subject": acceptance_subject,
         "pending_review": pending_review, "wake_silent": bool(silent) or None,
+        "swarm_comparison": swarm_comparison,
     }, allow_empty=allow_empty)
 
 
@@ -888,6 +889,8 @@ def stage_completion_request(ctx: ToolContext, request: dict, *, source: str = "
         error = "answer_sha256 must name an offered answer"
     elif request.get("pending_review") not in {None, "wait", "finish"}:
         error = "pending_review must be wait or finish"
+    elif request.get("swarm_comparison") is not None and not isinstance(request["swarm_comparison"], str):
+        error = "swarm_comparison must be text"
     elif request.get("pending_review") is not None and not resolve_task_lineage(
         getattr(ctx, "task_id", ""), metadata=getattr(ctx, "task_metadata", {}),
         parent_task_id=getattr(ctx, "parent_task_id", None),

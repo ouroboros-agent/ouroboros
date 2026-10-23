@@ -1206,8 +1206,9 @@ def collect_trace_refs(usage: Dict[str, Any], llm_trace: Dict[str, Any]) -> Dict
     execution_id = str(usage.get("execution_id") or "").strip()
     if execution_id:
         refs["execution_id"] = execution_id
-    if isinstance(llm_trace.get("timeout_repeat"), dict):
-        refs["timeout_repeat"] = copy.deepcopy(llm_trace["timeout_repeat"])
+    for key in ("timeout_repeat", "output_recovery"):
+        if isinstance(llm_trace.get(key), dict):
+            refs[key] = copy.deepcopy(llm_trace[key])
     llm_refs = [
         {key: item.get(key) for key in (
             "llm_call_id", "execution_id", "round_id", "round", "request_ref",

@@ -83,6 +83,7 @@ def restart_case(tmp_path, monkeypatch):
     requested.set()
     monkeypatch.setattr(server_restart, "_restart_requested", requested)
     monkeypatch.setattr(server_restart, "_owner_restart_requested", owner_requested)
+    monkeypatch.setattr(server_restart, "_OWNER_STOP_BEGAN", threading.Event())
     monkeypatch.delenv(delegate_recovery.PLANNED_RESTART_TRANSACTION_ENV, raising=False)
 
     task_id, attempt, started = "native-owner-a", 3, time.time() - 4000

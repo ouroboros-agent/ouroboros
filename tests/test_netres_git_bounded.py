@@ -403,7 +403,7 @@ def test_ci_note_names_every_push_workflow_and_none_stands_for_the_others(monkey
     ])
     assert note.startswith("\n\n⏳ CI: push runs in progress — ") and "✅" not in note
     # The hint names the repository the push went to: a bare SHA is read in the Project's repository.
-    assert note.endswith(f". Read the results later: get_github_checks(sha='{'a' * 40}', repo='example/project').")
+    assert note.endswith(f". Read the results later: github_read(method='checks', target='{'a' * 40}', repo='example/project').")
     assert "Provider canaries: success; CI: in progress; UI browser (ouroboros push): queued" in note
 
     note = _ci_note(monkeypatch, [{"name": "Provider canaries", **_DONE}, {"name": "CI", **_DONE}])

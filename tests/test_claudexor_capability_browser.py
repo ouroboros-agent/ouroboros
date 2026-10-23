@@ -94,8 +94,13 @@ def capability_ui(tmp_path, monkeypatch, replay):
 
 @pytest.mark.parametrize("width,height,theme", [(1360, 900, "light"), (390, 844, "dark")])
 def test_capability_line_and_main_notice(capability_ui, width, height, theme):
+    from playwright.sync_api import expect
+
     ui, evidence = capability_ui
     page = ui["page"]
+    mark = ui["fixture"]["status"]["profiles"]["routing_evidence"]["capabilities"][0]
+    # Preserve the recorded engine wire; exercise both sides of its expiry with a fixed browser clock.
+    page.clock.set_fixed_time(mark["observed_at"])
     page.set_viewport_size({"width": width, "height": height})
     page.add_init_script(f"localStorage.setItem('ouroboros.theme', '{theme}')")
     page.goto(ui["url"] + "/#settings")
@@ -125,6 +130,13 @@ def test_capability_line_and_main_notice(capability_ui, width, height, theme):
     stem = f"{width}-{theme}"
     page.screenshot(path=str(evidence / f"accounts-{stem}.png"), animations="disabled")
     (evidence / f"geometry-{stem}.json").write_text(json.dumps(geometry, indent=2), encoding="utf-8")
+    page.clock.set_fixed_time(mark["expires_at"])
+    page.reload()
+    page.click('[data-settings-tab="providers"]')
+    expect(lines).to_have_count(2)
+    expect(lines.first).to_contain_text("temporary mark set")
+    expect(lines.first).to_contain_text("the next request may recheck it")
+    expect(lines.first).not_to_contain_text("may be retried")
     navigate(page, "chat")
     notice = page.locator('#chat-messages .chat-bubble[data-system-type="model_capability_notice"]')
     notice.wait_for()

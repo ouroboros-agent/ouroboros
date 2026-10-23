@@ -340,14 +340,16 @@ def test_the_dialogue_cutover_runs_before_the_dialogue_opens_and_a_failure_stays
 
     source = inspect.getsource(server.lifespan)
     assert source.index("_dialogue_cutover(lifespan_drive_root)") < source.index("_open_dialogue(settings")
+    # The lifespan's own steps are the boot owners that choose an existing store's journal (store_journal).
+    assert "usage_store.migrate_from_journal(lifespan_drive_root, initialize_journal=True)" in source
     BOOT.reset()
     calls = []
-    monkeypatch.setattr(dialogue_import, "cutover", lambda root: calls.append(root))
+    monkeypatch.setattr(dialogue_import, "cutover", lambda root, **kwargs: calls.append((root, kwargs)))
     server._dialogue_cutover(tmp_path)
     steps = {row["name"]: row for row in BOOT.snapshot()["steps"]}
-    assert calls == [tmp_path] and steps["dialogue_cutover"]["state"] == "done"
+    assert calls == [(tmp_path, {"initialize_journal": True})] and steps["dialogue_cutover"]["state"] == "done"
 
-    def held(_root):
+    def held(_root, **_kwargs):
         raise RuntimeError("append lock held")
 
     monkeypatch.setattr(dialogue_import, "cutover", held)

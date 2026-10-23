@@ -1,7 +1,7 @@
 """Restored configured read-only actors retain only the typed zero-run receipt."""
 import pytest
 
-from tests._stub_delegate_engines import stub_delegate_engines  # noqa: F401
+from tests._stub_delegate_engines import stub_delegate_engines as stub_delegate_engines
 from tests.test_configured_session_restore import _known_custody, _restored_registry, _task
 
 pytestmark = pytest.mark.serial

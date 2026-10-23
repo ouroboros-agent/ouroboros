@@ -208,7 +208,7 @@ def restart_current_process(
     else:
         log.info("Re-executing direct server mode on %s:%d", desired_host, port)
         if _restart_stop_requested:
-            return  # the watcher parks in exit_after_restart; Panic keeps its thread and writes
+            return  # the watcher parks in exit_after_shutdown; Panic keeps its thread and writes
         try:
             os.execvpe(sys.executable, argv, env)
             return  # exec does not return; only a test double of it reaches this line
@@ -292,11 +292,13 @@ def stop_restart_successor() -> list[dict]:
     return [request_process_tree_kill(proc) for proc in list(_restart_successors)]
 
 
-def exit_after_restart(exit_code: int) -> None:
-    """Finish the watcher unless Panic owns termination, including its writes.
+def exit_after_shutdown(exit_code: int) -> None:
+    """Exit after lifecycle cleanup, unless Panic owns termination and its writes.
 
-    Only the watcher parks: main already joins it, so neither can exit before
-    Panic's flag/control writes and exit. Panic never waits for this thread.
+    The executable and restart watcher must not enter Python's executor joins:
+    interrupted capture stays owed to the next generation. An accepted Panic
+    parks the caller until its own flag/control writes and exit finish; Panic
+    never waits for this caller. Ordinary imported main()/ASGI shutdown returns.
     """
     if _restart_stop_requested:
         import threading
@@ -304,6 +306,10 @@ def exit_after_restart(exit_code: int) -> None:
         threading.Event().wait()
     else:
         os._exit(exit_code)
+
+
+# Compatibility for existing restart callers.
+exit_after_restart = exit_after_shutdown
 
 
 def execute_panic_stop(

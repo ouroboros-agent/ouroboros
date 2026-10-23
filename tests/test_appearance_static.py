@@ -105,7 +105,7 @@ DARK_VOICE = ':root:not([data-theme="light"])'
 # theme's before the dark voices were added (docs/DESIGN.md seed table). `--green` among them: the light theme read
 # the dark seed's green until the dark one changed.
 LIGHT_RESTATED = (
-    "--voice-owner", "--voice-ouroboros", "--voice-ouroboros-card", "--system-border", "--system-sender", "--amber",
+    "--voice-owner", "--voice-ouroboros", "--voice-ouroboros-card", "--system-sender", "--amber",
     "--green", "--status-ok-fg", "--status-warn-fg", "--status-error-fg", "--accent-light", "--focus-accent-border",
     "--assistant-sender", "--panic-ink", "--tone-chosen-answer", "--tone-chosen-answer-ink",
     "--tone-chosen-answer-detail", "--tone-chosen-answer-shadow", "--chosen-answer-cue-display", "--tone-recommended",
@@ -115,15 +115,18 @@ LIGHT_RESTATED = (
 
 def test_the_dark_voice_materials_stay_out_of_the_light_theme():
     """A voice material (ui.css, after the light block) restates palette roles on a voice's own objects. Only the dark
-    theme has one: the two materials are guarded by the dark selector, and no other rule restates a role they set, so
-    a light document keeps every inherited value."""
+    theme has one. Code blocks deliberately reset their quiet hover to the room's neutral material in both themes;
+    every other role override stays in its theme block."""
     rules = _rules(_read("web/ui.css"))
     declared = lambda body: set(re.findall(r"(--[\w-]+)\s*:", body))  # noqa: E731
     materials = {selector: declared(body) for selector, body in rules if selector.startswith(DARK_VOICE)}
     assert set(materials) == {f"{DARK_VOICE} :is(.chat-bubble.assistant, .chat-live-card)", f"{DARK_VOICE} .chat-bubble.user"}, materials
     voice_roles = set().union(*materials.values())
+    neutral_code = [body.strip() for selector, body in rules if selector == ".md-code-block"]
+    assert neutral_code == ["--tone-quiet-hover: var(--bg-hover);"], neutral_code
     leaks = [(selector, sorted(declared(body) & voice_roles)) for selector, body in rules
-             if selector not in THEME_BLOCKS and not selector.startswith(DARK_VOICE) and declared(body) & voice_roles]
+             if selector not in (*THEME_BLOCKS, ".md-code-block")
+             and not selector.startswith(DARK_VOICE) and declared(body) & voice_roles]
     assert not leaks, f"voice material roles restated outside the dark voice materials: {leaks}"
     light = "".join(body for selector, body in rules if selector == ':root[data-theme="light"]')
     missing = [name for name in LIGHT_RESTATED if not re.search(rf"(?<![\w-]){re.escape(name)}\s*:", light)]

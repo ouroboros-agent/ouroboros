@@ -5,7 +5,7 @@ interface a server generation serves (``StateResponse.served_ui``), the read-onl
 bootstrap a client renders onboarding from (``GET /api/onboarding/bootstrap``, whose rows
 mirror ``settings_setup_contract``), the settings writers' durable-outcome refusal, the
 auth gate's JSON login, the derived ABI document ``GET /api/contract`` publishes, and the
-bodies of the everyday journey routes (projects, files, owner controls, schedules) whose
+bodies of the everyday journey routes (projects, files, places, owner controls, schedules) whose
 handlers check their fields by hand.
 """
 
@@ -308,6 +308,36 @@ class OwnerEnabledRequest(TypedDict):
     enabled: bool
 
 
+class PlaceConnectRequest(TypedDict):
+    """Connect an installed connector; omitted account and conversation ids default to empty."""
+
+    connector: str
+    account_id: NotRequired[str]
+    conversation_id: NotRequired[str]
+
+
+class PlaceOwnerAccountRequest(TypedDict):
+    """Confirm a person; omitted account_id uses the place's account."""
+
+    platform_actor_id: str
+    label: NotRequired[str]
+    account_id: NotRequired[str]
+
+
+class PlaceUpdateRequest(TypedDict, total=False):
+    """Atomic owner choices. Send a nonempty body; expected_revision compares before writing."""
+
+    state: Literal["active", "silent", "paused"]
+    wakes: List[str]
+    add_note: str
+    remove_note: str
+    working_folder: str
+    model: str
+    confirm_owner_account: PlaceOwnerAccountRequest
+    revoke_owner_account: str
+    expected_revision: int
+
+
 class SettingsSecretRequest(TypedDict, total=False):
     """``POST /api/settings/secret``: exactly one selector, ``{key}``, ``{mcp_server_id}`` or
     ``{mcp_server_id, header_name}``. Reads one stored secret on purpose; writes nothing."""
@@ -565,6 +595,7 @@ __all__ = [
     "AuthLoginRequest", "AuthLoginResponse",
     "ContractBody", "ContractHttpEntry", "ContractWsEntry", "ContractWs", "GatewayContractResponse",
     "OwnerRuntimeModeRequest", "OwnerContextModeRequest", "OwnerEffortRangeRequest", "OwnerSafetyModeRequest", "OwnerSafetyRulesRequest", "OwnerSafetyRulesResponse", "OwnerSafetyModelRequest", "OwnerSafetyModelResponse", "OwnerEnabledRequest",
+    "PlaceConnectRequest", "PlaceOwnerAccountRequest", "PlaceUpdateRequest",
     "SettingsSecretRequest", "SettingsSecretResponse", "ChatUploadDeleteRequest", "ChatUploadDeleteResponse",
     "ProjectListResponse", "ProjectCreateResponse", "ProjectUpdateRequest", "ProjectUpdateResponse",
     "ProjectFromTaskRequest", "ProjectTaskBinding", "ProjectFromTaskResponse",

@@ -224,7 +224,7 @@ def test_a_whole_malformed_saved_map_round_trips_unchanged_until_removed():
 
 @pytest.fixture
 def mcp_settings(settings_client, monkeypatch):  # noqa: F811
-    monkeypatch.setattr(mcp_client, "refresh_all_background", lambda **kwargs: None)
+    monkeypatch.setattr(mcp_client.MCPManager, "refresh_all_background", lambda *args, **kwargs: None)
     client, on_disk, saved = settings_client
     on_disk.update(MCP_ENABLED=False, MCP_SERVERS=[http(
         id="docs_server", auth_header="X-Legacy", auth_token="legacy-0007",
@@ -397,7 +397,7 @@ def test_production_read_and_write_keep_untouched_legacy_and_malformed_values(re
     untouched legacy token survive an unrelated save byte for byte.
     """
     case = reveal_settings
-    monkeypatch.setattr(mcp_client, "refresh_all_background", lambda **kwargs: None)
+    monkeypatch.setattr(mcp_client.MCPManager, "refresh_all_background", lambda *args, **kwargs: None)
     entries = [
         None,
         {"id": "legacy", "url": "https://legacy.example/mcp", "auth_header": "X-Legacy",

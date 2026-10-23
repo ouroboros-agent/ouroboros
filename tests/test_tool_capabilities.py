@@ -420,9 +420,7 @@ def test_ordinary_fresh_start_ignores_actor_first_zero_run_receipt_surface(tmp_p
 
     claimed, refusal = claimed_start_request(
         data,
-        claim_target="",
         actor_ctx=ctx,
-        enforce_actor_idle=True,
         run_id="",
         task_id=ctx.task_id,
         idempotency_key="ordinary-root-invocation",

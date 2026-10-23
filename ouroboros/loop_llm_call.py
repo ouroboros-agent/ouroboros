@@ -8,6 +8,7 @@ import contextlib
 import hashlib
 import pathlib
 import queue
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -563,7 +564,6 @@ _NON_RETRYABLE_PROVIDER_MARKERS = {
 _RETRYABLE_PROVIDER_MARKERS = (
     "rate limit",
     "rate_limit",
-    "429",
     "timeout",
     "temporarily",
     "server error",
@@ -574,20 +574,19 @@ _RETRYABLE_PROVIDER_MARKERS = (
 _RATE_LIMIT_TEXT_MARKERS = (
     "rate limit",
     "rate_limit",
-    "429",
     "tokens per minute",
     "requests per minute",
     "token per minute",
     "request per minute",
-    "tpm",
-    "rpm",
 )
+# Short markers count only as whole tokens, so "1004290 tokens" or "req_1f429ab0" is not a rate limit.
+_RATE_LIMIT_TEXT_PATTERN = re.compile(r"(?<![a-z0-9])(?:429|tpm|rpm)(?![a-z0-9])")
 _RETRYABLE_PROVIDER_CODES = frozenset({"rate_limit_exceeded"})
 
 
 def _is_rate_limit_text(text: str) -> bool:
     low = str(text or "").lower()
-    return any(marker in low for marker in _RATE_LIMIT_TEXT_MARKERS)
+    return any(marker in low for marker in _RATE_LIMIT_TEXT_MARKERS) or bool(_RATE_LIMIT_TEXT_PATTERN.search(low))
 
 
 is_rate_limit_text = _is_rate_limit_text  # public SSOT aliases for the safety lane
@@ -1349,7 +1348,7 @@ def call_llm_with_retry(
     initial_messages: Optional[List[Dict[str, Any]]] = None,
     stop_retry_check: Optional[Callable[[], bool]] = None,
     model_role: str = "main", model_turn_state: Any = None, model_account_override: Optional[str] = None,
-    processing_preference: Optional[str] = None,
+    processing_preference: Optional[str] = None, physical_send_claim: Optional[Callable[[Any], None]] = None,
     send_clock_policy: Any = None, max_tokens: int = MAIN_LOOP_MAX_TOKENS, configured_api_child: bool = False,
     physical_fit_predicate: Optional[Callable[[Any], Any]] = None,  # every send; candidate_predicate is first-attempt-only
 ) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
@@ -1358,7 +1357,6 @@ def call_llm_with_retry(
     ``max_tokens`` is the LOGICAL caller ceiling (the strict-shrink retry passes the failed
     attempt's sent allowance); the sent value lives on the physical candidate."""
     from ouroboros.model_slots import resolve_processing_preference
-
     processing_preference = resolve_processing_preference(model_role, override=processing_preference)
     _replace_response_meta(response_meta_out)
     drive_root = pathlib.Path(drive_logs).parent
@@ -1455,7 +1453,8 @@ def call_llm_with_retry(
             _emit_main_llm_call_state(event_queue, call_identity, "started")
             repeat = TIMEOUT_REPEAT_KEY in accumulated_usage
             if repeat: kwargs["wait_for_resources"] = False
-            with single_physical_send(lambda reservation: _claim_timeout_repeat(accumulated_usage, call_ids, reservation)) if repeat else contextlib.nullcontext():
+            claim = (lambda reservation: _claim_timeout_repeat(accumulated_usage, call_ids, reservation)) if repeat else physical_send_claim
+            with single_physical_send(claim) if claim is not None else contextlib.nullcontext():
                 msg, usage = _send_main_candidate(
                     llm, kwargs, model=model, use_local=use_local, deadline_ts=deadline_ts,
                     physical_context=physical_context, candidate_predicate=candidate_predicate if attempt == 0 else None,

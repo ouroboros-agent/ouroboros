@@ -627,10 +627,9 @@ def test_observe_does_without_the_work_starting_review_verb():
     """`request_deep_self_review` enqueues a ROOT: Observe starts nothing (В10')."""
     assert "request_deep_self_review" in ca.OBSERVE_DISABLED and "request_deep_self_review" not in ca.ACT_DISABLED
     # The GitHub write verbs change the world beyond the repository (PLAN §5.4: Observe keeps the reads only).
-    for verb in ("create_github_issue", "comment_on_issue", "comment_on_pr", "close_github_issue"):
+    for verb in ("github_write", "pr_merge"):
         assert verb in ca.OBSERVE_DISABLED and verb not in ca.ACT_DISABLED, verb
-    for verb in ("list_github_prs", "get_github_pr", "get_github_checks", "list_github_issues", "get_github_issue"):
-        assert verb not in ca.OBSERVE_DISABLED, verb
+    assert "github_read" not in ca.OBSERVE_DISABLED
     # The built-in execution verb (astra scope round 5): a skill's script.
     assert "skill_exec" in ca.OBSERVE_DISABLED and "skill_exec" not in ca.ACT_DISABLED
 

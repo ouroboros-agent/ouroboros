@@ -369,7 +369,7 @@ def get_tools() -> List[ToolEntry]:
                 "run_at": {"type": "string", "description": "Update: replace the trigger with a one-shot ISO 8601 instant (naive = UTC). Mutually exclusive with cron; blank means unchanged."},
                 "cron": {"type": "string", "description": "Update: replace the trigger with a recurring 5-field cron expression. Mutually exclusive with run_at; blank means unchanged."},
                 "timezone": {"type": "string", "description": "Update: IANA timezone. Blank means unchanged."},
-                "reasoning_effort": {"type": "string", "enum": ["", *EFFORT_SCALE], "description": "Update: starting effort for future tasks, applied in Cyber Pro only. Otherwise ignored with a disclosure. Blank means unchanged."},
+                "reasoning_effort": {"type": "string", "enum": [*EFFORT_SCALE], "description": "Update: starting effort for future tasks, applied in Cyber Pro only. Otherwise ignored with a disclosure. Omit it to leave the effort unchanged."},
                 "expected_hold_id": {"type": "string", "description": "Exact hold_id from list, required to restore a held row. A stale identity refuses."},
                 "relation": {"type": "string", "enum": ["related", "independent"], "description": "Resolve a legacy unknown relationship on restore. Related must bind the existing origin; no fresh budget is inferred."},
                 "offset": {"type": "integer", "minimum": 0, "description": "Zero-based list offset."},

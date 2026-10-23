@@ -75,6 +75,8 @@ _TRUNCATION_CODES_NOT_BEST_EFFORT = frozenset({
     # Known-window admission exhausted size recovery before the task could
     # finish; a host forecast stopped it, not a measured capability failure.
     "context_overflow",
+    # Recovery ended before a usable answer; not a completed capability trial.
+    "output_recovery_exhausted",
 })
 
 RUNTIME_TRUNCATION_REASON_CODES = BEST_EFFORT_REASON_CODES | _TRUNCATION_CODES_NOT_BEST_EFFORT

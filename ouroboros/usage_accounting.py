@@ -48,7 +48,6 @@ from ouroboros._usage_rows import (  # noqa: F401  (re-exported substrate vocabu
     _with_integrity,
     _with_limit,
 )
-from ouroboros.skill_review_usage import skill_review_usage
 log = logging.getLogger(__name__)
 __all__ = (
     "AttemptRequest", "AttemptReservation", "BillingAuthorityUnavailable", "BudgetExceeded", "ControlAuthorityUnavailable", "PhysicalAttemptCapture",
@@ -65,7 +64,7 @@ __all__ = (
     "record_unmetered_external_dispatch", "refresh_root_accounting",
     "release_attempt", "reserve_attempt", "settle_attempt",
     "apply_provider_price_receipt", "bind_provider_generation",
-    "skill_review_usage", "usage_breakdown", "usage_from_response", "usage_projection", "usage_scope",
+    "usage_breakdown", "usage_from_response", "usage_projection", "usage_scope",
     "usage_writer_snapshot", "read_usage_records",
     "review_wave_admission",
 )

@@ -199,7 +199,11 @@ _REVIEW_SURFACES = {
                      "cyber_pro": "panel, self-check or no review; the skill may run"},
     "plan_review": "opening is optional; first own-code ask: Blocking adds missing ticked reviewers, Advisory requires a ticked reviewer and a reason when narrowed, Cyber Pro is free; later asks name rows; only a counted participant's objection holds, only under Blocking",
     "advisers": "enabled unticked rows may be named in every mode: heard, not counted, never holding",
-    "result": "review_change(subject=result): named ticked rows in every mode, a narrowed panel records a missing reason; omitted means the whole pool",
+    "result": ("review_change(subject=result): on a Required root, Blocking widens a named subset to every ticked "
+               "reviewer and records it; Advisory names ticked reviewers and requires a reason when narrowed, and if "
+               "nobody reviewed before delivery the host seats the whole pool (chosen by the host); Auto composes "
+               "freely; Cyber Pro composes freely and never holds; Off is refused; a child's own result review "
+               "composes freely; advisers are heard, not counted; omitted reviewers mean the whole pool"),
     "preflight": "one enabled catalog row you name: commit_reviewed(preflight_reviewer=…); none → recorded as not performed",
     "system_review": "/review: one enabled catalog row, default Main",
 }
@@ -387,6 +391,82 @@ def review_records_block(*, drive_root: Any, task_id: str) -> str:
     return "## Review records\n\n" + json.dumps({
         "recent_records": records, "omitted": {"records": unseen}, "full_source": "state/review_ledger/",
     }, ensure_ascii=False, separators=(",", ":"))
+
+
+def cognitive_route_billing_basis(
+    route_model: str, *, use_local: bool = False, ctx: Any = None, cost: Any = None,
+) -> tuple[str, str]:
+    """Return ``(route_label, billing_basis)`` with ``billing_basis`` in
+    ``subscription | measured | unknown`` (``reviewer_slot_config.review_cost_facts`` style,
+    never a price table)."""
+    from ouroboros.reviewer_slot_config import review_cost_facts
+
+    raw = str(route_model or "").strip()
+    local = bool(use_local or raw.endswith(" (local)"))
+    base = raw[: -len(" (local)")].strip() if raw.endswith(" (local)") else raw
+    route_label = (f"{base} (local)" if local and base else base) or "unknown"
+    observed = cost
+    if observed is None and ctx is not None:
+        usage = getattr(ctx, "_accumulated_usage", None)
+        if isinstance(usage, Mapping):
+            last_meta = usage.get("_last_llm_call_meta")
+            last_model = str(last_meta.get("model") or "").strip() if isinstance(last_meta, Mapping) else ""
+            raw_cost = usage.get("cost")
+            if last_model and last_model in {raw, base, route_label} and isinstance(raw_cost, (int, float)) and not isinstance(raw_cost, bool):
+                observed = raw_cost
+    return route_label, str(review_cost_facts(observed, model=route_label)["cost_kind"])
+
+
+def current_cognitive_route_and_billing(
+    task: Optional[Mapping[str, Any]] = None, *, ctx: Any = None,
+) -> tuple[str, str]:
+    """Resolve the caller's current cognitive route and billing basis for nanny supervision."""
+    task_map = task if isinstance(task, Mapping) else {}
+    meta = task_map.get("task_metadata") if isinstance(task_map.get("task_metadata"), Mapping) else (
+        getattr(ctx, "task_metadata", None) if isinstance(getattr(ctx, "task_metadata", None), Mapping) else {}
+    )
+    model = str(
+        getattr(ctx, "active_model_override", "")
+        or getattr(ctx, "active_model", "")
+        or getattr(ctx, "task_model_override", "")
+        or task_map.get("model")
+        or meta.get("model")
+        or runtime_setting("OUROBOROS_MODEL", "")
+        or ""
+    ).strip()
+    for candidate in (
+        getattr(ctx, "active_use_local_override", None),
+        getattr(ctx, "active_use_local", None),
+        getattr(ctx, "task_use_local_override", None),
+        task_map.get("use_local_model") if "use_local_model" in task_map else None,
+        meta.get("use_local_model") if "use_local_model" in meta else None,
+    ):
+        if candidate is not None:
+            use_local = bool(candidate)
+            break
+    else:
+        use_local = str(runtime_setting("USE_LOCAL_MAIN", "") or "").strip().lower() in ("true", "1")
+    return cognitive_route_billing_basis(model, use_local=use_local, ctx=ctx)
+
+
+def subagent_supervision_fact_line(
+    task: Optional[Mapping[str, Any]] = None, *, ctx: Any = None, catalog: Optional[Mapping[str, Any]] = None,
+) -> str:
+    """Dynamic-tier fact for nanny supervision when the visible catalog has an Agent-session row."""
+    try:
+        visible = current_model_visible_subagent_catalog() if catalog is None else catalog
+        rows = visible.get("rows") if isinstance(visible, Mapping) else None
+        if not isinstance(rows, list) or not any(
+            isinstance(row, Mapping) and row.get("route_class") == "Agent session" for row in rows
+        ):
+            return ""
+        route_label, billing = current_cognitive_route_and_billing(task, ctx=ctx)
+        return (
+            f"An Agent-session row also creates a supervising child on {route_label}; "
+            f"its calls bill as {billing}; the row named as supervisor replaces that route."
+        )
+    except Exception:
+        return ""
 
 
 def _recent_review_records(drive_root: Any, task_id: str) -> tuple[list[dict[str, Any]], Any]:
@@ -692,8 +772,10 @@ def resolve_configured_actor_dispatch(
         route_health,
     )
     from ouroboros.tools.control_delegation import profile_from_task_constraint
+    from ouroboros.supervisor_route import validate_cognitive_route
 
     snapshot = validate_subagent_snapshot(task.get("configured_subagent"))
+    cognitive = validate_cognitive_route(task.get("parent_cognitive_route"))
     route_spec = snapshot["route"]
     route_kind = str(route_spec.get("kind") or "")
     route_target = str(route_spec.get("target_id") or "").strip()
@@ -775,7 +857,7 @@ def resolve_configured_actor_dispatch(
             surface = str(getattr(normalized, "surface", "") or "")
             shape = delegated_run_shape(
                 predicted_subagent_profile(write_surface=surface) == "acting_subagent",
-                snapshot.get("access", "workspace_write"),
+                snapshot.get("access", "workspace_write"), task.get("delegated_mode"),
             )
             gateway = None
             try:
@@ -795,7 +877,6 @@ def resolve_configured_actor_dispatch(
                 if gateway is not None:
                     gateway.close()
 
-    cognitive = task.get("parent_cognitive_route") if isinstance(task.get("parent_cognitive_route"), dict) else {}
     nanny_model = str(cognitive.get("model") or "").strip()
     nanny_effort = str(cognitive.get("effort") or "").strip().lower()
     if not nanny_model and not unavailable:
@@ -910,7 +991,6 @@ def prepare_delegate_start_actor(
     """Resolve the exact actor/start fence; ``continuing`` names the run a continuation takes over."""
 
     from ouroboros import delegate_custody as custody
-    from ouroboros.delegate_recovery import unsettled_start_ids
     from ouroboros.delegate_shared import _fail
     selection = dict(_EXACT_START_SELECTION.get() or {})
     selected_snapshot = selection.get("snapshot")
@@ -949,23 +1029,6 @@ def prepare_delegate_start_actor(
             "The custody event log exists but cannot be read, so the host cannot "
             "prove that no physical start/run remains. Repair or reconcile the "
             "canonical custody record before starting a replacement.",
-        )
-    blockers = unsettled_start_ids(
-        drive_root, str(getattr(ctx, "task_id", "") or ""), continuing=str(continuing or "")
-    )
-    if any(blockers.values()):
-        live_ids = [str(v) for key in ("open_run_ids", "pending_invocation_ids",
-                                       "undisposed_patch_run_ids")
-                    for v in (blockers.get(key) or [])]
-        shown = ", ".join(live_ids[:4]) + (
-            f" (+{len(live_ids) - 4} more)" if len(live_ids) > 4 else "")
-        return {}, _fail(
-            "delegate_start", "replacement_requires_settlement",
-            "This task still owns an unsettled run/start invocation or an undisposed "
-            f"captured patch ({shown}). Wait for or cancel an open run; replay a "
-            "pending invocation with retry_of=<invocation id>; dispose a captured "
-            "patch explicitly (#364).",
-            **blockers,
         )
     return {
         "route": route,
@@ -1062,6 +1125,7 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
     try:
         if str(options.get("retry_of") or "").strip() and (
             selected_id or selected_snapshot is not None or access is not None
+            or options.get("mode") is not None or options.get("override_plan_readiness") is not None
         ):
             raise SubagentSelectionError(
                 "retry_selector_conflict",
@@ -1085,7 +1149,13 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
                 subagent_id=selected_id,
             )
         if selected_snapshot is not None:
-            if access is None and str(options.get("continue_from") or "").strip():
+            from ouroboros.delegate_plan import inherited_mode
+
+            prior_mode = inherited_mode(ctx, options["continue_from"]) if options.get("continue_from") else None
+            if options.get("mode") is None:
+                options["mode"] = prior_mode
+            plan_turn = prior_mode == "plan"
+            if access is None and not plan_turn and str(options.get("continue_from") or "").strip():
                 # Omitted access keeps the continued run's own; only a chosen widening is refused.
                 from ouroboros.delegate_continuation import inherited_access
 
@@ -1096,6 +1166,9 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
         from ouroboros.delegate_shared import _fail
 
         # Selector validation has not entered the physical-start producer yet.
+        from ouroboros.delegate_evidence import record_start_blocked
+
+        record_start_blocked(ctx, str(getattr(ctx, "task_id", "") or ""), exc.code)
         return _replace_tool_result(_fail("delegate_start", exc.code, exc.detail),
                                     meta_updates={"operation_outcome": "completed_no_effect"})
 
@@ -1115,8 +1188,10 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
             _canonical_work_order_fingerprint=canonical_work_order_fingerprint,
             _work_order_source_request=work_order_source_request,
             _coordination_context=coordination_context,
+            _initial_bootstrap=bool(options.pop("_initial_bootstrap", False)),
             **{key: options.pop(key) for key in (
-                "directory_strategy", "scope_paths", "continue_from", "continue_carrier") if key in options},
+                "directory_strategy", "scope_paths", "continue_from", "continue_carrier", "mode",
+                "override_plan_readiness", "_plan_answers") if key in options},
         )
         # Every configured-session start lands here — the host's pre-start
         # (charter, owner 2026-08-28/29) and any model-issued retry/replacement
@@ -1208,34 +1283,8 @@ def _mark_actor_physical_start(ctx: Any, result: "ToolResult") -> None:
     ctx._nanny_physical_activity_seed = True
 
 
-def _names_bound_actor(selector: str, bootstrap: Mapping[str, Any]) -> bool:
-    """Whether a ``subagent_id`` argument names the actor this episode is bound to.
-
-    The bound row is the frozen snapshot, so its stored id and its own handle
-    (the one the startup receipt shows) always name it; any other value goes
-    through the same resolver as ``schedule_subagent`` against the live roster.
-    """
-    expected_id = str(bootstrap.get("selected_subagent_id") or "")
-    snapshot = bootstrap.get("snapshot") if isinstance(bootstrap.get("snapshot"), dict) else {}
-    if selector in {expected_id, snapshot_handle(snapshot)}:
-        return True
-    try:
-        from ouroboros.config import runtime_settings
-
-        settings = effective_runtime_subagent_settings(runtime_settings())
-        config = _resolution(settings, allow_undecided_legacy=False).config
-        return config is not None and resolve_configured_row(
-            config, selector, settings).subagent_id == expected_id
-    except SubagentSelectionError:
-        return False
-
-
 def delegate_start_entry(ctx: Any, prompt: str = "", _resolved_binding: Any = None, **params: Any) -> "ToolResult":
-    # Actor-first configured sessions bind every fresh start to the immutable
-    # snapshot captured before the episode. The model supplies only an advisory
-    # coordination appendix; the canonical work order remains host-owned. An
-    # omitted prompt is the empty one: a direct fresh start still refuses it, and
-    # with retry_of it replays the recorded request (#1614).
+    # Only the private bootstrap and an omitted selector use the scheduled row.
     bootstrap = getattr(ctx, "_configured_actor_bootstrap", None)
     retry_of = str(params.get("retry_of") or "").strip()
     from ouroboros.delegate_shared import _fail
@@ -1249,36 +1298,25 @@ def delegate_start_entry(ctx: Any, prompt: str = "", _resolved_binding: Any = No
 
         record_start_blocked(ctx, str(getattr(ctx, "task_id", "") or ""), reason)
 
-    if isinstance(bootstrap, dict):
-        # A fresh start and a retry alike stay bound to the frozen snapshot: an
-        # argument the bound start cannot honor is refused typed, never
-        # silently discarded.
-        expected_id = str(bootstrap.get("selected_subagent_id") or "")
-        requested_id = str(params.get("subagent_id") or "").strip()
-        if retry_of and params.get("access") is not None:
-            _blocked("retry_selector_conflict")
-            return _fail("delegate_start", "retry_selector_conflict",
-                         "A retry replays its recorded access; omit access.")
-        if requested_id and not _names_bound_actor(requested_id, bootstrap):
-            _blocked("configured_actor_route_mismatch")
-            return _fail(
-                "delegate_start", "configured_actor_route_mismatch",
-                "This configured session is bound to its scheduled actor, fresh start and "
-                "retry alike; select another actor with schedule_subagent instead.",
-                selected_subagent_id=expected_id,
-                requested_subagent_id=requested_id,
-                host_fallback=False,
-            )
+    if retry_of:
+        return exact_start(ctx, prompt, {**params, "_resolved_binding": _resolved_binding})
+    if str(params.get("subagent_id") or "").strip():
+        return exact_start(ctx, prompt, {**params, "_resolved_binding": _resolved_binding})
+    if isinstance(bootstrap, dict) and not retry_of:
         if any(str(params.get(key) or "").strip() for key in ("root", "bucket", "skill_name")):
             _blocked("configured_actor_resource_mismatch")
-            return _fail(
-                "delegate_start", "configured_actor_resource_mismatch",
-                "A configured session starts only its assigned route, fresh start and "
-                "retry alike, never a skill-payload resource.",
-                selected_subagent_id=expected_id,
-                host_fallback=False,
-            )
-    if isinstance(bootstrap, dict) and not retry_of:
+            return _fail("delegate_start", "configured_actor_resource_mismatch",
+                         "An omitted selector keeps the assigned resource; choose an explicit row for a new request.")
+        if not prompt and not params.get("_initial_bootstrap"):
+            from ouroboros import delegate_custody as custody
+            from ouroboros.delegate_recovery import unsettled_start_ids
+
+            obligations = unsettled_start_ids(custody.custody_root(ctx), str(ctx.task_id))
+            if obligations["open_run_ids"] or obligations["pending_invocation_ids"]:
+                _blocked("replacement_requires_settlement")
+                return _fail("delegate_start", "replacement_requires_settlement",
+                             "An empty-prompt replacement needs verified settlement; use retry_of for an unresolved start, "
+                             "or choose subagent_id and a new prompt for independent work.", **obligations)
         canonical_work_order = str(bootstrap.get("canonical_work_order") or "")
         if not canonical_work_order:
             _blocked("configured_work_order_unavailable")
@@ -1292,6 +1330,8 @@ def delegate_start_entry(ctx: Any, prompt: str = "", _resolved_binding: Any = No
             )
         bound = dict(params)
         bound.pop("subagent_id", None)
+        if "mode" not in bound and bootstrap.get("delegated_mode"):
+            bound["mode"] = bootstrap["delegated_mode"]
         bound.update({
             "snapshot": dict(bootstrap.get("snapshot") or {}),
             "compiled_work_order": True,
@@ -1305,14 +1345,6 @@ def delegate_start_entry(ctx: Any, prompt: str = "", _resolved_binding: Any = No
         if _resolved_binding is not None:
             bound["_resolved_binding"] = _resolved_binding
         return exact_start(ctx, canonical_work_order, bound)
-    if retry_of and isinstance(bootstrap, dict):
-        # Retry replays the stored canonical request byte-for-byte once the shared
-        # validator owns it. Every request argument meets the same retry checks as a
-        # direct call (only the bound actor's own id is redundant); the advisory text
-        # is disclosed as not sent, never asserted against or added to the replay.
-        retry_spec = {key: value for key, value in params.items() if key != "subagent_id"}
-        retry_spec.update(_resolved_binding=_resolved_binding, _coordination_context=str(prompt or ""))
-        return exact_start(ctx, "", retry_spec)
     return exact_start(ctx, prompt, {**params, "_resolved_binding": _resolved_binding})
 
 

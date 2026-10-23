@@ -22,7 +22,7 @@ The context-delivery registry:
 | Background consciousness wake-up (`consciousness.py` → `handle_wake_direct`) | = Main task context | = Main task context | = Main task context |
 | Preflight (`review_change(surface=preflight)`: one named row over the system repository's worktree) | the `review_change` body row | as BIBLE | as BIBLE |
 | The coupling question (Part 2 of the retrieving seat's brief, `tools/review_brief_coupling.py`) | full tier 1 beside the `Coupling questions` section, in every context mode | tier 3 navigation | tier 2 within the usable-window share |
-| Skill review (`skill_review.py`) | full inline (packet) / declared mandatory full read (retrieving) | same two classes | same two classes |
+| Skill review (`review_change(subject="skill")`) | full inline (packet) / declared mandatory full read (retrieving) | tier 3 navigation | tier 2: owed chapters + selected contracts |
 | Plan review (`tools/plan_review.py`) | full for a body plan (`api_chat` inline, `agent_session` mandatory full read); otherwise none, no map | as BIBLE | not delivered or pointed at; the mind may attach it |
 | Deep self-review (`deep_self_review.py`) | full tier 1 on both deliveries | tier 3 navigation | tier 2 within the row's share (ARCHITECTURE §6 "Deep self-review") |
 

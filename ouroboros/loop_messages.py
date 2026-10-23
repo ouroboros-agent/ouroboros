@@ -684,17 +684,18 @@ def context_facts_line(ctx: Any, *, money: Optional[Dict[str, Any]] = None,
     # The task's own anchor outranks comparable same-model witnesses; its largest accepted input floors W.
     anchor, anchor_round = usage.get("_context_anchor_input_tokens"), usage.get("_context_anchor_round")
     accepted = usage.get("_context_accepted_input_tokens") if measured else None
-    reading = usage.get("_context_window_reading_tokens") if measured else None
     from ouroboros.context_anchor import refused_input
     refused = refused_input(usage, getattr(ctx, "context_fit_plan", None)) if measured else None
     parts = [_round_fact(ctx, tool_ctx), f"mode {ctx.active_context_mode}", f"model {ctx.active_model}"]
     notes = [note for note in (f"largest accepted input {int(accepted):,}" if accepted else "",
                                f"refused at ~{int(refused):,}" if refused else "") if note]
     largest = f" ({'; '.join(notes)})" if notes else ""
-    if capacity is None and reading is not None and accepted:
-        parts.append(f"window above {int(accepted):,}: this model accepted that input, the stated {int(reading):,} is below it")
-    else:
-        parts.append(("window unknown" if capacity is None else f"window {int(capacity):,}") + largest)
+    from ouroboros.context_view_facts import window_fact, wake_facts
+    source = window_fact(getattr(ctx, "context_fit_plan", None), usage.get("_context_response_reserve_tokens")) if measured else ""
+    parts.append((source or ("window unknown" if capacity is None else f"window {int(capacity):,}")) + largest)
+    wake = wake_facts(getattr(ctx, "context_fit_plan", None), ctx.active_context_mode)
+    if wake:
+        parts.append(wake)
     if target is not None:
         parts.append(f"target {int(target):,}")
     if estimate is None:
@@ -708,12 +709,10 @@ def context_facts_line(ctx: Any, *, money: Optional[Dict[str, Any]] = None,
         floor = int(usage.get("_context_response_reserve_tokens") or reserve or 0)
         parts.append(f"input ~{int(estimate):,} before this line ({how}) + reply reservation {int(reserve or 0):,}")
         # Known-window admission acts on this prediction; a reservation is no provider observation.
-        bound = int(accepted or 0) - int(estimate) - floor  # the window holds what it accepted
         parts.append(f"predicted free ~{int(capacity) - int(estimate) - floor:,}"
                      + (f" (reply floor {floor:,})" if floor != int(reserve or 0) else "")
                      if capacity is not None and refused is None else
-                     f"free at least ~{bound:,} (below an input this model accepted)"
-                     if anchor is not None and bound > 0 else "free unknown")
+                     "free unknown (acceptance established no reply room)")
         if target is not None:
             excess = int(estimate) + floor - int(target)
             parts.append((f"over target {excess:,}" if excess > 0 else f"target room {-excess:,}")
@@ -856,6 +855,7 @@ def _context_components(ctx: Any, *, measured: bool) -> list:
     """Largest blocks, complete units and schemas, on the same calibrated basis."""
     from ouroboros.context_compaction import context_units
     from ouroboros.context_fit import estimate_context_prompt_tokens
+    from ouroboros.context_view_facts import block_label
 
     density = float(ctx.accumulated_usage.get("_context_measurement_density") or 1.0) if measured else 1.0
     units = context_units(ctx.messages, scope="dialogue", measurement_density=density)
@@ -867,7 +867,9 @@ def _context_components(ctx: Any, *, measured: bool) -> list:
         content = message.get("content")
         chunks = [{**message, "content": [block]} for block in content] if message.get("role") == "system" and isinstance(content, list) else [message]
         for j, chunk in enumerate(chunks):
-            sizes.append((f"{message.get('role', 'message')}[{i}:{j}]", int(estimate_context_prompt_tokens([chunk]) * density)))
+            block = chunk.get("content")
+            label = block_label(message, i, block[0] if isinstance(block, list) and block else block, ctx.context_fit_plan)
+            sizes.append((label, int(estimate_context_prompt_tokens([chunk]) * density)))
     sizes.append(("tool schemas", int(estimate_context_prompt_tokens([], ctx.tool_schemas) * density)))
     return sorted(sizes, key=lambda item: item[1], reverse=True)[:3]
 

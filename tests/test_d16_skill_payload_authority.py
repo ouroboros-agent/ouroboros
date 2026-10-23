@@ -577,7 +577,7 @@ def test_selected_manifestless_preflight_to_manifest_and_fresh_review(
 ):
     from ouroboros.gateway.skill_publish import build_skill_publish_preflight
     from ouroboros.skill_loader import load_review_state
-    from tests.test_skill_review_persist_guard import _pass_actor
+    from tests.test_skill_review_persist_guard import _clean_wave
 
     repo = tmp_path / "repo"
     data = tmp_path / "data"
@@ -638,10 +638,7 @@ def test_selected_manifestless_preflight_to_manifest_and_fresh_review(
         {**selector, "bucket": "user_repo", "path": "notes.txt"},
     )
 
-    monkeypatch.setattr(
-        "ouroboros.tools.review._handle_multi_model_review",
-        lambda *_a, **_kw: json.dumps({"results": [_pass_actor("fake/a"), _pass_actor("fake/b")]}),
-    )
+    _clean_wave(monkeypatch)  # the golden pool's seats answer clean through the real custody layer
     preflight = json.loads(registry.execute("skill_preflight", {"skill": "draft"}))
     assert preflight.get("ok") is True, preflight
     registry.execute("skill_review", {"skill": "draft"})

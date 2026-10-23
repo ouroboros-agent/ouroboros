@@ -14,6 +14,7 @@ from tests import _dialogue as dialogue_test
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -173,13 +174,17 @@ def test_notes_reach_main_activity_and_the_live_banner(direct_server_with_data, 
             waiting = schedules.locator(".activity-row").filter(has_text=LATER)
             waiting.wait_for(state="visible", timeout=30_000)
             assert waiting.locator(".activity-name").inner_text() == LATER
-            assert waiting.locator(".activity-sub").inner_text().startswith("reminder · one-shot · at/after ")
+            assert waiting.locator(".activity-sub[data-i18n-authored]").inner_text() == LATER
+            timing = waiting.locator(".activity-sub").filter(has_text=re.compile(r"^reminder · one-shot · at/after "))
+            assert timing.count() == 1
+            assert timing.locator("time").get_attribute("datetime") == "2999-01-01T09:00:00Z"
             schedules.scroll_into_view_if_needed()
             page.screenshot(path=str(evidence / "activity-desktop.png"), full_page=True)
             page.set_viewport_size({"width": 390, "height": 844})
             wait_drawer_closed(page)
             page.evaluate(SETTLED)
-            assert waiting.locator(".activity-sub").evaluate("node => node.scrollWidth <= node.clientWidth + 1")
+            assert waiting.locator(".activity-sub").evaluate_all(
+                "nodes => nodes.every(node => node.scrollWidth <= node.clientWidth + 1)")
             page.screenshot(path=str(evidence / "activity-narrow.png"), full_page=True)
         finally:
             browser.close()

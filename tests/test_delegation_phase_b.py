@@ -78,7 +78,7 @@ def test_configured_nanny_note_states_the_charter_and_defers_truth_to_receipt():
     assert "For fresh work the host starts the exact leaf before your first round" in note
     assert "Restored supervision follows its continuation receipt" in note
     assert "the receipt states custody" in note
-    assert "metered duplicate" in note
+    assert "duplicate of already-paid work" in note
     assert "cancellation and terminal settlement are verified" in note
     assert "explicit separate child" in note
     assert "zero_run_decision=incomplete|unknown" in note

@@ -21,7 +21,8 @@ def test_density_never_borrows_another_view_on_route_or_model(tmp_path, kind):
     ce.record_token_density(tmp_path, "model", prompt_chars=80_000, prompt_tokens=25_000,
                             route_fp="same-route", basis=ce.MAIN_DENSITY_BASIS, view_kind=kind)
     assert ce.resolve_main_token_density(tmp_path, "same-route", "model", view_kind=kind) == (1.25, "fresh_route_usage")
-    assert ce.resolve_main_token_density(tmp_path, "another-account", "model", view_kind=kind) == (1.25, "fresh_model_usage")
+    # Another route of the same model and view keeps its own basis: no model-wide borrowing (THESIS I-8, C1).
+    assert ce.resolve_main_token_density(tmp_path, "another-account", "model", view_kind=kind) == (1.0, "cold_estimate")
 
 
 def test_throttle_and_retention_are_independent_per_view(tmp_path):

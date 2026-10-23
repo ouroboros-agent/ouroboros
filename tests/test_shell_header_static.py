@@ -48,7 +48,8 @@ def test_stack_header_is_one_row_of_at_most_56px_with_restart_and_budget_inside_
     # The note is a floating sibling under the bar, never a second row of it; the move into ⋯ follows the
     # bar's measured width as well as the layout (page_header.js), so a narrow docked column keeps one row too.
     assert '.chat-page-note {' in css and "top: var(--chat-header-bar, 56px)" in _rule(css, ".chat-page-note {")
-    assert "createHistoryControls(messagesDiv, pageNote || page.querySelector('.chat-panel-statusbar'))" in _read("web/modules/chat.js")
+    assert re.search(r"createHistoryControls\(messagesDiv, pageNote \|\| page\.querySelector\('\.chat-panel-statusbar'\)[,)]",
+                     _read("web/modules/chat.js"))
     header_js = _read("web/modules/page_header.js")
     assert "export const HEADER_FULL_ROW_MIN_WIDTH = 640;" in header_js
     assert "bar.clientWidth < HEADER_FULL_ROW_MIN_WIDTH" in header_js and "new Observer(place)" in header_js

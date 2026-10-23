@@ -323,7 +323,7 @@ function createCodeBlock(source, language = '') {
     label.textContent = language || 'text';
     const copy = document.createElement('button');
     copy.type = 'button';
-    copy.className = 'md-code-copy';
+    copy.className = 'btn btn-ghost btn-sm md-code-copy';
     copy.dataset.codeCopy = '';
     copy.setAttribute('aria-label', tr('code.copy_code', 'Copy code'));
     copy.title = tr('code.copy_code', 'Copy code');

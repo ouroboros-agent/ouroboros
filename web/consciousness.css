@@ -223,10 +223,9 @@ textarea.ui-control.consciousness-owner-words {
 .btn.btn-ghost.place-danger { color: var(--status-error-fg); }
 /* The place's state: the Settings segmented control in its tray; the note under it says what the state does. */
 .place-state-note { margin: 0; color: var(--text-meta); font-size: var(--type-body); line-height: var(--line-body); }
-/* What Silent guarantees is a host fact: the System voice (its tint and rail), one paragraph under the tray. */
+/* What Silent guarantees is a host fact: the System voice (its tint, no edge), one paragraph under the tray. */
 .place-sheet-section p.place-silent-card {
     padding: var(--space-2) var(--space-4);
-    border-left: 2px solid var(--system-border);
     border-radius: var(--radius-inner);
     background: var(--system-bubble-bg);
     color: var(--system-text);

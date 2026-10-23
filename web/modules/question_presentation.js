@@ -104,8 +104,6 @@ export function normalizeQuiz(msg) {
         optionsKnown,
         stake: String(src.stake || ''),
         assumption: String(src.assumption || ''),
-        // The host's sentence (asking task, run start, the owner's last message): plain text.
-        hostFacts: String(src.host_facts || ''),
         closedReason: String(src.closed_reason || ''),
         materials: Array.isArray(src.materials) ? src.materials : [],
         // The wait facts the header and the signature line read (waitFacts): the
@@ -125,16 +123,6 @@ export function normalizeQuiz(msg) {
         comment: String(src.comment || ''),
         detailsUnavailable: src.option_details === undefined && raw.every((option) => typeof option === 'string'),
     };
-}
-
-// The host's sentence rides the bubble's time line (docs/DESIGN.md "Quiz card"). The node exists from the first
-// paint and stays hidden until a delivery carries the sentence, so a later, richer one fills it in place.
-export function hostFactsLine(text) {
-    const line = document.createElement('div');
-    line.className = 'chat-quiz-host-facts';
-    line.textContent = text;  // ids, times and counts of one question: a sentence, not a translation key
-    line.hidden = !text;
-    return line;
 }
 
 export function appendRecommendedBadge(button) {

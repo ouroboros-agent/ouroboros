@@ -17,7 +17,8 @@ from ouroboros.owner_mailbox import (
     drain_owner_entries,
 )
 from ouroboros.tools.tool_result import ToolResult
-from ouroboros.utils import atomic_write_json, utc_now_iso
+from ouroboros.utils import utc_now_iso
+from ouroboros import delegate_supervision_state as checkpoints
 
 _TICK_SEC = 3
 _QUIET_STATUSES = {"progress", "no_progress", "observation_pending"}
@@ -90,43 +91,21 @@ def _state_path(ctx: Any) -> pathlib.Path:
 
 
 def _load_state(ctx: Any, run_id: str) -> dict[str, Any]:
-    path = _state_path(ctx)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        data = {}
-    return supervision_state_for_run(data, run_id)
+    data = checkpoints.read(_state_path(ctx))
+    selected = run_id or (next(iter(data["runs"])) if len(data["runs"]) == 1 else "")
+    return supervision_state_for_run(data, selected)
 
 
 def supervision_state_for_run(data: Any, run_id: str) -> dict[str, Any]:
-    """Share task-scoped facts, never another run's cursor or wake, on wait and recovery."""
-    if not isinstance(data, dict) or (
-        str(run_id) and str(data.get("run_id") or "") != str(run_id)
-    ):
-        # The unknown-provider hold is CROSS-RUN durable state (nanny-leaf): a
-        # state rebuild for a newer/first run id must not erase the latch —
-        # supervised_wait's own entry persisted the reset, so a worker crash
-        # during the (hours-long) wait lost the hold and the recovered
-        # successor dispatched the unknown transcript again (final-pair F2).
-        # The COMMITTED coordination cursor is task-scoped too: a new run id must
-        # not re-announce every already-acknowledged child terminal/beacon. Only
-        # the acked cursor rides; an unacked ``pending_wake`` (and its uncommitted
-        # cursor) stays run-scoped, so an undelivered child event re-emits once.
-        data = {"schema": 1, "run_id": str(run_id), "journal_cursor": 0, **task_scoped_supervision(data)}
-    return data
+    return checkpoints.run_view(data, run_id)
 
 
 def task_scoped_supervision(data: Any) -> dict[str, Any]:
-    """The facts every run of one task shares; all a holder without its own wait inherits."""
-    return {key: data[key] for key in ("unknown_provider_hold", "coordination_cursor")
-            if isinstance(data, dict) and isinstance(data.get(key), dict)}
+    return checkpoints.task_facts(data)
 
 
 def _save_state(ctx: Any, state: dict[str, Any]) -> None:
-    path = _state_path(ctx)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    state["updated_at"] = utc_now_iso()
-    atomic_write_json(path, state)
+    checkpoints.save_view(_state_path(ctx), custody.custody_root(ctx), str(ctx.task_id), state)
 
 
 def _emit(ctx: Any, kind: str, payload: dict[str, Any]) -> bool:
@@ -787,11 +766,11 @@ def stage_pending_wake_exposure(ctx: Any, delivered: Any) -> None:
         return
     if not _wake_ids(payload):
         return
-    state = _load_state(ctx, "")
-    pending = state.get("pending_wake") or {}
-    if not pending.get("wake_id") or pending["wake_id"] not in _wake_ids(payload):
-        return
-    _record_exposure(ctx, payload, pending, str(state.get("run_id") or ""))
+    for run_id in checkpoints.read(_state_path(ctx))["runs"]:
+        state = _load_state(ctx, run_id)
+        pending = state.get("pending_wake") or {}
+        if pending.get("wake_id") in _wake_ids(payload):
+            _record_exposure(ctx, payload, pending, run_id)
 
 
 def _record_exposure(ctx: Any, payload: Any, pending: dict[str, Any], run_id: str) -> None:
@@ -809,9 +788,22 @@ def _record_exposure(ctx: Any, payload: Any, pending: dict[str, Any], run_id: st
 
 
 def acknowledge_pending_wake(ctx: Any, delivered: Any = None) -> bool:
-    """Ack the exact delivered wake; incorporated loop callers defer this until save."""
+    """Acknowledge only run wakes named by the persisted delivered envelope."""
+    try:
+        payload = json.loads(delivered) if isinstance(delivered, str) else delivered
+    except (TypeError, ValueError):
+        return False
+    ids = _wake_ids(payload)
+    states = [_load_state(ctx, run_id) for run_id in checkpoints.read(_state_path(ctx))["runs"]]
+    pending = [state for state in states if state.get("pending_wake")
+               and not state["pending_wake"].get("acknowledged_at")]
+    selected = [state for state in pending if state["pending_wake"].get("wake_id") in ids]
+    if pending and not selected:
+        return False
+    return all(_acknowledge_run_wake(ctx, payload, state) for state in selected)
 
-    state = _load_state(ctx, "")
+
+def _acknowledge_run_wake(ctx: Any, delivered: Any, state: dict) -> bool:
     pending = state.get("pending_wake") if isinstance(state.get("pending_wake"), dict) else {}
     if not pending or pending.get("acknowledged_at"):
         return True
@@ -880,17 +872,7 @@ def acknowledge_pending_wake(ctx: Any, delivered: Any = None) -> bool:
         ),
     }):
         return False
-    _record_terminal_acknowledged(ctx, state, pending, expected, attempt)
-    interaction_ids = frozenset(
-        str(item) for item in (pending.get("interaction_ids") or []) if str(item)
-    )
-    if interaction_ids and str(state.get("run_id") or ""):
-        from ouroboros.delegate_interactions import _REPORTED_INTERACTIONS
-
-        run_id = str(state.get("run_id") or "")
-        _REPORTED_INTERACTIONS[run_id] = frozenset(
-            set(_REPORTED_INTERACTIONS.get(run_id, frozenset())) | set(interaction_ids)
-        )
+    interaction_ids = frozenset(str(item) for item in (pending.get("interaction_ids") or []) if str(item))
     prior_mailbox_ids = (
         state.get("mailbox_acknowledged_ids") or []
         if str(state.get("mailbox_acknowledged_attempt_key") or "") == attempt
@@ -913,6 +895,12 @@ def acknowledge_pending_wake(ctx: Any, delivered: Any = None) -> bool:
     state["pending_wake"] = {}
     state["status"] = "awake"
     _save_state(ctx, state)
+    _record_terminal_acknowledged(ctx, state, pending, expected, attempt)
+    if interaction_ids and state.get("run_id"):
+        from ouroboros.delegate_interactions import _REPORTED_INTERACTIONS
+
+        run_id = state["run_id"]
+        _REPORTED_INTERACTIONS[run_id] = frozenset(set(_REPORTED_INTERACTIONS.get(run_id, ())) | interaction_ids)
     # Compatibility for direct ACK consumers (the UNKNOWN hold): only a saved receipt
     # records exposure, since the hold drops a receipt whose ACK failed (#2142).
     # Loop/startup consumers stage BEFORE saving.
@@ -1007,20 +995,18 @@ def observed_run_activity(drive_root: Any, task_id: str, run_id: str, attempt: A
         stamp, memo = (stat.st_mtime_ns, stat.st_size), _OBSERVED.get(str(path))
         if memo is None or memo[0] != stamp:
             data = json.loads(path.read_text(encoding="utf-8"))
-            observation = data.get("observation") if isinstance(data, dict) else None
-            memo = (stamp, {"run_id": str(data.get("run_id") or ""), "observation": dict(observation)}
-                    if isinstance(observation, dict) else {})
+            memo = (stamp, checkpoints.normalize(data)["runs"])
             if len(_OBSERVED) >= 256:
                 _OBSERVED.clear()
             _OBSERVED[str(path)] = memo
     except (OSError, ValueError, AttributeError):
         return None
-    observation = memo[1].get("observation") or {}
+    observation = memo[1].get(str(run_id), {}).get("observation") or {}
     try:
         current = time.time() - float(observation.get("at_unix") or 0) <= _OBSERVATION_CURRENT_SEC
     except (TypeError, ValueError):
         current = False
-    if (memo[1].get("run_id") != str(run_id) or not current
+    if (str(run_id) not in memo[1] or not current
             or str(observation.get("attempt") or "") != str(attempt or 1)):
         return None
     return run_activity(observation)
@@ -1111,7 +1097,7 @@ def _publish_wake_facts(ctx: Any, state: dict[str, Any], payload: dict[str, Any]
 
 def supervised_wait(
     ctx: Any,
-    run_id: str,
+    run_id: str | list[str],
     *,
     since_seq: Optional[int] = None,
     checkpoint_after_sec: Optional[int] = None,
@@ -1120,15 +1106,10 @@ def supervised_wait(
 ) -> ToolResult:
     """Renew quiet windows internally and return only a meaningful wake batch.
 
-    The journal cursor is durable, so it survives worker restarts. ``cache_horizon_note``
-    is attached once per wake, only when the time since the last model response exceeds
-    the applied cache horizon. ``checkpoint_after_sec`` is a one-shot wake: an earlier
-    real event consumes it, and it never repeats. Renewal runs on a fixed three-second
-    tick with no backoff and no durable outage latch. A read that delivered no daemon
-    answer is a quiet renewal: ``observation_read_timeout`` is our own read bound
-    expiring, ``daemon_unreachable`` a socket that carried nothing, an engine busy code a
-    GET the daemon could not serve; only ``daemon_unreachable`` opens an outage episode
-    (one owner line, plus one line when a read is answered again).
+    The journal cursor survives restart. A checkpoint wakes once; any earlier event
+    consumes it. The existing three-second renewal keeps unanswered reads quiet;
+    only daemon_unreachable opens an outage episode, closed by an answered read.
+    The applied cache horizon is disclosed once per wake when exceeded.
     """
 
     reason_text = str(checkpoint_reason or "").strip()
@@ -1150,61 +1131,63 @@ def supervised_wait(
             f"{missing} is missing. Supply both for one proactive inspection, or omit both "
             "(0 with an empty reason also means none).",
         )
+    run_ids = list(dict.fromkeys(run_id if isinstance(run_id, list) else [str(run_id)]))
     owns_transport = wait_once is None
     if wait_once is None:
-        # Validate the checkpoint pair above before custody can refuse the call.
-        # A foreign run may be a proven retry product; read it without entering
-        # live supervision. Missing/unknown ids keep the ordinary wait's refusal.
-        if custody.lookup(custody.custody_root(ctx), str(getattr(ctx, "task_id", "") or ""), run_id)[0] == custody.FOREIGN:
-            from ouroboros.tools.delegate_terminal_evidence import retry_terminal_result
+        for selected in run_ids:
+            ownership, _entry = custody.lookup(custody.custody_root(ctx), str(ctx.task_id), selected)
+            if ownership == custody.FOREIGN:
+                from ouroboros.tools.delegate_terminal_evidence import retry_terminal_result
 
-            return retry_terminal_result(ctx, run_id)
+                return retry_terminal_result(ctx, selected)
         from ouroboros.tools.delegate import _delegate_wait
-
         from functools import partial
 
         wait_once = partial(_delegate_wait, observation_only=True)
     from ouroboros.delegate_recovery import restore_bound_handoff
 
-    restore_bound_handoff(ctx, run_id)
-    state = _load_state(ctx, run_id)
-    replay = _pending_payload(ctx, state)
-    if replay:
-        _emit(ctx, "delegate_supervision_wake_replayed", {
-            "run_id": str(run_id),
-            "wake_id": str(replay.get("supervision_wake_id") or ""),
+    states = {}
+    try:
+        for selected in run_ids:
+            restore_bound_handoff(ctx, selected)
+            state = _load_state(ctx, selected)
+            replay = _pending_payload(ctx, state)
+            if replay:
+                _emit(ctx, "delegate_supervision_wake_replayed", {
+                    "run_id": selected, "wake_id": str(replay.get("supervision_wake_id") or "")})
+                return _render_wake_payload(ctx, replay)
+            states[selected] = state
+    except (OSError, ValueError) as exc:
+        return _fail("delegate_wait", "supervision_state_unknown", str(exc))
+    for run_id, state in states.items():
+        _ownership, held = custody.lookup(custody.custody_root(ctx), str(ctx.task_id), run_id)
+        state["config_fingerprint"] = str(getattr(held, "config_fingerprint", "") or "")
+        if since_seq is not None:
+            state["journal_cursor"] = max(int(state.get("journal_cursor") or 0), int(since_seq))
+        _open_sleep_entry(state, run_id)
+        state["status"] = "sleeping"
+        if checkpoint_after_sec is not None:
+            delay = max(1, min(604_800, int(checkpoint_after_sec)))
+            state["checkpoint"] = {
+                "due_at_unix": time.time() + delay,
+                "reason": str(checkpoint_reason).strip(),
+                "requested_at": utc_now_iso(),
+                "consumed": False,
+            }
+            _emit(ctx, "delegate_supervision_checkpoint_scheduled", {
+                "run_id": str(run_id), "due_at_unix": state["checkpoint"]["due_at_unix"],
+                "reason": state["checkpoint"]["reason"],
+            })
+        # Do not baseline already-terminal children before the first poll.  The model
+        # has not observed them yet; treating them as prior state loses a fast child
+        # forever when the physical leaf stays quiet.  The ordinary pending-wake
+        # cursor/ack path below publishes each existing terminal/attention fact once.
+        _save_state(ctx, state)
+        _emit(ctx, "delegate_supervision_wait_entered", {
+            "run_id": str(run_id), "journal_cursor": int(state.get("journal_cursor") or 0),
+            "checkpoint_scheduled": bool(checkpoint_after_sec is not None),
+            "sleep_entry": dict(state["sleep_entry"]),
         })
-        return _render_wake_payload(ctx, replay)
-    snapshot = getattr(ctx, "task_metadata", {})
-    snapshot = snapshot.get("configured_subagent") if isinstance(snapshot, dict) else {}
-    snapshot = snapshot if isinstance(snapshot, dict) else {}
-    state["config_fingerprint"] = str(snapshot.get("config_fingerprint") or "")
-    if since_seq is not None:
-        state["journal_cursor"] = max(int(state.get("journal_cursor") or 0), int(since_seq))
-    _open_sleep_entry(state, run_id)
-    state["status"] = "sleeping"
-    if checkpoint_after_sec is not None:
-        delay = max(1, min(604_800, int(checkpoint_after_sec)))
-        state["checkpoint"] = {
-            "due_at_unix": time.time() + delay,
-            "reason": str(checkpoint_reason).strip(),
-            "requested_at": utc_now_iso(),
-            "consumed": False,
-        }
-        _emit(ctx, "delegate_supervision_checkpoint_scheduled", {
-            "run_id": str(run_id), "due_at_unix": state["checkpoint"]["due_at_unix"],
-            "reason": state["checkpoint"]["reason"],
-        })
-    # Do not baseline already-terminal children before the first poll.  The model
-    # has not observed them yet; treating them as prior state loses a fast child
-    # forever when the physical leaf stays quiet.  The ordinary pending-wake
-    # cursor/ack path below publishes each existing terminal/attention fact once.
-    _save_state(ctx, state)
-    _emit(ctx, "delegate_supervision_wait_entered", {
-        "run_id": str(run_id), "journal_cursor": int(state.get("journal_cursor") or 0),
-        "checkpoint_scheduled": bool(checkpoint_after_sec is not None),
-        "sleep_entry": dict(state["sleep_entry"]),
-    })
 
     # The OPEN unreachable-daemon episode: its UTC start (empty when none) plus the
     # millisecond stamp that keeps two episodes of one wait distinct on both client
@@ -1213,16 +1196,26 @@ def supervised_wait(
     outage_stamp = ""
     # The loop's own transport, only when it built the observing wait.
     from ouroboros.tools.delegate_terminal_evidence import retained_terminal_result
-    retained = retained_terminal_result(ctx, run_id) if owns_transport else None
-    gateway = _loop_gateway() if owns_transport and retained is None else None
-    live_input = _leaf_live_input(ctx, run_id, gateway) if retained is None else "unknown"
+    retained_runs = {selected: retained_terminal_result(ctx, selected) for selected in run_ids} if owns_transport else {}
+    gateway = None
+    live_inputs = {}
     from ouroboros import model_sleep
 
     # Holding the run is a wait, never this task's own work; what the run does is its
     # recorded observation (``observed_run_activity``, DESIGN §9 Telegram typing).
-    hold_key, hold_until, activity = f"delegate:{run_id}", 0.0, None
+    hold_key, hold_until, activity = "delegate:" + ",".join(run_ids), 0.0, None
+    selected_index = 0
     try:
         while True:
+            run_id = run_ids[selected_index]
+            selected_index = (selected_index + 1) % len(run_ids)
+            state = _load_state(ctx, run_id)
+            retained = retained_runs.pop(run_id, None)
+            if run_id not in live_inputs:
+                if owns_transport and gateway is None and retained is None:
+                    gateway = _loop_gateway()
+                live_inputs[run_id] = _leaf_live_input(ctx, run_id, gateway) if retained is None else "unknown"
+            live_input = live_inputs[run_id]
             if hold_until - time.time() < _HOLD_MARK_SEC / 2:
                 hold_until = time.time() + _HOLD_MARK_SEC
                 model_sleep.declare_in_slot_wait(ctx, hold_key, hold_until)
@@ -1279,6 +1272,19 @@ def supervised_wait(
                 and float(checkpoint.get("due_at_unix") or 0) <= time.time()
             )
             meaningful = str(payload.get("status") or "") not in _QUIET_STATUSES
+            collecting = (payload.get("status") == "observation_pending"
+                          and payload.get("reason") == "collection_in_progress")
+            try:
+                from ouroboros.store import acquisition_budget
+                with acquisition_budget(0):
+                    # A terminal observation does not finish the collector's owned delivery.
+                    terminal = [] if meaningful or wakes or collecting else model_sleep.terminal_readiness(
+                        ctx, {"runs": [str(run_id)]})
+            except Exception:
+                terminal = []  # An unreadable custody source cannot hide observed controls or answers.
+            if terminal and not meaningful and not wakes:
+                payload.update(status="terminal_custody", terminal_facts=terminal)
+                meaningful = True
             if meaningful or wakes or due:
                 if checkpoint and not checkpoint.get("consumed"):
                     checkpoint["consumed"] = True
@@ -1326,6 +1332,8 @@ def supervised_wait(
                     "created_at": utc_now_iso(),
                 }
                 _save_state(ctx, state)
+                payload = state["pending_wake"]["payload"]
+                wake_id = state["pending_wake"]["wake_id"]
                 _emit(ctx, "delegate_supervision_wake_pending", {
                     "run_id": str(run_id), "wake_id": wake_id,
                     "payload": payload,
@@ -1377,8 +1385,8 @@ def supervised_wait(
 def read_unknown_hold(ctx: Any) -> dict[str, Any]:
     """Durable unknown-provider hold latch (nanny-leaf D1-min).
 
-    Written when a nanny round dies ``provider_outcome_unknown`` with exactly one
-    live delegated leaf; the successor generation (worker-crash adoption) must
+    Written when a nanny round dies ``provider_outcome_unknown`` with eligible
+    live delegated leaves; the successor generation (worker-crash adoption) must
     re-enter the hold BEFORE any LLM call, so the latch lives in this durable
     supervision record that ``prepare_handoff`` already snapshots.
 
@@ -1395,7 +1403,7 @@ def read_unknown_hold(ctx: Any) -> dict[str, Any]:
     except OSError as exc:
         raise UnknownHoldUnreadable(str(exc)) from exc
     try:
-        data = json.loads(raw)
+        data = checkpoints.normalize(json.loads(raw))
     except ValueError as exc:
         raise UnknownHoldUnreadable(str(exc)) from exc
     hold = data.get("unknown_provider_hold") if isinstance(data, dict) else None
@@ -1424,23 +1432,25 @@ def clear_unknown_hold(ctx: Any) -> None:
 def supervision_checkpoint(ctx: Any) -> dict[str, Any]:
     """Read the durable checkpoint used by selective recovery/restart."""
 
-    try:
-        data = json.loads(_state_path(ctx).read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    return checkpoints.read(_state_path(ctx))
 
 
 def delegate_wait_entry(
     ctx: Any,
-    run_id: str,
+    run_id: str = "",
     wait_sec: Optional[int] = None,
     since_seq: Optional[int] = None,
     checkpoint_after_sec: Optional[int] = None,
     checkpoint_reason: str = "",
+    runs: Optional[list[str]] = None,
 ) -> ToolResult:
     """Event-only wait; hidden ``wait_sec`` is accepted only for old transcripts."""
 
+    if not run_id and runs is None:
+        return _fail("delegate_wait", "missing_run_id", "Supply one run_id or a nonempty runs array.")
+    if (bool(run_id) == (runs is not None) or (runs is not None and
+            (not isinstance(runs, list) or not runs or any(not isinstance(r, str) or not r.strip() for r in runs)))):
+        return _fail("delegate_wait", "run_selector_conflict", "Supply one run_id or a nonempty runs array.")
     if wait_sec is not None:
         _emit(ctx, "delegate_supervision_legacy_wait_ignored", {
             "run_id": str(run_id), "wait_sec": int(wait_sec),
@@ -1448,7 +1458,7 @@ def delegate_wait_entry(
         })
 
     return supervised_wait(
-        ctx, run_id, since_seq=since_seq,
+        ctx, runs if runs is not None else run_id, since_seq=since_seq,
         checkpoint_after_sec=checkpoint_after_sec,
         checkpoint_reason=checkpoint_reason,
     )

@@ -491,7 +491,7 @@ def _delegation_fact(tmp_path, monkeypatch):
     return payload["capabilities"]
 
 
-def test_delegation_fact_carries_historical_rows_and_profile_evidence(tmp_path, monkeypatch):
+def test_delegation_fact_carries_historical_identities_and_profile_readers(tmp_path, monkeypatch):
     root = _delegation_data_root(tmp_path, monkeypatch)
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "claudexor=opus-5:high")
     (root / "state" / "reviewer_slot_last_execution.json").write_text(json.dumps({
@@ -532,34 +532,31 @@ def test_delegation_fact_carries_historical_rows_and_profile_evidence(tmp_path, 
 
     assert "configured_route" not in delegation
     rows = {row["slot"]: row for row in delegation["reviewer_slots_last"]}
-    assert rows["triad_1"]["outcome"] == "ok"
-    assert rows["triad_1"]["requested_profile"] == "requested-review-profile"
-    assert rows["triad_1"]["applied_profile"] == "applied-review-profile"
-    assert "failure_code" not in rows["triad_1"]
-    assert rows["triad_2"]["outcome"] == "failed"
-    assert rows["triad_2"]["failure_code"] == "subscription_window_exhausted"
-    assert rows["triad_2"]["reset_at"] == "2026-08-18T09:20:00+00:00"
-    # Per-row label is the timestamp only; the verbatim historical disclaimer
-    # lives ONCE in the note (review fix 12), never repeated per row.
-    assert rows["triad_1"]["observed"] == "last observed at 2026-08-18T01:02:03+00:00"
-    last = delegation["subagent_last_delegation"]
-    assert last["route"] == "claudexor"
-    assert last["applied_model"] == "claude-opus-5"
-    assert last["requested_profile"] == "requested-delegate-profile"
-    assert last["applied_profile"] == "applied-delegate-profile"
-    # Named from the record's own facts (no typed identity here: its route target).
-    assert last["selected_subagent_id"] == "claudexor=opus-5"
-    assert last["observed"] == "last observed at 2026-08-18T02:00:00+00:00"
-    assert "historical" not in rows["triad_1"]["observed"]
-    # The prompt-visible note teaches the semantics ONCE: rows are history, live
-    # facts come from plan-review waves and typed delegate refusals.
-    assert "historical, not live health" in delegation["note"]
-    assert "plan-review wave rows" in delegation["note"]
-    assert "typed" in delegation["note"] and "refusal" in delegation["note"]
-    assert "never healthy" in delegation["note"]
+    assert rows["triad_1"] == {"slot": "triad_1", "outcome": "ok", "observed": "2026-08-18T01:02:03+00:00"}
+    assert rows["triad_2"]["outcome"] == "error"
+    (last,) = delegation["subagents_last_executions"]
+    assert last["selected_subagent_id"] == "claudexor=opus-5" and last["run_id"] == "run-1"
+    assert last["observed"] == "2026-08-18T02:00:00+00:00"
+    assert "not live health" in delegation["note"]
+    assert not any(key in json.dumps(delegation) for key in
+                   ("requested_profile", "applied_profile", "failure_code", "reset_at"))
+    # The exact readers retain the account and failure evidence instead of copying it inline.
+    records = {}
+    for reader in delegation["readers"]:
+        assert reader["tool"] == "read_file" and reader["arguments"]["root"] == "runtime_data"
+        path = reader["arguments"]["path"]
+        records[path] = json.loads((root / path).read_text(encoding="utf-8"))
+    reviews = records["state/reviewer_slot_last_execution.json"]
+    assert reviews["triad_1"]["requested"]["profile_id"] == "requested-review-profile"
+    assert reviews["triad_1"]["effective"]["profile_id"] == "applied-review-profile"
+    assert reviews["triad_2"]["failure_code"] == "subscription_window_exhausted"
+    assert reviews["triad_2"]["reset_at"] == "2026-08-18T09:20:00+00:00"
+    saved = records["state/subagent_last_delegation.json"]
+    assert saved["requested_profile"] == "requested-delegate-profile"
+    assert saved["applied_profile"] == "applied-delegate-profile" and saved["applied_model"] == "claude-opus-5"
 
 
-def test_delegation_fact_undated_window_code_surfaces_without_reset(tmp_path, monkeypatch):
+def test_delegation_fact_addresses_undated_window_code_without_inventing_reset(tmp_path, monkeypatch):
     root = _delegation_data_root(tmp_path, monkeypatch)
     monkeypatch.delenv("OUROBOROS_SUBAGENT_HARNESS", raising=False)
     (root / "state" / "reviewer_slot_last_execution.json").write_text(json.dumps({
@@ -573,9 +570,11 @@ def test_delegation_fact_undated_window_code_surfaces_without_reset(tmp_path, mo
     delegation = _delegation_fact(tmp_path, monkeypatch)["delegation"]
 
     (row,) = delegation["reviewer_slots_last"]
-    assert row["failure_code"] == "credential_pool_exhausted"
-    assert "reset_at" not in row
-    assert row["outcome"] == "failed"
+    assert "failure_code" not in row and "reset_at" not in row
+    assert row["outcome"] == "error"
+    reader = delegation["readers"][0]
+    stored = json.loads((root / reader["arguments"]["path"]).read_text(encoding="utf-8"))["scope"]
+    assert stored["failure_code"] == "credential_pool_exhausted" and "reset_at" not in stored
 
 
 def test_delegation_fact_absent_files_mean_absent_observations_not_health(tmp_path, monkeypatch):

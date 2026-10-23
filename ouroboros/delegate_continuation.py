@@ -105,7 +105,8 @@ class ContinuationStart(NamedTuple):
 
 
 NO_CONTINUATION = ContinuationStart()
-CUSTODY_KEYS = ("continuation_of", "capture_id", "snapshot_task_id")
+CUSTODY_KEYS = ("continuation_of", "capture_id", "snapshot_task_id", "thread_id",
+                "execution_mode", "effective_access", "authority_ceiling", "promotion")
 
 
 def _task_line(ctx: Any, drive: Any, state: Dict[str, Any], entry: Any) -> str:
@@ -125,7 +126,7 @@ def _task_line(ctx: Any, drive: Any, state: Dict[str, Any], entry: Any) -> str:
     return "owner_continue" if recorded_continuation(drive, entry.root_task_id or entry.task_id, reader) else ""
 
 
-def still_continuable(drive: Any, entry: Any, live_task_ids=None) -> bool:
+def still_continuable(drive: Any, entry: Any, live_task_ids=None, *, recoverable_handles=()) -> bool:
     """Retain a registration until its owner line and every root's Continue offer end.
 
     Each root of the recorded Continue chain (the original root and every
@@ -133,12 +134,15 @@ def still_continuable(drive: Any, entry: Any, live_task_ids=None) -> bool:
     the offer is read at every settled member the walk reaches, not only at the
     run's own root; child tasks never carry an offer.
 
-    The sweep supplies its authoritative live/reserved census. Addressed result
+    The sweep supplies its live census and exact reserved handles. Addressed result
     reads validate retry and Continue edges; missing/changed evidence keeps the
     registration. This observation grants no continuation or execution authority.
     """
     if entry.review_owned or not entry.run_id:
         return False
+    if ((entry.task_id, entry.run_id, entry.invocation_id) in recoverable_handles
+            or (entry.task_id, entry.run_id, "") in recoverable_handles):
+        return True
     if live_task_ids is None or not entry.task_id:
         return True
     from types import SimpleNamespace
@@ -207,7 +211,7 @@ def still_continuable(drive: Any, entry: Any, live_task_ids=None) -> bool:
 
 def bind_continuation(ctx: Any, drive: Any, run_id: str, *, actor: Dict[str, Any], route: Any,
                       authority: Any, target_root: str,
-                      canonical_work_order_fingerprint: str = "") -> Tuple[Dict[str, Any], str, str]:
+                      canonical_work_order_fingerprint: str = "", plan_promotion: bool = False) -> Tuple[Dict[str, Any], str, str]:
     """``(facts, refusal_code, detail)``: the four floors, from durable custody only.
 
     Nothing here reads the engine, so a daemon that is gone cannot turn an
@@ -225,6 +229,12 @@ def bind_continuation(ctx: Any, drive: Any, run_id: str, *, actor: Dict[str, Any
         return {}, REFUSAL_SOURCE_UNKNOWN, (
             f"No durable custody record names run {rid!r} on this drive; a continuation binds to a "
             "run this task can prove it holds.")
+    from ouroboros.delegate_plan import promotion_permitted
+
+    promoted = plan_promotion and promotion_permitted(
+        ctx, entry, authority, target_root, str(actor.get("authority_fingerprint") or ""))
+    if plan_promotion and not promoted:
+        return {}, REFUSAL_AUTHORITY_WIDENED, "Plan implementation requires its starter and the recorded, still-current authority ceiling."
     line = _task_line(ctx, drive, {rid: entry}, entry)
     if not line:
         return {}, REFUSAL_SOURCE_NOT_OWNED, (
@@ -247,7 +257,7 @@ def bind_continuation(ctx: Any, drive: Any, run_id: str, *, actor: Dict[str, Any
             "Resolve it through integrate_delegated_patch(acknowledge_ambiguous=true) before continuing.")
     this_access = str(getattr(authority, "access", "") or "")
     if (entry.access not in _ACCESS_RANK or this_access not in _ACCESS_RANK
-            or _ACCESS_RANK[this_access] > _ACCESS_RANK[entry.access]):
+            or _ACCESS_RANK[this_access] > _ACCESS_RANK[entry.access]) and not promoted:
         return {}, REFUSAL_AUTHORITY_WIDENED, (
             f"Run {rid} ran with access {entry.access or 'unrecorded'!r}; this start derives "
             f"{this_access or 'unrecorded'!r}. A continuation may keep or lower native access, never widen it"
@@ -386,7 +396,8 @@ def engine_continues(gateway: Any) -> bool:
 def start_binding(ctx: Any, drive: Any, token: str, *, gateway: Any, actor: Dict[str, Any], route: Any,
                   authority: Any, target_root: str, invocation_id: str, text: str, source_binding: Dict[str, Any],
                   coordination_context: str = "", carrier: Any = None,
-                  canonical_work_order_fingerprint: str = "") -> Tuple[ContinuationStart, Optional[Any]]:
+                  canonical_work_order_fingerprint: str = "", requested_mode=None, override_plan_readiness=None,
+                  plan_answers=None) -> Tuple[ContinuationStart, Optional[Any]]:
     """``(continuation, refusal)`` for ONE start: the floors, the engine bit, the tree.
 
     Decided before any snapshot or registration exists; a refusal is a definite
@@ -399,9 +410,30 @@ def start_binding(ctx: Any, drive: Any, token: str, *, gateway: Any, actor: Dict
     from ouroboros.delegate_evidence import record_start_blocked
     from ouroboros.delegate_shared import _fail
 
+    prior = current_runs(drive, "run_id=?", (token,)).get(token)
+    plan_turn = prior is not None and prior.mode == "plan"
     facts, code, detail = bind_continuation(
         ctx, drive, token, actor=actor, route=route, authority=authority, target_root=target_root,
-        canonical_work_order_fingerprint=canonical_work_order_fingerprint)
+        canonical_work_order_fingerprint=canonical_work_order_fingerprint,
+        plan_promotion=plan_turn and requested_mode == "agent")
+    if not code and override_plan_readiness is not None and not plan_turn:
+        code, detail = "plan_override_conflict", "override_plan_readiness requires a recorded plan predecessor."
+    if not code and plan_turn:
+        from ouroboros.delegate_plan import continuation
+        from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+        try:
+            if route.route_id != prior.route_id or route.profile_id != prior.profile_id:
+                raise ClaudexorUnavailable("plan_thread_route_mismatch", "Use the plan thread's recorded route and account.")
+            bound = continuation(ctx, drive, prior, gateway, authority, actor, invocation_id, text,
+                override=override_plan_readiness, answers=plan_answers, carrier=carrier)
+            if bound.snapshot:
+                from ouroboros.delegate_source_coverage import inherit_source_obligations
+
+                inherit_source_obligations(prior, source_binding)
+            return bound, None
+        except ClaudexorUnavailable as exc:
+            code, detail = exc.code, str(exc)
     adopted = None
     if not code:  # the subscript keeps a missing row's KeyError
         adopted, code, detail = _adopted_snapshot(current_runs(drive, "run_id=?", (token,))[token], authority)
@@ -423,15 +455,28 @@ def start_binding(ctx: Any, drive: Any, token: str, *, gateway: Any, actor: Dict
         inherit_source_obligations(entry, source_binding)
         record.update(capture_id=invocation_id, snapshot_task_id=entry.snapshot_task_id or entry.task_id)
     caller = coordination_context if bool(actor.get("compiled_work_order")) else text
+    request = {"continueFrom": token, **({"continueCarrier": preference} if preference else {})}
+    if authority.access == "readonly" and entry.access != "readonly":
+        from ouroboros.workspace_preflight import _route_row, route_grants_auxiliary_roots
+
+        # Omission inherits the writer's live execution and auxiliary grants. Replace
+        # the whole object with the ordinary read-only shape; scope still names the
+        # current source, not the writer's private, possibly unapplied snapshot.
+        execution = {"isolation": "envelope", "delegated": False}
+        if route_grants_auxiliary_roots(_route_row(gateway, route.route_id)):
+            execution["auxiliaryWritableRoots"] = []
+        request["execution"] = execution
     return ContinuationStart(
         facts=facts, prompt=continuation_prompt(facts, caller),
-        request={"continueFrom": token, **({"continueCarrier": preference} if preference else {})},
+        request=request,
         custody=record, snapshot=adopted), None
 
 
 def replayed_custody(record: Dict[str, Any]) -> ContinuationStart:
     """A retry replays its recorded lineage; its body already carries the wire keys."""
-    return ContinuationStart(custody={key: str(record.get(key) or "") for key in CUSTODY_KEYS})
+    from copy import deepcopy
+
+    return ContinuationStart(custody={key: deepcopy(record[key]) for key in CUSTODY_KEYS if key in record})
 
 
 def retry_matches_caller_text(record: Dict[str, Any], text: str) -> bool:

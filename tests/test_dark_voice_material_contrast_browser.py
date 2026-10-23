@@ -48,15 +48,28 @@ window.__contrast = (() => {
         return sum + [0.2126, 0.7152, 0.0722][i] * (s <= 0.04045 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4);
     }, 0);
     const caveats = [];
+    const layers = (value) => {
+        const parts = []; let depth = 0, from = 0;
+        for (let i = 0; i < value.length; i++) {
+            if (value[i] === '(') depth++;
+            if (value[i] === ')') depth--;
+            if (value[i] === ',' && !depth) { parts.push(value.slice(from, i).trim()); from = i + 1; }
+        }
+        return [...parts, value.slice(from).trim()];
+    };
     function walk(start, fg, bg) {
         for (let node = start; node && node.nodeType === 1; node = node.parentElement) {
             const style = getComputedStyle(node);
             let fill = rgba(style.backgroundColor);
             if (style.backgroundImage && style.backgroundImage !== 'none') {
-                const stops = style.backgroundImage.match(/rgba?\([^)]*\)/g) || [];
-                if (/^linear-gradient\(/.test(style.backgroundImage) && stops.length === 2 && stops[0] === stops[1]) {
-                    fill = over(rgba(stops[0]), fill);
-                } else caveats.push(style.backgroundImage);
+                // CSS lists the topmost image first; composite uniform layers from the backing upward.
+                for (const layer of layers(style.backgroundImage).reverse()) {
+                    if (layer === 'none') continue;
+                    const stops = layer.match(/rgba?\([^)]*\)/g) || [];
+                    if (/^linear-gradient\(/.test(layer) && stops.length === 2 && stops[0] === stops[1]) {
+                        fill = over(rgba(stops[0]), fill);
+                    } else caveats.push(layer);
+                }
             }
             fg = over(fg, fill); bg = over(bg, fill);
             if (style.filter && style.filter !== 'none') {
@@ -85,7 +98,7 @@ window.__contrast = (() => {
             const f = over(fg, ground), b = over(bg, ground);
             return { ratio: Math.round(ratio(f, b) * 100) / 100, fg: f.slice(0, 3).map(Math.round), bg: b.slice(0, 3).map(Math.round), caveats: caveats.splice(0) };
         },
-        of(el) { return this.finish(el.parentElement, this.partial(el)); },
+        of(el) { return this.finish(null, this.partial(el)); },
     };
 })();
 """
@@ -224,7 +237,8 @@ SEEDS = {
     ".chat-bubble.assistant": ("backgroundColor", "rgb(118, 22, 43)"),
     ".chat-live-card": ("backgroundColor", "rgb(118, 22, 43)"),
     '[data-palette="owner"]': ("backgroundColor", "rgb(16, 62, 127)"),
-    ".chat-bubble.system": ("borderLeftColor", "rgb(247, 203, 88)"),
+    ".chat-bubble.system": ("backgroundColor", "rgba(255, 255, 255, 0.055)"),
+    ".chat-bubble.system .sender": ("color", "rgb(247, 203, 88)"),
     '[data-palette="quiz-answered"] .chosen': ("backgroundColor", "rgb(35, 81, 147)"),
     '[data-palette="quiz-answered"] .chat-quiz-option:not(.chosen)': ("backgroundColor", "rgb(131, 35, 54)"),
     '[data-palette="quiz-open"] .chat-quiz-option:nth-child(2)': ("backgroundColor", "rgb(143, 38, 58)"),
@@ -287,6 +301,18 @@ def open_scene(ui, scheme="dark"):
 
 def test_every_word_on_the_dark_voices_keeps_its_contrast_at_rest_hovered_and_pressed(room_ui):
     page = open_scene(room_ui)
+    # An independent compositing sample catches reversed/omitted layers; varying gradients stay unmeasurable.
+    calibration = page.evaluate("""() => {
+        const el = document.createElement('span'); document.body.append(el);
+        el.style.cssText = 'color:black;background:linear-gradient(rgba(255,0,0,.5),rgba(255,0,0,.5)),'
+            + 'linear-gradient(rgba(0,0,255,.5),rgba(0,0,255,.5)),white';
+        const uniform = window.__contrast.of(el);
+        el.style.backgroundImage = 'linear-gradient(rgb(255,0,0),rgb(0,0,255))';
+        const varying = window.__contrast.of(el); el.remove();
+        return {uniform, varying};
+    }""")
+    assert calibration["uniform"]["bg"] == [191, 64, 128] and not calibration["uniform"]["caveats"], calibration
+    assert calibration["varying"]["caveats"], calibration
     frame = page.frame_locator('[data-palette="app"] iframe')
     seeds = {selector: page.evaluate("([s, p]) => getComputedStyle(document.querySelector(s))[p]", [selector, prop])
              for selector, (prop, _) in SEEDS.items()}

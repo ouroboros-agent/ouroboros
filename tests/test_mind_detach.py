@@ -232,8 +232,9 @@ def test_raise_after_saved_pause_parks_before_unregister_without_error_terminal(
 @pytest.mark.parametrize("unreadable", [False, True])
 def test_failed_pause_source_stays_visible_without_dispatch_authority(tmp_path, monkeypatch, unreadable):
     from ouroboros import budget_pause, working_checkpoint
+    from ouroboros.work_stop import stop_presentation
     from supervisor.direct_pause import recover_direct_pause
-    from supervisor.events_budget import HOLD_SAVED_WORK, HOLD_UNSAVED_PAUSE, budget_hold_fact
+    from supervisor.events_budget import HOLD_UNSAVED_PAUSE, budget_hold_fact
 
     _q, _state, workers = _install_queue(tmp_path, monkeypatch)
     task = {"id": "head", "type": "task", "chat_id": 0, "_attempt": 1, "_is_direct_chat": True}
@@ -251,7 +252,10 @@ def test_failed_pause_source_stays_visible_without_dispatch_authority(tmp_path, 
     assert len(workers.PENDING) == 1
     held = workers.PENDING[0]
     assert held["id"] == "head" and held["_is_direct_chat"]
-    assert budget_hold_fact(held)["reason"] == (HOLD_SAVED_WORK if unreadable else HOLD_UNSAVED_PAUSE)
+    # Unreadable evidence after the body ran is an unknown, never work "saved when the app stopped".
+    assert budget_hold_fact(held)["reason"] == ("authority" if unreadable else HOLD_UNSAVED_PAUSE)
+    if unreadable:
+        assert stop_presentation(held)["reason"]["text"] == "After a technical problem"
     assert budget_hold_fact(held) and "_resume_selection" not in held
     assert not held.get("_budget_pause_resume")
     assert recover_direct_pause(task) and len(workers.PENDING) == 1

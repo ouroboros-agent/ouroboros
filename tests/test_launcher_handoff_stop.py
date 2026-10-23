@@ -48,10 +48,19 @@ def native_guard(monkeypatch):
     for name in ("TerminateProcess", "TerminateJobObject", "GenerateConsoleCtrlEvent", "CreateProcessW"):
         block(kernel, name)
     winapi = sys.modules.get("_winapi") or ModuleType("_winapi")
+    # Proactor loops own real I/O completion handles, including the pytest phase
+    # loops. Give only asyncio its original CloseHandle; product/subprocess calls
+    # and imported aliases must still be denied, even for a swallowed failure.
+    asyncio_windows = sys.modules.get("asyncio.windows_events")
+    asyncio_winapi = SimpleNamespace(**vars(winapi)) if asyncio_windows is not None else None
     for name in ("TerminateProcess", "CreateProcess", "OpenProcess", "CloseHandle", "GenerateConsoleCtrlEvent",
                  "WaitForSingleObject", "GetExitCodeProcess", "DuplicateHandle"):
         block(winapi, name)
         monkeypatch.setattr(winapi, name, denied, raising=False)
+        if asyncio_winapi is not None and name != "CloseHandle":
+            setattr(asyncio_winapi, name, denied)
+    if asyncio_windows is not None:
+        monkeypatch.setattr(asyncio_windows, "_winapi", asyncio_winapi)
     for name in ("WinDLL", "OleDLL"):
         block(ctypes, name)
     # Replace imported function aliases before any fake PID/handle test body.
@@ -68,7 +77,13 @@ def native_guard(monkeypatch):
     monkeypatch.setattr(ctypes, "WinDLL", denied, raising=False)
     monkeypatch.setattr(ctypes, "windll", SimpleNamespace(
         kernel32=Native(), user32=Native(), shell32=Native(), ntdll=Native()), raising=False)
-    monkeypatch.setattr(platform_layer, "_kernel32", Native(), raising=False)
+    guarded_kernel = Native()
+    # These are the layer's only non-process/console kernel32 calls. Keep real
+    # locking for the dialogue store and append_jsonl; every other call denies.
+    if kernel is not None:
+        for name in ("LockFileEx", "UnlockFileEx"):
+            setattr(guarded_kernel, name, getattr(kernel, name))
+    monkeypatch.setattr(platform_layer, "_kernel32", guarded_kernel, raising=False)
     monkeypatch.setattr(background, "NativeAppearance", lambda: SimpleNamespace())
     monkeypatch.setattr(background, "WindowChrome", lambda: SimpleNamespace())
     monkeypatch.setattr(background, "native_notifier", lambda *a: SimpleNamespace())
@@ -76,6 +91,82 @@ def native_guard(monkeypatch):
     monkeypatch.setitem(sys.modules, "_winapi", winapi)
     yield denied
     assert attempts == [], f"unexpected effects, including swallowed calls: {attempts}"
+
+
+def test_native_guard_preserves_windows_file_lock_calls(monkeypatch):
+    calls = []
+    kernel = SimpleNamespace(
+        LockFileEx=lambda *args: calls.append(("lock", args)) or 1,
+        UnlockFileEx=lambda *args: calls.append(("unlock", args)) or 1,
+    )
+
+    class Overlapped(ctypes.Structure):
+        _fields_ = [("Offset", ctypes.c_uint32), ("OffsetHigh", ctypes.c_uint32)]
+
+    with monkeypatch.context() as patch:
+        patch.setattr(platform_layer, "_kernel32", kernel, raising=False)
+        patch.setattr(platform_layer, "_OVERLAPPED", Overlapped, raising=False)
+        patch.setattr(platform_layer, "IS_WINDOWS", True)
+        patch.setitem(sys.modules, "msvcrt", SimpleNamespace(get_osfhandle=lambda fd: fd + 1000))
+        with contextlib.contextmanager(native_guard.__wrapped__)(patch):
+            platform_layer.file_lock_exclusive_nb(41)
+            platform_layer.file_unlock(41)
+        assert [name for name, _ in calls] == ["lock", "unlock"]
+        assert calls[0][1][:-1] == (1041, 3, 0, platform_layer._WIN32_LOCK_LENGTH, 0)
+        assert calls[1][1][:-1] == (1041, 0, platform_layer._WIN32_LOCK_LENGTH, 0)
+        for _, args in calls:
+            overlap = args[-1]._obj
+            assert (overlap.OffsetHigh << 32) | overlap.Offset == platform_layer._WIN32_LOCK_OFFSET
+
+
+def test_native_guard_denies_effects_and_aliases_but_preserves_asyncio_close(monkeypatch):
+    calls = []
+
+    def record(name):
+        def invoke(*args, **kwargs):
+            calls.append((name, args, kwargs))
+        return invoke
+
+    kernel_names = ("TerminateProcess", "TerminateJobObject", "GenerateConsoleCtrlEvent", "CreateProcessW",
+                    "OpenProcess", "CloseHandle", "GetConsoleProcessList", "GetProcessTimes", "GetExitCodeProcess",
+                    "GetProcessId", "GetCurrentProcess", "IsProcessInJob", "QueryInformationJobObject",
+                    "CreateJobObjectW", "SetInformationJobObject", "AssignProcessToJobObject", "UnknownNativeEffect")
+    winapi_names = ("TerminateProcess", "CreateProcess", "OpenProcess", "CloseHandle", "GenerateConsoleCtrlEvent",
+                    "WaitForSingleObject", "GetExitCodeProcess", "DuplicateHandle")
+    kernel = SimpleNamespace(**{name: record(name) for name in (*kernel_names, "LockFileEx", "UnlockFileEx")})
+    winapi = ModuleType("_winapi")
+    for name in winapi_names:
+        setattr(winapi, name, record(name))
+    real_close = winapi.CloseHandle
+    asyncio_windows = ModuleType("asyncio.windows_events")
+    asyncio_windows._winapi = winapi
+    aliases = ModuleType("ouroboros._native_guard_probe")
+    aliases.close = real_close
+    aliases.terminate = kernel.TerminateProcess
+    aliases.kill = os.kill
+    aliases.signal_pid = platform_layer.signal_pid
+    popen_alias = subprocess.Popen
+
+    with monkeypatch.context() as patch:
+        patch.setattr(platform_layer, "_kernel32", kernel, raising=False)
+        patch.setitem(sys.modules, "_winapi", winapi)
+        patch.setitem(sys.modules, "asyncio.windows_events", asyncio_windows)
+        patch.setitem(sys.modules, aliases.__name__, aliases)
+        with pytest.raises(AssertionError, match="unexpected effects, including swallowed calls"):
+            with contextlib.contextmanager(native_guard.__wrapped__)(patch) as denied:
+                asyncio_windows._winapi.CloseHandle(901)
+                effects = [getattr(platform_layer._kernel32, name) for name in kernel_names]
+                effects += [getattr(sys.modules["_winapi"], name) for name in winapi_names]
+                effects += [getattr(asyncio_windows._winapi, name) for name in winapi_names if name != "CloseHandle"]
+                effects += [getattr(getattr(ctypes.windll, library), name)
+                            for library in ("kernel32", "user32", "shell32", "ntdll") for name in kernel_names]
+                effects += [aliases.close, aliases.terminate, aliases.kill, aliases.signal_pid,
+                            os.kill, platform_layer.signal_pid, popen_alias.__init__, ctypes.WinDLL]
+                for effect in effects:
+                    assert effect is denied
+                    with pytest.raises(AssertionError, match="unexpected native effect in fake-PID test"):
+                        effect(42)
+        assert calls == [("CloseHandle", (901,), {})]
 
 
 @pytest.fixture

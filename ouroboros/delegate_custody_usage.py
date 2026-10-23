@@ -112,7 +112,7 @@ def is_terminal(detail: Dict[str, Any], terminal_states: frozenset[str]) -> bool
     return str(summary_of(detail).get("state") or "") in terminal_states
 
 
-# ---- reviewer usage observation (one llm_usage row per physical send) ----
+# ---- reviewer usage observation (sessions and physical extraction sends stay separate) ----
 
 _EMITTED_SESSION_USAGE: Dict[str, float] = {}  # delegated run id -> first llm_usage emission
 
@@ -126,6 +126,13 @@ def session_usage_once(run_id: str) -> bool:
         _EMITTED_SESSION_USAGE.clear() if len(_EMITTED_SESSION_USAGE) >= 256 else None
         _EMITTED_SESSION_USAGE[key] = time.monotonic()
     return True
+
+
+def observe_session_usage(observer: Any, usage: Dict[str, Any]) -> None:
+    """A continued reviewer emits each run, never its chain total as the last run."""
+    for part in usage.get("session_usage_events") or [usage]:
+        if session_usage_once(part.get("delegated_run_id", "")):
+            observe_review_usage(observer, part)
 
 
 def observe_review_usage(observer: Any, usage: Optional[Dict[str, Any]]) -> None:

@@ -1010,21 +1010,17 @@ def _apply_settings_save_side_effects(
     immediately" without saying so (#285).
     """
     side_effect_warnings: list = []
-    if any(k in all_changed for k in ("MCP_ENABLED", "MCP_SERVERS", "MCP_TOOL_TIMEOUT_SEC")):
-        try:
-            from ouroboros.mcp_client import (
-                reconfigure_from_settings as _mcp_reconfigure,
-                refresh_all_background as _mcp_refresh_background,
-            )
-            _mcp_reconfigure(current)
-            _mcp_refresh_background(reason="settings")
-        except Exception as exc:
-            log.warning("MCP reconfigure after settings change failed", exc_info=True)
-            side_effect_warnings.append(
-                "MCP reconfigure failed in the server process: "
-                f"{type(exc).__name__}: {exc}. The saved values are on disk; "
-                "agent processes retry on their next tool-schema read."
-            )
+    try:
+        from ouroboros.mcp_client import MCPManager, configuration_changed
+        if MCPManager._fingerprint(current) != MCPManager._fingerprint(old_effective_settings):
+            configuration_changed(current, reason="settings")
+    except Exception as exc:
+        log.warning("MCP reconfigure after settings change failed", exc_info=True)
+        side_effect_warnings.append(
+            "MCP reconfigure failed in the server process: "
+            f"{type(exc).__name__}: {exc}. The saved values are on disk; "
+            "server discovery setup retries on its next tool-schema read."
+        )
 
     # Skills repo/runtime changes require extension loader reconciliation.
     try:

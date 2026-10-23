@@ -357,6 +357,7 @@ def resume_outcome(outcome: dict) -> dict:
         outcome = {**outcome, "blockers": [{"kind": "delegated_run", **run} for run in outcome["runs"]]}
     error = str(outcome.get("error") or "")
     phrases = {"panic_requires_owner_resume": "Only the owner can release a Panic hold.",
+               "update_in_progress": "An update is in progress; press Resume after the restart.",
                "pause_source_unreadable": STOP_TEXT["restore_failed"],
                "pause_record_missing": STOP_TEXT["restore_failed"],
                "root_still_paused": STOP_TEXT["awaiting_selection"],

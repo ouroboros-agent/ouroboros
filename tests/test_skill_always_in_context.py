@@ -71,7 +71,8 @@ def test_field_parses_and_defaults_off():
                  "always_in_context": True}), "non-empty SKILL.md body"),
     # The bound counts UTF-8 bytes, not characters.
     (_manifest(body="é" * (MAX_ALWAYS_IN_CONTEXT_BODY_BYTES // 2 + 1)), "bytes"),
-])
+], ids=["quoted-bool", "integer-bool", "blank", "null", "extension", "script",
+        "empty-markdown", "empty-json", "oversized-utf8"])
 def test_refusals_teach_the_repair(text, problem):
     with pytest.raises(SkillManifestError) as excinfo:
         parse_skill_manifest_text(text)

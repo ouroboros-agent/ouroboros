@@ -1371,25 +1371,16 @@ def test_ui_smoke_chat_chronology_reconnect_and_plain_answer_marker(direct_serve
                 assert page.locator(".final-answer-chip").count() == 0
                 assert "FINAL ANSWER: 41" in page.locator("#chat-messages").inner_text()
                 assert "FINAL ANSWER: 42" in page.locator("#chat-messages").inner_text()
-                # Its last note's day in the chat's clock (formatMsgTime, #1959; a UTC page), not the reload's.
-                assert "updated Jul 18," in page.locator(
-                    '.chat-live-card[data-task-id="chronology-progress-only"]'
-                ).inner_text()
-                scroll_after = page.evaluate(
-                    """() => {
-                        const messages = document.querySelector('#chat-messages');
-                        const anchor = messages.querySelector(
-                            '.chat-live-card[data-task-id="chronology-anchor"]'
-                        );
-                        return {
-                            top: messages.scrollTop,
-                            height: messages.scrollHeight,
-                            anchorTop: anchor?.getBoundingClientRect().top,
-                        };
-                    }"""
-                )
+                anchor_after = page.locator('.chat-live-card[data-task-id="chronology-anchor"]').evaluate(
+                    "el => el.getBoundingClientRect().top")
                 assert page.evaluate("() => Boolean(window.__chronologyDocument)")
-                assert abs(scroll_after["anchorTop"] - scroll_before["anchorTop"]) <= 6
+                assert abs(anchor_after - scroll_before["anchorTop"]) <= 6
+                # Settled clocks live in Details (#2188): the last note's day in this UTC chat, not the reload's.
+                settled = page.locator('.chat-live-card[data-task-id="chronology-progress-only"]')
+                settled.locator('[data-live-disclosure]').click()
+                updated = settled.locator('.chat-live-fact').filter(has=page.get_by_text("Updated", exact=True)).locator('dd')
+                assert updated.is_visible() and "Jul 18," in updated.inner_text()
+                settled.locator('[data-live-disclosure]').click()
                 page.locator("#chat-messages").evaluate("(messages) => { messages.scrollTop = 0; }")
                 page.screenshot(
                     path=str(evidence_dir / "phase3-chat-chronology-desktop.png"),
@@ -2466,7 +2457,7 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
         assert all(card["activityTitle"] is None for card in facts["cardFacts"]), facts
         deepest = page.locator('.chat-live-card[data-task-id="layout-child-10"]')
         assert deepest.locator(':scope > .chat-live-summary-button [data-live-title]').inner_text() == "pty-tests"
-        assert "Agent model: gemini-3.6-flash" in deepest.locator(
+        assert "gemini-3.6-flash" in deepest.locator(
             ':scope > .chat-live-foot [data-live-meta]').inner_text()
         deepest.locator(":scope > [data-live-summary-button] [data-live-disclosure]").click()
         line_toggle = deepest.locator(":scope > [data-live-timeline] .chat-live-line-toggle").last

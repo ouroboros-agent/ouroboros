@@ -1003,6 +1003,13 @@ def _press(page, task_id, action, url_suffix):
     menu = page.locator("body > .task-control-menu")
     with page.expect_response(lambda r: r.url.endswith(url_suffix) and r.request.method == "POST", timeout=30_000) as answer:
         menu.locator(f'[data-task-control="{action}"]').click()
+    if action in {"hurry", "finalize"}:
+        # Let the acknowledgement expire away from the pointer, keeping the Work list open (#2193).
+        notice = page.locator('#toast-stack .toast').filter(has_text=("Hurry up: accepted" if action == "hurry"
+            else f"The owner asked task {task_id} to summarize and stop"))
+        notice.wait_for(state="visible")
+        page.mouse.move(0, 0)
+        notice.wait_for(state="detached")
     return {"status": answer.value.status, "body": answer.value.json(), "request": answer.value.request.post_data_json}
 
 

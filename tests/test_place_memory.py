@@ -107,7 +107,10 @@ def test_wake_never_repeats_main_words_in_live_rooms(tmp_path):
     snapshot = mv.capture_memory_view(tmp_path, task, mv.view_spec_for_task(task, tmp_path))
     rendered = mv.render_room(snapshot)
     assert rendered.count("SHARED_TRANSPORT_WORDS") == 1
-    assert "alpha again" in rendered  # non-place room's independent words still appear
+    # Another room is one directory line with its reader, never its standing words (owner wake view 2A).
+    alpha = next(room for room in snapshot.live_rooms if room["label"].startswith("Project Alpha"))
+    assert "alpha again" not in rendered
+    assert f"memory_read(room_id='{alpha['room_id']}', rows=true)" in rendered
 
 
 def test_shared_prefix_is_identical_and_focus_assignment_is_volatile(tmp_path, monkeypatch):

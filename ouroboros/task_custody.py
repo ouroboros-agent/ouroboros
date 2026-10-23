@@ -1372,6 +1372,12 @@ def remove_custody_trash(canonical_root: Any, *, stop: Optional[Callable[[], boo
         if stop is not None and stop():
             break
         with contextlib.suppress(OSError):
+            if entry.is_dir() and not entry.is_symlink():
+                from ouroboros.workspace_preflight import release_session_scratch
+
+                release_session_scratch(entry)
+                if (entry / "data").is_dir() and not (entry / "data").is_symlink():
+                    release_session_scratch(entry / "data")
             _remove_entry(entry)
         try:
             stat = entry.lstat()

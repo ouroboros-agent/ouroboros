@@ -870,6 +870,10 @@ def build_swarm_efficiency(env: Any, task: Dict[str, Any]) -> Dict[str, Any] | N
             return None
         facts = load_swarm_rollup(drive_root, task_id)
         child_ids = facts.get("child_ids", [])
+        from ouroboros.swarm_receipt import publish
+        if (not (task.get("parent_task_id") or metadata.get("parent_task_id"))
+                and str(task.get("root_task_id") or metadata.get("root_task_id") or task_id) == task_id):
+            publish(task.get("budget_drive_root") or drive_root, task_id, task=task)
         if not child_ids:
             if swarm_intent:
                 # Absence proves neither a planned count nor a plain-task intent.

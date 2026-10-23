@@ -1042,39 +1042,51 @@ test('a late answer says where it went', async () => {
     }
 });
 
-test('the host facts ride the bubble time line after the time; a later, richer delivery fills them in place', () => {
+// Owner 21.10 (refined A): the question bubble's foot is its time alone. The host's sentence (asking task, run start,
+// the owner's last message) no longer renders anywhere; everything inside the card — question, options with their
+// details and recommendation, the recorded choice (`Your choice`), the owner's own words and the signature line —
+// stays exactly as it was, live and on a replayed history row.
+test('the question bubble ends on its time alone; the host sentence never renders and the card keeps every part', () => {
     const fx = fixture({ frameNode: frameBubble });
     const facts = 'Asked by task t-1, started by your message of 2026-09-25 00:21 UTC; '
         + 'your last message in this chat: 2026-09-25 00:21 UTC (47 minutes before this question).';
-    const line = (bubble) => bubble.querySelector('.chat-quiz-host-facts');
+    const answered = { ...WS_MSG, state: 'answered', answered_index: 1, comment: 'after CI, please', host_facts: facts };
+    const parts = (bubble) => {
+        const card = bubble.querySelector('.chat-quiz-card');
+        const options = card.querySelectorAll('.chat-quiz-option');
+        return {
+            question: card.querySelector('.chat-quiz-question')?.textContent,
+            options: options.map((button) => button.querySelector('.chat-quiz-option-label')?.textContent),
+            detail: options[1]?.querySelector('.chat-quiz-option-detail')?.textContent,
+            chosen: options.map((button) => Boolean(button.querySelector('.chat-quiz-option-chosen-name'))),
+            answer: card.querySelector('.chat-quiz-answer')?.textContent,
+            assumption: card.querySelector('.chat-quiz-assumption')?.textContent,
+            state: card.dataset.state,
+        };
+    };
     try {
-        const bubble = fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-facts', host_facts: facts });
-        assert.deepEqual([line(bubble).textContent, line(bubble).hidden], [facts, false]);
-        // Plain text, never through the markdown pipeline, on the time line and not in the card (owner 19.10, A).
-        assert.equal(line(bubble).innerHTML, undefined);
-        const foot = bubble.querySelector('.chat-bubble-foot');
-        assert.deepEqual(foot.children.map((node) => node.className), ['msg-time', 'chat-quiz-host-facts']);
-        assert.equal(bubble.querySelector('.chat-quiz-card').querySelector('.chat-quiz-host-facts'), null);
-        // A stored history row nests the quiz; the sentence rides the nested block.
+        const live = fx.decision.buildQuizCard({ ...answered, quiz_id: 'qz-facts' });
+        assert.equal(live.querySelector('.chat-quiz-host-facts'), null);
+        assert.equal(live.querySelector('.chat-bubble-foot'), null, 'no part joins the time: the plain frame');
+        assert.deepEqual(live.children.map((node) => node.className), ['sender', 'chat-quiz-card', 'msg-time']);
+        const expected = { question: 'Merge now?', options: ['Yes', 'No'], detail: 'wait for CI', chosen: [false, true],
+            answer: "Owner's answer: after CI, please", assumption: 'Continuing meanwhile: continuing with the merge',
+            state: 'answered' };
+        assert.deepEqual(parts(live), expected);
+        // A stored history row nests the quiz: the replay paints the same card, its choice included, and no sentence.
         const replay = fx.decision.buildQuizCard({ task_id: 't-1', text: WS_MSG.question,
-            quiz: { ...WS_MSG, quiz_id: 'qz-facts-replay', host_facts: facts } });
-        assert.equal(line(replay).textContent, facts);
-        // Without the sentence the line is absent: an empty, hidden node waiting on the time line.
-        const bare = fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-bare' });
-        const empty = fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-empty', host_facts: '' });
-        for (const node of [bare, empty]) assert.deepEqual([line(node).textContent, line(node).hidden], ['', true]);
-        // A later, richer delivery of an already rendered card fills that line once, in place; a different later
-        // sentence never replaces it.
-        const waiting = line(bare);
-        assert.equal(fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-bare', host_facts: facts }), null);
-        assert.equal(bare.querySelectorAll('.chat-quiz-host-facts').length, 1);
-        assert.deepEqual([line(bare), waiting.textContent, waiting.hidden], [waiting, facts, false]);
-        fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-bare', host_facts: 'Another sentence.' });
-        assert.deepEqual([bare.querySelectorAll('.chat-quiz-host-facts').length, waiting.textContent], [1, facts]);
+            quiz: { ...answered, quiz_id: 'qz-facts-replay' } });
+        assert.equal(replay.querySelector('.chat-quiz-host-facts'), null);
+        assert.deepEqual(parts(replay), expected);
+        // Free words with no chosen option are the whole answer: no option is marked as chosen.
+        const words = fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-words', state: 'answered', comment: 'neither yet',
+            host_facts: facts });
+        assert.deepEqual(parts(words).chosen, [false, false]);
+        assert.equal(parts(words).answer, "Owner's answer: neither yet");
     } finally { fx.restore(); }
 });
 
-test('a Main mirror of a Project question carries the host facts line from its pointer row', () => {
+test('a Main mirror of a Project question shows no host sentence, from its pointer row or a later delivery', () => {
     const column = new NodeStub();
     const fx = fixture({ isMain: true, frameNode: frameBubble,
         insertMessageNode: (node) => { column.append(node); return true; } });
@@ -1083,13 +1095,13 @@ test('a Main mirror of a Project question carries the host facts line from its p
         quiz_state: 'open', question: 'Merge now?', options: ['Yes', 'No'] };
     try {
         assert.ok(fx.decision.appendQuestionPointer({ ...row, host_facts: 'Asked by task t-9, origin unknown.' }));
-        const line = column.children[0].querySelector('.chat-quiz-host-facts');
-        assert.deepEqual([line.textContent, line.hidden], ['Asked by task t-9, origin unknown.', false]);
-        assert.ok(fx.decision.appendQuestionPointer({ ...row, task_id: 't-10' }));
-        assert.equal(column.children[1].querySelector('.chat-quiz-host-facts').hidden, true);
-        // The census row (narrower) never blanks it; the history row with the sentence fills the bare one.
-        fx.decision.appendQuestionPointer({ ...row, task_id: 't-10', host_facts: 'Asked by task t-10.' });
-        assert.equal(column.children[1].querySelector('.chat-quiz-host-facts').textContent, 'Asked by task t-10.');
+        const bubble = column.children[0];
+        assert.equal(bubble.querySelector('.chat-quiz-host-facts'), null);
+        assert.equal(bubble.querySelector('.chat-quiz-question').textContent, 'Merge now?');
+        assert.deepEqual(bubble.querySelectorAll('.chat-quiz-option').map((button) =>
+            button.querySelector('.chat-quiz-option-label').textContent), ['Yes', 'No']);
+        fx.decision.appendQuestionPointer({ ...row, host_facts: 'Asked by task t-9, a later sentence.' });
+        assert.equal(bubble.querySelector('.chat-quiz-host-facts'), null);
     } finally { fx.restore(); }
 });
 

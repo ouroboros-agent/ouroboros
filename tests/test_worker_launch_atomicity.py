@@ -23,7 +23,16 @@ from tests._store_journal_shared import exclusive_hold
 from tests.test_g1_followup_policy import _assignment_world, register, row, world as _world
 
 pytestmark = pytest.mark.serial
-world = _world  # requested by name: re-bound so the CI ruff gate sees no F811
+followup_world = _world  # fixture alias: injection does not shadow the import (F811)
+
+
+@pytest.fixture
+def world(followup_world, monkeypatch):
+    from supervisor import workers
+
+    # The real launch writes drive obligations through the pool, too.
+    monkeypatch.setattr(workers, "DRIVE_ROOT", followup_world[1])
+    return followup_world
 
 
 @contextlib.contextmanager
@@ -430,6 +439,8 @@ def test_a_receipt_busy_at_boot_is_rechecked_without_another_boot(world, monkeyp
     from supervisor import restart_retention, schedule_occurrence as occurrences
     from supervisor.events_budget import HOLD_OWNER_RESTART, HOLD_SAVED_WORK
     from supervisor.task_admission import revalidate_project_holds
+    from ouroboros import delegate_recovery
+    from ouroboros.work_stop import current_stop, stop_presentation
 
     _, root, pending = world
     _, task = admitted(world)
@@ -440,7 +451,9 @@ def test_a_receipt_busy_at_boot_is_rechecked_without_another_boot(world, monkeyp
     if stop == "returning":
         monkeypatch.setattr(restart_retention, "fresh_return_transaction", lambda _root: {"queue_ids": [task["id"]]})
     if stop == "owner_restart":
-        monkeypatch.setattr(restart_retention, "saved_sleep_hold_reason", lambda _root: HOLD_OWNER_RESTART)
+        transaction = delegate_recovery.prepare_owner_restart(root)
+        monkeypatch.setattr(delegate_recovery, "_PROCESS_GENERATION", transaction["generation"] + "-successor")
+        assert delegate_recovery.boot_door(root) == "owner_restart"
     stop_hold = {"returning": None, "app_stop": HOLD_SAVED_WORK, "owner_restart": HOLD_OWNER_RESTART}[stop]
     with held_store(root), store.acquisition_budget(0.2):  # contention reads the same, without a long wait
         assert occurrences.restore_verdict(copy.deepcopy(legacy)) == "busy"
@@ -451,6 +464,10 @@ def test_a_receipt_busy_at_boot_is_rechecked_without_another_boot(world, monkeyp
     queue.check_scheduled_tasks()  # the live row is the occurrence: never republished beside it
     [row_] = pending
     assert hold_reason(row_) == stop_hold, "the stop's own hold stays independent of the receipt check"
+    if stop == "owner_restart":
+        for stopped in (restored, row_):
+            assert current_stop(stopped)["door"] == "owner_restart"
+            assert stop_presentation(stopped)["reason"]["text"] == "Held after a restart"
     if truth == "unsent":
         assert row_["admitted_dispatch"] == "none" and not row_.get("_project_admission_restore_hold")
     else:

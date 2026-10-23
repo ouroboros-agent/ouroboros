@@ -92,10 +92,9 @@ window.__ouroLayers = layers;
 // Every moving mark on the page rides one wave (status_mark.js), for the page's life.
 syncMarkPhases(document);
 const primarySidebar = document.getElementById('primary-sidebar');
-// The phone shell's motion between places (shell_motion.js): presentation only; it paints the real state again
-// through syncNavigationState when its beat ends.
-const shellMotion = createShellMotion({ content: document.getElementById('content'), sidebar: primarySidebar,
-    isStack: () => isStackLayout(), onPaint: () => syncNavigationState() });
+// The phone shell's motion between places (shell_motion.js): presentation only.
+const shellMotion = createShellMotion({ content: document.getElementById('content'),
+    isStack: () => isStackLayout() });
 // The places come from the one registry (pages.js): Main into the pinned head, the tools into the foot that
 // follows the Projects, before the version. Nothing below looks a row up before this.
 primarySidebar?.querySelector('.sidebar-head')?.insertAdjacentHTML('beforeend', renderNavRows('head'));
@@ -287,46 +286,47 @@ function syncDrawerScrim(painted, settled) {
     if (!navDrawerBackdrop) return;
     if (painted || navDrawerBackdrop.hidden) { navDrawerBackdrop.hidden = !painted; return; }
     settled.then(() => {
-        if (!navState.mobileDrawerOpen && !shellMotion.holding() && !navDrawerBackdrop.classList.contains('dragging')) {
+        if (!navState.mobileDrawerOpen && !navDrawerBackdrop.classList.contains('dragging')) {
             navDrawerBackdrop.hidden = true;
         }
     });
 }
 
 // What a place picked in the open drawer hands over inside the room card (shell_motion.js): the leaving and arriving
-// rooms (a page, the Project panel, a Project room in it), what of it takes the breath, the rows the pill slides between.
+// rooms (a page, the Project panel, a Project room in it) and what of it takes the breath.
 function handoverBetween(from, to) {
     const room = (scene, other) => (scene.project
         ? (other.project ? (rooms.retiring.get(scene.project) || projectInstances.get(scene.project))?.page : projectPanel)
         : document.getElementById(`page-${scene.page}`));
     const arriving = room(to, from);
     const breathe = arriving === projectPanel ? [...projectPanel.children].filter((el) => !el.classList.contains('room-veil')) : [arriving];
-    const toRow = [...primarySidebar.querySelectorAll('[data-project-id], [data-nav-page]')].find((row) => (to.project
-        ? row.dataset.projectId === to.project : row.dataset.navPage === to.page)) || null;
-    return { leaving: [room(from, to)].filter(Boolean), arriving, breathe: breathe.filter(Boolean),
-        fromRow: primarySidebar.querySelector('[aria-current="page"]'), toRow };
+    return { leaving: [room(from, to)].filter(Boolean), arriving, breathe: breathe.filter(Boolean) };
 }
 
 function syncNavigationState() {
     const activeProjectId = navState.activeProjectId;
     const drawerOpen = Boolean(navState.mobileDrawerOpen);
-    // A place chosen in the open drawer changes inside the room card while the drawer stays painted open for one beat,
-    // then the drawer's own close brings the card home (owner 20.10, 4A).
+    // A place chosen in the open drawer changes inside the room card as the drawer closes (owner 20.10, 4A; 21.10).
     const scene = { page: state.activePage, project: activeProjectId || null };
-    if (document.body.classList.contains('nav-drawer-open') && !drawerOpen && isStackLayout()
-        && (scene.page !== lastScene.page || scene.project !== lastScene.project)) {
+    const handingOver = document.body.classList.contains('nav-drawer-open') && !drawerOpen && isStackLayout()
+        && (scene.page !== lastScene.page || scene.project !== lastScene.project);
+    if (handingOver) {
+        if (activeProjectId && projectPanel) {
+            projectPanel.hidden = false;
+            projectPanel.classList.add('open');
+            void projectPanel.offsetWidth;
+        }
         shellMotion.handover(handoverBetween(lastScene, scene));
     }
     lastScene = scene;
-    const drawerPainted = drawerOpen || shellMotion.holding();
-    document.body.classList.toggle('nav-drawer-open', drawerPainted);
-    primarySidebar?.classList.toggle('open', drawerPainted);
+    document.body.classList.toggle('nav-drawer-open', drawerOpen);
+    primarySidebar?.classList.toggle('open', drawerOpen);
     document.querySelectorAll('[data-mobile-nav-toggle]').forEach((button) => {
         button.setAttribute('aria-expanded', drawerOpen ? 'true' : 'false');
     });
     // The end of the room card's motion: the covered room's inert, the scrim and a room that was left wait for it.
     const settled = shellMotion.settled();
-    syncDrawerScrim(drawerPainted, settled);
+    syncDrawerScrim(drawerOpen, settled);
     // In the stack layout the closed drawer lies under the room: inert and out of the tab order, from the tap.
     const sidebarInert = isStackLayout() && !drawerOpen;
     if (primarySidebar && primarySidebar.inert !== sidebarInert) primarySidebar.inert = sidebarInert;
@@ -383,6 +383,13 @@ function syncNavigationState() {
                 onClose: () => closeProjectPanel(), focus: focusProjectRoom });
         } else layers.remove('project');
     }, { inertAfter: isStackLayout() ? settled : null });
+    // The layer's inert release is registered first. A delayed read behind the drawer keeps its notice pending.
+    Promise.all([settled, exit]).then(() => {
+        if (navState.mobileDrawerOpen) return;
+        const room = navState.activeProjectId ? projectInstances.get(navState.activeProjectId)
+            : state.activePage === 'chat' ? mainChat : null;
+        room?.showHistoryNotice?.();
+    });
     // Last: the open Project's row is marked. A closed Project hands the focus back to its row (layers.js); where the
     // collapsed list hides that row, the focus would be lost, so the Projects toggle takes it.
     syncProjectsCollapse();
@@ -432,8 +439,6 @@ document.addEventListener('click', (event) => {
     const toggle = event.target.closest('[data-mobile-nav-toggle]');
     if (!toggle) return;
     setMobileDrawerOpen(!navState.mobileDrawerOpen);
-    // Opening on a phone, the chosen place's pill switches on where you are (shell_motion.js).
-    if (navState.mobileDrawerOpen) shellMotion.sweep(primarySidebar?.querySelector('[aria-current="page"]'));
 });
 navDrawerBackdrop?.addEventListener('click', () => setMobileDrawerOpen(false));
 // On a phone the room is the card the drawer pushes aside (style.css, owner 19.10 1A): Main, and a Project open over
@@ -465,6 +470,7 @@ if (navDrawerClose) {
 // While a Project panel paints, Main defers first hydration (bounded in chat.js).
 let projectPanelOpeningSince = 0;
 let mainChat;
+let evolution = null;  // Dashboard → Evolution, which takes every sequenced snapshot too (its campaign controls)
 const stateSnapshots = createStateSnapshotSequencer((data, requestedAt, generation) => {
     data = data && typeof data === 'object' ? data : {};
     // A complete REST body cannot prove absence while the socket is in a
@@ -477,10 +483,12 @@ const stateSnapshots = createStateSnapshotSequencer((data, requestedAt, generati
         data.project_chat_ids ?? (data.projects ? undefined : Array.from(state.projectChatIds)), projectActivityIndex);
     applyTaskBindings(data.task_bindings || {});
     hydrateOpenChatsFromState(data, requestedAt, generation);
+    evolution?.hydrateStateSnapshot(data);
     observeMainRevision(data.main_visible_revision);
 }, undefined, (requestedAt) => {
     markProjectActivityUnknown();
     hydrateOpenChatsFromState(null, requestedAt);
+    evolution?.hydrateStateSnapshot(null);
 });
 
 const ctx = {
@@ -1370,7 +1378,7 @@ setInterval(() => refreshProjectsNav(false), 20000);
 settingsControls = initSettings(ctx);
 dashboardControls = initDashboard(ctx);
 initLogs({ ...ctx, mount: document.getElementById('dashboard-panel-logs') });
-const disposeEvolution = initEvolution({ ...ctx, mount: document.getElementById('dashboard-panel-evolution') });
+evolution = initEvolution({ ...ctx, mount: document.getElementById('dashboard-panel-evolution') });
 initUpdates({ ...ctx, mount: document.getElementById('dashboard-panel-updates') });
 initActivity({ ...ctx, mount: document.getElementById('dashboard-panel-activity') });
 initConsciousnessDashboard({ ...ctx, mount: document.getElementById('dashboard-panel-consciousness') });
@@ -1388,7 +1396,7 @@ const telegramHost = createTelegramHost({ layers });
 telegramHost.bind();
 window.addEventListener('pagehide', (event) => {
     if (event.persisted) return;
-    disposeEvolution();
+    evolution.dispose();
     updateStatus.dispose();
     disposeStorage?.destroy();
     disposeScrollFades.forEach((dispose) => dispose());

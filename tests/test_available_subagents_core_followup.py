@@ -390,7 +390,7 @@ def test_unacknowledged_delegate_wake_replays_before_successor_poll(tmp_path):
     ).text)
     successor = _child_attempt(tmp_path, 2)
     assert supervision.acknowledge_pending_wake(successor) is False
-    assert supervision.supervision_checkpoint(successor)["pending_wake"]
+    assert supervision.supervision_checkpoint(successor)["runs"]["run-1"]["pending_wake"]
     replay = json.loads(supervision.supervised_wait(
         successor, "run-1",
         wait_once=lambda *_a, **_k: (_ for _ in ()).throw(
@@ -480,7 +480,7 @@ def test_sleeping_control_wakes_then_loop_routes_without_supervision_ack(tmp_pat
         }),
     ).text)
     assert wake["wake_events"][0]["kind"] == kind
-    assert supervision.supervision_checkpoint(ctx)["pending_wake"]["mailbox_ids"] == []
+    assert supervision.supervision_checkpoint(ctx)["runs"]["run-1"]["pending_wake"]["mailbox_ids"] == []
     assert supervision.acknowledge_pending_wake(ctx, wake)
     assert acknowledged_task_message_ids(tmp_path, "child1") == set()
     assert supervision._addressed_wakes(

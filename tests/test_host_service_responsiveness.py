@@ -365,48 +365,32 @@ def test_an_interrupted_admission_settles_waiters_and_capacity(admission_started
 
 
 def test_blocking_checks_run_off_the_event_loop(tmp_path, monkeypatch):
-    """Token discovery and presence admission read disk; the loop keeps ticking through both."""
+    """The loop can release each real blocking check before that check returns."""
     import ouroboros.presence_admission as presence_admission
 
     app, binding_id, ctx = _presence_app(tmp_path, _answer)
     authenticate, admit = ctx.authenticate_token_payload, presence_admission.admit_presence_turn
-
-    def slow_authenticate(raw_token):
-        time.sleep(0.3)
-        return authenticate(raw_token)
-
-    def slow_admit(**kwargs):
-        time.sleep(0.3)
-        return admit(**kwargs)
-
-    monkeypatch.setattr(ctx, "authenticate_token_payload", slow_authenticate)
-    monkeypatch.setattr(presence_admission, "admit_presence_turn", slow_admit)
-
-    async def ticks_during(awaitable):
-        ticks, done = 0, asyncio.Event()
-
-        async def tick():
-            nonlocal ticks
-            while not done.is_set():
-                ticks += 1
-                await asyncio.sleep(0.01)
-
-        ticker = asyncio.create_task(tick())
-        try:
-            response = await awaitable
-        finally:
-            done.set()
-            await ticker
-        return response.status_code, ticks
+    calls = []
 
     async def scenario():
-        return (await ticks_during(host_service._api_identity(_request(app))),
-                await ticks_during(_turn(app, binding_id, "e-1")))
+        loop, loop_thread = asyncio.get_running_loop(), threading.get_ident()
 
-    (identity_status, identity_ticks), (turn_status, turn_ticks) = asyncio.run(scenario())
-    assert identity_status == 200 and turn_status == 200
-    # Inline on the loop, each 0.3 s check would be one tick.
-    assert identity_ticks > 10 and turn_ticks > 20
+        def checked(name, function, *args, **kwargs):
+            assert threading.get_ident() != loop_thread, name + " ran on the event loop"
+            released = threading.Event()
+            loop.call_soon_threadsafe(released.set)
+            assert released.wait(5), name + " prevented the loop from releasing it"
+            calls.append(name)
+            return function(*args, **kwargs)
+
+        monkeypatch.setattr(ctx, "authenticate_token_payload", lambda token: checked("auth", authenticate, token))
+        monkeypatch.setattr(presence_admission, "admit_presence_turn", lambda **kw: checked("admit", admit, **kw))
+        identity = await host_service._api_identity(_request(app))
+        turn = await _turn(app, binding_id, "e-1")
+        return identity.status_code, turn.status_code
+
+    assert asyncio.run(scenario()) == (200, 200)
+    assert calls == ["auth", "auth", "admit"]
 
 
 def test_coroutine_admission_keeps_the_cross_process_gate_contract(tmp_path):

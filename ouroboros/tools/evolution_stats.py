@@ -27,6 +27,7 @@ def _git(args: list[str], timeout: int = 15) -> str:
             cwd=str(resolve_repo_dir()),  # per call: the serving checkout, never a home default
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=timeout,
         )
         return r.stdout if r.returncode == 0 else ""

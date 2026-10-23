@@ -283,7 +283,7 @@ def test_assignment_rechecks_exact_pre_adoption_and_independent_fences(prepared,
     elif fault in {"authority", "actor", "config", "work_order"}:
         key = {"authority": "authority_fingerprint", "actor": "selected_subagent_id",
                "config": "config_fingerprint", "work_order": "work_order_fingerprint"}[fault]
-        row[key] = "changed"
+        row["holders"][0][key] = "changed"
     elif fault.startswith("tx_"):
         transaction = recovery._read_restart_transaction(case.host.root, transaction_id)
         path = recovery._restart_transaction_path(case.host.root, transaction_id)
@@ -610,15 +610,15 @@ def test_one_restart_returns_saved_work_planned_session_owner_wait_and_project_h
         assert task_id not in dispatched
     if variant == "later_process":
         assert transaction["status"] == "normal_exit_acknowledged" and not transaction.get("returns_restored_at")
-        # Undispatched S1 carriers still use the acknowledged transaction in a later process.
-        assert pre_adopted == {"child1"}
-        assert dispatched == ["asker", "child1"]  # each once in this process, no cross-process once claim
+        # The owner wait keeps its own gate; D1's holder needs the exact Windows successor.
+        assert pre_adopted == set()
+        assert dispatched == ["asker"]
         by_id = {row["id"]: row for row in sent}
         assert by_id["asker"]["_owner_wait_resume"]["wait_id"] == case.wait["wait_id"]
-        assert not by_id["child1"].get("_project_admission_restore_hold")
-        assert recovery.planned_handoff_resume_allowed(root, by_id["child1"])
-        assert recovery._read(root, "child1")["status"] == "pre_adopted"
-        assert set(row["id"] for row in case.host.pending) == {"saved-root", "queued"}
+        assert rows["child1"]["_project_admission_restore_hold"]
+        assert not recovery.planned_handoff_resume_allowed(root, rows["child1"])
+        assert recovery._read(root, "child1")["veto_reason"] == "restart_successor_generation_mismatch"
+        assert set(row["id"] for row in case.host.pending) == {"child1", "saved-root", "queued"}
         assert fresh_return_transaction(root) == {}
         return
     assert transaction["status"] == "prepared" and pre_adopted == set()

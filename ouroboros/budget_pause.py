@@ -1031,7 +1031,7 @@ from ouroboros.model_sleep import enter_cold_sleep  # noqa: E402, F401 -- existi
 
 
 # Fields of a direct turn's task record that never travel in its pause event:
-# the inline image bytes were consumed into the checkpointed transcript, and a
+# the inline image bytes live in the checkpointed transcript or a prestart source, and a
 # multi-megabyte base64 blob has no business in the supervisor's event queue or
 # the queue snapshot (which whitelists its own fields anyway).
 _DIRECT_TASK_EVENT_OMITTED = frozenset({"image_base64"})
@@ -1049,6 +1049,37 @@ def parkable_direct_task(task: Dict[str, Any]) -> Dict[str, Any]:
     row.setdefault("_attempt", int(task.get("_attempt") or 1))
     row.setdefault("depth", 0)
     return row
+
+
+def prestart_pause_event(task: Dict[str, Any], error: BaseException, owner: Any) -> Optional[Dict[str, Any]]:
+    """Positive no-body evidence for a fresh input; never reclassify a continuation or prior attempt."""
+    from ouroboros.owner_wait import governing_continuation
+
+    if (not getattr(error, "before_task_start", False) or getattr(error, "control_reason", "") != RAIL_OWNER_PAUSE
+            or governing_continuation(task) or int(task.get("_attempt") or 1) != 1
+            or task.get("original_task_id") or task.get("timeout_retry_from")):
+        return None
+    task_id = str(task["id"])
+    root_id = str(task.get("root_task_id") or (task.get("metadata") or {}).get("root_task_id") or task_id)
+    if task.get("_is_direct_chat") and task.get("image_base64"):
+        # No transcript checkpoint exists before the body. Keep the original
+        # pixels under the existing durable source owner before omitting the
+        # inline payload from the event and the queue's restart snapshot.
+        import base64
+        from ouroboros.artifacts import store_actor_source_bytes
+
+        source = store_actor_source_bytes(owner.drive_root, task_id, category="context_checkpoints",
+                                          source_id="inline-image", extension="image",
+                                          data=base64.b64decode(task["image_base64"], validate=True))
+        task = {**task, "drive_root": str(owner.drive_root), "image_source_ref": source}
+    return {"type": "budget_pause", "task_id": task_id, "task_attempt": 1, "chat_id": task.get("chat_id"),
+            "root_task_id": root_id, "resource_limit": {
+                "before_task_start": True, "task_attempt": 1, "replay_safe": True, "physical_calls": 0,
+                "execution_consumed_sec": owner.executed_seconds(),
+                "scope": "root" if root_id == task_id else "subtree", "root_task_id": root_id,
+                "reason": "owner", "cause": "owner_pause", "auto_resume": False,
+                "fence_id": owner.prestart_pause_fence["fence_id"]},
+            **({"_is_direct_chat": True, "task": parkable_direct_task(task)} if task.get("_is_direct_chat") else {})}
 
 
 def pause_event(task: Dict[str, Any], pause: Dict[str, Any]) -> Dict[str, Any]:

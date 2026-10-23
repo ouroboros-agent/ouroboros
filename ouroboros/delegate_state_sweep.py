@@ -93,8 +93,9 @@ def sweep_settled_delegate_state(
                                      "error": "unreadable_row"})
             references_unknowable = True
             continue
-        pending_wait = (row.get("status") == "adopted" and row.get("pending_invocation_id")
-                        and not row.get("run_id") and not _task_settled(root, path.stem))
+        pending_wait = any(holder.get("status") in {"adopted", "deferred", "reserved", "pre_adopted"}
+                           and holder.get("pending_invocation_id") and not holder.get("run_id")
+                           for holder in row.get("holders", [row])) and not _task_settled(root, path.stem)
         if str(row.get("status") or "") in _TERMINAL_RECOVERY_STATUSES and not pending_wait and _aged(path):
             _remove(path, "delegate_recovery")
             continue

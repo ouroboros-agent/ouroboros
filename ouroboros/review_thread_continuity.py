@@ -1,4 +1,4 @@
-"""Thin Claudexor v3 thread operations for delegated plan reviewers."""
+"""Shared Claudexor thread operations and reviewer continuity receipts."""
 
 from __future__ import annotations
 
@@ -61,29 +61,38 @@ def ensure_review_thread(
         str(getattr(route, "profile_id", "") or ""), root,
         *((access, workspace_root) if writable else ()),
     )
+    try:
+        return ensure_execution_thread(
+            gateway, route=route, root=root, mode="agent" if writable else "ask",
+            access=access, workspace_root=workspace_root if writable else "",
+            title=f"Ouroboros {surface} · {slot_id}", idempotency_key=key)
+    except ValueError as exc:
+        from ouroboros.review_execution import ReviewRouteUnavailable
+
+        raise ReviewRouteUnavailable(str(exc), code="review_thread_id_missing") from exc
+
+
+def ensure_execution_thread(gateway: Any, *, route: Any, root: str, mode: str,
+                            access: str, workspace_root: str, title: str, idempotency_key: str) -> str:
+    """Create a thread binding one stable project and, when supplied, its private copy."""
     request: Dict[str, Any] = {
-        "title": f"Ouroboros {surface} · {slot_id}",
+        "title": title,
         "scope": {"kind": "project", "root": root},
-        "mode": "agent" if writable else "ask",
-        "workspace": "delegated" if writable else "in_place",
+        "mode": mode,
+        "workspace": "delegated" if workspace_root else "in_place",
         "authPreference": "subscription",
         "primaryHarness": route.route_id, "eligibleHarnesses": [route.route_id],
         "access": access,
     }
-    if writable:
+    if workspace_root:
         request["workspaceRoot"] = workspace_root
     profile_id = str(getattr(route, "profile_id", "") or "")
     if profile_id:
         request["credentialProfileId"] = profile_id
-    created = gateway.create_thread(request, idempotency_key=key)
+    created = gateway.create_thread(request, idempotency_key=idempotency_key)
     created_id = str(created.get("id") or "").strip() if isinstance(created, dict) else ""
     if not created_id:
-        from ouroboros.review_execution import ReviewRouteUnavailable
-
-        raise ReviewRouteUnavailable(
-            "Claudexor thread creation returned no thread identity",
-            code="review_thread_id_missing",
-        )
+        raise ValueError("Claudexor thread creation returned no thread identity")
     return created_id
 
 

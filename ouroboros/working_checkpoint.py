@@ -130,7 +130,7 @@ def save_resumed(tools: Any, state: Dict[str, Any], messages: list, trace: dict,
         context_model_role=str(state.get("context_model_role") or "")), RESUMED)
 
 
-def _write(ctx: Any, limit_ctx: Any, boundary: str) -> None:
+def _write(ctx: Any, limit_ctx: Any, boundary: str, *, model_call: Any = None) -> None:
     from ouroboros.budget_pause import pending_tool_call_ids
     from ouroboros.owner_wait import continuation_state
     from ouroboros.utils import utc_now_iso, write_bytes_atomic
@@ -143,6 +143,12 @@ def _write(ctx: Any, limit_ctx: Any, boundary: str) -> None:
         ctx, limit_ctx.messages, limit_ctx.llm_trace if isinstance(limit_ctx.llm_trace, dict) else {},
         {key: value for key, value in usage.items() if key not in _TRANSIENT_USAGE},
         int(limit_ctx.round_idx), list(limit_ctx.tool_schemas or []), set(limit_ctx.owner_msg_seen or ()))
+    if model_call is not None:  # a provisional alternative can checkpoint before route adoption
+        state["messages"] = model_call.messages
+        state["route"].update(active_model=model_call.active_model, active_model_override=model_call.active_model,
+                              active_use_local=model_call.active_use_local, active_use_local_override=model_call.active_use_local,
+                              active_context_mode=model_call.active_context_mode, active_role_override=model_call.model_role)
+        state["context_model_role"] = model_call.model_role or state["context_model_role"]
     if boundary == RESUMED:  # written before the rebind: the plan is still the new worker's
         state["context_model_role"] = limit_ctx.context_model_role
     state["working"] = {"boundary": boundary, "seq": seq, "saved_at": utc_now_iso(),
@@ -200,7 +206,7 @@ def model_call_scope(limit_ctx: Any):
         _MODEL_CALL.reset(token)
 
 
-def save_model_call() -> None:
+def save_model_call(*, model_call: Any = None) -> None:
     """Usage-only transition: bypass ready's cognition signature, hold on write failure.
 
     The accepted-response checkpoint later replaces this ready state. Until then
@@ -212,7 +218,7 @@ def save_model_call() -> None:
     limit = _MODEL_CALL.get()
     if limit is not None:
         _hold_until(limit.tools._ctx, limit.accumulated_usage, HOLD_UNWRITABLE,
-                    lambda: _write(limit.tools._ctx, limit, "ready"), rail="working_checkpoint")
+                    lambda: _write(limit.tools._ctx, limit, "ready", model_call=model_call), rail="working_checkpoint")
 
 
 def defer_content_ack(ctx: Any, ack: Any) -> None:
@@ -727,6 +733,9 @@ def resume_from_working(tools: Any, state: Dict[str, Any], messages: list, trace
             row: {"task_id": source, **record[row]} for row in ("first", "repeat") if isinstance(record.get(row), dict)})}
         if not same_id:
             usage.setdefault("_vision_caption_memo", dict(state["usage"].get("_vision_caption_memo") or {}))
+    from ouroboros.loop_output_exhaustion import KEY as OUTPUT_RECOVERY_KEY
+    if record := (state.get("usage") or {}).get(OUTPUT_RECOVERY_KEY):
+        usage[OUTPUT_RECOVERY_KEY] = dict(record)
     # Saved prose is evidence, never permission to skip today's finalization:
     # a restored attempt holds no seal of the interrupted one.
     ctx._task_acceptance_sealed_fence_token = None

@@ -279,7 +279,10 @@ def fallback_chain_allowed(
         return False
     if last_error_kind == "provider_outcome_unknown":
         return new_generation_after_unknown(ctx, accumulated_usage)
-    return last_error_kind not in ("deadline_exhausted", "llm_output_exhausted")
+    if last_error_kind == "llm_output_exhausted":
+        from ouroboros.loop_output_exhaustion import ready_for_fallback
+        return ready_for_fallback(usage) and not getattr(ctx, "route_wait_on_primary", False)
+    return last_error_kind not in ("deadline_exhausted", "output_recovery_interrupted")
 
 
 def reconcile_transport_wait(

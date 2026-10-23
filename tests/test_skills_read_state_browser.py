@@ -7,6 +7,8 @@ and disclosures survive late answers, and Browse keeps an earlier catalog when a
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from tests._skills_page_harness import (
@@ -519,7 +521,7 @@ def test_skills_review_reads_the_list_once_and_findings_render_on_open(skills_br
 
 
 def _failed_review_projection(tmp_path, monkeypatch, deps_reason):
-    """Two real failed runs of the review lifecycle, read back by the /api/extensions projection."""
+    """Real current failures, plus retained pre-ledger lifecycle rows read by /api/extensions."""
     from types import SimpleNamespace
 
     from ouroboros.skill_review import SkillReviewOutcome
@@ -555,9 +557,24 @@ def _failed_review_projection(tmp_path, monkeypatch, deps_reason):
         raise RuntimeError("reviewer transport closed")
 
     assert review(clean)["status"] == "clean"
+    dependency_failure = skill_review_ui_projection(drive_root, "weather")
+    first = dependency_failure["current"]
+    assert first["review_status"] == "clean" and first["lifecycle_status"] == "failed"
+    assert first["terminal_reason"] == deps_reason
     with pytest.raises(RuntimeError, match="reviewer transport closed"):
         review(broken)
-    return skill_review_ui_projection(drive_root, "weather")
+    second = skill_review_ui_projection(drive_root, "weather")["current"]
+    # Since #2123 only a real review wave writes the shared ledger. These stubs do
+    # not dispatch one. Seed the frozen legacy format explicitly to exercise its
+    # supported historical reader alongside the actual current failed job.
+    from ouroboros.skill_review_history import review_history_path
+    path = review_history_path(drive_root, "weather")
+    path.write_text("".join(json.dumps({**row, "job_status": row["status"],
+        "status": row["review_status"] or row["status"]}) + "\n" for row in (first, second)), encoding="utf-8")
+    before = path.read_bytes()
+    projection = skill_review_ui_projection(drive_root, "weather")
+    assert path.read_bytes() == before, "reading legacy failures must not rewrite them"
+    return dependency_failure, projection
 
 
 @pytest.mark.parametrize("browser_name,width", [("chromium", 1440), ("webkit", 390)])
@@ -566,14 +583,21 @@ def test_failed_review_runs_read_as_failures_with_their_recorded_reason(
     """PR #782: a failed run is not an open `pending`, and a clean verdict whose dependency
     install failed keeps both facts; a long recorded reason stays bounded on a narrow card and
     the full reason opens by touch or keyboard (no hover title)."""
-    projection = _failed_review_projection(tmp_path, monkeypatch, "pip install failed: " + "e" * 3000)
+    dependency_failure, projection = _failed_review_projection(tmp_path, monkeypatch, "pip install failed: " + "e" * 3000)
     browser = getattr(skills_browser, browser_name).launch(headless=True)
     try:
         page = browser.new_page(viewport={"width": width, "height": 900})
-        open_skills(page, extensions=[{**WEATHER, "skill_review": projection}])
+        skills = open_skills(page, extensions=[{**WEATHER, "skill_review": dependency_failure}])
         page.goto(URL, wait_until="networkidle")
         card = page.locator('.skills-card[data-skill="weather"]')
         card.locator('.skills-details > summary').click()
+        current = card.locator(".skills-review-current").inner_text()
+        assert current.endswith(" · clean · lifecycle failed"), current
+        reason = card.locator(".skills-review-current + .skills-review-reason")
+        assert reason.inner_text().startswith("Reason: pip install failed: eee")
+        assert reason.bounding_box()["height"] < 200
+        skills.set_skills([{**WEATHER, "skill_review": projection}])
+        refresh(page)
         current = card.locator(".skills-review-current").inner_text()
         assert current.endswith(" · review verdict unavailable · lifecycle failed"), current
         assert "pending" not in current

@@ -838,9 +838,8 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                 assert page.locator(f"{progress_card} .chat-live-phase").inner_text().strip() == "Done"
                 _wait_status(page, "Online")
 
-                # A kind-stamped known subagent still gains no convergence
-                # authority, and its frame alone mints no parent card (A5: a parent card
-                # comes only from the parent's OWN evidence) — so no parent-root read.
+                # A missing child reconciles through its OWN detail. Its frame alone
+                # mints no parent card (A5), nor does its outcome settle that parent.
                 state["activities"] = []
                 page.evaluate(
                     """() => {
@@ -858,11 +857,21 @@ def test_ui_smoke_queue_loss_converges_terminal_card_once(direct_server_with_dat
                         window.__ouroWs.emit('projects_changed', {});
                     }"""
                 )
-                page.wait_for_timeout(200)
+                page.wait_for_function("() => window.__taskDetailCalls.length === 7")
                 assert page.evaluate("() => window.__taskDetailCalls") == [
                     "truth-root", "truth-root", "truth-root", "rehome-root", "active",
-                    "progress-only-root",
+                    "progress-only-root", "child-root",
                 ]
+                child_card = '.chat-live-card.subagent[data-task-id="child-root"]'
+                assert page.locator(child_card).get_attribute("data-finished") == "0"
+                assert page.evaluate("() => window.__settleTaskDetail({status: 'completed'}, 200)")
+                page.wait_for_function(
+                    "(sel) => document.querySelector(sel)?.dataset.finished === '1'", arg=child_card)
+                assert page.locator(f"{child_card} .chat-live-phase").inner_text().strip() == "Done"
+                page.evaluate("() => window.__ouroWs.emit('projects_changed', {})")
+                _wait_state_reads_quiescent(page)
+                _wait_status(page, "Online")
+                assert page.evaluate("() => window.__taskDetailCalls.length") == 7
                 assert page.locator('.chat-live-card[data-task-id="parent-root"]').count() == 0
             finally:
                 browser.close()
@@ -1146,7 +1155,7 @@ def test_ui_smoke_project_pointer_is_a_main_root_affordance(direct_server_with_d
 def test_ui_smoke_project_panel_lifecycle_does_not_leak(direct_server_with_data):  # noqa: F811
     """Open/close cycles keep one live panel, flat ws listeners, and flat DOM.
 
-    P3 lifecycle concrete: closing or switching a project DESTROYS its chat
+    P3 lifecycle concrete: after its exit, closing or switching a project DESTROYS its chat
     instance (disposing every ws.on subscription, the ResizeObserver, the
     window/document listeners, and all timers), so repeated open/close cycles
     cannot accumulate hidden panels, listeners, or DOM nodes. Panels marked
@@ -1192,6 +1201,7 @@ def test_ui_smoke_project_panel_lifecycle_does_not_leak(direct_server_with_data)
                     page.wait_for_selector(
                         f'[id="panel-pchat-{project_id}"]:not([hidden])', timeout=30_000
                     )
+                    page.wait_for_function("() => !document.querySelector('.chat-instance-panel[data-leaving]')")
 
                 def close_project():
                     page.click("#project-panel-close")
@@ -1200,6 +1210,7 @@ def test_ui_smoke_project_panel_lifecycle_does_not_leak(direct_server_with_data)
                         ".classList.contains('open')",
                         timeout=30_000,
                     )
+                    page.wait_for_function("() => !document.querySelector('.chat-instance-panel[data-leaving]')")
 
                 # Baseline AFTER one full open/close cycle so one-time lazy
                 # registrations cannot masquerade as leaks.

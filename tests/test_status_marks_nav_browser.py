@@ -517,6 +517,9 @@ def test_a_long_press_opens_a_rows_menu_on_touch_where_the_dots_take_no_column(c
         with page.expect_request(lambda request: request.url.endswith(update)) as pressed:
             page.locator(f'{MENU} [data-prm="pin"]').tap()
         facts['pressed'] = pressed.value.post_data_json
+        # The shared fake returns {} for this POST, so the save settles as unconfirmed.
+        # While it is pending, Pin is disabled and Rename correctly receives the menu's focus.
+        expect()(page.locator('#toast-stack')).to_contain_text('Pin state was not confirmed')
         # The keyboard still has the ⋯: focused, it is drawn again with its column.
         kebab = page.locator(f'[data-nav-project-id="{sending}"] .nav-project-kebab')
         kebab.focus()

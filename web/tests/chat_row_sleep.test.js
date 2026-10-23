@@ -283,3 +283,20 @@ test('a video sleeps only once its metadata has given it its size', () => {
     s.run(2);
     assert.equal(row.hasAttribute('data-laid'), true);
 });
+
+test('a row without a box (a deck\'s tucked note) is never marked laid; drawn again, it sleeps like any row', () => {
+    const s = stand();
+    const tucked = s.element();
+    let box = [];
+    tucked.getClientRects = () => box;
+    s.feed.append(tucked, s.element());
+    const sleep = createRowSleep({ feed: s.feed, win: s.win });
+    s.show(390);
+    s.run(2);
+    assert.deepEqual(s.laid(), [false, true], 'nothing to remember: marked, it would open at the placeholder size');
+    box = [{ width: 390, height: 120 }];
+    s.changed(tucked);
+    s.run(40);
+    assert.equal(tucked.hasAttribute('data-laid'), true, 'once it has a box it sleeps');
+    sleep.destroy();
+});

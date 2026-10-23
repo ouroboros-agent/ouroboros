@@ -17,26 +17,20 @@ test('safeHttpUrl accepts only absolute HTTP(S) URLs', () => {
     assert.equal(safeHttpUrl('data:text/plain,no'), '');
 });
 
-test('a framed question keeps one voice line and one time line: its parts join the sender and the time', () => {
+test('a framed question joins its Project to the voice and ends on its time alone', () => {
     const fx = fixture({ formatMsgTime: () => ({ short: '15:18', full: '19 Oct 2026, 15:18' }) });
     try {
         const part = (className) => { const node = document.createElement('span'); node.className = className; return node; };
         const card = part('chat-quiz-card');
         const reference = part('chat-quiz-project');
-        const facts = part('chat-quiz-host-facts');
         const msg = { role: 'assistant', ts: '2026-10-19T15:18:00Z' };
-        const bubble = fx.controller.bubbleFrameNode(msg, card, { voice: [reference], foot: [facts] });
+        const bubble = fx.controller.bubbleFrameNode(msg, card, { voice: [reference] });
         const classes = (node) => node.children.map((child) => child.className);
-        // The Project reference beside `Ouroboros`, the host's sentence after the time (owner 19.10, A).
-        assert.deepEqual(classes(bubble), ['chat-bubble-voice', 'chat-quiz-card', 'chat-bubble-foot']);
+        assert.deepEqual(classes(bubble), ['chat-bubble-voice', 'chat-quiz-card', 'msg-time']);
         assert.deepEqual(classes(bubble.children[0]), ['sender', 'chat-quiz-project']);
-        assert.deepEqual(classes(bubble.children[2]), ['msg-time', 'chat-quiz-host-facts']);
         // Without parts the frame is the one every other delivery gets.
         const plain = fx.controller.bubbleFrameNode(msg, part('chat-quiz-card'));
         assert.deepEqual(classes(plain), ['sender', 'chat-quiz-card', 'msg-time']);
-        // A row with no readable time keeps its foot part on a line of its own.
-        const untimed = fixture().controller.bubbleFrameNode(msg, part('chat-quiz-card'), { foot: [part('chat-quiz-host-facts')] });
-        assert.deepEqual(classes(untimed.children[2]), ['chat-quiz-host-facts']);
     } finally {
         fx.controller.destroy();
         fx.restore();
@@ -230,7 +224,7 @@ test('media and document builders render upgraded DOM shapes with type-anchored 
             file_base64: 'aGVsbG8=', size_bytes: 5,
         });
         assert.match(document.innerHTML, /class="chat-file-grid"/);
-        assert.match(document.innerHTML, /class="chat-file-card"/);
+        assert.ok(document.querySelector('.chat-file-card'));
         assert.match(document.innerHTML, /PDF · 5 B/);
         const actions = Array.from({ length: 13 }, (_value, index) => ({
             label: `Link ${index}`,

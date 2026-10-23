@@ -201,7 +201,8 @@ _RELAY = Index("relay", {
 
 
 def _relay_text(relay: Any, note: str, lang: str) -> str:
-    """The relay's quoted owner messages above its note; just the note when nothing is quoted."""
+    """The relay's quoted owner messages above its note; nothing when it quotes none (a note between works
+    is written for that work, so it stays in the room and never reaches the phone)."""
     relay = relay if isinstance(relay, dict) else {}
     quotes = relay.get("quotes") if isinstance(relay.get("quotes"), list) and relay.get("quotes") else [relay]
     blocks = []
@@ -219,7 +220,7 @@ def _relay_text(relay: Any, note: str, lang: str) -> str:
         lines += [words] if words else []
         lines += [_RELAY[lang].format("files", names=", ".join(names))] if names else []
         blocks.append("\n".join(lines))
-    return "\n\n".join(blocks + ([note] if note else []))
+    return "\n\n".join(blocks + ([note] if note else [])) if blocks else ""
 
 # Completion notices are opt-in for every outcome. The task's evidence stays in
 # its details even when the owner chooses no additional phone messages.

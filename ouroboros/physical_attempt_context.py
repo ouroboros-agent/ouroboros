@@ -23,3 +23,6 @@ class PhysicalAttemptContext:
     # the send finalizer sizes the reply with it. None on rows written before it existed.
     measurement_density: Optional[float] = None
     view_kind: str = ""  # the captured memory view; old producers stay unclassified
+    response_reserve_tokens: int = 0
+    window_witness_bound: bool = False
+    window_observation_fp: str = ""  # Main account scope, separate from capability/density route_fp

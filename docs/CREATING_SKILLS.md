@@ -8,7 +8,7 @@ widget render schemas, skill sources and publishing are explained
 together.
 
 If you are looking for the *runtime* architecture (how the loader
-imports plugins, how the tri-model review pipeline is wired, etc.),
+imports plugins, how the review pipeline is wired, etc.),
 read [`docs/ARCHITECTURE.md`](ARCHITECTURE.md). If you want to know
 exactly what a reviewer model is asked to check, read the "Skill
 Review Checklist" section of [`docs/CHECKLISTS.md`](CHECKLISTS.md).
@@ -22,9 +22,9 @@ review or acceptance before they run. Disk copies use the configured review;
 source installs also support trusted-source acceptance and, in Cyber Pro only,
 Ouroboros's recorded self-check (see "Sources and publishing"). Skills authored by the current Ouroboros agent session carry
 both payload-local `.self_authored.json` and owner-state
-`data/state/skills/<name>/self_authored.json` markers for provenance,
-but they still go through the same tri-model skill review before they
-can run.
+`data/state/skills/<name>/self_authored.json` markers for provenance
+only: they are admitted like any other disk copy, by the review the current
+mode requires (see **Review** under the lifecycle below).
 
 **Owner attestation (Skip review / Turn on anyway).** For a skill from any
 origin, the OWNER may skip the expensive LLM review of its exact bytes via the
@@ -55,7 +55,7 @@ There are three skill types:
 
 | Type | What it ships | When to use |
 |------|---------------|-------------|
-| `instruction` | Markdown-only `SKILL.md` (no code). | Pure prompts / playbooks for the agent. |
+| `instruction` | `SKILL.md`, optionally with helper files such as scripts that the agent runs itself (`run_command` with `cwd=skill_payload`); the host executes nothing. | Playbooks and the agent's own instruments. |
 | `script` | One or more scripts under `scripts/` plus a manifest. | Heavy / batch work that runs as a subprocess. |
 | `extension` | A `plugin.py` that registers tools/routes/widgets via `PluginAPI`. | Host-integrated capabilities, including widgets and chat-driven tools; native-risk isolated deps dispatch in short-lived child processes. |
 
@@ -64,8 +64,8 @@ The **runtime ownership** of an installed skill is also tagged:
 - `native`: a built-in bundled with the app (e.g. `unix_computer_use` on macOS/Linux,
   `windows_computer_use` on Windows).
 - `self_authored`: created by Ouroboros itself in the current data
-  plane; marked by `.self_authored.json` and reviewed through the
-  standard tri-model skill-review path.
+  plane; marked by `.self_authored.json` (provenance only) and reviewed
+  like any other disk copy.
 - `external`: dropped into `data/skills/external/` by the user.
 - `clawhub`: installed from the ClawHub registry.
 - `ouroboroshub`: installed from a hub or another git-hosted source.
@@ -423,12 +423,27 @@ flowchart LR
   `data/state/skills/<name>/install.json`, outside the payload. ClawHub
   installs also keep their `.clawhub.json` sidecar; skills installed from the
   hub by earlier versions keep `.ouroboroshub.json`.
-- **Review** runs three reviewer models in parallel against the
-  Skill Review Checklist (see [`docs/CHECKLISTS.md`](CHECKLISTS.md)).
-  The review pack hashes every runtime-reachable file in the skill
-  directory; any later edit stales that critic verdict. `.self_authored.json`
-  is provenance only; self-authored skills use the same tri-model review,
-  grant, enable, and extension reload flow as other executable skills.
+- **Review** is one wave of the shared review mechanism (`skill_review` →
+  `review_change(subject="skill")`, `tools/review_skill.py`): the panel the
+  review mode composes answers the one skill question against the Skill Review
+  Checklist (see [`docs/CHECKLISTS.md`](CHECKLISTS.md)) in the common
+  findings-only form — Blocking seats every ticked reviewer; Advisory accepts a
+  panel of at least one ticked reviewer when the narrowing carries its reason;
+  in Cyber Pro the review is evidence for Ouroboros's judgment. The record is a
+  `surface="skill"` entry of the review ledger; `review.json` is the run gate's
+  projection of it, bound to the content hash of every runtime-reachable file
+  in the skill directory, so any later edit stales that verdict. A review after
+  an edit is change-focused in every mode: reviewers get the manifest, the
+  changed files and a diff since the last verdict, every unchanged file one
+  read away, and judge the whole current skill. Under Advisory, after the first
+  feedback the author may accept a later edit with
+  `skill_review(author_disposition="accepted", author_rationale=…)` (the
+  deterministic preflight still runs) instead of buying another panel. The tool
+  waits for the panel but hears an addressed owner message: it then returns
+  pending while the reviewers finish, and the same call later collects the
+  verdict at $0.
+  `.self_authored.json` is provenance only; self-authored skills use the same
+  review, grant, enable, and extension reload flow as other executable skills.
   Reviewers also read how the skill was installed (`install.json`: by the
   owner or by Ouroboros, from which source and trust, why, in which task) as
   context, never as approval.
@@ -446,9 +461,10 @@ flowchart LR
   the declared packages itself when they are missing, failed or stale (idempotent: Enable on an
   enabled skill repairs it; a refusal is typed, `code` + one sentence + `detail`). The
   Skills UI surfaces a toggle; agents can also call `toggle_skill`.
-  A self-authored skill's first enablement can follow
-  `OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS`; otherwise enabling requires the owner
-  toggle or an agent acting on the owner's expressed instruction.
+  An ordinary top-level task enables a skill whose review gate admits its
+  bytes; a selected-skill (repair) task needs an owner message, answered quiz
+  or mailbox entry for that skill. Declared keys and host permissions follow
+  `OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS` or an owner grant.
 - **Execute**: `skill_exec` runs `type: script` skills as
   subprocess. `type: extension` skills without isolated deps normally run
   through the in-process loader; extensions with reviewed isolated deps are
@@ -1895,10 +1911,12 @@ or repair a skill instead of reading a paraphrase here. Review verdicts are
 `clean`, `warnings`, `blockers`, or `pending`; execution is decided by
 `review_gate.executable_review`.
 Advisory explicit author finish can accept unchanged or corrected bytes after
-feedback, or a returned terminal partial/unavailable review reference, with current
-deterministic preflight. It buys no second critic and retains the original hash,
-status and findings; pending work without feedback is not unavailable. Blocking
-requires fresh reviewer approval. See ARCHITECTURE §13 for the shared runtime gate.
+feedback (a verdict in `review.json` or a settled skill record with findings), or
+the exact `review_reference` (`record_id`/`job_id` + `content_hash`) returned by a
+terminal review that formed no verdict, with current deterministic preflight. It
+buys no second critic and retains the original hash, status and findings; a review
+still running is not unavailable. Blocking requires fresh reviewer approval. See
+ARCHITECTURE §13 for the shared runtime gate.
 
 ## Reference skills
 

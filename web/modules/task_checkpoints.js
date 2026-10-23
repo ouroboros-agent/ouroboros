@@ -73,6 +73,9 @@ export function taskCheckpointLabel(evt = {}) {
     if (!kind && Number(evt.checkpoint_number) > 0) {
         return `Checkpoint ${evt.checkpoint_number} — periodic self-check`;
     }
+    if (kind === 'context_reclaim_emergency' && evt.cause === 'output_exhaustion') {
+        return 'Source-address recovery after empty length-limited replies (no model)';
+    }
     const folded = Number(evt.reclaimed_tokens);
     if (kind === 'prompt_prefix_break' && evt.reasoning_retired) {
         const turns = evt.reasoning_retired.turns;

@@ -184,9 +184,9 @@ def test_skills_jobs_in_flight_are_neutral_and_the_owner_move_amber(subscription
     setup_browser.capture(page, f"status-marks-skills-{theme}")
 
 
-def test_evolution_pills_are_amber_only_for_the_owner(subscription_ui):
-    """Evolution and Consciousness pills: amber only while they need the owner (a first conversation, the owner's chat, a
-    spending-limit stop); a wait or a pause keeps the plain pill; a failure is red, running green."""
+def test_evolution_chip_and_sentence_are_amber_only_for_the_owner(subscription_ui):
+    """The campaign chip and the consciousness sentence: amber only while they need the owner (a first conversation, the
+    owner's chat, a spending-limit stop); a wait or a pause stays neutral; a failure is red, running green."""
     ui = subscription_ui
     page = ui["page"]
     status = {"evolution": "waiting_for_first_conversation", "consciousness": "wake_paused"}
@@ -200,25 +200,24 @@ def test_evolution_pills_are_amber_only_for_the_owner(subscription_ui):
     open_app(ui)
     page.click('[data-nav-page="dashboard"]')
     page.locator('[data-dashboard-tab="evolution"]').click()
-    plain = (page.evaluate("__probe('var(--text-secondary)')"),
-             page.evaluate("__probe('rgba(var(--neutral-rgb), 0.04)', 'backgroundColor')"))
     tones = {tone: (page.evaluate("t => __probe(`var(--status-${t}-fg)`)", tone),
                     page.evaluate("t => __probe(`var(--status-${t}-bg)`, 'backgroundColor')", tone))
-             for tone in ("warn", "error", "ok")}
-    expected = {"owner": tones["warn"], "error": tones["error"], "online": tones["ok"], "offline": plain}
-    for evolution, consciousness, labels, classes in (
-            ("waiting_for_first_conversation", "wake_paused", ("needs owner", "paused"), ("owner", "offline")),
-            ("budget_stopped", "waiting_for_owner_chat", ("budget", "needs owner"), ("owner", "owner")),
-            ("waiting_for_restart_verify", "sleeping", ("restart verify", "sleeping"), ("offline", "online")),
-            ("paused", "wake_failed", ("paused", "failed"), ("offline", "error"))):
+             for tone in ("warn", "error", "ok", "neutral")}
+    for evolution, consciousness, labels, chip_tones in (
+            ("waiting_for_first_conversation", "wake_paused", ("Needs owner", "Consciousness paused"), ("warn", "neutral")),
+            ("budget_stopped", "waiting_for_owner_chat", ("Budget", "Consciousness needs owner"), ("warn", "warn")),
+            ("waiting_for_restart_verify", "sleeping", ("Restart verify", "Consciousness sleeping"), ("neutral", "ok")),
+            ("paused", "wake_failed", ("Paused", "Consciousness failed"), ("neutral", "error"))):
         status.update(evolution=evolution, consciousness=consciousness)
-        page.locator("#evo-refresh").click()
-        for pill, label, tone in zip(("#evo-mode-pill", "#evo-bg-pill"), labels, classes):
-            locator = page.locator(pill)
-            locator.filter(has_text=label).wait_for()
-            assert locator.get_attribute("class") == f"evo-runtime-pill {tone}", (pill, label)
-            painted = locator.evaluate("el => [getComputedStyle(el).color, getComputedStyle(el).backgroundColor]")
-            assert tuple(painted) == expected[tone], (pill, label, painted, expected[tone])
+        page.evaluate("() => window.dispatchEvent(new CustomEvent('ouro:dashboard-subtab-shown', {detail: {tab: 'evolution'}}))")
+        chip, sentence = page.locator("#evo-campaign-chip"), page.locator("#evo-consciousness")
+        chip.filter(has_text=labels[0]).wait_for()
+        sentence.filter(has_text=labels[1]).wait_for()
+        assert (chip.get_attribute("data-tone"), sentence.get_attribute("data-tone")) == chip_tones, labels
+        # The chip IS the status (the full triple); the sentence states it in its foreground only.
+        painted = chip.evaluate("el => [getComputedStyle(el).color, getComputedStyle(el).backgroundColor]")
+        assert tuple(painted) == tones[chip_tones[0]], (labels, painted)
+        assert sentence.evaluate("el => getComputedStyle(el).color") == tones[chip_tones[1]][0], labels
     # Loading… goes on by itself: the meta ink, not amber.
     loading = page.evaluate("""() => { const el = document.createElement('span'); el.className = 'status-badge starting';
         el.textContent = 'Loading...'; document.body.append(el); const color = getComputedStyle(el).color; el.remove();

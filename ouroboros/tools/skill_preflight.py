@@ -1,6 +1,6 @@
 """Read-only skill payload syntax/contract preflight for skill development.
 
-Tri-model review remains authoritative. Preflight uses argv-only subprocesses,
+The skill review remains authoritative. Preflight uses argv-only subprocesses,
 cwd=skill_dir, scrubbed env, 30s timeout, in-process Python compile(), and no
 review/enablement/grant state mutation.
 """
@@ -585,7 +585,7 @@ def _plugin_permission_findings(skill_dir: pathlib.Path, manifest: Optional[Skil
     # receiver is provably the `register(api)` parameter (or an alias assigned
     # from it) keeps blocking power; an unproven receiver DEGRADES to an ok=True
     # note — the disposition every other unprovable preflight check already gets
-    # — and the tri-model review / runtime permission gate stay authoritative.
+    # — and the skill review / runtime permission gate stay authoritative.
     api_names: set[str] = set()
     for node in ast.walk(tree):
         if (
@@ -797,7 +797,7 @@ def _handle_skill_preflight(
         if runtime_path is None:
             # Missing/unusable external runtime is an environment gap, not a
             # syntax verdict. Skip it (do not block) and disclose the health
-            # reason; tri-model review still reads the file in full.
+            # reason; the skill review still reads the file in full.
             reason_note = f" ({runtime_reason})" if runtime_reason else ""
             file_findings.append({
                 "path": rel_path,
@@ -807,7 +807,7 @@ def _handle_skill_preflight(
                 "skip_reason": "runtime_unavailable",
                 "detail": (
                     f"{runtime} not usable{reason_note} — syntax not verified; "
-                    "relying on tri-model review"
+                    "relying on the skill review"
                 ),
                 **grammar,
             })
@@ -823,7 +823,7 @@ def _handle_skill_preflight(
             # (SIGKILL), a preflight-deadline kill, or a runtime that vanished
             # between resolution and exec. This is infrastructure, not a syntax
             # error: only a clean non-zero exit (rc > 0) means bad syntax.
-            # Skip so a working skill is not falsely blocked; tri-model review
+            # Skip so a working skill is not falsely blocked; the skill review
             # remains the authoritative gate.
             if timed_out:
                 skip_reason, detail = "validator_timeout", "timed out"
@@ -842,7 +842,7 @@ def _handle_skill_preflight(
                 "ok": True,
                 "skipped": True,
                 "skip_reason": skip_reason,
-                "detail": f"{runtime} syntax not verified ({detail}); relying on tri-model review",
+                "detail": f"{runtime} syntax not verified ({detail}); relying on the skill review",
                 "returncode": rc,
                 "timeout": timed_out,
                 "stderr": result["stderr"][:2000],
@@ -870,11 +870,11 @@ def _handle_skill_preflight(
     # validated (not skipped) is clean. Skipped findings (missing/killed/
     # timed-out validators) never block — they are environment limitations, not
     # syntax failures — and a file set with nothing syntax-checkable (e.g. only
-    # .txt/.md, or all validators skipped) is tolerated; tri-model review stays
+    # .txt/.md, or all validators skipped) is tolerated; the skill review stays
     # authoritative. A real syntax error (rc > 0) on any non-skipped file blocks.
     # A file count beyond the syntax-check headroom is a DEGRADED note, NOT a block: the
-    # skill-review pass now packs the whole payload under a pack-level token budget (chunked
-    # when oversized) and reads every file, so an arbitrary preflight file-count cap must not
+    # skill review judges every file (a packet seat gets the whole payload when it fits, else its
+    # index and a NOT-delivered statement; retrieving seats read the frozen copy), so a preflight file-count cap must not
     # re-introduce the hard gate the token budget replaced. omitted files are surfaced below.
     overall_ok = (
         all(f.get("ok") for f in manifest_findings)
@@ -907,7 +907,7 @@ def _handle_skill_preflight(
         notes.append(
             f"{len(skipped_files)} validator(s) could not run "
             f"({', '.join(sorted({str(f.get('skip_reason') or 'skipped') for f in skipped_files}))}); "
-            "syntax for those files was not verified and tri-model review remains authoritative."
+            "syntax for those files was not verified and the skill review remains authoritative."
         )
     if dynamic_ui_findings:
         notes.append(
@@ -917,11 +917,12 @@ def _handle_skill_preflight(
     if omitted_count:
         notes.append(
             f"{omitted_count} file(s) beyond the {_PREFLIGHT_HARD_FILE_LIMIT}-file syntax-check headroom "
-            "were not individually syntax-checked; the skill-review pass reads every file under its "
-            "pack-level token budget (chunked when oversized) and remains authoritative."
+            "were not individually syntax-checked; the skill review still judges every file (a payload "
+            "too large for a packet seat is named NOT delivered beside its index; retrieving seats read "
+            "the frozen copy) and remains authoritative."
         )
     if notes:
-        # Surface the degradation explicitly (no silent skip): tri-model review
+        # Surface the degradation explicitly (no silent skip): the skill review
         # is authoritative for these files.
         payload["degraded"] = True
         payload["degraded_note"] = " ".join(notes)
@@ -937,7 +938,7 @@ _PREFLIGHT_SCHEMA = {
         "parse, module-widget entry existence, and static render-schema validation. Cheap and offline (no LLM, no review.json mutation, "
         "no review status change). Skill-development tasks use this before "
         "calling skill_review so silly syntax errors are caught "
-        "without spending tri-model review tokens. Argv-only "
+        "without spending the review panel's tokens. Argv-only "
         "subprocess invocation, cwd=skill_dir, scrubbed env, 30s "
         "per-file cap, panic-tracked process group."
     ),

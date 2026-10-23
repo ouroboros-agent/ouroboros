@@ -220,7 +220,7 @@ export function initUpdateStatus({ showPage, openDashboardTab, ws, readStatus = 
             ownedPill = pill;
             pill.id = 'update-pill';
             pill.type = 'button';
-            pill.className = 'update-pill';
+            pill.className = 'btn btn-default btn-sm update-pill';
             pill.hidden = true;
             pill.addEventListener('click', () => {
                 if (openDashboardTab) openDashboardTab('updates');

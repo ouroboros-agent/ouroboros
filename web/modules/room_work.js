@@ -136,8 +136,9 @@ export function createRoomWork({
     // header floats over the transcript, so its anchor is the header's own last child at its bottom edge.
     const shadeAnchor = element('div', 'rw-shade-anchor');
     shadeAnchor.appendChild(surface);
-    if (asPanel) (bar || page.querySelector('.chat-panel-statusbar'))?.insertAdjacentElement('afterend', shadeAnchor);
-    else (bar || page).appendChild(shadeAnchor);
+    if (bar) bar.appendChild(shadeAnchor);
+    else if (asPanel) page.querySelector('.chat-panel-statusbar')?.insertAdjacentElement('afterend', shadeAnchor);
+    else page.appendChild(shadeAnchor);
     // The element that says "open" for CSS: the Project panel, or Main's header.
     const openHost = panel || (asPanel ? null : bar);
 
@@ -186,6 +187,11 @@ export function createRoomWork({
         target.addEventListener(type, fn, options);
         disposers.push(() => target.removeEventListener?.(type, fn, options));
     };
+    if (titleRow) {
+        listen(titleRow, 'click', (event) => {
+            if (!trigger.disabled && !trigger.hidden && !event.target?.closest?.('.rw-trigger')) trigger.click();
+        });
+    }
 
     // ---- model
     // The owner's own message for a direct turn or an unconfirmed send, by its exact client id.
@@ -679,12 +685,14 @@ export function createRoomWork({
 
     // The word goes whole or not at all (DESIGN "Shell"): shown, measured, dropped when the row would cut it, in one
     // task so nothing paints between; the mark stays and the control's name keeps the word. Measured again when the
-    // word or the bar's width changes (the bar is sized by the page, so this never feeds itself).
-    let fittedWord = null;
+    // word, mark or available width changes. Remember the capsule's width AFTER fitting, so observing its
+    // content-sized box does not feed a hide/show cycle back into the ResizeObserver.
+    let fittedWord = null, fittedWidth = null, fitNeeded = false;
     function fitWord() {
         if (destroyed) return;
         delete trigger.dataset.word;
         if (statusBadge.scrollWidth > statusBadge.clientWidth + 1) trigger.dataset.word = 'off';
+        fittedWidth = titleRow?.clientWidth;
     }
 
     function paintTrigger() {
@@ -712,7 +720,7 @@ export function createRoomWork({
         if (waitNote.textContent !== said) waitNote.textContent = said;
         waitNote.hidden = !said;
         // A new word, or a mark of another width beside the same word (the owner's dot for the dots), is measured again.
-        if (text !== fittedWord || reshaped) { fittedWord = text; fitWord(); }
+        if (text !== fittedWord || reshaped || fitNeeded) { fittedWord = text; fitNeeded = false; fitWord(); }
         if (!listed && open) close({ restoreFocus: false });
     }
 
@@ -792,8 +800,10 @@ export function createRoomWork({
 
     function scrollToNode(node) {
         reading.cancel();
-        // Main's header floats over the feed: the target lands just below it, not under it.
-        const reserve = asPanel ? 0 : parseFloat(page.style?.getPropertyValue?.('--chat-header-reserve')) || 0;
+        // Main's measured reserve includes its error note; Project's in-flow bars already clear the feed.
+        const reserve = asPanel
+            ? Math.max(0, (bar?.getBoundingClientRect().bottom || 0) - messagesDiv.getBoundingClientRect().top)
+            : parseFloat(page.style?.getPropertyValue?.('--chat-header-reserve')) || 0;
         messagesDiv.scrollTop += node.getBoundingClientRect().top - messagesDiv.getBoundingClientRect().top - reserve;
         reading.stick = false;
         reading.scroll();
@@ -814,7 +824,7 @@ export function createRoomWork({
         close({ restoreFocus: false });
         scrollToNode(target);
         showBack(place.anchor, place);
-        // The card's one control of its own, "Show details", takes the keyboard; a portal (which hides it) takes it itself.
+        // The card's one control of its own, "Details", takes the keyboard; a portal (which hides it) takes it itself.
         const disclosure = records.get(row.id)?.disclosureEl;
         const focus = disclosure?.isConnected && disclosure.getClientRects?.().length ? disclosure : target;
         if (focus === target && !target.hasAttribute?.('tabindex')) target.setAttribute('tabindex', '-1');
@@ -925,7 +935,7 @@ export function createRoomWork({
         const target = event.target;
         // The shared task-controls menu is a portal outside the list but part of its interaction.
         if (target?.closest?.('.task-control-menu')) return;
-        lastInside = surface.contains(target) || trigger.contains(target);
+        lastInside = surface.contains(target) || trigger.contains(target) || Boolean(titleRow?.contains(target));
         if (!open || lastInside) return;
         close({ restoreFocus: false });
         // The first outside press only dismisses the list: a press on the dimmed Main must not also close the room.
@@ -1006,11 +1016,19 @@ export function createRoomWork({
         const away = Boolean(page.hidden) || !page.isConnected;
         if (away) { navigationIntent += 1; close({ restoreFocus: false }); showBack(null); }
         trigger.hidden = away;
+        if (!away) fitWord();
     }) : null;
     watcher?.observe(page, { attributes: true, attributeFilter: ['hidden'] });
     const Resize = globalThis.ResizeObserver;
-    const sizer = bar && typeof Resize === 'function' ? new Resize(() => fitWord()) : null;
+    const sizer = bar && typeof Resize === 'function' ? new Resize((entries) => {
+        if (entries.some(entry => entry.target === bar) || titleRow?.clientWidth !== fittedWidth) {
+            // Use the existing paint frame: resizing an observed capsule inside delivery
+            // would produce an undelivered-notifications loop warning in WebKit.
+            fitNeeded = true; schedule();
+        }
+    }) : null;
     sizer?.observe(bar);
+    if (titleRow) sizer?.observe(titleRow);
 
     function schedule() {
         if (destroyed || scheduled) return;

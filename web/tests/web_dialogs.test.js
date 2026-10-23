@@ -44,6 +44,14 @@ test('promptCampaignObjective: cancel starts nothing, confirmed-empty starts the
     // A dialog that never resolves a shape (glitch) reads as cancel, not start.
     const glitch = await promptCampaignObjective({ dialogImpl: async () => undefined });
     assert.deepEqual(glitch, { confirmed: false, objective: '' });
+
+    // A running campaign is asked for a new objective in place; its words say an empty one keeps the current one.
+    const asked = [];
+    const retarget = await promptCampaignObjective({ running: true,
+        dialogImpl: async (options) => { asked.push(options); return { confirmed: true, value: ' faster history ' }; } });
+    assert.deepEqual(retarget, { confirmed: true, objective: 'faster history' });
+    assert.deepEqual([asked[0].title, asked[0].confirmLabel, asked[0].input], ['New campaign objective', 'Set objective', true]);
+    assert.match(asked[0].body, /continues with this objective\. Leave it empty to keep the current one\.$/);
 });
 
 // ---------------------------------------------------------------------------

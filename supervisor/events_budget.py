@@ -18,6 +18,7 @@ from typing import Any, Dict, Optional
 from ouroboros._usage_rows import REVIEW_ATTRIBUTION_KEYS
 from ouroboros.contracts.record_contract import RECORD_CONTRACT_VERSION
 from ouroboros.event_usage import event_token_counts
+from ouroboros._usage_response import _normalized_input_token_usage
 # Re-export the shared queue/money predicate and the historical hold key.
 from ouroboros.budget_pause import BUDGET_HOLD_KEY, budget_fence_selected  # noqa: F401
 from ouroboros.delegate_recovery import owner_restart_in_progress
@@ -72,6 +73,7 @@ def _handle_llm_usage(evt: Dict[str, Any], ctx: Any) -> None:
     # neither drops the event (dispatch_event would swallow it, losing the round) nor
     # claims the provider measured zero tokens.
     token_counts = event_token_counts(usage, evt)
+    input_split = _normalized_input_token_usage(usage.get("input_token_usage"))
     prompt_cache_ttl = str(usage.get("prompt_cache_ttl") or evt.get("prompt_cache_ttl") or "")
     ledger_attempt_ids = [
         str(value)
@@ -134,6 +136,7 @@ def _handle_llm_usage(evt: Dict[str, Any], ctx: Any) -> None:
         "cost": resolved_cost,
         "cost_known": cost_known,
         **token_counts,
+        **({"input_token_usage": input_split} if input_split is not None else {}),
         "prompt_cache_ttl": prompt_cache_ttl,
         "accounting_authority": "physical_attempt_ledger",
         "projection_update_status": projection_update_status,
@@ -317,25 +320,41 @@ def _handle_budget_pause(evt: Dict[str, Any], ctx: Any) -> None:
         raise ValueError("budget pause requires a replay-safe zero-dispatch task")
     from supervisor.queue import _queue_lock
 
+    prestart = bool(pause.get("before_task_start"))
     with _queue_lock:
-        if str(pause.get("scope") or "") == "root":
-            root_row = _set_root_budget_pause_locked(
-                str(pause.get("root_task_id") or evt.get("root_task_id") or ""),
-                pause,
-            )
-            pause = {
-                **pause,
-                **root_row,
-                "status": "paused_before_dispatch",
-                "replay_safe": True,
-                "physical_calls": 0,
-            }
-        meta = ctx.RUNNING.pop(task_id, None)
+        meta = ctx.RUNNING.get(task_id)
         task = meta.get("task") if isinstance(meta, dict) and isinstance(meta.get("task"), dict) else None
+        direct = task is None and prestart and evt.get("_is_direct_chat")
+        if direct and isinstance(evt.get("task"), dict) and evt["task"].get("id") == task_id:
+            task = evt["task"]
         if task is None:
             raise RuntimeError(f"budget-paused task is not running: {task_id}")
+        if prestart:
+            from ouroboros.cancel_intents import active_intent
+            if active_intent(task.get("budget_drive_root") or ctx.DRIVE_ROOT, task_id):
+                return  # the accepted Stop owns settlement, never a later Pause event
+            import math
+            from ouroboros.owner_wait import governing_continuation
+            spent = pause.get("execution_consumed_sec")
+            attempt = int((meta or {}).get("attempt") or task.get("_attempt") or 1)
+            if (attempt != 1 or pause.get("task_attempt") != attempt or evt.get("task_attempt") != attempt
+                    or not pause.get("fence_id") or pause.get("cause") != "owner_pause"
+                    or type(spent) not in (int, float) or not math.isfinite(spent) or spent < 0
+                    or governing_continuation(task) or task.get("original_task_id") or task.get("timeout_retry_from")):
+                raise ValueError("pre-start Pause requires this fresh attempt's no-body evidence")
+        if str(pause.get("scope") or "") == "root":
+            root_row = _set_root_budget_pause_locked(
+                str(pause.get("root_task_id") or evt.get("root_task_id") or ""), pause)
+            pause = {**pause, **root_row, "status": "paused_before_dispatch",
+                     "replay_safe": True, "physical_calls": 0}
+        ctx.RUNNING.pop(task_id, None)
         resumed_task = dict(task)
         resumed_task["_budget_pause"] = dict(pause)
+        if prestart:
+            resumed_task["_execution_handoff_sec"] = pause["execution_consumed_sec"]
+        if direct:
+            resumed_task.setdefault("priority", 1)
+            resumed_task.setdefault("queued_at", utc_now_iso())
         if not any(str(item.get("id") or "") == task_id for item in ctx.PENDING):
             ctx.PENDING.append(resumed_task)
             ctx.sort_pending()
@@ -351,10 +370,11 @@ def _handle_budget_pause(evt: Dict[str, Any], ctx: Any) -> None:
             task_id,
             STATUS_SCHEDULED,
             _field_projector=lambda current, incoming: {
-                **incoming, **notice_fields(current, ctx.DRIVE_ROOT, task_id, episode_id, "budget")},
-            reason_code="budget_exhausted",
+                **incoming, **notice_fields(current, ctx.DRIVE_ROOT, task_id, episode_id, "owner" if prestart else "budget")},
+            reason_code="owner_pause" if prestart else "budget_exhausted",
             resource_limit=pause,
-            result="Task paused before its first model dispatch; explicit resume or cancel required.",
+            result=("Task paused before its body started; explicit resume or cancel required." if prestart else
+                    "Task paused before its first model dispatch; explicit resume or cancel required."),
         )
     except Exception:
         log.warning("Failed to persist budget pause for %s", task_id, exc_info=True)

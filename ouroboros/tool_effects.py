@@ -57,9 +57,9 @@ _MCP_LOCK = threading.Lock()
 def record_mcp_annotations(server_id: str, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Replace one server's discovery hints. They never grant read authority.
 
-    One small entry per discovered tool, replaced on rediscovery; process exit
-    removes the cache. Only the four protocol booleans are retained. Return
-    discovery rows without the hints so the existing transport shape stays put.
+    One small entry per tool, replaced on catalog adoption; process exit removes
+    the cache. Only the four protocol booleans are retained. The adopter ignores
+    the returned hint-free rows and presents the original published items.
     """
     from ouroboros.mcp_client import make_tool_name
 

@@ -105,7 +105,8 @@ def test_presence_promotion_preserves_ceiling_and_cannot_choose_new_scope(tmp_pa
     contract = {
         "capability_ceiling": capability_ceiling,
         "context": "preserve exact owner context",
-        "predecessor_authority": {"result": "preserve completed predecessor"},
+        "predecessor_authority": {"result": "preserve completed predecessor",
+                                  "source": {"task_id": "previous", "tool": "get_task_result"}},
         "attachment_manifest": [{
             "ordinal": 0, "status": "staged", "reason": "", "label": "authority",
             "root": "artifact_store", "relpath": "attachments/authority.txt",
@@ -142,9 +143,9 @@ def test_presence_promotion_preserves_ceiling_and_cannot_choose_new_scope(tmp_pa
     })
     for key in ("capability_ceiling", "context", "attachment_manifest"):
         assert child[key] == contract[key]
-    assert child["predecessor_authority"] == {
-        **contract["predecessor_authority"], "omitted_fields": {},
-    }
+    assert child["predecessor_authority"]["source"] == contract["predecessor_authority"]["source"]
+    assert "result" not in child["predecessor_authority"]
+    assert child["predecessor_authority"]["omitted_fields"]["result"] == len("preserve completed predecessor")
 
 
 def test_real_presence_promotion_rebases_root_and_materializes_all_attachments(

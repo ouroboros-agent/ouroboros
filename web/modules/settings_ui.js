@@ -606,8 +606,9 @@ export function renderSettingsPage() {
                             <a href="https://clawhub.ai" target="_blank" rel="noopener">clawhub.ai</a>.
                             The Skills page exposes a Marketplace tab; every install is
                             staged, OpenClaw frontmatter is translated into the
-                            Ouroboros manifest shape, and the standard tri-model review runs
-                            automatically before the skill becomes executable. Plugins (Node)
+                            Ouroboros manifest shape, and the skill review (the panel the current
+                            review mode composes) runs automatically before the skill becomes
+                            executable. Plugins (Node)
                             are filtered out — only skill packages are installable.
                         </div>
                         <div class="form-row">

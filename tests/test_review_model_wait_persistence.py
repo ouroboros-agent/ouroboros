@@ -47,7 +47,7 @@ def _record_stop(root, kind, monkeypatch):
 
 
 @contextlib.contextmanager
-def _persist_remote(f, monkeypatch, surface):
+def _persist_remote(f, monkeypatch, surface, *, launcher=False):
     """A real remote review controller parked on its reviewer wait, its seat saved in Settings,
     and the real decision ingress; ``post`` answers while a concurrent Settings Save holds the lock."""
     from starlette.applications import Starlette
@@ -122,9 +122,12 @@ def _persist_remote(f, monkeypatch, surface):
 
     r.post, r.claimed_then, r.applied_then, r.forge = post, claimed_then, applied_then, forge
     r.unforge = lambda wait_id, forged: _forge(f.root, wait_id, forged, dict(r.pointer), remove=True)
-    child = subprocess.Popen([sys.executable, "-c", _REMOTE_OPERATION, str(f.root), current_custody_session_id(), TASK,
-                              surface],
-                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, cwd=os.getcwd())
+    command = [sys.executable, "-c", _REMOTE_OPERATION, str(f.root), current_custody_session_id(), TASK,
+               surface, str(os.getpid())]
+    if launcher:  # Exercise Windows venv topology on every host: the interpreter is a grandchild.
+        command = [sys.executable, "-c",
+                   "import subprocess, sys; sys.exit(subprocess.call(sys.argv[1:]))", *command]
+    child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, cwd=os.getcwd())
     r.out, reader = _lines(child.stdout)
     executing = {}
     try:
@@ -220,8 +223,10 @@ def test_a_role_save_that_waits_for_settings_meets_its_own_remote_receipt(env, m
 
 
 @pytest.mark.serial
-@pytest.mark.parametrize("stop", ["", "graceful", "immediate", "owner_restart", "unknown"])
-def test_a_role_save_for_a_still_waiting_claim_obeys_the_same_stop_record(env, monkeypatch, stop):
+@pytest.mark.parametrize("stop,launcher", [("", False), ("graceful", False), ("immediate", False),
+                                         ("owner_restart", False), ("unknown", False),
+                                         ("owner_restart", True)])
+def test_a_role_save_for_a_still_waiting_claim_obeys_the_same_stop_record(env, monkeypatch, stop, launcher):
     """The controller is live and has not consumed the claim (a row under its own open pointer)
     when a stop record lands while the Settings lock is held. Clear: the role is saved and the
     claim stays pending for its controller. Wrap up (finalize-then-stop) leaves the operation
@@ -231,7 +236,7 @@ def test_a_role_save_for_a_still_waiting_claim_obeys_the_same_stop_record(env, m
     from ouroboros.owner_mailbox import KIND_MODEL_WAIT, drain_owner_entries
 
     f = env
-    with _persist_remote(f, monkeypatch, "task_acceptance") as r:
+    with _persist_remote(f, monkeypatch, "task_acceptance", launcher=launcher) as r:
         wait_id = "live-claim"
         forged = r.forge(wait_id)
         try:

@@ -116,6 +116,15 @@ def build_user_content(task: Dict[str, Any]) -> Any:
         )
         text = plan_notice + str(text or "")
     image_b64 = task.get("image_base64")
+    if not image_b64 and task.get("image_source_ref"):
+        # A prestart Pause has original input, but no checkpointed transcript.
+        # Resolve and verify its durable source through the same owner as other
+        # task inputs, then use the unchanged inline-image preparation path.
+        import base64
+        from ouroboros.artifacts import read_actor_source_bytes
+
+        raw = read_actor_source_bytes(task["drive_root"], str(task["id"]), task["image_source_ref"])
+        image_b64 = base64.b64encode(raw).decode("ascii")
     attachment_image_blocks = _build_attachment_image_blocks(task)
 
     if not image_b64 and not attachment_image_blocks:
@@ -1271,7 +1280,7 @@ def _capture_context_core(
     else:
         docs_need_development = _task_requires_development_context(task)
 
-    semi_stable_parts = []
+    semi_stable_parts, subagent_catalog = [], None
     try:
         from ouroboros.subagent_runtime import current_model_visible_subagent_catalog
 
@@ -1311,18 +1320,20 @@ def _capture_context_core(
 
     from ouroboros.tools.tool_resolution import active_repo_dir_for
     active_root = str(active_repo_dir_for(ctx)) if ctx is not None else ""
-    # The actual attempt, normalized exactly as the terminal-wake acknowledgement records it.
+    # Same attempt normalization as terminal-wake acknowledgement.
     from ouroboros.delegate_supervision import _attempt_key
     attempt_key = _attempt_key(ctx if ctx is not None else SimpleNamespace(task_attempt=task.get("_attempt")))
     health_section = build_health_invariants(context_env, task_id=str(task.get("id") or ""),
                                              active_root=active_root, attempt_key=attempt_key)
-    dynamic_parts = []
-    if health_section:
-        dynamic_parts.append(health_section)
+    dynamic_parts = [health_section] if health_section else []
     try:
-        from ouroboros.subagent_runtime import review_records_block
-
-        dynamic_parts.append(review_records_block(drive_root=canonical_root, task_id=str(task.get("id") or "")))
+        from ouroboros.subagent_runtime import review_records_block, subagent_supervision_fact_line
+        from ouroboros.subagent_metrics import fact_line
+        dynamic_parts.extend(filter(None, (
+            review_records_block(drive_root=canonical_root, task_id=str(task.get("id") or "")),
+            subagent_supervision_fact_line(task, ctx=ctx, catalog=subagent_catalog),
+            fact_line(task, drive_root=canonical_root),
+        )))
     except Exception:
         log.warning("Failed to build the Review records block", exc_info=True)
     dynamic_parts.extend(build_memory_sections(context_memory, partition="volatile", include_scratchpad=not is_child))

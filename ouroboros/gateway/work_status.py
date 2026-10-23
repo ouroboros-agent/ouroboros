@@ -127,7 +127,8 @@ def classify_member(row: Mapping[str, Any], raw: Optional[Mapping[str, Any]] = N
 
     ``raw`` carries the queue row's hold and pause records, the declared author of the tree's Pause
     (``pause_by``, ``control_actor.pause_author``), the members that Pause already parked and the task's
-    own identity facts (see ``work_projection``), ``running`` when the queue runs it, and ``sent_review`` while a
+    own identity facts (see ``work_projection``), ``running`` when the queue runs it, its current worker ``owner_wait``,
+    and ``sent_review`` while a
     review it sent from a warm park still runs. Returns the member's
     own state only; ``live`` says whether the member itself executes now: under a settling Pause only a running
     member the Pause has not parked does, never a queued one or one that already saved its place."""
@@ -165,6 +166,15 @@ def classify_member(row: Mapping[str, Any], raw: Optional[Mapping[str, Any]] = N
         return state
     if wait == "unknown":
         state["confirmed"] = False
+        return state
+    # A warm sleeper keeps its worker and frozen census phase, but executes nothing.
+    # A current Pause above wins; an ended or older attempt's wait proves no sleep.
+    waiting = raw.get("owner_wait")
+    if isinstance(waiting, dict) and waiting.get("state") == "waiting" and waiting.get("reason") == "sleep" \
+            and waiting.get("task_attempt") == int(row.get("task_attempt") or 1) \
+            and isinstance(waiting.get("sleep"), dict) and waiting["sleep"].get("mode") == "warm":
+        state["activity"] = "waiting"
+        state["reasons"].append(reason("sleeping"))
         return state
     waits = _current_waits(row)
     if waits:
@@ -221,9 +231,9 @@ def controls_for(current: Optional[Mapping[str, Any]], current_row: Optional[Map
         phase = str(current_row.get("phase") or "")
         codes = {entry.get("code") for entry in current.get("reasons") or ()}
         # A live root, managed or a direct turn, and an answered root's upkeep: the hurry, stop and Pause doors
-        # take them all; the Pause ends that upkeep at once.
-        if current["activity"] == "working" and current.get("transition") in {"none", "finalizing"} \
-                and phase in _RUNNING_PHASES:
+        # take them all; the Pause ends that upkeep at once. A warm sleep keeps both: either control wakes it.
+        if ((current["activity"] == "working" and current.get("transition") in {"none", "finalizing"})
+                or (current["activity"] == "waiting" and "sleeping" in codes)) and phase in _RUNNING_PHASES:
             controls += [{"action": "wrap_up", "target": target}, {"action": "hurry", "target": target}]
         # A Pause still settling keeps its Pause: the door coalesces a repeat, which retries an uncertain reply.
         if current.get("transition") in {"none", "finalizing", "pausing"} \

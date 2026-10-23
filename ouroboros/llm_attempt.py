@@ -110,13 +110,10 @@ def require_physical_dispatch_window() -> Optional[float]:
     confirmed handoff only this exact attempt may proceed through later SDK
     checks. Stop and execution deadlines remain effective; packet timing is opaque.
     """
-    from ouroboros.model_wait import current_model_wait, dispatch_deadline_remaining_sec
-    from ouroboros.owner_pause import RAIL_OWNER_PAUSE, scope_fence, model_handed_off
+    from ouroboros.model_wait import current_model_wait, dispatch_control_reason, dispatch_deadline_remaining_sec
+    from ouroboros.owner_pause import model_handed_off
 
-    owner = current_model_wait()
-    reason = owner.control_reason(strict_current=not model_handed_off()) if owner is not None else None
-    if not reason and not model_handed_off() and scope_fence():
-        reason = RAIL_OWNER_PAUSE
+    reason = dispatch_control_reason(current_model_wait(), handed_off=model_handed_off())
     if reason:
         raise _PhysicalSendNotStarted(reason)
     remaining = dispatch_deadline_remaining_sec()
@@ -509,12 +506,13 @@ def main_context_fit_refusal(request: AttemptRequest) -> Optional[Dict[str, Any]
     window = request.context_window_tokens_exact or physical.capacity_total_tokens
     if window is None:
         return None  # unknown capacity leaves the first full request admissible
-    reserve = context_mode_limits(physical.rendered_mode, "", request.max_completion_tokens)[1]
+    reserve = physical.response_reserve_tokens or context_mode_limits(
+        physical.rendered_mode, "", request.max_completion_tokens)[1]
     exact = request.prompt_tokens_exact is not None
     size = request.prompt_tokens_exact if exact else math.ceil(
         request.prompt_tokens_bounded_estimate * (physical.measurement_density or 1.0))
     free = window - reserve - size
-    if free > 0:
+    if free >= 0:
         return None  # only physical W gates; the owner target never vetoes a send
     return refused_candidate_facts(
         request, capacity_total_tokens=window, response_reserve_tokens=reserve, free_tokens=free,
@@ -873,13 +871,14 @@ class _PayloadCachePolicyMixin:
         "default" so pricing bills the extended-tier write multiplier.
 
         The owner's global TTL (``config.resolve_prompt_cache_ttl``, owner decision
-        2026-08-08 Q2=A) has its single WIRE authority here — the one place that decides
+        2026-08-08 Q2=A) has its single API WIRE authority here — the one place that decides
         what every marker on this family actually ships as. It is not the only READER:
         ``review_helpers.cached_prompt_blocks(ttl=None)`` projects the same setting into
-        the block it owns so a non-normalizing route still carries the owner's tier; on
-        this family the finalizer would stamp that block to the same value anyway, so the
-        two readers cannot diverge on the wire (``config.resolve_prompt_cache_ttl`` names
-        both). When the setting names an explicit tier
+        the block it owns so a non-normalizing route still carries the owner's tier, and
+        ``effort_evidence.session_prompt_cache_ttl_request`` negotiates ``promptCacheTtl``
+        for native Claudexor sessions; on this family the finalizer would stamp that block
+        to the same value anyway, so the readers cannot diverge on the wire
+        (``config.resolve_prompt_cache_ttl`` names all). When the setting names an explicit tier
         ('5m'/'1h') it is stamped onto EVERY existing breakpoint of this family —
         including caller-declared review/safety prefixes, which is what makes it an
         HONEST override rather than a floor — before the promotion rule runs, so

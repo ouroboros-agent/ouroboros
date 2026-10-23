@@ -7,7 +7,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from tests.test_launcher_handoff_stop import native_guard  # noqa: F401
+from tests.test_launcher_handoff_stop import native_guard as native_guard
 
 
 @pytest.mark.parametrize("door", ["tray", "abort", "setup_tray"])

@@ -40,7 +40,8 @@ def _agent():
 
 
 def dispatch_executor_note(decision: Optional[SubagentExecutorResolution],
-                           lane: Optional["SubagentLaneResolution"] = None) -> str:
+                           lane: Optional["SubagentLaneResolution"] = None,
+                           *, cognitive_route: Optional[Dict[str, Any]] = None) -> str:
     """The child's VISIBLE marker for a substrate decision it did not make ('' = silent).
 
     The rule table's `auto` rows are only honest if the child can see which way they
@@ -65,15 +66,21 @@ def dispatch_executor_note(decision: Optional[SubagentExecutorResolution],
         route = decision.route.route_id if decision.route else ""
         configured_atomic = lane is not None and lane.provenance == "configured_subagent"
         if configured_atomic:
+            from ouroboros.supervisor_route import cognitive_route_provenance
+
+            provenance = cognitive_route_provenance(cognitive_route)
+            cognition = (f" Your cognitive route is {lane.model} ({provenance}); "
+                         "its calls bill as that route bills. You may change it with switch_model. "
+                         if provenance else " ")
             return (
                 f"EXECUTOR: your parent selected the configured agent-session route ({route}). "
-                "You are its Ouroboros NANNY. For fresh work the host starts the exact leaf "
+                "You are its Ouroboros NANNY." + cognition + "For fresh work the host starts the exact leaf "
                 "before your first round. Restored supervision follows its continuation receipt; "
                 "the receipt states custody, and waiting is your own call "
                 "(delegate_wait when you want its facts). Your "
-                "metered rounds are for judgment — verify and integrate what the run "
+                "supervisory rounds are for judgment — verify and integrate what the run "
                 "produces, answer its authorized questions, decide recovery — never for "
-                "rebuilding its work: co-building beside a delegated run is a metered "
+                "rebuilding its work: co-building beside a delegated run is a "
                 "duplicate of already-paid work. After a terminal failure, replace through "
                 "delegate_start(prompt='') only once cancellation and terminal settlement are "
                 "verified; an unknown start outcome is retried with "

@@ -226,8 +226,7 @@ export function createChatInstance({
             actionsHtml: mainHeaderActionsHtml(),
             showMobileNav: false,  // a room's ☰ is its composer row's first control
         });
-    // Main: the history note (gaps, a failed read, an approximate position) floats UNDER the bar as its own
-    // strip, never as a second row of it; the Project panel keeps its in-flow status bar.
+    // Main: a failed read or approximate restoration floats under the bar; Project keeps its status bar.
     page.innerHTML = `
         ${headerHtml}${asPanel ? '' : '<div class="chat-page-note"></div>'}
         <div id="chat-messages"></div>
@@ -258,7 +257,7 @@ export function createChatInstance({
     const inputArea = byId('input-area');
     const statusBadge = byId('status');
     const headerActions = byId('header-actions');
-    const pageHeader = page.querySelector('.chat-page-header');
+    const pageHeader = page.querySelector('.chat-page-header') || (asPanel ? container?.closest?.('.project-panel')?.querySelector?.('.project-panel-bar') : null);
     const pageNote = page.querySelector('.chat-page-note');
     const budgetPill = byId('budget-pill');
     const disposeHeaderPlacement = asPanel ? () => {} : bindHeaderControlPlacement({ headerActions, budgetPill });
@@ -1219,7 +1218,8 @@ export function createChatInstance({
             : Boolean(options.isSubagent && nestedSubagentsExpanded);
         root.dataset.expanded = initialExpanded ? '1' : '0';
         // The summary band is reading content (selectable, never a control); its one disclosure is the
-        // "N notes · Show details" button (DESIGN §5 "A task card's summary outranks its details").
+        // "Details" button, its notes count kept in the button's name (DESIGN §5 "A task card's summary
+        // outranks its details").
         root.innerHTML = `
             <div class="chat-live-summary-button" data-live-summary-button>
                 <div class="chat-live-summary">
@@ -1231,7 +1231,7 @@ export function createChatInstance({
                     <span class="chat-live-title" data-live-title>Waiting for work</span>
                     <button type="button" class="chat-live-summary-side ui-hit-area" data-live-disclosure aria-expanded="false" aria-controls="${escapeHtmlAttr(timelineId)}">
                         <span class="chat-live-count" data-live-count hidden></span>
-                        <span class="chat-live-toggle" data-live-toggle>Show details</span>
+                        <span class="chat-live-toggle" data-live-toggle>Details</span>
                         <svg class="chat-live-chevron" width="14" height="14" viewBox="0 0 20 20" fill="none" aria-hidden="true">
                             <path d="M5 7.5 10 12.5 15 7.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"></path>
                         </svg>
@@ -1248,6 +1248,7 @@ export function createChatInstance({
             </div>
             <div class="chat-live-details">
                 <div data-live-phase-detail hidden></div>
+                <dl class="chat-live-facts" data-live-facts hidden></dl>
                 <div data-live-cost-detail hidden></div>
             </div>
             <div class="chat-live-timeline" data-live-timeline id="${escapeHtmlAttr(timelineId)}"></div>
@@ -1547,7 +1548,7 @@ export function createChatInstance({
         if (event?.detail?.page === 'chat') void showLatest();
         else if (event?.type !== 'visibilitychange') return;
         else if (document.hidden) reading.land(() => 0, reading.arriving);
-        else reading.request();
+        else { reading.request(); historyControls.showNotice(); }
     };
     window.addEventListener('ouro:page-shown', handlePageShown);
     document.addEventListener('visibilitychange', handlePageShown);
@@ -2489,7 +2490,7 @@ export function createChatInstance({
                         originId: msg.origin_id || '',
                         chatAnnotation: msg.chat_annotation || null,
                         skillReview: msg.system_type === 'skill_review' && msg.skill && msg.job_id
-                            ? { skill: msg.skill, jobId: msg.job_id }
+                            ? { skill: msg.skill, jobId: msg.job_id, ...(msg.record_id ? { recordId: msg.record_id } : {}) }
                             : null,
                     });
                     if (msg.role === 'user') { markIngressSaved(messagesDiv, msg); replies.adopt(msg); unconfirmed.settle(msg); }
@@ -2795,6 +2796,7 @@ export function createChatInstance({
         for (const record of liveCardRecords.values()) record.childDetailRead = undefined;
         reading.followAfterLayout();
         updateScrollButton();
+        historyControls.showNotice();
     }
     scrollBottomBtn?.addEventListener('click', showLatest);
 
@@ -3044,7 +3046,11 @@ export function createChatInstance({
         }
     }
 
-    const historyControls = createHistoryControls(messagesDiv, pageNote || page.querySelector('.chat-panel-statusbar'));
+    const historyControls = createHistoryControls(messagesDiv, pageNote || page.querySelector('.chat-panel-statusbar'), {
+        isVisible: () => isInstanceVisible() && !messagesDiv.closest('[inert]')
+            && !document.body.classList.contains('nav-drawer-open') && (asPanel || (!isProjectOpening?.()
+            && !document.body.classList.contains('project-panel-open'))),
+    });
     const { olderButton: loadOlderBtn } = historyControls;
 
     const historyPager = createChatHistoryPager({
@@ -3091,6 +3097,8 @@ export function createChatInstance({
             return true;
         });
     }
+    const handleHistoryLanguage = () => syncLoadOlderControl();
+    window.addEventListener('ouro:language-changed', handleHistoryLanguage);
     async function loadOlderHistory() {
         if (historyControls.recentFailed()) {
             const owned = onHistoryRetry?.();
@@ -3551,6 +3559,8 @@ export function createChatInstance({
         // Called by app.js when a kept panel is shown again: a room reopens at its
         // newest message (owner decision 2026-10-05).
         showLatest,
+        // Shell exposure after its motion: present retained notice state, without fetching or scrolling.
+        showHistoryNotice: () => { if (!destroyed) historyControls.showNotice(); },
         refreshHistory: readReceipt.refresh,
         revealQuestion,
         revealSource: replies.reveal,
@@ -3593,6 +3603,8 @@ export function createChatInstance({
             }
             wsDisposers.length = 0;
             historyControls.endRecent();
+            historyControls.destroy();
+            window.removeEventListener('ouro:language-changed', handleHistoryLanguage);
             historyPager.destroy();
             disposeReadingGestures();
             document.removeEventListener('selectionchange', retryHistoricalUpserts);

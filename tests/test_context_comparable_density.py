@@ -32,10 +32,10 @@ def test_real_start_and_first_send_use_comparable_density(main_call, monkeypatch
     words = "Owner asks for the complete text. " + "word " * 720_000
     ctx, gateway, tools, events, build, windows = _native(
         main_call, monkeypatch, tmp_path, task_text=words, owner_mode=mode)
-    windows["account-a"] = 2_000_000
+    windows["account-a"] = 2_200_000
     ce.record_token_density(ce.canonical_evidence_root(), ce._normalized_density_model(MODEL),
         prompt_chars=witness_size * 4, prompt_tokens=int(witness_size * 1.56),
-        route_fp="capacity-account-a-2000000", basis=ce.MAIN_DENSITY_BASIS, source="dispatch_usage", view_kind="owner_turn")
+        route_fp=_route("account-a"), basis=ce.MAIN_DENSITY_BASIS, source="dispatch_usage", view_kind="owner_turn")
     plan = build(windows["account-a"])
     assert plan.initial_mode == plan.preferred_mode == mode
     assert plan.projection(mode).calibration_ratio == expected
@@ -68,7 +68,7 @@ def test_real_route_rebind_sizes_its_running_input(main_call, monkeypatch, tmp_p
     shown = list(ctx.messages)
     ce.record_token_density(ce.canonical_evidence_root(), ce._normalized_density_model(MODEL),
         prompt_chars=witness_size * 4, prompt_tokens=int(witness_size * 1.56),
-        route_fp="capacity-account-b-2000000", basis=ce.MAIN_DENSITY_BASIS, source="dispatch_usage", view_kind="owner_turn")
+        route_fp=_route("account-b"), basis=ce.MAIN_DENSITY_BASIS, source="dispatch_usage", view_kind="owner_turn")
     ctx.tool_schemas = initial_tool_schemas(tools, context_mode="nano")
     rebound, mode = loop._rebind_context_fit_plan(plan, tools, ctx.messages, model=MODEL, use_local=False,
         tool_schemas=ctx.tool_schemas, start_mode="nano", credential_profile_id="account-b")
@@ -77,6 +77,11 @@ def test_real_route_rebind_sizes_its_running_input(main_call, monkeypatch, tmp_p
     ctx.context_fit_plan, ctx.active_context_mode = rebound, mode
     fit = loop._measure_round_main_fit(ctx, automatic_pass_used=False).measurement
     assert fit.measurement_density == expected and fit.anchor_input_tokens is None
+
+
+def _route(account):
+    return ce.route_fingerprint(provider="claudexor", model=MODEL, base_url="", options={
+        "source_id": "codex", "credential_profile_id": account, "account_fingerprint": f"fingerprint-{account[-1]}"})
 
 
 def _witness(raw, density=1.56, *, route="route-a", basis=ce.MAIN_DENSITY_BASIS, observed=None):
@@ -110,15 +115,17 @@ def test_round_one_uses_only_comparable_same_model_evidence(
     assert ctx.accumulated_usage["_context_measurement_density"] == expected
 
 
-def test_comparability_is_symmetric_and_model_fallback_follows_route_filter(monkeypatch, tmp_path):
+@pytest.mark.parametrize("route", ["route-a", "other-route"])
+def test_comparability_is_symmetric_and_never_crosses_routes(monkeypatch, tmp_path, route):
     monkeypatch.setattr(ce, "_load", lambda root: {"token_density": {"openai/test-model": {"pairs": [
-        _witness(97_000, 0.8), _witness(600_000, route="other-route"),
+        _witness(97_000, 0.8), _witness(600_000, route=route),
     ]}}})
     assert ce.resolve_main_token_density(tmp_path, "route-a", "openai/test-model",
-                                        estimate_tokens=600_000) == (1.56, "fresh_model_usage")
+                                        estimate_tokens=600_000) == (
+                                            (1.56, "fresh_route_usage") if route == "route-a" else (1.0, "cold_estimate"))
     for size, expected in [(300_000, 1.56), (1_200_000, 1.56), (1_200_001, 1.0)]:
         assert ce.resolve_main_token_density(tmp_path, "route-a", "openai/test-model",
-                                            estimate_tokens=size)[0] == expected
+                                            estimate_tokens=size)[0] == (expected if route == "route-a" else 1.0)
 
 
 def test_task_anchor_outranks_even_comparable_foreign_measurements(monkeypatch):

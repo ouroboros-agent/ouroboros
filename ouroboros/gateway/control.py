@@ -16,15 +16,12 @@ from ouroboros import get_version
 from ouroboros.gateway._helpers import json_error, json_exception, request_drive_root, request_json_or, request_repo_dir
 from ouroboros.gateway.ws import broadcast_ws_sync
 from ouroboros.gateway import update_progress
-from ouroboros.outcomes import public_task_result
 from ouroboros.utils import utc_now_iso
 
 log = logging.getLogger(__name__)
 
 _RECENT_VISIBLE_COMMANDS: Dict[str, float] = {}
 _VISIBLE_COMMAND_DEDUPE_SEC = 5.0
-_evo_cache: Dict[str, Any] = {}
-_evo_task: asyncio.Task | None = None
 
 
 def _request_restart(request: Request) -> bool:
@@ -569,13 +566,23 @@ def _stop_repo_writers(reason: str) -> list[str]:
 
 
 def _fence_failure(blockers: list[str], stash_note: str = "") -> JSONResponse:
-    restart_required = not all(str(item).startswith("active:") for item in blockers)
+    active_only = bool(blockers) and all(str(item).startswith("active:") for item in blockers)
+    restart_required = not active_only
+    if active_only:
+        names = ", ".join(str(item)[len("active:"):] for item in blockers)
+        error = (
+            f"Active work is still running or finishing review ({names}). "
+            "No work was stopped and the repository was not changed; wait for it to finish, "
+            "pause it, or restart Ouroboros to clear the blocker."
+        )
+    else:
+        error = (
+            "Could not prove every repository writer stopped. The repository was not "
+            "changed, but runtime shutdown may be incomplete."
+        )
     return JSONResponse(
         {
-            "error": (
-                "Could not prove every repository writer stopped. The repository was not "
-                "changed, but runtime shutdown may be incomplete."
-            ),
+            "error": error,
             "reason": "update_writer_fence_blocked",
             "blockers": blockers,
             "restart_required": restart_required,
@@ -1351,53 +1358,18 @@ async def api_update_apply(request: Request) -> JSONResponse:
 
 
 async def api_evolution_data(request: Request) -> JSONResponse:
-    """Collect evolution metrics for each git tag."""
-    from ouroboros.utils import collect_evolution_metrics
+    """The saved version history at once (``evolution_history``), never waiting for a measurement;
+    ``force`` re-measures in the background. The refresh status says whether a newer copy is coming."""
+    from ouroboros.evolution_history import history
 
-    global _evo_task
-    now = time.time()
     force_refresh = str(request.query_params.get("force") or "").strip().lower() in {"1", "true", "yes"}
-    if not force_refresh and _evo_cache.get("ts") and now - _evo_cache["ts"] < 60:
-        return JSONResponse({
-            "points": _evo_cache["points"],
-            "checkpoints": _evo_cache.get("checkpoints", []),
-            "generated_at": _evo_cache.get("generated_at", ""),
-            "cached": True,
-        })
-    if _evo_task is None or _evo_task.done():
-        _evo_task = asyncio.create_task(
-            collect_evolution_metrics(
-                str(request_repo_dir(request)),
-                data_dir=str(request_drive_root(request)),
-            )
-        )
-    data_points = await _evo_task
-    try:
-        from ouroboros.evolution_checkpoints import CHECKPOINTS_REL
-        from ouroboros.utils import iter_jsonl_objects
-
-        checkpoints = []
-        rows = [
-            row for row in iter_jsonl_objects(request_drive_root(request) / CHECKPOINTS_REL)
-            # cycle_outcome rows are solve-capability digest fodder (different
-            # schema: no git_sha/identity hashes); the Dashboard checkpoints
-            # view renders absorb checkpoints only.
-            if isinstance(row, dict) and row.get("kind") != "cycle_outcome"
-        ]
-        for row in rows[-100:]:
-            checkpoints.append(public_task_result(row))
-    except Exception:
-        checkpoints = []
-    _evo_cache["ts"] = time.time()
-    _evo_cache["points"] = data_points
-    _evo_cache["checkpoints"] = checkpoints
-    _evo_cache["generated_at"] = utc_now_iso()
-    return JSONResponse({
-        "points": data_points,
-        "checkpoints": checkpoints,
-        "generated_at": _evo_cache["generated_at"],
-        "cached": False,
-    })
+    drive_root = request_drive_root(request)
+    payload = await asyncio.to_thread(
+        history.projection, str(request_repo_dir(request)), str(drive_root), force=force_refresh)
+    # Older clients' newest absorb checkpoints: one stat while the journal is unchanged (evolution_history).
+    payload["checkpoints"] = await asyncio.to_thread(history.checkpoints, str(drive_root))
+    payload["generated_at"] = utc_now_iso()
+    return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
 
 __all__ = [

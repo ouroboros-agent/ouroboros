@@ -22,7 +22,7 @@ import pytest
 
 import ouroboros.launcher_bootstrap as bootstrap_module
 from ouroboros import platform_layer
-from tests.test_launcher_handoff_stop import native_guard  # noqa: F401
+from tests.test_launcher_handoff_stop import native_guard as native_guard
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 MARK = bootstrap_module.LAUNCHER_HANDOFF_ENV
@@ -131,7 +131,7 @@ def test_container_warm_handoff_counts_helpers_loaded_from_the_image(tmp_path, m
     if compiled:
         source = source.with_suffix(".pyc")
     monkeypatch.setattr(bootstrap_module, "checkout_sha", lambda root: "updated")
-    monkeypatch.setattr(bootstrap_module, "sys", types.SimpleNamespace(modules={
+    monkeypatch.setattr(bootstrap_module, "sys", types.SimpleNamespace(platform=sys.platform, modules={
         "loaded": types.SimpleNamespace(__file__=str(source)),
         "unrelated": types.SimpleNamespace(__file__=str(tmp_path / "elsewhere/server.py"))}))
     probes = []
@@ -599,3 +599,33 @@ def test_a_successor_keeps_an_attached_console_and_is_hidden_only_without_one(mo
     monkeypatch.setattr(platform_layer, "ctypes", ctypes, raising=False)
     assert platform_layer.inherited_console_kwargs() == ({"creationflags": flags} if flags else {})
     assert asked == ([1] if windows else []), "elsewhere nothing is asked"
+
+
+def test_linux_source_handoff_keeps_native_bundle_environment(hand_over, monkeypatch, tmp_path):
+    from ouroboros.desktop_media import LINUX_DESKTOP_KEYS, host_environment
+
+    import dataclasses
+    embedded_python = str(tmp_path / 'app dir/_internal/python-standalone/bin/python3')
+    original_context = context
+    monkeypatch.setattr(sys.modules[__name__], 'context', lambda path: dataclasses.replace(
+        original_context(path), embedded_python=embedded_python))
+    monkeypatch.setattr(bootstrap_module.sys, 'executable', '/seed/Ouroboros.bin')
+    native = {'LD_LIBRARY_PATH': '/seed/_internal:/seed/_internal/linux-gtk/lib/x86_64-linux-gnu',
+              'GI_TYPELIB_PATH': '/seed/_internal/linux-gtk/lib/x86_64-linux-gnu/girepository-1.0',
+              'GIO_MODULE_DIR': '/seed/_internal/linux-gtk/lib/x86_64-linux-gnu/gio/modules',
+              'PYWEBVIEW_GUI': 'gtk', 'OUROBOROS_DESKTOP_ENV_SAVED': '1',
+              **{'OUROBOROS_DESKTOP_HOST_' + key: '' for key in LINUX_DESKTOP_KEYS},
+              'OUROBOROS_DESKTOP_HOST_LD_LIBRARY_PATH': '1',
+              'OUROBOROS_DESKTOP_HOST_XDG_DATA_DIRS': '1/caller/share'}
+    for key, value in native.items():
+        monkeypatch.setenv(key, value)
+    with pytest.raises(Handover):
+        hand_over([], windows=False, frozen=True)
+    executed = next(call for call in hand_over.calls if isinstance(call, tuple) and call[0] == 'exec')
+    assert all(executed[3][key] == value for key, value in native.items())
+    host = host_environment(executed[3])
+    assert host['LD_LIBRARY_PATH'] == '' and host['XDG_DATA_DIRS'] == '/caller/share'
+    assert 'GI_TYPELIB_PATH' not in host
+    assert '--seed-bundle' in executed[2]
+    assert executed[1] == executed[2][0] == embedded_python
+    assert executed[1] != bootstrap_module.sys.executable

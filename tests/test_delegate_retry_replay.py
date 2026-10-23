@@ -2,7 +2,7 @@
 
 ``delegate_start(retry_of=<pending_invocation_id>)`` replays the retained canonical
 request under its original key. An omitted or empty prompt reuses that request; other
-text is an assertion on a direct call and undelivered advice on a configured one. The
+text is an exact assertion on both direct and configured calls. The
 single validator keeps its order, the recorded fingerprints survive the replay, the
 present target/snapshot checks still run, and a request argument the replay cannot
 honor is refused before anything is sent. Every engine call goes to a stub transport.
@@ -96,15 +96,14 @@ def test_a_public_retry_replays_the_recorded_request_under_its_key(tmp_path, mon
     assert payload["invocation_id"] == token and payload["max_seconds"] == 120
     assert engine.keys == [token, token] and engine.bodies[1] == engine.bodies[0]
     assert custody.pending_invocations(tmp_path) == []
-    # Configured text is advice: even the recorded words are disclosed as not sent.
-    assert ("coordination_text" in payload) == bool(configured and prompt)
+    assert "coordination_text" not in payload
 
 
-def test_a_configured_retry_never_sends_its_advisory_text(tmp_path, monkeypatch):
+def test_a_configured_retry_refuses_changed_text(tmp_path, monkeypatch):
     registry, engine, token = _lost_start(tmp_path, monkeypatch, configured=True)
     payload = _call(registry, retry_of=token, prompt=ADVICE)
-    assert payload["status"] == "started" and payload["coordination_text"].startswith("not sent"), payload
-    assert engine.keys == [token, token] and engine.bodies[1] == engine.bodies[0]
+    assert payload["reason"] == "retry_prompt_mismatch", payload
+    assert engine.keys == [token]
     assert ADVICE not in json.dumps(engine.bodies)
 
 
@@ -137,8 +136,7 @@ def test_a_retry_refuses_a_request_argument_it_cannot_replay(tmp_path, monkeypat
 @pytest.mark.parametrize("configured", [False, True])
 def test_a_retry_accepts_resent_values_equal_to_the_recording(tmp_path, monkeypatch, configured):
     registry, engine, token = _lost_start(tmp_path, monkeypatch, configured=configured)
-    bound_actor = {"subagent_id": "transport-fixture"} if configured else {}
-    payload = _call(registry, retry_of=token, max_seconds=120, effort="low", **bound_actor)
+    payload = _call(registry, retry_of=token, max_seconds=120, effort="low")
     assert payload["status"] == "started", payload
     assert engine.keys == [token, token] and engine.bodies[1] == engine.bodies[0]
 

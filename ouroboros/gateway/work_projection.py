@@ -20,7 +20,7 @@ log = logging.getLogger(__name__)
 
 _CONTINUE_PREFIX = "Continue: "
 # The census's execution facts for a member (gateway/state.py), never a work's identity.
-_EXECUTION_FACTS = frozenset({"running", "owner_pause_warm"})
+_EXECUTION_FACTS = frozenset({"running", "owner_pause_warm", "owner_wait"})
 
 
 def _strip_continue(name: str) -> str:

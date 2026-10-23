@@ -655,6 +655,30 @@ test('saved Pause with unreadable tree authority remains unknown in Activity and
     assert.match(body, /Pause status could not be read/);
 });
 
+test('Restart warns about a pausing child of a parked root, once, until it settles', async (t) => {
+    const { confirmAndSendRestart } = await import('../modules/chat_activity.js');
+    const { routes, ws } = setup(t);
+    const root = { activity_id: 'root', phase: 'budget_paused' };
+    const child = { activity: 'working', transition: 'pausing', confirmed: true };
+    const snapshot = (members, extra = {}) => ({ active_chat_activities: [root],
+        active_chat_activities_complete: true, works_complete: true,
+        works: [projectedWork('root', 'paused', { members: { states: members } })], ...extra });
+    const read = async (body) => {
+        routes.set(backgroundUrl, response(body));
+        let words;
+        assert.equal(await confirmAndSendRestart({ ws,
+            openConfirmDialog: async (options) => { words = options.body; return false; } }), 'cancelled');
+        return words;
+    };
+    assert.match(await read(snapshot({ child })), /1 task is still pausing/);
+    assert.match(await read(snapshot({ child }, { active_chat_activities: [root,
+        { activity_id: 'child', phase: 'budget_pausing' }] })), /1 task is still pausing/);
+    assert.match(await read(snapshot({ child, sibling: child })), /2 tasks are still pausing/);
+    assert.doesNotMatch(await read(snapshot({ child: { ...child, activity: 'paused', transition: 'none' } })), /still pausing/);
+    assert.match(await read(snapshot({ child: { ...child, confirmed: false } })), /Pause status could not be read/);
+    assert.match(await read(snapshot({}, { works_complete: false })), /Pause status could not be read/);
+});
+
 test('Activity Resume follows the root census while owner Pause is settling', async (t) => {
     const { mount, routes, ws } = setup(t);
     emptyActivity(routes);
@@ -1293,26 +1317,33 @@ test('Storage tray says why a run did not start and stops a run on Stop', async 
     storage.destroy();
 });
 
-test('Activity says why a held Continue waits, keeps its Resume, and never calls it a budget pause (#1721)', async (t) => {
+test('Activity keeps a held Continue blocker readable without offering Pause or Resume (#1721)', async (t) => {
     const { mount, routes, ws } = setup(t);
     emptyActivity(routes);
     routes.set(queueUrl, response({ queue: { running: [], pending: [{ id: 'pred-1-s1', task: {
         id: 'pred-1-s1', root_task_id: 'pred-1-s1', title: 'Continue Friday report',
         _budget_pause_hold: { reason: 'continuation_writer_unsettled', selected: false, dispatchable: false,
             detail: "the interrupted task's own work is not proven settled; this Continue waits",
-            predecessor_task_id: 'pred-1', blockers: [{ kind: 'delegated_run', task_id: 'pred-1', run_id: 'run-leaf',
-                invocation_id: '', state: 'running', stop_outcome: '', source: 'delegated_subagent' }] } } }] } }));
+            predecessor_task_id: 'pred-1', blockers: [{ kind: 'delegated_run', task_id: 'pred-1', run_id: '',
+                invocation_id: 'unbound', state: 'stop_unknown', stop_outcome: 'pending_invocation_unbound',
+                source: 'delegated_subagent' }] } } }] } }));
     routes.set(backgroundUrl, response({ bg_consciousness_enabled: false, works: [projectedWork('pred-1-s1', 'waiting', {
         because: [{ code: 'earlier_work_unconfirmed', text: "Continue starts when the earlier attempt's work is confirmed finished" }],
-        controls: [{ action: 'resume', target: 'pred-1-s1' }] })] }));
+        controls: [{ action: 'stop', target: 'pred-1-s1' }] })] }));
     const activity = initActivity({ mount, ws });
     await activity.refresh();
     const row = section(mount, 'queue').querySelector('.activity-row');
     assert.match(row.querySelector('.activity-sub').textContent,
-        /^Waiting · Continue starts when the earlier attempt&#39;s work is confirmed finished$/);
+        /^Waiting · Continue starts when the earlier attempt&#39;s work is confirmed finished · a delegated start has an unknown outcome \(no run was recorded\)$/);
     assert.ok(row.classList.contains('activity-held'), 'its cause wraps instead of ending in an ellipsis');
     assert.doesNotMatch(row.textContent, /paused \(budget\)/);
     const control = row.querySelector('[data-act="task-control"]');
-    assert.equal(control.getAttribute('data-budget-paused'), '1', 'the existing Resume rechecks it');
+    assert.equal(control.getAttribute('data-resume'), null, 'the wait releases itself');
+    assert.equal(control.getAttribute('data-budget-paused'), null, 'a writer wait is not a Pause');
+    // An older queue reply cannot keep displaying a blocker after the work moved on.
+    routes.set(backgroundUrl, response({ bg_consciousness_enabled: false,
+        works: [projectedWork('pred-1-s1', 'queued')] }));
+    await activity.refresh();
+    assert.equal(section(mount, 'queue').querySelector('.activity-sub').textContent, 'Queued');
     activity.destroy();
 });

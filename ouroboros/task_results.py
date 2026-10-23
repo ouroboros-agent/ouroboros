@@ -497,6 +497,8 @@ def write_task_result(
             note_task_terminal_transition(results_drive_root, task_id)
         except Exception:
             log.debug("task scope cleanup could not be started for %s; the sweep owns it", task_id, exc_info=True)
+    from ouroboros.swarm_receipt import refresh_for_task
+    refresh_for_task(results_drive_root, stored)
     return stored
 
 

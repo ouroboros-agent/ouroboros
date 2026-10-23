@@ -25,9 +25,6 @@ from ouroboros.delegate_registration_policy import (
     INVESTIGATION_AUTHORITY, INVESTIGATION_NOTE, evidence_only, no_write_authority,
     record_persistent as _record_persistent)
 from ouroboros.delegate_shared import _fail, lock_busy_facts
-from ouroboros.delegate_start_claims import (
-    PAYLOAD_CUSTODY_UNREADABLE as _UNREADABLE_HOLDER, payload_busy_detail,
-)
 from ouroboros.configured_subagents import SESSION_ACCESS_PROFILES
 from ouroboros.tools.tool_result import ToolResult
 from ouroboros.tools.registry import ToolContext, active_repo_dir_for
@@ -224,7 +221,7 @@ def _validated_invocation(drive: Any, retry_token: str, task_id: str,
                            "That invocation's durable row carries no canonical request "
                            "body, so it cannot be replayed byte-identically. Its outcome "
                            "remains unknown; restore the recorded request or reconcile "
-                           "the original invocation before starting a replacement.",
+                           "the original invocation before retrying that invocation.",
                            retry_of=retry_token)
     from ouroboros.delegate_continuation import retry_matches_caller_text
     if text and prompt != text and not retry_matches_caller_text(record, text):
@@ -257,6 +254,7 @@ class _RetryBinding(NamedTuple):
     execution_binding_fingerprint: str
     max_seconds_basis: str
     continuation: Any   # delegate_continuation.ContinuationStart: the recorded lineage
+    prompt_cache_ttl: Dict[str, Any]
 
 
 def _resolve_retry_invocation(ctx: ToolContext, drive: pathlib.Path, retry_token: str, text: str, *,
@@ -302,7 +300,8 @@ def _resolve_retry_invocation(ctx: ToolContext, drive: pathlib.Path, retry_token
     # byte-for-byte, but host custody/capture must keep naming the snapshot.
     # On the strict 3.8.0 wire workspaceRoot is absent and scope.root remains
     # the execution root, so this is byte-compatible with the legacy shape.
-    root = str(execution.get("workspaceRoot") or scope_root)
+    root = str((record.get("execution_root") if request_body.get("_thread_id") else "")
+               or execution.get("workspaceRoot") or scope_root)
     project_id = str(record.get("project_id") or "")
     # The C1 isolation binding recorded at the original attempt. Pre-C1 rows
     # carry none; their scope.root IS the authority target (in-place regime).
@@ -388,6 +387,7 @@ def _resolve_retry_invocation(ctx: ToolContext, drive: pathlib.Path, retry_token
         # too, never re-derived from today's clocks.
         max_seconds_basis=str(record.get("max_seconds_basis") or ""),
         continuation=replayed_custody(record),
+        prompt_cache_ttl=deepcopy(record.get("prompt_cache_ttl") if isinstance(record.get("prompt_cache_ttl"), dict) else {}),
     ), None
 
 
@@ -622,8 +622,8 @@ def capture_terminal_patch_for_drive(drive: Any, entry: _RunCustody, *, gateway=
                                      retain_investigation: bool = True) -> Optional[Dict[str, Any]]:
     """The drive-rooted core of the terminal capture — same contract, no ToolContext.
 
-    One capture author for both the nanny flow and the RECONCILIATION path (orphan sweep, kill-path
-    reconcile, pending-invocation recovery), so they cannot drift in what a "captured patch" is; the
+    One ordinary capture author for foreground collection, the body and disposition;
+    startup/control reconciliation leaves its work pending. Reviewers use their native owner. The
     apply/reject DECISION stays with a live owner, never taken here — an evidence-only investigation has
     none to take, so its ready capture is retained as evidence at once (#1609). ``patch_captured`` MEANS
     "a usable patch artifact exists" (C1-R3): the custody row is minted only over a ready-status
@@ -631,11 +631,16 @@ def capture_terminal_patch_for_drive(drive: Any, entry: _RunCustody, *, gateway=
     retry point stays open), and a pre-R3 row over a failed manifest falls through to a fresh capture.
     """
     from ouroboros.delegate_directory import is_directory_run, capture_directory_result, directory_capture_block
-    from ouroboros.tools.subagent_integration_delegated import retain_investigation_evidence
+    from ouroboros.tools.subagent_integration_delegated import retain_run_evidence
+
+    if entry is None or entry.review_owned:
+        return None  # the review owner compares against its frozen subject, never a product baseline
 
     def finish(block, transport=None):
-        return retain_investigation_evidence(drive, entry, block, transport) if retain_investigation else block
+        return retain_run_evidence(drive, entry, block, transport) if retain_investigation else block
 
+    if entry is not None and entry.mode == "plan":
+        return None  # A read-only plan retains its workspace for a later implement turn.
     if is_directory_run(entry):
         owned_gateway = None
         try:
@@ -700,14 +705,22 @@ def capture_terminal_patch_for_drive(drive: Any, entry: _RunCustody, *, gateway=
             # The preflight-head shape pins the capture BASE to the snapshot's baseline
             # commit (never a moved HEAD), reusing the one existing capture primitive —
             # sensitive veto, binary handling, sha256 manifest and all.
+            from ouroboros.delegate_start_instructions import EVIDENCE_DIRNAME
             from ouroboros.subagent_worktrees import find_execution_snapshot
             snapshot = find_execution_snapshot(entry.snapshot_id) or {}
             # A Git-subdirectory investigation runs in a folder of its clone; the
-            # capture always diffs the whole registered clone.
+            # capture always diffs the whole registered clone. The run's untracked
+            # named evidence is retained beside the capture, never carried in it (#2070).
+            clone = pathlib.Path(str(snapshot.get("path") or exec_root))
+            try:
+                evidence = (exec_root.resolve().relative_to(clone.resolve()) / EVIDENCE_DIRNAME).as_posix()
+            except ValueError:
+                evidence = ""
             _, manifest = write_workspace_patch_artifacts(
-                pathlib.Path(str(snapshot.get("path") or exec_root)), cap_dir,
+                clone, cap_dir,
                 task={"metadata": {"workspace_preflight": {"git": {"head": entry.baseline_sha}},
-                                   "file_baseline": snapshot.get("file_baseline") or {}}},
+                                   "file_baseline": snapshot.get("file_baseline") or {},
+                                   "host_evidence": evidence}},
             )
     except Exception as exc:
         log.warning("Delegated run patch capture failed for %s", entry.run_id, exc_info=True)
@@ -798,48 +811,6 @@ def payload_content_hash(payload_root: Any) -> str:
     return payload_digest(pathlib.Path(str(payload_root)), bucket="")
 
 
-def _payload_delegation_busy(drive: pathlib.Path, target: pathlib.Path) -> str:
-    """A run/invocation that still holds THIS payload open, or "" (R1 item 9).
-
-    Two concurrent delegations against one payload would race the same CAS
-    baseline, so the second is refused while the first has undisposed custody.
-    Single-pass (Sol delta, fix 5a): both projections come from ONE store read
-    transaction (``delegate_custody_current.payload_snapshot``) — two separate
-    reads let the holder's REQUESTED→STARTED transition land between them and a
-    second start slipped the claim lock; against one snapshot the holder is in
-    exactly one state, never missed. A failed read names ``_UNREADABLE_HOLDER``:
-    unknown custody refuses the start, never reads as a free payload.
-
-    An obligation is held by the payload, not by the task that created it: a
-    holder whose OWNER TASK is terminal cannot race the CAS baseline (its
-    snapshot is frozen; the apply-time whole-payload CAS is the real race
-    guard), so it stops locking the payload. Unprovable terminality keeps the
-    lock, and the cheap authority/target filters short-circuit first; the
-    terminality read follows the closed transaction.
-    """
-    from ouroboros.delegate_custody_current import payload_snapshot
-    from ouroboros.delegate_terminal import _task_is_terminal
-
-    resolved = _resolved(target)
-    try:
-        held = payload_snapshot(drive)
-    except Exception:
-        log.warning("Payload custody unreadable under %s; the start is refused", drive, exc_info=True)
-        return _UNREADABLE_HOLDER
-    for run in held["runs"].values():
-        if (run.authority_source == "skill_payload"
-                and _resolved(run.target_root) == resolved
-                and not (run.settled and run.patch_disposed)
-                and not _task_is_terminal(drive, run.task_id)):
-            return run.run_id or run.invocation_id
-    for record in held["pending"]:
-        if (str(record.get("authority_source") or "") == "skill_payload"
-                and _resolved(record.get("target_root")) == resolved
-                and not _task_is_terminal(drive, str(record.get("task_id") or ""))):
-            return str(record.get("invocation_id") or "")
-    return ""
-
-
 def _payload_selector_refusal(selector_root: str, retry_of: Any, bucket: Any,
                               skill_name: Any) -> Optional[ToolResult]:
     """Argument-shape validation for delegate_start's exact-resource selector."""
@@ -883,18 +854,12 @@ def payload_host_instructions(text: str, skill_name: str) -> str:
         "review then re-runs before the new content is relied on.")
 
 
-def claimed_start_request(
-    drive: pathlib.Path, *, claim_target: str, actor_ctx: Any = None,
-    enforce_actor_idle: bool = False, **request_row: Any,
-) -> Tuple[bool, Dict[str, Any]]:
-    """Compatibility facade for the one atomic pre-transport claim owner."""
-
+def claimed_start_request(drive: pathlib.Path, *, actor_ctx: Any = None,
+                          initial_bootstrap: bool = False, **request_row: Any) -> Tuple[bool, Dict[str, Any]]:
+    """The pre-POST custody decision; each private capture has its own admission."""
     from ouroboros.delegate_start_claims import claimed_start_request as claim
 
-    return claim(
-        drive, claim_target=claim_target, payload_busy=_payload_delegation_busy,
-        actor_ctx=actor_ctx, enforce_actor_idle=enforce_actor_idle, **request_row,
-    )
+    return claim(drive, actor_ctx=actor_ctx, initial_bootstrap=initial_bootstrap, **request_row)
 
 
 def _payload_mutation_authority(
@@ -965,21 +930,10 @@ def _payload_mutation_authority(
             "(write_file root='skill_payload', bucket='external', path='SKILL.md'), "
             "then delegate the now-existing payload.",
             bucket=b, skill_name=s)
-    busy = _payload_delegation_busy(drive, target)
-    if busy:
-        # Name the HOLDER'S OWNER, not a call the refused caller cannot make:
-        # delegate_wait and integrate_delegated_patch both refuse a non-owner.
-        # A PENDING (START_REQUESTED-only) holder has no replayed run row;
-        # unreadable custody has no holder to name.
-        holder_owner = "" if busy == _UNREADABLE_HOLDER else (str(
-            getattr(custody.lookup(drive, "", busy)[1], "task_id", "") or "") or next(
-            (str(r.get("task_id") or "") for r in custody.pending_invocations(drive)
-             if str(r.get("invocation_id") or "") == busy), ""))
+    if custody.custody_log_unreadable(drive):
         return None, None, _fail(
-            "delegate_start", "payload_delegation_busy",
-            payload_busy_detail(busy),
-            holder=busy, holder_owner_task_id=holder_owner,
-            target_root=str(target))
+            "delegate_start", "replacement_custody_unknown",
+            "Payload custody is unreadable; no new invocation was admitted.")
     record = {
         "target_root": str(target),
         "source": "skill_payload",

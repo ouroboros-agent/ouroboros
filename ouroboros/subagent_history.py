@@ -152,6 +152,8 @@ def record_task_execution(task: Mapping[str, Any], usage: Mapping[str, Any], *, 
     A failed API call leaves ``applied_model`` empty; the model that served
     instead is recorded under ``fallback`` and never certifies the failed route.
     """
+    from ouroboros.subagent_metric_events import task_execution
+    task_execution(drive_root, task, usage)
     snapshot = task.get("configured_subagent") or {}
     identity = execution_identity(snapshot)
     availability = task.get("subagent_availability") or {}
@@ -246,6 +248,10 @@ def record_session_execution(drive_root, custody, detail: Mapping[str, Any], obs
                 **({"effort": effort} if effort is not None else {}),
                 **({"processing_preference": custody.processing_preference}
                    if custody.processing_preference is not None else {})}
+    from ouroboros.subagent_metric_events import session_execution
+    session_execution(drive_root, custody, summary, identity, observed)
+    from ouroboros.swarm_receipt import refresh_for_task
+    refresh_for_task(drive_root, custody.task_id)
     record_last_delegation(
         route=custody.route_id, requested_model=custody.model,
         applied_model=str(observed.get("model") or ""), run_id=custody.run_id,

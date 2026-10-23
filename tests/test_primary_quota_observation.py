@@ -174,7 +174,19 @@ def test_a_real_engine_refusal_reaches_the_next_input_with_its_reset_the_prior_e
     from tests.test_quota_rotation_fallback import _pool_quota
     from tests.test_quota_rotation_fallback import _run as run_main
 
+    from ouroboros import context
+
     ctx, gateway, owner, events, _decide, _observations = main_call
+    shared_route = context._context_fit_route
+
+    def fallback_holds_its_input(task, **kwargs):
+        # The fallback's reported 512,206-token input is this test's subject; its route must hold it and a reply.
+        route, evidence = shared_route(task, **kwargs)
+        if evidence.route_fp == "other-route":
+            evidence = SimpleNamespace(**{**vars(evidence), "window_tokens": 1_050_000})
+        return route, evidence
+
+    monkeypatch.setattr(context, "_context_fit_route", fallback_holds_its_input)
     tools = _loop_tools(ctx, owner)
     monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", API_FALLBACK)
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")

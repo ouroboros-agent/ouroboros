@@ -398,8 +398,8 @@ export function setLiveCardPhase(record, phase = 'working', text = '', className
 }
 
 // One line of a card's OWN details block (a nested child card carries its own): what the
-// expanded card says about its chip or amount.
-function ownLiveDetail(record, key) {
+// expanded card says about its chip or amount, or its list of labelled facts.
+export function ownLiveDetail(record, key) {
     const own = node => Boolean(node?.dataset && key in node.dataset);
     for (const node of record?.root?.children || []) {
         if (own(node)) return node;

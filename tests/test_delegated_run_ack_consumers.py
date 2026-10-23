@@ -10,7 +10,8 @@ callers and the one same-attempt rebuild, not the helper alone:
   the attempt that transcript belongs to;
 * an owner-wait planned restart resumes the SAME attempt through ``run_llm_loop``:
   the first request after it omits the own-run line exactly when the restored
-  dialogue carries the terminal wake, and names the run when it does not;
+  dialogue carries the terminal wake; otherwise the unread-result line names
+  the output the body collected at loop exit, without acknowledging a wake;
 * the row survives the marker-filtered custody chain and the current closed-run
   receipt, so every custody reader replays the same acknowledgement.
 
@@ -44,6 +45,7 @@ from tests.test_delegated_run_discovery import geo as _geo
 geo = _geo
 TASK = "t-own"
 OWN_LINE = "OWN DELEGATED RUN ENDED — run run-1"
+UNREAD_LINE = "DELEGATED RESULT NEVER READ — run run-1"
 
 
 @pytest.fixture(autouse=True)
@@ -169,7 +171,7 @@ def test_a_same_attempt_cold_resume_keeps_the_restored_wake_and_its_ack(tmp_path
     if waited:
         from ouroboros.delegate_supervision import supervision_checkpoint
 
-        wake_id = supervision_checkpoint(live._ctx)["last_acknowledged_wake"]["wake_id"]
+        wake_id = supervision_checkpoint(live._ctx)["runs"]["run-1"]["last_acknowledged_wake"]["wake_id"]
         assert len(tool_rows) == 1 and '"status": "terminal"' in tool_rows[0]["content"]
         assert wake_id in tool_rows[0]["content"]
         assert _acks(tmp_path) == [("run-1", TASK, "1")]
@@ -197,7 +199,8 @@ def test_a_same_attempt_cold_resume_keeps_the_restored_wake_and_its_ack(tmp_path
     cold._ctx.owner_wait_resume = {**wait, "restart_transaction_id": "observed-restart"}
     cold._ctx.owner_wait_callback = lambda *_: None
     rebuilt = _fresh_messages(tmp_path, cold, attempt=1)
-    assert (OWN_LINE in _system_text(rebuilt)) is not waited
+    assert OWN_LINE not in _system_text(rebuilt)
+    assert (UNREAD_LINE in _system_text(rebuilt)) is not waited
 
     sent = []
 
@@ -215,10 +218,16 @@ def test_a_same_attempt_cold_resume_keeps_the_restored_wake_and_its_ack(tmp_path
         # The restored dialogue carries the wake; the reprojected system view does not repeat it.
         assert wake_id in restored and '"status": "terminal"' in restored
         assert OWN_LINE not in _system_text(request)
+        assert UNREAD_LINE not in _system_text(request)
     else:
-        assert '"status": "terminal"' not in restored and OWN_LINE in _system_text(request)
-    # A crash retry is a NEW attempt with a fresh transcript: the line returns there.
-    assert OWN_LINE in _system_text(_fresh_messages(tmp_path, _registry(tmp_path, attempt=2), attempt=2))
+        assert '"status": "terminal"' not in restored
+        assert OWN_LINE not in _system_text(request) and UNREAD_LINE in _system_text(request)
+    assert _acks(tmp_path) == ([("run-1", TASK, "1")] if waited else [])
+    # A crash retry has a fresh transcript: a consumed result's own-run line
+    # returns; a never-read result keeps its D7 line instead, without duplication.
+    retried = _system_text(_fresh_messages(tmp_path, _registry(tmp_path, attempt=2), attempt=2))
+    assert (OWN_LINE in retried) is waited
+    assert (UNREAD_LINE in retried) is not waited
 
 
 # --- the unknown-provider hold ---------------------------------------------------------

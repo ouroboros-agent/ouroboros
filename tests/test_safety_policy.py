@@ -119,7 +119,7 @@ def test_policy_check_calls_llm(monkeypatch):
     stub = _StubLLMClient('{"status":"SAFE","reason":"ok"}')
     _patch_llm_client(monkeypatch, stub)
 
-    ok, msg = check_safety("comment_on_pr", {"pr_number": 1, "body": "hi"})
+    ok, msg = check_safety("github_write", {"method": "comment", "target": 1, "body": "hi"})
 
     assert ok is True
     assert msg == ""
@@ -224,7 +224,7 @@ def test_llm_verdict_safe_proceeds_silently(monkeypatch):
     stub = _StubLLMClient('{"status":"SAFE","reason":"all good"}')
     _patch_llm_client(monkeypatch, stub)
 
-    ok, msg = check_safety("create_github_issue", {"title": "x"})
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"})
 
     assert ok is True
     assert msg == ""
@@ -241,7 +241,7 @@ def test_safety_calls_request_low_effort(monkeypatch):
     stub = _StubLLMClient(["not json at all", '{"status":"SAFE","reason":"ok"}'])
     _patch_llm_client(monkeypatch, stub)
 
-    ok, _ = check_safety("create_github_issue", {"title": "x"})
+    ok, _ = check_safety("github_write", {"method": "create_issue", "title": "x"})
 
     assert ok is True
     assert len(stub.calls) == 2
@@ -254,7 +254,7 @@ def test_llm_verdict_suspicious_proceeds_with_warning(monkeypatch):
     stub = _StubLLMClient('{"status":"SUSPICIOUS","reason":"odd but fine"}')
     _patch_llm_client(monkeypatch, stub)
 
-    ok, msg = check_safety("create_github_issue", {"title": "x"})
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"})
 
     assert ok is True
     assert "SAFETY_WARNING" in msg
@@ -267,7 +267,7 @@ def test_llm_verdict_dangerous_blocks(monkeypatch):
     stub = _StubLLMClient('{"status":"DANGEROUS","reason":"would leak secrets"}')
     _patch_llm_client(monkeypatch, stub)
 
-    ok, msg = check_safety("create_github_issue", {"title": "x"})
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"})
 
     assert ok is False
     assert "SAFETY_VIOLATION" in msg
@@ -281,7 +281,7 @@ def test_llm_unparseable_response_blocks(monkeypatch):
     stub = _StubLLMClient("this is not json at all")
     _patch_llm_client(monkeypatch, stub)
 
-    ok, msg = check_safety("create_github_issue", {"title": "x"})
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"})
 
     assert ok is False
     assert "SAFETY_UNAVAILABLE" in msg
@@ -295,7 +295,7 @@ def test_llm_json_embedded_in_prose_is_accepted(monkeypatch):
     stub = _StubLLMClient('Sure. {"status":"SAFE","reason":"benign"}')
     _patch_llm_client(monkeypatch, stub)
 
-    ok, msg = check_safety("create_github_issue", {"title": "x"})
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"})
 
     assert ok is True
     assert msg == ""
@@ -311,7 +311,7 @@ def test_llm_embedded_safe_before_dangerous_uses_stricter_verdict(monkeypatch):
     )
     _patch_llm_client(monkeypatch, stub)
 
-    ok, msg = check_safety("create_github_issue", {"title": "x"})
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"})
 
     assert ok is False
     assert "would leak secrets" in msg
@@ -326,7 +326,7 @@ def test_llm_unparseable_response_retries_once(monkeypatch):
     ])
     _patch_llm_client(monkeypatch, stub)
 
-    ok, msg = check_safety("create_github_issue", {"title": "x"})
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"})
 
     assert ok is True
     assert msg == ""
@@ -341,7 +341,7 @@ def test_llm_api_failure_blocks(monkeypatch):
     stub = _StubLLMClient("unused", raise_exc=RuntimeError("network down"))
     _patch_llm_client(monkeypatch, stub)
 
-    ok, msg = check_safety("create_github_issue", {"title": "x"})
+    ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"})
 
     assert ok is False
     assert "SAFETY_UNAVAILABLE" in msg
@@ -1033,7 +1033,7 @@ def test_usage_event_uses_resolved_model_and_inferred_provider_on_openrouter(mon
         event_queue = object()
         task_id = "t-openrouter"
 
-    ok, _ = check_safety("create_github_issue", {"title": "x"}, ctx=_Ctx())
+    ok, _ = check_safety("github_write", {"method": "create_issue", "title": "x"}, ctx=_Ctx())
     assert ok is True
     assert captured["provider"] == "openrouter"
     assert captured["source"] == "safety_check"
@@ -1069,7 +1069,7 @@ def test_usage_event_uses_direct_provider_when_resolved_by_client(monkeypatch):
         event_queue = object()
         task_id = "t-anthropic"
 
-    ok, _ = check_safety("create_github_issue", {"title": "x"}, ctx=_Ctx())
+    ok, _ = check_safety("github_write", {"method": "create_issue", "title": "x"}, ctx=_Ctx())
     assert ok is True
     assert captured["provider"] == "anthropic"
     assert captured["model_name"] == "anthropic/claude-sonnet-4-6"
@@ -1110,7 +1110,7 @@ def test_no_event_queue_preserves_unknown_cost_in_budget_fallback(monkeypatch):
     monkeypatch.setattr("supervisor.state.update_budget_from_usage", _record)
 
     # ctx=None path
-    ok, _ = check_safety("create_github_issue", {"title": "x"}, ctx=None)
+    ok, _ = check_safety("github_write", {"method": "create_issue", "title": "x"}, ctx=None)
     assert ok is True
     assert len(captured) == 1
     # Direct Anthropic has no automatic catalog. The fallback must preserve
@@ -1124,7 +1124,7 @@ def test_no_event_queue_preserves_unknown_cost_in_budget_fallback(monkeypatch):
 
     captured.clear()
     stub.calls.clear()
-    ok2, _ = check_safety("create_github_issue", {"title": "y"}, ctx=_CtxNoQueue())
+    ok2, _ = check_safety("github_write", {"method": "create_issue", "title": "y"}, ctx=_CtxNoQueue())
     assert ok2 is True
     assert len(captured) == 1
 
@@ -1160,7 +1160,7 @@ def test_usage_event_uses_local_provider_when_use_local_light(monkeypatch):
         event_queue = object()
         task_id = "t-local"
 
-    ok, _ = check_safety("create_github_issue", {"title": "x"}, ctx=_Ctx())
+    ok, _ = check_safety("github_write", {"method": "create_issue", "title": "x"}, ctx=_Ctx())
     assert ok is True
     assert captured["provider"] == "local"
     assert "(local)" in captured["model_name"]

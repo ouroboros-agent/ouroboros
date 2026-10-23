@@ -40,12 +40,16 @@ def test_runtime_branch_defaults_preserve_managed_choices_and_fallback(monkeypat
 @pytest.fixture
 def startup_controls(native_guard, tmp_path, monkeypatch):  # noqa: F811 - imported fixture
     import server
+    from ouroboros import store
     from ouroboros.gateway.control import api_command
     from ouroboros.gateway.ws import ws_endpoint
     from supervisor import message_bus, state, workers, git_ops
 
     data, repo = tmp_path / 'data', tmp_path / 'repo'
     repo.mkdir(); data.mkdir()
+    # Receipt creation probes the Windows drive type via WinDLL. Supply this
+    # fixture's local-disk fact; keep real SQLite I/O and the native-effect fence.
+    monkeypatch.setattr(store, '_windows_filesystem', lambda _path: 'fixed')
     monkeypatch.setattr(server, 'DATA_DIR', data)
     monkeypatch.setattr(server, 'REPO_DIR', repo)
     monkeypatch.setattr(server, '_supervisor_thread', None)

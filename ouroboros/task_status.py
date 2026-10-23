@@ -1209,6 +1209,7 @@ def wait_for_effective_tasks(
     mode: str = "all_terminal",
     poll_interval_sec: float = 0.5,
     on_poll: Optional[Callable[[Dict[str, Any], Dict[str, bool]], Any]] = None,
+    terminal_probe: Optional[Callable[[Dict[str, Any]], Dict[str, bool]]] = None,
 ) -> Dict[str, Any]:
     """Poll effective task results until the wait ``mode`` is satisfied.
 
@@ -1244,7 +1245,8 @@ def wait_for_effective_tasks(
             )
             for tid in ids
         }
-        terminal = {tid: str(data.get("status") or "").strip().lower() in SETTLED_STATUSES for tid, data in results.items()}
+        terminal = (terminal_probe(results) if terminal_probe is not None else
+                    {tid: str(data.get("status") or "").strip().lower() in SETTLED_STATUSES for tid, data in results.items()})
         # Sliced wait hook: a child->parent attention beacon (including review_requested)
         # gets one preflight even when the child already terminalized, so a beacon
         # written before this wait is not hidden by the terminal fast path.
@@ -1272,7 +1274,8 @@ def wait_for_effective_tasks(
         "timeout_sec": float(timeout_sec or 0),
         "elapsed_sec": max(0.0, time.monotonic() - start),
         "timed_out": timed_out,
-        "all_terminal": all(str(data.get("status") or "").strip().lower() in SETTLED_STATUSES for data in results.values()) if ids else True,
+        "all_terminal": (all(terminal_probe(results).values()) if terminal_probe is not None else
+                         all(str(data.get("status") or "").strip().lower() in SETTLED_STATUSES for data in results.values())) if ids else True,
         "tasks": results,
     }
     if early is not None:

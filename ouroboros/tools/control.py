@@ -184,6 +184,7 @@ def get_tools() -> List[ToolEntry]:
                     "effective_criteria": {"type": "string"}, "material_tool_indices": {"type": "array", "items": {"type": "integer"}},
                 }, "required": ["owner_source_sha256"]},
                 "pending_review": {"type": "string", "enum": ["wait", "finish"], "default": "wait"},
+                "swarm_comparison": {"type": "string", "description": "Optional solo-versus-swarm comparison in your own words, attributed to you separately from measured tree facts."},
                 "silent": {"type": "boolean", "default": False, "description": "A consciousness wake or a schedule-born root without a Presence binding may finish without a message when no human reply is owed; any answer stays in the durable result as internal text (wake_silent)."},
             }, "required": ["action"]}}, _finish_task),
         ToolEntry("set_tool_timeout", {
@@ -256,11 +257,14 @@ def get_tools() -> List[ToolEntry]:
             "description": "Send a note to another work, with optional exact owner quotes selected from "
                            "your held owner_quote_handles. The note is yours; quoted words remain the owner's. "
                            "The work reads it at its next checkpoint. Paused work keeps the mail without resuming. "
+                           "The owner sees it in that work's room as a note card: your summary first, the note on request. "
                            "Use forward_to_worker for messages inside your task tree. "
                            "Presence can address work of its own binding only.",
             "parameters": {"type": "object", "properties": {
                 "task_id": {"type": "string", "description": "Work to receive the message."},
                 "note": {"type": "string", "default": "", "description": "Your own words and context."},
+                "summary": {"type": "string", "default": "",
+                            "description": "One plain sentence for the owner, in the owner's language: what this note tells that work."},
                 "quote": {"type": "array", "items": {"type": "string"}, "default": [],
                           "description": "Owner row addresses held by this turn; exact words and attachments travel together."},
             }, "required": ["task_id"]},

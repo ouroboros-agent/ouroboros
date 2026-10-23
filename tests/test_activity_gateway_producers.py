@@ -24,6 +24,11 @@ def test_activity_renders_the_real_gateway_members_without_inventing_unknowns(tm
     wait = owner_wait.set_owner_wait(tmp_path, warm["id"], {"state": "waiting", "reason": "owner_pause"})
     workers.RUNNING[warm["id"]]["owner_wait"] = wait
     assert refresh_owner_pause_tree(warm["id"]) == "paused"
+    sleeper = {"id": "warm-sleeper", "type": "task", "chat_id": 7, "root_task_id": "warm-sleeper"}
+    write_task_result(tmp_path, sleeper["id"], "running", chat_id=7)
+    sleeping = owner_wait.set_owner_wait(tmp_path, sleeper["id"], {
+        "state": "waiting", "reason": "sleep", "sleep": {"mode": "warm"}, "task_attempt": 1})
+    workers.RUNNING[sleeper["id"]] = {"task": sleeper, "attempt": 1, "owner_wait": sleeping}
     registry = get_direct_activity_registry()
     registry.register("direct-turn", 42, phase="thinking")
     try:
@@ -37,7 +42,7 @@ def test_activity_renders_the_real_gateway_members_without_inventing_unknowns(tm
     members = {task: state for work in body["works"] for task, state in work["members"]["states"].items()}
     assert {task: (state["activity"], state["confirmed"]) for task, state in members.items()} == {
         "direct-turn": ("working", True), "root-1": ("working", True), "child-run": ("working", True),
-        "child-new": ("queued", True), "warm-author": ("paused", True)}
+        "child-new": ("queued", True), "warm-author": ("paused", True), "warm-sleeper": ("waiting", True)}
     # Both HTTP bodies are Python-produced. Only HTTP transport/DOM mechanics are stood in for;
     # Activity, workRowView, memberState and controls remain production JS.
     script = """
@@ -68,7 +73,8 @@ try {
     rows = json.loads(rendered.stdout)
     assert set(rows) == set(members)
     for task, word in {"direct-turn": "Thinking", "root-1": "Working", "child-run": "Working",
-                       "child-new": "Queued", "warm-author": "Paused"}.items():
+                       "child-new": "Queued", "warm-author": "Paused",
+                       "warm-sleeper": "Waiting · Sleeping until it is woken"}.items():
         assert word in rows[task]["text"], rows[task]
         assert "unconfirmed" not in rows[task]["text"]
         assert rows[task]["resume"] is (task == "warm-author")

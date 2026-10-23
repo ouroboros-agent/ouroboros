@@ -56,7 +56,8 @@ chat use a native reply; answers to its latest owner message stay unquoted.
 Silent mode edits only within one task episode and reply origin; Continue
 episodes remain separate messages. Relay success stays silent; a host-reported
 failure arrives as one line. A relayed row quotes the owner's words verbatim as
-plain text, under where he wrote them and with the file names, above the note.
+plain text, under where he wrote them and with the file names, above the note; a
+note between works that quotes none of his words stays in its room.
 Quiz buttons and replies keep their decision path; earlier parts of a long
 question carry ordinary references.
 

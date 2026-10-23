@@ -695,7 +695,7 @@ def run_llm_loop(
                 # Configured routes before any wait; an active episode owns its own outcome.
                 # Fallbacks and an owner-wait resend are author calls too. Their
                 # physical sender retains any late answer after this wait leaves.
-                with receiver_abandonable():
+                with receiver_abandonable(), working_checkpoint.model_call_scope(limit_ctx):
                     (msg, active_model, active_use_local, context_fit_plan, active_context_mode,
                      transport_wait) = _recover_failed_round(
                         limit_ctx, tools, msg, transport_wait, context_fit_plan=context_fit_plan,
@@ -713,13 +713,11 @@ def run_llm_loop(
             limit_ctx.active_model = ctx.active_model = active_model
             limit_ctx.active_use_local = ctx.active_use_local = active_use_local
             ctx.context_fit_plan, ctx.active_context_mode = context_fit_plan, active_context_mode
-            if (msg is None and str(accumulated_usage.get("_last_llm_error_kind") or "") == "llm_output_exhausted"
-                    and not provider_no_call_source(accumulated_usage, False)[0]):
-                # Output exhaustion is no outage (primary or configured candidate): no wait, no provider
-                # terminal; one host fact, then the next round decides under the round, time and money
-                # limits. A round holding an unresolved attempt keeps the recovery below (provider_no_call_source).
-                _append_or_merge_user_message(
-                    messages, _output_exhausted_notice(accumulated_usage.get("_last_llm_output_exhausted")))
+            from ouroboros import loop_output_exhaustion as output_recovery
+            if msg is None and (output_step := output_recovery.next_step(accumulated_usage)):
+                if output_step == "finish":
+                    return output_recovery.finish(limit_ctx)
+                # The episode owner persisted the facts with its informed allowance.
                 pending_no_tool_budget = True  # an unfinished no-tool round keeps the same budget tail (#1223)
                 continue
             if msg is None and transport_wait is not None and _transport_wait_step(

@@ -1279,14 +1279,14 @@ def _no_tool_final_answer(
         messages.append({"role": "user", "content": refusal})
         _loop()._arm_delivery_control(tools, limit_ctx, llm_trace)
         return held()
-    if isinstance(getattr(tools._ctx, "_presence_completion", None), dict):
-        # Only this successful common exit accepts the requested outcome. Holds,
-        # owner controls and budget exits must not inherit an earlier silent/send.
+    if isinstance(getattr(tools._ctx, "_presence_completion", None), dict):  # Accept only at this common exit.
         tools._ctx._presence_completion_accepted = True
         limit_ctx.accumulated_usage["presence_completion_outcome"] = tools._ctx._presence_completion["outcome"]
         limit_ctx.accumulated_usage["terminal_origin"] = _loop().TERMINAL_ORIGIN_MODEL_FINAL
     if getattr(candidate, "quiet", False):  # only this exit accepts a wake's silent finish
         limit_ctx.accumulated_usage.update(wake_silent=True, terminal_origin=_loop().TERMINAL_ORIGIN_MODEL_FINAL)
+    from ouroboros.swarm_receipt import retain_comparison
+    retain_comparison(tools._ctx)
     return _loop()._handle_text_response(str(content or ""), llm_trace, limit_ctx.accumulated_usage)
 
 

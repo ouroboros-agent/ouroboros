@@ -171,20 +171,7 @@ def _handle_chat_direct_locked(
     task_constraint: Optional[dict] = None,
     task_metadata: Optional[dict] = None,
 ) -> None:
-    from supervisor.state import budget_remaining, load_state
-    failure_meta = _host_operation_failure(task_metadata)
-    try:
-        remaining = budget_remaining(load_state(), strict=True)
-    except Exception:
-        _pool().send_with_budget(chat_id, "⚠️ Cost accounting is unavailable. Task was not dispatched; retry after ledger recovery.", **failure_meta, role="system", system_type="task_admission_notice")
-        return
-    if remaining <= 0:
-        try:
-            _pool().send_with_budget(chat_id, "🚫 Budget exhausted. Task rejected. Please increase TOTAL_BUDGET in settings.", **failure_meta, role="system", system_type="task_admission_notice")
-        except Exception:
-            pass
-        return
-
+    # The registered agent owns the strict money read, including its storage wait and controls.
     _run_chat_task(
         None, chat_id, text, image_data,
         task_constraint=task_constraint, task_metadata=task_metadata,
@@ -530,18 +517,23 @@ def _execute_chat_task(admitted: Dict[str, Any]) -> bool:
             checkpoint = ((event.get("resource_limit") or {}).get("checkpoint")
                           if isinstance(event, dict) and isinstance(event.get("resource_limit"), dict) else None)
             if not (isinstance(event, dict) and str(event.get("type") or "") == "budget_pause"
-                    and event.get("_is_direct_chat") and isinstance(checkpoint, dict)):
+                    and event.get("_is_direct_chat") and (isinstance(checkpoint, dict)
+                    or (event.get("resource_limit") or {}).get("before_task_start"))):
                 remaining.append(event)
                 continue
             from supervisor.direct_pause import park_direct_pause
-            if not park_direct_pause(task, event):
-                remaining.append(event)
+            try:
+                if not park_direct_pause(task, event):
+                    remaining.append(event)
+            finally:
+                if (event.get("resource_limit") or {}).get("before_task_start"):
+                    agent._release_turn()
         for e in remaining:
             _pool().get_event_q().put(stamp_finalization_enqueue(turn_queue.stamp(e)))
         ok = True
     except Exception as e:
         from supervisor.direct_pause import recover_direct_pause
-        ok = recover_direct_pause(task)
+        ok = recover_direct_pause(task, e)
         if not ok:
             _report_direct_chat_error(admitted, e)
     finally:
@@ -554,12 +546,17 @@ def _report_direct_chat_error(admitted: Dict[str, Any], e: BaseException) -> Non
     import traceback
     task, chat_id, kind = admitted["task"], admitted["chat_id"], admitted["kind"]
     client_msg_id, task_metadata = admitted["client_msg_id"], admitted.get("task_metadata")
-    err_msg = f"⚠️ Error: {type(e).__name__}: {e}"
+    stopped = (getattr(e, "before_task_start", False)
+               and getattr(e, "control_reason", "") in {"cancelled", "finalize_requested"})
+    exhausted = getattr(e, "before_task_start", False) and getattr(e, "control_reason", "") == "budget_exhausted"
+    err_msg = ("⏹ The owner stopped this chat turn before it started; no work was done." if stopped else
+               "🚫 Budget exhausted. Task rejected. Please increase TOTAL_BUDGET in settings." if exhausted else
+               f"⚠️ Error: {type(e).__name__}: {e}")
     append_jsonl(
         _pool().DRIVE_ROOT / "logs" / "supervisor.jsonl",
         {
             "ts": utc_now_iso(),
-            "type": "direct_chat_error",
+            "type": "direct_chat_stopped" if stopped else "direct_chat_error",
             "task_id": str(task.get("id") or ""),
             "chat_id": int(chat_id or 0),
             "error": repr(e),
@@ -592,7 +589,7 @@ def _report_direct_chat_error(admitted: Dict[str, Any], e: BaseException) -> Non
                 log.debug("Failed-turn typing announce failed", exc_info=True)
         # The keyed final concludes its own turn and linked Sending; it keeps only the host-operation source.
         correlation = _host_operation_failure(task_metadata).get("progress_meta", {})
-        progress_meta = {"task_terminal_status": "failed"}
+        progress_meta = {"task_terminal_status": "cancelled" if stopped else "failed"}
         if "origin_message_ref" in correlation:
             progress_meta["origin_message_ref"] = correlation["origin_message_ref"]
         initiator = str((task_metadata or {}).get("initiator") or "")
@@ -603,7 +600,7 @@ def _report_direct_chat_error(admitted: Dict[str, Any], e: BaseException) -> Non
             err_msg,
             task_id=failed_task_id,
             progress_meta=progress_meta,
-            role="system", system_type="task_error")
+            role="system", system_type="task_not_started" if stopped or exhausted else "task_error")
     except Exception:
         log.debug("Suppressed exception", exc_info=True)
 

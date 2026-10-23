@@ -127,7 +127,7 @@ function cardHtml(view, atoms, note = view.available ? '' : tr('media.attachment
     const meta = metaText(view, atoms, note);
     const kind = note ? '' : readable(view);
     return `<div class="chat-file-item${view.available ? '' : ' is-unavailable'}">
-        <button type="button" class="chat-file-card" ${view.available ? 'aria-haspopup="dialog"' : 'disabled aria-disabled="true"'}
+        <button type="button" class="btn btn-default chat-file-card" ${view.available ? 'aria-haspopup="dialog"' : 'disabled aria-disabled="true"'}
             aria-label="${escapeHtmlAttr(`${view.name}${meta ? ` — ${meta}` : ''}`)}">
             ${FILE_GLYPH}
             <span class="chat-file-copy">

@@ -355,10 +355,13 @@ def _live_running_task_ids(ctx: Any) -> list:
             hb = 0.0
         if hb and (now - hb) < HEARTBEAT_STALE_SEC:
             live.append(str(tid))
-    from supervisor.active_activity import get_direct_activity_registry
+    from supervisor.active_activity import get_direct_activity_registry, is_parked_direct_entry
 
+    # A direct turn parked in a durable owner wait is carried by the restart's
+    # owner-wait handoff, exactly as the update fence treats it (#2191).
     return list(dict.fromkeys(live + [
-        row["activity_id"] for row in get_direct_activity_registry().snapshot()
+        entry.activity_id for entry in get_direct_activity_registry().actors()
+        if not is_parked_direct_entry(entry)
     ]))
 
 

@@ -34,6 +34,8 @@ from ouroboros.gateway.contracts import (
     DecisionRequest,
     DecisionResponse,
     DesktopAutostartResponse,
+    EvolutionDataResponse,
+    EvolutionRefresh,
     QuizOutbound,
     QuizStateOutbound,
     LogOutbound,
@@ -231,6 +233,9 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     for name in ("CommandInbound", "PanicAcceptedOutbound"):
         assert f"import('./client_contract_types.js').{name}" in text
     text += "\n" + (modules / "client_contract_types.js").read_text(encoding="utf-8")
+    for name in ("EvolutionRefresh", "EvolutionDataResponse"):
+        assert f"import('./evolution_types.js').{name}" in text
+    text += "\n" + (modules / "evolution_types.js").read_text(encoding="utf-8")
     version = (pathlib.Path(__file__).resolve().parent.parent / "VERSION").read_text(encoding="utf-8").strip()
     assert f"GATEWAY_CONTRACT_VERSION = '{version}'" in text
     settings_meta_fields = {
@@ -341,7 +346,8 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
                 ClaudexorVendorCredentialDisposition,
                 ClaudexorStatusReads, ClaudexorStatusResponse,
                 ClaudexorPassiveReadError, ClaudexorQuotaResponse,
-                WidgetTab, WidgetsResponse, WidgetFaultRequest, WidgetFaultResponse):
+                WidgetTab, WidgetsResponse, WidgetFaultRequest, WidgetFaultResponse,
+                EvolutionDataResponse, EvolutionRefresh):
         expected = set(get_type_hints(cls, include_extras=True))
         actual = _js_typedef_fields(text, cls.__name__)
         # ABI 7.0 (ABI-3): the alias JSDoc lines were cleaned up in the F3.3

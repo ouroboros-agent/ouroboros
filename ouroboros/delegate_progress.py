@@ -673,6 +673,40 @@ def paused_note(pending_interactions: Optional[List[Dict[str, Any]]]) -> str:
             "Do not cancel a run merely because it asked a question.")
 
 
+def message_journal_receipt(ctx: Any, result: Any) -> Any:
+    """Attach peer journal rows at the ordinary receipt boundary, never a wake.
+
+    Receipts may repeat rows by message_id. No read cursor or ACK advances
+    here, so losing a receipt before transcript insertion loses no message.
+    The existing wake renderer retains oversized receipts before projecting.
+    """
+    from ouroboros.delegate_message_store import journal
+    from ouroboros.delegate_shared import delegate_payload, delegate_result
+    from ouroboros.tool_capabilities import tool_result_limit
+
+    payload = delegate_payload(result)
+    run_id = str(payload.get("run_id") or "")
+    if not run_id or payload.get("message_id") or payload.get("ok") is False:
+        return result
+    rows = []
+    try:
+        rows = journal(ctx, run_id)
+    except Exception:
+        payload["peer_messages_delivery"] = {"complete": False, "reason": "journal_unavailable"}
+    else:
+        if not rows:
+            return result
+        payload["peer_messages"] = rows
+    if len(json.dumps(payload, ensure_ascii=False, indent=2)) > tool_result_limit("delegate_wait"):
+        from ouroboros.delegate_supervision import _render_wake_payload
+
+        payload = delegate_payload(_render_wake_payload(ctx, payload))
+        if "wake_delivery" in payload and rows:
+            payload["wake_delivery"]["note"] = (
+                f"Full receipt and {len(rows)} peer messages at source. Read before relying on omitted detail.")
+    return delegate_result(payload, meta=result.meta)
+
+
 def window_payload(
     *,
     run_id: str,

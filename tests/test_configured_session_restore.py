@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from tests.test_available_subagents_runtime import _session_row, _settings, _snapshot
-from tests._stub_delegate_engines import stub_delegate_engines  # noqa: F401
+from tests._stub_delegate_engines import stub_delegate_engines as stub_delegate_engines
 
 pytestmark = pytest.mark.serial
 
@@ -191,7 +191,7 @@ def test_owner_wait_repark_does_not_deliver_or_ack_startup_receipt(tmp_path, mon
 
 @pytest.mark.parametrize("retry", [False, True])
 @pytest.mark.parametrize("ready", [False, True])
-def test_fresh_and_no_saved_retry_keep_automatic_start_rules(tmp_path, monkeypatch, retry, ready):
+def test_fresh_start_and_retry_keep_bootstrap_once_rules(tmp_path, monkeypatch, retry, ready):
     from ouroboros import claudexor_daemon, subagents, subagent_bootstrap, subagent_runtime
     from ouroboros.agent_dispatch import resolve_dispatch_axes
     from ouroboros.delegate_shared import delegate_result
@@ -210,7 +210,12 @@ def test_fresh_and_no_saved_retry_keep_automatic_start_rules(tmp_path, monkeypat
     monkeypatch.setattr(subagent_runtime, "exact_start", lambda *_a, **_k:
                         calls.append(True) or delegate_result({"status": "started", "run_id": "fresh-run"}))
     raw = subagent_bootstrap.bootstrap_before_context(ctx, task, resolve_dispatch_axes(task))
-    if ready:
+    if ready and retry:
+        assert not calls
+        payload = json.loads(raw)
+        assert payload["status"] == "configured_session_continuation"
+        assert payload["startup"]["physical_start"] == "not_repeated"
+    elif ready:
         assert calls == [True] and json.loads(raw)["status"] == "configured_session_started"
     else:
         assert not calls and raw == ""

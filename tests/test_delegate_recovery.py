@@ -6,9 +6,9 @@ import pytest
 
 from tests.test_configured_session_restore import InputReached
 from tests.test_delegate_pending_recovery import _pending_handoff
-from tests.test_planned_delegate_assignment import prepared, restore  # noqa: F401
+from tests.test_planned_delegate_assignment import prepared as prepared, restore  # noqa: F401
 from tests.test_swarm_host_admission import host  # noqa: F401
-from tests._stub_delegate_engines import stub_delegate_engines  # noqa: F401
+from tests._stub_delegate_engines import stub_delegate_engines as stub_delegate_engines
 
 pytestmark = pytest.mark.serial
 
@@ -465,8 +465,9 @@ def test_restored_handoff_grounds_prior_physical_runs_in_local_custody(tmp_path,
     assert not stub_delegate_engines
 
 
-@pytest.mark.parametrize("fate", ["refused", "bound_settled", "refused_running",
-                                  "refused_foreign_binding", "refusal_unreadable"])
+# A bad OLD holder (foreign binding, unreadable fate) no longer decides the fate of a valid sleeping
+# sibling: holders are proven and preserved one by one (tests/test_delegate_plural_recovery.py).
+@pytest.mark.parametrize("fate", ["refused", "bound_settled", "refused_running"])
 @pytest.mark.parametrize("door", ["worker_crash", "planned_restart"])
 def test_resolved_pending_reservation_yields_wait_sources_to_current_supervision(
         tmp_path, monkeypatch, stub_delegate_engines, fate, door):
@@ -487,8 +488,6 @@ def test_resolved_pending_reservation_yields_wait_sources_to_current_supervision
     else:
         assert custody.emit(tmp_path, custody.START_FAILED, {"task_id": "nanny", "invocation_id": invocation,
                                                              "definite": True})
-    if fate == "refused_foreign_binding":
-        recovery._write(tmp_path, {**row, "snapshot_id": "foreign"})
     assert custody.record_started(tmp_path, custody.RunCustody(
         run_id="run-c", invocation_id="invoke-c", task_id="nanny", route_id="codex", **binding))
     if fate != "refused_running":
@@ -497,10 +496,6 @@ def test_resolved_pending_reservation_yields_wait_sources_to_current_supervision
         with pytest.raises(InputReached):
             ds.supervised_wait(ctx, "run-c", since_seq=23, wait_once=worker_dies)
         assert ds._load_state(ctx, "run-c")["status"] == "sleeping"
-    if fate == "refusal_unreadable":
-        def unreadable(*_a, **_k):
-            raise OSError("controlled unreadable invocation fate")
-        monkeypatch.setattr(custody, "invocation_record", unreadable)
     engines, before = list(stub_delegate_engines), recovery._path(tmp_path, "nanny").read_bytes()
     unrecoverable = []
     monkeypatch.setattr(recovery, "reconcile_unrecoverable_task", lambda *_a: unrecoverable.append(True))

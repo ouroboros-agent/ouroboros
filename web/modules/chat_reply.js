@@ -8,6 +8,7 @@ import { tr } from './i18n.js';
 import { showToast } from './toast.js';
 import { isStoreMigrating } from './api_client.js';
 import { authorOf, createRelayQuote, createReplyQuote, normalizeReplyRef, replySnippet } from './chat_reply_quote.js';
+import { createRelayDecks } from './chat_relay_deck.js';
 import { fullText } from './text_fit.js';
 import { bindBubbleActions } from './message_actions.js';
 import { revealTimelineNode } from './chat_render_batch.js';
@@ -65,6 +66,8 @@ export function createChatReplies({ chatId, feed, input, key = '', reading, hist
     let strip = null;
     let targetTimer = 0;
     const bubbleActions = bindBubbleActions({ feed, registry: actions, onDomWrite });
+    // Notes between works: a relay row's bubble is dressed as a note card and grouped into decks (chat_relay_deck.js).
+    const decks = createRelayDecks({ feed, onDomWrite });
     let destroyed = false;
     // `held`: the reader's own live-edge intent while a reveal is pending (a reveal sets stick false itself).
     let revealGeneration = 0, revealing = 0, held = null;
@@ -125,7 +128,9 @@ export function createChatReplies({ chatId, feed, input, key = '', reading, hist
             target = result.target;
         }
         if (!wanted()) return null;
-        const header = feed.closest('.page, .chat-instance-panel')?.querySelector('.chat-page-header, .chat-panel-statusbar');
+        target = decks.surface(target) || target;  // a tucked note's deck opens, so the row it lands on shows
+        const header = feed.closest('.project-panel')?.querySelector('.project-panel-bar')
+            || feed.closest('.page, .chat-instance-panel')?.querySelector('.chat-page-header, .chat-panel-statusbar');
         const clearance = Math.max(HEADER_CLEARANCE,
             (header?.getBoundingClientRect().bottom || 0) - feed.getBoundingClientRect().top + 12);
         revealTimelineNode(target, feed, clearance);
@@ -313,6 +318,7 @@ export function createChatReplies({ chatId, feed, input, key = '', reading, hist
     }
 
     function syncDerivedQuotes(around = null) {
+        decks.schedule();  // a landed row may join, split or end a run of notes
         if (!around) {
             return [...feed.querySelectorAll('.chat-bubble > .chat-quote[data-derived="1"]')]
                 .reduce((changed, quote) => syncDerivedQuote(quote.parentElement) || changed, false);
@@ -335,7 +341,7 @@ export function createChatReplies({ chatId, feed, input, key = '', reading, hist
             if (address) bubble.dataset.rowAddress = address;
             const sender = bubble.querySelector('.sender');
             const role = ROLE_NAMES.find((name) => bubble.classList.contains(name));
-            const relay = role === 'assistant' ? createRelayQuote(row?.relay, { onDomWrite }) : null;
+            const relay = role === 'assistant' ? createRelayQuote(row?.relay, { onDomWrite, card: bubble.dataset.systemType === 'relay_entry' }) : null;
             const quote = relay || createReplyQuote(row?.reply_to, { onJump: jump });
             if (quote && !relay && role !== 'user') {
                 quote.dataset.derived = '1';
@@ -343,6 +349,7 @@ export function createChatReplies({ chatId, feed, input, key = '', reading, hist
             }
             if (quote) sender?.after(quote);
             mountControl(bubble);
+            if (row?.relay && bubble.dataset.systemType === 'relay_entry') decks.adopt(bubble, row, Boolean(relay));
         },
         /** A row built outside addMessage (media, files, links, a question card): its address makes it a reply target. */
         stamp(bubble, row) {
@@ -390,6 +397,7 @@ export function createChatReplies({ chatId, feed, input, key = '', reading, hist
             destroyed = true;
             clearTimeout(targetTimer);
             bubbleActions.destroy();
+            decks.destroy();
             keyHost?.removeEventListener('keydown', onKeydown);
             strip?.remove();
             strip = null;

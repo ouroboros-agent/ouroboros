@@ -11,6 +11,7 @@ from ouroboros import dialogue_store
 from tests.test_ui_smoke_playwright import direct_server_with_data as direct_server_with_data
 from tests.test_subscription_setup_browser import subscription_ui as subscription_ui
 from tests.ui_chat_viewport_smoke import _CAPTURE_TEST_SOCKET, _emit_ws_frame, _SETTLE_RESTORE_FRAMES
+from tests.ui_motion_samples import SAMPLE_TRANSITION
 
 
 _MEASURE = """messages => {
@@ -136,17 +137,16 @@ def test_main_behind_a_page_keeps_its_reserve_and_comes_back_above_the_composer(
     assert back["lastBottom"] <= back["composerTop"] + 1, ("the first frame back clears the composer", back)
 
 
-# Where the composer's ☰ stands on every frame from a press: Reply on the newest answer, or the strip's ×.
+# Where ☰ stands along the real transition: Reply on the newest answer, or the strip's ×.
 _MENU_FRAMES = """async (action) => {
     const menu = document.querySelector('#page-chat .chat-toolbar-row [data-mobile-nav-toggle]');
-    const tops = [menu.getBoundingClientRect().top];
-    if (action === 'stage') [...document.querySelectorAll('#chat-messages .chat-message-reply')].at(-1).click();
-    else document.querySelector('#page-chat .chat-quote--composer .chat-quote-cancel').click();
-    for (let i = 0; i < 30; i += 1) {
-        await new Promise((resolve) => requestAnimationFrame(resolve));
-        tops.push(menu.getBoundingClientRect().top);
-    }
-    return tops;
+    const strip = () => document.querySelector('#page-chat .chat-quote--composer');
+    const sample = """ + SAMPLE_TRANSITION + """;
+    return sample({root: document.querySelector('#chat-input-area'), target: strip, property: 'max-height',
+        ready: () => strip()?.dataset.motion === (action === 'stage' ? 'open' : 'shut') && !strip().hasAttribute('data-hold'),
+        act: () => { if (action === 'stage') [...document.querySelectorAll('#chat-messages .chat-message-reply')].at(-1).click();
+                     else strip().querySelector('.chat-quote-cancel').click(); },
+        measure: () => menu.getBoundingClientRect().top});
 }"""
 
 
@@ -155,7 +155,8 @@ _MENU_FRAMES = """async (action) => {
 @pytest.mark.parametrize("reduce", [False, True], ids=["motion", "reduced"])
 def test_a_reply_strip_opens_and_closes_like_the_capsule_rows_fold(direct_server_with_data, engine, reduce):
     """Owner 20.10 (A): staging or cancelling a reply moved the capsule row and its ☰ about 60 px in one frame. The strip
-    opens and closes like the row's fold now, so ☰ travels over several frames; reduced motion takes one step."""
+    opens and closes like the row's fold now, so ☰ travels through intermediate positions; reduced motion takes one
+    step. Seek the browser's own transitions: a loaded runner can miss every frame of a 280 ms animation."""
     from playwright.sync_api import sync_playwright
 
     data = direct_server_with_data["data_dir"]
@@ -178,14 +179,16 @@ def test_a_reply_strip_opens_and_closes_like_the_capsule_rows_fold(direct_server
             moves["closing"] = page.evaluate(_MENU_FRAMES, "cancel")
         finally:
             browser.close()
-    for name, tops in moves.items():
+    for name, motion in moves.items():
+        tops = motion['values']
         steps = [round(b - a, 2) for a, b in zip(tops, tops[1:])]
         travel = abs(tops[-1] - tops[0])
         moving = [step for step in steps if abs(step) > 0.5]
         assert travel > 30, (name, tops)
         if reduce:
-            assert len(moving) <= 1, (name, steps)
+            assert motion['duration'] == 0 and len(moving) <= 1, (name, motion)
         else:
+            assert motion['duration'] > 0, (name, motion)
             assert len(moving) >= 3 and max(abs(step) for step in steps) < travel * 0.6, (name, steps)
 
 

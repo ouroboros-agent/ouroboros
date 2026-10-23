@@ -18,7 +18,7 @@ from tests.test_physical_candidate_capture import _scope
 
 
 def _ctx(lane):
-    return SimpleNamespace(accumulated_usage={}, drive_logs=lane["root"] / "logs",
+    return SimpleNamespace(active_model="local-model", accumulated_usage={}, drive_logs=lane["root"] / "logs",
                            event_queue=queue.Queue(), task_id="local-fit", round_idx=1)
 
 
@@ -63,6 +63,7 @@ def test_exact_overflow_is_never_sent(lane, mode):
         assert _send(lane, ctx, mode=mode) is None
         facts = ctx.accumulated_usage[REFUSED_CANDIDATE_KEY]
         assert facts["cause"] == "exact_local_count" and "predicted_free_tokens" not in facts
+        assert ctx.accumulated_usage["_last_llm_failure"]["model"] == "local-model"
     assert facts["input_tokens"] == 15_000 and facts["context_window_tokens"] == 16_384
     assert not lane["sent"] and len(lane["measured"]) == 1
 
@@ -77,7 +78,10 @@ def test_unproven_count_cannot_override_admission(lane, monkeypatch, supported):
 
     manager.measure_prepared_input = unproven
     monkeypatch.setattr(local_model, "get_manager", lambda: manager)
-    assert _send(lane, _ctx(lane)) is None
+    ctx = _ctx(lane)
+    assert _send(lane, ctx) is None
+    assert ctx.accumulated_usage[REFUSED_CANDIDATE_KEY]["cause"] == "known_window_prediction"
+    assert ctx.accumulated_usage["_last_llm_failure"]["model"] == "local-model"
     assert not lane["sent"] and len(lane["measured"]) == 1
 
 

@@ -397,9 +397,9 @@ def test_precustody_refusals_leave_a_durable_start_blocked_row(tmp_path):
     assert reasons == ["configured_actor_resource_mismatch"]
 
     out = runtime.delegate_start_entry(ctx, "do work", subagent_id="someone-else")
-    assert "configured_actor_route_mismatch" in out.text
+    assert "unknown_subagent_id" in out.text
     reasons = [row["reason"] for row in _rows(tmp_path)]
-    assert reasons[-1] == "configured_actor_route_mismatch"
+    assert reasons[-1] == "unknown_subagent_id"
 
     out = runtime.delegate_start_entry(ctx, "do work")
     assert "configured_work_order_unavailable" in out.text

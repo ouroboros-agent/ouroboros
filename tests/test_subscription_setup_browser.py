@@ -51,7 +51,25 @@ def subscription_ui():
         def log_message(self, *_):
             pass
 
+        def do_HEAD(self):
+            if self.path in backend.get("downloads", {}):
+                self.do_GET()
+                return
+            super().do_HEAD()
+
         def do_GET(self):
+            # Browser-managed downloads may bypass Playwright's page routing.
+            # Tests can give the isolated HTTP server exact download bytes too.
+            if self.path in backend.get("downloads", {}):
+                body = backend["downloads"][self.path]
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Disposition", 'attachment; filename="archive.zip"')
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(body)
+                return
             if self.path == "/onboarding":
                 body = (WEB / "onboarding_template.html").read_text(encoding="utf-8").replace(
                     "__ONBOARDING_BOOTSTRAP__", json.dumps(bootstrap))

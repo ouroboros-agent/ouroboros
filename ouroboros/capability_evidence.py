@@ -210,6 +210,7 @@ class CapabilityEvidence:
     account_fingerprint: str = ""
     provenance: str = ""
     response_limit: Dict[str, Any] = field(default_factory=dict)
+    window_kind: str = "total"  # metadata may explicitly state an input-only limit
 
     def to_json(self) -> Dict[str, Any]:
         return {
@@ -227,6 +228,7 @@ class CapabilityEvidence:
             "account_fingerprint": self.account_fingerprint,
             "provenance": self.provenance,
             "response_limit": self.response_limit,
+            "window_kind": self.window_kind,
         }
 
 
@@ -835,7 +837,7 @@ def resolve_main_token_density(
     drive_root: Any, route_fp: str, model_id: str, *, estimate_tokens: Optional[int] = None,
     view_kind: str = "",
 ) -> Tuple[float, str]:
-    """Newest fresh witness: exact route across storage keys, then model, else neutral.
+    """Newest comparable witness of this exact route and view, else the cold family estimate.
 
     View kinds are exact: unclassified legacy rows never calibrate a classified
     focus, own wake or owner turn. When sizing a candidate, compare raw input with raw input (``prompt_chars / 4``),
@@ -853,24 +855,16 @@ def resolve_main_token_density(
             item for item in _fresh_density_pairs(store, basis=MAIN_DENSITY_BASIS)
             if route and str(item[0].get("route_fp") or "") == route and comparable(item)
         ]
-        model_pairs = [
-            item for item in _fresh_density_pairs(
-                store, _normalized_density_model(model_id), basis=MAIN_DENSITY_BASIS)
-            if model_id and comparable(item)
-        ]
         if route_pairs:
             return max(
                 enumerate(route_pairs),
                 key=lambda item: (*_density_recency_key(item[1][0]), item[0]),
             )[1][1], "fresh_route_usage"
-        if model_pairs:
-            return max(
-                enumerate(model_pairs),
-                key=lambda item: (*_density_recency_key(item[1][0]), item[0]),
-            )[1][1], "fresh_model_usage"
     except Exception:
         pass
-    return 1.0, "cold_estimate"
+    # Empirical tokenizer classes (audit D8), never a per-model window table.
+    native = str(model_id).lower().removeprefix("claudexor::")
+    return (4 / 2.7 if "claude" in native else 1.0), "cold_estimate"
 
 
 def resolve_review_token_density(drive_root: Any, model_id: str) -> Tuple[float, str]:
@@ -980,6 +974,7 @@ def _cached_evidence(record: Dict[str, Any], fp: str, model: str, provider: str,
         credential_profile_id=str(record.get("credential_profile_id") or ""),
         account_fingerprint=str(record.get("account_fingerprint") or ""),
         provenance=str(record.get("provenance") or ""),
+        window_kind=str(record.get("window_kind") or "total"),
     )
 
 
@@ -1357,7 +1352,7 @@ def probe(drive_root: Any, **route) -> CapabilityEvidence:
 # excluding it would starve the route of density witnesses entirely.
 _CACHE_INCLUSIVE_PROMPT_TOKEN_PROVIDERS = frozenset({
     "openrouter", "openai", "openai-compatible", "cloudru", "local", "anthropic",
-    "deepseek", "zai",
+    "deepseek", "zai", "claudexor",
 })
 
 
@@ -1405,16 +1400,25 @@ def observe_token_density(request: Any, usage: Optional[Dict[str, Any]], *, driv
             return
         from ouroboros.provider_models import normalize_model_identity
 
+        physical = request.physical_context
+        main = bool(getattr(physical, "view_kind", ""))
+        route = str(getattr(physical, "route_fp", "") or "")
+        bound = provider != "claudexor" and bool(getattr(physical, "window_witness_bound", True))
+        if main and bound and route:
+            from ouroboros.context_window import record_observation
+            record_observation(drive_root_resolver(request.drive_root),
+                getattr(physical, "window_observation_fp", ""), accepted=real, kind="input",
+                reserve=int(getattr(physical, "response_reserve_tokens", 0) or 0),
+                transmitted=int(getattr(request, "max_completion_tokens", 0) or 0))
         record_token_density(
             drive_root_resolver(request.drive_root),
             normalize_model_identity(str(request.model or "")),
             prompt_chars=estimate * 4,
             prompt_tokens=real,
             source="dispatch_usage",
-            route_fp=str(request.physical_context.route_fp if request.physical_context else ""),
+            route_fp=route if main and bound else "",
             basis=basis,
-            **({"view_kind": request.physical_context.view_kind}
-               if getattr(request.physical_context, "view_kind", "") else {}),
+            **({"view_kind": physical.view_kind} if main and bound else {}),
         )
     except Exception:
         log.debug("token-density observation skipped", exc_info=True)

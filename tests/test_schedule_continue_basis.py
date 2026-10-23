@@ -6,7 +6,7 @@ pytestmark = pytest.mark.serial
 from ouroboros.schedule_continuation import admission_basis
 from ouroboros.owner_continue import work_order_text
 from supervisor.followup_policy import current_hold
-from tests.test_g1_followup_policy import world  # noqa: F401 - shared isolated scheduler fixture
+from tests.test_g1_followup_policy import world as world  # shared isolated scheduler fixture
 
 
 def receipt():

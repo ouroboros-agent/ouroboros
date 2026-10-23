@@ -11,7 +11,7 @@ from ouroboros.loop_llm_call import TIMEOUT_REPEAT_KEY, call_llm_with_retry
 from ouroboros.task_results import write_task_result
 from tests.test_stream_timeout_repeat import (
     CHILD, MODEL, PARENT, Wire, WireLLM, child_drive, child_loop, chunk,
-    deliver_to_parent, ok_wire, parent_tools, parent_views, sleeps, timeout_wire, wire_env,
+    deliver_to_parent, ok_wire, parent_tools, parent_views, sleeps as sleeps, timeout_wire, wire_env as wire_env,
 )
 from tests.test_working_checkpoint import _registry
 

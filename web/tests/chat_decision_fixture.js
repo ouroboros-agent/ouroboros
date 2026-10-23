@@ -97,17 +97,15 @@ export class NodeStub {
     querySelectorAll(selector) { return this.collect(selector.replace(/^\./, '')); }
 }
 
-// The bubble chat_media.bubbleFrameNode builds around a card, in its order: the sender line, the card, the time line;
-// a `voice` part joins the sender in one voice line, a `foot` part the time in one foot line.
-export function frameBubble(_msg, card, { voice = [], foot = [] } = {}) {
+// Match chat_media.bubbleFrameNode: sender/optional Project reference, card, then time alone.
+export function frameBubble(_msg, card, { voice = [] } = {}) {
     const node = (className, text = '') => { const el = new NodeStub(); el.className = className; el.textContent = text; return el; };
     const line = (className, anchor, parts) => {
         if (!parts.length) return anchor;
         const wrap = node(className); wrap.append(anchor, ...parts); return wrap;
     };
     const bubble = new NodeStub();
-    bubble.append(line('chat-bubble-voice', node('sender', 'Ouroboros'), voice), card,
-        line('chat-bubble-foot', node('msg-time', '10:00'), foot));
+    bubble.append(line('chat-bubble-voice', node('sender', 'Ouroboros'), voice), card, node('msg-time', '10:00'));
     return bubble;
 }
 

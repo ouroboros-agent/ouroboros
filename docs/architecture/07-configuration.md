@@ -164,8 +164,8 @@ One row per key (`settings_defaults.py`). Env-only rows have no settings.json ca
 | OUROBOROS_RUNTIME_MODE | advanced | Effective Access light/advanced/pro/cyber_pro, persisted as the next-boot value (§6 Safety and runtime mode) |
 | OUROBOROS_SKILLS_REPO_PATH | "" | Skills Repo Path: read in place as My folder (`my-folder`), even with a saved source list; removing that row clears this path. Other folders stay connected. |
 | MCP_ENABLED | false | MCP client toggle (§6 MCP and browser-facing external tools) |
-| MCP_SERVERS | [] | MCP server list; persisted in settings, never env-exported |
-| MCP_TOOL_TIMEOUT_SEC | 60 | Per-MCP-tool timeout |
+| MCP_SERVERS | [] | Saved, never env-exported; a change re-lists in the server |
+| MCP_TOOL_TIMEOUT_SEC | 60 | Per listing and tool call |
 | OUROBOROS_HUB_CATALOG_URL | `https://raw.githubusercontent.com/razzant/OuroborosHub/main/catalog.json` | Derives the two hub rows; a non-GitHub raw URL needs `OUROBOROS_SKILL_SOURCES` with the git address |
 | OUROBOROS_CLAWHUB_REGISTRY_URL | `https://clawhub.ai/api/v1` | ClawHub registry URL |
 | OUROBOROS_SKILL_SOURCES | "" | Skill source list (§13); empty = derived from the keys above, unwritten |

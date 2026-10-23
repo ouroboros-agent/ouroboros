@@ -95,6 +95,9 @@ _PROGRESS_META_FIELDS = (
     # Phase 6: the resolved delegated route (a harness id), so a replayed
     # bubble keeps its executor chip instead of losing it on reload.
     "executor_route",
+    # Recorded coordinator facts only; missing facts stay absent without result enrichment.
+    "parent_cognitive_route", "coordinator_route", "use_local_model",
+    "coordinator_billing", "coordinator_provenance",
     "effort_level", "effort_requested", "effort_source",  # the effort decision's chip on replay
     "executor_observation", "delegated_activity",  # the executor's typed words/technical events (#1350)
     # The completion-seam evidence block (delegated runs started/settled,
@@ -116,7 +119,9 @@ _PROGRESS_META_FIELDS = (
 )
 
 _SKILL_REVIEW_STRING_FIELDS = (
-    "skill", "status", "content_hash", "job_id", "group_id",
+    # ``record_id``: the review ledger record a row references (a reused review has a fresh job id but the
+    # retained record; the detail reader resolves the record id, the job id only for rows of an earlier version).
+    "skill", "status", "content_hash", "job_id", "record_id", "group_id",
     "presentation_owner_task_id", "origin_task_id", "origin_root_task_id",
     "root_task_id", "source", "job_status", "terminal_reason",
     "replayed_from_ts",
