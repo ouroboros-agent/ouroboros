@@ -217,8 +217,6 @@ class _Call:
         self.preparing_revision = None
         self.resume_revision = 0
         self.resume_tool_output = None
-        self.tool_answer_pending = False
-        self.tool_answer_write = None
 
     async def run(self):
         writer = self.writer = asyncio.create_task(self.save_rows())
@@ -299,7 +297,6 @@ class _Call:
     async def consume(self, session):
         self.session = self.last_session = session
         self.resume_tool_output = None
-        self.tool_answer_write = None
         if not self.resume:
             self.delivered_catalog = None
         self.connection_resumed = self.resume
@@ -398,16 +395,13 @@ class _Call:
                 return
             try:
                 resume_revision = self.resume_revision
-                if isinstance(command, ToolOutputs):
-                    self.tool_answer_write = getattr(session, 'tool_response_write_generation', None)
-                    self.tool_answer_pending = any(row.get('tool_call_id') not in command.silent
-                        for row in command.messages if row.get('role') == 'tool')
                 result = await session.send(command)
                 if isinstance(command, ToolOutputs):
                     # Adapters may distinguish native response writes from pixels
                     # and queue acceptance. Older sessions keep send-boundary order.
                     if getattr(session, 'resume_after_tool_response', False) is not None:
-                        self.resume_tool_output = resume_revision
+                        self.resume_tool_output = (resume_revision, any(row.get('tool_call_id') not in command.silent
+                            for row in command.messages if row.get('role') == 'tool'))
                     self.delivered_catalog = command.tools
                     delivered = getattr(self.host, 'tool_results_delivered', None)
                     if delivered is not None:
@@ -751,22 +745,11 @@ class _Call:
                     raise RealtimeSetupError('provider_closed', detail) from exc
                 self.lost_connection(resuming=False)
                 return
-            # Keep the received batch's order even if saving a caption yields to
-            # a later result write. Older sessions retain send-boundary behavior.
-            write_generation = getattr(self.session, 'received_tool_response_write_generation',
-                                       getattr(self.session, 'tool_response_write_generation', None))
             for event in events:
                 data = event.data
                 if refusal is not None and not (event.kind == "response_done"
                         or (event.kind == "caption" and data.get("final"))):
                     continue
-                answer_written = self.tool_answer_pending and (
-                    self.tool_answer_write is None or write_generation > self.tool_answer_write)
-                if self.tool_answer_pending and (event.kind == 'audio'
-                        or event.kind == 'caption' and data['speaker'] == 'ouroboros'):
-                    # Speech may start before the write, under the tool's response
-                    # id. Only a completion observed after the write can answer it.
-                    self.tool_responses.difference_update(self.active_responses)
                 if event.kind == "ready":
                     if self.tool_refit.is_set():
                         continue  # a late ready cannot release work to the retiring connection
@@ -833,9 +816,6 @@ class _Call:
                         self.receipts[response] = receipt
                     self.active_responses.discard(response)
                     self.response_open = bool(self.active_responses) or bool(data.get("continues"))
-                    if (answer_written and not self.response_open and data['status'] == 'completed'
-                            and response not in self.tool_responses):
-                        self.tool_answer_pending = False
                     self.hub.send_turn(cp.TURN_AWAITING if self.response_open or self.tools_running else cp.TURN_IDLE)
                 elif event.kind == "tool_call":
                     self.tool_responses.update(self.active_responses)
@@ -908,11 +888,13 @@ class _Call:
                     if self.quiet() and (self.resume or self.preparation_ready()):
                         self.timing("quiet")
                         if self.resume and self.resume_tool_output is not None:
+                            revision, ordinary = self.resume_tool_output
                             covered = getattr(self.session, 'resume_after_tool_response',
-                                              self.resume_tool_output != self.resume_revision)
+                                              revision != self.resume_revision)
                             if not self.host.state.get("resume_handle") or not covered:
                                 self.resume = False
-                                if self.tool_answer_pending:
+                                if ordinary:
+                                    # Always offer continuation, even if the old socket spoke.
                                     self.pending_offers.append(self.tool_answer_pointer())
                                 self.request_renewal()
                                 continue  # adopt the fresh result-bearing fit before offering its pointer

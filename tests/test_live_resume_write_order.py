@@ -92,20 +92,19 @@ def test_handle_during_requested_pixels_cannot_cover_later_result(
                 if handle_timing != 'after-result':
                     assert order == ['pixels-written', 'handle-received', 'function-response-written']
                     assert setup == {}, 'handle predating function response must use a fresh fit'
-                    if not answer:
-                        await live.wait(lambda: any('The requested tool batch returned' in json.dumps(r)
-                                                   for r in live.wire.sent if 'clientContent' in r))
                 else:
                     assert order == ['pixels-written', 'function-response-written', 'handle-received']
                     assert setup == {'handle': 'after-result'}
                     assert not any('The requested tool batch returned' in json.dumps(r)
                                    for r in live.wire.sent if 'clientContent' in r)
+                await live.wait(lambda: not call.pending_offers)
                 await live.quiet()
                 assert observed['effects'] == 1 and not live.wire.outputs
-                if answer:
-                    assert not live.wire.spoken
-                    assert not any('The requested tool batch returned' in json.dumps(r)
-                                   for r in live.wire.sent if 'clientContent' in r)
+                pointer = any('The requested tool batch returned' in json.dumps(r)
+                              for r in live.wire.sent if 'clientContent' in r)
+                assert pointer is (handle_timing != 'after-result')
+                assert len(live.wire.spoken) == int(handle_timing != 'after-result')
+                assert sum('toolResponse' in row for row in old.sent) == 1
             finally:
                 release.set()
                 await live.wait(lambda: all(task.done() for task in queued))

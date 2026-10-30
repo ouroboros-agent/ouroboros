@@ -356,9 +356,7 @@ def test_r28_goaway_while_tool_pending(host_world, monkeypatch, during_call, han
                     await live.wait(lambda: len(live.provider.connections) == 2 and live.wire.sent)
                     expected = {} if fresh else {'handle': 'before-call' if handle_after == 'with-answer' else 'after-answer'}
                     assert live.wire.sent[0]['setup']['sessionResumption'] == expected
-                if fresh and outcome == 'unanswered':
-                    await live.wait(lambda: any('The requested tool batch returned' in json.dumps(row)
-                                               for row in live.wire.sent if 'clientContent' in row))
+                await live.wait(lambda: not live.call.pending_offers)
                 await live.quiet()
                 assert effects == ([] if outcome == 'silent' else ['list_available_tools'])
                 assert len(old.spoken) - spoken_before == (1 if outcome in ('answered', 'same-turn') else 0)
@@ -372,7 +370,11 @@ def test_r28_goaway_while_tool_pending(host_world, monkeypatch, during_call, han
                         assert any(row.get('tool_call_id') == 'pending-native' for row in fitted)
                         if outcome != 'silent':
                             assert 'Completed exactly once.' in json.dumps(live.wire.sent[0]['setup'])
-                    if not fresh or outcome != 'unanswered':
+                    if fresh and outcome != 'silent':
+                        assert any('The requested tool batch returned' in json.dumps(row)
+                                   for row in live.wire.sent if 'clientContent' in row)
+                        assert len(live.wire.spoken) == 1
+                    else:
                         assert not live.wire.spoken
                         assert not any('The requested tool batch returned' in json.dumps(row)
                                        for row in live.wire.sent if 'clientContent' in row)

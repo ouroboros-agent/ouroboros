@@ -241,8 +241,6 @@ class GeminiSession(JsonSession):
         self.resume_handle = options.resume_handle
         self.resume_revision = 0
         self.tool_response_revision = None
-        self.tool_response_write_generation = 0
-        self.received_tool_response_write_generation = 0
         self.resume_requested = bool(options.resume_handle)
         now = time.monotonic()
         for key, (expiry, _) in tuple(RESUMPTIONS.items()):
@@ -258,13 +256,6 @@ class GeminiSession(JsonSession):
         if self.tool_response_revision is None:
             return None
         return self.resume_revision > self.tool_response_revision
-
-    def tool_response_boundary(self):
-        # Called inside the writer lock, after any pixels or microphone writes.
-        # The generation orders incoming answers even before write() returns;
-        # only its successful return commits the resume revision and result custody.
-        self.tool_response_write_generation += 1
-        return self.resume_revision
 
     @property
     def renewal_ready(self):
@@ -376,7 +367,6 @@ class GeminiSession(JsonSession):
         return []
 
     async def convert(self, event):
-        self.received_tool_response_write_generation = self.tool_response_write_generation
         result = []
         thinking = 'thinkingConfig' in self.events[0]['setup']['generationConfig']
         content = event.get('serverContent', {})
@@ -614,7 +604,7 @@ class GeminiSession(JsonSession):
                     other.append(message)
             if responses:
                 self.tool_response_revision = await self.write({'toolResponse': {'functionResponses': responses}},
-                                                               snapshot=self.tool_response_boundary)
+                                                               snapshot=lambda: self.resume_revision)
                 ids = {r['id'] for r in responses}
                 self.hold_context([row for row in command.messages if row.get('tool_call_id') in ids
                                    or any(c.get('id') in ids for c in row.get('tool_calls', ()))])
