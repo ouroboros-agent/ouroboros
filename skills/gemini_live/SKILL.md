@@ -1,7 +1,7 @@
 ---
 name: gemini_live
 description: Gemini native Live audio and image provider for Live Conversation.
-version: 0.1.17
+version: 0.1.18
 type: extension
 runtime: python3
 entry: plugin.py

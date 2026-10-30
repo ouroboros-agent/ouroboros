@@ -400,7 +400,9 @@ class _Call:
                     # Adapters may distinguish native response writes from pixels
                     # and queue acceptance. Older sessions keep send-boundary order.
                     if getattr(session, 'resume_after_tool_response', False) is not None:
-                        self.resume_tool_output = (resume_revision, any(row.get('tool_call_id') not in command.silent
+                        previous = self.resume_tool_output
+                        self.resume_tool_output = (resume_revision, bool(previous and previous[1]) or any(
+                            row.get('tool_call_id') not in command.silent
                             for row in command.messages if row.get('role') == 'tool'))
                     self.delivered_catalog = command.tools
                     delivered = getattr(self.host, 'tool_results_delivered', None)
@@ -750,6 +752,9 @@ class _Call:
                 if refusal is not None and not (event.kind == "response_done"
                         or (event.kind == "caption" and data.get("final"))):
                     continue
+                if event.kind == 'audio' or event.kind == 'caption' and data['speaker'] == 'ouroboros':
+                    # Refit must wait for speech to finish; continuation custody is unchanged.
+                    self.tool_responses.difference_update(self.active_responses)
                 if event.kind == "ready":
                     if self.tool_refit.is_set():
                         continue  # a late ready cannot release work to the retiring connection

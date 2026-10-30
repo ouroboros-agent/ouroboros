@@ -293,6 +293,12 @@ class GeminiSession(JsonSession):
         self.resume_requested = False
         self.queue_events(LiveEvent('ready', {'input_rate': 16000, 'output_rate': 24000, 'vision': True}), *handshake)
 
+    async def read(self):
+        event = await super().read()
+        if 'sessionResumptionUpdate' in event:
+            self.resume_revision += 1
+        return event
+
     async def receive(self):
         if self.pending:
             return self.take_pending()
@@ -537,7 +543,6 @@ class GeminiSession(JsonSession):
                     await self.send(command)
         if 'sessionResumptionUpdate' in event:
             update = event['sessionResumptionUpdate']
-            self.resume_revision += 1
             self.resume_handle = update.get('newHandle', '') if update.get('resumable') else ''
             result.append(LiveEvent('resumable', {'handle': self.resume_handle}))
         if 'goAway' in event:

@@ -390,3 +390,71 @@ def test_r28_goaway_while_tool_pending(host_world, monkeypatch, during_call, han
                 release.set()
         assert live.result[1]['execution_status'] == 'ok', live.result
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('thinking', [False, True])
+@pytest.mark.parametrize('second', ['silent', 'ordinary', 'single'])
+def test_ordinary_continuation_survives_later_batches(host_world, monkeypatch, record_property, thinking, second):
+    import threading
+    entered, release = threading.Event(), threading.Event()
+
+    async def scenario():
+        async with stack(host_world, monkeypatch, 'gemini', thinking=thinking) as live:
+            host, call, old = live.host, live.call, live.wire
+            old.put({'sessionResumptionUpdate': {'resumable': True, 'newHandle': 'before-tool'}})
+            await live.wait(lambda: host.state.get('resume_handle') == 'before-tool')
+            tool_batch = host.tool_batch
+            batches = []
+
+            async def gated(calls):
+                batches.append([c['id'] for c in calls])
+                if len(batches) == 1:
+                    entered.set()
+                    while not release.is_set():
+                        await asyncio.sleep(.01)
+                return await tool_batch(calls)
+
+            monkeypatch.setattr(host, 'tool_batch', gated)
+            complete = old.complete
+            old.complete = lambda: None
+            old.answer = lambda: None  # the model has not begun any answer to the first result
+            old.tool('first-ordinary', 'list_available_tools', {})
+            old.complete = complete
+            try:
+                await live.wait(entered.is_set)
+                if second != 'single':
+                    # A second native message of the same open model turn (NON_BLOCKING calling).
+                    name, args = (('attend', {'see': None, 'look': None, 'revisit_after_s': None})
+                                  if second == 'silent' else ('get_task_result', {'task_id': 'none'}))
+                    old.put({'toolCall': {'functionCalls': [{'id': 'second-call', 'name': name, 'args': args}]}})
+                    await live.wait(lambda: call.tool_queue.qsize() == 1)
+                old.put({'goAway': {'timeLeft': '30s'}})
+                await live.wait(lambda: call.renewing and call.resume)
+                release.set()
+                await live.wait(lambda: 'first-ordinary' in old.outputs and (second == 'single' or 'second-call' in old.outputs))
+                old.put({'serverContent': {'turnComplete': True,
+                    **({'interactionStatus': 'IDLE'} if thinking else {})}})
+                await live.wait(lambda: len(live.provider.connections) == 2 and live.wire.sent)
+                await live.wait(lambda: not call.pending_offers)
+                await live.quiet()
+                fitted = json.loads(call.session.selected.messages_json)
+                result = dict(probe='B', thinking=thinking, second=second, batches=batches,
+                    setup=live.wire.sent[0]['setup']['sessionResumption'], pointer=any('The requested tool batch returned' in json.dumps(row)
+                                for row in live.wire.sent if 'clientContent' in row),
+                    spoken=live.wire.spoken, old_spoken=old.spoken[1:],
+                    in_fit=any(r.get('tool_call_id') == 'first-ordinary' for r in fitted),
+                    old_responses=sum('toolResponse' in r for r in old.sent),
+                    new_responses=sum('toolResponse' in r for r in live.wire.sent))
+                record_property('continuation_batches', json.dumps(result))
+                assert result['setup'] == {} and result['in_fit'] and not result['new_responses'], result
+                assert result['pointer'] and len(result['spoken']) == 1, result
+                assert result['old_responses'] == (1 if second == 'single' else 2), result
+                assert batches == [['first-ordinary']] + ([] if second == 'single' else [['second-call']])
+                ids = [r.get('tool_call_id', r.get('call_id')) for r in host.trace['tool_calls']]
+                assert ids.count('first-ordinary') == 1
+                assert ids.count('second-call') == int(second != 'single')
+            finally:
+                release.set()
+        assert live.result[1]['execution_status'] == 'ok', live.result
+
+    asyncio.run(scenario())
