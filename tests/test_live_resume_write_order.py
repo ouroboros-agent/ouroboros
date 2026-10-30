@@ -1,4 +1,4 @@
-"""Independent R30 check: handle ordering inside a multi-write ToolOutputs."""
+"""Native result-write ordering and publication of the corresponding resume handle."""
 import asyncio
 import json
 import threading
@@ -6,7 +6,7 @@ import threading
 import pytest
 
 from ouroboros import call_protocol as cp
-from ouroboros.contracts.live_conversation import Audio, ToolOutputs
+from ouroboros.contracts.live_conversation import Audio
 from tests._live_stack import stack
 from tests.test_live_conversation import host_world as host_world
 
@@ -139,119 +139,164 @@ def test_legacy_session_keeps_send_boundary_order(handle_after):
 
 
 @pytest.mark.parametrize('thinking', [False, True])
-@pytest.mark.parametrize('lane', ['pixels', 'microphone'])
-@pytest.mark.parametrize('read_before_write', [True, False])
-def test_handle_freshness_uses_native_read_before_conversion(
-        host_world, monkeypatch, record_property, thinking, lane, read_before_write):
-    entered, release = threading.Event(), threading.Event()
-    audio_entered, result_queued = threading.Event(), threading.Event()
+@pytest.mark.parametrize('release_at', ['read', 'conversion'])
+def test_resume_uses_the_handle_whose_freshness_was_observed(host_world, monkeypatch, record_property,
+                                                          thinking, release_at):
+    held = threading.Event()
 
     async def scenario():
         async with stack(host_world, monkeypatch, 'gemini', thinking=thinking) as live:
             host, call, old = live.host, live.call, live.wire
+            initial_spoken = list(old.spoken)
             old.put({'sessionResumptionUpdate': {'resumable': True, 'newHandle': 'before-tool'}})
             await live.wait(lambda: host.state.get('resume_handle') == 'before-tool')
-            batch, tool_loop = host.tool_batch, None
-
-            async def delayed(calls):
-                nonlocal tool_loop
-                tool_loop = asyncio.get_running_loop()
-                entered.set()
-                while not release.is_set():
-                    await asyncio.sleep(.01)
-                return await batch(calls)
-
-            monkeypatch.setattr(host, 'tool_batch', delayed)
             native = call.session
-            observe, write, convert, send = native.observe, native.ws.send, native.convert, native.send
-            handle_read = asyncio.Event()
-            seen, trail = {}, []
-            awaiting = hold_audio = False
+            old.answer = old.complete  # ordinary result is written; no spoken continuation yet
+            old.tool('publication-result', 'list_available_tools', {})
+            await live.wait(lambda: 'publication-result' in old.outputs and not call.tools_running)
+            await live.quiet()
+            assert call.resume_tool_output and call.resume_tool_output[1]
+            assert not native.resume_after_tool_response
+
+            check, observe, convert = call.check_preparation, native.observe, native.convert
+            gate = None
+            trail = []
+
+            async def checked():
+                nonlocal gate
+                await check()
+                if not held.is_set():
+                    # Schedule the existing peer worker at the read boundary.
+                    # The native reader and conversion have no inserted delay.
+                    gate = asyncio.Event()
+                    held.set()
+                    await gate.wait()
+                    trail.append(dict(at='peer-wakes', covered=native.resume_after_tool_response,
+                                      host_handle=host.state.get('resume_handle'),
+                                      native_handle=native.resume_handle))
 
             def observed(direction, raw):
                 observe(direction, raw)
-                if direction == 'receive' and awaiting and 'sessionResumptionUpdate' in json.loads(raw):
-                    # Release the writer at the actual native read. The existing
-                    # receive loop, without an added reader delay, orders conversion.
-                    seen.setdefault('response_started_at_read', 'response-write-start' in trail)
-                    trail.append('handle-read')
-                    handle_read.set()
+                if direction == 'receive' and json.loads(raw).get('sessionResumptionUpdate', {}).get('newHandle') == 'after-tool':
+                    trail.append(dict(at='handle-read'))
+                    if release_at == 'read':
+                        gate.set()
 
             async def converted(event):
-                if awaiting and 'sessionResumptionUpdate' in event:
-                    seen.setdefault('response_started_at_conversion', 'response-write-start' in trail)
-                    trail.append('handle-converted')
-                return await convert(event)
+                result = await convert(event)
+                if event.get('sessionResumptionUpdate', {}).get('newHandle') == 'after-tool':
+                    trail.append(dict(at='handle-converted'))
+                    if release_at == 'conversion':
+                        gate.set()
+                return result
 
-            async def queued_send(command):
-                if isinstance(command, ToolOutputs):
-                    result_queued.set()
-                return await send(command)
-
-            async def timed_write(raw):
-                nonlocal awaiting, hold_audio
-                payload = json.loads(raw)
-                is_result = 'toolResponse' in payload
-                if is_result:
-                    trail.append('response-write-start')
-                await write(raw)
-                gate = 'video' in payload.get('realtimeInput', {})
-                if 'audio' in payload.get('realtimeInput', {}) and hold_audio:
-                    hold_audio = False
-                    audio_entered.set()
-                    await live.wait(result_queued.is_set)
-                    gate = True  # the ordinary result now waits on this writer lock
-                if gate and read_before_write or is_result and not read_before_write:
-                    awaiting = True
-                    old.put({'sessionResumptionUpdate': {'resumable': True, 'newHandle': 'probed-handle'}})
-                    await handle_read.wait()
-
+            monkeypatch.setattr(call, 'check_preparation', checked)
             monkeypatch.setattr(native, 'observe', observed)
             monkeypatch.setattr(native, 'convert', converted)
-            monkeypatch.setattr(native, 'send', queued_send)
-            monkeypatch.setattr(native.ws, 'send', timed_write)
-            complete = old.complete
-            old.complete = lambda: None
-            if lane == 'pixels':
-                call.attention.frame(cp.PeerVideo('screen', cp.PEER_OWNER, 'image/jpeg', b'exact requested frame'))
-                old.tool('read-order', 'attend', {'see': 'asked', 'look': True, 'revisit_after_s': None})
-            else:
-                old.tool('read-order', 'list_available_tools', {})
-            old.complete = complete
-            old.answer = complete  # finish the tool turn without inventing a spoken answer
-            audio_task = None
             try:
-                await live.wait(entered.is_set)
+                await live.wait(held.is_set)
                 old.put({'goAway': {'timeLeft': '30s'}})
                 await live.wait(lambda: call.renewing and call.resume)
-                if lane == 'microphone':
-                    hold_audio = True
-                    audio_task = asyncio.run_coroutine_threadsafe(native.send(Audio(b'\0\0' * 320, 16000)), tool_loop)
-                    await live.wait(audio_entered.is_set)
-                release.set()
+                old.put({'sessionResumptionUpdate': {'resumable': True, 'newHandle': 'after-tool'}})
                 await live.wait(lambda: len(live.provider.connections) == 2 and live.wire.sent)
                 await live.wait(lambda: not call.pending_offers)
                 await live.quiet()
-                result = dict(thinking=thinking, lane=lane, read_before_write=read_before_write, trail=trail, **seen,
+                result = dict(thinking=thinking, release_at=release_at, trail=trail,
                     setup=live.wire.sent[0]['setup']['sessionResumption'],
-                    pointer=any('The requested tool batch returned' in json.dumps(row)
+                    pointers=sum('The requested tool batch returned' in json.dumps(row)
                                 for row in live.wire.sent if 'clientContent' in row),
                     spoken=live.wire.spoken, old_responses=sum('toolResponse' in row for row in old.sent),
                     new_responses=sum('toolResponse' in row for row in live.wire.sent),
-                    effects=sum(row.get('tool_call_id', row.get('call_id')) == 'read-order'
-                                for row in host.trace['tool_calls']))
-                record_property('handle_read_order', json.dumps(result))
-                assert result['effects'] == 1 and result['old_responses'] == 1 and not result['new_responses']
-                assert seen['response_started_at_read'] is not read_before_write, result
-                assert seen['response_started_at_conversion'], result
-                assert result['setup'] == ({} if read_before_write else {'handle': 'probed-handle'}), result
-                assert result['pointer'] is read_before_write, result
-                assert len(result['spoken']) == int(read_before_write), result
+                    effects=sum(row.get('tool_call_id') == 'publication-result' for row in host.trace['tool_calls']))
+                record_property('handle_publication', json.dumps(result))
+                assert result['effects'] == 1 and result['old_responses'] == 1 and not result['new_responses'], result
+                if release_at == 'read':
+                    assert result['setup'] == {}, result
+                    assert result['pointers'] == 1 and len(result['spoken']) == 1, result
+                else:
+                    assert result['setup'] == {'handle': 'after-tool'}, result
+                    assert result['pointers'] == 0 and not result['spoken'], result
+                assert old.spoken == initial_spoken, result
             finally:
-                release.set()
-                if audio_task is not None:
-                    await live.wait(audio_task.done)
-                    audio_task.result()
+                if gate is not None:
+                    native_loop = gate._loop
+                    if native_loop is not None:
+                        native_loop.call_soon_threadsafe(gate.set)
+        assert live.result[1]['execution_status'] == 'ok', live.result
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('thinking', [False, True])
+@pytest.mark.parametrize('update', ['new-handle', 'cleared'])
+def test_update_read_after_write_unconverted_at_quiet_poll(
+        host_world, monkeypatch, record_property, thinking, update):
+    async def scenario():
+        async with stack(host_world, monkeypatch, 'gemini', thinking=thinking) as live:
+            host, call, old = live.host, live.call, live.wire
+            initial_spoken = list(old.spoken)
+            old.put({'sessionResumptionUpdate': {'resumable': True, 'newHandle': 'before-tool'}})
+            await live.wait(lambda: host.state.get('resume_handle') == 'before-tool')
+            native = call.session
+            complete = old.complete
+            old.complete = lambda: None
+            old.answer = lambda: None  # the result is written; no answer has started
+            old.tool('after-write', 'list_available_tools', {})
+            old.complete = complete
+            await live.wait(lambda: 'after-write' in old.outputs and call.response_open and not call.tools_running)
+
+            # Park the 10 ms poll at its next pass and let the native read of the update release it.
+            # The reader is not delayed; this only lands the poll's timer inside the existing interval.
+            gate, parked = asyncio.Event(), threading.Event()
+            observe, convert, check = native.observe, native.convert, call.check_preparation
+            armed = False
+            trail = []
+
+            async def parked_check():
+                if armed and not gate.is_set():
+                    parked.set()
+                    await gate.wait()
+                    trail.append(dict(poll_resumes=True, revision=native.resume_revision,
+                                      handle=host.state.get('resume_handle')))
+                return await check()
+
+            def observed(direction, raw):
+                observe(direction, raw)
+                if direction == 'receive' and armed and 'sessionResumptionUpdate' in json.loads(raw):
+                    trail.append('update-read')
+                    gate.set()
+
+            async def converted(event):
+                if armed and 'sessionResumptionUpdate' in event:
+                    trail.append('update-converted')
+                return await convert(event)
+
+            monkeypatch.setattr(call, 'check_preparation', parked_check)
+            monkeypatch.setattr(native, 'observe', observed)
+            monkeypatch.setattr(native, 'convert', converted)
+            armed = True
+            await live.wait(parked.is_set)
+            old.put({'goAway': {'timeLeft': '30s'}})
+            await live.wait(lambda: call.renewing and call.resume)
+            complete()  # the tool turn finishes with no speech: quiet, unobserved by the parked poll
+            await live.wait(lambda: not call.response_open and call.quiet())
+            frame = ({'resumable': True, 'newHandle': 'after-write'} if update == 'new-handle' else {'resumable': False})
+            old.put({'sessionResumptionUpdate': frame})
+            await live.wait(lambda: len(live.provider.connections) == 2 and live.wire.sent)
+            await live.wait(lambda: not call.pending_offers)
+            await live.quiet()
+            result = dict(probe='F', thinking=thinking, update=update, trail=trail,
+                setup=live.wire.sent[0]['setup']['sessionResumption'],
+                pointers=sum('The requested tool batch returned' in json.dumps(row)
+                             for row in live.wire.sent if 'clientContent' in row),
+                spoken=live.wire.spoken, old_responses=sum('toolResponse' in r for r in old.sent),
+                new_responses=sum('toolResponse' in r for r in live.wire.sent),
+                effects=sum(row.get('tool_call_id') == 'after-write' for row in host.trace['tool_calls']))
+            record_property('handle_publication', json.dumps(result))
+            assert result['effects'] == 1 and result['old_responses'] == 1 and not result['new_responses'], result
+            assert result['setup'] == {}, result
+            assert result['pointers'] == 1 and len(result['spoken']) == 1, result
+            assert old.spoken == initial_spoken, result
         assert live.result[1]['execution_status'] == 'ok', live.result
 
     asyncio.run(scenario())
