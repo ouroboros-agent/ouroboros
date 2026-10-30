@@ -669,6 +669,11 @@ class _Call:
                 offline_tools = getattr(self.session, "tools_need_renewal", None)
                 needs_fit = (self.host.state.get("refit") or self.host.renewal_due()
                              or (offline_tools is not None and offline_tools(tuple(self.host.schemas))))
+                if not needs_fit and self.resume:
+                    # Fresh projection can collapse a prior frame that this socket
+                    # still holds. Price the complete native delivery, images too.
+                    needs_fit = not await self.host.delivery_fits(
+                        tuple(changes) + tuple(images), self.serving_catalog())
                 if (self.renewing and not self.resume) or self.tool_refit.is_set() or needs_fit:
                     if not self.hub.ended_by_ouroboros:
                         # Results and execution receipts are already canonical.
