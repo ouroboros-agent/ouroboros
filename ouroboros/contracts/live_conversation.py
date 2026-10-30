@@ -161,6 +161,14 @@ class LiveSession(Protocol):
     # function-response write? An update may clear the handle. None means no write
     # on this connection; absent keeps legacy send-boundary ordering. Pixels do not count.
     resume_after_tool_response: bool | None
+    # Optional per-connection generation, advanced when a native function-response
+    # write starts under its writer lock (not while pixels or a queued result wait).
+    # This orders answers during send; successful delivery still requires send to
+    # return. A failed attempt is retried with a new baseline. Absent keeps legacy order.
+    tool_response_write_generation: int
+    # The same generation when the latest native event was observed, before its
+    # conversion can yield to another write. Absent uses the receive-return boundary.
+    received_tool_response_write_generation: int
     # Opt in only when ContextUpdate(respond=False) never opens an answer.
     # Absent/False preserves sequential renewal for older provider implementations.
     silent_context_updates: bool = False

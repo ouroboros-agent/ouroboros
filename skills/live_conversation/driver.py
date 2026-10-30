@@ -218,6 +218,7 @@ class _Call:
         self.resume_revision = 0
         self.resume_tool_output = None
         self.tool_answer_pending = False
+        self.tool_answer_write = None
 
     async def run(self):
         writer = self.writer = asyncio.create_task(self.save_rows())
@@ -298,6 +299,7 @@ class _Call:
     async def consume(self, session):
         self.session = self.last_session = session
         self.resume_tool_output = None
+        self.tool_answer_write = None
         if not self.resume:
             self.delivered_catalog = None
         self.connection_resumed = self.resume
@@ -397,6 +399,7 @@ class _Call:
             try:
                 resume_revision = self.resume_revision
                 if isinstance(command, ToolOutputs):
+                    self.tool_answer_write = getattr(session, 'tool_response_write_generation', None)
                     self.tool_answer_pending = any(row.get('tool_call_id') not in command.silent
                         for row in command.messages if row.get('role') == 'tool')
                 result = await session.send(command)
@@ -748,14 +751,21 @@ class _Call:
                     raise RealtimeSetupError('provider_closed', detail) from exc
                 self.lost_connection(resuming=False)
                 return
+            # Keep the received batch's order even if saving a caption yields to
+            # a later result write. Older sessions retain send-boundary behavior.
+            write_generation = getattr(self.session, 'received_tool_response_write_generation',
+                                       getattr(self.session, 'tool_response_write_generation', None))
             for event in events:
                 data = event.data
                 if refusal is not None and not (event.kind == "response_done"
                         or (event.kind == "caption" and data.get("final"))):
                     continue
+                answer_written = self.tool_answer_pending and (
+                    self.tool_answer_write is None or write_generation > self.tool_answer_write)
                 if self.tool_answer_pending and (event.kind == 'audio'
                         or event.kind == 'caption' and data['speaker'] == 'ouroboros'):
-                    # A tool turn can answer under the same native response id.
+                    # Speech may start before the write, under the tool's response
+                    # id. Only a completion observed after the write can answer it.
                     self.tool_responses.difference_update(self.active_responses)
                 if event.kind == "ready":
                     if self.tool_refit.is_set():
@@ -823,7 +833,7 @@ class _Call:
                         self.receipts[response] = receipt
                     self.active_responses.discard(response)
                     self.response_open = bool(self.active_responses) or bool(data.get("continues"))
-                    if (not self.response_open and data['status'] == 'completed'
+                    if (answer_written and not self.response_open and data['status'] == 'completed'
                             and response not in self.tool_responses):
                         self.tool_answer_pending = False
                     self.hub.send_turn(cp.TURN_AWAITING if self.response_open or self.tools_running else cp.TURN_IDLE)

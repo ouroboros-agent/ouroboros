@@ -198,18 +198,21 @@ def test_only_a_successful_function_response_advances_write_order(gemini, monkey
             await receive(session, wire, checkpoint('before'))
             await session.send(command)  # no native call on this connection
             assert session.resume_after_tool_response is None
+            assert session.tool_response_write_generation == 0
             await receive(session, wire, {'toolCall': {'functionCalls': [
                 {'id': 'owed', 'name': 'read_file', 'args': {}}]}})
-            write = session.write
-            async def failed(event, **kwargs):
+            write = wire.send
+            async def failed(raw):
+                assert session.tool_response_write_generation == 1
                 raise ConnectionError('synthetic failed function-response write')
-            monkeypatch.setattr(session, 'write', failed)
+            monkeypatch.setattr(wire, 'send', failed)
             with pytest.raises(ConnectionError):
                 await session.send(command)
             assert session.resume_after_tool_response is None
             assert session.calls['owed'] == 'read_file' and not session.tool_results
-            monkeypatch.setattr(session, 'write', write)
+            monkeypatch.setattr(wire, 'send', write)
             await session.send(command)
+            assert session.tool_response_write_generation == 2
             assert session.resume_after_tool_response is False
             assert not session.calls and 'owed' in session.tool_results
             await receive(session, wire, checkpoint('after'))
