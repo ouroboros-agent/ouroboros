@@ -16,6 +16,7 @@ from typing import Any, List, Optional
 from ouroboros.context_budget import LARGE_CONTEXT_SECTION_CHARS
 from ouroboros.context_health import safe_read
 from ouroboros.section_floor import HostSection
+from ouroboros.context_timing import timed_section
 
 log = logging.getLogger(__name__)
 _LARGE_CONTEXT_SECTION_CHARS = LARGE_CONTEXT_SECTION_CHARS
@@ -30,6 +31,7 @@ _SHARED_UNDERSTANDING_GAP = (
 )
 
 
+@timed_section("knowledge")
 def build_knowledge_sections(
     env: Any,
     *,
@@ -128,6 +130,7 @@ def knowledge_navigation_sections(root: Any, project_id: str = "", *, overview: 
     return sections
 
 
+@timed_section("registry")
 def _build_registry_digest(env: Any) -> str:
     reg_path = env.drive_path("memory/registry.md")
     if not reg_path.exists():
@@ -177,6 +180,7 @@ def _registry_row(source_id: str, fields: dict) -> str:
     return f"| {source_id} | {path} | {updated} | {gaps} |"
 
 
+@timed_section("installed_skills")
 def _build_installed_skills_section(env: Any, *, max_lines: int = 100, skills: Optional[List[Any]] = None) -> str:
     try:  # ``skills``: the context build's own discovery, so this catalog and its always-on block agree
         from ouroboros.skill_catalogue import always_in_context_skills, discover_context_skills
@@ -270,6 +274,7 @@ def _build_installed_skills_section(env: Any, *, max_lines: int = 100, skills: O
     return HostSection("installed_skills", "\n".join(lines), "\n".join(operative), "list_skills")
 
 
+@timed_section("drive_state")
 def _drive_state_section(env: Any) -> str:
     """Typed projection of ``state/state.json`` + an on-demand pointer. Keys =
     what the agent REASONS about; the rest is internal caches or a second spend

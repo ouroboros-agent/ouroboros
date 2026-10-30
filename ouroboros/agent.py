@@ -857,26 +857,26 @@ class OuroborosAgent:
         review_env = self.env if canonical_drive.resolve(strict=False) == self.env.drive_root.resolve(strict=False) else replace(self.env, drive_root=canonical_drive)
         from ouroboros.config import get_context_mode
         from ouroboros.tool_policy import initial_tool_schemas  # the schemas count in the memory view's floor
-        messages, cap_info = build_llm_messages(
-            env=self.env,
-            memory=self.memory,
-            task=task,
-            review_context_builder=lambda: build_review_context(review_env),
-            ctx=ctx,
-            tool_schemas=initial_tool_schemas(self.tools, context_mode=get_context_mode()), tool_registry=self.tools,
-            **({"route_resolver": self._realtime_turn.resolve_route} if getattr(self, "_realtime_turn", None) is not None else {}),
-        )
-        # The second of the three places a reduction must reach (the durable record
-        # above is the first, `[SUBTASK_OUTCOME]` the third). It is appended HERE,
-        # after the context is built, because it is a fact about THIS dispatch —
-        # the composed child text it used to live in was frozen at enqueue time.
+        from ouroboros.context_timing import measured_sections
+
+        with measured_sections():  # each section's wall and CPU time rides on the build's context_memory_view receipt
+            messages, cap_info = build_llm_messages(
+                env=self.env,
+                memory=self.memory,
+                task=task,
+                review_context_builder=lambda: build_review_context(review_env),
+                ctx=ctx,
+                tool_schemas=initial_tool_schemas(self.tools, context_mode=get_context_mode()), tool_registry=self.tools,
+                **({"route_resolver": self._realtime_turn.resolve_route} if getattr(self, "_realtime_turn", None) is not None else {}),
+            )
+        # A reduction reaches the durable record, this dispatch's context, then [SUBTASK_OUTCOME].
+        # Append after building: the composed child text was frozen at enqueue time.
         _delta_block = capability_delta_prompt_block(dispatch)
         if _delta_block:
             messages.append({"role": "user", "content": _delta_block})
-        # The substrate note is the executor-axis half of the same destination: a
-        # harness child must know it is a NANNY (delegate_start/delegate_wait, not
-        # metered thinking), and an `auto` child that fell back to metered spend
-        # must be able to say so instead of discovering it by spending.
+        # The executor note tells a harness child it is a NANNY (delegate_start/delegate_wait,
+        # not metered thinking), and an `auto` child that fell back to metered spend
+        # must be able to say so before spending.
         _exec_note = dispatch_executor_note(
             dispatch.executor_resolution if dispatch is not None else None,
             lane=dispatch.lane if dispatch is not None else None,

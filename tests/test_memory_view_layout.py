@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import queue
 
 import pytest
@@ -648,3 +649,54 @@ def test_aggregate_range_keeps_interleaved_verbatim_rows_in_place():
     assert text.index(rows[0]['line']) < text.index('2 earlier rows') < text.index(rows[2]['line']) < text.index(rows[4]['line'])
     assert rows[1]['line'] not in text and rows[3]['line'] not in text
     assert f"from='{rows[1]['address']}', to='{rows[3]['address']}'" in text
+
+
+def test_a_measured_build_times_each_section_on_its_receipt(tmp_path, monkeypatch):
+    """The receipt of a build inside ``measured_sections`` carries each section's wall and CPU time;
+    a build outside one carries neither, and the request itself is the same."""
+    from ouroboros.context_timing import measured_sections
+    from ouroboros.agent_task_pipeline import build_review_context
+    from ouroboros import context_timing, skill_catalogue
+    from types import SimpleNamespace
+
+    env, memory, _rooms = world(tmp_path)
+    events = memory.drive_root / "logs" / "events.jsonl"
+    # Skill discovery moved ahead of catalog rendering; its cost must still be
+    # in installed_skills, and the always-on block and catalog share one read.
+    clock = [0.0]
+    discoveries = []
+    discover = skill_catalogue.discover_context_skills
+
+    def discover_skills(root):
+        discoveries.append(root)
+        clock[0] += 2.0
+        return discover(root)
+
+    monkeypatch.setattr(skill_catalogue, "discover_context_skills", discover_skills)
+    monkeypatch.setattr(context_timing, "time", SimpleNamespace(
+        perf_counter=lambda: clock[0], thread_time=lambda: clock[0] / 2))
+
+    def receipt():
+        return [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()
+                if '"context_memory_view"' in line][-1]
+
+    history = events.read_bytes() if events.exists() else b""
+    with measured_sections():
+        timed_messages, _cap = _messages(env, memory, MAIN, review_context_builder=lambda: build_review_context(env))
+    timed = receipt()
+    assert discoveries == [memory.drive_root]
+    assert timed["sections_ms"]["installed_skills"] == 2000
+    assert timed["sections_cpu_ms"]["installed_skills"] == 1000
+    events.write_bytes(history)  # the second build reads the same recent events as the first
+    plain_messages, _cap = _messages(env, memory, MAIN, review_context_builder=lambda: build_review_context(env))
+    assert discoveries == [memory.drive_root, memory.drive_root]
+    plain = receipt()
+    assert {"memory_view", "knowledge", "health", "runtime", "registry", "installed_skills",
+            "drive_state", "review_records", "review_context", "fit", "total"} == set(timed["sections_ms"])
+    assert set(timed["sections_cpu_ms"]) == set(timed["sections_ms"])
+    assert timed["sections_ms"]["total"] >= max(timed["sections_ms"].values())  # the build's own time
+    assert all(isinstance(ms, int) and ms >= 0 for ms in [*timed["sections_ms"].values(), *timed["sections_cpu_ms"].values()])
+    assert "sections_ms" not in plain and "sections_cpu_ms" not in plain
+    # The spans stay on the receipt: both requests are the same text, apart from their capture time.
+    stamp = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?([+-]\d{2}:?\d{2}|Z)?")
+    assert stamp.sub("<ts>", json.dumps(timed_messages)) == stamp.sub("<ts>", json.dumps(plain_messages))

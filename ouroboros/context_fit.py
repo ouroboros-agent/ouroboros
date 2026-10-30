@@ -33,6 +33,7 @@ from ouroboros import context_budget
 from ouroboros.context_window import WindowRecord, resolve_window, route_observation_scope
 from ouroboros.tool_result_delivery import project_tool_result_batch  # noqa: F401
 from ouroboros.utils import estimate_tokens
+from ouroboros.context_timing import timed_section
 
 log = logging.getLogger(__name__)
 
@@ -777,6 +778,7 @@ def _whole_request(core, governance, mode, tool_schemas):
     return messages, list(select_tool_schemas(tool_schemas or [], context_mode=mode).schemas)
 
 
+@timed_section("fit")
 def build_context_fit_plan(
     env: Any,
     core: ContextCore,

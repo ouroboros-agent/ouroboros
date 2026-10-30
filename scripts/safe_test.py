@@ -7,7 +7,8 @@ the boundary before starting the command. It installs nothing and is not a sandb
 
 Stage two retains complete raw output and declared diagnostics, reaps the
 contained command, then releases declared reproducible test scratch on green
-and red. Unknown command data, debug and unconfirmed teardown stay in place.
+and red, including a command that could not be launched (exit 2, `launch_error`
+in its result). Unknown command data, debug and unconfirmed teardown stay in place.
 The last stderr line names the root once: `SAFE_TEST_RETAINED` or
 `SAFE_TEST_RELEASED` describes that path, not every process anywhere.
 
@@ -123,8 +124,8 @@ def main() -> int:
             "PLAYWRIGHT_BROWSERS_PATH", "OUROBOROS_E2E_DEEP",
             # The run's shard weights (ci.yml `shard-plan`): tests/default_lane.py, tests/browser_lane.py.
             "OUROBOROS_CI_DURATIONS",
-            # Opt-in native Windows desktop qualification (tests/test_windows_computer_use_native.py).
-            "OUROBOROS_WINDOWS_DESKTOP_QA",
+            # Opt-in native desktop qualification; ordinary runs remain skipped.
+            "OUROBOROS_WINDOWS_DESKTOP_QA", "OUROBOROS_MACOS_DESKTOP_QA",
             "OUROBOROS_TEST_EVIDENCE_ROOT", *environment["DIAGNOSTIC_OUTPUT_KEYS"],
         ))
         # Each pytest controller claims its own fresh basetemp beneath this owned
