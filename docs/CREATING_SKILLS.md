@@ -1105,6 +1105,9 @@ Use the connector's ordinary content-hash-bound skill token for:
   Main messages/questions and live/late answer routing; `presence_work_output_version: 1`
   advertises canonical output identities and separate producer/child references in
   work polls. `presence_wake_facts` lists accepted provider facts.
+  `presence_explicit_completion: 1` advertises that a new completion's outcome comes from
+  its explicit answer, silence or handoff, never from a delivery receipt. An absent key means
+  an older host without this promise: any confirmed tool receipt may suppress its final.
   `presence_history_import_version: 1` advertises `POST /presence/history` ("Importing
   earlier history" below); `presence_source_order_version: 1` advertises
   `event.message.source_order` on live and history events alike: an integer from 0 to
@@ -1168,15 +1171,15 @@ handoff is not exactly-once across a Host crash. A
 wake arrival its model has not seen when it finishes reopens it for another round; background
 arrivals alone never do.
 
-A focus uses ordinary `finish_task`, including `silent=true`. The host derives
-`message`, `silent`, `tool_delivered` or `deferred` from the final, delivery receipts
-and successfully started long work. Automatic speech passes the `place_reply`
-Safety check; a flag returns to the mind, including for long work promoted from a
-focus. Silent/Paused/disconnected destinations and Advises autonomy hold the reply
+A focus, or a root promoted or scheduled from it, uses ordinary `finish_task`, including
+`silent=true`; receipts never choose its outcome. An answer after any send, file or
+reaction is new speech; started work stays `deferred` (empty after silence).
+Automatic speech passes the `place_reply` Safety check; a flag returns to the mind.
+Silent/Paused/disconnected destinations and Advises autonomy hold the reply
 with a System fact. Cached replies, continuation envelopes and work polls apply the
 current place state without another generation or paid check. A held projection keeps
 the durable answer and its output identity; repeated holds record one fact per subject.
-Late receipts still record what happened and add a visible warning. Proactive speech uses the connector's own tools; `presence_finish` and
+Late receipts still record what happened, with a visible warning. Proactive speech uses the connector's own tools; `presence_finish` and
 `initiate_presence` are no longer public tools.
 
 Private Main contact uses the mind's existing tools: a Presence root can call
