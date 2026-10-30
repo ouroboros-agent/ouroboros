@@ -276,10 +276,17 @@ def test_transport_replacement_open_refusal_ends_with_its_typed_reason(host_worl
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize('during_call', ['none', 'cleared', 'predates'])
-@pytest.mark.parametrize('handle_after', ['absent', 'with-answer', 'after-answer'])
+@pytest.mark.parametrize('during_call,handle_after,outcome', [
+    (during, after, 'answered')
+    for during in ('none', 'cleared', 'predates')
+    for after in ('absent', 'with-answer', 'after-answer')
+] + [('predates', 'cleared-after', 'answered'),
+     ('cleared', 'absent', 'silent'), ('predates', 'absent', 'silent'),
+     ('predates', 'after-answer', 'silent'),
+     ('cleared', 'absent', 'unanswered'), ('predates', 'absent', 'unanswered'),
+     ('cleared', 'absent', 'same-turn'), ('predates', 'absent', 'same-turn')])
 @pytest.mark.parametrize('thinking', [False, True])
-def test_r28_goaway_while_tool_pending(host_world, monkeypatch, during_call, handle_after, thinking):
+def test_r28_goaway_while_tool_pending(host_world, monkeypatch, during_call, handle_after, outcome, thinking):
     """Follow direct delivery through renewal: only a post-write handle can resume its result."""
     import threading
     from tests._live_stack_wire import NativeWire
@@ -291,13 +298,21 @@ def test_r28_goaway_while_tool_pending(host_world, monkeypatch, during_call, han
             execute = live.host.tools.execute_result
             def blocked(name, args):
                 if name != 'list_available_tools': return execute(name, args)
-                effects.append(name); entered.set()
-                assert release.wait(30)
+                effects.append(name)
                 return ToolResult(status='ok', code='OK', text='Completed exactly once.')
             monkeypatch.setattr(live.host.tools, 'execute_result', blocked)
+            tool_batch = live.host.tool_batch
+            async def pending(calls):
+                entered.set()
+                while not release.is_set():
+                    await asyncio.sleep(.01)
+                return await tool_batch(calls)
+            monkeypatch.setattr(live.host, 'tool_batch', pending)
             send = NativeWire.send
             async def answer_then_handle(wire, raw):
                 is_result = 'toolResponse' in json.loads(raw)
+                if is_result and handle_after == 'cleared-after':
+                    wire.put({'sessionResumptionUpdate': {'resumable': False}})
                 if is_result and handle_after == 'with-answer':
                     # Reissuing the same value still supplies new authority. It
                     # arrives with the response, before its answer completes.
@@ -309,7 +324,22 @@ def test_r28_goaway_while_tool_pending(host_world, monkeypatch, during_call, han
             old = live.wire
             old.put({'sessionResumptionUpdate': {'resumable': True, 'newHandle': 'before-call'}})
             await live.wait(lambda: live.host.state.get('resume_handle') == 'before-call')
-            old.tool('pending-native', 'list_available_tools', {})
+            spoken_before = len(old.spoken)
+            complete = old.complete
+            if outcome in ('unanswered', 'same-turn'):
+                old.complete = lambda: None
+            if outcome == 'unanswered':
+                old.answer = complete  # finish the tool turn, with no answer
+            name, args = ('attend', {'see': None, 'look': None, 'revisit_after_s': None}) if outcome == 'silent' else ('list_available_tools', {})
+            if outcome == 'silent' and handle_after == 'after-answer':
+                write = live.call.session.ws.send
+                async def write_then_handle(raw):
+                    await write(raw)
+                    if 'toolResponse' in json.loads(raw):
+                        await live.wait(lambda: live.host.state.get('resume_handle') == 'after-answer')
+                monkeypatch.setattr(live.call.session.ws, 'send', write_then_handle)
+            old.tool('pending-native', name, args)
+            old.complete = complete
             try:
                 await live.wait(entered.is_set)
                 if during_call == 'cleared':
@@ -321,16 +351,17 @@ def test_r28_goaway_while_tool_pending(host_world, monkeypatch, during_call, han
                 release.set()
                 await live.wait(lambda: 'pending-native' in old.outputs or len(live.provider.connections) > 1)
                 assert 'pending-native' in old.outputs, 'a fitting result must reach the issuing socket'
-                fresh = during_call != 'none' and handle_after == 'absent'
+                fresh = during_call != 'none' and handle_after in ('absent', 'cleared-after')
                 if during_call != 'none':
                     await live.wait(lambda: len(live.provider.connections) == 2 and live.wire.sent)
                     expected = {} if fresh else {'handle': 'before-call' if handle_after == 'with-answer' else 'after-answer'}
                     assert live.wire.sent[0]['setup']['sessionResumption'] == expected
-                if fresh:
+                if fresh and outcome == 'unanswered':
                     await live.wait(lambda: any('The requested tool batch returned' in json.dumps(row)
                                                for row in live.wire.sent if 'clientContent' in row))
                 await live.quiet()
-                assert effects == ['list_available_tools']
+                assert effects == ([] if outcome == 'silent' else ['list_available_tools'])
+                assert len(old.spoken) - spoken_before == (1 if outcome in ('answered', 'same-turn') else 0)
                 assert not live.call.deferred_tool_outputs and not live.call.pending_offers
                 assert len(live.provider.connections) == (1 if during_call == 'none' else 2)
                 assert sum('toolResponse' in row for row in old.sent) == 1
@@ -338,12 +369,21 @@ def test_r28_goaway_while_tool_pending(host_world, monkeypatch, during_call, han
                     assert 'pending-native' not in live.wire.outputs
                     if fresh:
                         fitted = json.loads(live.call.session.selected.messages_json)
-                        assert any(row.get('tool_call_id') == 'pending-native'
-                                   and row['content'] == 'Completed exactly once.' for row in fitted)
-                        assert 'Completed exactly once.' in json.dumps(live.wire.sent[0]['setup'])
-                    else:
+                        assert any(row.get('tool_call_id') == 'pending-native' for row in fitted)
+                        if outcome != 'silent':
+                            assert 'Completed exactly once.' in json.dumps(live.wire.sent[0]['setup'])
+                    if not fresh or outcome != 'unanswered':
+                        assert not live.wire.spoken
                         assert not any('The requested tool batch returned' in json.dumps(row)
                                        for row in live.wire.sent if 'clientContent' in row)
+                    if not fresh:
+                        # A later GoAway has no new handle or tool write. The old
+                        # connection's marker must not invalidate this checkpoint.
+                        live.wire.put({'goAway': {'timeLeft': '30s'}})
+                        await live.wait(lambda: len(live.provider.connections) == 3 and live.wire.sent)
+                        assert live.wire.sent[0]['setup']['sessionResumption'] == expected
+                        await live.quiet()
+                        assert not live.wire.outputs and not live.wire.spoken
             finally:
                 release.set()
         assert live.result[1]['execution_status'] == 'ok', live.result

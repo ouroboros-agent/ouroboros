@@ -217,6 +217,7 @@ class _Call:
         self.preparing_revision = None
         self.resume_revision = 0
         self.resume_tool_output = None
+        self.tool_answer_pending = False
 
     async def run(self):
         writer = self.writer = asyncio.create_task(self.save_rows())
@@ -395,14 +396,15 @@ class _Call:
                 return
             try:
                 resume_revision = self.resume_revision
+                if isinstance(command, ToolOutputs):
+                    self.tool_answer_pending = any(row.get('tool_call_id') not in command.silent
+                        for row in command.messages if row.get('role') == 'tool')
                 result = await session.send(command)
                 if isinstance(command, ToolOutputs):
-                    # Only a successful write invalidates older handles. A handle
-                    # received with the write or later covers this completed batch;
-                    # a failed write still owes its result to the resumed socket.
-                    self.resume_tool_output = (resume_revision, any(
-                        row.get('tool_call_id') not in command.silent
-                        for row in command.messages if row.get('role') == 'tool'))
+                    # Adapters may distinguish native response writes from pixels
+                    # and queue acceptance. Older sessions keep send-boundary order.
+                    if getattr(session, 'resume_after_tool_response', False) is not None:
+                        self.resume_tool_output = resume_revision
                     self.delivered_catalog = command.tools
                     delivered = getattr(self.host, 'tool_results_delivered', None)
                     if delivered is not None:
@@ -685,7 +687,7 @@ class _Call:
                 offline_tools = getattr(self.session, "tools_need_renewal", None)
                 needs_fit = (self.host.state.get("refit") or self.host.renewal_due()
                              or (offline_tools is not None and offline_tools(tuple(self.host.schemas))))
-                if not needs_fit and self.resume:
+                if not needs_fit and (self.resume or images):
                     # Fresh projection can collapse a prior frame that this socket
                     # still holds. Price the complete native delivery, images too.
                     needs_fit = not await self.host.delivery_fits(
@@ -751,6 +753,10 @@ class _Call:
                 if refusal is not None and not (event.kind == "response_done"
                         or (event.kind == "caption" and data.get("final"))):
                     continue
+                if self.tool_answer_pending and (event.kind == 'audio'
+                        or event.kind == 'caption' and data['speaker'] == 'ouroboros'):
+                    # A tool turn can answer under the same native response id.
+                    self.tool_responses.difference_update(self.active_responses)
                 if event.kind == "ready":
                     if self.tool_refit.is_set():
                         continue  # a late ready cannot release work to the retiring connection
@@ -817,6 +823,9 @@ class _Call:
                         self.receipts[response] = receipt
                     self.active_responses.discard(response)
                     self.response_open = bool(self.active_responses) or bool(data.get("continues"))
+                    if (not self.response_open and data['status'] == 'completed'
+                            and response not in self.tool_responses):
+                        self.tool_answer_pending = False
                     self.hub.send_turn(cp.TURN_AWAITING if self.response_open or self.tools_running else cp.TURN_IDLE)
                 elif event.kind == "tool_call":
                     self.tool_responses.update(self.active_responses)
@@ -889,10 +898,11 @@ class _Call:
                     if self.quiet() and (self.resume or self.preparation_ready()):
                         self.timing("quiet")
                         if self.resume and self.resume_tool_output is not None:
-                            revision, ordinary = self.resume_tool_output
-                            if not self.host.state.get("resume_handle") or revision == self.resume_revision:
+                            covered = getattr(self.session, 'resume_after_tool_response',
+                                              self.resume_tool_output != self.resume_revision)
+                            if not self.host.state.get("resume_handle") or not covered:
                                 self.resume = False
-                                if ordinary:
+                                if self.tool_answer_pending:
                                     self.pending_offers.append(self.tool_answer_pointer())
                                 self.request_renewal()
                                 continue  # adopt the fresh result-bearing fit before offering its pointer

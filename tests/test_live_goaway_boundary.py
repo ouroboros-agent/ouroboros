@@ -16,6 +16,7 @@ from tests.test_live_conversation import host_world as host_world
 @pytest.mark.parametrize('vision,room,successor', [
     (True, 700, 'native'), (True, 4000, 'native'),
     (True, 700, 'fresh'), (False, 700, 'native'),
+    (True, 700, 'none'), (True, 4000, 'none'), (False, 700, 'none'),
 ])
 def test_native_attend_measures_the_complete_delivery(host_world, record_property, vision, room, successor):
     host = host_world.host
@@ -47,7 +48,8 @@ def test_native_attend_measures_the_complete_delivery(host_world, record_propert
             call.response_open = False
             assert not host.renewal_due()
             call.attention.frame(cp.PeerVideo('screen', cp.PEER_OWNER, 'image/jpeg', b'second exact frame'))
-            call.request_renewal(resuming=successor == 'native')
+            if successor != 'none':
+                call.request_renewal(resuming=successor == 'native')
             await call.tool_queue.put(request('second-look'))
             await asyncio.wait_for(call.tool_queue.join(), 30)
             later = deliveries[1:]
@@ -64,7 +66,7 @@ def test_native_attend_measures_the_complete_delivery(host_world, record_propert
             if vision and room == 700:
                 assert not later and deferred
                 assert not call.resume and call.pending_offers
-            elif successor == 'native':
+            elif successor != 'fresh':
                 assert later and not deferred
         finally:
             worker.cancel()
@@ -73,14 +75,17 @@ def test_native_attend_measures_the_complete_delivery(host_world, record_propert
     asyncio.run(host.session(consume, LiveOptions()))
 
 
-@pytest.mark.parametrize('thinking', [False, True])
+@pytest.mark.parametrize('engine,thinking,successor', [
+    ('gemini', False, 'native'), ('gemini', True, 'native'),
+    ('gemini', False, 'none'), ('gemini', True, 'none'), ('openai', False, 'none'),
+])
 @pytest.mark.parametrize('room', [700, 4000])
-def test_native_wire_attend_during_goaway(host_world, monkeypatch, record_property, thinking, room):
+def test_native_wire_attend_during_goaway(host_world, monkeypatch, record_property, engine, thinking, successor, room):
     from tests._live_stack import stack
     import threading
     entered, release = threading.Event(), threading.Event()
     async def scenario():
-        async with stack(host_world, monkeypatch, 'gemini', thinking=thinking) as live:
+        async with stack(host_world, monkeypatch, engine, thinking=thinking) as live:
             host, call, old = live.host, live.call, live.wire
             call.attention.frame(cp.PeerVideo('screen', cp.PEER_OWNER, 'image/jpeg', b'first exact frame'))
             old.tool('first-look', 'attend', {'see': 'asked', 'look': True, 'revisit_after_s': None})
@@ -93,8 +98,9 @@ def test_native_wire_attend_during_goaway(host_world, monkeypatch, record_proper
                 view._history_at_receipt = view._history_estimate()
                 view._serving_history_at_receipt = view._serving_history_estimate()
             old.prompt, old.audio_tokens = held, held  # next tool boundary reports the same held size
-            old.put({'sessionResumptionUpdate': {'resumable': True, 'newHandle': 'before-look'}})
-            await live.wait(lambda: host.state.get('resume_handle') == 'before-look')
+            if successor == 'native':
+                old.put({'sessionResumptionUpdate': {'resumable': True, 'newHandle': 'before-look'}})
+                await live.wait(lambda: host.state.get('resume_handle') == 'before-look')
             retain = host.retain_frame
             async def delayed(data, mime, *, source=''):
                 entered.set()
@@ -116,9 +122,12 @@ def test_native_wire_attend_during_goaway(host_world, monkeypatch, record_proper
             old.tool('second-look', 'attend', {'see': 'asked', 'look': True, 'revisit_after_s': None})
             try:
                 await live.wait(entered.is_set)
-                old.put({'sessionResumptionUpdate': {'resumable': False}})
-                old.put({'goAway': {'timeLeft': '30s'}})
-                await live.wait(lambda: call.renewing and call.resume, timeout=15)
+                if successor == 'native':
+                    old.put({'sessionResumptionUpdate': {'resumable': False}})
+                    old.put({'goAway': {'timeLeft': '30s'}})
+                    await live.wait(lambda: call.renewing and call.resume, timeout=15)
+                else:
+                    assert not call.renewing
                 release.set()
                 await live.wait(lambda: 'second-look' in old.outputs or len(live.provider.connections) > 1)
                 observed = [item for item in sent if item['second_result']]
@@ -128,14 +137,17 @@ def test_native_wire_attend_during_goaway(host_world, monkeypatch, record_proper
                     new_video_on_issuing_wire=more_video, connections=len(live.provider.connections))))
                 assert all(item['room'] >= 0 for item in observed), 'native wire received an over-capacity requested image'
                 if room == 4000:
-                    assert observed and 'second-look' in old.outputs and more_video == 1
+                    assert observed and 'second-look' in old.outputs
+                    if engine == 'gemini':
+                        assert more_video == 1
                 else:
                     assert not observed and 'second-look' not in old.outputs and more_video == 0
                     await live.wait(lambda: any('The requested tool batch returned' in json.dumps(row)
-                                               for row in live.wire.sent if 'clientContent' in row))
+                                               for row in live.wire.sent))
                     await live.quiet()
-                    assert live.wire.sent[0]['setup']['sessionResumption'] == {}
-                    assert 'second-look' not in live.wire.outputs
+                    if engine == 'gemini':
+                        assert live.wire.sent[0]['setup']['sessionResumption'] == {}
+                        assert 'second-look' not in live.wire.outputs
                     assert 'second-look' in live.call.session.selected.messages_json
                     assert sum(row.get('call_id') == 'second-look' for row in host.trace['tool_calls']) == 1
             finally:
