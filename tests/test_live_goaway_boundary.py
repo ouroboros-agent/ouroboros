@@ -54,6 +54,7 @@ def test_native_attend_measures_the_complete_delivery(host_world, record_propert
             deferred = call.deferred_tool_outputs
             command = later[0][0] if later else deferred[0][0]
             free = later[0][1] if later else serving_delivery_room(host, command.messages, command.tools)
+            assert not host.renewal_due(), 'the fresh projection collapses the prior same-source pixels'
             record_property('attend_boundary', json.dumps(dict(vision=vision, room=room, successor=successor,
                 serving_free=free, fresh_due=host.renewal_due(), sent=len(later), deferred=len(deferred),
                 refit=bool(host.state.get('refit')), native_resume=call.resume,
@@ -62,6 +63,7 @@ def test_native_attend_measures_the_complete_delivery(host_world, record_propert
             assert sum(row.get('call_id') == 'second-look' for row in host.trace['tool_calls']) == 1
             if vision and room == 700:
                 assert not later and deferred
+                assert not call.resume and call.pending_offers
             elif successor == 'native':
                 assert later and not deferred
         finally:
@@ -129,6 +131,13 @@ def test_native_wire_attend_during_goaway(host_world, monkeypatch, record_proper
                     assert observed and 'second-look' in old.outputs and more_video == 1
                 else:
                     assert not observed and 'second-look' not in old.outputs and more_video == 0
+                    await live.wait(lambda: any('The requested tool batch returned' in json.dumps(row)
+                                               for row in live.wire.sent if 'clientContent' in row))
+                    await live.quiet()
+                    assert live.wire.sent[0]['setup']['sessionResumption'] == {}
+                    assert 'second-look' not in live.wire.outputs
+                    assert 'second-look' in live.call.session.selected.messages_json
+                    assert sum(row.get('call_id') == 'second-look' for row in host.trace['tool_calls']) == 1
             finally:
                 release.set()
     asyncio.run(scenario())

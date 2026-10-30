@@ -215,6 +215,8 @@ class _Call:
         self.pending_context_rows = []
         self.delivered_catalog = None
         self.preparing_revision = None
+        self.resume_revision = 0
+        self.resume_tool_output = None
 
     async def run(self):
         writer = self.writer = asyncio.create_task(self.save_rows())
@@ -294,6 +296,7 @@ class _Call:
 
     async def consume(self, session):
         self.session = self.last_session = session
+        self.resume_tool_output = None
         if not self.resume:
             self.delivered_catalog = None
         self.connection_resumed = self.resume
@@ -391,8 +394,15 @@ class _Call:
                         'You may answer, act or stay silent.'})
                 return
             try:
+                resume_revision = self.resume_revision
                 result = await session.send(command)
                 if isinstance(command, ToolOutputs):
+                    # Only a successful write invalidates older handles. A handle
+                    # received with the write or later covers this completed batch;
+                    # a failed write still owes its result to the resumed socket.
+                    self.resume_tool_output = (resume_revision, any(
+                        row.get('tool_call_id') not in command.silent
+                        for row in command.messages if row.get('role') == 'tool'))
                     self.delivered_catalog = command.tools
                     delivered = getattr(self.host, 'tool_results_delivered', None)
                     if delivered is not None:
@@ -418,6 +428,12 @@ class _Call:
     def consume_revisit(self):
         self.attention.revisit_at = None
         self.pending_offers[:] = [row for row in self.pending_offers if not row.get("_requested_look")]
+
+    @staticmethod
+    def tool_answer_pointer():
+        return {"role": "user", "content":
+            "[Host fact; not owner words] The requested tool batch returned; its results are in the fitted history. "
+            "You may continue from them, act or stay silent; completed effects stay done."}
 
     @staticmethod
     def room_answer_pointer():
@@ -680,9 +696,7 @@ class _Call:
                         # Waiting for quiet would deadlock on the withheld result.
                         offers = []
                         if any(call["id"] not in silent for call in calls):
-                            offers = [*({**image, "_canonical": True} for image in images), {"role": "user", "content":
-                                "[Host fact; not owner words] The requested tool batch returned; its results are in the fitted history. "
-                                "You may continue from them, act or stay silent; completed effects stay done."}]
+                            offers = [*({**image, "_canonical": True} for image in images), self.tool_answer_pointer()]
                             self.pending_offers.extend(offers)
                         if needs_fit or not self.renewing:
                             self.request_renewal()
@@ -811,6 +825,7 @@ class _Call:
                 elif event.kind == "renew":
                     self.request_renewal(resuming=data["resume"], within=data["within_s"])
                 elif event.kind == "resumable":
+                    self.resume_revision += 1
                     self.host.state["resume_handle"] = data["handle"]
                 elif event.kind == "closed":
                     resuming = bool(data.get('resumable') and self.host.state.get('resume_handle'))
@@ -873,6 +888,14 @@ class _Call:
                 if self.renewing:
                     if self.quiet() and (self.resume or self.preparation_ready()):
                         self.timing("quiet")
+                        if self.resume and self.resume_tool_output is not None:
+                            revision, ordinary = self.resume_tool_output
+                            if not self.host.state.get("resume_handle") or revision == self.resume_revision:
+                                self.resume = False
+                                if ordinary:
+                                    self.pending_offers.append(self.tool_answer_pointer())
+                                self.request_renewal()
+                                continue  # adopt the fresh result-bearing fit before offering its pointer
                         if self.resume and not self.host.state.get("resume_handle"):
                             raise RealtimeSetupError("resume_unavailable", "provider has not supplied a resume handle")
                         self.hub.send_state(cp.STATE_RECONNECTING, "provider_renewal")

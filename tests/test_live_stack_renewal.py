@@ -277,15 +277,17 @@ def test_transport_replacement_open_refusal_ends_with_its_typed_reason(host_worl
 
 
 @pytest.mark.parametrize('during_call', ['none', 'cleared', 'predates'])
-def test_r28_goaway_while_tool_pending(host_world, monkeypatch, during_call):
-    """The fitting result reaches the issuing socket; only its answer enables a new handle."""
+@pytest.mark.parametrize('handle_after', ['absent', 'with-answer', 'after-answer'])
+@pytest.mark.parametrize('thinking', [False, True])
+def test_r28_goaway_while_tool_pending(host_world, monkeypatch, during_call, handle_after, thinking):
+    """Follow direct delivery through renewal: only a post-write handle can resume its result."""
     import threading
     from tests._live_stack_wire import NativeWire
     from ouroboros.tools.tool_result import ToolResult
     entered, release = threading.Event(), threading.Event()
     effects = []
     async def scenario():
-        async with stack(host_world, monkeypatch, 'gemini') as live:
+        async with stack(host_world, monkeypatch, 'gemini', thinking=thinking) as live:
             execute = live.host.tools.execute_result
             def blocked(name, args):
                 if name != 'list_available_tools': return execute(name, args)
@@ -295,8 +297,13 @@ def test_r28_goaway_while_tool_pending(host_world, monkeypatch, during_call):
             monkeypatch.setattr(live.host.tools, 'execute_result', blocked)
             send = NativeWire.send
             async def answer_then_handle(wire, raw):
+                is_result = 'toolResponse' in json.loads(raw)
+                if is_result and handle_after == 'with-answer':
+                    # Reissuing the same value still supplies new authority. It
+                    # arrives with the response, before its answer completes.
+                    wire.put({'sessionResumptionUpdate': {'resumable': True, 'newHandle': 'before-call'}})
                 await send(wire, raw)
-                if 'toolResponse' in json.loads(raw):
+                if is_result and handle_after == 'after-answer':
                     wire.put({'sessionResumptionUpdate': {'resumable': True, 'newHandle': 'after-answer'}})
             monkeypatch.setattr(NativeWire, 'send', answer_then_handle)
             old = live.wire
@@ -314,13 +321,29 @@ def test_r28_goaway_while_tool_pending(host_world, monkeypatch, during_call):
                 release.set()
                 await live.wait(lambda: 'pending-native' in old.outputs or len(live.provider.connections) > 1)
                 assert 'pending-native' in old.outputs, 'a fitting result must reach the issuing socket'
+                fresh = during_call != 'none' and handle_after == 'absent'
+                if during_call != 'none':
+                    await live.wait(lambda: len(live.provider.connections) == 2 and live.wire.sent)
+                    expected = {} if fresh else {'handle': 'before-call' if handle_after == 'with-answer' else 'after-answer'}
+                    assert live.wire.sent[0]['setup']['sessionResumption'] == expected
+                if fresh:
+                    await live.wait(lambda: any('The requested tool batch returned' in json.dumps(row)
+                                               for row in live.wire.sent if 'clientContent' in row))
                 await live.quiet()
                 assert effects == ['list_available_tools']
                 assert not live.call.deferred_tool_outputs and not live.call.pending_offers
                 assert len(live.provider.connections) == (1 if during_call == 'none' else 2)
+                assert sum('toolResponse' in row for row in old.sent) == 1
                 if during_call != 'none':
-                    assert live.wire.sent[0]['setup']['sessionResumption'] == {'handle': 'after-answer'}
                     assert 'pending-native' not in live.wire.outputs
+                    if fresh:
+                        fitted = json.loads(live.call.session.selected.messages_json)
+                        assert any(row.get('tool_call_id') == 'pending-native'
+                                   and row['content'] == 'Completed exactly once.' for row in fitted)
+                        assert 'Completed exactly once.' in json.dumps(live.wire.sent[0]['setup'])
+                    else:
+                        assert not any('The requested tool batch returned' in json.dumps(row)
+                                       for row in live.wire.sent if 'clientContent' in row)
             finally:
                 release.set()
         assert live.result[1]['execution_status'] == 'ok', live.result
