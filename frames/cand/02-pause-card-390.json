@@ -1,0 +1,6 @@
+{
+  "word": "Paused",
+  "line": "You paused it: Codex: CI on main is red; hold the migration until it is green again · 17:31",
+  "card": "Paused\nYou paused it: Codex: CI on main is red; hold the migration until it is green again · 17:31\nupdated 17:03\nMigrate the settings store to v3\n2 notes\nDetails\nCopying the settings rows into the v3 store.\nTurn into project\nResume\nStop…\nCopying the settings rows into the v3 store.\n17:03:00\nYou paused this task: Codex: CI on main is red; hold the migration until it is green again. Its work is retained; Resume continues it.\n17:31:00",
+  "notice_sent": "You paused this task: Codex: CI on main is red; hold the migration until it is green again. Its work is retained; Resume continues it."
+}

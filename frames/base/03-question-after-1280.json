@@ -1,0 +1,14 @@
+{
+  "status": "Answer saved · the task reads it when it continues",
+  "card": "Question\nAnswer saved · the task reads it when it continues\n\nWhich format should the archive export use?\n\nCSV, one file per table\nYour choice\nOne JSON file with every table\nOption details were not retained for this older question.",
+  "posts": [
+    [
+      "/api/decisions",
+      {
+        "request_id": "10efcf1c-338d-49b4-8064-1a98e63cbc3c",
+        "decision_id": "quiz:fr-ask:q-export",
+        "option_index": 0
+      }
+    ]
+  ]
+}

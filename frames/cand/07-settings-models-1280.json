@@ -1,0 +1,4 @@
+{
+  "main_section": "Main\nLocal\nCodex (model)\nAdd a key in Accounts for more\nAccount: automatic rotation\nAccount: personal (pinned)\nAccount: work (pinned)\nUses your subscription. No API key required.\nContext & processing · Route default (inherited)\n\nRunning work that follows Main uses this model at its next call. The new route may need to read its full context again; work with its own model keeps it.",
+  "note": "Running work that follows Main uses this model at its next call. The new route may need to read its full context again; work with its own model keeps it."
+}
