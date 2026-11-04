@@ -1,0 +1,14 @@
+{
+  "status": "Answer saved · read after Resume",
+  "card": "Question\nAnswer saved · read after Resume\n\nWhich format should the archive export use?\n\nCSV, one file per table\nYour choice\nOne JSON file with every table\nOption details were not retained for this older question.",
+  "posts": [
+    [
+      "/api/decisions",
+      {
+        "request_id": "b8911c8b-7fd2-4427-82ee-11604bc152b6",
+        "decision_id": "quiz:fr-ask:q-export",
+        "option_index": 0
+      }
+    ]
+  ]
+}

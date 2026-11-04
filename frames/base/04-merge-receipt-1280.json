@@ -1,0 +1,8 @@
+{
+  "line": "Warning: PR #7 merge: merged as cccccccccccc. The review read uncommitted files; whether it saw what merged is not recorded.\n17:10:00",
+  "card": "Working\nupdated 17:02\nReading the PR.\n2 notes\nDetails\nTurn into project\nStop…\nReading the PR.\n17:02:00\nWarning: PR #7 merge: merged as cccccccccccc. The review read uncommitted files; whether it saw what merged is not recorded.\n17:10:00",
+  "history_rows": [
+    "⚠️ PR #7 merge: merged as cccccccccccc. The review read uncommitted files; whether it saw what merged is not recorded.",
+    "⚠️ PR #7 merge: merged as cccccccccccc. The review read uncommitted files; whether it saw what merged is not recorded."
+  ]
+}
