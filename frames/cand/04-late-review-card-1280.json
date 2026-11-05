@@ -1,0 +1,45 @@
+{
+  "link": {
+    "label": "Download the reviewer’s report",
+    "href": "/api/tasks/merge-task/reviews/late-merge-review/critic?role=response&part=change&sha256=f1289c4d33511613ce6d1b99d3050e4bb7fb177da3250c1a9ec58431d412ca08&domain=ledger",
+    "opened": {
+      "status": 200,
+      "tail": "AIL: the rollback loses data.\nREPORT-END"
+    }
+  },
+  "history": {
+    "before": [
+      "⚠️ PR #7 merge: merged as cccccccccccc · review coverage unknown\nWhether the review covers what merged is not recorded."
+    ],
+    "after": [
+      "⚠️ PR #7 merge: merged as cccccccccccc · review coverage unknown\nWhether the review covers what merged is not recorded.\nIts later review: FAIL."
+    ],
+    "late_evidence": [
+      {
+        "kind": "merge_review",
+        "record_id": "late-merge-review",
+        "revision": 2,
+        "verdict": "FAIL",
+        "review_source": {
+          "task_id": "merge-task",
+          "record_id": "late-merge-review",
+          "seat_id": "critic",
+          "role": "response",
+          "part": "change",
+          "sha256": "f1289c4d33511613ce6d1b99d3050e4bb7fb177da3250c1a9ec58431d412ca08"
+        }
+      }
+    ],
+    "room_rows_before": 3,
+    "room_rows_after": 3,
+    "main_rows_before": 3,
+    "main_rows_after": 3
+  },
+  "line": "Warning: PR #7 merge: merged as cccccccccccc · review coverage unknown\n4 нояб. 2026 г., 17:10:00\nWhether the review covers what merged is not recorded.\nIts later review: FAIL.\n\nDownload the reviewer’s report",
+  "card": "Working\nupdated Yesterday, 17:02\nReading the PR.\n2 notes\nDetails\nTurn into project\nStop…\nReading the PR.\n4 нояб. 2026 г., 17:02:00\nWarning: PR #7 merge: merged as cccccccccccc · review coverage unknown\n4 нояб. 2026 г., 17:10:00\nWhether the review covers what merged is not recorded.\nIts later review: FAIL.\n\nDownload the reviewer’s report",
+  "words_before_shot": {
+    "line": "Warning: PR #7 merge: merged as cccccccccccc · review coverage unknown\n4 нояб. 2026 г., 17:10:00\nWhether the review covers what merged is not recorded.\nIts later review: FAIL.\n\nDownload the reviewer’s report",
+    "card": "Working\nupdated Yesterday, 17:02\nReading the PR.\n2 notes\nDetails\nTurn into project\nStop…\nReading the PR.\n4 нояб. 2026 г., 17:02:00\nWarning: PR #7 merge: merged as cccccccccccc · review coverage unknown\n4 нояб. 2026 г., 17:10:00\nWhether the review covers what merged is not recorded.\nIts later review: FAIL.\n\nDownload the reviewer’s report"
+  },
+  "words_changed_during_shot": false
+}

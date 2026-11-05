@@ -1,0 +1,137 @@
+{
+  "settled_word": "Stopped",
+  "producer": {
+    "appended": "terminal_projection.append_terminal_projection",
+    "source_stored": {
+      "status": "completed",
+      "reason_code": "final_message",
+      "outcome_axes": {
+        "schema_version": 1,
+        "lifecycle": {
+          "status": "completed"
+        },
+        "execution": {
+          "status": "ok",
+          "reason_code": "final_message",
+          "task_completion": {
+            "action": "stop",
+            "rationale": "Not ready: the export endpoint still fails on empty input.",
+            "answer_sha256": "7e72ca219be1f9507538c72b3da08335f7ff7277df12d8197af14c9112bb1f20",
+            "source": "finish_task"
+          },
+          "failure": null,
+          "recoveries": [],
+          "cosmetic_tool_errors": [],
+          "ignored_tool_errors": [],
+          "policy_denials": [],
+          "unresolved_tool_errors": []
+        },
+        "artifacts": {
+          "status": "not_applicable"
+        },
+        "objective": {
+          "status": "fail",
+          "source": "task_completion",
+          "review_status": "skipped",
+          "reason": "author_stop"
+        },
+        "review": {
+          "status": "skipped",
+          "trigger": "not_evaluated",
+          "eligibility": "not_eligible",
+          "run_count": 0
+        }
+      }
+    },
+    "stored": {
+      "status": "completed",
+      "reason_code": "final_message",
+      "suggested_name": "Export endpoint",
+      "outcome_axes": {
+        "schema_version": 1,
+        "lifecycle": {
+          "status": "completed"
+        },
+        "execution": {
+          "status": "ok",
+          "reason_code": "final_message",
+          "task_completion": {
+            "action": "stop",
+            "rationale": "Not ready: the export endpoint still fails on empty input.",
+            "answer_sha256": "7e72ca219be1f9507538c72b3da08335f7ff7277df12d8197af14c9112bb1f20",
+            "source": "finish_task"
+          },
+          "failure": null,
+          "recoveries": [],
+          "cosmetic_tool_errors": [],
+          "ignored_tool_errors": [],
+          "policy_denials": [],
+          "unresolved_tool_errors": []
+        },
+        "artifacts": {
+          "status": "not_applicable"
+        },
+        "objective": {
+          "status": "fail",
+          "source": "task_completion",
+          "review_status": "skipped",
+          "reason": "author_stop"
+        },
+        "review": {
+          "status": "skipped",
+          "trigger": "not_evaluated",
+          "eligibility": "not_eligible",
+          "run_count": 0
+        }
+      }
+    },
+    "reload_rows": [
+      {
+        "history_id": "chat:0",
+        "system_type": "",
+        "is_progress": false,
+        "text": "Ship the export endpoint."
+      },
+      {
+        "history_id": "progress:0",
+        "system_type": "",
+        "is_progress": true,
+        "task_terminal_status": "completed",
+        "outcome_phase": "cancelled",
+        "text": "Checking the export endpoint against empty input."
+      },
+      {
+        "history_id": "chat:129",
+        "system_type": "task_summary",
+        "is_progress": false,
+        "text": ""
+      }
+    ],
+    "detail": {
+      "status": "completed",
+      "reason_code": "final_message",
+      "continuation_offer": {
+        "eligible": true,
+        "cause": "author_stop",
+        "refusal": ""
+      }
+    }
+  },
+  "word": "Stopped",
+  "line": "",
+  "title": "Export endpoint",
+  "activity": "Ouroboros stopped with unfinished work · Not ready: the export endpoint still fails on empty input.",
+  "continue": "Continue",
+  "continue_title": "Start a new task that continues this unfinished work",
+  "card": "Stopped\nExport endpoint\n3 notes\nDetails\nOuroboros stopped with unfinished work · Not ready: the export endpoint still fails on empty input.\nRequested test-model · execution not observed ·\n1 tool call\nTurn into project\nContinue",
+  "words_before_shot": {
+    "word": "Stopped",
+    "line": "",
+    "title": "Export endpoint",
+    "activity": "Ouroboros stopped with unfinished work · Not ready: the export endpoint still fails on empty input.",
+    "continue": "Continue",
+    "continue_title": "Start a new task that continues this unfinished work",
+    "card": "Stopped\nExport endpoint\n3 notes\nDetails\nOuroboros stopped with unfinished work · Not ready: the export endpoint still fails on empty input.\nRequested test-model · execution not observed ·\n1 tool call\nTurn into project\nContinue"
+  },
+  "words_changed_during_shot": false
+}

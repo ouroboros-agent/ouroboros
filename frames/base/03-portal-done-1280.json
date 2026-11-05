@@ -1,0 +1,29 @@
+{
+  "settled_word": "Done",
+  "main_row": "Export service › Migrate the export settings · Done",
+  "detail": {
+    "status": "completed",
+    "wake_summary": "The export settings moved to v3; nothing needed you.",
+    "title": "Migrate the export settings",
+    "project_id": "fr-proj",
+    "error": null,
+    "reason_code": "final_message"
+  },
+  "word": "Done",
+  "line": "",
+  "title": "Migrate the export settings",
+  "activity": "Copying the export presets into the v3 store.",
+  "continue": "",
+  "continue_title": "",
+  "card": "Done\nMigrate the export settings\nCopying the export presets into the v3 store.\n12 tool calls\nExport service\n↗",
+  "words_before_shot": {
+    "word": "Done",
+    "line": "",
+    "title": "Migrate the export settings",
+    "activity": "Copying the export presets into the v3 store.",
+    "continue": "",
+    "continue_title": "",
+    "card": "Done\nMigrate the export settings\nCopying the export presets into the v3 store.\n12 tool calls\nExport service\n↗"
+  },
+  "words_changed_during_shot": false
+}

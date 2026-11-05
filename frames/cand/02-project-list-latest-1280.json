@@ -1,0 +1,50 @@
+{
+  "open": {
+    "name": "Rebuild the export index",
+    "word": "Done",
+    "secondary": "",
+    "focus": "The export index is rebuilt and every link resolves.",
+    "settled": true,
+    "group": "",
+    "row": "Rebuild the export indexDoneThe export index is rebuilt and every link resolves."
+  },
+  "groups": [
+    "Latest task"
+  ],
+  "card_word_settled": "Done",
+  "name": "Rebuild the export index",
+  "word": "Done",
+  "secondary": "",
+  "focus": "The export index is rebuilt and every link resolves.",
+  "settled": true,
+  "group": "",
+  "row": "Rebuild the export indexDoneThe export index is rebuilt and every link resolves.",
+  "card": {
+    "word": "Done",
+    "line": "",
+    "title": "Rebuild the export index",
+    "activity": "The export index is rebuilt and every link resolves.",
+    "continue": "",
+    "continue_title": "",
+    "card": "Done\nRebuild the export index\n2 notes\nDetails\nThe export index is rebuilt and every link resolves."
+  },
+  "words_before_shot": {
+    "name": "Rebuild the export index",
+    "word": "Done",
+    "secondary": "",
+    "focus": "The export index is rebuilt and every link resolves.",
+    "settled": true,
+    "group": "",
+    "row": "Rebuild the export indexDoneThe export index is rebuilt and every link resolves.",
+    "card": {
+      "word": "Done",
+      "line": "",
+      "title": "Rebuild the export index",
+      "activity": "The export index is rebuilt and every link resolves.",
+      "continue": "",
+      "continue_title": "",
+      "card": "Done\nRebuild the export index\n2 notes\nDetails\nThe export index is rebuilt and every link resolves."
+    }
+  },
+  "words_changed_during_shot": false
+}

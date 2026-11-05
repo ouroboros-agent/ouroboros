@@ -1,0 +1,25 @@
+{
+  "link": null,
+  "history": {
+    "before": [
+      "⚠️ PR #7 merge: merged as cccccccccccc · review coverage unknown\nWhether the review covers what merged is not recorded."
+    ],
+    "after": [
+      "⚠️ PR #7 merge: merged as cccccccccccc · review coverage unknown\nWhether the review covers what merged is not recorded."
+    ],
+    "late_evidence": [
+      null
+    ],
+    "room_rows_before": 3,
+    "room_rows_after": 3,
+    "main_rows_before": 3,
+    "main_rows_after": 3
+  },
+  "line": "Warning: PR #7 merge: merged as cccccccccccc · review coverage unknown\n4 нояб. 2026 г., 17:10:00\nWhether the review covers what merged is not recorded.",
+  "card": "Working\nupdated Yesterday, 17:02\nReading the PR.\n2 notes\nDetails\nTurn into project\nStop…\nReading the PR.\n4 нояб. 2026 г., 17:02:00\nWarning: PR #7 merge: merged as cccccccccccc · review coverage unknown\n4 нояб. 2026 г., 17:10:00\nWhether the review covers what merged is not recorded.",
+  "words_before_shot": {
+    "line": "Warning: PR #7 merge: merged as cccccccccccc · review coverage unknown\n4 нояб. 2026 г., 17:10:00\nWhether the review covers what merged is not recorded.",
+    "card": "Working\nupdated Yesterday, 17:02\nReading the PR.\n2 notes\nDetails\nTurn into project\nStop…\nReading the PR.\n4 нояб. 2026 г., 17:02:00\nWarning: PR #7 merge: merged as cccccccccccc · review coverage unknown\n4 нояб. 2026 г., 17:10:00\nWhether the review covers what merged is not recorded."
+  },
+  "words_changed_during_shot": false
+}

@@ -1,0 +1,85 @@
+{
+  "card_word_settled": "Done",
+  "task_done": {
+    "ts": "2026-11-04T14:09:00Z",
+    "type": "task_done",
+    "task_id": "fr-close",
+    "root_task_id": "fr-close",
+    "task_type": "task",
+    "chat_id": 1,
+    "status": "completed",
+    "wake_silent": false,
+    "wake_summary": "Empty tables now export as a header-only CSV; the regression test passes.",
+    "target_label": "Fix the export of empty tables",
+    "quiet_effective": false,
+    "_is_direct_chat": false,
+    "root_phase_checkpoint": {},
+    "outcome_axes": {
+      "schema_version": 1,
+      "lifecycle": {
+        "status": "completed"
+      },
+      "execution": {
+        "status": "ok",
+        "reason_code": "final_message",
+        "failure": null,
+        "recoveries": [],
+        "cosmetic_tool_errors": [],
+        "ignored_tool_errors": [],
+        "policy_denials": [],
+        "unresolved_tool_errors": []
+      },
+      "artifacts": {
+        "status": "not_applicable"
+      },
+      "objective": {
+        "status": "not_evaluated",
+        "source": "none",
+        "review_status": "skipped"
+      },
+      "review": {
+        "status": "skipped",
+        "eligibility": "not_eligible",
+        "trigger": "not_evaluated",
+        "run_count": 0
+      }
+    },
+    "reason_code": "final_message",
+    "artifact_status": null
+  },
+  "name": "Fix the export of empty tables",
+  "word": "Done",
+  "secondary": "",
+  "focus": "",
+  "settled": true,
+  "group": "",
+  "row": "Fix the export of empty tablesDone",
+  "card": {
+    "word": "Done",
+    "line": "",
+    "title": "Fix the export of empty tables",
+    "activity": "Empty tables now export as a header-only CSV; the regression test passes.",
+    "continue": "",
+    "continue_title": "",
+    "card": "Done\nFix the export of empty tables\n2 notes\nDetails\nEmpty tables now export as a header-only CSV; the regression test passes.\nTurn into project"
+  },
+  "words_before_shot": {
+    "name": "Fix the export of empty tables",
+    "word": "Done",
+    "secondary": "",
+    "focus": "",
+    "settled": true,
+    "group": "",
+    "row": "Fix the export of empty tablesDone",
+    "card": {
+      "word": "Done",
+      "line": "",
+      "title": "Fix the export of empty tables",
+      "activity": "Empty tables now export as a header-only CSV; the regression test passes.",
+      "continue": "",
+      "continue_title": "",
+      "card": "Done\nFix the export of empty tables\n2 notes\nDetails\nEmpty tables now export as a header-only CSV; the regression test passes.\nTurn into project"
+    }
+  },
+  "words_changed_during_shot": false
+}
