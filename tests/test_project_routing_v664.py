@@ -327,6 +327,35 @@ def test_project_single_active_direct_root_gets_zero_call_mailbox_delivery(tmp_p
     assert calls[-1][1]["target"] == "direct-racer"
 
 
+def test_main_owner_message_attempts_only_owner_direct_followup_before_new_turn(tmp_path, monkeypatch):
+    import server
+    import ouroboros.server_owner_routing as owner_routing
+
+    calls = []
+    ctx = _ctx(tmp_path, direct=lambda *_a, **_k: calls.append("direct"))
+    monkeypatch.setattr(
+        owner_routing,
+        "_route_project_chat_to_running_task",
+        lambda _ctx, _chat_id, _text, _client_id, **kwargs: (
+            calls.append(kwargs.get("owner_direct_only")), "joined-root"
+        )[1],
+    )
+    monkeypatch.setattr(server, "_record_routing_receipt", lambda *_a, **_k: None)
+
+    server._route_owner_message(
+        types.SimpleNamespace(),
+        ctx,
+        {
+            "chat_id": 1,
+            "text": "here is the chat",
+            "client_message_id": "main-followup",
+            "source": "web",
+        },
+    )
+
+    assert calls == [True]
+
+
 def test_project_direct_stale_race_releases_admission_lock_once(tmp_path):
     import server
     from ouroboros.projects_registry import create_project

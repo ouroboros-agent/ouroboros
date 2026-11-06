@@ -499,7 +499,17 @@ def root_conversation_key(task: Any) -> str:
     from ouroboros.dialogue_provenance import presence_record_binding, presence_related_work
 
     metadata = task.get("metadata") if isinstance(task, dict) and isinstance(task.get("metadata"), dict) else {}
-    if (not isinstance(task, dict) or task.get("_presence_turn") or task.get("_presence_run") or task.get("_is_direct_chat")
+    if not isinstance(task, dict):
+        return ""
+    # Main owner-direct turns have no Presence conversation, but they still
+    # need the same durable intake/final-drain seam as a carried author. Use
+    # the current attempt owner so detached pooled work cannot reclaim it.
+    from ouroboros.task_carrier import execution_kind, execution_owner
+    if metadata.get("owner_direct") and execution_kind(task) == "direct":
+        owner = execution_owner(task)
+        if not owner or owner.get("lane") == "conversation":
+            return f"owner-direct:{int(task.get('chat_id') or 0)}"
+    if (task.get("_presence_turn") or task.get("_presence_run") or task.get("_is_direct_chat")
             or metadata.get("presence_event_identity") or not presence_related_work(presence_record_binding(task), task)):
         return ""
     presence = metadata.get("presence") if isinstance(metadata.get("presence"), dict) else {}
@@ -553,7 +563,9 @@ def follow_loop_admission(ctx: Any, accepting: bool) -> None:
     final). Only the writer's own process moves its fact; a turn with no intake row has none to follow."""
     metadata = getattr(ctx, "task_metadata", None)
     root, task_id = getattr(ctx, "drive_root", None), str(getattr(ctx, "task_id", "") or "")
-    if not isinstance(metadata, dict) or not isinstance(metadata.get("presence"), dict) or root is None or not task_id:
+    owner_direct = isinstance(metadata, dict) and bool(metadata.get("owner_direct"))
+    if (not isinstance(metadata, dict) or (not isinstance(metadata.get("presence"), dict) and not owner_direct)
+            or root is None or not task_id):
         return
     from ouroboros.task_custody import task_mail_lock
 

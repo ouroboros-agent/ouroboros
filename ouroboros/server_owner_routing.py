@@ -98,6 +98,7 @@ def _route_project_chat_to_running_task(
     image_data: Any = None,
     thread_of: str = "",
     roots: Optional[RootSnapshot] = None,
+    owner_direct_only: bool = False,
 ) -> str:
     """Deliver ordinary room input to its sole live reader, under admission locks.
 
@@ -110,13 +111,17 @@ def _route_project_chat_to_running_task(
     one thread. No other reader receives it. ``roots``: the message's one root snapshot.
     """
     try:
-        if not thread_of and not _project_id_for_registered_chat(ctx, chat_id):
+        if not owner_direct_only and not thread_of and not _project_id_for_registered_chat(ctx, chat_id):
             return ""
     except Exception:
         return ""
     try:
-        steerable = [row for row in (roots if roots is not None else addressable_roots(ctx)).rows(chat_id)
-                     if row.get("room_reader") and (not thread_of or row.get("late_input_of") == thread_of)]
+        steerable = [
+            row for row in (roots if roots is not None else addressable_roots(ctx)).rows(chat_id)
+            if row.get("room_reader")
+            and (not thread_of or row.get("late_input_of") == thread_of)
+            and (not owner_direct_only or (row.get("direct_chat") and row.get("owner_direct")))
+        ]
         if thread_of:
             steerable = sorted(steerable, key=_start_order)[:1]
         # Exactly one candidate => unambiguous transport. Zero or many => a routing
@@ -137,7 +142,9 @@ def _route_project_chat_to_running_task(
             direct_agent = (presence_author_agent(ctx.DRIVE_ROOT, tid) if candidate.get("inline_presence")
                             else get_direct_chat_agent(tid))
             direct_lock = getattr(direct_agent, "_owner_message_admission_lock", None)
-            remote_author = direct_lock is None and bool(candidate.get("inline_presence"))
+            remote_author = direct_lock is None and bool(
+                candidate.get("inline_presence") or candidate.get("owner_direct")
+            )
             if direct_lock is None and not remote_author:
                 return ""
         task_obj: Dict[str, Any] = {}
@@ -159,6 +166,7 @@ def _route_project_chat_to_running_task(
             project_id=str((task_obj or candidate).get("project_id") or ""),
         )
         from ouroboros.conversation_lease import author_intake_accepting
+        from ouroboros.conversation_lease import root_conversation_key
         from ouroboros.owner_mailbox import write_owner_message
         from supervisor.queue import (
             ACCEPTANCE_FENCES,
@@ -190,6 +198,8 @@ def _route_project_chat_to_running_task(
                 return ""
         task_drive = (pathlib.Path(ctx.DRIVE_ROOT) if direct_lock_held or remote_author
                       else _task_drive_for_task(task_obj, tid))
+        intake_key = root_conversation_key(task_obj or candidate) if remote_author else ""
+        intake_attempt = task_obj.get("_attempt") if isinstance(task_obj, dict) else None
         msg_id = f"{client_message_id}:{tid}" if client_message_id else None
         staged_manifest: list = []
         attachment_report = ""
@@ -286,7 +296,9 @@ def _route_project_chat_to_running_task(
                 reply_reference=task_metadata.get("reply_reference") if isinstance(task_metadata, dict) else None,
                 # Only while that author's loop still reads mail, checked under the mail lock its final drain closes
                 # the intake under (``conversation_lease.accept_author_mail``): else the words start their own turn.
-                admit=(lambda: author_intake_accepting(task_drive, tid)) if remote_author else None,
+                admit=(lambda: author_intake_accepting(
+                    task_drive, tid, intake_key, attempt=intake_attempt,
+                )) if remote_author else None,
             ):
                 return ""
             message_written = True
@@ -549,7 +561,15 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
         return
     # An owner message never wakes consciousness (owner decision В13): Main answers it itself.
     task_metadata = _scoped_task_metadata(project_id, task_metadata)
-    task_metadata = {**(task_metadata or {}), "client_message_id": client_message_id, "work_kind": "owner"}
+    task_metadata = {
+        **(task_metadata or {}),
+        "client_message_id": client_message_id,
+        "work_kind": "owner",
+        # A typed fact for the A1 Main follow-up contract. It is deliberately
+        # narrower than owner_ingress: only this owner-direct Main admission
+        # may be joined by the next owner message.
+        "owner_direct": not bool(project_id),
+    }
     # The turn's origin identity rides UNCONDITIONALLY (not only when the
     # decision lane runs): a bare direct turn with no projects/roots yet — the
     # first-ever project creation — must still carry it so promote/route/bind
@@ -591,6 +611,31 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
     # manifest and the decision metadata all see the same projection.
     roots = addressable_roots(ctx)
     # A live call's admitted turn keeps the room it was opened in; it never re-routes.
+    if realtime_turn is None and not project_id and not late and not thread_of:
+        routed_to_task = _route_project_chat_to_running_task(
+            ctx,
+            chat_id,
+            text or image_caption,
+            client_message_id,
+            task_metadata=task_metadata,
+            image_data=image_data,
+            roots=roots,
+            owner_direct_only=True,
+        )
+        if routed_to_task:
+            _record_routing_receipt(
+                bridge, ctx, chat_id=chat_id, client_message_id=client_message_id,
+                action="mailbox_delivery", target=routed_to_task,
+                target_label=(str(task_metadata.get("_routing_target_label") or "")
+                              if isinstance(task_metadata, dict) else ""),
+                status="delivered",
+                detail=(str(task_metadata.get("_attachment_report") or "")
+                        if isinstance(task_metadata, dict) else ""),
+                attachment_manifest=(list(task_metadata.get("_attachment_manifest") or [])
+                                    if isinstance(task_metadata, dict) else None),
+                task=task_metadata.get("_routing_target") if isinstance(task_metadata, dict) else None,
+            )
+            return
     if realtime_turn is None and ((project_id and not late) or thread_of):
         routed_to_task = _route_project_chat_to_running_task(
             ctx,

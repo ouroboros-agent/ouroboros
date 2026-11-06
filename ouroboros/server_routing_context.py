@@ -21,6 +21,19 @@ from typing import Any, Dict, Optional
 from ouroboros.server_process import log
 
 
+def _owner_direct_current(task: Dict[str, Any]) -> bool:
+    """Return whether the current attempt is an eligible Main owner-direct turn."""
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    if not metadata.get("owner_direct") or task.get("_presence_turn"):
+        return False
+    from ouroboros.task_carrier import execution_kind, execution_owner
+
+    if execution_kind(task) != "direct":
+        return False
+    owner = execution_owner(task)
+    return not owner or owner.get("lane") == "conversation"
+
+
 @dataclass(frozen=True)
 class RootSnapshot:
     """One owner message's addressable roots, read once and handed on by value.
@@ -97,6 +110,7 @@ def _active_direct_roots(ctx: Any) -> list:
                     "objective": _clip_marked(turn.get("text"), 600),
                     "project_id": turn["project_id"], "chat_id": turn["chat_id"],
                     "started_at": turn["_started_at"], "steerable": True, "direct_chat": True, "room_reader": reader,
+                    "owner_direct": bool(entry.reply_expected),
                     **_late_input_author(turn),
                 })
     return roots
@@ -183,6 +197,7 @@ def addressable_roots(ctx: Any) -> RootSnapshot:
                     "project_id": str(task.get("project_id") or ""),
                     "started_at": started_at,
                     "steerable": True, "room_reader": reader, **_late_input_author(task),
+                    "owner_direct": _owner_direct_current(task),
                 }, _task_chats(ctx, tid, task)))
         pairs += [(row, _task_chats(ctx, row["task_id"], row))
                   for row in [*_active_direct_roots(ctx), *_moved_presence_readers(ctx)]]

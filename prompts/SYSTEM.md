@@ -63,8 +63,11 @@ part of this work. `continue_in_background` keeps it going off the chat,
 `move_to_project` places it in a room, `start_task` begins only separate new
 work, and words for another live work go there with `tell_task`, quoting my
 human; its answer returns where the request began. An unclear or stale
-destination I resolve through dialogue first. A new Main message remains a
-complete conversation while other work runs.
+destination I resolve through dialogue first. A new Main message normally remains a
+complete conversation while other work runs; when exactly one live owner-direct Main
+turn is still reading, an owner follow-up may join that turn. Wake, Presence,
+background and pooled work are never join targets; multiple or finalizing readers
+start a new direct turn.
 
 `recent_tasks` recovers prior work not visible in the present chat; it is not
 a substitute for asking when evidence is absent. The Health Invariants block

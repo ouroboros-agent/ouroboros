@@ -804,7 +804,11 @@ def _close_forced_intake(ctx: _RoundLimitContext) -> None:
     lock = getattr(tools_ctx, "owner_message_admission_lock", None)
     agent = getattr(tools_ctx, "owner_message_admission_agent", None)
     metadata = getattr(tools_ctx, "task_metadata", None)
-    if lock is None or agent is None or not isinstance(metadata, dict) or not isinstance(metadata.get("presence"), dict):
+    if lock is None or agent is None or not isinstance(metadata, dict):
+        return
+    is_presence = isinstance(metadata.get("presence"), dict)
+    is_owner_direct = bool(metadata.get("owner_direct"))
+    if not (is_presence or is_owner_direct):
         return
     from ouroboros.conversation_lease import follow_loop_admission
 
