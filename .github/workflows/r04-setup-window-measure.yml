@@ -1,0 +1,43 @@
+# One-off measurement for razzant/ouroboros#3204 (track R04): where the 980x780 setup window lands on a Windows
+# desktop of a given resolution. Runs only on this branch of the agent's fork; never part of a pull request.
+name: r04 setup window measure
+on:
+  push:
+    branches: ['r04/setup-window-measure']
+permissions:
+  contents: read
+jobs:
+  measure:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        res: ['1366x768', '1280x720', '1920x1080']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install pywebview as the product pins it
+        run: python -m pip install "pywebview==5.4" "pythonnet==3.0.5"
+      - name: Set the display resolution and say what the desktop is
+        shell: pwsh
+        run: |
+          $w, $h = '${{ matrix.res }}'.Split('x')
+          Set-DisplayResolution -Width $w -Height $h -Force
+          Start-Sleep -Seconds 3
+          Add-Type -AssemblyName System.Windows.Forms
+          $s = [System.Windows.Forms.Screen]::PrimaryScreen
+          "screen=$($s.Bounds) work=$($s.WorkingArea)"
+          "explorer running: $([bool](Get-Process explorer -ErrorAction SilentlyContinue))"
+          (Get-CimInstance Win32_OperatingSystem).Caption
+      - name: Measure the window as the product creates it today
+        run: python measure/measure_setup_window.py --label "before ${{ matrix.res }}"
+      - name: Measure with the fix, when this branch carries one
+        shell: pwsh
+        run: |
+          if (Test-Path measure/fit.py) { python measure/measure_setup_window.py --label "after ${{ matrix.res }}" --fit "fit:attach" } else { "no fix on this branch yet" }
+        working-directory: .
+        env:
+          PYTHONPATH: measure
