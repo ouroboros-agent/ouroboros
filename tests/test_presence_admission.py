@@ -3,20 +3,16 @@ from __future__ import annotations
 import pytest
 
 from ouroboros.presence_admission import PresenceAdmissionError, admit_presence_turn
-from ouroboros.presence_bindings import (
-    PresenceBinding,
-    PresenceEndpoint,
-    new_presence_binding_id,
-    save_presence_binding,
-)
-from ouroboros.presence_capabilities import (
+from ouroboros.presence_bindings import PresenceBinding, PresenceEndpoint
+from tests.frozen_presence_bindings import new_presence_binding_id, save_presence_binding
+from tests.frozen_presence_capabilities import (
     PresenceSelection,
     PresenceState,
     PresenceToolTarget,
     presence_state_fingerprint,
     save_presence_state,
 )
-from ouroboros.presence_profile import parse_presence_profile, presence_request_fingerprint
+from tests.frozen_presence_profile import parse_presence_profile, presence_request_fingerprint
 from ouroboros.skill_loader import (
     SkillReviewState,
     load_skill,
@@ -119,93 +115,74 @@ def _admit(drive_root, binding):
     )
 
 
-def test_admission_freezes_reviewed_behavior_runtime_digests_and_authority(tmp_path):
-    drive_root = tmp_path / "data"
-    skill_dir = _install_behavior(drive_root)
-    _select_history(drive_root, skill_dir)
-    binding = _binding(drive_root)
-
-    admission = _admit(drive_root, binding)
-
-    assert admission.instructions == "Participate helpfully in the selected room."
-    assert admission.context_topics == ("community-guidelines",)
-    assert admission.model_slot == "light"
-    assert admission.inline_max_rounds == 8
-    assert admission.origin == binding.origin
-    assert admission.destination == binding.destination
-    assert admission.capability_ceiling.skill_name == "community-helper"
-    # The reviewed profile selected chat_history; the rest is the constant
-    # cognitive baseline every admitted conversation carries.
-    assert [grant.name for grant in admission.capability_ceiling.tool_grants] == [
-        "chat_history",
-        "knowledge_list",
-        "knowledge_read",
-        "knowledge_write",
-        "update_identity",
-        "update_scratchpad",
-    ]
-    assert admission.capability_ceiling.skill_content_hash == admission.skill_content_hash
-    assert admission.capability_ceiling.profile_fingerprint == admission.profile_fingerprint
-    assert admission.capability_ceiling.state_fingerprint == admission.state_fingerprint
-    assert admission.capability_ceiling.selection_fingerprint == admission.selection_fingerprint
+def test_admission_migrates_without_behavior_gates_or_ceiling(tmp_path):
+    skill = _install_behavior(tmp_path, enabled=False)
+    _select_missing_builtin(tmp_path, skill)
+    binding = _binding(tmp_path)
+    admitted = _admit(tmp_path, binding)
+    assert admitted.place and admitted.binding_id == binding.binding_id
+    assert admitted.instructions == "Participate helpfully in the selected room."
+    assert admitted.model_slot == "light" and admitted.inline_max_rounds is None
+    assert admitted.capability_ceiling is None
+    assert admitted.origin == binding.origin and admitted.destination == binding.destination
 
 
-def test_admission_rejects_binding_owned_by_another_transport(tmp_path):
-    drive_root = tmp_path / "data"
-    _install_behavior(drive_root)
-    binding = _binding(drive_root)
-
+def test_admission_requires_matching_authenticated_connector(tmp_path):
+    _install_behavior(tmp_path)
+    binding = _binding(tmp_path)
+    assert _admit(tmp_path, binding).place
     with pytest.raises(PresenceAdmissionError) as caught:
-        admit_presence_turn(
-            drive_root=drive_root,
-            authenticated_transport_skill="slack-bridge",
-            binding_id=binding.binding_id,
-            global_max_rounds=8,
-            repo_path="",
-        )
-
+        admit_presence_turn(drive_root=tmp_path, authenticated_transport_skill="unrelated", binding_id=binding.binding_id)
     assert caught.value.code == "presence_binding_wrong_transport"
 
 
-@pytest.mark.parametrize(
-    ("state", "expected"),
-    [("disabled", "presence_behavior_skill_disabled"), ("stale", "presence_behavior_review_stale")],
-)
-def test_admission_rejects_disabled_or_stale_behavior(tmp_path, state, expected):
-    drive_root = tmp_path / "data"
-    _install_behavior(drive_root, enabled=state != "disabled")
-    if state == "stale":
-        save_review_state(
-            drive_root,
-            "community-helper",
-            SkillReviewState(status="pass", content_hash="0" * 64),
-        )
-    binding = _binding(drive_root)
-
-    with pytest.raises(PresenceAdmissionError) as caught:
-        _admit(drive_root, binding)
-
-    assert caught.value.code == expected
+def test_new_admission_uses_scope_without_binding_id(tmp_path):
+    from ouroboros.places import connect_place
+    place = connect_place(tmp_path, connector="bridge", provider="chat", account_id="a", conversation_id="r")
+    admitted = admit_presence_turn(drive_root=tmp_path, authenticated_transport_skill="bridge",
+                                  provider="chat", account_id="a", conversation_id="r")
+    assert admitted.binding_id == place.place_id
+    with pytest.raises(PresenceAdmissionError):
+        admit_presence_turn(drive_root=tmp_path, authenticated_transport_skill="bridge",
+                            provider="chat", account_id="other", conversation_id="r")
 
 
-def test_admission_rejects_missing_required_selection(tmp_path):
-    drive_root = tmp_path / "data"
-    _install_behavior(drive_root)
-    binding = _binding(drive_root)
+def test_admission_carries_circle_model_from_the_same_snapshot(tmp_path, monkeypatch):
+    from ouroboros import places, presence_admission
+    place = places.connect_place(tmp_path, connector="bridge", provider="chat", account_id="account")
+    circle = places.create_circle(tmp_path, name="Team", model="circle/first", author="owner")
+    places.edit_place(tmp_path, place.place_id, "set_circle", author="owner", circle_id=circle["circle_id"])
+    reads = []
+    read_records = presence_admission.place_records
+    def read(root):
+        reads.append(root)
+        return read_records(root)
+    monkeypatch.setattr(presence_admission, "place_records", read)
+    admitted = admit_presence_turn(drive_root=tmp_path, authenticated_transport_skill="bridge",
+                                   provider="chat", account_id="account")
+    assert reads == [tmp_path] and admitted.circle["model"] == "circle/first"
+    assert admitted.place.model == admitted.model_slot == ""
+    places.edit_circle(tmp_path, circle["circle_id"], author="owner", model="circle/next")
+    assert admitted.circle["model"] == "circle/first"
+    fresh = admit_presence_turn(drive_root=tmp_path, authenticated_transport_skill="bridge",
+                                   provider="chat", account_id="account")
+    assert fresh.circle["model"] == "circle/next" and reads == [tmp_path, tmp_path]
 
-    with pytest.raises(PresenceAdmissionError) as caught:
-        _admit(drive_root, binding)
 
-    assert caught.value.code == "presence_authority_missing_required"
-
-
-def test_admission_rejects_selected_but_unavailable_required_target(tmp_path):
-    drive_root = tmp_path / "data"
-    skill_dir = _install_behavior(drive_root)
-    _select_missing_builtin(drive_root, skill_dir)
-    binding = _binding(drive_root)
-
-    with pytest.raises(PresenceAdmissionError) as caught:
-        _admit(drive_root, binding)
-
-    assert caught.value.code == "presence_required_capability_unavailable"
+def test_migrated_main_is_a_place_override_until_cleared(tmp_path, monkeypatch):
+    from ouroboros import places
+    from ouroboros.place_projection import place_view
+    skill = _install_behavior(tmp_path)
+    manifest = skill / "SKILL.md"
+    manifest.write_text(manifest.read_text(encoding="utf-8").replace("    model_slot: light\n", ""), encoding="utf-8")
+    binding = _binding(tmp_path)
+    admitted = _admit(tmp_path, binding)
+    assert admitted.place.model == "main"
+    circle = places.create_circle(tmp_path, name="Team", model="circle/model", author="owner")
+    places.edit_place(tmp_path, admitted.place.place_id, "set_circle", author="owner", circle_id=circle["circle_id"])
+    monkeypatch.setattr("ouroboros.model_slots._main_model", lambda: "main/model")
+    inherited = _admit(tmp_path, binding)
+    assert place_view(tmp_path, inherited.place, brief=True)["model_route"] == {"value": "main/model", "layer": "place"}
+    places.edit_place(tmp_path, admitted.place.place_id, "set_model", author="owner", model="")
+    cleared = _admit(tmp_path, binding)
+    assert place_view(tmp_path, cleared.place, brief=True)["model_route"] == {"value": "circle/model", "layer": "circle"}

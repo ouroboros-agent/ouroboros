@@ -4,8 +4,8 @@ Split out of ``gateway/tasks.py`` by the module-size boundary (the same shape as
 ``gateway/task_events.py``); ``gateway.tasks`` re-exports ``api_task_hurry`` so
 route wiring and tests keep one namespace.
 
-The request body carries ONLY a client-generated stable ``request_id`` — there
-is no text field and no chat side effect anywhere on this path (§19.7.2 items
+The request body carries ONLY a client-generated stable ``request_id`` (a body
+with any extra field is refused, never ignored) — there is no text field and no chat side effect anywhere on this path (§19.7.2 items
 1-4): no ``steer_task``, no ``owner_text``, no ``send_message``, no outbox row,
 no routing receipt, no WS chat frame. The acknowledgement is the HTTP response;
 durable facts are the mailbox control, the ``owner_hurry`` task-result
@@ -34,9 +34,13 @@ def _admit_hurry_locked(task_id: str) -> Tuple[Optional[Dict[str, Any]], str, in
 
     Returns ``(task_row, refusal_reason, attempt)``. Runs UNDER the queue lock:
     live membership (RUNNING or PENDING), root-only eligibility (managed
-    children refused), sealed-acceptance-fence refusal, and the cancel-pending
+    children refused), the refusal of a root whose admission seal is sealed
+    (``ACCEPTANCE_FENCES``, the seal's historical name), and the cancel-pending
     re-check all happen inside one transaction so a racing cancel ingress and
-    this admission cannot both win.
+    this admission cannot both win. For a queue task (RUNNING or PENDING) it also
+    seeds an absent task-result lifecycle via ``ensure_control_task_result``
+    (create-only; an existing record is never rewritten); a direct-chat turn
+    never gets one.
     """
     from supervisor import queue as q
 
@@ -77,6 +81,10 @@ def _admit_hurry_locked(task_id: str) -> Tuple[Optional[Dict[str, Any]], str, in
             task = direct_chat_turn(task_id)
         if task is None:
             return None, "task_not_live", attempt
+        from ouroboros.task_carrier import execution_kind
+
+        if execution_kind(task) == "presence":  # a correspondent's turn, live: no Hurry, nothing seeded (as Pause)
+            return None, "presence_hurry_unsupported", attempt
         lineage = resolve_task_lineage(
             task_id,
             metadata=task.get("metadata"),
@@ -103,17 +111,7 @@ def _admit_hurry_locked(task_id: str) -> Tuple[Optional[Dict[str, Any]], str, in
                 raise  # Preserve unreadable pooled authority before any hurry write.
             log.debug("hurry cancel-pending check failed for %s", task_id, exc_info=True)
         if pooled_status:
-            from ouroboros.task_results import load_task_result, write_task_result
-
-            # Queue identity owns this lifecycle seed; direct turns stay unchanged.
-            # The worker can publish between read and write, so create atomically.
-            if str(task.get("id") or "") != task_id:
-                raise ValueError("hurry queue task identity mismatch")
-            if load_task_result(q.DRIVE_ROOT, task_id, strict=True) is None:
-                write_task_result(
-                    q.DRIVE_ROOT, task_id, pooled_status,
-                    create_only=True, strict_existing_dict=True,
-                )
+            q.ensure_control_task_result(task_id)
         return task, "", attempt
 
 

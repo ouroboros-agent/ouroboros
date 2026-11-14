@@ -17,6 +17,7 @@ import sys
 import tempfile
 
 import pytest
+from tests._source_scan import parse
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 
@@ -46,15 +47,16 @@ TOOL_MODULES = [
     "ouroboros.tools.control",
     "ouroboros.tools.browser",
     "ouroboros.tools.review",
-    "ouroboros.tools.claude_advisory_review",
+    "ouroboros.tools.preflight_review",
+    "ouroboros.tools.commit_gate",
+    "ouroboros.tools.review_change",
     "ouroboros.tools.recent_tasks",
-    "ouroboros.tools.scope_review",
+    "ouroboros.tools.review_brief_coupling",
     "ouroboros.tools.review_helpers",
     "ouroboros.tools.plan_review",
     "ouroboros.tools.git_rollback",
     "ouroboros.tools.git_pr",
     "ouroboros.tools.github",
-    "ouroboros.tools.ci",
     "ouroboros.tools.verify",
 ]
 
@@ -98,48 +100,52 @@ def test_tool_set_matches(registry):
 
 
 EXPECTED_TOOLS = [
-    "browse_page", "browser_action",
-    "run_ci_tests",
-    "preflight_review", "review_status",
-    "compact_context", "set_tool_timeout", "request_restart",
-    "promote_to_stable", "schedule_subagent", "schedule_followup",
-    "configure_presence", "initiate_presence",
+    "continue_in_background", "pause_task", "resume_task", "continue_task",
+    "browse_page", "browser_action", "showSecretHitl",
+    "preflight_review", "review_change", "review_status",
+    "compact_context", "set_tool_timeout", "request_restart", "prepare_self_change",
+    "inspect_harness", "maintain_harness", "free_storage", "inspect_subagent",
+    "promote_to_stable", "schedule_subagent", "schedule_followup", "manage_schedules",
+    "configure_presence",
     "integrate_subagent_patch", "compare_subagent_patches",
     # C1: the explicit acceptance seam for a delegated run's captured patch —
     # a first-class tool, so the registry contract must name it.
-    "integrate_delegated_patch", "cancel_task",
+    "integrate_delegated_patch", "cancel_task", "resume_child_task", "set_task_retention",
     "peek_task", "discard_child_result", "override_delegation_constraint",
     "request_deep_self_review", "chat_history", "update_scratchpad",
-    "send_user_message", "update_identity", "toggle_evolution",
+    "send_user_message", "update_identity", "update_world", "toggle_evolution",
     "toggle_consciousness",
     "set_next_wakeup", "switch_model", "get_task_result",
-    "wait_task", "wait_tasks", "tree_note", "tree_read",
+    "wait_task", "wait_tasks", "await_messages", "tree_note", "tree_read",
     "delegate_start", "delegate_wait", "delegate_cancel", "delegate_answer",
+    "delegate_message",
     "read_file", "list_files", "write_file", "edit_text",
     "apply_patch", "edit_batch",
-    "send_photo", "send_video", "send_file", "send_links", "search_code", "query_code", "escalate",
+    "send_photo", "send_video", "send_file", "send_links", "show_card", "search_code", "query_code", "query_data", "escalate",
         "forward_to_worker",
-    "generate_evolution_stats",
-    "commit_reviewed", "vcs_commit_reviewed", "vcs_status", "vcs_diff",
+    "generate_image", "list_image_models", "recover_image",
+    "commit_reviewed", "vcs_read",
     "vcs_pull_ff", "vcs_restore", "vcs_revert",
     "fetch_pr_ref", "create_integration_branch", "cherry_pick_pr_commits",
     "stage_adaptations", "stage_pr_merge", "vcs_rollback",
-    "list_github_prs", "get_github_pr", "comment_on_pr",
-    "list_github_issues", "get_github_issue", "comment_on_issue",
-    "close_github_issue", "create_github_issue",
+    "github_read", "github_write", "pr_merge",
     "codebase_health", "knowledge_read", "knowledge_write", "knowledge_list",
+    "chronicle_write", "memory_read", "memory_mark",
     "journal_read", "journal_write", "workpad_read", "workpad_write",
-    "promote_chat_to_task", "route_to_project", "list_projects", "steer_task",
-    "ensure_project_scope", "schedule_followup",
+    "start_task", "list_projects", "tell_task",
+    "move_to_project", "close_project", "schedule_followup",
     "memory_map", "memory_update_registry",
-    "plan_task", "recent_tasks", "task_acceptance_review", "verify_and_record", "web_search",
+    "plan_task", "recent_tasks", "live_roots", "update_focus",
+    "search_ui_translations", "pin_ui_translation", "record_update_description", "remote_mcp_sign_in",
+    "finish_task", "verify_and_record", "web_search",
     "start_service", "service_status", "service_logs", "stop_service",
     "run_command", "run_script",
     "list_skills", "skill_review", "skill_exec", "toggle_skill", "skill_owner_action",
     "skill_preflight", "submit_skill_to_hub",
-    "list_available_tools", "enable_tools",
+    "skill_sources", "skill_search", "skill_install", "skill_update",
+    "list_available_tools", "enable_tools", "call_mcp_tool",
     "analyze_screenshot", "vlm_query", "view_image",
-    "ocr_pdf", "youtube_transcript", "extract_video_frames",
+    "extract_pdf_text", "youtube_transcript", "extract_video_frames", "read_archive",
 ]
 
 
@@ -195,15 +201,16 @@ def test_tool_schemas_have_no_empty_enum_values(registry):
         _walk(schema.get("function", {}).get("parameters", {}), schema.get("function", {}).get("name", "?"))
 
 
-def test_github_create_issue_schema_fields(registry):
-    schema = registry.get_schema_by_name("create_github_issue")["function"]
+def test_github_write_schema_fields(registry):
+    schema = registry.get_schema_by_name("github_write")["function"]
     props = schema["parameters"]["properties"]
-    assert schema["parameters"]["required"] == ["title"]
+    assert schema["parameters"]["required"] == ["method"]
+    assert {"create_issue", "create_pr"} <= set(props["method"]["enum"])
     assert props["title"]["type"] == "string"
     assert props["body"]["type"] == "string"
-    assert props["body"]["default"] == ""
-    assert props["labels"]["type"] == "string"
-    assert props["labels"]["default"] == ""
+    assert "default" not in props["body"]  # Omitted keeps the PR body; only an explicit "" clears it.
+    assert props["labels"]["type"] == "array"
+    assert "default" not in props["labels"]  # Omitted keeps labels; only an explicit [] clears them.
 
 
 def test_tool_execute_basic(registry):
@@ -224,14 +231,14 @@ def test_frozen_registry_includes_packaged_tool_modules(monkeypatch):
         "memory_map",
         "memory_update_registry",
         "preflight_review",
+        "review_change",
         "review_status",
         "plan_task",
         "vcs_rollback",
-        "run_ci_tests",
-        # github.py is in _FROZEN_TOOL_MODULES — PR inspection tools must work in frozen builds
-        "list_github_prs",
-        "get_github_pr",
-        "comment_on_pr",
+        # github.py is in _FROZEN_TOOL_MODULES — the GitHub tools must work in frozen builds
+        "github_read",
+        "github_write",
+        "pr_merge",
         "query_code",
     }
     missing = expected_subset - available
@@ -338,7 +345,7 @@ def test_memory_persistence():
 
 def test_no_hardcoded_replies():
     """Principle 5 (LLM-First): no hardcoded reply strings in code.
-    
+
     Checks for suspicious patterns like:
     - reply = "Fixed string"
     - return "Sorry, I can't..."
@@ -443,7 +450,7 @@ def test_no_oversized_modules():
 
 @pytest.mark.size_ratchet
 def test_size_ratchet_manifest_matches_live_tree():
-    """Exact module/function/band/byte debt matches the untruncated candidate tree."""
+    """Module/function/band/byte debt matches the untruncated candidate tree (a band entry may stay at 1501-1600 lines)."""
     from ouroboros.review import validate_size_ratchet
 
     errors = validate_size_ratchet(REPO)
@@ -457,8 +464,8 @@ def test_size_ratchet_transition_against_explicit_base():
     CI exports ``OURO_SIZE_RATCHET_BASE_REF`` (PR base SHA / push
     ``event.before``); without it the check degrades to the tip's parent
     manifest — the merge-aware local semantics. An all-zeros base (new-branch /
-    tag push) degrades the same way (never a skip), while manifest exactness
-    stays enforced by ``test_size_ratchet_manifest_matches_live_tree``.
+    tag push) degrades the same way (never a skip), while the manifest matching
+    the tree stays enforced by ``test_size_ratchet_manifest_matches_live_tree``.
     """
     from ouroboros.review import validate_size_ratchet_transition_against_base
 
@@ -470,25 +477,25 @@ def test_size_ratchet_transition_against_explicit_base():
 
 
 def test_js_module_gate_buckets_and_grandfathering():
-    """The JS size gate sees web/tests and exempts debt by exact rel-path only."""
+    """The JS size gate leaves test modules (web/tests) and vendored code out and exempts debt by exact rel-path only."""
     from ouroboros.review import compute_complexity_metrics, module_is_grandfathered
 
     sections = [
         ("repo/web/app.js", "x\n" * 2000),                   # gated, over hard gate, not grandfathered
         ("repo/web/modules/chat.js", "x\n" * 4000),          # gated, grandfathered by rel-path
         ("repo/web/vendor/chart.umd.min.js", "x\n" * 9000),  # vendored/minified — excluded
-        ("repo/web/tests/foo.test.js", "x\n" * 9000),        # web/tests/ — gated
+        ("repo/web/tests/foo.test.js", "x\n" * 9000),        # web/tests/ — a test module, out of the band
         ("repo/ouroboros/small.py", "x\n" * 10),
     ]
     metrics = compute_complexity_metrics(sections)
 
-    assert metrics["js_files"] == 3  # app.js + chat.js + web/tests; vendored excluded
+    assert metrics["js_files"] == 2  # app.js + chat.js; web/tests and vendored excluded
     oversized = {p for p, _n in metrics["oversized_modules"]}
     grandfathered = {p for p, _n in metrics["grandfathered_modules"]}
     assert "web/app.js" in oversized
     assert "web/modules/chat.js" in grandfathered
     assert "web/modules/chat.js" not in oversized
-    assert "web/tests/foo.test.js" in oversized
+    assert "web/tests/foo.test.js" not in oversized
     assert "web/vendor/chart.umd.min.js" not in oversized
     assert "web/vendor/chart.umd.min.js" not in grandfathered
 
@@ -500,7 +507,7 @@ def test_js_module_gate_buckets_and_grandfathering():
 
 def test_no_bare_except_pass():
     """No bare `except: pass` (not even except Exception: pass with just pass).
-    
+
     v4.9.0 hardened exceptions — but checks the STRICTEST form:
     bare except (no Exception class) followed by pass.
     """
@@ -601,15 +608,16 @@ class TestPrePushGate:
         assert callable(_git_commit_with_tests)
 
     def test_pre_push_tests_timeout_is_sufficient(self):
-        """The pre-push/post-commit pytest budget must be >= 180s.
+        """A bounded run's default budget must be >= 180s.
 
-        Since v6.88.0 this is the TOTAL budget across the node test lane AND
-        both preflight passes (parallel ``not serial``, then ``serial``, which
-        gets the remainder) — not a per-pass one. A full suite takes MINUTES,
-        and one loaded-host run measured 1077s, so a cap sized for an idle host
-        reports a healthy suite as a timeout. The budget is owned by ``run_hermetic_pytest``
-        (default + ``OUROBOROS_PREFLIGHT_TIMEOUT_SEC`` env) so callers do not
-        re-pin a stale literal — this guard anchors on that single source of truth.
+        Since v6.88.0 this is the TOTAL budget across the node test lane AND both
+        preflight passes (the xdist ``not exclusive`` pass, then ``serial("exclusive")``,
+        which gets the remainder) — not a per-pass one. It bounds a selected run or an
+        explicit pytest argv; the full suite has no total budget (owner 5A, 2026-11-05:
+        each test's own 300 s bound, containment and Stop end it). The budget is owned by
+        ``run_hermetic_pytest`` (default + ``OUROBOROS_PREFLIGHT_TIMEOUT_SEC`` for a
+        bounded run) so callers do not re-pin a stale literal — this guard anchors on
+        that single source of truth.
         """
         from ouroboros.preflight_runner import (
             _DEFAULT_PREFLIGHT_TIMEOUT_SEC,
@@ -621,7 +629,7 @@ class TestPrePushGate:
             "FLOOR against a caller re-pinning a tiny literal, never a claim about how "
             "long the suite takes; the real budget must cover a whole loaded-host run."
         )
-        # The env override is honoured so operators can raise it on slow hosts.
+        # The env override is honoured for a bounded run so operators can raise it on slow hosts.
         import os as _os
         prev = _os.environ.get("OUROBOROS_PREFLIGHT_TIMEOUT_SEC")
         try:
@@ -632,8 +640,6 @@ class TestPrePushGate:
                 _os.environ.pop("OUROBOROS_PREFLIGHT_TIMEOUT_SEC", None)
             else:
                 _os.environ["OUROBOROS_PREFLIGHT_TIMEOUT_SEC"] = prev
-
-
 
 
 def test_no_module_defines_the_same_top_level_name_twice():
@@ -653,11 +659,11 @@ def test_no_module_defines_the_same_top_level_name_twice():
     root = pathlib.Path(__file__).resolve().parents[1]
     offenders = []
     for path in sorted(root.rglob("*.py")):
-        parts = set(path.parts)
+        parts = set(path.relative_to(root).parts)
         if parts & {".git", "node_modules", "venv", ".venv", "build", "dist"}:
             continue
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+            tree = parse(path.read_text(encoding="utf-8"))
         except (SyntaxError, UnicodeDecodeError):
             continue
         seen = collections.Counter()
@@ -675,3 +681,21 @@ def test_no_module_defines_the_same_top_level_name_twice():
             if count > 1 and not name.startswith("__"):
                 offenders.append(f"{path.relative_to(root)}: {name} defined {count}x")
     assert not offenders, "Top-level names defined more than once:\n" + "\n".join(offenders)
+
+
+@pytest.mark.parametrize("ancestor, relative, detected", [
+    *[(name, "dup.py", True) for name in (".git", "node_modules", "venv", ".venv", "build", "dist")],
+    *[("checkout", f"{name}/dup.py", False) for name in (".git", "node_modules", "venv", ".venv", "build", "dist")],
+    ("build", "Build/dup.py", True),
+])
+def test_duplicate_scan_exclusions_are_relative_to_checkout(tmp_path, monkeypatch, ancestor, relative, detected):
+    root = tmp_path / ancestor / "source"
+    path = root / relative
+    path.parent.mkdir(parents=True)
+    path.write_text("x = 1\nx = 2\n", encoding="utf-8")
+    monkeypatch.setitem(globals(), "__file__", str(root / "tests" / "test_smoke.py"))
+    if detected:
+        with pytest.raises(AssertionError, match="dup.py: x defined 2x"):
+            test_no_module_defines_the_same_top_level_name_twice()
+    else:
+        test_no_module_defines_the_same_top_level_name_twice()

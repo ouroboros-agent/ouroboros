@@ -14,22 +14,26 @@ and WHERE its producers are, so neither half can drift without a failure.
 from __future__ import annotations
 
 import ast
+import json
 import pathlib
 import types
 
-import pytest
 
 from supervisor import event_taxonomy, events
 from supervisor.event_taxonomy import (
+    CONTROL_LANE,
     EVENT_DISPOSITIONS,
+    LANES,
     NESTED_LOG_EVENT,
     SERVER_INTERCEPT,
+    TELEMETRY_LANE,
     TELEMETRY_ONLY,
     TIERS,
     WORKER_HANDLER,
 )
 from supervisor.telemetry_events import TELEMETRY_EVENT_HANDLERS
 from tests.test_worker_event_registry import ALLOWLIST, _emitted_types
+from tests._cases import case_folders
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
@@ -46,6 +50,34 @@ def test_every_row_declares_one_of_the_four_tiers_and_both_ends():
         # A row with no producer is the schedule_task shape: an answer nothing
         # can reach. There is no allowlist for it — retire the key instead.
         assert row.producers, name
+
+
+def test_every_row_declares_a_lane_and_telemetry_is_exactly_the_three_streams():
+    """The lane is declared once, here. Telemetry is the three high-volume
+    streams whose handlers take no runtime action (plus the nested kinds that
+    ride the log envelope); everything authority-changing is control, and an
+    undeclared kind rides control."""
+    from supervisor.event_observation import event_lane
+
+    assert set(LANES) == {CONTROL_LANE, TELEMETRY_LANE}
+    for name, row in EVENT_DISPOSITIONS.items():
+        assert row.lane in LANES, name
+    telemetry = {name for name, row in EVENT_DISPOSITIONS.items() if row.lane == TELEMETRY_LANE}
+    assert telemetry == {"task_heartbeat", "llm_usage", "log_event"} | _tier(NESTED_LOG_EVENT)
+    for name in (
+        "send_message", "send_photo", "send_document", "send_links", "send_quiz", "send_video",
+        "typing_start", "task_done", "task_metrics", "schedule_subagent", "cancel_task", "owner_wait",
+        "task_model_wait", "worker_quiescent", "restart_request", "cognitive_operation",
+        "main_llm_call_state", "work_lead", "acceptance_fence", "budget_pause",
+        "budget_root_fence", "task_dispatch_resolved", "promote_chat_to_task", "steer_task",
+        *_tier(TELEMETRY_ONLY),
+    ):
+        assert EVENT_DISPOSITIONS[name].lane == CONTROL_LANE, name
+        assert event_lane({"type": name, "task_id": "t"}) == CONTROL_LANE, name
+    for name in ("task_heartbeat", "llm_usage", "log_event"):
+        assert event_lane({"type": name, "task_id": "t"}) == TELEMETRY_LANE
+    assert event_lane({"type": "no_such_kind"}) == CONTROL_LANE
+    assert event_lane("not an event") == CONTROL_LANE
 
 
 def test_the_dispatch_table_is_exactly_the_two_dispatched_tiers():
@@ -111,39 +143,49 @@ def test_every_declared_producer_still_names_the_event_it_produces():
 def test_restart_request_is_intercepted_by_the_server_not_the_dispatcher():
     row = EVENT_DISPOSITIONS["restart_request"]
     assert row.tier == SERVER_INTERCEPT
-    assert row.answered_by == "server.py"
-    assert '"restart_request"' in (REPO / "server.py").read_text(encoding="utf-8")
+    assert row.answered_by == "ouroboros.server_liveness"
+    drain = (REPO / "ouroboros" / "server_liveness.py").read_text(encoding="utf-8")
+    assert '"restart_request"' in drain and "on_restart(evt, ctx)" in drain
+    assert "on_restart=_handle_restart_in_supervisor" in (REPO / "server.py").read_text(encoding="utf-8")
 
 
 def test_the_nested_tier_is_answered_inside_the_log_envelope():
     owner = (REPO / "supervisor" / "events_worker_reports.py").read_text(encoding="utf-8")
     for name in _tier(NESTED_LOG_EVENT):
         assert EVENT_DISPOSITIONS[name].answered_by == "supervisor.events_worker_reports"
-    # The two the nested branch persists are named there literally; the third
-    # (review_reference) is forwarded live and durable via its own producer.
-    assert '"task_checkpoint", "task_start_settings_reload_failed"' in owner
+    # The one the nested branch persists is named there literally; the other
+    # two are forwarded live and durable via their own producers (the checkpoint
+    # producer writes events.jsonl and the System row's dialogue progress itself).
+    assert 'data.get("type") == "task_start_settings_reload_failed"' in owner
+    assert '"task_checkpoint", "task_start_settings_reload_failed"' not in owner
+    producer = (REPO / "ouroboros" / "loop_messages.py").read_text(encoding="utf-8")
+    assert 'append_jsonl(drive_logs / "events.jsonl", payload)' in producer
+    assert 'dialogue_store.append_quietly(drive_logs.parent, "progress", payload)' in producer
     from supervisor.worker_process import WORKER_LOG_SINK_SUPPRESSED_TYPES
 
     assert "task_checkpoint" in WORKER_LOG_SINK_SUPPRESSED_TYPES
 
 
-@pytest.mark.parametrize("event_type", sorted(_tier(TELEMETRY_ONLY)))
-def test_a_telemetry_only_event_is_recorded_rather_than_dropped(tmp_path, monkeypatch, event_type):
-    written = []
-    monkeypatch.setattr(
-        "supervisor.telemetry_events.append_jsonl",
-        lambda path, row: written.append((path, row)),
-    )
-    ctx = types.SimpleNamespace(
-        DRIVE_ROOT=tmp_path,
-        append_jsonl=lambda path, row: written.append((path, row)),
-    )
-    events.dispatch_event({"type": event_type, "task_id": "t1"}, ctx)
-    assert len(written) == 1
-    path, row = written[0]
-    assert path == tmp_path / "logs" / "events.jsonl"
-    assert row["type"] == event_type
-    assert row["task_id"] == "t1"
+def test_a_telemetry_only_event_is_recorded_rather_than_dropped(subtests, tmp_path, monkeypatch):
+    case_paths = case_folders(tmp_path)
+    for event_type in sorted(_tier(TELEMETRY_ONLY)):
+        tmp_path = next(case_paths)
+        with subtests.test(event_type=event_type), monkeypatch.context() as monkeypatch:
+            written = []
+            monkeypatch.setattr(
+                "supervisor.telemetry_events.append_jsonl",
+                lambda path, row: written.append((path, row)),
+            )
+            ctx = types.SimpleNamespace(
+                DRIVE_ROOT=tmp_path,
+                append_jsonl=lambda path, row: written.append((path, row)),
+            )
+            events.dispatch_event({"type": event_type, "task_id": "t1"}, ctx)
+            assert len(written) == 1
+            path, row = written[0]
+            assert path == tmp_path / "logs" / "events.jsonl"
+            assert row["type"] == event_type
+            assert row["task_id"] == "t1"
 
 
 def test_an_undeclared_event_is_still_reported_loudly_as_unknown(tmp_path):
@@ -178,3 +220,21 @@ def test_the_taxonomy_is_data_and_dispatches_nothing():
             imported.update(alias.name for alias in node.names)
     assert imported == {"__future__", "dataclasses", "typing"}
     assert event_taxonomy.disposition_for("nope") is None
+
+
+def test_a_crashing_handler_row_names_the_event_it_failed_on_without_its_content(tmp_path, monkeypatch):
+    """The handler-error row is attributable (the event's task ids and key names) and content-free
+    (no field values): the one row of 05–08.11 carried only ``repr(exc)``."""
+    written = []
+    ctx = types.SimpleNamespace(DRIVE_ROOT=tmp_path, append_jsonl=lambda path, row: written.append((path, row)))
+
+    def crash(_evt, _ctx):
+        raise RuntimeError("handler exploded")
+
+    monkeypatch.setitem(events.EVENT_HANDLERS, "probe_crash", crash)
+    events.dispatch_event({"type": "probe_crash", "task_id": "t1", "root_task_id": "r1", "text": "the owner's words"}, ctx)
+    [(path, row)] = written
+    assert path == tmp_path / "logs" / "supervisor.jsonl"
+    assert (row["type"], row["event_type"], row["task_id"], row["root_task_id"]) == ("worker_event_handler_error", "probe_crash", "t1", "r1")
+    assert "handler exploded" in row["error"] and "the owner's words" not in json.dumps(row)
+    assert set(row["event_keys"]) == {"type", "task_id", "root_task_id", "text"}

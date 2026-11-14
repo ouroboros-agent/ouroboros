@@ -1,5 +1,7 @@
 """Target-bound passive managed-update cache regressions."""
 
+import pytest
+
 import ouroboros.gateway.control as control
 import supervisor.git_ops as git_ops
 
@@ -10,6 +12,7 @@ LATEST = "b" * 40
 
 def _wire(monkeypatch, *, cache_channel="stable", cache_ref="refs/ouroboros-managed/tags/v6.87.5", ancestor=False):
     import ouroboros.update_channels as update_channels
+    monkeypatch.setattr("ouroboros.server_process.server_source_baseline", lambda: CURRENT)
 
     monkeypatch.setattr(update_channels, "get_update_channel", lambda settings=None: "stable")
     monkeypatch.setattr(git_ops, "_read_managed_repo_meta", lambda: {"managed_remote_name": "managed"})
@@ -131,6 +134,7 @@ def test_passive_status_exposes_cache_checked_at_without_from_cache(monkeypatch)
     _wire(monkeypatch, ancestor=True)  # consumed target: overlay must not fire
     state = git_ops.compute_managed_update_status(fetch=False)
     assert state["checked_at"] == "2026-08-03T00:00:00Z"
+    assert state["checked_target_sha"] == LATEST
     assert not state.get("from_cache")
     assert not state.get("available")
 
@@ -158,6 +162,12 @@ def test_payload_carries_minimal_update_tx_projection(monkeypatch):
         "active": True, "phase": "assisted_running",
         "task_id": "task-77", "restart_required": False,
     }
+    monkeypatch.setattr(
+        update_merge, "active_update_tx",
+        lambda: {"phase": "rolling_back", "attempt_id": "attempt-9"},
+    )
+    payload = control._managed_update_payload(fetch=False, include_tags=False)
+    assert payload["update_tx"]["attempt_id"] == "attempt-9"  # what update_progress.tx_attempt_id binds to
     monkeypatch.setattr(update_merge, "active_update_tx", lambda: {})
     payload = control._managed_update_payload(fetch=False, include_tags=False)
     assert payload["update_tx"] == {"active": False}
@@ -290,3 +300,35 @@ def test_fetching_payload_writes_the_letter_through_the_one_seam(monkeypatch):
 
     assert calls and calls[0]["fetched"] is True
     assert payload["letter"] is None and payload["latest_version"] == "6.87.5"
+
+
+@pytest.mark.parametrize(("facts", "fetch"), [
+    pytest.param({}, False, id='facts0-False'),  # unchecked/consumed: absence is not an invented "no local changes"
+    pytest.param({"local_changes": "absent", "local_changes_base": CURRENT}, True, id='facts1-True'),
+    pytest.param({"local_changes": "present", "local_changes_base": CURRENT}, False, id='facts2-False'),
+    pytest.param({"local_changes": "unknown", "local_changes_base": "", "local_changes_reason": "several_bases"}, True, id='facts3-True'),
+])
+def test_gateway_preserves_optional_local_content_facts(monkeypatch, fetch, facts):
+    import ouroboros.update_letter as update_letter
+
+    _wire(monkeypatch)
+    status = {"current_sha": CURRENT, "latest_sha": LATEST, **facts}
+    monkeypatch.setattr(git_ops, "compute_managed_update_status", lambda fetch: dict(status))
+    monkeypatch.setattr(update_letter, "refresh_after_check", lambda *_a, **_k: None)
+    monkeypatch.setattr(update_letter, "read_record", lambda drive_root=None: None)
+    payload = control._managed_update_payload(fetch=fetch, include_tags=False)
+    assert {key: value for key, value in payload.items() if key.startswith("local_changes")} == facts
+
+
+def test_pending_local_work_is_projected_without_exposing_raw_transaction(monkeypatch):
+    import supervisor.update_merge as update_merge
+    _wire(monkeypatch)
+    tx = {"phase": "pending_boot_smoke", "stash_restore": {"status": "applying", "stash_sha": "s" * 40}}
+    monkeypatch.setattr(update_merge, "active_update_tx", lambda: tx)
+    payload = control._managed_update_payload(fetch=False, include_tags=False)
+    assert payload["update_tx"]["local_work_recovery"] is True
+    assert "stash_restore" not in payload["update_tx"]
+    tx.pop("stash_restore")
+    assert "local_work_recovery" not in control._managed_update_payload(fetch=False, include_tags=False)["update_tx"]
+    tx.update(phase="marker_cleanup_retry", gate_blocked_reason="rollback_restart_pending")
+    assert control._managed_update_payload(fetch=False, include_tags=False)["update_tx"]["local_work_recovery"] is True

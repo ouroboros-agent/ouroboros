@@ -2,23 +2,223 @@
 
 Extracted whole from ``context.py`` at its module ceiling (v7 leaf) so the
 facts the runtime section renders keep one home: the project room a task sits in,
-the budget rails it runs under, and the
+the budget rails it runs under, how the run learns the time (its capture instant
+labels the Recent/Drive snapshots), the body's own dated facts (``vitals_fact``, beside
+``storage_fact``; ``admission_observation`` beside an unconfirmed start's receipt), and the
 configured delegation route with its honestly-labeled historical observations.
 Each returns a plain projection and reads no context state, so nothing here can
-change what the section MEANS — only what it reports. ``context`` re-exports every
-name, so historical imports and monkeypatch targets keep working unchanged.
+change what the section MEANS — only what it reports. ``context`` re-exports the
+start-of-task builders, so historical imports and monkeypatch targets keep working
+unchanged; ``round_clock_fact`` is the per-round time segment of the facts line
+(``loop_messages``), read from the same clock owners.
 """
 
 from __future__ import annotations
 
 import logging
 import pathlib
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from ouroboros.task_pacing import in_task_cost_ceiling_disclosure as _in_task_cost_ceiling
 from ouroboros.config import runtime_setting
 
 log = logging.getLogger(__name__)
+
+
+def schedule_store_fact(env: Any) -> Dict[str, Any]:
+    """Observed schedule controls for context; an unreadable table is not empty."""
+    from supervisor.followup_policy import observed_store
+    from supervisor.queue import ScheduleStoreUnreadable, load_schedule_store
+
+    root = getattr(env, "drive_root", None) or pathlib.Path(env.drive_path("state/scheduled_tasks.json")).parent.parent
+    try:
+        return observed_store(root, load_schedule_store(root))
+    except ScheduleStoreUnreadable as exc:
+        return {"unavailable": str(exc), "pointer": "manage_schedules(action='list')"}
+
+
+def task_schedule_fact(task: Dict[str, Any]) -> Dict[str, Any]:
+    """The admitted occurrence's original clock, even after its row advances.
+
+    Lateness is for the mind to judge. A missing legacy date stays unknown;
+    the schedule's next firing point cannot supply this occurrence's due time.
+    """
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    occurrence = metadata.get("schedule_occurrence")
+    if not isinstance(occurrence, dict):
+        return {}
+    fact = {
+        key: occurrence.get(key) for key in ("schedule_id", "due_at", "claimed_at")
+    }
+    if "previous" in occurrence:
+        fact["previous"] = occurrence["previous"]
+    return {"schedule_occurrence": fact}
+
+
+def task_execution_clock_fact(task: Dict[str, Any], ctx: Any) -> Dict[str, Any]:
+    """Current finite execution-ceiling estimate, not a calendar deadline.
+
+    Quota/budget pauses can move the estimate after this context is assembled;
+    an unknown start or unlimited ceiling yields null instead of a false date.
+    """
+    import datetime
+    import math
+    import time
+    from ouroboros.config import explicit_execution_timeout_sec, resolve_task_execution_timeout_sec
+    from ouroboros.deadline_utils import parse_deadline_ts
+    from ouroboros.model_wait import current_model_wait, execution_elapsed_seconds
+
+    raw = getattr(ctx, "task_started_at", None) or task.get("started_at")
+    try:
+        start = float(raw)
+    except (TypeError, ValueError):
+        parsed = parse_deadline_ts(raw)
+        start = parsed.timestamp() if parsed is not None else 0.0
+    ceiling = resolve_task_execution_timeout_sec(task)  # the narrower of explicit budget and global ceiling
+    started = datetime.datetime.fromtimestamp(start, datetime.timezone.utc).isoformat() if start > 0 and math.isfinite(start) else None
+    projected = None
+    if started and ceiling is not None:
+        now = time.time()
+        owner = current_model_wait()
+        elapsed = (owner.executed_seconds() if owner is not None and owner.task_id == str(task.get("id") or "")
+                   else execution_elapsed_seconds({**task, "started_at": start}, now))
+        try:
+            projected = datetime.datetime.fromtimestamp(now + max(0.0, ceiling - elapsed),
+                                                        datetime.timezone.utc).isoformat()
+        except (OverflowError, ValueError, OSError):
+            pass  # a finite duration need not fit the platform's calendar range: stays not_set
+    # The same absolute_ceiling rail either way; the basis names which bound it is (#939).
+    bound = "task execution budget" if ceiling is not None and ceiling == explicit_execution_timeout_sec(task) else "global ceiling"
+    return {"started_at": started, "absolute_ceiling_at": projected,
+            "absolute_ceiling_at_basis": (f"current estimate of the {bound}; quota or budget pauses may move it"
+                                          if projected else "not_set")}
+
+
+def _start_epoch(raw: Any) -> Optional[float]:
+    import math
+    from ouroboros.deadline_utils import parse_deadline_ts
+
+    try:
+        start = float(raw)
+    except (TypeError, ValueError):
+        parsed = parse_deadline_ts(raw)
+        start = parsed.timestamp() if parsed is not None else 0.0
+    return start if start > 0 and math.isfinite(start) else None
+
+
+def round_clock_fact(ctx: Any, now: Optional[float] = None) -> str:
+    """The facts line's time segment, read from the Time clock owners (#1786) per round.
+
+    Calendar time since this task's clock origin and execution time (the carried
+    offset, quota waits, budget pauses and warm sleep excluded) are named apart; the
+    execution limit names its basis; the calendar deadline stays its own axis; the
+    host's local finalization instant exists only for an explicit deadline or
+    execution budget (``loop_round_limits._maybe_deadline_local_finalize``). A
+    missing start is unknown, never zero; every value is as of the one sample
+    instant, with the live wait owner's clock when it owns this task and otherwise
+    the same carriers ``model_wait.execution_window_remaining_for_context`` reads.
+    An owner turn in this process ends the segment with its own wait so far
+    (``_owner_wait_fact``); a wake, a pooled task or a resume has none.
+    """
+    import datetime
+    import time
+    from ouroboros.config import explicit_execution_timeout_sec, resolve_task_execution_timeout_sec
+    from ouroboros.deadline_utils import parse_deadline_ts
+    from ouroboros.model_wait import budget_paused_seconds, current_model_wait, execution_elapsed_seconds
+    from ouroboros.task_pacing import effective_finalization_reserve_sec
+
+    def stamp(epoch: float) -> str:
+        return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    now = time.time() if now is None else float(now)
+    meta = getattr(ctx, "task_metadata", None)
+    meta = meta if isinstance(meta, dict) else {}
+    limit = resolve_task_execution_timeout_sec(meta)
+    parts, executed, left = [f"time sampled {stamp(now)}"], None, None
+    owner = getattr(ctx, "model_wait_context", None) or current_model_wait()
+    start = _start_epoch(getattr(ctx, "task_started_at", None) or meta.get("started_at"))
+    if owner is not None and owner.task_id == str(getattr(ctx, "task_id", "") or ""):
+        executed, left = owner.executed_seconds(), owner.execution_window_remaining()
+    elif start is not None:
+        paused = getattr(ctx, "_budget_paused_sec", None)
+        if paused is None:
+            paused = budget_paused_seconds(getattr(ctx, "budget_pause_resume", None) or {})
+        executed = execution_elapsed_seconds({**meta, "started_at": start, "budget_paused_sec": paused}, now)
+        left = None if limit is None else max(0.0, limit - executed)
+    if start is None:
+        parts.append("wall elapsed unknown (no recorded start)")
+    else:
+        parts.append(f"wall {max(0.0, now - start) / 60:.1f} min since start {stamp(start)}")
+    parts.append("execution elapsed unknown" if executed is None
+                 else f"execution {executed / 60:.1f} min (quota waits and pauses excluded)")
+    if limit is None:
+        parts.append("no execution limit")
+    elif left is None:
+        parts.append(f"execution limit {limit / 60:.1f} min, remaining unknown")
+    else:
+        basis = "task execution budget" if limit == explicit_execution_timeout_sec(meta) else "global execution ceiling"
+        parts.append(f"{basis} {limit / 60:.1f} min, {left / 60:.1f} min left")
+    deadline = parse_deadline_ts(meta.get("deadline_at"))
+    bounds = [left] if left is not None and explicit_execution_timeout_sec(meta) is not None else []
+    if deadline is not None:
+        bounds.append(deadline.timestamp() - now)
+        parts.append(f"deadline {stamp(deadline.timestamp())}, {(deadline.timestamp() - now) / 60:.1f} min left")
+    if bounds:
+        grace = effective_finalization_reserve_sec(ctx)
+        parts.append(f"host requests one tool-less final answer at ~{stamp(now + max(0.0, min(bounds) - grace))} "
+                     f"({grace / 60:.1f} min before the nearer explicit bound)")
+    parts.extend(filter(None, [_owner_wait_fact(ctx)]))
+    return "; ".join(parts)
+
+
+def _owner_wait_fact(ctx: Any) -> str:
+    """This turn's own wait, from the process-local registry (``TurnExecution.receipt``): when my human's
+    message was accepted and how much later this request comes, so far, with the slowest phase; once
+    the first dispatch was observed, when it went out and on which basis. Elapsed only, never a
+    dispatch that has not happened; "" for a turn nobody awaits or a process that serves none."""
+    from supervisor.active_activity import turn_execution
+
+    execution = turn_execution(str(getattr(ctx, "task_id", "") or ""))  # inline (registry) or carried
+    if execution is None or not execution.owner_turn:
+        return ""
+    receipt = execution.receipt()
+    slowest = (f"; slowest phase so far {receipt['slowest_phase']} {receipt['slowest_phase_sec']:.1f} s"
+               if receipt.get("slowest_phase") else "")
+    if receipt.get("accepted_at"):
+        origin, wait = f"my human's message accepted at {receipt['accepted_at']}", receipt["owner_wait_sec"]
+    else:
+        origin, wait = f"my turn began at {receipt['entered_at']} (acceptance stamp unknown)", receipt["handler_wait_sec"]
+    if receipt["dispatch"] == "not_observed":
+        return f"{origin}; this request {wait:.1f} s later{slowest}"
+    return f"{origin}; my first request went out {wait:.1f} s later ({receipt['dispatch']}){slowest}"
+
+
+def _context_clock_note(task: Dict[str, Any]) -> str:
+    """How this run learns the time: Main gets a clock line per request (``send_clock``)."""
+    from ouroboros.send_clock import main_clock_policy
+
+    meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    if task.get("delegation_role") and "delegation_role" not in meta:
+        meta = {**meta, "delegation_role": task.get("delegation_role")}
+    if main_clock_policy(meta, task_type=str(task.get("type") or "")) is None:
+        return ("context_captured_at is when this context was built; it does not advance "
+                "during this run.")
+    return ("context_captured_at is when this context was built, not the current time. "
+            "Each of your model requests ends with a host clock line sampled for that request.")
+
+
+def snapshot_labelled(section: str, captured_at: str) -> str:
+    """Label a captured Recent/Drive section with its capture time, below its heading.
+
+    These sections are rendered once per run and stay byte-stable in the cached
+    prefix; the label says so instead of refreshing them every round.
+    """
+    heading, sep, body = str(section or "").partition("\n")
+    if not heading.startswith(("## Recent ", "## Drive state")) or not captured_at:
+        return section
+    label = (f"_Snapshot captured at {captured_at} when this context was built; "
+             "not refreshed during this run._")
+    return heading + "\n" + label + ((sep + body) if body else "")
 
 
 def _queue_context_fact(task: Dict[str, Any]) -> Dict[str, Any]:
@@ -29,20 +229,69 @@ def _queue_context_fact(task: Dict[str, Any]) -> Dict[str, Any]:
     root = pathlib.Path(task.get("budget_drive_root") or DATA_DIR)
     snapshot = _load_queue_snapshot(root)
     fact = {**queue_snapshot_observation(snapshot), "source_root": str(root),
-            "max_workers": int(get_max_workers()),
+            "max_workers": get_max_workers(),  # the owner's cap on acting tasks as configured here; None: no number
             "max_active_subagents_per_root": int(get_max_active_subagents_per_root())}
     if snapshot.get("_snapshot_missing") or snapshot.get("_snapshot_invalid"):
         return {**fact, "note": "Queue observation unavailable; current capacity is unknown."}
-    for key in ("running", "pending"):
+    from ouroboros.project_admission import project_hold_fact
+    from ouroboros.queue_observation import pool_observation_status
+    from ouroboros.task_carrier import execution_kind
+    from ouroboros.work_stop import continuation_refusal, current_stop
+
+    for key in ("running", "pending"):  # a correspondent's Presence turn is its place's, never counted as the owner's
         rows = snapshot.get(key)
-        fact[key + "_count"] = sum(isinstance(row, dict) for row in rows) if isinstance(rows, list) else None
-    fact["reaping_count"] = snapshot.get("reaping_count")
-    fact["worker_total"] = snapshot.get("worker_total")
+        fact[key + "_count"] = sum(isinstance(row, dict) and execution_kind(row.get("task") or {}) != "presence"
+                                   for row in rows) if isinstance(rows, list) else None
+    intent = snapshot.get("restart_intent")
+    if isinstance(intent, dict) and intent.get("status") in {"awaiting", "accepted", "ready"}:
+        # The host's restart request at this snapshot (``awaiting`` until its ACK; ``server_restart.agent_restart_snapshot``);
+        # the reason is the requester's own words. Until its task finishes nothing restarts; ``ready`` is the bounded drain.
+        fact["pending_restart"] = {
+            "requested_by_task": intent.get("task_id"), "phase": "draining" if intent["status"] == "ready" else "requested",
+            **({"requester_reason": intent["reason"]} if intent.get("reason") else {})}
+    pending_rows = [row for row in snapshot.get("pending") or () if isinstance(row, dict)
+                    and execution_kind(row.get("task") or {}) != "presence"]
+    budget_fences = {str(fence.get("root_task_id") or ""): fence
+                     for fence in snapshot.get("budget_root_fences") or ()
+                     if isinstance(fence, dict)}
+    # Compose the existing hold owners: current_stop, project admission, and continuation refusal.
+    # A budget-pause marker without a known reason remains uncounted; no marker classifier lives here.
+    pending_stop_status = "observed"
+    pending_stops = 0
+    if isinstance(snapshot.get("pending"), list):
+        for row in pending_rows:
+            try:
+                task_row = row.get("task") or {}
+                if (current_stop(task_row, {"budget": budget_fences})
+                        or project_hold_fact(task_row) or continuation_refusal(task_row)):
+                    pending_stops += 1
+            except Exception:
+                pending_stop_status = "unknown"
+                break
+    else:
+        pending_stop_status = "unknown"
+    fact["pending_paused_or_held_count"] = pending_stops if pending_stop_status == "observed" else None
+    fact["pending_paused_or_held_status"] = pending_stop_status
+    # A cold sleeper is a queued row that keeps no process: its saved pause says it sleeps.
+    fact["pending_sleeping_count"] = (sum(((row.get("task") or {}).get("_budget_pause") or {}).get("reason") == "sleep"
+                                          for row in pending_rows) if pending_stop_status == "observed" else None)
+    observed = pool_observation_status(snapshot)
+    fact["pool_observation_status"] = observed
+    for key in ("max_workers", "worker_total", "busy_worker_count", "acting_worker_count", "parked_worker_count",
+                "booting_count", "reaping_count", "retiring_count", "lane_carrier_total", "memory_admission"):
+        # worker_total: project processes that exist (the pool grows on demand while memory admits); the
+        # conversation lane's carriers are apart. A snapshot's max_workers is its writer's cap (null: none).
+        fact["recorded_max_workers" if key == "max_workers" else key] = (
+            snapshot.get(key) if observed == "observed" else None)
     assignable = snapshot.get("assignable_idle_workers")
-    if assignable is not None:
+    if observed != "observed":
+        fact["free_worker_slots"] = None
+        fact["free_worker_slots_basis"] = "unknown_pool_observation"
+    elif assignable is not None:
         fact["free_worker_slots"] = max(0, int(assignable))
         fact["free_worker_slots_basis"] = "recorded_assignable_idle_workers"
-    elif fact["running_count"] is not None:
+    elif "assignable_idle_workers" not in snapshot and fact["running_count"] is not None and fact["max_workers"]:
+        # Only a snapshot from before the pool was published: a recorded null is unknown, never spare.
         fact["free_worker_slots"] = max(0, fact["max_workers"] - fact["running_count"]
                                           - int(fact["reaping_count"] or 0))
         fact["free_worker_slots_basis"] = "legacy_estimate_from_configured_limit"
@@ -53,7 +302,14 @@ def _queue_context_fact(task: Dict[str, Any]) -> Dict[str, Any]:
         "Last recorded queue counts at ts; freshness and age were measured when this context "
         "was built and do not refresh during the task. Stale or unknown observations do not "
         "establish current load. Legacy free-slot estimates are not measured capacity. "
-        "Scheduling owns admission; these observations reserve no slots."
+        "pending_count counts rows, not runnable demand: paused or held rows and cold sleepers (no process) say so "
+        "explicitly, and other rows record no wait cause here. acting_worker_count holds a task and acts; parked_worker_count waits on its own process "
+        "(a warm sleep, an owner wait or an in-slot wait) and is not counted against the owner's cap, which counts "
+        "acting tasks only (recorded_max_workers; null: no number, the machine's memory is the limit). "
+        "free_worker_slots is assignable idle existing capacity, not headroom; booting and reaping overlap for "
+        "fresh slots. memory_admission is the supervisor's last reading of the machine (dated read_at): available, "
+        "reserve, the typical worker size, the processes still starting, how many new processes it admitted and why "
+        "a start waits. Scheduling owns admission; these observations reserve no slots."
     )
     return fact
 
@@ -69,16 +325,20 @@ def _project_room_fact(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         _room_pid = str(task.get("project_id") or "").strip()
         if _room_pid and not str(task.get("workspace_root") or "").strip():
             from ouroboros.config import DATA_DIR as _DATA_DIR
+            from ouroboros.project_admission import admitted_folder
             from ouroboros.projects_registry import get_project as _get_project
-            from ouroboros.workspace_admission import room_chat_lens_dir as _room_lens
+            from ouroboros.workspace_admission import room_chat_lens_dir as _room_lens, room_lens_applies
 
-            _room = _get_project(_DATA_DIR, _room_pid) or {}
-            _room_wd = str(_room.get("working_dir") or "").strip()
+            # A lens turn states the folder it was admitted with; folderless work (or none
+            # carried) states the room's current folder, which only promoted tasks use.
+            _basis = task.get("_project_admission") if room_lens_applies(task) else None
+            _room_wd = (admitted_folder(_basis, _room_pid)
+                        or str((_get_project(_DATA_DIR, _room_pid) or {}).get("working_dir") or "").strip())
             if _room_wd:
                 # Same resolver the agent uses for the tool lens, so the stated rule
                 # and the actual tool surface cannot diverge (the robot incident).
-                _lens_dir, _room_note = _room_lens(_DATA_DIR, _room_pid)
-                _lens_active = bool(task.get("_is_direct_chat")) and bool(_lens_dir)
+                _lens_dir, _room_note = _room_lens(_DATA_DIR, _room_pid, basis=_basis)
+                _lens_active = room_lens_applies(task) and bool(_lens_dir)
                 fact = {
                     "project_id": _room_pid,
                     "working_dir": _room_wd,
@@ -110,8 +370,8 @@ def _project_room_fact(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 def _runtime_budget_info(env: Any, task: Dict[str, Any], ctx: Any = None) -> Dict[str, Any]:
     """Start-of-task budget block: global projection + the STATIC per-task tree cap,
     written once at task start so the cached prefix stays byte-stable (DEVELOPMENT
-    cache_friendliness item 22); live tree spend rides only the cache-breaking
-    surfaces (checkpoint/pacing/milestones)."""
+    cache_friendliness item 24); live wallet and tree spend ride the per-round facts
+    line (``loop_messages.context_facts_line``)."""
     try:
         from ouroboros.usage_accounting import usage_projection
         from ouroboros.settings_setup_contract import resolve_total_budget_usd
@@ -119,10 +379,13 @@ def _runtime_budget_info(env: Any, task: Dict[str, Any], ctx: Any = None) -> Dic
         total_usd = resolve_total_budget_usd()
         budget_root = pathlib.Path(task.get("budget_drive_root") or env.drive_root)
         projection = usage_projection(budget_root, global_limit_usd=total_usd)
-        spent_usd = float(projection.get("accounted_usd") or 0.0)
+        # Known spend (confirmed + estimated) is what the limit decides on; open
+        # holds ride beside it, never added in (#1487).
+        spent_usd = float(projection.get("settled_usd") or 0.0)
         budget_info = {
             "status": "available" if total_usd is not None else "no_global_limit", "total_usd": total_usd,
-            "spent_usd": spent_usd, "remaining_usd": None if total_usd is None else total_usd - spent_usd,
+            "spent_usd": spent_usd, "spent_basis": "known_settled_incl_estimates",
+            "remaining_usd": None if total_usd is None else max(0.0, total_usd - spent_usd),
             "reserved_usd": float(projection.get("reserved_usd") or 0.0),
             "unresolved_upper_bound_usd": float(projection.get("unresolved_upper_bound_usd") or 0.0),
             "unknown_unmetered": int(projection.get("unknown_unmetered") or 0),
@@ -138,95 +401,492 @@ def _runtime_budget_info(env: Any, task: Dict[str, Any], ctx: Any = None) -> Dic
         budget_info["per_task_tree_cap_usd"] = root_cap
         budget_info["per_task_tree_cap_rule"] = (
             "Hard cap for THIS task's WHOLE tree (own model calls + all subagents), enforced "
-            "by the physical-attempt ledger: dispatches are refused once the tree's accounted "
-            "spend reaches it and the task is force-stopped. Budget checkpoints during the task report the live tree number."
+            "by the physical-attempt ledger: new dispatches are refused once the tree's KNOWN "
+            "spend (confirmed and estimated) reaches it. A task with an exact continuation then "
+            "pauses with its work saved; an actor without one (no continuation owner, task id or "
+            "durable root) ends with a typed budget_exhausted result and no paid recap. "
+            "Open reservations and unresolved charges are not counted as spending, and calls "
+            "in flight or charged late can take the tree past the cap. The facts line of each "
+            "round reports the live tree number."
         )
     if ctx is not None:
         budget_info["in_task_cost_ceiling"] = _in_task_cost_ceiling(ctx, budget_info.get("remaining_usd"))
     return budget_info
 
 
+def disk_view(path: Any, *, observed_at: Optional[str] = None) -> Dict[str, Any]:
+    """Free and total space of the disk holding ``path``, read now through the Storage page's own reader
+    (``storage._volume``): exact bytes, the same decimal GB that page prints (``storage_format.js``), and when
+    it was read. Empty when the volume cannot be read: unknown stays absent, never a zero."""
+    from ouroboros import storage
+
+    volume = storage._volume(path)
+    free, total = volume.get("free_bytes"), volume.get("total_bytes")
+    if free is None or total is None:
+        return {}
+    return {"free_bytes": free, "free_gb": round(free / 1e9, 1), "volume_total_bytes": total,
+            "volume_total_gb": round(total / 1e9, 1), "disk_read_at": observed_at or volume.get("observed_at")}
+
+
+def storage_fact(data_root: Any, *, observed_at: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """What the mind knows about its disk, as one compact fact, every turn: free and total space of the
+    data folder's disk, read fresh with or without a count, in bytes and the Storage page's decimal GB with
+    when it was read (``disk_view``); what every retirer holds and why
+    (``holds``: by remover, each class with its count, one example and since when, from the job rows the
+    server's five retirer passes and the custody sweep's engine record keep; never an engine call while a
+    turn is prepared) and what the last pass of each released; the last finished storage count when there
+    is one (when it was counted, what Ouroboros owns and how many items it could not read, the growth since
+    the count before, flagged when either count had unreadable items); and one ``removers`` line only
+    while a remover's last outcome is not clean (``storage_removers.not_ok``). None only when free space
+    cannot be read, nothing holds, nothing was counted and every remover is clean (never a fake zero). No
+    threshold, tier or warning stands in for judgment here: the mind reads the numbers and acts through
+    ``free_storage`` or the owner's Storage page."""
+    from ouroboros import storage, storage_removers
+
+    fact: Dict[str, Any] = disk_view(data_root, observed_at=observed_at)
+    removers = ""
+    try:
+        found = storage_removers.place_removers(data_root, engine=False)
+        removers = "; ".join(storage_removers.not_ok(found))
+        holds = storage_removers.holds_by_remover(found)
+        if holds:
+            fact["holds"] = holds
+    except Exception:  # the readers already answer unknown; anything else is said, never a broken section
+        log.debug("storage removers unreadable for the runtime fact", exc_info=True)
+        removers = "the removers' facts could not be read"
+    try:
+        saved = storage.count.saved(data_root)
+        count = storage.with_growth(saved["latest"], saved["previous"]) if saved else None
+    except Exception:  # an unreadable or malformed file is no fact, never a broken Runtime section
+        log.debug("storage count unreadable for the runtime fact", exc_info=True)
+        count = None
+    if count is not None:
+        fact.update({
+            "counted_at": count["finished_at"],
+            "bytes": count["bytes"],
+            "unreadable": count["unreadable"],  # items the count could not read: the headline excludes them
+            "basis": count.get("basis"),
+            "previous_at": count.get("growth_since"),
+            "growth_bytes": count.get("growth_bytes"),
+        })
+        if count.get("growth_flag"):
+            fact["growth_flag"] = count["growth_flag"]  # either count had unreadable items: the growth is qualified
+    if removers:
+        fact["removers"] = removers
+    return fact or None
+
+
+# The body's own facts: bounds here are transport and memory limits, never judgments. Each item is one
+# short line of text (the Runtime section is indented JSON), kept small for small context windows: clocks
+# are UTC HH:MM of observed_at's day (MM-DD HH:MM on another day), and no phrase carries a verdict.
+_SUPERVISOR_TAIL_BYTES = 256_000  # the same bounded tail the health block reads
+_OWNER_TURNS_SHOWN = 2  # receipts rendered per context; the ring keeps 100 and the journal every one
+_STALL_ENDS = {"direct_turn_stall": "direct_turn_stall_end", "host_duty_stall": "host_duty_stall_end",
+               "supervisor_loop_stall": "supervisor_loop_stall_end"}
+_STALL_WORDS = {"direct_turn_stall": "turn", "host_duty_stall": "duty", "supervisor_loop_stall": "loop"}
+_STALLS_KEY = "stalls, no end in window"
+_ROUTES_SHOWN = 4  # failing routes rendered in the line; the row keeps every route
+_CAUSE_CHARS = 80  # of a top cause's message in the line; the row keeps the engine's whole first line
+_STORE_FILES = ("state/current.sqlite", "state/dialog.sqlite", "state/usage.sqlite")
+_JOURNAL_MODES: Dict[str, str] = {}  # per process: each store file's header, read once
+# The minimal working call: the kind requires op='jsonl', and these rows are the installation's journal,
+# which a forked drive does not keep (plane='canonical' reads it from any focus).
+VITALS_READER = "query_data(kind='supervisor_log', op='jsonl', plane='canonical')"
+VITALS_NOTE = f"No verdict here, the weighing is mine; clocks UTC; rows: {VITALS_READER}"
+WAL_GATE = ("WAL needs a SQLite with the WAL-reset fix (3.51.3+, or 3.50.7+ / 3.44.6+ within those series),"
+            " enforced kernel locks and a local filesystem; an Update keeps this interpreter")
+
+
+def _clock(stamp: Any, today: Any) -> str:
+    """HH:MM of a UTC stamp, with its day (MM-DD) only when that is not observed_at's day."""
+    text = str(stamp or "")
+    if len(text) < 16:
+        return text
+    return text[11:16] if text[:10] == str(today or "")[:10] else f"{text[5:10]} {text[11:16]}"
+
+
+def _sec(value: Any) -> str:
+    return f"{float(value):.1f} s" if isinstance(value, (int, float)) else "unknown"
+
+
+def _site(site: Any) -> str:
+    text = str(site or "")
+    return text.split(".", 1)[1] if text.startswith(("ouroboros.", "supervisor.")) else text
+
+
+def _stall_key(row: Dict[str, Any]) -> tuple:
+    return (str(row.get("execution_id") or ""), str(row.get("duty") or ""), str(row.get("phase") or ""))
+
+
+def _supervisor_tail(root: pathlib.Path) -> Dict[str, Any]:
+    """One pass over the journal's bounded tail: the newest boot and ``supervisor_load`` rows, the newest
+    ``direct_turn`` receipts (a pooled worker has no ring), stall onsets whose end is not in the window
+    (an onset's ``_end`` row with the same identity closes it; a closed episode's ``top_frames`` is kept
+    by execution for the receipts). The tail is the one the health block reads, memoized on the file's
+    identity (``jsonl_tail.cached_tail_objects``): one read per context build serves both. An
+    unreadable or absent journal is no fact: empty, never an error. The newest route-health row is not
+    read here: its own file keeps it past this tail (``claudexor_exit_facts.latest_route_health``)."""
+    from ouroboros.jsonl_tail import cached_tail_objects
+
+    found: Dict[str, Any] = {"open": {}, "ended": {}, "turns": []}
+    try:
+        rows = cached_tail_objects(root / "logs" / "supervisor.jsonl", _SUPERVISOR_TAIL_BYTES)
+    except Exception:
+        log.debug("supervisor journal tail unreadable for the body fact", exc_info=True)
+        return found
+    for row in rows:
+        kind = str(row.get("type") or "")
+        if kind in ("launcher_start", "restart", "boot"):
+            found["boot"] = row
+        elif kind == "supervisor_load":
+            found["load"] = row
+        elif kind == "direct_turn":
+            found["turns"] = [*found["turns"], row][-_OWNER_TURNS_SHOWN:]
+        elif kind == "conversation_inline_executor":  # a turn that ran on a thread of the server (2A)
+            found["inline"] = [*found.get("inline", []), row][-_OWNER_TURNS_SHOWN:]
+        elif kind in _STALL_ENDS:
+            found["open"][(kind, _stall_key(row))] = row
+        elif kind in _STALL_ENDS.values():
+            onset = kind[: -len("_end")]
+            found["open"].pop((onset, _stall_key(row)), None)
+            if onset == "direct_turn_stall" and row.get("execution_id"):
+                found["ended"][str(row["execution_id"])] = row
+    return found
+
+
+def _owner_turn(row: Dict[str, Any], ended: Dict[str, Any], today: Any) -> str:
+    """One receipt in one line: when, the chat, how long my human waited to my first request (the
+    handler's own wait when the acceptance stamp was unknown), the slowest phase, the dispatch basis
+    when it was not a seen send, the turn's transactions per store (r/w) and chronicle opens, the stall
+    episode's top frame when its end row is still in the tail, and a journal row that was not written."""
+    wait = row.get("owner_wait_sec")
+    text = f"{_clock(row.get('ts'), today)} chat {row.get('chat_id')} waited " + (
+        _sec(wait) if wait is not None else f"{_sec(row.get('handler_wait_sec'))} from entry (acceptance stamp unknown)")
+    if row.get("slowest_phase"):
+        text += f", slowest {row['slowest_phase']} {_sec(row.get('slowest_phase_sec'))}"
+    if row.get("dispatch") not in (None, "observed_send"):
+        text += f", {row['dispatch']}"
+    meter = row.get("meter") if isinstance(row.get("meter"), dict) else {}
+    stores: Dict[str, str] = {}
+    for key, value in meter.items():
+        if key.endswith("_sec") or key.endswith(".sec"):
+            continue
+        kind, _dot, side = key.partition(".")
+        stores[kind] = stores.get(kind, "") + (f" {value} locked" if side == "locked" else f" {value}{side[:1]}")
+    if stores:
+        text += "; txns " + " · ".join(f"{kind}{counts}" for kind, counts in stores.items())
+    frames = (ended.get(str(row.get("execution_id") or "")) or {}).get("top_frames")
+    if isinstance(frames, list) and frames and isinstance(frames[0], dict) and frames[0].get("frame"):
+        text += f"; top {str(frames[0]['frame']).rsplit('/', 1)[-1]}"
+    if row.get("journal") == "not_written":
+        text += "; journal row not written"
+    return text
+
+
+def _stall(kind: str, row: Dict[str, Any], today: Any) -> str:
+    where = " ".join(str(row[key]) for key in ("phase", "duty") if row.get(key))
+    ident = str(row.get("task_id") or row.get("execution_id") or "")
+    return " ".join(part for part in (_STALL_WORDS.get(kind, kind), ident, where, "since", _clock(row.get("ts"), today)) if part)
+
+
+def _busy_minute(row: Dict[str, Any], today: Any) -> str:
+    """The newest ``supervisor_load`` row in one line: the worst event lag; per store, holds as
+    count/summed seconds by side, the longest hold's site after its store; the queue lock's holds."""
+    text = f"{_clock(row.get('ts'), today)}: lag ≤{_sec(row.get('max_event_lag_sec'))}"
+    locks = row.get("store_locks")
+    if isinstance(locks, dict) and locks and "error" not in locks:
+        longest, parts = (0.0, "", ""), []
+        for kind, sides in locks.items():
+            if not isinstance(sides, dict):
+                continue
+            parts.append(f"{kind} " + " ".join(f"{side[:1]}{bucket.get('count')}/{float(bucket.get('total_sec') or 0.0):.1f} s"
+                                               for side, bucket in sides.items() if isinstance(bucket, dict)))
+            for bucket in sides.values():
+                if isinstance(bucket, dict) and float(bucket.get("max_sec") or 0.0) >= longest[0] and bucket.get("max_site"):
+                    longest = (float(bucket.get("max_sec") or 0.0), kind, _site(bucket["max_site"]))
+        if parts:
+            text += "; holds " + ", ".join(part + (f" ({longest[2]})" if part.startswith(longest[1] + " ") else "") for part in parts)
+    queue = row.get("queue_lock")
+    if isinstance(queue, dict) and queue.get("count"):
+        text += f"; queue {queue.get('count')}/{float(queue.get('hold_total_sec') or 0.0):.1f} s"
+    return text
+
+
+def _carriers(row: Dict[str, Any], today: Any) -> str:
+    """The conversation lane's carriers in the newest ``supervisor_load`` row (owner decision 4A: no number
+    bounds them, the vitals show them): how many, how many idle, each one's last own RSS ("?" before its
+    first turn's beat), the peak named as such. "" for a row without the section."""
+    lane = row.get("conversation_lane")
+    if not isinstance(lane, dict) or type(lane.get("carriers")) is not int:
+        return ""
+    text = f"{_clock(row.get('ts'), today)}: carriers {lane['carriers']}, idle {lane.get('idle')}"
+    sizes = lane.get("rss_mib") if isinstance(lane.get("rss_mib"), list) else []
+    if any(size is not None for size in sizes):
+        text += "; rss " + " · ".join("?" if size is None else str(size) for size in sizes) + " MiB"
+        text += " (peak)" if "peak" in (lane.get("rss_measure") or ()) else ""
+    return text
+
+
+def _route_health(row: Dict[str, Any], today: Any) -> str:
+    """The newest ``claudexor_route_health`` row in one line: the engine's window and the routes it saw
+    (a harness with its access profile), the routes with failed runs, most failed first, each as
+    failed/runs with its top failure group, and the scan's own incompleteness. A window the engine
+    counted without a run says so, with its scan's completeness. Counts only: no share, no threshold,
+    no verdict. "" for a row without its routes (then no key, never "none failed" or "no engine runs")."""
+    raw = row.get("routes")
+    routes = [route for route in (raw if isinstance(raw, list) else [])
+              if isinstance(route, dict) and type(route.get("runs")) is int and type(route.get("failed")) is int]
+    if not isinstance(raw, list) or len(routes) != len(raw):
+        return ""
+    text = f"{_clock(row.get('generated_at') or row.get('ts'), today)}: {row.get('window_days')}-day window"
+    if not routes:
+        return text + ", no engine runs" + (", scan complete" if row.get("complete") is True else _scan_note(row))
+    text += f", {len(routes)} routes, {sum(route['runs'] for route in routes)} engine runs"
+    failing = sorted((route for route in routes if route["failed"] > 0),
+                     key=lambda route: (-route["failed"], str(route.get("harness")), str(route.get("access"))))
+    if not failing:
+        return text + ", none failed" + _scan_note(row)
+    parts = []
+    for route in failing[:_ROUTES_SHOWN]:
+        part = f"{route.get('harness')} {route.get('access')} {route['failed']}/{route['runs']}"
+        top = next(iter(route.get("top_failures") or []), None)
+        if isinstance(top, dict) and top.get("count") is not None:
+            cause = str(top.get("message") or top.get("code") or "")[:_CAUSE_CHARS]
+            part += f" ({top.get('category')}{': ' + cause if cause else ''} ×{top['count']})"
+        parts.append(part)
+    text += "; failed: " + ", ".join(parts)
+    if len(failing) > _ROUTES_SHOWN:
+        text += f", +{len(failing) - _ROUTES_SHOWN} more routes with failed runs"
+    return text + _scan_note(row)
+
+
+def _scan_note(row: Dict[str, Any]) -> str:
+    return f"; scan incomplete ({row.get('incomplete_reason') or 'reason unknown'})" if row.get("complete") is False else ""
+
+
+def _route_health_line(root: pathlib.Path, today: Any) -> str:
+    """The newest route-health row from its own file (``claudexor_exit_facts.latest_route_health``, which
+    its writer owns), rendered; "" without a row or for one this line cannot read, so a damaged file
+    drops only its own key."""
+    from ouroboros.claudexor_exit_facts import latest_route_health
+
+    try:
+        row = latest_route_health(root)
+        return _route_health(row, today) if isinstance(row, dict) else ""
+    except Exception:
+        log.debug("route health fact unreadable for the body fact", exc_info=True)
+        return ""
+
+
+def _runtime_facts(root: pathlib.Path) -> Tuple[str, str]:
+    """CPython and SQLite as this process runs them with each present store's journal as its header
+    says (read once per process: a boot or a handoff is the only writer of that choice), and the WAL
+    gate while a store runs a rollback journal ("" otherwise)."""
+    import platform
+    import sqlite3
+
+    from ouroboros import store
+
+    journal: Dict[str, str] = {}
+    for rel in _STORE_FILES:
+        path = root / rel
+        key = str(path)
+        try:
+            if key not in _JOURNAL_MODES:
+                if not path.is_file():
+                    continue
+                _JOURNAL_MODES[key] = "wal" if store.wal_file(path) else "rollback"
+            journal[path.stem] = _JOURNAL_MODES[key]
+        except Exception:
+            log.debug("journal mode unreadable: %s", path, exc_info=True)
+    runtime = f"python {platform.python_version()}, sqlite {sqlite3.sqlite_version}"
+    if journal:
+        runtime += ", journal " + ", ".join(f"{name}={mode}" for name, mode in journal.items())
+    return runtime, WAL_GATE if "rollback" in journal.values() else ""
+
+
+def _last_update(root: pathlib.Path) -> str:
+    """The retained managed update in one line: outcome and target, the first request's wait before
+    and after, RSS before and after (named peak when a side only knew its high-water mark), the duty
+    overruns the newest side counted; "" without a retained attempt."""
+    from ouroboros.update_generation_facts import projection
+
+    facts = projection(drive_root=root)
+    if not isinstance(facts, dict):
+        return ""
+    sides = [(name, facts[name]) for name in ("before", "after") if isinstance(facts.get(name), dict)]
+    text = f"{facts.get('outcome')} {str(facts.get('target_sha') or '')[:12]}"
+    if not sides:
+        return text
+    dispatch = {name: (sample.get("direct_message_first_dispatch") or {}).get("seconds") for name, sample in sides}
+    text += ": first request from handler entry " + " → ".join(
+        f"{name} {_sec(dispatch[name]) if dispatch[name] is not None else 'none'}" for name, _s in sides)
+    if any(sample.get("rss_bytes") is not None for _n, sample in sides):
+        text += "; rss " + " → ".join(f"{int(sample['rss_bytes']) // 1048576}" if sample.get("rss_bytes") is not None else "?"
+                                      for _n, sample in sides) + " MiB"
+        if any(sample.get("rss_measure") == "peak" for _n, sample in sides):
+            text += " (peak)"
+    overruns = next((sample["duty_overruns"] for _n, sample in reversed(sides) if sample.get("duty_overruns")), None)
+    if overruns:
+        text += "; duty overruns " + ", ".join(f"{name} {count}" for name, count in overruns.items())
+    return text + "; record state/state.json managed_update_attempt"
+
+
+def vitals_fact(data_root: Any, *, observed_at: str, captured_at: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """The body's own dated facts beside ``storage``, one line each: the last owner turns from this serving
+    process's receipt ring, or in a pooled worker from the journal's tail (wait, slowest phase, dispatch
+    basis when unobserved, own transactions; the top frame of a stall episode whose end row is still in
+    the tail), stall onsets whose end was not observed in the journal's bounded tail (never «current»),
+    the last busy minute (counts and summed seconds per store and side, the longest hold's site, never a
+    percentage), the engine-and-pool row (counts and durations; a missing source says it was not observed;
+    no daemon read) and the conversation lane's carriers in that row (count, idle, each one's own last RSS),
+    the engine's per-route failure shares (the newest ``claudexor_route_health`` row, kept
+    in its own file, which the custody sweep replaces only when they change: failed/runs and the top
+    cause per route, most failed first, or a window without runs; no row, no key),
+    the runtime (CPython, SQLite, journal per store, the WAL gate while a store runs a
+    rollback journal), the retained update's before/after, the boot row, and a note that names the
+    journal's reader. ``observed_at`` is the fact's own instant (the clocks' day); it is written only
+    when it differs from ``captured_at``, the Runtime JSON's ``context_captured_at`` beside it (a stale
+    snapshot), so the same instant is not printed twice. Every absent source omits its key, except
+    ``engine_pool`` and ``vendor_programs``, which name unobserved sources. Never
+    raises."""
+    import os
+
+    root = pathlib.Path(data_root)
+    fact: Dict[str, Any] = {} if observed_at == captured_at else {"observed_at": observed_at}
+    try:
+        tail = _supervisor_tail(root)
+        if os.environ.get("OUROBOROS_IN_WORKER") == "1":  # no ring in a pooled worker: the journal's receipts
+            turns, none = tail["turns"], "none in the journal's tail"
+        else:
+            from supervisor.active_activity import direct_turns
+
+            turns, none = direct_turns(limit=_OWNER_TURNS_SHOWN), "none since this process started"
+        if turns:
+            fact["owner_turns"] = [_owner_turn(row, tail["ended"], observed_at) for row in turns]
+        else:
+            fact["owner_turns_note"] = none
+        stalls = [_stall(kind, row, observed_at) for (kind, _key), row in tail["open"].items()]
+        if stalls:
+            fact[_STALLS_KEY] = stalls
+        if isinstance(tail.get("load"), dict):
+            fact["busy_minute"] = _busy_minute(tail["load"], observed_at)
+            if carriers := _carriers(tail["load"], observed_at):
+                fact["conversation_carriers"] = carriers
+        try:
+            from ouroboros.engine_facts import engine_pool_line
+            fact["engine_pool"] = engine_pool_line(root)
+        except Exception:
+            log.debug("engine pool fact unavailable", exc_info=True)
+            fact["engine_pool"] = "engine: not observed"
+        from ouroboros.harness_program_facts import vendor_programs_line
+        fact["vendor_programs"] = vendor_programs_line(root)
+        if tail.get("inline"):
+            # Owner decision 2A: the turns the body ran on a thread of the server instead of a carrier, newest
+            # last — the degraded executor's reason (a refused spawn, a marker window) or a live call.
+            fact["inline_executors"] = [
+                f"{_clock(row.get('ts'), observed_at)} {row.get('executor')} turn {row.get('task_id')}"
+                + (f" ({row.get('reason')})" if row.get("reason") else "") for row in tail["inline"]]
+        routes = _route_health_line(root, observed_at)
+        if routes:
+            fact["route_health"] = routes
+        fact["runtime"], gate = _runtime_facts(root)
+        if gate:
+            fact["wal_gate"] = gate
+        update = _last_update(root)
+        if update:
+            fact["last_update"] = update
+        boot = tail.get("boot")
+        if isinstance(boot, dict):
+            fact["boot"] = (f"{_clock(boot.get('ts'), observed_at)} {boot.get('branch') or boot.get('git_branch')}@"
+                            f"{str(boot.get('sha') or boot.get('git_sha') or '')[:12]}")
+        fact["note"] = VITALS_NOTE
+    except Exception:  # a fact about the body never breaks the Runtime section
+        log.debug("vitals fact unavailable", exc_info=True)
+        return None
+    return fact
+
+
+def admission_observation(data_root: Any, *, observed_at: str) -> str:
+    """The body as recorded beside an admission not confirmed in time, each source with its own clock: the
+    published queue's running and waiting counts (``_queue_context_fact``; a correspondent's Presence turn
+    is not the owner's work) at the snapshot's stamp and age, and the newest ``supervisor_load`` row's worst
+    event wait in its window (``_supervisor_tail``: a past window's maximum, not the lag now). The bounded
+    readers a context build uses, once per receipt; no HTTP, no history scan, no verdict; an absent source
+    is unknown, never zero. Never raises."""
+    def at(stamp: Any) -> str:
+        clock = _clock(stamp, observed_at)
+        return f"at {clock} UTC" if clock else "at an unreadable time"
+
+    root = pathlib.Path(data_root)
+    try:
+        queue = _queue_context_fact({"budget_drive_root": str(root)})
+        running, waiting, age = queue.get("running_count"), queue.get("pending_count"), queue.get("age_sec")
+        when = f"{at(queue.get('ts'))} ({_sec(age)} old)" if age is not None else "at an unreadable time"
+        parts = ["Queue: unknown (no readable snapshot)." if running is None else
+                 f"Queue as recorded {when}: {running} running, {'unknown' if waiting is None else waiting} waiting."]
+        load = _supervisor_tail(root).get("load")
+        parts.append(f"Newest server load row {at(load.get('ts'))}: events waited up to "
+                     f"{_sec(load.get('max_event_lag_sec'))} for the supervisor in its {_sec(load.get('window_sec'))} "
+                     "window." if isinstance(load, dict)
+                     else "Server load: unknown (no supervisor_load row in the journal's recent tail).")
+    except Exception:  # a fact beside a receipt never breaks the receipt
+        log.debug("admission observation unavailable", exc_info=True)
+        return "Queue and server load: unknown (unreadable)."
+    return " ".join(parts)
+
+
+def body_facts(data_root: Any, *, observed_at: str) -> Dict[str, Any]:
+    """The Runtime section's ``storage``, ``vitals`` and ``kept_services`` keys, each present only with its fact: one
+    call site, ``context.build_runtime_section``. ``kept_services`` is what custody says runs now, never a task's
+    ``services_kept`` history (``launch_custody.kept_services_fact``)."""
+    from ouroboros.launch_custody import kept_services_fact
+
+    facts = {"storage": storage_fact(data_root, observed_at=observed_at),
+             "vitals": vitals_fact(data_root, observed_at=observed_at, captured_at=observed_at),
+             "kept_services": kept_services_fact(data_root)}
+    return {key: value for key, value in facts.items() if value is not None}
+
+
+def vitals_line(fact: Optional[Dict[str, Any]]) -> str:
+    """The same facts in one line (a deep self-review's inline rendering); "" for none."""
+    if not isinstance(fact, dict):
+        return ""
+    parts = [f"body as of {fact['observed_at']}" if fact.get("observed_at") else "body"]
+    for key in ("owner_turns", "owner_turns_note", _STALLS_KEY, "busy_minute", "engine_pool", "vendor_programs", "conversation_carriers",
+                "inline_executors", "route_health", "runtime", "wal_gate", "last_update", "boot"):
+        value = fact.get(key)
+        if isinstance(value, list) and value:
+            parts.append(f"{key.replace('_', ' ')} " + " | ".join(str(item) for item in value))
+        elif isinstance(value, str) and value:
+            parts.append(f"{key.replace('_', ' ')} {value}")
+    return "; ".join(parts)
 
 
 def _delegation_capability_fact() -> Optional[Dict[str, Any]]:
-    """B4-lite: honestly-labeled HISTORICAL delegation observations.
-
-    Deliberately NOT live health — receipts prove what the last execution did,
-    not what a lane can do now; live lane facts arrive from plan-review wave
-    rows and typed delegate refusals. Pure bounded file reads over the existing
-    receipt projections: no daemon probes, no new health authority. Absent
-    receipt files mean absent observations, never "healthy". Fail-soft on its
-    own (None on any failure) so a problem here never drops the surrounding
-    capabilities digest.
-    """
+    """Historical identities and readers; execution bodies are chosen reads."""
     try:
-        from ouroboros.reviewer_slot_config import reviewer_slot_last_executions
+        from ouroboros.reviewer_slot_config import reviewer_slot_last_executions, LAST_EXECUTION_FILENAME
+        from ouroboros.subagent_history import first_call_facts, recorded_handle, LAST_DELEGATION_FILENAME
         from ouroboros.subagents import subagent_last_delegation
 
-        def _observed_label(ts: Any) -> str:
-            # Timestamp only: the verbatim "historical, not live health" disclaimer
-            # lives ONCE in the note below, never repeated per row.
-            return f"last observed at {str(ts or '').strip() or 'unknown time'}"
-
-        delegation: Dict[str, Any] = {
-            "note": (
-                "Every row here is historical, not live health (the last "
-                "recorded execution per reviewer slot / delegated run): "
-                "live lane facts arrive from plan-review wave rows and typed "
-                "delegate refusals. A missing row means no observation on "
-                "record — never healthy."
-            ),
-        }
-        slot_rows: List[Dict[str, Any]] = []
-        for slot_id, row in sorted(reviewer_slot_last_executions().items()):
-            if not isinstance(row, dict):
-                continue
-            status = str(row.get("status") or "").strip()
-            fact: Dict[str, Any] = {
-                "slot": str(slot_id),
-                "outcome": (("ok" if status == "ok" else "failed") if status
-                            else "unknown"),
-                "observed": _observed_label(row.get("ts")),
-            }
-            requested = row.get("requested") if isinstance(row.get("requested"), dict) else {}
-            effective = row.get("effective") if isinstance(row.get("effective"), dict) else {}
-            if requested.get("profile_id"):
-                fact["requested_profile"] = str(requested["profile_id"])
-            if effective.get("profile_id"):
-                fact["applied_profile"] = str(effective["profile_id"])
-            # B1's typed failure facts, forwarded only when recorded (a dated
-            # window carries reset_at without a code and an undated one the
-            # code without a reset — read both independently).
-            for key in ("failure_code", "reset_at"):
-                if row.get(key):
-                    fact[key] = row[key]
-            slot_rows.append(fact)
-        if slot_rows:
-            delegation["reviewer_slots_last"] = slot_rows
-        last = subagent_last_delegation()
-        if isinstance(last, dict) and last:
-            last_fact = {
-                "route": str(last.get("route") or ""),
-                "requested_model": str(last.get("requested_model") or ""),
-                "applied_model": str(last.get("applied_model") or ""),
-                "observed": _observed_label(last.get("ts")),
-            }
-            if last.get("requested_profile"):
-                last_fact["requested_profile"] = str(last["requested_profile"])
-            if last.get("applied_profile"):
-                last_fact["applied_profile"] = str(last["applied_profile"])
-            if last.get("selected_subagent_id"):
-                last_fact["selected_subagent_id"] = str(last["selected_subagent_id"])
-            for key in ("outcome", "failure_code", "reset_at", "occurred_at", "observed_at"):
-                if key in last:
-                    last_fact[key] = last[key]
-            delegation["subagent_last_delegation"] = last_fact
-            rows = last.get("latest_by_subagent")
-            if isinstance(rows, dict) and rows:
-                delegation["subagents_last_executions"] = list(rows.values())
-        if len(delegation) == 1:
+        slots = reviewer_slot_last_executions()
+        last = subagent_last_delegation() or {}
+        if not slots and not last:
             return None
-        return delegation
+        records = last.get("latest_by_subagent")
+        records = list(records.values()) if isinstance(records, dict) and records else ([last] if last else [])
+        prices = first_call_facts()
+        return {"note": "Historical observations, not live health; read the records for details.",
+                "reviewer_slots_last": [{"slot": str(slot), "outcome": row.get("status", "unknown"),
+                    "observed": row.get("ts")} for slot, row in sorted(slots.items()) if isinstance(row, dict)],
+                "subagents_last_executions": [{"selected_subagent_id": recorded_handle(row),
+                    "outcome": row.get("outcome", "unknown"), "observed": row.get("observed_at") or row.get("ts"),
+                    **prices.get(str(row.get("selected_subagent_id") or ""), {}),
+                    **{key: row[key] for key in ("task_id", "run_id", "attempt_id") if row.get(key)}}
+                    for row in records if isinstance(row, dict)],
+                "readers": [{"tool": "read_file", "arguments": {"root": "runtime_data", "path": "state/" + name}}
+                            for name in (LAST_EXECUTION_FILENAME, LAST_DELEGATION_FILENAME)]}
     except Exception:
         log.debug("Failed to build delegation capability fact", exc_info=True)
         return None

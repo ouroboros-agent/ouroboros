@@ -29,7 +29,8 @@ from urllib.parse import parse_qsl, urlsplit
 
 import httpx
 import websockets
-from starlette.requests import Request
+from websockets.exceptions import ConnectionClosed
+from starlette.requests import ClientDisconnect, Request
 from starlette.responses import HTMLResponse, Response
 from starlette.websockets import WebSocket
 
@@ -107,23 +108,36 @@ _BOOTSTRAP_HTML = """<!doctype html>
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <title>Ouroboros</title>
   <style>
-    html,body{height:100%;margin:0;background:#0d0f12;color:#e8eaed;font:16px system-ui,sans-serif}
+    html{color-scheme:dark;--bg-primary:#0f0f11;--text-secondary:rgba(255,255,255,.58)}
+    html[data-theme="light"]{color-scheme:light;--bg-primary:#ffffff;--text-secondary:#626977}
+    html,body{height:100%;margin:0;background:var(--bg-primary);color:var(--text-secondary);
+      font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}
     main{height:100%;display:grid;place-items:center;text-align:center;padding:24px;box-sizing:border-box}
-    #status{max-width:28rem;line-height:1.45;opacity:.85}
+    #status{max-width:28rem}
   </style>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <script src="/__telegram/bootstrap.js" defer></script>
+  <script src="/__telegram/bootstrap.js"></script>
 </head>
-<body><main><div id="status">Connecting to Ouroboros…</div></main></body>
+<body><main><div id="status" role="status">Connecting to Ouroboros…</div></main></body>
 </html>
 """
 
+# Runs in <head>, after Telegram's script and before the first paint: the interface's room and ink
+# (web/ui.css) for the Mini App's saved Light or Dark (web/theme.js keeps it under this key), else
+# Telegram's own light or dark (the interface's System here), else the device's. Then, once the
+# document is parsed, the launch.
 _BOOTSTRAP_JS = r"""(() => {
-  const status = document.getElementById('status');
-  const fail = () => { if (status) status.textContent = 'Open this app from its Telegram bot menu.'; };
+  const webApp = window.Telegram && window.Telegram.WebApp;
+  let saved = '';
+  try { saved = localStorage.getItem('ouroboros.theme') || ''; } catch (_) { /* blocked: Telegram's own */ }
+  const scheme = webApp && webApp.colorScheme;
+  document.documentElement.dataset.theme = saved === 'light' || saved === 'dark' ? saved
+    : scheme === 'light' || scheme === 'dark' ? scheme
+    : window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+  const say = (text) => { const status = document.getElementById('status'); if (status) status.textContent = text; };
+  const fail = () => say('Open this app from its Telegram bot menu.');
   const start = async () => {
     try {
-      const webApp = window.Telegram && window.Telegram.WebApp;
       if (!webApp || !webApp.initData) { fail(); return; }
       webApp.ready();
       webApp.expand();
@@ -139,13 +153,14 @@ _BOOTSTRAP_JS = r"""(() => {
         method: 'GET', credentials: 'same-origin', cache: 'no-store'
       });
       if (!session.ok) {
-        if (status) status.textContent = 'This Telegram web client cannot store the secure owner session. Use the native Telegram app.';
+        say('This Telegram web client cannot store the secure owner session. Use the native Telegram app.');
         return;
       }
       window.location.replace('/');
     } catch (_) { fail(); }
   };
-  start();
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true });
+  else start();
 })();
 """
 
@@ -205,21 +220,33 @@ class _ProxyStreamResponse:
         self.body = body
         self.close = close
 
-    async def __call__(self, _scope: dict[str, Any], _receive: Any, send: Any) -> None:
-        await send(
-            {
-                "type": "http.response.start",
-                "status": self.status_code,
-                "headers": self.headers,
-            }
-        )
+    async def __call__(self, _scope: dict[str, Any], receive: Any, send: Any) -> None:
+        # The upstream response closes however delivery ends. uvicorn (ASGI 2.3) reports a client gone only to
+        # receive(), its send() then returning quietly, so delivery races that report as Starlette's StreamingResponse
+        # does: an abandoned stream (a stream widget's EventSource) lets its upstream socket go.
+        delivery = asyncio.ensure_future(self._deliver(send))
+        gone = asyncio.ensure_future(self._client_gone(receive))
         try:
-            async for chunk in self.body:
-                if chunk:
-                    await send({"type": "http.response.body", "body": chunk, "more_body": True})
-            await send({"type": "http.response.body", "body": b"", "more_body": False})
+            await asyncio.wait((delivery, gone), return_when=asyncio.FIRST_COMPLETED)
         finally:
+            for task in (delivery, gone):
+                task.cancel()
+            await asyncio.gather(delivery, gone, return_exceptions=True)
             await self.close()
+        if not delivery.cancelled() and delivery.exception() is not None:
+            raise delivery.exception()
+
+    async def _deliver(self, send: Any) -> None:
+        await send({"type": "http.response.start", "status": self.status_code, "headers": self.headers})
+        async for chunk in self.body:
+            if chunk:
+                await send({"type": "http.response.body", "body": chunk, "more_body": True})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    @staticmethod
+    async def _client_gone(receive: Any) -> None:
+        while (await receive())["type"] != "http.disconnect":
+            pass
 
 
 def _data_check_string(items: Iterable[tuple[str, str]]) -> str:
@@ -728,7 +755,10 @@ class TelegramProxySidecar:
             self._http_client = httpx.AsyncClient(
                 follow_redirects=False,
                 trust_env=False,
-                timeout=httpx.Timeout(connect=3.0, read=None, write=None, pool=3.0),
+                # A phone importing the SPA's module graph holds response slots for a while: a finite burst
+                # past the 32 connections waits its turn instead of becoming a 502 after three seconds. The
+                # limit bounds open sockets, not the wait: a request waits until a slot frees or it is cancelled.
+                timeout=httpx.Timeout(connect=3.0, read=None, write=None, pool=None),
                 limits=httpx.Limits(max_connections=32, max_keepalive_connections=8),
             )
         return self._http_client
@@ -858,6 +888,10 @@ class TelegramProxySidecar:
         try:
             upstream = await client.send(upstream_request, stream=True)
         except (httpx.HTTPError, OSError):
+            return _plain_response(502, "Ouroboros is unavailable.")
+        except ClientDisconnect:
+            # The phone left while this request waited for a socket: once one freed, its head reached the core and
+            # reading its body met the disconnect, which ended the upstream exchange. Nobody receives this answer.
             return _plain_response(502, "Ouroboros is unavailable.")
 
         public_target = self._public_target()
@@ -1012,8 +1046,23 @@ class TelegramProxySidecar:
                 for task in pending:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
+                close_code = 4401 if expired else 1000
+                if not expired:
+                    for task in (from_upstream, from_client):
+                        if task not in done or task.cancelled() or task.exception() is None:
+                            continue
+                        error = task.exception()
+                        close_code = 1011
+                        if isinstance(error, ConnectionClosed):
+                            # A local rejection (e.g. max_size) may have no peer close.
+                            close = (error.sent if error.sent and error.sent.code not in (1000, 1001)
+                                     else error.rcvd or error.sent)
+                            if close and close.code not in (1005, 1006, 1015):
+                                close_code = close.code
+                        break
                 try:
-                    await client.close(code=4401 if expired else 1000)
+                    # Relay the protocol cause, never private exception/reason text.
+                    await client.close(code=close_code)
                 except Exception:
                     pass
         except Exception:

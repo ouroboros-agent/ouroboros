@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+import math
 import pathlib
+import time
+from datetime import datetime, timezone
 from typing import Any
 
 import anyio
@@ -18,7 +20,7 @@ _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
 _FALSE_LITERALS = frozenset({"0", "false", "no", "off"})
 
 
-_TAIL_WINDOW_START_BYTES = 512 * 1024
+from ouroboros.jsonl_tail import ARCHIVE_BACKFILL_MAX  # noqa: E402
 
 
 async def run_sync_to_completion(function, /, *args, **kwargs):
@@ -32,53 +34,31 @@ async def run_sync_to_completion(function, /, *args, **kwargs):
     try:
         return await asyncio.shield(worker)
     except asyncio.CancelledError:
-        # Starlette streams use level cancellation; shield that scope while
-        # also tolerating repeated raw asyncio Task.cancel() calls.
-        with anyio.CancelScope(shield=True):
-            while not worker.done():
-                try:
-                    await asyncio.shield(worker)
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    break
-            try:
-                worker.result()
-            except Exception:
-                logging.getLogger(__name__).debug(
-                    "Request worker failed while cancellation settled", exc_info=True,
-                )
+        await settle_to_completion(worker)
         raise
 
 
-def _read_jsonl_segment_with_gaps(
-    path: pathlib.Path,
-    *,
-    tail_bytes: int | None = None,
-) -> tuple[list, set[str]]:
-    """Read one JSONL segment while retaining truthful parse/read-gap facts.
+async def settle_to_completion(task: asyncio.Task) -> None:
+    """Wait until an owned task is done, through the caller's cancellation.
 
-    ``iter_jsonl_objects`` intentionally skips malformed rows because most
-    callers are best-effort telemetry readers.  Gateway history is different:
-    it publishes a completeness claim, so a skipped row must remain visible as
-    a bounded read-gap fact even when the valid rows can still be rendered.
+    Its failure is logged, not raised; a cancelled task still raises.
     """
-    path = pathlib.Path(path)
-    try:
-        path.stat()
-    except FileNotFoundError:
-        return [], set()
-    except OSError:
-        return [], {"unreadable_source"}
-
-    gaps: set[str] = set()
-    try:
-        entries = list(
-            iter_jsonl_objects(path, tail_bytes=tail_bytes, gap_reasons=gaps)
-        )
-    except OSError:
-        gaps.add("unreadable_source")
-    return entries, gaps
+    # Starlette streams use level cancellation; shield that scope while
+    # also tolerating repeated raw asyncio Task.cancel() calls.
+    with anyio.CancelScope(shield=True):
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                break
+        try:
+            task.result()
+        except Exception:
+            logging.getLogger(__name__).debug(
+                "Request worker failed while cancellation settled", exc_info=True,
+            )
 
 
 def read_rotated_jsonl_entries(
@@ -87,75 +67,22 @@ def read_rotated_jsonl_entries(
     archive_prefix: str,
     want: int,
     counts_toward_quota,
-    max_archives: int = 3,
+    max_archives: int = ARCHIVE_BACKFILL_MAX,
     *,
     include_gaps: bool = False,
 ) -> list | tuple[list, set[str]]:
-    """Bounded, rotation-aware read of one JSONL log (v6.90.x P2, built on the
-    ``iter_jsonl_objects(tail_bytes=...)`` bounded-read SSOT).
+    """Bounded, rotation-aware read of one JSONL log (v6.90.x P2).
 
-    The live file is read from a byte tail that starts at 512KB and DOUBLES until
-    the FILTERED quota is satisfied (rows for which ``counts_toward_quota`` is
-    true reach ``want``) or the window covers the whole file — the degenerate
-    case equals today's full read, so a quota the file cannot satisfy costs one
-    full pass, never an infinite loop. Rotated ``archive/<prefix>_*.jsonl``
-    segments are then backfilled newest-first until the quota is met, bounded to
-    ``max_archives`` files, and everything is reassembled chronologically
-    (oldest chosen archive -> live window). The backfill is bounded to the
-    ``max_archives`` newest archives: older segments are NOT consulted by this
-    reader (they stay durable on disk for full-history consumers)."""
-    live = pathlib.Path(live)
-    try:
-        size = live.stat().st_size
-    except FileNotFoundError:
-        size = 0
-    except OSError:
-        size = 0
-    window = _TAIL_WINDOW_START_BYTES
-    gaps: set[str] = set()
-    while True:
-        if window >= size:
-            if include_gaps:
-                live_entries, live_gaps = _read_jsonl_segment_with_gaps(live)
-                gaps.update(live_gaps)
-            else:
-                live_entries = list(iter_jsonl_objects(live))
-            break
-        if include_gaps:
-            live_entries, live_gaps = _read_jsonl_segment_with_gaps(live, tail_bytes=window)
-            gaps.update(live_gaps)
-        else:
-            live_entries = list(iter_jsonl_objects(live, tail_bytes=window))
-        if sum(1 for entry in live_entries if counts_toward_quota(entry)) >= want:
-            break
-        window *= 2
-    collected = sum(1 for entry in live_entries if counts_toward_quota(entry))
-    try:
-        archives = sorted(
-            archive_dir.glob(f"{archive_prefix}_*.jsonl"), key=lambda p: p.name, reverse=True
-        )
-    except Exception:
-        archives = []
-    chosen: list = []
-    for archive_path in archives:
-        if collected >= want or len(chosen) >= max_archives:
-            break
-        try:
-            if include_gaps:
-                archive_entries, archive_gaps = _read_jsonl_segment_with_gaps(archive_path)
-                gaps.update(archive_gaps)
-            else:
-                archive_entries = list(iter_jsonl_objects(archive_path))
-        except Exception:
-            gaps.add("unreadable_source")
-            continue
-        chosen.append(archive_entries)
-        collected += sum(1 for entry in archive_entries if counts_toward_quota(entry))
-    ordered: list = []
-    for archive_entries in reversed(chosen):  # oldest chosen archive first
-        ordered.extend(archive_entries)
-    ordered.extend(live_entries)
-    return (ordered, gaps) if include_gaps else ordered
+    The reader itself lives in ``ouroboros/jsonl_tail.py`` (one bounded
+    filtered tail for the endpoints AND context assembly); this wrapper keeps
+    the gateway call shape and its parser seam (see above).
+    """
+    from ouroboros.jsonl_tail import read_rotated_jsonl_entries as _read
+
+    return _read(
+        live, archive_dir, archive_prefix, want, counts_toward_quota, max_archives,
+        include_gaps=include_gaps, iter_objects=iter_jsonl_objects,
+    )
 
 
 def request_drive_root(request: Request) -> pathlib.Path:
@@ -197,16 +124,18 @@ def coerce_int(value: Any, default: int = 0) -> int:
         return default
 
 
-async def request_json_or(
-    request: Request,
-    default: Any,
-    *,
-    exceptions: tuple[type[BaseException], ...] = (json.JSONDecodeError, ValueError),
-) -> Any:
+async def request_json_or(request: Request, default: Any) -> Any:
+    """The JSON object the request carries, ``default`` for an empty body, else ``None``.
+
+    The ``Content-Type`` label is not read (``curl -d`` labels JSON as a form). A present body that is
+    not a JSON object (malformed or wrongly encoded text, whitespace, ``null``, an array or a scalar)
+    is ``None``, never ``default``: a route that acts on an absent body refuses every non-dict in its
+    own response shape, so a body it cannot read never becomes its default action."""
     try:
-        return await request.json()
-    except exceptions:
-        return default
+        value = await request.json()
+    except (ValueError, RecursionError):
+        return None if await request.body() else default
+    return value if isinstance(value, dict) else None
 
 
 def json_error(message: str, status: int = 500, **extra: Any) -> JSONResponse:
@@ -216,7 +145,22 @@ def json_error(message: str, status: int = 500, **extra: Any) -> JSONResponse:
     return JSONResponse(payload, status_code=status)
 
 
-def json_exception(exc: BaseException, status: int = 500) -> JSONResponse:
+def migrating_error(drive_root: Any) -> JSONResponse | None:
+    """The write doors' 503 while the boot import owns the store (P1), else ``None``."""
+    from ouroboros.store import migrating
+
+    if not migrating(drive_root):
+        return None
+    return json_error("the task store is importing; retry shortly", 503, reason_code="migrating")
+
+
+def json_exception(exc: BaseException, status: int | None = None, *, context: str = "") -> JSONResponse:
+    """Answer an exception as JSON. Without an explicit status it is an unexpected
+    failure, recorded here once with its stack (#1138); a caller that chooses a status
+    is giving a deliberate answer, which is not a crash report."""
+    if status is None:
+        logging.getLogger(__name__).error(context or "Unhandled gateway request failure", exc_info=exc)
+        status = 500
     return json_error(str(exc), status)
 
 
@@ -257,8 +201,48 @@ def stage_initial_task_attachments(
     }, status_code=422)
 
 
+def _normalize_deadline_at(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("deadline_at must be an ISO-8601 datetime") from exc
+    if parsed.tzinfo is None:
+        raise ValueError("deadline_at must include a timezone offset or Z")
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def task_time_limits(body: dict, raw_metadata: dict) -> dict:
+    """Keep the submit-anchored calendar limit separate from the execution duration.
+
+    ``deadline_at`` wins; otherwise legacy ``timeout_sec``/``timeout`` becomes a calendar
+    deadline counted from submission (queue included). ``execution_timeout_sec`` never
+    creates a deadline: it is the pause-excluded execution budget, absent/0 = no limit.
+    """
+    deadline = _normalize_deadline_at(body.get("deadline_at") or raw_metadata.get("deadline_at") or "")
+    try:
+        timeout = float(body.get("timeout_sec") or body.get("timeout") or 0)
+    except (TypeError, ValueError):
+        timeout = 0.0
+    if not deadline and timeout > 0:
+        deadline = datetime.fromtimestamp(time.time() + timeout, timezone.utc).isoformat().replace("+00:00", "Z")
+    limits: dict = {"deadline_at": deadline}
+    if "execution_timeout_sec" in body:
+        raw = body["execution_timeout_sec"]
+        try:
+            execution = float(raw) if not isinstance(raw, bool) else math.nan
+        except (TypeError, ValueError, OverflowError):
+            execution = math.nan
+        if not math.isfinite(execution) or execution < 0:
+            raise ValueError("execution_timeout_sec must be a finite non-negative number (0 adds no limit)")
+        limits["execution_timeout_sec"] = execution
+    return limits
+
+
 __all__ = (
-    "coerce_bool", "coerce_int", "iter_jsonl_objects", "json_error", "json_exception",
+    "coerce_bool", "coerce_int", "iter_jsonl_objects", "json_error", "json_exception", "task_time_limits",
     "read_rotated_jsonl_entries", "request_json_or", "request_drive_root", "request_repo_dir",
-    "stage_initial_task_attachments", "run_sync_to_completion",
+    "stage_initial_task_attachments", "run_sync_to_completion", "settle_to_completion",
 )

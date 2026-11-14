@@ -16,7 +16,8 @@ publication carries no process facts at all — under the typed-result organ
 (D02) prose is never harvested into typed fields.
 
 This lives outside ``tools/shell.py`` deliberately: it is a loop↔handler seam
-(``tools/verify.py`` consumes the attested runtime through it too), and keeping it here keeps
+(``tools/verify.py`` consumes the attested runtime through it too; run_script reads the
+loop's persisted dispatch-source ref through it), and keeping it here keeps
 ``shell.py`` under the repository's 1600-line hard size gate.
 """
 
@@ -56,7 +57,7 @@ def redact_process_data(value):
     if isinstance(value, dict):
         # Host vocabulary/identity is not a child echo. In particular a one-char
         # selected secret must not rewrite PASS/status or receipt identity hashes.
-        typed = {"tool", "status", "code", "contract_kind", "expected_match", "ts",
+        typed = {"tool", "status", "code", "contract_kind", "expected_match", "ts", "receipt_ts",
                  "criterion_source", "check_rendering", "root", "source", "kind",
                  "sha256", "content_sha256", "input_sha256", "output_sha256"}
         return {key: item if key in typed else redact_process_data(item) for key, item in value.items()}
@@ -67,8 +68,8 @@ def redact_process_data(value):
 
 @contextlib.contextmanager
 def process_environment_scope(ctx, name, arguments):
-    """One admitted Settings snapshot shared by resolution and nested launchers."""
-    from ouroboros.config import load_settings, runtime_settings
+    """One current Settings selection at dispatch, shared by nested launchers."""
+    from ouroboros.config import load_settings, selection_settings
     from ouroboros.workspace_executor import resolve_process_env, validate_process_env
     from ouroboros.tools.tool_result import ToolResult
 
@@ -85,7 +86,7 @@ def process_environment_scope(ctx, name, arguments):
                     text="⚠️ PROCESS_ENV_REFERENCE_BLOCKED: this task cannot select settings-backed process environment.")
             else:
                 prepared = resolve_process_env(None, refs,
-                    settings=runtime_settings(settings_reader=load_settings) if refs else None)
+                    settings=selection_settings(settings_reader=load_settings) if refs else None)
         except ValueError as exc:
             error = ToolResult(status="error", code="TOOL_ARG_ERROR", text=f"⚠️ TOOL_ARG_ERROR: {exc}")
     _process_facts_tls.environment = prepared
@@ -110,7 +111,8 @@ def process_environment_tool(handler):
             arguments.setdefault("contract_kind", args[0])
         with process_environment_scope(ctx, name, arguments) as error:
             if error is not None:
-                return _publish_tool_result(ctx, error)
+                return _publish_tool_result(ctx, _replace_tool_result(
+                    error, meta_updates={"operation_outcome": "completed_no_effect"}))
             try:
                 result = handler(ctx, *args, **kwargs)
             except Exception as exc:
@@ -127,6 +129,77 @@ def process_environment_tool(handler):
                     meta_updates=redact_process_data(dict(published.meta))))
             return text
     return invoke
+
+
+def _script_source(ctx):
+    """``(meta fact, sentence)`` for where this call's script text survives; never raises.
+
+    The loop persisted the call's full redacted arguments, script included, before
+    dispatch. That record is cited, never copied again; its absence or a failed
+    lookup changes only this note, never the outcome it is attached to.
+    """
+    from ouroboros.tool_call_log import current_args_source
+    from ouroboros.presence_authority import PRESENCE_OWN_WORK_SCOPE, presence_caller_binding
+
+    try:
+        source = current_args_source()
+        ref = source.get("args_source_ref")
+        if source.get("args_source_status") == "ready" and isinstance(ref, dict) and ref.get("call_id") and ref.get("sha256"):
+            task_id = str(getattr(ctx, "task_id", "") or "")
+            if not task_id:
+                status = "unavailable:task_identity"
+                return {"status": status}, f"retention is unavailable or unknown ({status})"
+            arguments = {
+                "task_id": task_id,
+                "call_id": str(ref["call_id"]), "manifest_sha256": str(ref["sha256"]),
+            }
+            if presence_caller_binding(ctx) is not None:
+                arguments["presence_scope"] = PRESENCE_OWN_WORK_SCOPE
+            source_read = {"tool": "get_task_result", "arguments": arguments}
+            fact = {
+                "status": "ready", "call_id": str(ref["call_id"]),
+                "sha256": str(ref["sha256"]), "source_read": source_read,
+            }
+            rendered = ", ".join(f"{key}={value!r}" for key, value in arguments.items())
+            return fact, f"its redacted source is get_task_result({rendered})"
+        status = str(source.get("args_source_status") or "no dispatch record for this call")
+    except Exception as exc:  # observational: the outcome stands
+        status = f"unavailable:{type(exc).__name__}"
+    if status == "no dispatch record for this call":
+        # A direct call outside loop dispatch positively has no retained
+        # dispatch record.  Preserve that established compatibility wording;
+        # failures while looking up or persisting a record remain unknown.
+        return {"status": status}, f"its text was not retained ({status})"
+    return {"status": status}, f"retention is unavailable or unknown ({status})"
+
+
+def _publish_script_source(ctx, before, after, fact):
+    from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, _published_tool_result, _replace_tool_result
+
+    published = _published_tool_result(ctx, None)
+    if isinstance(published, ToolResult) and published.text == before:
+        return _publish_tool_result(ctx, _replace_tool_result(published, text=after, meta_updates={"script_source": fact}))
+    return after
+
+
+def wrap_script_result(ctx, result, audit_note, script_path, note_meta=None):
+    """Close a run_script result with where its script text survives the removed temp file."""
+    from ouroboros.tools.tool_result import _wrap_run_script_process_result
+
+    fact, held = _script_source(ctx)
+    try:
+        removed = "temporary file cleanup failed" if pathlib.Path(script_path).exists() else "temporary file removed after the run"
+    except OSError:
+        removed = "temporary file state unknown"
+    wrapped = _wrap_run_script_process_result(ctx, result, audit_note, f"{script_path} ({removed}; {held})", note_meta)
+    return _publish_script_source(ctx, wrapped, wrapped, fact)
+
+
+def script_refusal_with_source(ctx, refusal):
+    """A run_script refused before any process started: no script file or effect is
+    claimed, only where the requested script text survives."""
+    fact, held = _script_source(ctx)
+    return _publish_script_source(ctx, refusal, f"{refusal}\n# script_source: nothing ran; {held}", fact)
 
 
 def selected_process_environment():
@@ -207,6 +280,32 @@ def signal_name_for_returncode(returncode) -> str:
 
 
 _process_facts_tls = threading.local()
+
+
+@contextlib.contextmanager
+def process_facts_handoff(function):
+    """Bridge this invocation's channel to its joined handler executor.
+
+    The admitted environment is a snapshot, not a request to resolve Settings
+    again. Only the joined invocation returns its measured facts to the loop.
+    """
+    fields = ("environment", "runtime_provenance", "facts")
+    state = {key: getattr(_process_facts_tls, key, None) for key in fields}
+    def invoke(*args, **kwargs):
+        prior = {key: getattr(_process_facts_tls, key, None) for key in fields}
+        try:
+            for key, value in state.items():
+                setattr(_process_facts_tls, key, value)
+            return function(*args, **kwargs)
+        finally:
+            state.update({key: getattr(_process_facts_tls, key, None) for key in fields})
+            for key, value in prior.items():
+                setattr(_process_facts_tls, key, value)
+    try:
+        yield invoke
+    finally:
+        for key in ("facts", "runtime_provenance"):
+            setattr(_process_facts_tls, key, state[key])
 
 # The complete typed fact family this channel owns. When typed facts exist for
 # a call, they are authoritative for EVERY member — including the ABSENCE of a

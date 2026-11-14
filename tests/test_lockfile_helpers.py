@@ -76,7 +76,9 @@ def test_stale_eviction_never_removes_a_lock_re_created_under_it(tmp_path, monke
 
     Between the staleness judgement and the unlink the real owner may release
     and a third writer take the lock; removing THAT file would put two writers
-    on one authority.
+    on one authority. A file replaced under the judgement earns no retry past
+    the deadline (each replacement would otherwise loop forever); an eviction
+    this call made does, even under a zero wait (``body_adoption.arm``).
     """
     lock_path = tmp_path / "state.lock"
     lock_path.write_text("pid=424242 ts=0\n", encoding="utf-8")
@@ -94,6 +96,10 @@ def test_stale_eviction_never_removes_a_lock_re_created_under_it(tmp_path, monke
 
     assert fd is None  # the lock was not ours to take
     assert lock_path.read_text(encoding="utf-8") == "pid=999 ts=fresh\n"
+    monkeypatch.setattr(platform_layer, "pid_is_alive", lambda pid: False)  # nobody replaces it now
+    fd = acquire_exclusive_file_lock(lock_path, timeout_sec=0.0, stale_sec=1.0, owner_aware_stale=True)
+    assert fd is not None  # our own eviction is retried past the zero deadline
+    release_exclusive_file_lock(lock_path, fd)
 
 
 def test_stale_eviction_still_reclaims_a_genuinely_abandoned_lock(tmp_path, monkeypatch):
@@ -488,7 +494,7 @@ def test_the_design_note_names_the_exact_kernel_refusal_sets():
     closed if the design note contradicted the implemented errno sets.
     So the note names both sets and this compares them, member for member, by
     the numbers (EWOULDBLOCK and ENOTSUP are aliases on Linux, not everywhere)."""
-    note = pathlib.Path(__file__).resolve().parents[1] / "docs" / "USAGE_COMPACTION.md"
+    note = pathlib.Path(__file__).resolve().parents[1] / "docs" / "USAGE_STORE.md"
     spelled = re.findall(r"are exactly ((?:`[A-Z]+`/)+`[A-Z]+`)", note.read_text(encoding="utf-8"))
     assert len(spelled) == 2, spelled
     unsupported, held = ({getattr(errno, name.strip("`")) for name in group.split("/")} for group in spelled)
@@ -814,20 +820,6 @@ def _custody_ledger_rewrite(drive: pathlib.Path):
     return path, jsonl_append_lock_path(path), lambda: process_custody._rewrite_ledger(drive, [])
 
 
-def _skill_review_history_append(drive: pathlib.Path):
-    """skill_review_history.append_history_once -- same sidecar as its own
-    append_jsonl writer of the very same history file."""
-    from ouroboros import skill_review_history
-    from ouroboros.utils import jsonl_append_lock_path
-
-    path = skill_review_history.review_history_path(drive, "demo")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(b"")
-    return path, jsonl_append_lock_path(path), lambda: skill_review_history.append_history_once(
-        drive, "demo", {"job_id": "job-1", "ts": "2026-01-01T00:00:00Z"},
-    )
-
-
 def _supervisor_log_rotation(drive: pathlib.Path):
     """supervisor.state.rotate_jsonl_log_if_needed -- renames a log whose rows
     append_jsonl writes under this same lock."""
@@ -857,10 +849,9 @@ def _durable_json_update(drive: pathlib.Path):
 
 @pytest.mark.parametrize("build", [
     _custody_ledger_rewrite,
-    _skill_review_history_append,
     _supervisor_log_rotation,
     _durable_json_update,
-], ids=["process_custody", "skill_review_history", "supervisor_rotation", "update_json_locked"])
+], ids=["process_custody", "supervisor_rotation", "update_json_locked"])
 def test_a_shared_sidecar_taker_never_evicts_a_live_holders_lock(tmp_path, monkeypatch, build):
     """Every writer of one lock file must judge staleness the same way.
 

@@ -1,7 +1,7 @@
 """Checkout and reset: what it is allowed to destroy, and when it must block instead.
 
 Split verbatim out of ``tests/test_git_ops_recovery.py`` by theme. This module owns the
-stale index lock it clears, the fetch failure it survives, the rescue snapshot it will not
+index lock it waits on but never removes, the fetch failure it survives, the rescue snapshot it will not
 proceed without, the local head it preserves across a managed restart, the merge states and
 unreadable reads it blocks on, and the explicit update intent it applies without ever
 falling back to a branch tip.
@@ -19,8 +19,26 @@ import supervisor.git_ops as git_ops
 
 from tests._git_ops_recovery_shared import _git
 
+_REAL_RUN = subprocess.run
 
-def test_checkout_and_reset_removes_stale_index_lock(monkeypatch, tmp_path):
+
+def _git_only(fake):
+    """``fake`` answers the git commands of this checkout; any other program runs for real.
+
+    A git child the tracked runner started (``git_capture``) is released only once a process-table
+    read proves its tree ended (``shell_process.retire_tracked``). That read is the host's own, never
+    this test's git double: a double that answered it would keep the child named, or raise.
+    """
+    def run(cmd, *args, **kwargs):
+        if list(cmd[:1]) != ["git"]:
+            return _REAL_RUN(cmd, *args, **kwargs)
+        return fake(cmd, *args, **kwargs)
+    return run
+
+
+def test_checkout_and_reset_retries_an_old_index_lock_without_removing_it(monkeypatch, tmp_path):
+    """The lock's age proves no owner gone: the retry waits for its holder (here, released
+    after one refusal) and the file stays theirs (real holders: tests/test_git_lock_owners.py)."""
     git_dir = tmp_path / ".git"
     git_dir.mkdir()
     lock_path = git_dir / "index.lock"
@@ -34,10 +52,13 @@ def test_checkout_and_reset_removes_stale_index_lock(monkeypatch, tmp_path):
 
     saved_state = {}
     monkeypatch.setattr(git_ops, "save_state", lambda state: saved_state.update(state))
+    monkeypatch.setattr(git_ops, "update_state", lambda mutator, **_kw: mutator(saved_state) or saved_state)
 
     calls = {"checkout": 0}
 
     def fake_run(cmd, cwd=None, capture_output=False, text=False, check=False, env=None):
+        if cmd == ["git", "rev-parse", "--path-format=absolute", "--git-path", "index"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=str(git_dir / "index"), stderr="")
         if cmd[:3] == ["git", "rev-parse", "--verify"]:
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         if cmd[:2] == ["git", "checkout"]:
@@ -56,14 +77,14 @@ def test_checkout_and_reset_removes_stale_index_lock(monkeypatch, tmp_path):
             return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n", stderr="")
         raise AssertionError(cmd)
 
-    monkeypatch.setattr(git_ops.subprocess, "run", fake_run)
+    monkeypatch.setattr(git_ops.subprocess, "run", _git_only(fake_run))
 
     ok, message = git_ops.checkout_and_reset("ouroboros", unsynced_policy="ignore")
 
     assert ok
     assert message == "ok"
     assert calls["checkout"] == 2
-    assert not lock_path.exists()
+    assert lock_path.read_text(encoding="utf-8") == "lock"
     assert saved_state["current_branch"] == "ouroboros"
     assert saved_state["current_sha"] == "abc123"
 
@@ -81,6 +102,7 @@ def test_checkout_and_reset_continues_when_fetch_fails(monkeypatch, tmp_path, fe
 
     saved_state = {}
     monkeypatch.setattr(git_ops, "save_state", lambda state: saved_state.update(state))
+    monkeypatch.setattr(git_ops, "update_state", lambda mutator, **_kw: mutator(saved_state) or saved_state)
 
     events = []
     monkeypatch.setattr(git_ops, "append_jsonl", lambda path, payload: events.append(payload))
@@ -102,7 +124,7 @@ def test_checkout_and_reset_continues_when_fetch_fails(monkeypatch, tmp_path, fe
             return subprocess.CompletedProcess(cmd, 0, stdout="def456\n", stderr="")
         raise AssertionError(cmd)
 
-    monkeypatch.setattr(git_ops.subprocess, "run", fake_run)
+    monkeypatch.setattr(git_ops.subprocess, "run", _git_only(fake_run))
 
     ok, message = git_ops.checkout_and_reset("ouroboros", reason="restart", unsynced_policy="ignore")
 
@@ -149,7 +171,7 @@ def test_checkout_and_reset_blocks_when_rescue_snapshot_fails(monkeypatch, tmp_p
             reset_calls.append(cmd)
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(git_ops.subprocess, "run", fake_run)
+    monkeypatch.setattr(git_ops.subprocess, "run", _git_only(fake_run))
 
     ok, message = git_ops.checkout_and_reset(
         "ouroboros",
@@ -198,7 +220,7 @@ def test_checkout_and_reset_blocks_when_untracked_rescue_is_truncated(monkeypatc
             reset_calls.append(cmd)
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(git_ops.subprocess, "run", fake_run)
+    monkeypatch.setattr(git_ops.subprocess, "run", _git_only(fake_run))
 
     ok, message = git_ops.checkout_and_reset(
         "ouroboros",
@@ -232,8 +254,11 @@ def test_checkout_and_reset_preserves_local_head_on_managed_restart(monkeypatch,
 
     saved_state = {}
     monkeypatch.setattr(git_ops, "save_state", lambda state: saved_state.update(state))
+    monkeypatch.setattr(git_ops, "update_state", lambda mutator, **_kw: mutator(saved_state) or saved_state)
 
     def fake_git_capture(cmd):
+        if cmd == ["git", "rev-parse", "HEAD"]:
+            return 0, "before-head", ""
         raise AssertionError(cmd)
 
     monkeypatch.setattr(git_ops, "git_capture", fake_git_capture)
@@ -299,7 +324,8 @@ def test_checkout_and_reset_cleans_untracked_after_managed_restart_rescue(monkey
         },
     )
     monkeypatch.setattr(git_ops, "append_jsonl", lambda _path, _payload: None)
-    monkeypatch.setattr(git_ops, "git_capture", lambda cmd: (_ for _ in ()).throw(AssertionError(cmd)))
+    monkeypatch.setattr(git_ops, "git_capture", lambda cmd: (0, "before-head", "") if cmd == ["git", "rev-parse", "HEAD"]
+                        else (_ for _ in ()).throw(AssertionError(cmd)))
 
     calls = []
 
@@ -357,7 +383,8 @@ def test_checkout_and_reset_does_not_rescue_for_only_managed_ahead_commits(monke
         "_create_rescue_snapshot",
         lambda **_kwargs: (_ for _ in ()).throw(AssertionError("ahead-only restart should not rescue")),
     )
-    monkeypatch.setattr(git_ops, "git_capture", lambda cmd: (_ for _ in ()).throw(AssertionError(cmd)))
+    monkeypatch.setattr(git_ops, "git_capture", lambda cmd: (0, "before-head", "") if cmd == ["git", "rev-parse", "HEAD"]
+                        else (_ for _ in ()).throw(AssertionError(cmd)))
 
     def fake_run(cmd, cwd=None, capture_output=False, text=False, check=False, env=None):
         if cmd == ["git", "rev-parse", "--verify", "ouroboros"]:
@@ -392,6 +419,8 @@ def test_checkout_and_reset_blocks_when_status_read_is_unreadable(monkeypatch, t
     monkeypatch.setattr(git_ops, "append_jsonl", lambda path, payload: events.append(payload))
 
     def fake_capture(cmd, *, timeout=None):
+        if cmd == ["git", "rev-parse", "HEAD"]:
+            return 0, "before-head", ""
         if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
             return 0, "ouroboros", ""
         if cmd == ["git", "status", "--porcelain"]:
@@ -417,7 +446,6 @@ def test_checkout_and_reset_blocks_when_status_read_is_unreadable(monkeypatch, t
     assert events[-1]["dirty_count"] == 0
     assert events[-1]["warnings"] == ["status_error:git status exited -9 without stderr"]
 
-@pytest.mark.serial
 def test_checkout_and_reset_blocks_clean_merge_in_linked_worktree(monkeypatch, tmp_path):
     """A linked worktree stores MERGE_HEAD outside its .git pointer file."""
     repo = tmp_path / "repo"
@@ -478,7 +506,7 @@ def test_checkout_and_reset_blocks_on_unreadable_merge_head(monkeypatch, tmp_pat
             return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n", stderr="")
         raise AssertionError(cmd)
 
-    monkeypatch.setattr(git_ops.subprocess, "run", fake_run)
+    monkeypatch.setattr(git_ops.subprocess, "run", _git_only(fake_run))
 
     ok, message = git_ops.checkout_and_reset(
         "ouroboros", reason="restart", unsynced_policy="block",
@@ -518,7 +546,7 @@ def test_checkout_and_reset_blocks_on_merge_in_progress(monkeypatch, tmp_path):
             return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n", stderr="")
         raise AssertionError(cmd)
 
-    monkeypatch.setattr(git_ops.subprocess, "run", fake_run)
+    monkeypatch.setattr(git_ops.subprocess, "run", _git_only(fake_run))
 
     ok, message = git_ops.checkout_and_reset(
         "ouroboros", reason="restart", unsynced_policy="block",
@@ -560,8 +588,11 @@ def test_checkout_and_reset_applies_explicit_update_intent(monkeypatch, tmp_path
 
     saved_state = {}
     monkeypatch.setattr(git_ops, "save_state", lambda state: saved_state.update(state))
+    monkeypatch.setattr(git_ops, "update_state", lambda mutator, **_kw: mutator(saved_state) or saved_state)
 
     def fake_git_capture(cmd):
+        if cmd == ["git", "rev-parse", "HEAD"]:
+            return 0, "before-head", ""
         if cmd == ["git", "rev-parse", "--verify", "remote-sha^{commit}"]:
             return 0, "remote-sha", ""
         if cmd == ["git", "rev-list", "--left-right", "--count", "ouroboros...remote-sha"]:
@@ -634,6 +665,8 @@ def test_checkout_and_reset_preserves_ahead_head_before_update_intent(monkeypatc
     capture_calls = []
 
     def fake_git_capture(cmd):
+        if cmd == ["git", "rev-parse", "HEAD"]:
+            return 0, "before-head", ""
         capture_calls.append(cmd)
         if cmd == ["git", "rev-parse", "--verify", "remote-sha^{commit}"]:
             return 0, "remote-sha", ""
@@ -691,6 +724,8 @@ def test_checkout_and_reset_blocks_when_update_ahead_check_fails(monkeypatch, tm
     monkeypatch.setattr(git_ops._update_source, "official_ref_has_constitution", lambda *_a, **_k: True)
 
     def fake_git_capture(cmd):
+        if cmd == ["git", "rev-parse", "HEAD"]:
+            return 0, "before-head", ""
         if cmd == ["git", "rev-parse", "--verify", "remote-sha^{commit}"]:
             return 0, "remote-sha", ""
         if cmd == ["git", "rev-list", "--left-right", "--count", "ouroboros...remote-sha"]:
@@ -750,6 +785,7 @@ def test_checkout_and_reset_invalid_update_intent_never_falls_back_to_branch_tip
         "git_capture",
         lambda cmd: (1, "", "unknown revision")
         if cmd == ["git", "rev-parse", "--verify", "missing-sha^{commit}"]
+        else (0, "before-head", "") if cmd == ["git", "rev-parse", "HEAD"]
         else (_ for _ in ()).throw(AssertionError(cmd)),
     )
     monkeypatch.setattr(
@@ -793,6 +829,7 @@ def test_checkout_and_reset_rejects_orphan_or_mismatched_update_intent(
         "git_capture",
         lambda cmd: (0, "intent-sha", "")
         if cmd == ["git", "rev-parse", "--verify", "intent-sha^{commit}"]
+        else (0, "before-head", "") if cmd == ["git", "rev-parse", "HEAD"]
         else (_ for _ in ()).throw(AssertionError(cmd)),
     )
     monkeypatch.setattr(
@@ -843,6 +880,7 @@ def test_checkout_and_reset_rejects_target_without_constitution(monkeypatch, tmp
         "git_capture",
         lambda cmd: (0, "target-sha", "")
         if cmd == ["git", "rev-parse", "--verify", "target-sha^{commit}"]
+        else (0, "before-head", "") if cmd == ["git", "rev-parse", "HEAD"]
         else (_ for _ in ()).throw(AssertionError(cmd)),
     )
     monkeypatch.setattr(

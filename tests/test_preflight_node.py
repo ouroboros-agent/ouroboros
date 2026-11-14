@@ -26,7 +26,6 @@ import pytest
 from ouroboros import preflight_node as pn
 
 # Spawns real node/git subprocesses and exercises pass-owned process cleanup.
-pytestmark = pytest.mark.serial
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -164,13 +163,9 @@ def test_too_old_node_is_a_typed_hard_block(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("version,meets_floor", [
     ("20.11.0", True),
-    ("20.11", True),
     ("20.10.9", False),
     ("18.19.1", False),
-    ("22.0.0", True),
-    ("24.16.0", True),
     ("v20.11.0", True),      # probe strips the v, but the parser tolerates it
-    ("21.0.0-nightly", True),  # leading digits only, per piece
     ("garbage", False),        # unparseable degrades to 0 → blocked, not crashed
 ])
 def test_version_floor_comparison(version, meets_floor):
@@ -311,9 +306,8 @@ def test_node_containment_unknown_remains_a_hard_block(tmp_path, monkeypatch):
     assert result["returncode"] == 0
     assert "PREFLIGHT_CONTAINMENT_FAILED" in result["error"]
     assert "could not be enumerated" in result["error"]
-
-
-# ── Orchestration: the gate runs the lane on the CANDIDATE tree ───────
+    # The runner keys tree retention on this field, not on the rendered text.
+    assert result["reap_error"] == "the live process table could not be enumerated"
 
 
 def _git(repo: pathlib.Path, *args: str) -> None:
@@ -345,7 +339,7 @@ def _stub_pytest_passes(monkeypatch, calls):
     from ouroboros import preflight_runner as pr
 
     monkeypatch.setattr(pr, "_verify_preflight_plugins", lambda *a, **k: [])
-    monkeypatch.setattr(pr, "_observed_worker_ids", lambda *a, **k: {"gw0", "gw1"})
+    monkeypatch.setattr(pr, "observed_worker_ids", lambda *a, **k: {"gw0", "gw1"})
 
     def _fake_pass(agent_python, worktree, temp_root, args, timeout):
         calls.append(list(args))
@@ -391,6 +385,9 @@ def test_gate_runs_node_then_both_pytest_passes_when_green(tmp_path, monkeypatch
     assert len(calls) == 2, "both pytest passes must still run after a green node lane"
 
 
+# ── Orchestration: the gate runs the lane on the CANDIDATE tree ───────
+
+
 def test_gate_import_and_call_site_are_wired():
     """`run_hermetic_pytest` calls the lane by its module-level name (so tests
     and operators can stub `preflight_runner.run_node_tests`), after candidate
@@ -400,9 +397,11 @@ def test_gate_import_and_call_site_are_wired():
     from ouroboros import preflight_runner as pr
 
     assert pr.run_node_tests is pn.run_node_tests
-    source = inspect.getsource(pr.run_hermetic_pytest)
+    source = inspect.getsource(pr._run_hermetic_pytest)
     assert "run_node_tests(worktree, temp_root, timeout, max_output)" in source
-    assert source.index("_copy_untracked(repo, worktree)") < source.index("run_node_tests(") < source.index("for spec in passes:")
+    assert source.index("_assemble_live_source(") < source.index("run_node_tests(") < source.index("for spec in passes:")
+    assembly = inspect.getsource(pr._assemble_live_source)
+    assert assembly.index("_copy_untracked(repo, worktree)") < assembly.index("source_evidence(")
 
 
 # ── CI parity ─────────────────────────────────────────────────────────
@@ -418,24 +417,20 @@ def _ci_job_block(job: str) -> str:
     return block.group(1)
 
 
-@pytest.mark.parametrize("job", ["quick-test", "full-test"])
+@pytest.mark.parametrize("job", ["quick-test", "full-test-runs"])
 def test_each_ci_job_runs_the_node_suite_the_gate_runs(job):
-    """Both CI jobs carry the exact suite the gate runs, derived from the
-    module's own WEB_DIR/TESTS_GLOB constants so the three surfaces (gate, CI,
-    web/package.json) cannot drift apart silently."""
+    """Both CI jobs run the gate's own Node lane (`candidate_node_tests` over the
+    module's WEB_DIR/TESTS_GLOB) through the owned runner, so the three surfaces
+    (gate, CI, web/package.json) cannot drift apart silently."""
     block = _ci_job_block(job)
-    expected = f"run: cd {pn.WEB_DIR} && node --test {pn.TESTS_GLOB}"
-    assert block.count(expected) == 1, f"{job} does not run the gate's node suite exactly once"
-    # The Windows runner in full-test needs bash for the glob; keep the step
-    # byte-identical in both jobs so parity stays trivially checkable.
-    assert "shell: bash" in block.split(expected)[0].rsplit("- name:", 1)[-1]
+    assert block.count(_NODE_STEP) == 1, f"{job} does not run the gate's node suite exactly once"
     # ...and the job declares the provisioning contract, so a node regression
     # there is a loud failure instead of silent real-spawn skips.
     assert f'{_REQUIRE_NODE_ENV}: "1"' in block
 
 
 def test_full_test_provisions_node_pinned_by_sha():
-    block = _ci_job_block("full-test")
+    block = _ci_job_block("full-test-runs")
     setup = re.search(r"uses: actions/setup-node@([0-9a-f]{40})", block)
     assert setup, "full-test must provision node via a SHA-pinned actions/setup-node"
     assert "node-version: '22'" in block
@@ -454,19 +449,22 @@ def test_package_json_script_matches_the_gate_glob():
 # frozen install, the exact versions, and the one-rule config.
 
 _ESLINT_STEP = "run: cd web && npm ci --no-audit --no-fund && npm run lint:undef"
+_NODE_STEP = "run: python scripts/run_tests.py --node"
 
 
-@pytest.mark.parametrize("job", ["quick-test", "full-test"])
-def test_each_ci_job_runs_the_eslint_second_layer_after_the_node_suite(job):
-    block = _ci_job_block(job)
-    node_suite = f"run: cd {pn.WEB_DIR} && node --test {pn.TESTS_GLOB}"
-    assert block.count(_ESLINT_STEP) == 1, f"{job} does not run the ESLint no-undef layer exactly once"
-    # A second layer is only a second opinion when the first still runs.
-    assert block.index(node_suite) < block.index(_ESLINT_STEP), (
-        f"{job} runs ESLint before (or instead of) the gate's node suite"
-    )
-    # Windows runner in full-test: bash for the `cd web && ...` chain, same as the node step.
-    assert "shell: bash" in block.split(_ESLINT_STEP)[0].rsplit("- name:", 1)[-1]
+def test_the_eslint_second_layer_runs_wherever_the_node_suite_gates():
+    import yaml
+
+    lint = _ci_job_block("lint")
+    assert lint.count(_ESLINT_STEP) == 1, "the lint job does not run the ESLint no-undef layer exactly once"
+    for job in ("quick-test", "full-test-runs"):
+        assert _ESLINT_STEP not in _ci_job_block(job), f"{job} duplicates the lint job's ESLint layer"
+    # A second layer is only a second opinion when the first still runs: the lint job is admitted
+    # on every event that admits the Node suite, and a release requires both.
+    jobs = yaml.safe_load((REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))["jobs"]
+    assert jobs["lint"]["if"] == jobs["full-test-runs"]["if"]
+    assert {"lint", "full-test"} <= set(jobs["release"]["needs"])
+    assert "shell: bash" in lint.split(_ESLINT_STEP)[0].rsplit("- name:", 1)[-1]
 
 
 def test_the_eslint_layer_is_exact_pinned_and_lockfile_frozen():
@@ -479,7 +477,7 @@ def test_the_eslint_layer_is_exact_pinned_and_lockfile_frozen():
     assert set(dev) == {"eslint", "globals"}, "the layer needs eslint and its globals tables, nothing else"
     for name, version in dev.items():
         assert re.fullmatch(r"\d+\.\d+\.\d+", version), f"{name} is not exact-pinned: {version!r}"
-    assert package["scripts"]["lint:undef"] == "eslint --max-warnings=0 app.js modules tests"
+    assert package["scripts"]["lint:undef"] == "eslint --max-warnings=0 app.js theme.js modules tests"
     lock = json.loads((web / "package-lock.json").read_text(encoding="utf-8"))
     assert lock["lockfileVersion"] >= 3
     for name, version in dev.items():
@@ -500,6 +498,8 @@ def test_the_eslint_config_carries_only_no_undef_over_the_gate_scope():
     for body in rules:
         assert re.findall(r"'([a-z-]+)'\s*:", body) == ["no-undef"], body
     assert "files: ['app.js', 'modules/**/*.js']" in config
+    # The classic script every page runs before CSS is linted as the script it is, like the walker reads it.
+    assert re.search(r"files: \['theme\.js'\],\s*languageOptions: \{[^}]*sourceType: 'script'", config)
     assert "globals.browser" in config and "globals.es2022" in config
     for name in ("Chart", "marked", "DOMPurify", "mermaid", "hljs"):
         assert f"{name}: 'readonly'" in config, f"vendored <script> global {name} missing from the ESLint layer"

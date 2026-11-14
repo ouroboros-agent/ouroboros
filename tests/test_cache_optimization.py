@@ -19,7 +19,7 @@ def _make_env_and_memory(tmpdir: pathlib.Path):
     (repo_dir / "docs" / "ARCHITECTURE.md").write_text("# Ouroboros v1.2.3 — Architecture", encoding="utf-8")
     (repo_dir / "docs" / "DEVELOPMENT.md").write_text("# DEVELOPMENT.md", encoding="utf-8")
     (repo_dir / "README.md").write_text("version-1.2.3", encoding="utf-8")
-    (repo_dir / "docs" / "CHECKLISTS.md").write_text("## Repo Commit Checklist", encoding="utf-8")
+    (repo_dir / "docs" / "CHECKLISTS.md").write_text("## Change Review Checklist", encoding="utf-8")
     (drive_root / "state" / "state.json").write_text('{"spent_usd": 0}', encoding="utf-8")
     (drive_root / "memory" / "scratchpad.md").write_text("scratch", encoding="utf-8")
     (drive_root / "memory" / "identity.md").write_text("identity", encoding="utf-8")
@@ -28,7 +28,7 @@ def _make_env_and_memory(tmpdir: pathlib.Path):
     return env, memory
 
 
-def test_build_llm_messages_returns_three_system_blocks():
+def test_build_llm_messages_marks_every_stable_block_before_the_changing_tail():
     from ouroboros.context import build_llm_messages
 
     tmpdir = pathlib.Path(tempfile.mkdtemp())
@@ -37,10 +37,15 @@ def test_build_llm_messages_returns_three_system_blocks():
     system_msg = messages[0]
     assert system_msg["role"] == "system"
     assert isinstance(system_msg["content"], list)
-    assert len(system_msg["content"]) == 3
-    assert system_msg["content"][0]["cache_control"] == {"type": "ephemeral"}
-    assert system_msg["content"][1]["cache_control"] == {"type": "ephemeral"}
-    assert "cache_control" not in system_msg["content"][2]
+    stable, dynamic = system_msg["content"][:-1], system_msg["content"][-1]
+    assert all(block["cache_control"] == {"type": "ephemeral"} and block["text"].strip() for block in stable)
+    assert "cache_control" not in dynamic
+    assert stable[0]["text"].startswith("You are Ouroboros.")
+    assert stable[1]["text"].startswith("## DEVELOPMENT.md\n")
+    assert "## My story" in stable[-1]["text"]
+    from ouroboros.llm_messages import STABLE_PREFIX_BLOCKS_KEY
+
+    assert system_msg[STABLE_PREFIX_BLOCKS_KEY] == len(stable)
 
 
 def test_build_llm_messages_repartitions_stable_vs_dynamic_sections():
@@ -61,20 +66,25 @@ def test_build_llm_messages_repartitions_stable_vs_dynamic_sections():
     (tmpdir / "drive" / "memory" / "knowledge" / "patterns.md").write_text("patterns", encoding="utf-8")
 
     messages, _ = build_llm_messages(env=env, memory=memory, task={"id": "t2", "type": "task", "text": "hi"})
-    stable_text = messages[0]["content"][1]["text"]
-    dynamic_text = messages[0]["content"][2]["text"]
+    stable_text = messages[0]["content"][-2]["text"]
+    dynamic_text = messages[0]["content"][-1]["text"]
 
+    # Block B: identity, the deep review and my story; knowledge leads C, where its
+    # many daily edits never cost the cached story.
     assert "## Identity" in stable_text
-    assert "## Knowledge base" in stable_text
-    assert "## Known error patterns (Pattern Register)" in stable_text
+    assert "## My story" in stable_text
     assert "## Last Deep Self-Review" in stable_text
+    for knowledge in ("## Shared understanding", "## Knowledge base"):
+        assert knowledge in dynamic_text and knowledge not in stable_text, knowledge
+    # The former register is an ordinary note: its body rides in neither block.
+    assert "Pattern Register" not in dynamic_text and "Pattern Register" not in stable_text
     assert "## Scratchpad" not in stable_text
-    assert "## Dialogue History" not in stable_text
-    assert "## Dialogue Summary" not in stable_text
     assert "## Memory Registry" not in stable_text
 
     assert "## Scratchpad" in dynamic_text
-    assert ("## Dialogue Summary" in dynamic_text) or ("## Dialogue History" in dynamic_text)
+    assert "## This room (Main)" in dynamic_text and "## My story" not in dynamic_text
+    for gone in ("## Dialogue History", "## Dialogue Summary", "## Recent chat"):
+        assert gone not in stable_text and gone not in dynamic_text, gone
     assert "## Memory Registry (what I know / don't know)" in dynamic_text
     assert "## Memory Registry\n\n" not in dynamic_text
     assert "## Memory Registry (what I know / don't know)" not in stable_text
@@ -210,17 +220,16 @@ def test_build_memory_sections_partition_modes():
     stable = build_memory_sections(memory, partition="stable")
     volatile = build_memory_sections(memory, partition="volatile")
     all_sections = build_memory_sections(memory, partition="all")
-    registry_digest = __import__("ouroboros.context", fromlist=["_build_registry_digest"])._build_registry_digest(env)
+    registry = __import__("ouroboros.context", fromlist=["_build_registry_section"])._build_registry_section(env)
 
     assert any(section.startswith("## Identity") for section in stable)
     assert not any(section.startswith("## Scratchpad") for section in stable)
     assert any(section.startswith("## Scratchpad") for section in volatile)
-    assert any(
-        section.startswith("## Dialogue Summary") or section.startswith("## Dialogue History")
-        for section in volatile
-    )
+    # The retold dialogue is the memory view's (``## My story``), never a memory section.
+    assert not any(section.startswith(("## Dialogue Summary", "## Dialogue History", "## Legacy Dialogue"))
+                   for section in [*stable, *volatile, *all_sections])
     assert not any(section.startswith("## Memory Registry") for section in volatile)
-    assert registry_digest.startswith("## Memory Registry (what I know / don't know)")
+    assert registry.startswith("## Memory Registry (what I know / don't know)")
     assert any(section.startswith("## Identity") for section in all_sections)
     assert any(section.startswith("## Scratchpad") for section in all_sections)
 
@@ -266,10 +275,11 @@ def test_llm_round_event_exposes_cache_hit_rate(tmp_path):
     assert llm_round["prompt_cache_ttl"] == "default"
 
 
-def test_llm_round_event_flags_cache_cold_restart_with_gap(tmp_path):
-    """W3 telemetry: a later round that re-wrote (almost) the whole prompt is a
-    cold restart — flagged from the round's own facts, with the gap since the
-    previous successful round. No dollar accumulator (counterfactual)."""
+def test_llm_round_event_records_cache_facts_with_gap_and_no_cold_restart_verdict(tmp_path):
+    """W3 telemetry: each round records its provider-reported cache share and the gap
+    since the previous successful round, the datum that separates a TTL expiry from a
+    prefix rewrite. No verdict is derived from them (a Codex route reports no cache
+    writes, so "cold restart" never fired there) and no dollar accumulator."""
     import json
 
     from ouroboros.loop_llm_call import call_llm_with_retry
@@ -308,9 +318,9 @@ def test_llm_round_event_flags_cache_cold_restart_with_gap(tmp_path):
     ]
     assert [r["round"] for r in rounds] == [1, 2]
     first, second = rounds
-    assert first["cache_cold_restart"] is False  # round 1 always writes; not a RE-start
+    assert (first["cache_hit_rate"], second["cache_hit_rate"]) == (0.9, 0.0)
+    assert "cache_cold_restart" not in first and "cache_cold_restart" not in second
     assert first["gap_since_prev_round_sec"] is None
-    assert second["cache_cold_restart"] is True
     assert isinstance(second["gap_since_prev_round_sec"], float)
     assert second["gap_since_prev_round_sec"] >= 0.0
     # The applied TTL fact is recorded for the wait-tool disclosure to read.
@@ -461,46 +471,78 @@ def test_wait_for_task_appends_cache_horizon_note(tmp_path, monkeypatch):
     )
 
 
-def test_cache_horizon_reachability_matches_the_wait_clamps():
-    """Honest reachability of the wait disclosure, derived from the REAL clamps.
+def test_cache_horizon_reachability_matches_the_wait_clamps(tmp_path, monkeypatch):
+    """Honest reachability of the wait disclosure, measured on BEHAVIOR.
 
-    Each wait tool caps its own window, so the line's availability is per-tool and
-    per-TTL: at the shipped '1h' default only wait_tasks (7200s) can genuinely emit
-    it, wait_task sits exactly on the 3600s horizon and delegate_wait (1800s window
-    max — the wait's REAL clamp since F5a, not the 2100s ToolEntry kill timeout)
-    cannot reach it at all; at '5m' all three do. The stream report advertised it as
-    a live capability of all three at the default — this pin makes the truth loud and
-    fails if a clamp, the ceiling, or the tier scale moves without revisiting it."""
-    import inspect
-    import re
+    The root waits measure their own elapsed window, so their line's availability is
+    per-tool and per-TTL and follows the window each one actually hands the poller: at
+    the shipped '1h' default only wait_tasks (7200s) can genuinely emit it and
+    wait_task sits exactly on the 3600s horizon; at '5m' both do. delegate_wait no
+    longer measures its 3 s tick: its wake measures the time since the task's last
+    model response, so it can emit at ANY tier (pinned in the supervising-wake test
+    below). Fails if a clamp, the ceiling or the tier scale moves without revisiting
+    the disclosure."""
     from types import SimpleNamespace
 
-    from ouroboros.config import DELEGATE_WAIT_WINDOW_MAX_SEC
     from ouroboros.llm import cache_ttl_seconds
     from ouroboros.tools import control_task_results as control_mod
     from ouroboros.tools.control import cache_horizon_note
 
-    def _clamp(fn):
-        found = re.findall(r"min\(int\(timeout_sec\),\s*(\d+)\)", inspect.getsource(fn))
-        assert len(found) == 1, f"{fn.__name__}: expected one timeout clamp, found {found}"
-        return int(found[0])
+    def _clamp(ceiling):
+        # The one window ladder both task waits use, probed without a deadline.
+        window = control_mod._wait_window(SimpleNamespace(), 10**9, clamp=ceiling, minimum=0, margin=30)
+        assert window == (ceiling, "ceiling")
+        return window[0]
 
     ceilings = {
-        "wait_task": _clamp(control_mod._wait_for_task),
-        "wait_tasks": _clamp(control_mod._wait_for_tasks),
-        "delegate_wait": DELEGATE_WAIT_WINDOW_MAX_SEC,
+        "wait_task": _clamp(control_mod._WAIT_TASK_CLAMP_SEC),
+        "wait_tasks": _clamp(control_mod._WAIT_TASKS_CLAMP_SEC),
     }
-    assert ceilings == {"wait_task": 3600, "wait_tasks": 7200, "delegate_wait": 1800}
+    assert ceilings == {"wait_task": 3600, "wait_tasks": 7200}
 
     def _emits(tier, ceiling):
         ctx = SimpleNamespace(_accumulated_usage={"_last_prompt_cache_ttl": tier})
         return bool(cache_horizon_note(ctx, float(ceiling)))
 
     assert cache_ttl_seconds("1h") == 3600 and cache_ttl_seconds("5m") == 300
-    at_1h = {name: _emits("1h", sec) for name, sec in ceilings.items()}
-    assert at_1h == {"wait_task": False, "wait_tasks": True, "delegate_wait": False}
-    at_5m = {name: _emits("5m", sec) for name, sec in ceilings.items()}
-    assert at_5m == {"wait_task": True, "wait_tasks": True, "delegate_wait": True}
+    assert {name: _emits("1h", sec) for name, sec in ceilings.items()} == {
+        "wait_task": False, "wait_tasks": True}
+    assert {name: _emits("5m", sec) for name, sec in ceilings.items()} == {
+        "wait_task": True, "wait_tasks": True}
 
     doc = cache_horizon_note.__doc__ or ""
     assert "REACHABILITY" in doc  # the limitation is stated where the note is built
+
+
+def _response_meta(seconds_ago):
+    import datetime as _dt
+
+    stamp = _dt.datetime.now(tz=_dt.timezone.utc) - _dt.timedelta(seconds=seconds_ago)
+    return {"ts": stamp.isoformat(), "provider": "anthropic", "model": "m"}
+
+
+def test_supervising_wake_horizon_fires_only_past_the_applied_ttl(tmp_path):
+    """delegate_wait's note is computed ONCE per wake from the task's last model
+    response (a lower bound on cache age): it fires past the APPLIED horizon, stays
+    silent below it and on an unknown tier, and a replay repeats the recorded wake."""
+    import json
+    from types import SimpleNamespace
+
+    from ouroboros.delegate_supervision import run_wait
+    from tests._run_wait_shared import wake_now
+
+    def _wake(ttl, seconds_ago):
+        ctx = SimpleNamespace(
+            task_id=f"t-{ttl or 'none'}-{seconds_ago}", task_attempt=1, drive_root=tmp_path,
+            _accumulated_usage={"_last_prompt_cache_ttl": ttl,
+                                "_last_llm_call_meta": _response_meta(seconds_ago)})
+        raw = wake_now(ctx, "run-h", wait_once=lambda *_a: json.dumps(
+            {"status": "completed", "run_id": "run-h", "last_seq": 1})).text
+        return ctx, json.loads(raw)
+
+    _ctx, past = _wake("1h", 3700)
+    assert "1h" in past["cache_horizon_note"] and "may be cold" in past["cache_horizon_note"]
+    assert "cache_horizon_note" not in _wake("1h", 3500)[1]
+    assert "cache_horizon_note" not in _wake("", 10_000)[1]
+    replay = json.loads(run_wait(_ctx, "run-h").text)  # replayed before any sleep is armed or the run read
+    assert replay.pop("replay_of")["fresh_observation"] is False and replay == past  # marked, else as recorded

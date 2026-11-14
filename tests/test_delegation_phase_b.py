@@ -1,12 +1,12 @@
 """Phase B of the delegation-substrate sprint (owner decisions 2A/3A/5A/7A).
 
 B1: the dispatch-time executor note (moved whole to `subagent_dispatch_notes`,
-re-exported by `agent`) conditionally supersedes native-self-execution framing —
-and ONLY on the final post-preflight harness dispatch. B2: the frozen acting
+re-exported by `agent`) speaks only for a configured session row, and ONLY on the
+final post-preflight harness dispatch. B2: the frozen acting
 preamble states the write-root boundary without the "do it yourself" imperative.
-B3: a really-INJECTED finalization nudge is durably stamped by the worker, and a
-COMPLETED harness child with zero delegated runs carries the typed
-`nanny_finalized_after_nudge_without_delegation` substrate disclosure. B4:
+B3: a durable nudge stamp (written by the retired finalization nudge; audit 11.11,
+item 18) still reads back: a COMPLETED session child with zero delegated runs carries
+the typed `nanny_finalized_after_nudge_without_delegation` substrate disclosure. B4:
 `capability_delta` gains typed `reduction_reasons`/`substrate_disclosures` lists
 and `reason` is DERIVED from them at every writer (byte-identical to the old
 hand-splice). B5: `schedule_subagent` descriptions steer objective = outcome,
@@ -14,6 +14,8 @@ context = the delegated run's work order, model_lane = leave auto.
 """
 
 from types import SimpleNamespace
+
+import dataclasses
 
 import pytest
 
@@ -26,7 +28,6 @@ from ouroboros.subagents import (
     SubagentLaneResolution,
     derive_capability_reason,
     envelope_from_task,
-    resolve_subagent_executor,
     _disclose_native_only_substrate,
 )
 
@@ -36,39 +37,32 @@ from ouroboros.subagents import (
 
 def _resolution(executor="harness", reason="harness_ready", route="claude"):
     return SubagentExecutorResolution(
-        requested="auto", executor=executor,
+        requested="harness", executor=executor,
         route=DelegationRoute(route_id=route) if executor == "harness" else None,
         reason=reason,
     )
 
 
-def test_dispatch_note_override_rides_only_the_harness_branch():
+def test_dispatch_note_speaks_only_for_a_configured_session_row():
     from ouroboros.subagent_dispatch_notes import dispatch_executor_note
 
-    note = dispatch_executor_note(_resolution())
-    # The conditional supersede paragraph (owner decision 2A, verbatim wording).
-    assert "superseded by this dispatch" in note
-    assert "WORK ORDER" in note
-    assert "not a script for you to execute natively" in note
-
-    # A native child (the ordinary case) gets no note at all.
-    assert dispatch_executor_note(_resolution("native", "requested_native")) == ""
-
-    # A preflight-DEMOTED child runs native: it gets the metered-unavailable
-    # marker, never the delegation override (it has no delegated run to route to).
-    demoted = dispatch_executor_note(_resolution("native", "delegate_tools_invisible"))
-    assert "METERED API tokens" in demoted
-    assert "superseded by this dispatch" not in demoted
-    assert "WORK ORDER" not in demoted
-
-    # Blocked pins announce through the typed terminal, not this note.
-    assert dispatch_executor_note(_resolution("blocked", "delegate_tools_invisible")) == ""
+    configured = SubagentLaneResolution(
+        requested_lane="auto", effective_lane="main", model="openai/parent",
+        resolved_from="main", provenance="configured_subagent",
+    )
+    assert "configured agent-session route (claude)" in dispatch_executor_note(_resolution(), configured)
+    # Without the row there is no nanny to brief: the retired legacy note (and its
+    # METERED fallback marker) never rides any other dispatch.
+    assert dispatch_executor_note(_resolution(), dataclasses.replace(configured, provenance="inherited")) == ""
+    assert dispatch_executor_note(_resolution()) == ""
+    # A native child (the ordinary case) and a blocked pin get no note at all.
+    assert dispatch_executor_note(_resolution("native", "requested_native"), configured) == ""
+    assert dispatch_executor_note(_resolution("blocked", "delegate_tools_invisible"), configured) == ""
 
 
 def test_configured_nanny_note_states_the_charter_and_defers_truth_to_receipt():
-    # Charter (owner 2026-08-28): the host pre-starts the exact leaf before the
-    # first metered round; the note tells the nanny its rounds are judgment on
-    # wakes, points at the receipt as run truth, and keeps children explicit.
+    # Fresh work pre-starts the leaf; restored work follows its receipt. Both
+    # reserve the nanny's rounds for judgment and keep children explicit.
     from ouroboros.subagent_dispatch_notes import dispatch_executor_note
 
     lane = SubagentLaneResolution(
@@ -76,9 +70,10 @@ def test_configured_nanny_note_states_the_charter_and_defers_truth_to_receipt():
         resolved_from="main", provenance="configured_subagent",
     )
     note = dispatch_executor_note(_resolution(), lane)
-    assert "BEFORE your first metered round" in note
-    assert "startup/wake receipt in this context is the truth" in note
-    assert "metered duplicate" in note
+    assert "For fresh work the host starts the exact leaf before your first round" in note
+    assert "Restored supervision follows its continuation receipt" in note
+    assert "the receipt states custody" in note
+    assert "duplicate of already-paid work" in note
     assert "cancellation and terminal settlement are verified" in note
     assert "explicit separate child" in note
     assert "zero_run_decision=incomplete|unknown" in note
@@ -109,69 +104,34 @@ def test_acting_preamble_states_the_boundary_without_the_native_imperative():
                          "write_root": "/tmp/wt"},
     )
     assert "[WRITE SURFACE]" in text
-    assert "All changes land inside the write root only." in text
-    # The retired imperative framed the child as the native executor of the work.
-    assert "Make all changes" not in text
+    assert "Your changes to the project are captured from the write root: that is where this work's result" in text
+    # The retired imperatives framed the child as the native executor, or sent it only to the write root.
+    assert "Make all changes" not in text and "All changes land inside the write root only." not in text
+    assert "keep them out of it, wherever your tools let you write." in text
     # The rest of the frozen block is intact.
-    assert "Do NOT commit" in text
+    assert "are the parent's steps, not yours." in text
     assert "workspace.patch" in text
 
 
 # ---------------------------------------------------------- B4: derived reason (byte-equality)
 
 
-def _harness_ready(monkeypatch):
-    route = DelegationRoute(route_id="codex")
-    monkeypatch.setattr(
-        subagents, "dispatch_executor_resolution",
-        lambda task: resolve_subagent_executor("auto", route=route),
-    )
-
-
 def test_writer1_resolution_reason_is_derived_and_byte_identical(tmp_path, monkeypatch):
-    # Two dispatch axes at once (the incident shape): a lane slot reduction plus
-    # an exhausted-window executor fallback. The string must be byte-identical
-    # to the historical "; ".join AND derived from the typed list.
+    # Two dispatch axes at once: a lane slot reduction plus a row-less harness pin
+    # no route can honor. The string must be byte-identical to the historical
+    # "; ".join AND derived from the typed list.
     monkeypatch.setenv("OUROBOROS_MODEL", "provider::main")
     monkeypatch.setenv("OUROBOROS_MODEL_HEAVY", "")
-    route = DelegationRoute(route_id="codex")
-    monkeypatch.setattr(
-        subagents, "dispatch_executor_resolution",
-        lambda task: resolve_subagent_executor(
-            "auto", route=route, reset_at="2026-09-01T00:00:00Z"),
-    )
     dispatch = subagents.resolve_subagent_dispatch(
-        {"id": "c1", "type": "task", "requested_model_lane": "heavy"},
+        {"id": "c1", "type": "task", "requested_model_lane": "heavy", "requested_executor": "harness"},
         task_type="task",
     )
     delta = dispatch.delta.as_dict()
     assert delta["reduction_reasons"] == [
-        "lane_slot_unavailable=heavy", "subscription_window_exhausted"]
+        "lane_slot_unavailable=heavy", "harness_not_configured"]
     assert delta["substrate_disclosures"] == []
-    assert delta["reason"] == "lane_slot_unavailable=heavy; subscription_window_exhausted"
+    assert delta["reason"] == "lane_slot_unavailable=heavy; harness_not_configured"
     assert delta["reason"] == derive_capability_reason(delta["reduction_reasons"])
-
-
-def test_writer2_preflight_native_fallback_derives_the_reason(tmp_path, monkeypatch):
-    from ouroboros.agent import preflight_delegate_visibility, resolve_dispatch_axes
-
-    monkeypatch.setenv("OUROBOROS_MODEL", "provider::main")
-    monkeypatch.setenv("OUROBOROS_MODEL_HEAVY", "provider::strong")
-    monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", "provider::cheap")
-    _harness_ready(monkeypatch)
-    task = {"id": "c-fb", "type": "task", "delegation_role": "subagent",
-            "requested_model_lane": "auto", "parent_model_lane": "heavy",
-            "requested_executor": "auto"}
-    dispatch = resolve_dispatch_axes(task)
-    tools = SimpleNamespace(available_tools=lambda: ["read_file"])
-    amended, changed = preflight_delegate_visibility(tools, task, dispatch)
-    assert changed is True
-    delta = amended.delta.as_dict()
-    assert delta["reduction_reasons"][-1] == "delegate_tools_invisible"
-    assert delta["reason"] == derive_capability_reason(delta["reduction_reasons"])
-    assert delta["substrate_disclosures"] == []
-    # Byte-identical to the historical construction on this record too.
-    assert delta["reason"] == "; ".join(delta["reduction_reasons"])
 
 
 def test_writer3_append_reason_derives_on_the_unverified_path(monkeypatch):
@@ -182,10 +142,10 @@ def test_writer3_append_reason_derives_on_the_unverified_path(monkeypatch):
     dispatch = SubagentDispatch(
         lane=lane, effort="low", executor="harness", route="claude",
         profile="local_readonly_subagent",
-        delta=CapabilityDelta(requested_executor="auto", effective_executor="harness"),
+        delta=CapabilityDelta(requested_executor="harness", effective_executor="harness"),
         executor_resolution=_resolution(),
     )
-    task = {"id": "c1", "delegation_role": "subagent", "requested_executor": "auto",
+    task = {"id": "c1", "delegation_role": "subagent", "requested_executor": "harness",
             "effective_executor": "harness", "executor_route": "claude"}
 
     def _boom():
@@ -193,7 +153,7 @@ def test_writer3_append_reason_derives_on_the_unverified_path(monkeypatch):
 
     amended, changed = preflight_delegate_visibility(
         SimpleNamespace(available_tools=_boom), task, dispatch)
-    assert changed is True
+    assert changed is True and amended.executor == "blocked"
     delta = amended.delta.as_dict()
     assert delta["reduction_reasons"] == ["delegate_visibility_unverified"]
     assert delta["reason"] == "delegate_visibility_unverified"
@@ -270,7 +230,7 @@ def test_prompt_block_directs_harness_children_through_the_delegated_run():
     assert "delegated run" not in native
 
 
-# ---------------------------------------------------------- B3: nudge stamp end-to-end
+# ---------------------------------------------------------- B3: the nudge stamp's reader
 
 
 def _drive(tmp_path):
@@ -282,10 +242,18 @@ def _stamp_ctx(drive):
     return SimpleNamespace(task_metadata={"budget_drive_root": str(drive)})
 
 
+def record_nanny_nudge_stamp(ctx, task_id, nanny_code):
+    """A stamp row as the retired loop writer recorded it: the reader keeps such rows legible."""
+    from ouroboros import delegate_custody as custody
+    from ouroboros.delegate_evidence import NANNY_NUDGE_STAMP
+
+    custody.emit(custody.custody_root(ctx), NANNY_NUDGE_STAMP, {"task_id": task_id, "nanny_code": nanny_code})
+
+
 def _harness_task(drive, **extra):
     return {
         "id": "child-1", "delegation_role": "subagent",
-        "requested_executor": "auto", "effective_executor": "harness",
+        "requested_executor": "harness", "effective_executor": "harness",
         "executor_route": "claude", "budget_drive_root": str(drive),
         "capability_delta": {"reduced": False, "reason": "",
                              "reduction_reasons": [], "substrate_disclosures": []},
@@ -293,57 +261,10 @@ def _harness_task(drive, **extra):
     }
 
 
-def test_loop_injection_writes_the_durable_stamp(tmp_path):
-    import json
-
-    from ouroboros import delegate_custody as custody
-    from ouroboros.delegate_evidence import NANNY_NUDGE_STAMP
-    from ouroboros.loop import _maybe_inject_finalization_nudges
-
-    drive = _drive(tmp_path)
-    ctx = SimpleNamespace(
-        _nanny_route_dispatched=True, _nanny_finalization_injected=False,
-        task_metadata={"budget_drive_root": str(drive)},
-    )
-    tools = SimpleNamespace(_ctx=ctx, available_tools=lambda: ["delegate_start"])
-    msgs: list = []
-    assert _maybe_inject_finalization_nudges(
-        tools, drive, "child-1",
-        {"reasoning_notes": [], "tool_calls": []}, "done", msgs, lambda *_: None,
-    ) is True
-    rows = [json.loads(line) for line in
-            (drive / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()]
-    stamps = [r for r in rows if r.get("type") == NANNY_NUDGE_STAMP]
-    assert stamps and stamps[0]["task_id"] == "child-1"
-    assert stamps[0]["nanny_code"] == "NANNY_DID_NOT_DELEGATE"
-    assert custody.task_execution_evidence(drive, "child-1")["nanny_nudge_recorded"] is True
-
-
-def test_suppressed_nudge_writes_no_stamp(tmp_path):
-    # Verbs policy-hidden: the ctx flag is still latched, the message is empty,
-    # and NO stamp lands — the flag can never impersonate a fired nudge.
-    from ouroboros import delegate_custody as custody
-    from ouroboros.loop import _maybe_inject_finalization_nudges
-
-    drive = _drive(tmp_path)
-    ctx = SimpleNamespace(
-        _nanny_route_dispatched=True, _nanny_finalization_injected=False,
-        task_metadata={"budget_drive_root": str(drive)},
-    )
-    tools = SimpleNamespace(_ctx=ctx, available_tools=lambda: ["read_file"])
-    assert _maybe_inject_finalization_nudges(
-        tools, drive, "child-1",
-        {"reasoning_notes": [], "tool_calls": []}, "done", [], lambda *_: None,
-    ) is False
-    assert ctx._nanny_finalization_injected is True  # the flag alone is not the signal
-    assert custody.task_execution_evidence(drive, "child-1")["nanny_nudge_recorded"] is False
-
-
 def test_nudge_fact_rides_only_completed_native_only_envelopes(tmp_path):
-    from ouroboros.delegate_evidence import record_nanny_nudge_stamp
 
     drive = _drive(tmp_path)
-    record_nanny_nudge_stamp(_stamp_ctx(drive), "child-1", "NANNY_DID_NOT_DELEGATE")
+    record_nanny_nudge_stamp(_stamp_ctx(drive), "child-1", "CONFIGURED_ACTOR_INCOMPLETE")
 
     # Nudge fired + zero starts + completed -> the typed fact rides the envelope.
     envelope = envelope_from_task(_harness_task(drive), status="completed")
@@ -369,11 +290,11 @@ def test_a_refused_attempt_after_the_nudge_is_never_an_accusation(tmp_path):
     attempt shapes count: the pre-mint typed blocker row and a request row
     whose POST then died."""
     from ouroboros import delegate_custody as custody
-    from ouroboros.delegate_evidence import record_nanny_nudge_stamp, record_start_blocked
+    from ouroboros.delegate_evidence import record_start_blocked
 
     # Shape 1: typed route_health blocker before any invocation was minted.
     drive = _drive(tmp_path / "blocked")
-    record_nanny_nudge_stamp(_stamp_ctx(drive), "child-1", "NANNY_DID_NOT_DELEGATE")
+    record_nanny_nudge_stamp(_stamp_ctx(drive), "child-1", "CONFIGURED_ACTOR_INCOMPLETE")
     record_start_blocked(_stamp_ctx(drive), "child-1", "route_status_unavailable")
     evidence = custody.task_execution_evidence(drive, "child-1")
     assert evidence["delegate_start_attempted"] is True
@@ -385,7 +306,7 @@ def test_a_refused_attempt_after_the_nudge_is_never_an_accusation(tmp_path):
 
     # Shape 2: the durable request row landed, the POST failed, nothing started.
     drive2 = _drive(tmp_path / "requested")
-    record_nanny_nudge_stamp(_stamp_ctx(drive2), "child-1", "NANNY_DID_NOT_DELEGATE")
+    record_nanny_nudge_stamp(_stamp_ctx(drive2), "child-1", "CONFIGURED_ACTOR_INCOMPLETE")
     assert custody.emit(drive2, custody.START_REQUESTED, {
         "task_id": "child-1", "invocation_id": "inv-1", "route": "claude",
         "request": {"prompt": "x"}})
@@ -395,7 +316,7 @@ def test_a_refused_attempt_after_the_nudge_is_never_an_accusation(tmp_path):
 
     # A truly idle nanny (stamp, zero attempts) is still disclosed.
     idle = _drive(tmp_path / "idle")
-    record_nanny_nudge_stamp(_stamp_ctx(idle), "child-1", "NANNY_DID_NOT_DELEGATE")
+    record_nanny_nudge_stamp(_stamp_ctx(idle), "child-1", "CONFIGURED_ACTOR_INCOMPLETE")
     envelope3 = envelope_from_task(_harness_task(idle), status="completed")
     assert ("nanny_finalized_after_nudge_without_delegation"
             in envelope3["capability_delta"]["substrate_disclosures"])
@@ -403,7 +324,6 @@ def test_a_refused_attempt_after_the_nudge_is_never_an_accusation(tmp_path):
 
 def test_nudge_fact_absent_when_delegation_happened_or_nudge_never_fired(tmp_path):
     from ouroboros import delegate_custody as custody
-    from ouroboros.delegate_evidence import record_nanny_nudge_stamp
 
     # Delegation happened (a run started): not native_only, no amendment at all.
     drive = _drive(tmp_path / "ran")

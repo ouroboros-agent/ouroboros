@@ -4,6 +4,9 @@ This module is deliberately pure: it owns the JSON transport shape, validates
 the one authoritative GitHub pull-request receipt, and applies the
 ``skill_publish`` objective veto over pre-truncation trace metadata.  It does
 not perform I/O, GitHub calls, scanning, retries, or task-contract mutation.
+A failed envelope names the failed stage (``reason_code``), a ``repair_hint``
+and the transport's sanitized ``error_detail``; one refused for its destination
+also carries ``destination_comparison``.
 """
 
 from __future__ import annotations
@@ -59,12 +62,26 @@ _EFFECT_TEXT_LIMITS = {
     "commit_url": 360,
     "mode": 32,
 }
+# The destination comparison (skill_publish_destination.DestinationComparison.projection): its first rows
+# of each kind ride in the envelope, the rest are counted; its artifact names them all.
+_COMPARISON_STATES = frozenset({"clear", "decision_required", "decided"})
+_COMPARISON_BASE_REASONS = frozenset({
+    "install_record", "no_install_record", "base_unknown", "installed_elsewhere", "base_unreadable"})
+_COMPARISON_ROW_KINDS = {
+    "paths": ("path", "effect", frozenset({"replaced", "deleted", "added"})),
+    "fields": ("field", "change", frozenset({"replaced", "removed", "added"})),
+}
+_COMPARISON_UPSTREAM = frozenset({"changed_since_base", "unchanged_since_base", "unknown"})
+_COMPARISON_ROW_LIMIT = 20
+_OBJECT_ID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 
 
 class SkillPublishDestinationError(ValueError):
-    """Closed failure for an unsupported configured Hub catalog URL."""
+    """Closed failure for a destination this install cannot publish to (the reason is the message)."""
 
-    reason_code = "hub_destination_invalid"
+    def __init__(self, reason_code: str = "hub_destination_invalid") -> None:
+        super().__init__(reason_code)
+        self.reason_code = reason_code
 
 
 def parse_skill_publish_destination(catalog_url: str) -> tuple[str, str, str]:
@@ -264,6 +281,55 @@ def _normalize_effects(
     return normalized
 
 
+def _normalize_destination_comparison(value: Mapping[str, Any] | None) -> Dict[str, Any] | None:
+    """Validate the comparison's typed shape and bound its rows, counting the ones left out."""
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("destination_comparison must be a JSON object")
+
+    def choice(key: str, allowed: frozenset[str], row: Mapping[str, Any] = value) -> str:
+        text = _bounded_text(row.get(key), 64, required=True)
+        if text not in allowed:
+            raise ValueError(f"invalid destination comparison {key}")
+        return text
+
+    def object_id(key: str, *, required: bool) -> str:
+        text = _bounded_text(value.get(key), 65).lower()
+        if (text or required) and not _OBJECT_ID_RE.fullmatch(text):
+            raise ValueError(f"invalid destination comparison {key}")
+        return text
+
+    result: Dict[str, Any] = {
+        "state": choice("state", _COMPARISON_STATES),
+        "destination_state": _normalized_hash(value.get("destination_state"), required=True),
+        "head_commit": object_id("head_commit", required=True),
+        "base_commit": object_id("base_commit", required=False),
+        "base_reason": choice("base_reason", _COMPARISON_BASE_REASONS),
+        "base_version": _bounded_text(value.get("base_version"), 80),
+        "metadata_path": _bounded_text(value.get("metadata_path"), 240),
+    }
+    for kind, (name, change, changes) in _COMPARISON_ROW_KINDS.items():
+        rows = value.get(kind) or []
+        if isinstance(rows, (str, bytes)) or not isinstance(rows, Sequence) or not all(
+                isinstance(row, Mapping) for row in rows):
+            raise ValueError(f"destination comparison {kind} must be a list of objects")
+        result[kind] = [{name: _bounded_text(row.get(name), 240, required=True), change: choice(change, changes, row),
+                         "upstream": choice("upstream", _COMPARISON_UPSTREAM, row)}
+                        for row in rows[:_COMPARISON_ROW_LIMIT]]
+        result[f"omitted_{kind}"] = max(0, len(rows) - _COMPARISON_ROW_LIMIT)
+    artifact = value.get("artifact")
+    if artifact is not None:
+        if not isinstance(artifact, Mapping) or artifact.get("root") != "artifact_store":
+            raise ValueError("destination comparison artifact must be an artifact_store file")
+        result["artifact"] = {"root": "artifact_store", "path": _bounded_text(artifact.get("path"), 240, required=True),
+                              "sha256": _normalized_hash(artifact.get("sha256"), required=True),
+                              "bytes": _nonnegative_int(artifact.get("bytes"), field="bytes")}
+    if value.get("artifact_error"):
+        result["artifact_error"] = _bounded_text(value.get("artifact_error"), 300)
+    return result
+
+
 def validate_skill_publish_receipt(
     receipt: Mapping[str, Any] | None,
     *,
@@ -362,6 +428,7 @@ def serialize_skill_publish_result(
     receipt: Mapping[str, Any] | None = None,
     expected_repository: str = "",
     extra_fields: Mapping[str, Any] | None = None,
+    destination_comparison: Mapping[str, Any] | None = None,
 ) -> str:
     """Serialize one parseable envelope below the real tool-result cap.
 
@@ -369,7 +436,9 @@ def serialize_skill_publish_result(
     cap loop, so late annotations (e.g. the publication-receipt write
     outcome) participate in the findings-trimming discipline instead of
     growing an already-fitted envelope past the cap. Keys must be new,
-    string-named, and JSON-primitive-valued.
+    string-named, and JSON-primitive-valued. ``destination_comparison`` is
+    the one typed object beside them: what the publication would change at
+    its destination, bounded (``_normalize_destination_comparison``).
     """
 
     if type(ok) is not bool:
@@ -428,6 +497,9 @@ def serialize_skill_publish_result(
     }
     if safe_receipt is not None:
         envelope["receipt"] = safe_receipt
+    comparison = _normalize_destination_comparison(destination_comparison)
+    if comparison is not None:
+        envelope["destination_comparison"] = comparison
 
     if extra_fields:
         for raw_key, raw_value in extra_fields.items():
@@ -447,9 +519,14 @@ def serialize_skill_publish_result(
             if not isinstance(parsed, dict):
                 raise AssertionError("skill publish result stopped being a JSON object")
             return encoded
-        if not envelope["findings"]:
+        if envelope["findings"]:
+            envelope["findings"].pop()
+            continue
+        kind = next((key for key in _COMPARISON_ROW_KINDS if comparison and comparison[key]), None)
+        if kind is None:
             raise ValueError("skill publish result fixed fields exceed the transport limit")
-        envelope["findings"].pop()
+        comparison[kind].pop()
+        comparison[f"omitted_{kind}"] += 1
 
 
 def extract_skill_publish_result_metadata(result: Any) -> Dict[str, Any]:
@@ -504,9 +581,19 @@ def extract_skill_publish_result_metadata(result: Any) -> Dict[str, Any]:
         for key, limit in (
             ("scanner_status", 32), ("scanner_errors", 2400), ("review_status", 80),
             ("review_profile", 80), ("reviewed_content_hash", 64), ("review_record", 1024),
+            # Where the files went and what lists them are separate facts of one publication.
+            ("destination_kind", 16), ("destination_source", 80), ("destination_folder", 240),
+            ("files_published", 32), ("listed", 32), ("merged_commit", 64), ("release_digest", 64),
+            # The mind's decision to publish over destination content its base does not explain.
+            ("replacement_rationale", 2000),
         ):
             if key in payload:
                 attempt[key] = _bounded_text(payload[key], limit)
+        comparison = payload.get("destination_comparison")
+        if isinstance(comparison, Mapping) and comparison.get("state") in _COMPARISON_STATES:
+            attempt["destination_comparison"] = comparison["state"]
+            if _HASH_RE.fullmatch(str(comparison.get("destination_state") or "")):
+                attempt["destination_state"] = str(comparison["destination_state"]).lower()
         metadata: Dict[str, Any] = {"skill_publish_attempt": attempt}
         receipt = payload.get("receipt")
         valid_receipt = validate_skill_publish_receipt(
@@ -580,9 +667,9 @@ def apply_skill_publish_receipt_veto(
                     saw_attempt = True
                 if not isinstance(attempt, Mapping) or attempt.get("skill") == target["skill"]:
                     # completed_stage is LAST CONFIRMED, never proof that the next
-                    # request was not sent. Branch creation can follow fork_ready
-                    # directly (publishing to one's own repository), or fork_synced.
-                    # A typed fork-sync failure is before that call on either path.
+                    # request was not sent. Branch creation follows fork_ready; a fork is
+                    # synchronized only after GitHub refused that branch (422), so a typed
+                    # fork-sync failure still leaves no branch on either path.
                     stage = attempt.get("completed_stage", "") if isinstance(attempt, Mapping) else None
                     pre_branch_failures.append(
                         isinstance(attempt, Mapping)
@@ -638,12 +725,12 @@ def apply_skill_publish_receipt_veto(
     objective.update(
         {
             "status": "fail",
-            # Keep the existing objective-authority source vocabulary: the receipt is
-            # a veto over an acceptance result, not a second positive oracle.  The
-            # normalizer intentionally rejects every positive/negative objective whose
-            # source is not task_acceptance_review, so the host veto is carried as a
-            # typed negative fact alongside that source rather than minting authority.
-            "source": "task_acceptance_review",
+            # Keep the objective-authority source vocabulary: the receipt is a veto over
+            # the reviewed result, not a second positive oracle. The normalizer rejects
+            # every objective whose source is not a review's (``result_review``, or a
+            # recorded task acceptance on older records), so the host veto is carried as
+            # a typed negative fact under that source rather than minting authority.
+            "source": "result_review",
             "outcome_tier": "blocked_with_evidence",
             "reason": reason,
             "receipt_veto": {

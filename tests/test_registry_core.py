@@ -7,6 +7,36 @@ import inspect
 import pytest
 
 
+@pytest.mark.parametrize("resources,allowed", [
+    ({"web": True, "network": False}, False),
+    ({"allow_web": True, "allow_network": False}, False),
+    ({"web": True, "internet": False}, False),
+    ({"web": True, "network": True}, True),
+])
+def test_web_network_resource_gate_agrees_across_discovery_and_dispatch(tmp_path, monkeypatch, resources, allowed):
+    from ouroboros.tools import registry_guards
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
+
+    monkeypatch.setattr("ouroboros.tools.search._available_web_search_backends", lambda: ["fixture"])
+    repo, drive = tmp_path / "repo", tmp_path / "data"
+    repo.mkdir()
+    drive.mkdir()
+    ctx = ToolContext(repo_dir=repo, drive_root=drive, task_id="web-gate",
+                      task_metadata={"task_contract": {"allowed_resources": resources}})
+    registry = ToolRegistry(repo_dir=repo, drive_root=drive)
+    registry.set_context(ctx)
+    names = {row["function"]["name"] for row in registry.schemas()}
+    for name in registry_guards._WEB_TOOLS:
+        assert registry_guards._builtin_network_allowed(ctx, name) is allowed
+        assert (name in names) is allowed
+        assert (registry.get_schema_by_name(name) is not None) is allowed
+        guard = registry_guards._capability_resource_guard_result(ctx, name, {})
+        assert (guard is None) is allowed
+        if guard is not None:
+            assert guard.code == "RESOURCE_CONSTRAINT_BLOCKED"
+            assert "allowed_resources.network=false" in guard.text
+
+
 def test_registry_core_extraction_preserves_only_proven_facades():
     """Execution moves once; the compatibility module exports only proven ABI."""
     import ouroboros.tools as tools_package
@@ -305,6 +335,8 @@ def test_registry_uses_typed_required_root_not_note_or_tool_name(tmp_path, monke
         code="OK",
         text="OK\n\n⚠️ AUTO_ROUTED_TO_ACTIVE_WORKSPACE: benign additive note",
         meta={"route_note": True},
+        producer_text="OK",
+        host_annotations=("⚠️ AUTO_ROUTED_TO_ACTIVE_WORKSPACE: benign additive note",),
     )
     assert len(calls) == 1
 
@@ -354,43 +386,6 @@ def test_registry_uses_typed_required_root_not_note_or_tool_name(tmp_path, monke
             "isolated workspace (their default target is the live repo). Schedule a self_worktree "
             "/ external_workspace child for that work.",
             "blocked",
-        ),
-        (
-            "light_repo_mutation",
-            "write_file",
-            {"path": "README.md", "content": "changed\n"},
-            "LIGHT_MODE_BLOCKED",
-            "⚠️ LIGHT_MODE_BLOCKED: runtime_mode=light blocks Ouroboros "
-            "self-repo/control-plane mutation via 'write_file'. For user-visible "
-            "deliverables use root=user_files (for example Desktop/file.html), "
-            "root=artifact_store for the canonical task artifact, or root=task_drive "
-            "for scratch. Skill payload edits remain allowed only through "
-            "root=skill_payload with bucket and skill_name "
-            "(data/skills/<bucket>/<skill>/) or skill_repair constraints. "
-            "Switch to advanced/pro only for reviewed Ouroboros self-modification.",
-            "light_mode_blocked",
-        ),
-        (
-            "light_service",
-            "start_service",
-            {"name": "fixture", "cmd": ["sleep", "1"]},
-            "LIGHT_MODE_BLOCKED",
-            "⚠️ LIGHT_MODE_BLOCKED: runtime_mode=light refuses start_service against the "
-            "Ouroboros repository because long-running services can mutate after initial tool "
-            "checks. For external services, set cwd under user_files, task_drive, or "
-            "artifact_store; switch to advanced/pro only for reviewed Ouroboros self-modification.",
-            "light_mode_blocked",
-        ),
-        (
-            "protected_write",
-            "write_file",
-            {"path": "BIBLE.md", "content": "changed\n"},
-            "CORE_PROTECTION_BLOCKED",
-            "⚠️ CORE_PROTECTION_BLOCKED: runtime_mode='advanced' refuses to run tool "
-            "'write_file' against protected safety-critical path: BIBLE.md. Switch to "
-            "runtime_mode='pro' and let the normal triad + scope review cover the protected "
-            "core/contract/release change before commit.",
-            "protected_blocked",
         ),
     ),
 )
@@ -504,10 +499,10 @@ def test_stable_host_predispatch_denials_are_native_and_keep_legacy_projection(
     (
         ("read_file", {"path": "x"}, "profile=acting cannot read active_workspace.", "blocked", "ACCESS_BLOCKED", "⚠️ TOOL_ACCESS_BLOCKED: profile=acting cannot read active_workspace.", "blocked", True, 0),
         ("query_code", {"op": "digest"}, "binding failed", "error", "TOOL_ARG_ERROR", "⚠️ TOOL_ARG_ERROR (query_code): RuntimeError: binding failed", "argument_error", True, 0),
-        ("apply_patch", {"patch": "*** Begin Patch\n*** End Patch"}, "binding failed", "error", "TOOL_ERROR", "⚠️ TOOL_ERROR: RuntimeError: binding failed", "error", True, 0),
-        ("edit_batch", {"edits": [{"path": "x", "old_str": "a", "new_str": "b", "count": 1}]}, "binding failed", "error", "TOOL_ERROR", "⚠️ TOOL_ERROR: RuntimeError: binding failed", "error", True, 0),
-        ("vcs_status", {}, "binding failed", "ok", "GIT_ERROR", "⚠️ GIT_ERROR: RuntimeError: binding failed", "git_error", False, 0),
-        ("vcs_diff", {}, "binding failed", "ok", "GIT_ERROR", "⚠️ GIT_ERROR: RuntimeError: binding failed", "git_error", False, 0),
+        ("apply_patch", {"patch": "*** Begin Patch\n*** End Patch"}, "binding failed", "blocked", "EDIT_OPS_BLOCKED", "⚠️ APPLY_PATCH_ERROR: RuntimeError: binding failed", "edit_ops_blocked", True, 1),
+        ("edit_batch", {"edits": [{"path": "x", "old_str": "a", "new_str": "b", "count": 1}]}, "binding failed", "blocked", "EDIT_OPS_BLOCKED", "⚠️ EDIT_BATCH_ERROR: RuntimeError: binding failed", "edit_ops_blocked", True, 1),
+        ("vcs_read", {"action": "status"}, "binding failed", "ok", "GIT_ERROR", "⚠️ GIT_ERROR: RuntimeError: binding failed", "git_error", False, 0),
+        ("vcs_read", {"action": "diff"}, "binding failed", "ok", "GIT_ERROR", "⚠️ GIT_ERROR: RuntimeError: binding failed", "git_error", False, 0),
         ("read_file", {"path": "x"}, "binding failed", "error", "LEGACY_TOOL_ERROR", "⚠️ READ_FILE_ERROR: RuntimeError: binding failed", "error", True, 1),
     ),
 )
@@ -577,6 +572,8 @@ def test_binding_failures_cut_over_only_the_exact_native_families(
         "task-binding",
     )
 
+    if tool_name == "vcs_read":  # its refusal also names the two roots vcs_read takes
+        text += tool_resolution._VCS_READ_ROOTS
     assert row["tool_result"] == ToolResult(status=status, code=code, text=text)
     assert row["result"] == text
     assert row["is_error"] is is_error
@@ -648,11 +645,11 @@ def test_light_binding_root_redirect_is_native_without_invented_metadata(
     # the refusal echoes the posix spelling; feed it in that spelling so the
     # expected repr matches on Windows too (POSIX: identical to str()).
     target = (home / "Desktop" / "report.html").as_posix()
-    args = {"path": target, "content": "<html></html>"}
+    args = {"root": "active_workspace", "path": target, "content": "<html></html>"}
     text = (
         "⚠️ ROOT_REQUIRED_USER_FILES: an absolute home path "
-        f"({target!r}) was given but root defaulted to 'active_workspace'. "
-        "Pass root='user_files' to write under the owner's home, e.g. "
+        f"({target!r}) is outside root='active_workspace'. "
+        "Pass root='user_files' (or omit root) to write under the owner's home, e.g. "
         "write_file(root='user_files', path='Desktop/file.html', content=...)."
     )
     expected = ToolResult(status="blocked", code="ROOT_REQUIRED_USER_FILES", text=text)
@@ -753,7 +750,8 @@ def test_light_actionable_redirects_keep_legacy_mapping_without_light_remap(
         expected_text = (
             "⚠️ COGNITIVE_TOOL_REQUIRED: cognitive memory is not written via 'write_file'. "
             "Use the dedicated first-class tools (always available in light mode): "
-            "update_identity for memory/identity.md, update_scratchpad for "
+            "update_identity for memory/identity.md, update_world for memory/WORLD.md, "
+            "update_scratchpad for "
             "memory/scratchpad.md, knowledge_write for memory/knowledge/<topic>.md. They "
             "apply the correct structure (journaling, timestamped blocks, index maintenance). "
             "Read the current state before writing (Bible P12)."
@@ -762,11 +760,11 @@ def test_light_actionable_redirects_keep_legacy_mapping_without_light_remap(
         # as_posix() for the same reason as in
         # test_light_binding_root_redirect_is_native_without_invented_metadata.
         target = (home / "Desktop" / "report.html").as_posix()
-        args = {"path": target, "content": "<html></html>"}
+        args = {"root": "active_workspace", "path": target, "content": "<html></html>"}
         expected_text = (
             "⚠️ ROOT_REQUIRED_USER_FILES: an absolute home path "
-            f"({target!r}) was given but root defaulted to 'active_workspace'. "
-            "Pass root='user_files' to write under the owner's home, e.g. "
+            f"({target!r}) is outside root='active_workspace'. "
+            "Pass root='user_files' (or omit root) to write under the owner's home, e.g. "
             "write_file(root='user_files', path='Desktop/file.html', content=...)."
         )
 

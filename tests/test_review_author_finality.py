@@ -94,102 +94,6 @@ def test_skill_review_state_round_trips_current_hash_author_finish(tmp_path):
     assert loaded.to_dict()["author_disposition"]["disposition"] == "partial"
 
 
-def test_predeclared_stance_cannot_hide_the_first_feedback(monkeypatch, tmp_path):
-    from types import SimpleNamespace
-    import ouroboros.loop as loop_mod
-    from ouroboros.loop_acceptance_review import _apply_task_acceptance_result
-    from ouroboros.review_substrate import ReviewRunResult
-
-    monkeypatch.setattr(loop_mod, "get_review_enforcement", lambda: "advisory")
-    monkeypatch.setattr(loop_mod, "_end_task_acceptance_fence", lambda *_a, **_k: True)
-    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "3")
-    tools_ctx = SimpleNamespace(_task_acceptance_reviewed=False)
-    ctx = loop_mod._TaskAcceptanceContext(
-        tools=SimpleNamespace(_ctx=tools_ctx), content="initial answer", task_id="t", task_type="task",
-        llm_trace={"tool_calls": [], "acceptance_decision": {
-            "agent_disposition": "rejected", "agent_rationale": "Premature declaration.",
-        }}, drive_root=None, messages=[], emit_progress=lambda *_a, **_k: None,
-        mode="required", subtree_statuses=[], budget_profile={"max_improvement_passes": 3},
-        passes_done=0, review_binding={"binding_hash": "first-binding"},
-    )
-    result = ReviewRunResult(
-        request={"surface": "task_acceptance", "policy": {"min_successful_slots": 1}},
-        actors=[{"slot_id": "s0", "signal": "FAIL", "parsed": {
-            "verdict": "FAIL", "outcome_tier": "best_effort", "completion_coach": "Fix the output.",
-        }}], parsed_findings=[], aggregate_signal="FAIL",
-    )
-    assert _apply_task_acceptance_result(ctx, result) is True
-    assert ctx.llm_trace["acceptance_decision"]["reason"] == "improvement_capsule"
-    assert ctx.llm_trace["review_runs"][-1]["feedback_offered"]
-    assert not ctx.llm_trace["review_runs"][-1].get("feedback_delivered")
-    assert ctx.messages and "Fix the output" in ctx.messages[-1]["content"]
-    assert not tools_ctx._task_acceptance_reviewed
-
-
-@pytest.mark.parametrize("change", ["none", "owner", "evidence", "tools", "blocking", "ordinary_evidence", "late_service"])
-def test_post_review_finish_handles_revised_answer_without_another_panel(monkeypatch, tmp_path, change):
-    from types import SimpleNamespace
-    import ouroboros.loop as loop_mod
-    import ouroboros.loop_acceptance_review as review
-    from ouroboros.loop_acceptance import merge_agent_acceptance_stance, _set_acceptance_decision
-    from ouroboros.review_substrate import ReviewRunResult
-    from tests.test_loop_acceptance_gate import _seed_acceptance_root
-
-    monkeypatch.setattr(loop_mod, "get_task_review_mode", lambda: "required")
-    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "3")
-    enforcement = {"value": "advisory"}
-    monkeypatch.setattr(loop_mod, "get_review_enforcement", lambda: enforcement["value"])
-    tools_ctx = SimpleNamespace(_task_acceptance_reviewed=False, is_direct_chat=False,
-                               drive_root=str(tmp_path), _owner_directives=[])
-    _seed_acceptance_root(tmp_path, "author-root", tools_ctx)
-    tools = SimpleNamespace(_ctx=tools_ctx)
-    trace = {"tool_calls": [{"tool": "write_file", "args": {"path": "answer.txt"}}]}
-    messages = [{"role": "user", "content": "Solve the task."}]
-    calls = []
-    def panel(ctx):
-        calls.append(ctx.content)
-        return ReviewRunResult(
-            request={"surface": "task_acceptance", "policy": {"min_successful_slots": 1}},
-            actors=[{"slot_id": "critic", "signal": "FAIL", "parsed": {
-                "verdict": "FAIL", "outcome_tier": "best_effort", "completion_coach": "Fix the output.",
-            }}], parsed_findings=[], aggregate_signal="FAIL",
-        )
-    monkeypatch.setattr(loop_mod, "_execute_task_acceptance_panel", panel)
-    run = lambda text: review._run_task_acceptance_review_once(
-        tools=tools, content=text, task_id="author-root", task_type="task", llm_trace=trace,
-        drive_root=tmp_path, messages=messages, emit_progress=lambda *_a, **_k: None,
-    )
-    assert run("initial answer") is True
-    critic_hash = trace["review_runs"][-1]["binding_hash"]
-    from ouroboros.acceptance_settlement import expose_acceptance_feedback
-    expose_acceptance_feedback(trace, messages, "author-root")
-    trace["tool_calls"].append({"tool": "task_acceptance_review", "args": {}})
-    merge_agent_acceptance_stance(trace, {"disposition": "partial", "explicit_finish": change != "ordinary_evidence", "rationale": "I fixed the material issue."}, tools_ctx)
-    if change in {"owner", "evidence"}:
-        _set_acceptance_decision(trace, {"status": "revision_requested",
-                                        "reason": "owner_followup" if change == "owner" else "evidence_refresh"})
-    elif change == "tools":
-        trace["tool_calls"].append({"tool": "write_file", "args": {"path": "later.txt"}})
-    elif change == "blocking":
-        enforcement["value"] = "blocking"
-    elif change == "late_service":
-        trace["verification_events"] = [{"kind": "service_finalization_error",
-            "services": [{"service_id": "service", "artifact_output_failed": True}]}]
-    run("verified revised answer")
-    if change == "none":
-        assert calls == ["initial answer"]
-        decision = trace["acceptance_decision"]
-        assert decision["reason"] == "author_finish"
-        assert decision["status"] == "finalized_unaccepted"
-        assert decision["reviewer_binding_hash"] == critic_hash
-        assert decision["author_disposition"]["subject_hash"] != critic_hash
-        assert trace["review_runs"][0]["aggregate_signal"] == "FAIL"
-        assert trace["review_runs"][0]["applied_decision"]["reason"] == "improvement_capsule"
-    else:
-        assert len(calls) == 2
-        assert trace["acceptance_decision"]["reason"] != "author_finish"
-
-
 def test_skill_author_finish_uses_existing_review_without_dispatch_same_hash(
     monkeypatch, tmp_path,
 ):
@@ -206,7 +110,6 @@ def test_skill_author_finish_uses_existing_review_without_dispatch_same_hash(
         base_path=skill_dir, target_path=skill_dir, source="test",
         skill_name="demo", state_drive_root=tmp_path,
     )
-    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "advisory")
     monkeypatch.setattr(skill_exec_mod, "build_resolved_resource_binding", lambda *a, **k: binding)
     monkeypatch.setattr(skill_exec_mod, "_skill_tool_preflight", lambda *a, **k: "")
     prior_hash = compute_content_hash(skill_dir)
@@ -247,7 +150,6 @@ def test_skill_author_finish_binds_changed_hash_after_preflight_without_panel(
         base_path=skill_dir, target_path=skill_dir, source="test",
         skill_name="demo", state_drive_root=tmp_path,
     )
-    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "advisory")
     monkeypatch.setattr(skill_exec_mod, "build_resolved_resource_binding", lambda *a, **k: binding)
     monkeypatch.setattr(skill_exec_mod, "_skill_tool_preflight", lambda *a, **k: "")
     old_hash = compute_content_hash(skill_dir)
@@ -274,8 +176,7 @@ def test_skill_author_finish_binds_changed_hash_after_preflight_without_panel(
     assert loaded.is_stale_for(current_hash)
     assert loaded.gate_for(current_hash)["executable_review"]
     assert loaded.gate_for(current_hash)["author_accepted"] is True
-    assert loaded.gate_for(current_hash, enforcement="blocking")["author_accepted"] is False
-    assert loaded.gate_for(current_hash, enforcement="blocking")["executable_review"] is False
+    assert loaded.gate_for("other-bytes")["author_accepted"] is False  # bound to these exact bytes
     assert loaded.author_disposition["subject_hash"] == current_hash
     assert loaded.status == "blockers"
     assert "raw reviewer findings" in out
@@ -299,9 +200,8 @@ def test_ordinary_advisory_commit_does_not_invent_author_finish(tmp_path):
     assert attempts[-1].author_disposition == {}
 
 
-@pytest.mark.parametrize("status", ["clean", "warnings"])
-@pytest.mark.parametrize("kind", ["script", "extension"])
-def test_repeated_skill_finish_preserves_critic_and_independent_blocking(tmp_path, monkeypatch, status, kind):
+@pytest.mark.parametrize(("kind", "status"), [("script", "clean"), ("extension", "warnings")])
+def test_repeated_skill_finish_preserves_critic_evidence_and_runs_the_current_bytes(tmp_path, monkeypatch, status, kind):
     from ouroboros.skill_loader import SkillReviewState, compute_content_hash, load_skill, save_enabled, save_review_state
     from ouroboros.tool_access_types import ResolvedResourceBinding
     from ouroboros.tools import skill_exec
@@ -327,7 +227,6 @@ def test_repeated_skill_finish_preserves_critic_and_independent_blocking(tmp_pat
     save_enabled(ctx.drive_root, "demo", True)
     binding = ResolvedResourceBinding(profile="self_modification", root="skill_payload", operation="review",
         base_path=directory, target_path=directory, source="test", skill_name="demo", state_drive_root=ctx.drive_root)
-    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "advisory")
     for revision in (1, 2):
         changed.write_text(f"print('author-{revision}')\n" if kind == "script" else f"def register(api):\n    value = {revision}\n")
         result = skill_exec._author_finish_existing_skill_review(ctx, binding, "demo",
@@ -347,13 +246,7 @@ def test_repeated_skill_finish_preserves_critic_and_independent_blocking(tmp_pat
             assert f"author-{revision}" in actual["stdout"]
         else:
             assert _extension_runtime_state(loaded, drive_root=ctx.drive_root, skills=[loaded])["desired_live"]
-    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
     loaded = load_skill(directory, ctx.drive_root)
-    assert not loaded.review.gate_for(loaded.content_hash)["executable_review"]
-    if kind == "script":
-        assert "SKILL_EXEC_BLOCKED" in skill_exec._handle_skill_exec(ctx, skill="demo", script="hello.py")
-    else:
-        assert not _extension_runtime_state(loaded, drive_root=ctx.drive_root, skills=[loaded])["desired_live"]
     save_review_state(ctx.drive_root, "demo", SkillReviewState(status="clean", content_hash=loaded.content_hash))
     refreshed = load_skill(directory, ctx.drive_root)
     assert refreshed.review.gate_for(refreshed.content_hash)["executable_review"]

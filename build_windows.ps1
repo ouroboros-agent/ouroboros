@@ -76,6 +76,19 @@ Write-Host "--- Installing agent dependencies into python-standalone ---"
 Invoke-NativeChecked "Agent dependency installation" {
     uv pip install --python "python-standalone\python.exe" -q -r requirements-runtime.lock
 }
+# The source-launcher handoff cannot import the frozen launcher's private PYZ.
+$DesktopRequirements = Join-Path ([IO.Path]::GetTempPath()) "ouroboros-desktop-requirements-$PID.txt"
+try {
+    Invoke-NativeChecked "Desktop dependency export" {
+        uv export --locked --no-dev --extra desktop `
+            --no-emit-project --no-hashes --no-annotate --output-file $DesktopRequirements
+    }
+    Invoke-NativeChecked "Desktop dependency installation" {
+        uv pip install --python "python-standalone\python.exe" -q -r $DesktopRequirements
+    }
+} finally {
+    Remove-Item -Force -ErrorAction SilentlyContinue $DesktopRequirements
+}
 
 Write-Host "--- Fetching exact Claudexor runtime seed ---"
 Invoke-NativeChecked "Claudexor runtime seed fetch" {
@@ -88,34 +101,17 @@ if (Test-Path "dist") { Remove-Item -Recurse -Force "dist" }
 $env:PYINSTALLER_CONFIG_DIR = Join-Path (Get-Location) ".pyinstaller-cache"
 New-Item -ItemType Directory -Force -Path $env:PYINSTALLER_CONFIG_DIR | Out-Null
 
-Write-Host "--- Installing Chromium for browser tools (bundled into python-standalone) ---"
+Write-Host "--- Installing the pinned Chromium for browser tools (bundled into python-standalone) ---"
+# The Chrome for Testing headless shell ouroboros/chromium_runtime.py pins, verified and
+# unpacked without its archive folder, so its longest path stays under the 200-char check.
 $env:PLAYWRIGHT_BROWSERS_PATH = "0"
 Invoke-NativeChecked "Chromium installation" {
-    & "python-standalone\python.exe" -m playwright install --only-shell chromium
+    & "python-standalone\python.exe" -m ouroboros.chromium_runtime install
 }
 
 Write-Host "--- Installing WebKit for mobile-grade browser tools (bundled into python-standalone) ---"
 Invoke-NativeChecked "WebKit installation" {
     & "python-standalone\python.exe" -m playwright install webkit
-}
-
-Write-Host "--- Pruning optional Chromium resources with long Windows paths ---"
-$LocalBrowsers = "python-standalone\Lib\site-packages\playwright\driver\package\.local-browsers"
-if (Test-Path $LocalBrowsers) {
-    Get-ChildItem -Path $LocalBrowsers -Directory -Filter "chromium_headless_shell-*" | ForEach-Object {
-        $ShellRoot = $_.FullName
-        $OptionalPaths = @(
-            "chrome-headless-shell-win64\PrivacySandboxAttestationsPreloaded",
-            "chrome-headless-shell-win64\resources\accessibility\reading_mode_gdocs_helper",
-            "chrome-headless-shell-win64\resources\accessibility\reading_mode_gdocs_helper_manifest.json"
-        )
-        foreach ($Rel in $OptionalPaths) {
-            $Target = Join-Path $ShellRoot $Rel
-            if (Test-Path $Target) {
-                Remove-Item -Recurse -Force $Target
-            }
-        }
-    }
 }
 
 Write-Host "--- Building embedded managed repo bundle ---"
@@ -189,7 +185,10 @@ if ($TooLong) {
 
 Write-Host ""
 Write-Host "=== Creating archive ==="
-Compress-Archive -Path "dist\Ouroboros" -DestinationPath "dist\$ArchiveName" -Force
+# Always the unsigned ZIP; a release tag with a configured certificate signs the
+# executables scripts\windows_signing_catalog.json names and repacks it in the
+# separate windows-sign job.
+& "$PSScriptRoot\scripts\pack_windows_archive.ps1" -PayloadRoot "dist\Ouroboros" -Archive "dist\$ArchiveName"
 
 Write-Host ""
 Write-Host "=== Done ==="

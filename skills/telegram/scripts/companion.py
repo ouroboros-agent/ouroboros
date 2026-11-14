@@ -28,6 +28,7 @@ from cloudflare_tunnel import (
 )
 from sidecar import SidecarSeams, TelegramProxySidecar
 from platform_support import (
+    IS_WINDOWS,
     PlatformSupportError,
     acquire_file_lock,
     path_is_link_or_reparse,
@@ -47,6 +48,7 @@ from telegram_settings import (
     TelegramSettingsError,
     TelegramSettingsObserver,
     miniapp_enabled,
+    telegram_proxy,
 )
 from telegram_menu import (
     TelegramMenuConflictError,
@@ -54,6 +56,7 @@ from telegram_menu import (
     TelegramMenuManager,
     TelegramMenuRejectedError,
     TelegramMenuTransportError,
+    chat_only_owner_chat_id,
     snapshot_owner_chat_id,
 )
 
@@ -62,6 +65,8 @@ _CONFIG_NAME = "runtime_config.json"
 _STATUS_NAME = "status.json"
 _CONFIG_SCHEMA = 2
 _INITIAL_PARENT_PID = os.getppid()
+# The host's ouroboros.process_custody.PARENT_PID_ENV: the spawner's own PID.
+_PARENT_PID_ENV = "OUROBOROS_PARENT_PID"
 _RETRY_BASE_SEC = (1.0, 2.0, 4.0, 8.0, 15.0, 30.0, 60.0)
 _STABLE_READY_RESET_SEC = 300.0
 _CORE_HEALTH_INTERVAL_SEC = 30.0
@@ -103,6 +108,25 @@ def release_singleton(fd: int | None) -> None:
 
 def _pid_alive(pid: int) -> bool:
     return process_alive(pid)
+
+
+def _server_parent_pid() -> int:
+    """The spawning server's PID, or 0 once this companion is already orphaned.
+
+    A bare container server is PID 1, but PID 1 also adopts orphans. A host
+    that names itself settles it on POSIX: the parent captured at import and
+    the current one must both be that PID, so neither init nor a subreaper
+    passes for the server. A legacy host names nobody and PID 1 stays
+    refused; Windows never reparents a child.
+    """
+    parent = _INITIAL_PARENT_PID
+    try:
+        named = int(os.environ.get(_PARENT_PID_ENV) or 0)
+    except ValueError:
+        named = 0
+    if named and not IS_WINDOWS:
+        return parent if named == parent == os.getppid() else 0
+    return parent if parent > 1 else 0
 
 
 def require_running(stop_event: asyncio.Event) -> None:
@@ -455,6 +479,23 @@ async def _wait_or_stop(
     finally:
         stop_task.cancel()
         await asyncio.gather(stop_task, return_exceptions=True)
+
+
+async def _wait_without_token(state_dir: Path, status: RuntimeStatus, stop_event: asyncio.Event) -> None:
+    """No bot token in this process's environment: publish the wait, never exit.
+
+    The token reaches a companion only through its spawn environment. The host respawns it when a saved token
+    differs (``refresh_companion_process``), so this waits, with a fresh heartbeat, until it is stopped: no
+    tunnel, no menu change, no crash to count. Off is told before the missing token.
+    """
+    while True:
+        if not miniapp_enabled(state_dir):
+            status.transition("disabled", "Telegram Mini App is off; the text bridge remains active.",
+                              reason_code="miniapp_disabled")
+        else:
+            status.transition("waiting_token", "Waiting for a bot token in Settings → Secrets (TELEGRAM_BOT_TOKEN).",
+                              reason_code="token_missing")
+        await _wait_or_stop(5.0, stop_event)
 
 
 async def _wait_for_owner(
@@ -906,7 +947,8 @@ async def _wait_blocked_state(
             "menu_drift",
         ),
         _GenerationResult.TELEGRAM_BLOCKED: (
-            "Telegram rejected the bot configuration; disable and re-enable after fixing it.",
+            "Telegram rejected the bot configuration; disable and re-enable after fixing it,"
+            " or save another Bot API server.",
             "telegram_rejected",
         ),
         _GenerationResult.SETTINGS_BLOCKED: (
@@ -915,6 +957,11 @@ async def _wait_blocked_state(
         ),
     }
     message, reason_code = messages[reason]
+    # The menu calls follow the saved server, so another saved server is a new attempt;
+    # an unreadable value is no reading, never a change.
+    refused_by = getattr(menu, "last_rejected_api_root", None)
+    if refused_by is None and reason is _GenerationResult.TELEGRAM_BLOCKED:
+        refused_by = settings_observer.api_base()
     while True:
         if not miniapp_enabled(settings_observer.state_dir):
             return _GenerationResult.DISABLED
@@ -935,6 +982,11 @@ async def _wait_blocked_state(
             if reason is _GenerationResult.SETTINGS_BLOCKED:
                 if settings_observer.safe_for_exposure(owner):
                     return _GenerationResult.RECONNECT
+            if reason is _GenerationResult.TELEGRAM_BLOCKED:
+                current = settings_observer.api_base()
+                if refused_by is not None and current is not None and current != refused_by:
+                    return _GenerationResult.RECONNECT
+                refused_by = refused_by or current
         except (TelegramSettingsError, TelegramMenuTransportError, asyncio.TimeoutError):
             continue
         except TelegramMenuError:
@@ -1133,22 +1185,50 @@ async def _reconcile_owner_change(
         )
         await _wait_or_stop(delay, stop_event)
 
-def _prior_owner_reconciliation(
+async def _prior_owner_reconciliation(
     token: str,
     current_owner: int,
     state_dir: Path,
     telegram_client: httpx.AsyncClient,
     _settings_observer: TelegramSettingsObserver,
+    bot: str,
+    status: RuntimeStatus | None = None,
+    stop_event: asyncio.Event | None = None,
 ) -> tuple[bool, TelegramMenuManager | None]:
-    menu_owner = snapshot_owner_chat_id(state_dir)
+    """The previous owner's manager when this bot's own ledger names another owner (``bot``: verified getMe id).
+
+    Without one, an older release's chat-only ledger naming another owner counts once a bounded read of that chat
+    derives this bot's ledger from a button it records. When Telegram refuses that read, this bot's ownership there
+    stays unestablished: the record is left untouched, nothing is changed for it, and the current owner proceeds.
+    After the restore the menu no longer matches, so the retained chat-only file is not acted on again. A read
+    that cannot reach Telegram is retried here, with ``status`` saying so, before any new owner is exposed."""
+    menu_owner = snapshot_owner_chat_id(state_dir, bot)
+    chat_only = menu_owner is None
+    if chat_only:
+        menu_owner = chat_only_owner_chat_id(state_dir)
     if not isinstance(menu_owner, int) or menu_owner <= 0 or menu_owner == current_owner:
         return False, None
-    prior_menu = TelegramMenuManager(
-        token,
-        menu_owner,
-        state_dir,
-        client=telegram_client,
-    )
+    prior_menu = TelegramMenuManager(token, menu_owner, state_dir, client=telegram_client, bot=bot)
+    failures = 0
+    while chat_only:
+        try:
+            derived = await _run_startup_operation(
+                prior_menu.derive_from_chat_only(), stop_event=stop_event, timeout_sec=15.0
+            )
+        except TelegramMenuRejectedError:
+            return False, None
+        except (TelegramMenuTransportError, asyncio.TimeoutError) as exc:
+            if status is None or stop_event is None:
+                raise  # a caller with nothing to report on sees the failure itself
+            failures += 1
+            delay = _retry_delay(failures)
+            status.transition("reconciling", _safe_error(exc), reason_code="owner_change_rollback_pending",
+                              attempt=failures, next_retry_at_epoch=int(time.time() + delay))
+            await _wait_or_stop(delay, stop_event)
+            continue
+        if not derived:
+            return False, None
+        break
     return True, prior_menu
 
 
@@ -1194,22 +1274,23 @@ async def run() -> int:
         heartbeat_task = asyncio.create_task(
             status.heartbeat(heartbeat_stop, failure_event=stop_event)
         )
-        if not token:
-            raise CompanionError("TELEGRAM_BOT_TOKEN is missing or not granted.")
-        parent_pid = _INITIAL_PARENT_PID
-        if not _pid_alive(parent_pid):
+        parent_pid = _server_parent_pid()
+        if not parent_pid or not _pid_alive(parent_pid):
             raise CompanionError("Ouroboros server parent is unavailable.")
         lifeline_cancel, lifeline_thread = start_parent_lifeline(
             parent_pid,
             loop,
             stop_event,
         )
+        if not token:
+            await _wait_without_token(state_dir, status, stop_event)
         config = load_runtime_config(state_dir)
 
         telegram_client = httpx.AsyncClient(
             timeout=12,
             follow_redirects=False,
             trust_env=False,
+            proxy=telegram_proxy(state_dir),
         )
         settings_observer = TelegramSettingsObserver(state_dir, config["core_port"])
         while True:
@@ -1222,12 +1303,8 @@ async def run() -> int:
                 stop_event,
             )
             try:
-                reconcile_prior_owner, prior_menu = _prior_owner_reconciliation(
-                    token,
-                    owner,
-                    state_dir,
-                    telegram_client,
-                    settings_observer,
+                reconcile_prior_owner, prior_menu = await _prior_owner_reconciliation(
+                    token, owner, state_dir, telegram_client, settings_observer, candidate_menu.bot, status, stop_event,
                 )
             except (TelegramMenuError, TelegramSettingsError) as exc:
                 status.transition(

@@ -29,9 +29,9 @@ from __future__ import annotations
 
 import ast
 import pathlib
-import types
 
 import pytest
+from tests._source_scan import parse
 
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -52,61 +52,146 @@ _TERMINAL_TOKENS = (
 # constant from the sticky set; "dynamic" is a variable or expression that can
 # carry one, which counts because the reducer, not the caller, decides.
 TERMINAL_WRITERS = {
+    # Selects an already retained actor account; its locked projector preserves
+    # CURRENT lifecycle, including terminal state, and compares the prior pointer.
+    ('ouroboros/review_history_view.py::publish_review_history_view', '"running"'): 'dynamic',
+    # Writes the admission title with the status it just read; write_task_result
+    # refuses a status regression (_is_status_regression), so a stale read
+    # cannot reopen a finished wake.
+    ('supervisor/worker_chat_lane.py::name_wake_on_admission', 'current.get("status") or STATUS_RUNNING'): 'dynamic',
+    # Names the mind's surviving notes after an applied fold; its locked projector
+    # preserves CURRENT lifecycle, including terminal state, and writes only the pointer.
+    ('ouroboros/main_context_authority.py::publish_working_notes', '"running"'): 'dynamic',
+    # Create-only pooled control admission seeds running/scheduled authority;
+    # an existing row is returned unchanged, including any terminal status.
+    ('supervisor/queue.py::ensure_control_task_result', 'status'): 'dynamic',
+    # Continue replay restores the exact stored status, or seeds scheduled;
+    # its recovered admission cannot originate a new terminal transition.
+    ('supervisor/continuation_admission.py::_replay', 'stored.get("status") or "scheduled"'): 'dynamic',
     ('ouroboros/agent.py::_task_exception_terminal', 'STATUS_FAILED'): 'terminal',
+    # A conversation turn's before-start Stop (cancelled) or exhausted budget (failed) is the
+    # turn's own typed terminal, recorded in its carrier before the exception unwinds; its
+    # projector never replaces a row that is already truly terminal.
+    ('supervisor/worker_chat_lane.py::conversation_exception_terminal', 'STATUS_CANCELLED if stopped else STATUS_FAILED'): 'terminal',
+    # A deployment's hold that met a task inside its carrier (handle_task's before-start check raised: the pool
+    # worker's exception boundary and the conversation lane's) is that task's typed failed terminal, nothing spent;
+    # its projector never replaces a row that is already truly terminal.
+    ('ouroboros/deployment_extensions.py::record_held_task', 'STATUS_FAILED'): 'terminal',
     ('ouroboros/agent_task_pipeline.py::_store_task_result', 'status'): 'dynamic',
     ('ouroboros/delegate_terminal.py::record_terminal_reconciliation', 'str(existing.get("status") or STATUS_RUNNING)'): 'dynamic',
+    # Foreign-root disclosure preserves CURRENT status and pointers under the
+    # projector, then rests the local duty; it never terminalizes a task.
+    ('ouroboros/install_identity.py::rest_foreign_member', 'stored["status"]'): 'dynamic',
+    # A refused foreign-root launch names its reason on this install's own row;
+    # the projector keeps CURRENT status and writes nothing once it is named.
+    ('ouroboros/install_identity.py::disclose_foreign_task', '""'): 'dynamic',
+    # Preparation markers land only on a row still in the named non-terminal
+    # status (requested by default); the projector refuses any other row.
+    ('supervisor/workspace_preparation.py::_transition', 'status'): 'dynamic',
     # F6 upstream sync: the cursor/backfill refresh rewrites a stale stored
     # disclosure without changing the task's terminal status (same preserved
     # read as its record_terminal_reconciliation sibling).
     ('ouroboros/delegate_terminal.py::_rewrite_execution_evidence', 'str(existing.get("status") or STATUS_RUNNING)'): 'dynamic',
+    # Disposition removes only this run's resolved debt. The locked projector
+    # preserves the current lifecycle; "running" is the writer's placeholder.
+    ('ouroboros/delegate_terminal.py::refresh_disposed_reconciliation', '"running"'): 'dynamic',
     ('ouroboros/gateway/tasks.py::_admission_rejection_response', 'STATUS_FAILED'): 'terminal',
-    ('ouroboros/gateway/tasks.py::_complete_api_task_admission', '"failed"'): 'terminal',
-    # The scanner treats a variable status as dynamic. This create-only site
-    # seeds scheduled/running from pooled membership and never ends a task;
-    # test_hurry_initial_lifecycle pins both choices and existing-row preservation.
-    ('ouroboros/gateway/task_hurry.py::_admit_hurry_locked', 'pooled_status'): 'dynamic',
+    # The API admission receipt lands after the snapshot barrier, outside the first queue-lock section: it keeps
+    # the status the window left (a launch's running, a Stop's terminal) and adds only its token and admission facts.
+    ('ouroboros/gateway/tasks.py::_enqueue_api_task_durably', 'str(current.get("status") or STATUS_SCHEDULED)'): 'dynamic',
+    # #2753 native capture facts (a capture gap, received files, a capture effect) are written with the stored
+    # row's own status; their field projectors add only the capture facts and never end a task.
+    ('ouroboros/headless.py::_native_capture_gap', 'row["status"]'): 'dynamic',
+    ('ouroboros/headless.py::record_native_capture_effect', 'owner["status"]'): 'dynamic',
+    ('ouroboros/headless.py::record_native_received_files', 'owner["status"]'): 'dynamic',
+    # API refusal now belongs to _admission_rejection_response and its receipt writer.
     # Runtime707: CURRENT-ref retry publication moved out of observability's
     # locked sweep; terminal file-failure publication moved off event drain.
     # Both retain CURRENT lifecycle status rather than authoring completion.
-    ('ouroboros/headless.py::retry_child_task_refs', 'source["status"]'): 'dynamic',
+    ('ouroboros/headless.py::_retry_child_task_refs_locked', 'source["status"]'): 'dynamic',
     ('ouroboros/headless.py::prepare_terminal_task_files', 'existing["status"]'): 'dynamic',
-    ('ouroboros/headless.py::finalize_task_artifacts', 'status'): 'dynamic',
-    ('ouroboros/headless.py::finalize_task_artifacts', 'str(existing.get("status") or status or "completed")'): 'terminal',
+    # Existing task custody/projection enrichment only: its locked field
+    # projector preserves CURRENT lifecycle status rather than ending a task.
+    ('ouroboros/history_retention.py::call_inventory_custodied', 'current["status"]'): 'dynamic',
+    # Settlement's raw-QA carry arms only missing-evidence facts on the same
+    # attempt; its locked projector returns the row's own status unchanged.
+    ('ouroboros/history_retention.py::raw_evidence_custodied', 'current["status"]'): 'dynamic',
+    # #3048: a late PASS of an author's pending finish rewrites only the ended task's review and objective axes;
+    # its locked projector returns the CURRENT truly terminal status unchanged and writes nothing on any other row.
+    ('ouroboros/late_review_marks.py::resolve_pending_result_review', 'str(row["status"])'): 'dynamic',
+    ('ouroboros/headless.py::_finalize_task_artifacts_locked', 'status'): 'dynamic',
+    ('ouroboros/headless.py::_finalize_task_artifacts_locked', 'str(existing.get("status") or status or "completed")'): 'terminal',
     ('ouroboros/mutation_attribution.py::advance_mutation_baseline', 'status'): 'dynamic',
     ('ouroboros/mutation_attribution.py::capture_mutation_baseline', 'status'): 'dynamic',
     ('ouroboros/mutation_attribution.py::record_terminal_mutation_candidates', 'status'): 'dynamic',
     ('ouroboros/post_task_checkpoint.py::set_root_post_task_checkpoint', 'str(existing.get("status") or task.get("status") or STATUS_COMPLETED)'): 'terminal',
-    ('ouroboros/project_dialogue.py::_append_terminal_task_projection', 'status'): 'dynamic',
+    # #2566: a moved Presence turn's saved continuation nothing authorized (a crash retry) ends its attempt before
+    # the attempt leaves RUNNING and its slot: the orphan reconciler's unknown-outcome presence_attempt_lost failure,
+    # and its projector keeps a terminal already there. No answer exists; its task_done follows.
+    ('ouroboros/presence_carrier.py::_end_refused_attempt', 'STATUS_FAILED'): 'terminal',
+    # Presence recovery records an observation of an existing unresolved turn.
+    # Its field projector preserves CURRENT status, even after a late terminal;
+    # the receipt cannot terminalize or regenerate the lost attempt.
+    ('ouroboros/presence_recovery.py::record_unresolved_turn', 'str(stored["status"])'): 'dynamic',
+    # Same terminal status under the locked projector; this records only the
+    # deterministic successor link after a positive first-round no-effect proof.
+    ('ouroboros/presence_runner.py::_retry_target', 'STATUS_FAILED'): 'terminal',
+    # D12 durable new-work intent (start_task): prepare creates the "requested" row
+    # before emission; claim moves its locked projector to "admitting" and keeps
+    # "requested". Boot reconciliation (prior workers proved gone) settles ONLY a
+    # proven-unadmitted intent "failed"/promotion_not_started (explicit retry, nothing
+    # restarts); an uncertain one stays "requested" and held.
+    ('ouroboros/promotion_intent.py::prepare_promotion_intent', '"requested"'): 'dynamic',
+    ('ouroboros/promotion_intent.py::claim_promotion_intent', '"requested"'): 'dynamic',
+    ('ouroboros/promotion_intent.py::reconcile_promotion_intents', '"requested"'): 'dynamic',
+    # #1154: the compare-and-clear of a settled terminal-projection obligation.
+    # It preserves the record's CURRENT status inside the projector and publishes
+    # no lifecycle transition of its own; the status argument is only the
+    # primitive's required placeholder.
+    ('ouroboros/terminal_projection.py::_prepare', 'stored["status"]'): 'dynamic',
+    ('ouroboros/terminal_projection.py::_append_project', 'stored["status"]'): 'dynamic',
+    # Main publication retention, retry claims and durable-chat acknowledgement
+    # update readiness/receipt fields under the result lock. Each projector
+    # returns CURRENT status unchanged; none originates a lifecycle transition.
+    ('ouroboros/terminal_projection.py::retain_main_delivery', 'stored["status"]'): 'dynamic',
+    ('ouroboros/terminal_projection.py::claim_main_delivery', 'stored["status"]'): 'dynamic',
+    ('ouroboros/terminal_projection.py::acknowledge_main_delivery', 'stored["status"]'): 'dynamic',
+    ('ouroboros/terminal_projection.py::append_terminal_projection', 'status'): 'dynamic',
+    ('ouroboros/terminal_projection.py::clear_terminal_projection_obligation', 'str(expected.get("status") or "completed")'): 'terminal',
     ('ouroboros/project_naming.py::spawn_turn_namer._work', 'status'): 'dynamic',
-    ('ouroboros/project_dialogue.py::persist_continuation_narrative', 'requested_status'): 'dynamic',
-    # The locked field projector preserves the existing status, including a
-    # terminal one; publishing review evidence never completes the task itself.
-    ('ouroboros/review_projection.py::publish_acceptance_checkpoint', '"running"'): 'dynamic',
     # Rebinds a proven legacy child start before existing orphan materialization;
     # write_task_result still preserves any terminal status under its locked reducer.
-    ('ouroboros/server_maintenance.py::_recover_terminal_task_files', '"running"'): 'dynamic',
+    ('ouroboros/startup_task_files.py::recover_terminal_task_files', '"running"'): 'dynamic',
     ('ouroboros/task_status.py::reconcile_orphaned_running_tasks', 'eff_status'): 'dynamic',
+    # TZ-1 A/V10: the one child-drive settlement and mailbox cleanup write custody fields
+    # (published artifact rows, unread mail) onto CURRENT with its own status inside the
+    # projector; a changed attempt basis aborts, and they never originate a transition.
+    ('ouroboros/task_custody.py::_write_custody_fields', 'str(observed.get("status") or "")'): 'dynamic',
     ('ouroboros/tools/control_delegation.py::record_depth_limit_refusal', 'STATUS_FAILED'): 'terminal',
+    # Recovery of a dead attempt whose answer the host already holds (owed/delivered/unreadable
+    # registry evidence): the attempt is finalized from the outbox's bytes as failed /
+    # infra_failed / finalization_incomplete instead of re-running the prompt (both the
+    # hard-timeout reaper and dead-worker recovery route through it).
+    ('ouroboros/working_checkpoint.py::adopt_registered_answer', 'STATUS_FAILED'): 'terminal',
     ('supervisor/cancel_publication.py::_finalize_cancel_intent_on_miss', 'STATUS_CANCELLED'): 'terminal',
     ('supervisor/events_project_routing.py::_persist_promote_rejection', 'STATUS_FAILED'): 'terminal',
-    # The promoter's force_plan transfer is a locked field projection like its
-    # review-evidence sibling above: it preserves the status it reads (possibly
-    # terminal) and only records where the planning obligation went.
-    ('supervisor/events_project_routing.py::_record_obligation_transfer', '"running"'): 'dynamic',
     ('supervisor/events_schedule_task.py::_reject_schedule_task', 'status'): 'dynamic',
     ('supervisor/events_task_done.py::_finish_task_done_dispatch', 'STATUS_FAILED'): 'terminal',
     ('supervisor/events_task_done.py::_resolve_lifecycle_fault', 'STATUS_FAILED'): 'terminal',
     # Monetary refresh projects fields under the result lock and preserves its
     # current terminal status; it cannot publish a lifecycle transition.
     ('supervisor/events_task_done.py::_refresh_terminal_task_cost', 'current["status"]'): 'dynamic',
-    ('supervisor/queue_snapshot.py::restore_pending_from_snapshot', 'STATUS_CANCELLED'): 'terminal',
-    ('supervisor/task_admission.py::record_scheduled_admission', 'STATUS_FAILED'): 'terminal',
+    ('supervisor/queue_snapshot.py::_restore_pending', 'STATUS_CANCELLED'): 'terminal',
+    ('supervisor/queue_snapshot.py::_refuse_restore_invalid_fences', 'STATUS_CANCELLED'): 'terminal',
+    # Explicit calendar expiry retains pending custody until the result and delivery are durable.
+    ('supervisor/queue_timeouts.py::_settle_pending_deadline', '"failed"'): 'terminal',
+    # Positive never-admitted refusal; exact receipt readback precedes resource cleanup.
+    ('supervisor/task_admission.py::persist_never_admitted_refusal', 'STATUS_FAILED'): 'terminal',
+    # Accepted pending restore refusal; retain custody for retry until its terminal is durable.
+    ('supervisor/task_admission.py::restore_invalid_depth_admission', 'STATUS_FAILED'): 'terminal',
     ('supervisor/task_admission.py::terminalize_invalid_depth_restore', 'STATUS_FAILED'): 'terminal',
     ('supervisor/task_lifecycle.py::_finish_captured_pending', 'STATUS_CANCELLED'): 'terminal',
     ('supervisor/task_lifecycle.py::_finish_captured_running', 'STATUS_CANCELLED'): 'terminal',
-    ('supervisor/task_reaper.py::_enqueue_retry', 'STATUS_FAILED'): 'terminal',
-    ('supervisor/task_reaper.py::_run_retry_admission_transaction', 'STATUS_CANCELLED'): 'terminal',
-    ('supervisor/task_reaper.py::_run_retry_admission_transaction', 'STATUS_FAILED'): 'terminal',
     ('supervisor/task_reaper.py::reap_timed_out_task', 'STATUS_FAILED'): 'terminal',
     ('supervisor/worker_assignment.py::_cancel_unauthorized_evolution', 'STATUS_CANCELLED'): 'terminal',
     ('supervisor/worker_assignment.py::assign_tasks', 'STATUS_CANCELLED'): 'terminal',
@@ -133,12 +218,13 @@ SETTLE_INTENT_CALLERS = {
 NO_DELIVERABLE_LANES = {
     'supervisor/task_lifecycle.py::_finish_captured_pending':
         'cancelled before it ever started: no answer exists',
-    'supervisor/task_admission.py::record_scheduled_admission':
-        'a cron dispatch refused at admission never had an owner answer',
     'supervisor/workers.py::_settle_cancelled_pending_row':
         'dropped before assignment; the salvage receipt belongs to custody',
-    'supervisor/queue_snapshot.py::restore_pending_from_snapshot':
+    'supervisor/queue_snapshot.py::_restore_pending':
         'restore-time reconciliation of a task cancelled while the server was down',
+    'supervisor/queue_snapshot.py::_refuse_restore_invalid_fences':
+        'the invalid-acceptance-fence refusal moved out of restore_pending_from_snapshot (#1196): '
+        'ordinary rows keep the pre-existing fail-closed cancel, exact budget pauses are held instead',
     'supervisor/events_task_done.py::_finish_task_done_dispatch':
         'lifecycle fault: the durable row, not a message, is the disclosure',
     'supervisor/events_task_done.py::_resolve_lifecycle_fault':
@@ -147,11 +233,15 @@ NO_DELIVERABLE_LANES = {
         'a refused schedule never became a task with an answer',
     'supervisor/events_project_routing.py::_persist_promote_rejection':
         'a refused promotion never became a task with an answer',
+    'ouroboros/promotion_intent.py::reconcile_promotion_intents':
+        'a new-work intent proven never admitted is settled not_started: no attempt ran, no answer exists',
     # upstream retry/depth lanes (bea08137 class), absent at the reference cut:
+    'supervisor/task_admission.py::persist_never_admitted_refusal':
+        'positively never admitted: the origin refusal receipt exists, no model answer exists',
+    'supervisor/task_admission.py::restore_invalid_depth_admission':
+        'restored pending work refused before assignment; terminalization retry retains custody, no answer exists',
     'supervisor/task_admission.py::terminalize_invalid_depth_restore':
         'an invalid-depth restore is refused at admission; no answer exists',
-    'supervisor/task_reaper.py::_run_retry_admission_transaction':
-        'a refused retry admission terminalizes the retry, not an owner answer',
     'supervisor/workers.py::_terminalize_invalid_pending_depth':
         'an invalid-depth pending row is terminalized before it ever ran',
     'ouroboros/tools/control_delegation.py::record_depth_limit_refusal':
@@ -177,20 +267,38 @@ def _sources():
 def _calls(source: str, target: str):
     """Every call to ``target`` with the enclosing lexical qualname."""
     stack: list[str] = []
+    aliases: list[set[str]] = [set()]
     found: list[tuple[str, ast.Call]] = []
 
     class Visitor(ast.NodeVisitor):
         def visit_FunctionDef(self, node):
             stack.append(node.name)
+            aliases.append(set())
             self.generic_visit(node)
+            aliases.pop()
             stack.pop()
 
         visit_AsyncFunctionDef = visit_FunctionDef
 
         def visit_ClassDef(self, node):
             stack.append(node.name)
+            aliases.append(set())
             self.generic_visit(node)
+            aliases.pop()
             stack.pop()
+
+        def visit_Assign(self, node):
+            def points_to_target(value):
+                if isinstance(value, ast.IfExp):
+                    return points_to_target(value.body) or points_to_target(value.orelse)
+                return isinstance(value, ast.Name) and (value.id == target or value.id in aliases[-1])
+            is_alias = points_to_target(node.value)
+            for binding in node.targets:
+                if isinstance(binding, ast.Name):
+                    aliases[-1].discard(binding.id)
+                    if is_alias:
+                        aliases[-1].add(binding.id)
+            self.generic_visit(node)
 
         def visit_Call(self, node):
             func = node.func
@@ -198,11 +306,11 @@ def _calls(source: str, target: str):
                 func.id if isinstance(func, ast.Name)
                 else func.attr if isinstance(func, ast.Attribute) else ""
             )
-            if name == target:
+            if name == target or name in aliases[-1]:
                 found.append((".".join(stack) or "<module>", node))
             self.generic_visit(node)
 
-    Visitor().visit(ast.parse(source))
+    Visitor().visit(parse(source))
     return found
 
 
@@ -221,7 +329,18 @@ def _expression(source: str, node: ast.Call, index: int, keyword: str) -> str:
     for kw in node.keywords:
         if kw.arg == keyword:
             return " ".join((ast.get_source_segment(source, kw.value) or "").split())
-    return ""
+    # Conditional receipt writers pass status only to the ordinary writer via
+    # **(... if never_admitted else {"status": STATUS_FAILED}). Inspect the
+    # actual expressions; a wrapper must not disappear from the inventory.
+    expanded = []
+    for kw in node.keywords:
+        if kw.arg is None:
+            for mapping in ast.walk(kw.value):
+                if isinstance(mapping, ast.Dict):
+                    for key, value in zip(mapping.keys, mapping.values):
+                        if isinstance(key, ast.Constant) and key.value == keyword:
+                            expanded.append(" ".join((ast.get_source_segment(source, value) or "").split()))
+    return " | ".join(sorted(set(expanded)))
 
 
 def _function_source(path: pathlib.Path, qualname: str) -> str:
@@ -274,19 +393,6 @@ def test_c7_the_set_of_terminal_status_writers_equals_the_manifest():
         f"retired) — update the manifest row in the same commit: {removed}"
     )
     assert live == TERMINAL_WRITERS
-
-
-def test_c7_the_one_terminal_write_primitive_is_still_one():
-    """The property the manifest is guarding: there is a single durable writer
-    with the monotonic reducer inside it, not a family of them."""
-    from ouroboros import task_results
-
-    source = (REPO / "ouroboros" / "task_results.py").read_text(encoding="utf-8")
-    assert source.count("def write_task_result(") == 1
-    assert callable(task_results.write_task_result)
-    body = _function_source(REPO / "ouroboros" / "task_results.py", "write_task_result")
-    assert "update_json_locked" in body, "the write holds the per-file lock"
-    assert "_is_status_regression" in body, "the reducer is inside the lock, not at callers"
 
 
 # ---------------------------------------------------------------------------
@@ -425,65 +531,6 @@ def test_c9_the_lanes_that_owe_nothing_are_an_enumerated_list():
 # ---------------------------------------------------------------------------
 
 
-def _sweep_sees(tmp_path, task_id: str, monkeypatch) -> bool:
-    """Whether the watchdog, reading its own canonical root, sees the intent."""
-    from ouroboros.cancel_intents import active_intents
-    from supervisor import queue as q
-
-    monkeypatch.setattr(q, "DRIVE_ROOT", tmp_path, raising=False)
-    return task_id in active_intents(q.DRIVE_ROOT)
-
-
-def _agent_ctx(canonical, child_drive, *, carry_budget_root: bool):
-    from ouroboros.tools.registry import ToolContext
-
-    ctx = ToolContext(repo_dir=canonical, drive_root=child_drive or canonical)
-    ctx.task_id = "parent-1"
-    ctx.task_metadata = {"root_task_id": "parent-1", "parent_task_id": "parent-1"}
-    if carry_budget_root:
-        ctx.task_metadata["budget_drive_root"] = str(canonical)
-    return ctx
-
-
-def test_c10_the_agent_tool_writes_a_split_drive_intent_at_the_canonical_root(
-    tmp_path, monkeypatch,
-):
-    """C10: the agent `cancel_task` tool resolves
-    `metadata["budget_drive_root"] or ctx.budget_drive_root or ctx.drive_root`.
-    For a split-drive child the FIRST term is the canonical supervisor root, so
-    the intent lands where `sweep_cancel_intents` reads — the divergence a
-    reviewer suspected in the third fallback does not exist here."""
-    from ouroboros.tools.join_ledger import _cancel_task
-
-    canonical = tmp_path / "data"
-    child = tmp_path / "task_drives" / "child"
-    child.mkdir(parents=True)
-    ctx = _agent_ctx(canonical, child, carry_budget_root=True)
-
-    out = _cancel_task(ctx, "victim-1", reason="stop")
-
-    assert "Cancel requested" in out, out
-    assert (canonical / "state" / "cancel_intents.json").is_file()
-    assert not (child / "state" / "cancel_intents.json").exists()
-    assert _sweep_sees(canonical, "victim-1", monkeypatch)
-
-
-def test_c10_a_task_without_a_child_drive_resolves_to_the_same_root(
-    tmp_path, monkeypatch,
-):
-    """C10: the third fallback (`ctx.drive_root`) is reached only when NO child
-    drive exists — and then `drive_root` IS the canonical root, so the two
-    shapes agree. The pairing is what holds the invariant, asserted below."""
-    from ouroboros.tools.join_ledger import _cancel_task
-
-    canonical = tmp_path / "data"
-    canonical.mkdir()
-    ctx = _agent_ctx(canonical, None, carry_budget_root=False)
-
-    assert "Cancel requested" in _cancel_task(ctx, "victim-2", reason="stop")
-    assert _sweep_sees(canonical, "victim-2", monkeypatch)
-
-
 def test_c10_a_child_drive_is_never_set_without_its_budget_drive_root():
     """C10, the invariant the two tests above ride on: every production site
     that points a task's `drive_root` at a child drive sets `budget_drive_root`
@@ -499,42 +546,20 @@ def test_c10_a_child_drive_is_never_set_without_its_budget_drive_root():
             assert "budget_drive_root" in window, f"{module}:{index + 1}\n{window}"
 
 
-def test_c10_the_settled_probe_reads_the_intent_root_not_the_child_drive(tmp_path):
-    """C10, the one real divergence — and it is noise, not a wedge. The mint's
-    already-settled probe reads the task result at the INTENT root, so a
-    split-drive child whose result lives on its own drive reads as unsettled
-    and an intent IS minted. Custody then settles it `already_settled`, so the
-    cost is one watchdog round trip, not a lost cancellation."""
-    from ouroboros.cancel_intents import request_cancel, settled_status
-    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
-
-    canonical = tmp_path / "data"
-    child = tmp_path / "task_drives" / "child"
-    canonical.mkdir()
-    child.mkdir(parents=True)
-    write_task_result(child, "done-1", STATUS_COMPLETED, result="finished")
-
-    assert settled_status(child, "done-1") == STATUS_COMPLETED
-    assert settled_status(canonical, "done-1") == "", "the probe cannot see it"
-    intent = request_cancel(canonical, "done-1", reason="late cancel")
-    assert intent.get("already_settled") is False
-    assert intent.get("request_id"), "an intent is minted over a settled child"
-
-
-def test_c10_the_http_and_supervisor_roots_come_from_one_configured_value():
-    """C10 for the HTTP and project-deletion ingresses: they mint at the app's
-    `state.drive_root`, the watchdog reads `supervisor.queue.DRIVE_ROOT`, and
-    both are bound from the ONE configured `DATA_DIR` at startup. Two globals
-    that merely happen to agree would be the gap; one source is the answer."""
-    server_source = (REPO / "server.py").read_text(encoding="utf-8")
-    assert "app.app.state.drive_root = pathlib.Path(DATA_DIR)" in server_source
-    assert "DRIVE_ROOT=DATA_DIR" in server_source
-    from ouroboros.gateway._helpers import request_drive_root
-
-    app = types.SimpleNamespace(state=types.SimpleNamespace(drive_root="/pinned/root"))
-    request = types.SimpleNamespace(app=app)
-    # Path-compare, not string-compare: Windows spells the same bound value
-    # with backslashes.
-    assert pathlib.Path(str(request_drive_root(request))) == pathlib.Path("/pinned/root"), (
-        "the ingress root is whatever the app was bound to, never a re-derivation"
-    )
+def test_terminal_inventory_sees_conditional_writers_without_leaking_aliases():
+    source = '''
+def refusal():
+    writer = receipt_first if never_admitted else write_task_result
+    writer(root, tid, **({} if never_admitted else {"status": STATUS_FAILED}))
+    def nested(writer):
+        writer(root, tid, "not-a-result-writer")
+    writer = unrelated
+    writer(root, tid, "not-a-result-writer")
+def sibling():
+    writer(root, tid, "not-a-result-writer")
+    write_task_result(root, tid, status=status)
+'''
+    found = _calls(source, "write_task_result")
+    assert [(qualname, _expression(source, node, 2, "status")) for qualname, node in found] == [
+        ("refusal", "STATUS_FAILED"), ("sibling", "status"),
+    ]

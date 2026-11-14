@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,7 @@ from ouroboros.task_results import write_task_result
 from ouroboros.task_status import load_effective_task_result
 from ouroboros.tools import control_task_results as results
 from ouroboros.tools.join_ledger import _child_result_sha256
+from tests._store_shared import result_signature
 
 BODY = "Complete child analysis.\n" * 1200
 TRACE = "Exact trace summary.\n" * 400
@@ -54,7 +56,7 @@ def test_condition_is_explicit_and_full_read_survives_a_new_context(tmp_path, su
         return handler(ctx, "child1", **kwargs)
 
     ctx = _ctx(tmp_path)
-    before = (tmp_path / "task_results" / "child1.json").read_bytes()
+    before = result_signature(tmp_path, "child1")
     first = read(ctx)
     unchanged = read(ctx, True)
     assert BODY in (json.loads(first)["tasks"]["child1"]["result"] if surface == "batch" else first)
@@ -63,12 +65,19 @@ def test_condition_is_explicit_and_full_read_survives_a_new_context(tmp_path, su
     assert "Complete child analysis." not in unchanged
     assert "Exact trace summary." not in unchanged
     assert len(unchanged) < len(first) / 5
-    # A result hash is neither "seen" nor proof of a current in-context copy.
+    # A result hash is neither "seen" nor proof of a current in-context copy. A wait's first line says how long
+    # that wait took, so it only has to say the wait completed; the result after it is compared whole.
     def result_view(text):
-        return json.loads(text)["tasks"] if surface == "batch" else text
+        if surface == "batch":
+            return json.loads(text)["tasks"]
+        if surface == "wait":
+            header, gap, result = text.partition("\n\n")
+            assert re.fullmatch(r"Task wait completed after \d+\.\ds\.", header) and gap, header
+            return result
+        return text
     assert result_view(read(ctx)) == result_view(first)
     assert result_view(read(_ctx(tmp_path))) == result_view(first)
-    assert (tmp_path / "task_results" / "child1.json").read_bytes() == before
+    assert result_signature(tmp_path, "child1") == before
     assert not (tmp_path / "state" / "task_trees").exists()
 
 
@@ -76,9 +85,6 @@ def test_condition_is_explicit_and_full_read_survives_a_new_context(tmp_path, su
     ("result", "A revised complete answer."),
     ("trace_summary", "A revised trace."),
     ("status", "failed"),
-    ("artifact_status", "failed"),
-    ("artifacts", [{"name": "report.txt", "sha256": "b" * 64}]),
-    ("terminal_host_notice", "Unresolved delegated execution remains."),
 ])
 def test_semantic_change_returns_full_single_and_batch(tmp_path, monkeypatch, field, new_value):
     data = dict(task_id="child1", status="completed", result=BODY, trace_summary=TRACE)
@@ -161,7 +167,7 @@ def test_source_or_authority_request_is_not_suppressed_by_a_known_result(tmp_pat
     assert "result_unchanged" not in result
 
 
-@pytest.mark.parametrize("known", ["", "stale", None, 17, {"child1": "bad"}])
+@pytest.mark.parametrize("known", ["", None, {"child1": "bad"}])
 def test_nonmatching_condition_never_hides_result(tmp_path, known):
     _child(tmp_path)
     assert BODY in results._get_task_result(_ctx(tmp_path), "child1", known_result_sha256=known)

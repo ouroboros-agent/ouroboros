@@ -1,10 +1,21 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { assistedUpdatePhase, dismissUpdateAttempt, initUpdateStatus, RECOVERY_RETRY, unfinishedRecovery, updateAttemptView } from '../modules/update_status.js';
+import { installDomDouble } from './dom_double.js';
 import { bindUpdateRefreshEvents, updateVerdict } from '../modules/updates.js';
 
 const observed = (stage, extra = {}) => ({
     managed: true,
     update_progress: { operation_id: 'operation-a', generation: 'server-a', stage, active: true, ...extra },
+});
+
+test('only a completed update with a known base offers its local Restore target', () => {
+    for (const outcome of ['applied', 'not_applied', 'rolled_back', 'failed', 'unknown']) {
+        const view = updateAttemptView({ operation_id: 'a', outcome, active: false, base_sha: 'a'.repeat(40) });
+        assert.equal(view.restoreTarget, outcome === 'applied' ? 'a'.repeat(40) : '');
+    }
+    assert.equal(updateAttemptView({ operation_id: 'a', outcome: 'applied', active: false }).restoreTarget, '');
+    assert.equal(updateAttemptView({ operation_id: 'a', active: true, base_sha: 'a'.repeat(40) }).restoreTarget, undefined);
 });
 
 test('server stages refine the pending apply and survive reopening before a transaction exists', () => {
@@ -92,4 +103,393 @@ test('progress invalidation refreshes an apply but cannot certify boot completio
     assert.deepEqual(restart, [{ afterBootNotice: false }, { afterBootNotice: false }]);
     binding.dispose();
     assert.equal(listeners.size, 0);
+});
+
+test('the requested description task ends through its own task_done, which alone reads the status again', () => {
+    const listeners = new Map();
+    const ws = { on(name, fn) { listeners.set(name, fn); return () => listeners.delete(name); } };
+    let phase = '';
+    let requested = 'd3adb33f';
+    const reads = [];
+    const binding = bindUpdateRefreshEvents({ ws, getPhase: () => phase, loadStatus: (value) => reads.push(value),
+        reconcileRestart: () => {}, getRequestTaskId: () => requested });
+    const log = listeners.get('log');
+    log({ data: { type: 'task_done', task_id: 'other-task' } });
+    log({ data: { type: 'task_heartbeat', task_id: 'd3adb33f' } });
+    log({ data: { type: 'task_done', task_id: 'd3adb33f', _historical: true } });
+    assert.deepEqual(reads, [], 'another task, another event or a replayed frame is not this request ending');
+    log({ data: { type: 'task_done', task_id: 'd3adb33f' } });
+    assert.deepEqual(reads, [{ fetchRemote: false, preservePhase: true }]);
+    // A host retry ends under its own id with the request as its root; a child of the request does not end it.
+    log({ data: { type: 'task_done', task_id: 'd3adb33f-retry', root_task_id: 'd3adb33f', parent_task_id: 'd3adb33f' } });
+    assert.equal(reads.length, 1);
+    log({ data: { type: 'task_done', task_id: 'd3adb33f-retry', root_task_id: 'd3adb33f' } });
+    assert.equal(reads.length, 2);
+    reads.pop();
+    requested = '';
+    log({ data: { type: 'task_done', task_id: 'd3adb33f' } });
+    phase = 'restarting';
+    requested = 'd3adb33f';
+    log({ data: { type: 'task_done', task_id: 'd3adb33f' } });
+    assert.equal(reads.length, 1, 'no request, or a restart in progress, reads nothing');
+    binding.dispose();
+    assert.equal(listeners.size, 0);
+});
+
+test('Continue admitted in another client refreshes both panels and follows its terminal', () => {
+    const clients = [0, 1].map(() => {
+        const listeners = new Map(), reads = [];
+        const ws = { on(name, fn) { listeners.set(name, fn); return () => listeners.delete(name); } };
+        let current = 'original';
+        const binding = bindUpdateRefreshEvents({ ws, getPhase: () => '', reconcileRestart() {},
+            getRequestTaskId: () => current,
+            loadStatus: (options) => { reads.push(options); current = 'successor'; } });
+        return { listeners, reads, binding };
+    });
+    // The host's existing log frame reaches both sockets. No document-local event is sent.
+    for (const client of clients) {
+        client.listeners.get('log')({ data: { type: 'owner_continue_admitted', predecessor_task_id: 'other' } });
+        assert.equal(client.reads.length, 0);
+        client.listeners.get('log')({ data: { type: 'owner_continue_admitted', task_id: 'successor', predecessor_task_id: 'original' } });
+        assert.equal(client.reads.length, 1);
+        client.listeners.get('log')({ data: { type: 'task_done', task_id: 'successor' } });
+        assert.equal(client.reads.length, 2);
+        client.binding.dispose();
+        assert.equal(client.listeners.size, 0);
+    }
+});
+
+const refusal = {
+    operation_id: 'attempt-a', generation: 'server-a', current_generation: true, stage: 'draining_writers',
+    active: false, result: 'failed', outcome: 'not_applied', outcome_at: '2026-10-21T00:20:00Z',
+    error: 'Could not prove every repository writer stopped.', reason: 'update_writer_fence_blocked',
+    blockers: ['active:Main conversation'], work_stop: 'none', concluded_by: 'executor', restart_required: false,
+    base_sha: 'f'.repeat(40), target_sha: 'b'.repeat(40),
+};
+const settle = async () => {
+    for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setImmediate(resolve));
+};
+
+test('a refusal before any teardown is not applied, stopped nobody, and names its blocker', () => {
+    const view = updateAttemptView(refusal);
+    assert.deepEqual([view.terminal, view.pill, view.tone, view.headline],
+        [true, 'Update not applied', 'error', 'No update was applied.']);
+    assert.equal(view.text, 'Work was still finishing: Main conversation. This attempt stopped no running work. Try again when it finishes.');
+    assert.deepEqual(view.details.find((row) => row.label === 'Reason'), { label: 'Reason', value: 'update_writer_fence_blocked' });
+    assert.equal(view.details.some((row) => row.label === 'Saved local work'), false, 'no ref is ever manufactured');
+});
+
+test('after teardown or a restart the attempt never claims it stopped nobody', () => {
+    for (const work_stop of ['invoked', '']) {
+        assert.doesNotMatch(updateAttemptView({ ...refusal, blockers: ['service:mcp'], work_stop }).text, /stopped no running work/);
+    }
+    assert.match(updateAttemptView({ ...refusal, blockers: [], work_stop: 'invoked' }).text, /may have been interrupted/);
+});
+
+test('only the restarted server concludes success; reconnect, version and SHA are not evidence', () => {
+    const awaiting = { ...refusal, outcome: '', result: 'restart_requested', stage: 'restart_requested',
+        current_generation: false, work_stop: '', blockers: [] };
+    const view = updateAttemptView(awaiting);
+    assert.deepEqual([view.terminal, view.pill], [false, 'Confirming update…']);
+    assert.doesNotMatch(view.headline, /completed|applied/i);
+    const unknown = updateAttemptView({ ...awaiting, outcome: 'unknown', reason: 'no_completion_record' });
+    assert.deepEqual([unknown.pill, unknown.tone, unknown.terminal], ['Update outcome unconfirmed', 'neutral', true]);
+    assert.match(unknown.text, /running version alone does not establish the outcome/);
+    const applied = updateAttemptView({ ...awaiting, outcome: 'applied', concluded_by: 'boot' });
+    // Owner 1B: the confirmed success is a record (headline, facts, Restore target), never a capsule word.
+    assert.deepEqual([applied.pill, applied.tone, applied.headline], ['', 'ok', 'Update completed.']);
+    assert.equal(updateAttemptView({ ...awaiting, outcome: 'unknown', reason: 'startup_unconfirmed' }).text,
+        'The restarted server did not confirm its startup checks.');
+});
+
+test('a rollback and a preserved Replace ref read as facts, not actions', () => {
+    const rolled = updateAttemptView({ ...refusal, outcome: 'rolled_back', error: 'pre-restart smoke failed', blockers: [],
+        work_stop: 'invoked' });
+    assert.deepEqual([rolled.pill, rolled.headline], ['Previous version restored', 'The update failed; the previous version was restored.']);
+    const kept = updateAttemptView({ ...refusal, outcome: 'applied', concluded_by: 'boot', blockers: [], work_stop: '',
+        keep_branch: 'local-keep-20261021_032000-a1b2c3' });
+    assert.match(kept.text, /kept on branch local-keep-20261021_032000-a1b2c3/);
+    assert.equal(kept.details.find((row) => row.label === 'Saved local work').value, 'local-keep-20261021_032000-a1b2c3');
+});
+
+test('a failed save discloses retention uncertainty without changing the actual outcome or stage', () => {
+    for (const active of [false, true]) {
+        const progress = { ...refusal, active, retention_unconfirmed: true };
+        const view = updateAttemptView(progress);
+        const ordinary = updateAttemptView({ ...progress, retention_unconfirmed: false });
+        assert.deepEqual([view.pill, view.headline, view.terminal], [ordinary.pill, ordinary.headline, ordinary.terminal]);
+        assert.match(view.text, /could not be saved.*after restart/);
+        assert.doesNotMatch(ordinary.text, /could not be saved/);
+    }
+});
+
+test('a retained outcome never takes the primary action: Update stays an explicit retry', () => {
+    const data = { managed: true, check_ok: true, available: true, safe_to_apply: true, latest_version: '7.1.0',
+        update_tx: { active: false }, update_progress: refusal };
+    const verdict = updateVerdict(data);
+    assert.deepEqual([verdict.state, verdict.action.id, verdict.action.label], ['available', 'update', 'Update to 7.1.0']);
+    assert.deepEqual([updateVerdict({ ...data, available: false }).state, updateVerdict({ ...data, available: false }).action.id],
+        ['current', 'check']);
+});
+
+test('a restart need belongs to the server that had it', () => {
+    const failure = { ...refusal, outcome: 'failed', restart_required: true, blockers: ['service:mcp'], work_stop: 'invoked' };
+    assert.equal(updateVerdict({ managed: true, update_progress: failure }).state, 'restart_needed');
+    assert.notEqual(updateVerdict({ managed: true, update_progress: { ...failure, current_generation: false } }).state,
+        'restart_needed');
+    assert.doesNotMatch(updateAttemptView({ ...failure, current_generation: false }).text, /needs a restart/);
+});
+
+// One indicator on the DOM double: its listeners, storage and a window whose events reach their listeners.
+async function withIndicator(run) {
+    const env = installDomDouble();
+    const stored = new Map();
+    const priorStorage = globalThis.localStorage;
+    const priorDispatch = globalThis.window.dispatchEvent;
+    globalThis.localStorage = { getItem: (key) => stored.get(key) ?? null, setItem: (key, value) => stored.set(key, String(value)) };
+    globalThis.window.dispatchEvent = (event) => globalThis.window.emit(event.type);
+    let controller;
+    try {
+        env.doc.body.append(env.el('span', { attrs: { id: 'nav-version' } }));
+        const listeners = new Map();
+        const ws = { on(name, fn) { listeners.set(name, fn); return () => listeners.delete(name); } };
+        const opened = [];
+        const world = { status: null, reads: 0 };
+        controller = initUpdateStatus({ ws, showPage: (page) => opened.push(page), openDashboardTab: (tab) => opened.push(tab),
+            readStatus: async () => { world.reads += 1; if (!world.status) throw new Error('offline'); return structuredClone(world.status); } });
+        const show = async (status, event = 'update_progress_changed') => {
+            world.status = status;
+            listeners.get(event)();
+            await settle();
+        };
+        const pill = () => env.doc.getElementById('update-pill');
+        const close = () => env.doc.body.querySelector('.update-notice-close');
+        await run({ env, show, pill, close, opened, world, stored, listeners });
+    } finally {
+        controller?.dispose();
+        globalThis.window.dispatchEvent = priorDispatch;
+        globalThis.localStorage = priorStorage;
+        env.restore();
+    }
+}
+
+const applied = { ...refusal, operation_id: 'attempt-ok', outcome: 'applied', result: 'applied', concluded_by: 'boot',
+    blockers: [], work_stop: '', reason: '' };
+
+test('a confirmed success never wears the indicator, hides nothing, and never masks a newer version', async () => {
+    await withIndicator(async ({ show, pill, close, stored }) => {
+        await show({ managed: true, available: false, update_progress: { ...refusal, active: true, outcome: '', result: '',
+            stage: 'checking', work_stop: 'invoked' } });
+        assert.deepEqual([pill().hidden, pill().textContent], [false, 'Checking update…']);
+        assert.equal(close().hidden, true, 'a stage has no close: it ends by itself');
+        // The server concludes: nothing announces it. The record stays in Dashboard → Updates (updateAttemptView).
+        await show({ managed: true, available: false, update_progress: applied });
+        assert.equal(pill().hidden, true, 'no capsule, no toast, no timer: the success lives in the panel alone');
+        assert.equal(pill().dataset.tone, undefined);
+        assert.equal(stored.size, 0, 'nothing is stored: there is nothing to dismiss');
+        assert.equal(updateAttemptView(applied).headline, 'Update completed.', 'the retained record is untouched');
+        // An old success must not stand where a newer version is announced.
+        await show({ managed: true, available: true, latest_version: '7.1.0', update_progress: applied });
+        assert.deepEqual([pill().hidden, pill().textContent, pill().dataset.tone], [false, 'Update available', undefined]);
+        assert.equal(close().hidden, true, 'availability is a current fact: it ends with the fact');
+    });
+});
+
+test('a failed or unconfirmed outcome stays with its own close; closing hides this notice and nothing else', async () => {
+    await withIndicator(async ({ env, show, pill, close, opened, world, stored }) => {
+        await show({ managed: true, available: false, update_progress: refusal });
+        assert.deepEqual([pill().hidden, pill().textContent, pill().dataset.tone], [false, 'Update not applied', 'error']);
+        assert.equal(close().hidden, false, 'the close stands beside the notice it ends');
+        assert.equal(close().getAttribute('aria-label'), 'Hide this notice');
+        assert.equal(close().tagName, 'BUTTON');
+        pill().click();
+        assert.deepEqual(opened, ['updates'], 'the capsule still opens the one panel');
+        const before = world.reads;
+        close().click();
+        assert.equal(pill().hidden, true, 'hidden: no available update to point at');
+        assert.equal(world.reads, before, 'hiding sends no request');
+        assert.deepEqual([...stored], [['ouroboros.update-attempt-dismissed', 'attempt-a']], 'one attempt id, this browser only');
+        assert.equal(updateAttemptView(refusal).headline, 'No update was applied.', 'the saved result is untouched');
+        // A newer notice-worthy attempt shows again, closable, and a failure does not outlast a newer version.
+        await show({ managed: true, available: true, update_progress: { ...refusal, operation_id: 'attempt-b', outcome: 'unknown',
+            reason: 'no_completion_record', work_stop: '', blockers: [] } });
+        assert.deepEqual([pill().hidden, pill().textContent, pill().dataset.tone], [false, 'Update outcome unconfirmed', 'neutral']);
+        assert.equal(close().hidden, false, 'unconfirmed stays until closed, even beside a newer version');
+        close().focus();
+        assert.equal(env.doc.activeElement, close());
+        close().click();
+        assert.equal(env.doc.activeElement, pill(), 'a keyboard reader lands on what the close unmasked, not on the page');
+        assert.deepEqual([pill().hidden, pill().textContent, pill().dataset.tone], [false, 'Update available', undefined],
+            'once hidden, the version it was hiding shows');
+        assert.equal(close().hidden, true);
+        // Another browser has no such memory: the same record shows the notice again there.
+        stored.clear();
+        globalThis.window.emit('ouro:update-attempt-dismissed');
+        assert.deepEqual([pill().textContent, close().hidden], ['Update outcome unconfirmed', false]);
+    });
+});
+
+test('restart messages are untouched: a needed restart is a stage without a close, a failed one keeps its words', async () => {
+    await withIndicator(async ({ show, pill, close }) => {
+        await show({ managed: true, available: false, update_progress: { ...refusal, active: false, outcome: '',
+            result: 'restart_required', restart_required: true, stage: 'stopping_services', blockers: ['service:mcp'] } });
+        assert.deepEqual([pill().textContent, pill().dataset.tone, close().hidden], ['Restart needed', 'neutral', true]);
+        await show({ managed: true, available: false, update_progress: { ...refusal, outcome: 'failed', restart_required: true,
+            blockers: ['service:mcp'], work_stop: 'invoked', error: 'A service could not be stopped.' } });
+        assert.deepEqual([pill().textContent, pill().dataset.tone, close().hidden], ['Update failed', 'error', false]);
+        assert.match(pill().title, /Ouroboros needs a restart before updates can continue\./);
+    });
+});
+
+// #2671: the shapes /api/update/status serves for a resolver start whose boot rollback did not finish
+// (tests/test_update_attempt_consumers.py drives the real boot for each).
+const resolverStart = { ...refusal, operation_id: 'attempt-r', generation: 'server-a', current_generation: false,
+    stage: 'preparing', result: 'assisted_started', outcome: '', concluded_by: undefined, reason: '', error: '',
+    blockers: [], work_stop: undefined, tx_attempt_id: 'tx-r' };
+const unfinished = { ...resolverStart, outcome: 'failed', reason: 'rollback_incomplete', concluded_by: 'boot',
+    error: 'rollback could not clear update intent before restoring the repository',
+    stash_note: 'the conflicting update could not resume after the restart, and its rollback did not finish.',
+    blockers: ['worker:4242'] };
+const boundTx = (phase, attempt = 'tx-r') => ({ active: true, phase, task_id: '', restart_required: false, attempt_id: attempt });
+
+test('a boot rollback that did not finish reads as incomplete recovery everywhere, with no invented control', () => {
+    const view = updateAttemptView(unfinished, boundTx('rolling_back'));
+    assert.deepEqual([view.terminal, view.tone, view.pill, view.restoreTarget],
+        [true, 'error', 'Update recovery incomplete', '']);
+    assert.equal(view.headline, 'The update failed, and restoring the previous version did not finish.');
+    assert.match(view.text, /^Quit and reopen the desktop app/);
+    assert.equal(view.details.find((row) => row.label === 'Error').value, unfinished.error);
+    assert.equal(view.details.find((row) => row.label === 'Recovery note').value, unfinished.stash_note);
+    assert.doesNotMatch(view.text, /rollback could not clear|the conflicting/);
+    assert.equal(view.details.find((row) => row.label === 'Blocked by').value, 'worker:4242');
+    // History once its transaction is gone: the fact stays, the retry instruction does not.
+    assert.doesNotMatch(updateAttemptView(unfinished, { active: false }).text, /Quit and reopen/);
+    assert.doesNotMatch(updateAttemptView(unfinished, boundTx('rolling_back', 'tx-other')).text, /Quit and reopen/);
+    for (const phase of ['rolling_back', 'assisted_resolution', 'pending_boot_smoke']) {
+        const verdict = updateVerdict({ managed: true, update_progress: unfinished, update_tx: boundTx(phase) });
+        // pending_boot_smoke keeps the in-app Restart its phase allows (server_restart._RESTARTABLE_UPDATE_PHASES).
+        assert.deepEqual([verdict.state, verdict.tone, verdict.action, verdict.recoveryInstruction], ['resolving', 'error',
+            phase === 'pending_boot_smoke' ? { id: 'restart', label: 'Restart now' } : { id: 'check', label: 'Check again' }, true]);
+        assert.equal(verdict.headline, view.headline, `${phase}: the panel and the indicator say one thing`);
+        assert.equal(verdict.hint, view.text);
+        assert.doesNotMatch(verdict.headline, /under review|waiting for a restart/);
+    }
+    // An executor's own failure keeps its ordinary words: the reason names this boot report alone.
+    const executor = updateAttemptView({ ...unfinished, reason: 'update_writer_fence_blocked', concluded_by: 'executor' },
+        boundTx('rolling_back'));
+    assert.deepEqual([executor.pill, executor.headline], ['Update failed', 'The update did not complete.']);
+});
+
+test('only a bound transaction still in an assisted phase is a resolution at work', () => {
+    assert.equal(updateAttemptView(resolverStart, boundTx('assisted_resolution')).pill, 'Resolving update…');
+    assert.equal(updateAttemptView(resolverStart, boundTx('committing_assisted')).pill, 'Resolving update…');
+    for (const tx of [boundTx('marker_cleanup_retry'), boundTx('gate_blocked'), boundTx('rolling_back'),
+        { ...boundTx('pending_boot_smoke'), local_work_recovery: true }, boundTx('assisted_resolution', 'tx-other'),
+        { active: false }, null]) {
+        const view = updateAttemptView(resolverStart, tx);
+        assert.deepEqual([view.terminal, view.tone, view.pill, view.headline],
+            [false, 'neutral', 'Update not concluded', 'This update has not concluded yet.'], JSON.stringify(tx));
+    }
+});
+
+test('the panel can say the recovery instruction once without hiding other retained facts', () => {
+    const tx = boundTx('assisted_resolution');  // a failed write can leave this old phase on disk
+    for (const extra of [{ keep_branch: 'local-keep-test' }, { retention_unconfirmed: true },
+        { keep_branch: 'local-keep-test', retention_unconfirmed: true }]) {
+        const progress = { ...unfinished, ...extra };
+        const verdict = updateVerdict({ managed: true, update_progress: progress, update_tx: tx });
+        assert.equal(verdict.hint, RECOVERY_RETRY);
+        const view = updateAttemptView(progress, tx, { showRecoveryInstruction: !verdict.recoveryInstruction });
+        assert.doesNotMatch(view.text, /Quit and reopen/);
+        if (extra.keep_branch) assert.match(view.text, /local-keep-test/);
+        if (extra.retention_unconfirmed) assert.match(view.text, /could not be saved/);
+        assert.match(updateAttemptView(progress, tx).text, /Quit and reopen/, 'the indicator retains its instruction');
+    }
+});
+
+test('a verdict that gives the recovery instruction owns it, and a recorded completion outdates "did not finish"', () => {
+    const quitReopen = /Quit and reopen/g;
+    // local_work_recovery outranks the failed record: stash recovery after an unfinished rollback (still true), and a
+    // finished rollback awaiting its restart (marker_cleanup_retry, rollback_restart_pending).
+    for (const [phase, stale] of [['rolling_back', false], ['assisted_resolution', false], ['marker_cleanup_retry', true]]) {
+        const tx = { ...boundTx(phase), local_work_recovery: true };
+        const verdict = updateVerdict({ managed: true, update_progress: unfinished, update_tx: tx });
+        assert.equal(verdict.headline, 'Local changes still need recovery confirmation.');
+        assert.equal(verdict.recoveryInstruction, true);
+        const view = updateAttemptView(unfinished, tx, { showRecoveryInstruction: !verdict.recoveryInstruction });
+        const said = [verdict.hint, view.text].join(' ').match(quitReopen) || [];
+        assert.equal(said.length, 1, `${phase}: one quit/reopen instruction`);
+        assert.equal(view.headline, stale ? 'The update did not complete.'
+            : 'The update failed, and restoring the previous version did not finish.', phase);
+        assert.equal(Boolean(unfinishedRecovery(unfinished, tx)), !stale, phase);
+        // The exact diagnostics remain reachable, historical wording included.
+        assert.equal(view.details.find((row) => row.label === 'Recovery note').value, unfinished.stash_note);
+    }
+    // Cleanup retry alone (no local work): its own gate verdict gives the instruction; the record is history.
+    const cleanup = updateVerdict({ managed: true, update_progress: unfinished, update_tx: boundTx('marker_cleanup_retry') });
+    assert.equal(cleanup.headline, 'An update attempt stopped mid-flight and needs recovery.');
+    assert.equal(cleanup.recoveryInstruction, true);
+    const history = updateAttemptView(unfinished, boundTx('marker_cleanup_retry'));
+    assert.deepEqual([history.pill, history.headline], ['Update failed', 'The update did not complete.']);
+    assert.doesNotMatch(history.text, quitReopen);
+    // A corrupt marker's own instruction is not repeated either.
+    const corrupt = updateVerdict({ managed: true, update_progress: unfinished, update_tx: boundTx('corrupt') });
+    assert.equal(corrupt.recoveryInstruction, true);
+    // A verdict without its own instruction leaves the attempt's single one in place.
+    const plain = updateVerdict({ managed: true, update_progress: resolverStart, update_tx: boundTx('assisted_resolution') });
+    assert.notEqual(plain.recoveryInstruction, true);
+});
+
+test('one assisted-phase reading serves the panel verdict and the attempt record', () => {
+    for (const phase of ['materializing_assisted', 'assisted_resolution', 'committing_assisted',
+        'assisted_unknown_future', 'gate_blocked', 'pending_boot_smoke', '']) {
+        const tx = boundTx(phase);
+        const verdict = updateVerdict({ managed: true, update_progress: resolverStart, update_tx: tx });
+        const view = updateAttemptView(resolverStart, tx);
+        const resolving = assistedUpdatePhase(phase);
+        assert.equal(verdict.headline === 'A conflicting update is being resolved under review.', resolving, phase);
+        assert.equal(view.pill === 'Resolving update…', resolving, phase);
+    }
+});
+
+test('a hidden recovery notice stays hidden for its attempt while Last attempt takes the later conclusion', async () => {
+    await withIndicator(async ({ show, pill, close }) => {
+        await show({ managed: true, available: false, update_progress: resolverStart, update_tx: boundTx('assisted_resolution') });
+        assert.deepEqual([pill().textContent, close().hidden], ['Resolving update…', true]);
+        await show({ managed: true, available: false, update_progress: unfinished, update_tx: boundTx('rolling_back') });
+        assert.deepEqual([pill().hidden, pill().textContent, pill().dataset.tone, close().hidden],
+            [false, 'Update recovery incomplete', 'error', false]);
+        assert.match(pill().title, /Quit and reopen/);
+        close().click();
+        const restored = { ...unfinished, outcome: 'rolled_back', reason: '', error: '', stash_note: '', blockers: [] };
+        await show({ managed: true, available: false, update_progress: restored, update_tx: { active: false } });
+        assert.equal(pill().hidden, true, 'the same operation stays dismissed in this browser');
+        assert.equal(updateAttemptView(restored, { active: false }).pill, 'Previous version restored');
+    });
+});
+
+test('the indicator coalesces notices, never renders a superseded read, and disposes every subscription', async () => {
+    const env = installDomDouble();
+    try {
+        const listeners = new Map();
+        const ws = { on(name, fn) { listeners.set(name, fn); return () => listeners.delete(name); } };
+        const pending = [];
+        const windowListeners = globalThis.window.listenerCount();
+        const controller = initUpdateStatus({ ws, readStatus: () => new Promise((resolve) => pending.push(resolve)) });
+        listeners.get('update_progress_changed')();
+        listeners.get('update_progress_changed')();
+        assert.equal(pending.length, 1, 'one read in flight; later notices queue one more');
+        pending.shift()({ managed: true, available: false, update_progress: { ...refusal, operation_id: 'stale' } });
+        await settle();
+        assert.equal(env.doc.getElementById('update-pill'), null, 'the superseded answer is not rendered');
+        assert.equal(pending.length, 1, 'the queued read runs');
+        pending.shift()({ managed: true, available: false, update_progress: refusal });
+        await settle();
+        assert.equal(env.doc.getElementById('update-pill').textContent, 'Update not applied');
+        controller.dispose();
+        assert.equal(listeners.size, 0);
+        assert.equal(globalThis.window.listenerCount(), windowListeners);
+    } finally {
+        env.restore();
+    }
 });

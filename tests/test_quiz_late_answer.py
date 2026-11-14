@@ -12,6 +12,8 @@ invariants live in ``tests/test_quiz_answer.py``; the durable evidence half is
 
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import json
 
 import pytest
@@ -24,10 +26,20 @@ from ouroboros.owner_quiz import (
 )
 from tests.test_quiz_answer import _decision_app, _post
 
+# TZ-2 B3: the model-facing first line of every late answer (never the owner's row).
+LATE_HEAD = "[Late answer to a question asked by task {}, which had finished]"
+
 
 def _late_bridge(tmp_path, monkeypatch):
-    """A real bridge for the late-answer path: named ingress plus the WS echo."""
+    """A real bridge and explicit fixture publication witnesses for named late delivery."""
     import supervisor.message_bus as mb
+    from ouroboros.owner_quiz import record_publication
+    from ouroboros.task_store import task_facts
+
+    for task_id in task_facts(tmp_path):
+        for quiz_id, block in quiz_states(tmp_path, task_id).items():
+            if "chat_id" in block:
+                record_publication(tmp_path, task_id, quiz_id, block["chat_id"])
 
     bridge = mb.LocalChatBridge()
     frames = []
@@ -48,9 +60,19 @@ def _inbox(bridge):
 
 def _accepted_rows(tmp_path, client_message_id):
     return [row for row in (json.loads(line) for line in
-                            (tmp_path / "logs" / "chat.jsonl").read_text().splitlines())
+                            dialogue_test.log_text(tmp_path / "logs" / "chat.jsonl").splitlines())
             if row.get("client_message_id") == client_message_id]
 
+
+
+def _assert_host_snapshot(ref, task_id, quiz_id):
+    assert set(ref) == {"task_id", "quiz_id", "answer_snapshot"}
+    assert (ref["task_id"], ref["quiz_id"]) == (task_id, quiz_id)
+    snapshot = ref["answer_snapshot"]
+    assert snapshot["task_id"] == task_id
+    assert snapshot["quiz"]["quiz_id"] == quiz_id
+    assert snapshot["quiz"]["state"] == STATE_ANSWERED
+    assert snapshot["quiz"]["answered_after_terminal"] is True
 
 def test_ingress_late_answer_is_accepted_and_delivered_as_an_owner_message(tmp_path, monkeypatch):
     """Owner decision В17a=A (retiring 30=A): the card outlives its author.
@@ -78,17 +100,22 @@ def test_ingress_late_answer_is_accepted_and_delivered_as_an_owner_message(tmp_p
     [queued] = _inbox(bridge)
     assert queued["chat_id"] == 1 and queued["user_id"] == 1 and queued["source"] == "web"
     assert queued["client_message_id"] == source_id
-    # The FULL existing answer frame, nothing trimmed; provenance is its own
-    # field and the real transport's client_surface is never substituted.
-    assert "[Owner quiz answer]" in queued["text"] and "Which db?" in queued["text"]
-    assert "prod parity" in queued["text"] and "postgres" in queued["text"]
-    assert queued["task_metadata"]["late_answer"] == {"task_id": "task-1", "quiz_id": "q1"}
+    # The owner's row and bubble are the HUMAN's words (the verbatim comment),
+    # never the host frame; provenance is its own field and the real
+    # transport's client_surface is never substituted.
+    assert queued["text"] == "prod parity"
+    assert "[Owner quiz answer]" not in queued["text"]
+    _assert_host_snapshot(queued["task_metadata"]["late_answer"], "task-1", "q1")
     assert "client_surface" not in queued["task_metadata"]
     # The same user bubble the owner's own typing produces.
     echo = [f for f in frames if f.get("type") == "chat" and f.get("role") == "user"]
     assert len(echo) == 1 and echo[0]["client_message_id"] == source_id
     assert echo[0]["chat_id"] == 1 and echo[0]["content"] == queued["text"]
-    assert len(_accepted_rows(tmp_path, source_id)) == 1
+    [row] = _accepted_rows(tmp_path, source_id)
+    assert row["text"] == echo[0]["content"] == "prod parity"
+    # The live echo states the same durable-acceptance fact as the canonical row
+    # (history replays it), so the bubble says `Input saved` before a reload too.
+    assert row["ingress_accepted"] is True and echo[0]["ingress_accepted"] is True
 
     # A retry of the SAME request re-enters delivery; the named ingress rejoins.
     again = _post(app, {"request_id": "r1", "decision_id": "quiz:task-1:q1",
@@ -111,7 +138,10 @@ def test_an_answer_the_live_task_received_is_not_forwarded_when_retried_after_it
     assert first.status_code == 200, first.text
     assert first.json()["duplicate"] is False and not first.json().get("forwarded")
     assert "answered_after_terminal" not in quiz_states(tmp_path, "task-2")["q1"]
-    reconcile_terminal(tmp_path, "task-2")  # the task ended with the answer in its mailbox
+    from ouroboros.owner_mailbox import drain_owner_entries, acknowledge_transcript_entry
+    [entry] = drain_owner_entries(tmp_path, "task-2", set())
+    assert acknowledge_transcript_entry(tmp_path, "task-2", entry)
+    reconcile_terminal(tmp_path, "task-2")  # the task ended after reading the answer
     gone = _decision_app(tmp_path, monkeypatch, live_task=None)
     again = _post(gone, {"request_id": "r2", "decision_id": "quiz:task-2:q1", "option_index": 0})
     assert again.status_code == 200 and again.json()["duplicate"] is True
@@ -139,6 +169,9 @@ def test_a_relayed_late_answer_keeps_the_relaying_skill_as_its_source(tmp_path, 
     assert queued["source"] == "skill:telegram" and queued["chat_id"] == 1
     echo = [f for f in frames if f.get("type") == "chat" and f.get("role") == "user"]
     assert echo and echo[0].get("source") == "skill:telegram"
+    # Only a web acceptance row carries the typed fact; the echo never invents it.
+    [row] = _accepted_rows(tmp_path, "quiz_late_answer:task-3:q1")
+    assert "ingress_accepted" not in row and "ingress_accepted" not in echo[0]
 
 
 def test_ingress_heals_an_unreconciled_quiz_of_a_dead_task(tmp_path, monkeypatch):
@@ -161,9 +194,8 @@ def test_ingress_heals_an_unreconciled_quiz_of_a_dead_task(tmp_path, monkeypatch
     assert not drain_owner_entries(tmp_path, "task-1", set())
 
 
-def test_late_answer_addresses_the_task_row_when_the_block_predates_chat_ids(tmp_path, monkeypatch):
-    """An older block has no stored chat_id: the delivery falls back to the same
-    addressing the answer's own history row already uses."""
+def test_legacy_late_answer_without_publication_proof_retains_a_routing_gap(tmp_path, monkeypatch):
+    """Today's task chat does not prove where an older card was published."""
     from ouroboros.task_results import write_task_result
 
     write_task_result(tmp_path, "task-1", "completed", chat_id=1)
@@ -174,9 +206,10 @@ def test_late_answer_addresses_the_task_row_when_the_block_predates_chat_ids(tmp
     app = _decision_app(tmp_path, monkeypatch, live_task=None)
     resp = _post(app, {"request_id": "r1", "decision_id": "quiz:task-1:q1",
                        "option_index": 0})
-    assert resp.status_code == 200 and resp.json()["forwarded"] is True
-    [queued] = _inbox(bridge)
-    assert queued["chat_id"] == 1
+    assert resp.status_code == 200 and resp.json()["forwarded"] is False
+    assert resp.json()["reason_code"] == "publication_address_unknown"
+    assert resp.json()["question_delivery"]["state"] == "owed"
+    assert _inbox(bridge) == []
 
 
 @pytest.mark.parametrize("chat_id,reason", [(-1001, "a2a_chat"), (0, "hidden_chat")])
@@ -219,3 +252,503 @@ def test_a_second_answer_to_a_settled_card_is_still_a_first_wins_409(tmp_path, m
     assert loser.json()["state"] == STATE_ANSWERED
     assert loser.json()["answered_index"] == 1
     assert _inbox(bridge) == []
+
+
+def _real_liveness_app(tmp_path, monkeypatch):
+    """The decision app with the REAL queue-backed liveness read (no lambda stub)."""
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+
+    from ouroboros.gateway import task_decision as td
+
+    monkeypatch.setattr(td, "request_drive_root", lambda request: tmp_path)
+    return Starlette(routes=[Route("/api/decisions", endpoint=td.api_decision_answer, methods=["POST"])])
+
+
+@pytest.mark.parametrize("settled", [True, False])
+def test_an_answer_during_settled_post_work_takes_the_late_path_not_the_dead_mailbox(
+    tmp_path, monkeypatch, settled,
+):
+    """TZ-2 D15 at quiz ingress: a root whose result settled while its worker still
+    runs paid post-work is still in RUNNING, but its solve loop no longer drains
+    the mailbox — terminal cleanup would erase an answer written there unread.
+    The same actor-drive settlement fact the owner-mail routing guard reads sends
+    the answer through the late path instead: accepted with the audit flag and
+    delivered into the card's chat as the owner's own message. A root whose
+    result has not settled still receives the answer as its mailbox control."""
+    import supervisor.queue as q
+
+    from ouroboros.owner_mailbox import KIND_QUIZ_ANSWER, drain_owner_entries
+    from ouroboros.task_results import write_task_result
+
+    task = {"id": "task-3", "chat_id": 1, "root_task_id": "task-3", "delegation_role": "root",
+            "metadata": {}, "drive_root": str(tmp_path)}
+    monkeypatch.setattr(q, "RUNNING", {"task-3": {"task": task}}, raising=False)
+    monkeypatch.setattr(q, "PENDING", [], raising=False)
+    record_asked(tmp_path, "task-3", quiz_id="q1", question="Which db?",
+                 options=["sqlite", "postgres"], assumption="sqlite meanwhile", chat_id=1)
+    record_asked(tmp_path, "task-3", quiz_id="q2", question="Which cache?",
+                 options=["redis", "none"], assumption="none meanwhile", chat_id=1)
+    write_task_result(tmp_path, "task-3", "completed" if settled else "running", result="answer",
+                      root_phase_checkpoint={"post_task_synthesis": "running" if settled else "pending_once"})
+    bridge, frames = _late_bridge(tmp_path, monkeypatch)
+    app = _real_liveness_app(tmp_path, monkeypatch)
+    resp = _post(app, {"request_id": "r3", "decision_id": "quiz:task-3:q1", "option_index": 1})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    block = quiz_states(tmp_path, "task-3")["q1"]
+    mailbox = drain_owner_entries(tmp_path, "task-3")
+    if settled:
+        assert body["answered_after_terminal"] is True and body["forwarded"] is True
+        assert block["state"] == STATE_ANSWERED and block["answered_after_terminal"] is True
+        assert mailbox == []  # nothing is labelled delivered into a mailbox nobody drains
+        [queued] = _inbox(bridge)
+        assert queued["client_message_id"] == "quiz_late_answer:task-3:q1"
+        _assert_host_snapshot(queued["task_metadata"]["late_answer"], "task-3", "q1")
+        # The sibling card healed here is told now: the task-done seam announces
+        # only what it expires itself.
+        assert quiz_states(tmp_path, "task-3")["q2"]["state"] == "expired_terminal"
+        states = [(f["quiz_id"], f["state"]) for f in frames if f.get("type") == "quiz_state"]
+        assert states == [("q2", "expired_terminal"), ("q1", STATE_ANSWERED)]
+    else:
+        assert "answered_after_terminal" not in body and "answered_after_terminal" not in block
+        assert [row["kind"] for row in mailbox] == [KIND_QUIZ_ANSWER]
+        assert _inbox(bridge) == []
+        assert quiz_states(tmp_path, "task-3")["q2"]["state"] == "open"
+def test_a_button_only_late_answer_speaks_the_pressed_option_as_the_owner(tmp_path, monkeypatch):
+    """No comment: the owner's row, queued text and bubble are the pressed
+    option exactly as the button showed it (the ingress refuses empty text),
+    and still never the English host frame."""
+    record_asked(tmp_path, "task-1", quiz_id="q1", question="Which db?",
+                 options=["sqlite", "postgres"], assumption="sqlite meanwhile", chat_id=1)
+    reconcile_terminal(tmp_path, "task-1")
+    bridge, frames = _late_bridge(tmp_path, monkeypatch)
+    app = _decision_app(tmp_path, monkeypatch, live_task=None)
+    resp = _post(app, {"request_id": "r1", "decision_id": "quiz:task-1:q1", "option_index": 1})
+    assert resp.status_code == 200 and resp.json()["forwarded"] is True
+    [queued] = _inbox(bridge)
+    assert queued["text"] == "2. postgres"
+    [echo] = [f for f in frames if f.get("type") == "chat" and f.get("role") == "user"]
+    [row] = _accepted_rows(tmp_path, "quiz_late_answer:task-1:q1")
+    assert echo["content"] == row["text"] == "2. postgres"
+    assert "[Owner quiz answer]" not in row["text"]
+
+
+def test_a_retry_of_a_late_answer_accepted_with_the_old_frame_text_rejoins(tmp_path, monkeypatch):
+    """A late answer accepted before the row carried only the owner's words has
+    the host frame under the same id; a retry now rejoins that delivery instead
+    of failing forever on the text mismatch or enqueueing a second owner turn."""
+    import supervisor.message_bus as mb
+
+    record_asked(tmp_path, "task-1", quiz_id="q1", question="Which db?",
+                 options=["sqlite", "postgres"], assumption="sqlite meanwhile", chat_id=1)
+    reconcile_terminal(tmp_path, "task-1")
+    bridge, frames = _late_bridge(tmp_path, monkeypatch)
+    mb.log_chat("in", 1, 1, "[Owner quiz answer] quiz q1 -- old frame", source="web",
+                client_message_id="quiz_late_answer:task-1:q1", drive_root=tmp_path,
+                require_write=True)
+    app = _decision_app(tmp_path, monkeypatch, live_task=None)
+    resp = _post(app, {"request_id": "r1", "decision_id": "quiz:task-1:q1", "option_index": 1})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["forwarded"] is False
+    assert resp.json()["reason_code"] == "late_answer_delivery_unknown"
+    assert _inbox(bridge) == [] and not [f for f in frames if f.get("type") == "chat"]
+    assert len(_accepted_rows(tmp_path, "quiz_late_answer:task-1:q1")) == 1
+
+
+def _answered_late(tmp_path, *, option_index, comment=""):
+    from ouroboros.owner_quiz import record_answered
+
+    record_asked(tmp_path, "task-1", quiz_id="q1", question="Which db for the pilot?",
+                 options=["sqlite", "postgres"], assumption="sqlite meanwhile", chat_id=1)
+    reconcile_terminal(tmp_path, "task-1")
+    outcome = record_answered(tmp_path, "task-1", quiz_id="q1", option_index=option_index,
+                              request_id="r1", comment=comment, allow_expired=True)
+    assert outcome["ok"] is True
+    return outcome["block"]
+
+
+def test_the_drained_late_answer_gives_the_model_the_rebuilt_frame_while_the_row_stays_human(tmp_path):
+    """Project-room mailbox delivery: the entry (and the owner's row) carry only
+    the owner's words; the drain rebuilds the FULL card frame from the stored
+    block for the model and records the owner directive with that frame."""
+    import queue as queue_mod
+    from types import SimpleNamespace
+
+    from ouroboros.loop_round_limits import _drain_incoming_messages
+    from ouroboros.owner_mailbox import drain_owner_entries, write_owner_message
+
+    block = _answered_late(tmp_path, option_index=None, comment="neither -- use duckdb")
+    assert write_owner_message(
+        tmp_path, "neither -- use duckdb", "live-root", msg_id="quiz_late_answer:task-1:q1:live-root",
+        client_message_id="quiz_late_answer:task-1:q1",
+        late_answer={"task_id": "task-1", "quiz_id": "q1"},
+    )
+    [entry] = drain_owner_entries(tmp_path, "live-root", set(), include_acknowledged=True)
+    assert entry["text"] == "neither -- use duckdb"
+    assert entry["late_answer"] == {"task_id": "task-1", "quiz_id": "q1"}
+
+    ctx = SimpleNamespace()
+    messages = [{"role": "user", "content": "Initial requirement"}]
+    _drain_incoming_messages(messages, queue_mod.Queue(), tmp_path, "live-root", None, set(),
+                             owner_ctx=ctx)
+    delivered = str(messages[-1]["content"])
+    assert f"{LATE_HEAD.format('task-1')}\n[Owner quiz answer] quiz q1" in delivered
+    assert f"asked {block['asked_at']}" in delivered and f"answered {block['answered_at']}" in delivered
+    assert "Question was: Which db for the pilot?" in delivered
+    assert ("The owner answered in their own words without choosing an offered option. "
+            "Verbatim: neither -- use duckdb") in delivered
+    [directive] = [row for row in ctx._owner_directives if row["source"] == "owner_mailbox"]
+    assert directive["content"] == "neither -- use duckdb"
+    # The steer relay's delivery fact stays the owner's own message.
+    assert ctx.last_owner_delivery["text"] == "neither -- use duckdb"
+
+
+def test_an_ordinary_mailbox_message_is_not_reframed(tmp_path):
+    """The still-working case: a mailbox message without late_answer provenance
+    reaches the model as the owner's words, unchanged."""
+    import queue as queue_mod
+    from types import SimpleNamespace
+
+    from ouroboros.loop_round_limits import _drain_incoming_messages
+    from ouroboros.owner_mailbox import write_owner_message
+
+    _answered_late(tmp_path, option_index=1)
+    assert write_owner_message(tmp_path, "please also fix the test", "live-root", msg_id="m1")
+    ctx = SimpleNamespace()
+    messages = [{"role": "user", "content": "Initial requirement"}]
+    _drain_incoming_messages(messages, queue_mod.Queue(), tmp_path, "live-root", None, set(),
+                             owner_ctx=ctx)
+    delivered = str(messages[-1]["content"])
+    assert "please also fix the test" in delivered and "[Owner quiz answer]" not in delivered
+
+
+def test_an_unreadable_card_is_disclosed_with_the_owners_words(tmp_path):
+    """The block is gone (evicted, or the task result unreadable): the model
+    gets the owner's words plus one host line naming the quiz, never silence."""
+    import queue as queue_mod
+    from types import SimpleNamespace
+
+    from ouroboros.loop_round_limits import _drain_incoming_messages
+    from ouroboros.owner_mailbox import write_owner_message
+
+    assert write_owner_message(
+        tmp_path, "2. postgres", "live-root", msg_id="late-1",
+        late_answer={"task_id": "task-gone", "quiz_id": "q9"},
+    )
+    ctx = SimpleNamespace()
+    messages = [{"role": "user", "content": "Initial requirement"}]
+    _drain_incoming_messages(messages, queue_mod.Queue(), tmp_path, "live-root", None, set(),
+                             owner_ctx=ctx)
+    delivered = str(messages[-1]["content"])
+    assert "[Late answer to a question asked by task task-gone, which is not reading]\n2. postgres\n" in delivered
+    assert "answers quiz q9; that card could not be read" in delivered
+    assert "[Owner quiz answer]" not in delivered
+
+
+def test_a_late_answer_direct_turn_starts_with_the_rebuilt_frame(tmp_path, monkeypatch):
+    """Main / no live root: the late answer starts an ordinary owner turn whose
+    task carries the late_answer provenance; the carrier's first step rebuilds the
+    frame, so the model's first user content (and therefore the run's initial owner
+    directive) is the rebuilt frame, while the owner's row stays their words. A turn
+    without that provenance is unchanged."""
+    from ouroboros.context import build_user_content
+    from tests.test_attachment_staging import carried_turn
+
+    block = _answered_late(tmp_path, option_index=1, comment="prod parity")
+
+    class _Agent:
+        task = None
+
+        def handle_task(self, task):
+            self.task = task
+            return []
+
+    agent = _Agent()
+    carried_turn(monkeypatch, tmp_path, agent, 1, "prod parity", None, task_metadata={
+        "client_message_id": "quiz_late_answer:task-1:q1",
+        "late_answer": {"task_id": "task-1", "quiz_id": "q1"},
+    })
+    content = str(build_user_content(agent.task))
+    assert agent.task["text"].startswith(LATE_HEAD.format("task-1") + "\n[Owner quiz answer] quiz q1")
+    assert LATE_HEAD.format("task-1") in content
+    assert f"answered {block['answered_at']}" in content
+    assert "The owner chose option 2: postgres" in content
+    assert "Owner comment (verbatim): prod parity" in content
+
+    plain = _Agent()
+    carried_turn(monkeypatch, tmp_path, plain, 1, "prod parity", None, task_metadata={"client_message_id": "m-2"})
+    assert plain.task["text"] == "prod parity"
+
+
+def test_a_late_answer_bypasses_an_unrelated_project_reader(tmp_path, monkeypatch):
+    """End to end through the real bridge intake: a late answer in a Project room whose
+    one live root is unrelated work is never that root's addressed mail (it hears the room's
+    words as context only); a fresh head receives the answer with its typed late_answer provenance."""
+    from types import SimpleNamespace
+
+    import server
+    import supervisor.message_bus as mb
+    from ouroboros.owner_mailbox import drain_owner_entries
+    from ouroboros.owner_relay import ROUTED_BY_HEAD
+    from ouroboros.projects_registry import create_project
+
+    project = create_project(tmp_path, "racer")
+    chat_id = int(project["chat_id"])
+    record_asked(tmp_path, "task-1", quiz_id="q1", question="Which db?",
+                 options=["sqlite", "postgres"], assumption="sqlite meanwhile", chat_id=chat_id)
+    reconcile_terminal(tmp_path, "task-1")
+    bridge, _frames = _late_bridge(tmp_path, monkeypatch)
+    monkeypatch.setattr(mb, "load_state", lambda: {"session_id": "s-1"})
+    app = _decision_app(tmp_path, monkeypatch, live_task=None)
+    resp = _post(app, {"request_id": "r1", "decision_id": "quiz:task-1:q1",
+                       "option_index": 1, "comment": "prod parity"})
+    assert resp.status_code == 200 and resp.json()["forwarded"] is True
+
+    heads = []
+    pending = [{"id": "pending-root", "chat_id": chat_id, "root_task_id": "pending-root",
+                "delegation_role": "root", "drive_root": str(tmp_path)}]
+    ctx = SimpleNamespace(
+        DRIVE_ROOT=tmp_path, PENDING=[], RUNNING={"pending-root": {"task": pending[0]}},
+        load_state=lambda: {"owner_id": 1, "owner_chat_id": 1, "session_id": "s-1"},
+        update_state=lambda fn: fn({"owner_id": 1, "owner_chat_id": 1}),
+        consciousness=SimpleNamespace(inject_observation=lambda _text: None),
+        get_chat_agent=lambda: SimpleNamespace(_busy=False),
+        handle_chat_direct=lambda *a, **k: heads.append((a, k)),
+        send_with_budget=lambda *a, **k: None,
+    )
+    monkeypatch.setattr(bridge, "send_routing_ack", lambda *a, **k: None, raising=False)
+    server._process_bridge_updates(bridge, 0, ctx)
+
+    [context] = drain_owner_entries(tmp_path, "pending-root", set())
+    assert context["msg_id"].startswith("relay:carry-context:") and "late_answer" not in context
+    assert context["host_carried"] == {"went_to": ROUTED_BY_HEAD}
+    assert len(heads) == 1
+    metadata = heads[0][1]["task_metadata"]
+    _assert_host_snapshot(metadata["late_answer"], "task-1", "q1")
+
+
+def _late_answer_head(head_id, asker, chat_id, *, project_id="", started=1000.0, accepting=True):
+    """A live direct head that a late answer to ``asker`` started, as agent.py leaves it mid-turn."""
+    import threading
+    from types import SimpleNamespace
+
+    from supervisor.active_activity import get_direct_activity_registry
+
+    head = SimpleNamespace(
+        _busy=True, _accepting_owner_messages=accepting, _current_task_id=head_id, _current_chat_id=chat_id,
+        _current_task_metadata={**({"project_id": project_id} if project_id else {}),
+                                "late_answer": {"task_id": asker, "quiz_id": "q0"}},
+        _current_task_text="1. sqlite", _task_started_ts=started, _last_activity_ts=started,
+        _owner_message_admission_lock=threading.Lock())
+    get_direct_activity_registry().register(head_id, chat_id=chat_id, actor=head)
+    return head
+
+
+def _late_answered(tmp_path, monkeypatch, chat_id):
+    """task-1 asked q1 in ``chat_id`` and finished; the owner's late answer waits at bridge intake."""
+    import supervisor.message_bus as mb
+
+    record_asked(tmp_path, "task-1", quiz_id="q1", question="Which db?",
+                 options=["sqlite", "postgres"], assumption="sqlite meanwhile", chat_id=chat_id)
+    reconcile_terminal(tmp_path, "task-1")
+    bridge, _frames = _late_bridge(tmp_path, monkeypatch)
+    monkeypatch.setattr(mb, "load_state", lambda: {"session_id": "s-1"})
+    app = _decision_app(tmp_path, monkeypatch, live_task=None)
+    resp = _post(app, {"request_id": "r1", "decision_id": "quiz:task-1:q1", "option_index": 1})
+    assert resp.status_code == 200 and resp.json()["forwarded"] is True
+    return bridge
+
+
+def _intake(tmp_path, monkeypatch, bridge, *, running=None):
+    """One pass of the real bridge intake; returns the fresh heads it started."""
+    import threading
+    from types import SimpleNamespace
+
+    import server
+    from tests.test_v6730_origin_invariant import _ImmediateThread
+
+    started = []
+    ctx = SimpleNamespace(
+        DRIVE_ROOT=tmp_path, PENDING=[], RUNNING=dict(running or {}),
+        load_state=lambda: {"owner_id": 1, "owner_chat_id": 1, "session_id": "s-1"},
+        update_state=lambda fn: fn({"owner_id": 1, "owner_chat_id": 1}),
+        consciousness=SimpleNamespace(inject_observation=lambda _t: None, pause=lambda: None, resume=lambda: None),
+        get_chat_agent=lambda: SimpleNamespace(_busy=False),
+        handle_chat_direct=lambda *a, **k: started.append((a, k)),
+        send_with_budget=lambda *a, **k: None,
+    )
+    monkeypatch.setattr(bridge, "send_routing_ack", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(threading, "Thread", _ImmediateThread)
+    server._process_bridge_updates(bridge, 0, ctx)
+    return started
+
+
+@pytest.mark.parametrize(("head_asker", "room"), [("task-1", "project"), ("task-other", "main")])
+def test_a_late_answer_reaches_the_head_its_askers_earlier_answer_started(tmp_path, monkeypatch, room, head_asker):
+    """One asker's answers are one thread: through the real bridge intake, a late answer reads the
+    live head that an earlier late answer to the SAME asker started, beside an unrelated reader, in
+    a Project or in Main; a head holding another asker's answer is unrelated, and a fresh head starts."""
+    from ouroboros.owner_mailbox import drain_owner_entries
+    from ouroboros.owner_relay import ROUTED_BY_HEAD
+    from ouroboros.projects_registry import create_project
+
+    project = create_project(tmp_path, "racer") if room == "project" else {}
+    chat_id = int(project["chat_id"]) if project else 1
+    bridge = _late_answered(tmp_path, monkeypatch, chat_id)
+    _late_answer_head("head-1", head_asker, chat_id, project_id=str(project.get("id") or ""))
+    unrelated = {"id": "busy-root", "chat_id": chat_id, "root_task_id": "busy-root",
+                 "delegation_role": "root", "drive_root": str(tmp_path)}
+    started = _intake(tmp_path, monkeypatch, bridge, running={"busy-root": {"task": unrelated}})
+
+    # The unrelated reader is never addressed; in a Project it hears the room's words as context, naming the head.
+    heard = drain_owner_entries(tmp_path, "busy-root", set())
+    assert [(e["msg_id"].split(":")[1], e["host_carried"]["went_to"]) for e in heard] == (
+        [("carry-context", "head-1" if head_asker == "task-1" else ROUTED_BY_HEAD)] if room == "project" else [])
+    if head_asker == "task-1":
+        assert started == []
+        [entry] = drain_owner_entries(tmp_path, "head-1", set())
+        assert (entry["late_answer"]["task_id"], entry["late_answer"]["quiz_id"]) == ("task-1", "q1")
+    else:
+        [(_args, kwargs)] = started
+        _assert_host_snapshot(kwargs["task_metadata"]["late_answer"], "task-1", "q1")
+        assert drain_owner_entries(tmp_path, "head-1", set()) == []
+
+
+def test_two_heads_of_one_askers_answers_give_the_next_one_to_the_earliest(tmp_path, monkeypatch):
+    """A start race left two heads of one asker's late answers: the next answer goes to the
+    earliest of them instead of starting a third; the later head gets no answer, only the room's context."""
+    from ouroboros.owner_mailbox import drain_owner_entries
+    from ouroboros.projects_registry import create_project
+
+    project = create_project(tmp_path, "racer")
+    chat_id = int(project["chat_id"])
+    bridge = _late_answered(tmp_path, monkeypatch, chat_id)
+    _late_answer_head("head-late", "task-1", chat_id, project_id=project["id"], started=1002.0)
+    _late_answer_head("head-early", "task-1", chat_id, project_id=project["id"], started=1001.0)
+
+    assert _intake(tmp_path, monkeypatch, bridge) == []
+    assert [e["late_answer"]["quiz_id"] for e in drain_owner_entries(tmp_path, "head-early", set())] == ["q1"]
+    assert [(e["msg_id"].split(":")[1], e["host_carried"]["went_to"], "late_answer" in e)
+            for e in drain_owner_entries(tmp_path, "head-late", set())] == [("carry-context", "head-early", False)]
+
+
+def test_a_late_answer_head_running_as_queued_work_still_holds_its_askers_thread(tmp_path, monkeypatch):
+    """A head that continued in the background runs as a queue row; its typed late-answer
+    provenance still makes it the reader of the next answer to the same asker."""
+    from ouroboros.owner_mailbox import drain_owner_entries
+    from ouroboros.projects_registry import create_project
+
+    project = create_project(tmp_path, "racer")
+    chat_id = int(project["chat_id"])
+    bridge = _late_answered(tmp_path, monkeypatch, chat_id)
+    pooled = {"id": "pooled-head", "chat_id": chat_id, "root_task_id": "pooled-head", "delegation_role": "root",
+              "drive_root": str(tmp_path), "metadata": {"late_answer": {"task_id": "task-1", "quiz_id": "q0"}}}
+
+    assert _intake(tmp_path, monkeypatch, bridge, running={"pooled-head": {"task": pooled, "started_at": 1000.0}}) == []
+    assert [e["late_answer"]["quiz_id"] for e in drain_owner_entries(tmp_path, "pooled-head", set())] == ["q1"]
+
+
+def test_a_late_answer_head_that_stopped_reading_leaves_the_next_answer_to_a_fresh_head(tmp_path, monkeypatch):
+    from ouroboros.owner_mailbox import drain_owner_entries
+    from ouroboros.projects_registry import create_project
+
+    project = create_project(tmp_path, "racer")
+    chat_id = int(project["chat_id"])
+    bridge = _late_answered(tmp_path, monkeypatch, chat_id)
+    _late_answer_head("head-1", "task-1", chat_id, project_id=project["id"], accepting=False)
+
+    assert len(_intake(tmp_path, monkeypatch, bridge)) == 1
+    assert drain_owner_entries(tmp_path, "head-1", set()) == []
+
+
+def test_an_ordinary_main_message_never_joins_a_late_answer_head(tmp_path, monkeypatch):
+    """Main keeps one head per owner message: only a late answer follows its asker's head."""
+    import supervisor.message_bus as mb
+    from ouroboros.owner_mailbox import drain_owner_entries
+
+    bridge, _frames = _late_bridge(tmp_path, monkeypatch)
+    monkeypatch.setattr(mb, "load_state", lambda: {"session_id": "s-1"})
+    _late_answer_head("head-1", "task-1", 1)
+    mb.accept_local_message(bridge, tmp_path, "what else is open?", chat_id=1, user_id=1,
+                            source="web", client_message_id="m-1")
+
+    assert len(_intake(tmp_path, monkeypatch, bridge)) == 1
+    assert drain_owner_entries(tmp_path, "head-1", set()) == []
+
+
+def test_a_late_web_answer_passes_the_supervisor_consumer_seam(tmp_path, monkeypatch):
+    """The queued late answer is dequeued like any owner message: the supervisor's
+    one ingress writer (``record_inbound_message``) validates a web item against
+    the row the named ingress accepted, so that row must ride the queue item as
+    its in-process witness. The queue's EMPTY default is not a witness — treated
+    as one it raised, and a raise there is a supervisor loop crash that drops the
+    answer instead of delivering it."""
+    from supervisor.message_bus import record_inbound_message
+
+    record_asked(tmp_path, "task-1", quiz_id="q1", question="Which db?",
+                 options=["sqlite", "postgres"], assumption="sqlite meanwhile", chat_id=1)
+    reconcile_terminal(tmp_path, "task-1")
+    bridge, _frames = _late_bridge(tmp_path, monkeypatch)
+    app = _decision_app(tmp_path, monkeypatch, live_task=None)
+    resp = _post(app, {"request_id": "r1", "decision_id": "quiz:task-1:q1", "option_index": 1})
+    assert resp.status_code == 200 and resp.json()["forwarded"] is True, resp.text
+    source_id = "quiz_late_answer:task-1:q1"
+    [accepted] = _accepted_rows(tmp_path, source_id)
+    [update] = bridge.get_updates(offset=0, timeout=0)
+    msg = update["message"]
+    assert msg["source"] == "web" and msg["client_message_id"] == source_id
+    ref = record_inbound_message(  # the supervisor's call, verbatim arguments
+        bridge, msg, chat_id=1, user_id=1, client_message_id=source_id, text=msg["text"], ts="dequeued-later",
+    )
+    assert ref == msg["accepted_source_ref"] and ref["ts"] == accepted["ts"]
+    assert len(_accepted_rows(tmp_path, source_id)) == 1  # validated, never re-minted
+    witness = msg.get("accepted_source_row") or {}
+    assert witness.get("client_message_id") == source_id and witness.get("ts") == accepted["ts"]
+
+
+def test_supervisor_tick_delivers_a_late_web_answer_as_an_owner_turn(tmp_path, monkeypatch):
+    """The real supervisor intake (``server._process_bridge_updates``) drains the
+    late answer without raising and starts the ordinary owner turn with the
+    accepted row's identity threaded in — the delivery the 2xx's ``forwarded``
+    promised. A raise here counted as a supervisor loop crash and the failing
+    update was never handed back."""
+    import threading
+    from types import SimpleNamespace
+
+    import server
+    from tests.test_v6730_origin_invariant import _ImmediateThread
+
+    record_asked(tmp_path, "task-1", quiz_id="q1", question="Which db?",
+                 options=["sqlite", "postgres"], assumption="sqlite meanwhile", chat_id=1)
+    reconcile_terminal(tmp_path, "task-1")
+    bridge, _frames = _late_bridge(tmp_path, monkeypatch)
+    app = _decision_app(tmp_path, monkeypatch, live_task=None)
+    resp = _post(app, {"request_id": "r1", "decision_id": "quiz:task-1:q1", "option_index": 1})
+    assert resp.status_code == 200 and resp.json()["forwarded"] is True, resp.text
+    source_id = "quiz_late_answer:task-1:q1"
+    [accepted] = _accepted_rows(tmp_path, source_id)
+
+    captured = {}
+
+    def _direct(chat_id, text, image_data=None, *, task_constraint=None, task_metadata=None):
+        captured.update(chat_id=chat_id, text=text, metadata=task_metadata)
+
+    live_state = {"owner_id": 1, "owner_chat_id": 1}
+    ctx = SimpleNamespace(
+        DRIVE_ROOT=tmp_path, PENDING=[], RUNNING={},
+        load_state=lambda: dict(live_state), update_state=lambda fn: fn(live_state),
+        consciousness=SimpleNamespace(inject_observation=lambda _t: None, pause=lambda: None, resume=lambda: None),
+        get_chat_agent=lambda: SimpleNamespace(_busy=False),
+        handle_chat_direct=_direct, send_with_budget=lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(threading, "Thread", _ImmediateThread)
+    assert server._process_bridge_updates(bridge, 0, ctx) == 2
+    # The turn starts with the owner's own words (the pressed option); the host
+    # frame is rebuilt for the model from the late_answer provenance below.
+    assert captured["chat_id"] == 1 and captured["text"] == "2. postgres"
+    ref = captured["metadata"]["origin_message_ref"]
+    assert ref["client_message_id"] == source_id and ref["ts"] == accepted["ts"]
+    _assert_host_snapshot(captured["metadata"]["late_answer"], "task-1", "q1")
+    assert len(_accepted_rows(tmp_path, source_id)) == 1
+    assert bridge.get_updates(offset=0, timeout=0) == []  # consumed, nothing handed back

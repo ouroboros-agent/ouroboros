@@ -1,11 +1,15 @@
 """v6.37.0 guards for the semantic-dedup primitive (C9.6) and its consumers
-(C9.1/C9.2/C9.4/C9.5/C10.1/C10.2). The LLM is mocked everywhere — these assert the
+(C9.1/C9.3/C9.5/C10.1/C10.2). The LLM is mocked everywhere — these assert the
 structural contracts (fail-open, exact-id validation, fingerprint redirect, global
-backlog routing, typed artifact field, digest injection), not model quality."""
+backlog routing, typed artifact field), not model quality. The backlog's own
+semantic redirect, merge writer and ranked digest are retired with its host
+writers: the backlog is one authored note."""
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+import json
+
+import pytest
 
 
 # --------------------------------------------------------------------------- #
@@ -31,25 +35,8 @@ def test_primitive_fail_open_without_candidates_or_text():
     assert find_semantic_duplicate_id("", [{"id": "a", "text": "y"}], subject="s", call_type="t") is None
 
 
-def test_primitive_returns_exact_high_confidence_match(monkeypatch):
-    _fake_llm(monkeypatch, '{"duplicate_id":"obl-1","confidence":"high","reason":"same"}')
-    from ouroboros.semantic_dedup import find_semantic_duplicate_id
-
-    got = find_semantic_duplicate_id(
-        "new bug", [{"id": "obl-1", "text": "old bug"}], subject="s", call_type="t", drive_root=None
-    )
-    assert got == "obl-1"
-
-
 def test_primitive_rejects_low_confidence(monkeypatch):
     _fake_llm(monkeypatch, '{"duplicate_id":"obl-1","confidence":"medium","reason":"maybe"}')
-    from ouroboros.semantic_dedup import find_semantic_duplicate_id
-
-    assert find_semantic_duplicate_id("n", [{"id": "obl-1", "text": "o"}], subject="s", call_type="t", drive_root=None) is None
-
-
-def test_primitive_rejects_id_not_in_candidates(monkeypatch):
-    _fake_llm(monkeypatch, '{"duplicate_id":"obl-999","confidence":"high","reason":"hallucinated"}')
     from ouroboros.semantic_dedup import find_semantic_duplicate_id
 
     assert find_semantic_duplicate_id("n", [{"id": "obl-1", "text": "o"}], subject="s", call_type="t", drive_root=None) is None
@@ -62,90 +49,46 @@ def test_primitive_fail_open_on_unparseable(monkeypatch):
     assert find_semantic_duplicate_id("n", [{"id": "obl-1", "text": "o"}], subject="s", call_type="t", drive_root=None) is None
 
 
-# --------------------------------------------------------------------------- #
-# C9.2 — backlog: reworded restatement folds into the duplicate, not a new item
-# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("observed", [False, True])
+@pytest.mark.parametrize("chosen", ["omitted", "", None, "claudexor::codex=explicit-model"])
+def test_the_default_light_call_reaches_the_engine_with_the_light_role(tmp_path, monkeypatch, observed, chosen):
+    """#2575: the default model IS the Light slot, so its role-owned account goes with it;
+    an explicit model keeps its unlabelled (Auto) semantics. Real client, fake engine."""
+    from ouroboros import llm_claudexor as transport, pricing, usage_accounting as ua
+    from ouroboros.model_slots import MODEL_ACCOUNTS_KEY
+    from ouroboros.semantic_dedup import find_semantic_duplicate_id
+    from tests.test_llm_claudexor import MODEL, Gateway, result
 
-def test_backlog_semantic_redirect_bumps_instead_of_new(monkeypatch, tmp_path):
-    import ouroboros.improvement_backlog as ib
-    import ouroboros.semantic_dedup as sd
+    root = tmp_path / "data"
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(root))
+    monkeypatch.setenv("OUROBOROS_SETTINGS_PATH", str(root / "settings.json"))
+    monkeypatch.setenv("TOTAL_BUDGET", "100")
+    monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", MODEL)
+    monkeypatch.setenv(MODEL_ACCOUNTS_KEY, json.dumps({"main": "main-account", "light": "light-account"}))
+    monkeypatch.setattr(transport.config, "CLAUDEXOR_MODEL_POLL_INTERVAL_SEC", 0.001)
+    monkeypatch.setattr(pricing, "_fetch_live_rows", lambda *_: pytest.fail("Claudexor must not fetch API pricing"))
+    verdict = result()
+    verdict["message"] = {"role": "assistant",
+                          "content": '{"duplicate_id":"obl-1","confidence":"high","reason":"same"}'}
+    gateway = Gateway([verdict])
+    monkeypatch.setattr(transport, "ensure_owned_gateway", lambda **_kw: gateway)
 
-    ib.append_backlog_items(tmp_path, [{
-        "summary": "Flaky retry on transport 429", "category": "reliability", "source": "task",
-    }])
-    before = ib.load_backlog_items(tmp_path)
-    assert len(before) == 1
-    target_id = before[0]["id"]
+    with ua.usage_scope(ua.UsageScope(drive_root=root, task_id="dedup-owner", root_task_id="dedup-owner")):
+        got = find_semantic_duplicate_id(
+            "new bug", [{"id": "obl-1", "text": "old bug"}], subject="s", call_type="obligation_dedup",
+            drive_root=root if observed else None, **({} if chosen == "omitted" else {"model": chosen}))
 
-    # The detector (lazily imported from semantic_dedup) says the reworded item is a dup.
-    monkeypatch.setattr(sd, "find_semantic_duplicate_id", lambda *a, **k: target_id)
-    ib.append_backlog_items(tmp_path, [{
-        "summary": "Retries storm out on a 429 from the provider transport",
-        "category": "reliability", "source": "task",
-    }])
-    after = ib.load_backlog_items(tmp_path)
-    assert len(after) == 1  # folded in, no second ibl-*
-    assert int(after[0]["count"]) == 2
-
-
-def test_backlog_no_redirect_creates_new(monkeypatch, tmp_path):
-    import ouroboros.improvement_backlog as ib
-    import ouroboros.semantic_dedup as sd
-
-    ib.append_backlog_items(tmp_path, [{"summary": "A", "category": "c", "source": "task"}])
-    monkeypatch.setattr(sd, "find_semantic_duplicate_id", lambda *a, **k: None)
-    ib.append_backlog_items(tmp_path, [{"summary": "Totally different B", "category": "c", "source": "task"}])
-    assert len(ib.load_backlog_items(tmp_path)) == 2
-
-
-# --------------------------------------------------------------------------- #
-# C10.1 Fix A — merge_backlog_text + global routing
-# --------------------------------------------------------------------------- #
-
-def test_merge_backlog_text_fail_closed_on_unparseable(tmp_path):
-    from ouroboros.improvement_backlog import merge_backlog_text, append_backlog_items, load_backlog_items
-
-    append_backlog_items(tmp_path, [{"summary": "keep me", "category": "c", "source": "s"}])
-    # Prose with no `### ibl-` item blocks -> fail-closed, backlog preserved.
-    assert merge_backlog_text(tmp_path, "the model rambled but wrote no items") == -1
-    assert len(load_backlog_items(tmp_path)) == 1
-
-
-def test_project_scoped_backlog_write_routes_to_global_store(tmp_path, monkeypatch):
-    import ouroboros.config as cfg
-    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path, raising=False)
-    from ouroboros.tools import knowledge as kn
-    from ouroboros.improvement_backlog import backlog_path
-
-    ctx = SimpleNamespace(
-        drive_root=tmp_path, budget_drive_root="", project_id="proj-x", task_id="t1",
-        drive_path=lambda rel: tmp_path / rel,
-    )
-    item_block = "# Improvement Backlog\n\n### ibl-z\n- summary: routed globally\n- category: c\n- source: s\n"
-    msg = kn._knowledge_write(ctx, "improvement-backlog", item_block, mode="overwrite")
-    assert "global backlog" in msg
-    # Landed in the GLOBAL store, NOT projects/proj-x/knowledge.
-    assert backlog_path(tmp_path).exists()
-    assert "routed globally" in backlog_path(tmp_path).read_text(encoding="utf-8")
-    assert not (tmp_path / "projects" / "proj-x" / "knowledge" / "improvement-backlog.md").exists()
+    assert got == "obl-1" and len(gateway.uploads) == 1
+    sent = gateway.uploads[0][0]
+    explicit = bool(chosen and chosen != "omitted")
+    assert sent["account"] == ({"mode": "auto"} if explicit else {"mode": "pin", "profileId": "light-account"})
+    assert sent["model"] == ("explicit-model" if explicit else "exact-model")
+    assert bool(list((root / "observability" / "calls" / "semantic_dedup").glob("*_request.json"))) is observed
 
 
 # --------------------------------------------------------------------------- #
-# C9.4 — consolidator validates topics through the single sanitizer
+# C10.1 Fix A — global routing of the one authored backlog note
 # --------------------------------------------------------------------------- #
-
-def test_consolidator_skips_invalid_topic(tmp_path):
-    from ouroboros.consolidator import _write_knowledge_entries
-
-    kdir = tmp_path / "knowledge"
-    _write_knowledge_entries(kdir, [
-        {"topic": "valid-topic", "content": "ok"},
-        {"topic": "has spaces!", "content": "useful name is preserved"},
-        {"topic": "../evil", "content": "must not escape the shelf"},
-    ])
-    assert (kdir / "valid-topic.md").exists()
-    assert "useful name is preserved" in (kdir / "has spaces!.md").read_text()
-    assert not (tmp_path / "evil.md").exists()
 
 
 # --------------------------------------------------------------------------- #
@@ -170,13 +113,6 @@ def test_outcomes_recovery_uses_typed_artifact_flag():
 # --------------------------------------------------------------------------- #
 # C9.3 — review_state obligation redirect (off-lock map applied under lock)
 # --------------------------------------------------------------------------- #
-
-def test_compute_obligation_redirects_empty_without_candidates(tmp_path):
-    from ouroboros.review_state import AdvisoryReviewState, compute_obligation_semantic_redirects
-
-    state = AdvisoryReviewState()
-    findings = [{"verdict": "FAIL", "severity": "critical", "item": "bug_1", "reason": "boom"}]
-    assert compute_obligation_semantic_redirects(state, findings, repo_key="r", drive_root=tmp_path) == {}
 
 
 def test_obligation_redirect_folds_into_existing(monkeypatch):
@@ -204,21 +140,5 @@ def test_obligation_redirect_folds_into_existing(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# C10.2 Fix B — evolution prompt carries the backlog digest as context
+# C10.2 Fix B — the complete authored backlog reaches the evolution CONTEXT, never a digest
 # --------------------------------------------------------------------------- #
-
-def test_evolution_task_text_injects_backlog_digest(monkeypatch, tmp_path):
-    import supervisor.evolution_lifecycle as el
-    import supervisor.queue as sq
-    from ouroboros.improvement_backlog import append_backlog_items
-
-    append_backlog_items(tmp_path, [{"summary": "ctx-only backlog item", "category": "c", "source": "s", "priority": "high"}])
-    monkeypatch.setattr(el, "_read_evolution_campaign", lambda: {"status": "active", "id": "camp", "objective": "improve"})
-    # build_evolution_task_text does `from supervisor import queue` locally, so the real
-    # module attribute (not el.queue) is what it reads — isolate the drive root there.
-    monkeypatch.setattr(sq, "DRIVE_ROOT", tmp_path, raising=False)
-
-    text = el.build_evolution_task_text(1)
-    assert "Improvement Backlog (context only" in text
-    assert "ctx-only backlog item" in text
-    assert "NOT a work order" in text

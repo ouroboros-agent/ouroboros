@@ -17,7 +17,7 @@ import pathlib
 from typing import Any, Dict, Optional, Tuple
 from ouroboros.agent_startup_checks import persist_early_origin_stub as _persist_early_origin_stub_impl
 from ouroboros.config import EFFORT_SCALE, resolve_effort, runtime_setting
-from ouroboros.model_slots import MODEL_ROLE_SETTINGS
+from ouroboros.route_choice import model_role_slot_override  # the role slot a wake follows; resolved per call there
 from ouroboros.subagents import CapabilityDelta, SUBAGENT_RESOLUTION_FIELDS, SubagentDispatch, SubagentExecutorResolution, SubagentLaneResolution, capability_delta_disclosures, resolve_subagent_dispatch
 from ouroboros.task_results import STATUS_RUNNING
 from ouroboros.utils import append_jsonl, utc_now_iso
@@ -40,119 +40,46 @@ def _agent():
 
 
 def dispatch_executor_note(decision: Optional[SubagentExecutorResolution],
-                           lane: Optional["SubagentLaneResolution"] = None) -> str:
-    """The child's VISIBLE marker for a substrate decision it did not make ('' = silent).
+                           lane: Optional["SubagentLaneResolution"] = None,
+                           *, cognitive_route: Optional[Dict[str, Any]] = None) -> str:
+    """The configured nanny's VISIBLE marker for its substrate ('' = silent).
 
-    The rule table's `auto` rows are only honest if the child can see which way they
-    went: a nanny must know to delegate, and a child that fell back to metered tokens
-    must know its route was unavailable rather than discovering it by spending.
-
-    ``lane`` is the same dispatch's lane resolution: a nanny that landed on the
-    LIGHT lane by policy is told so, with the sanctioned escalation
-    (``switch_model`` for real acceptance judgment) named beside it — a policy the
-    child cannot see is a policy it will fight by accident.
-
-    The harness branch SUPERSEDES any native-self-execution framing in the frozen
-    task text (owner decision 2A): the composed text is written at schedule time,
-    when the executor is unknown, so its execution framing describes the metered
-    fallback — and this note rides ONLY the FINAL post-preflight harness dispatch
-    (the call site runs after the delegate-visibility preflight), so a native or
-    preflight-demoted child never receives the override.
+    Only a configured agent-session row dispatches onto the delegated substrate (its
+    lane says ``configured_subagent``), and its nanny must know the host starts the
+    exact leaf and that its own rounds are for judgment. Every other dispatch, an
+    API row or a row-less child, runs natively and has nothing to announce. The note
+    rides only the FINAL post-preflight dispatch (the call site runs after the
+    delegate-visibility preflight), so a blocked child never receives it.
     """
-    if decision is None or decision.blocked:
+    if (decision is None or decision.executor != "harness"
+            or lane is None or lane.provenance != "configured_subagent"):
         return ""
-    if decision.executor == "harness":
-        route = decision.route.route_id if decision.route else ""
-        configured_atomic = lane is not None and lane.provenance == "configured_subagent"
-        if configured_atomic:
-            return (
-                f"EXECUTOR: your parent selected the configured agent-session route ({route}). "
-                "You are its Ouroboros NANNY. The host starts the exact configured leaf run "
-                "BEFORE your first metered round; the startup/wake receipt in this context "
-                "is the truth about that run, and waiting on it is your own call "
-                "(delegate_wait when you want its facts). Your "
-                "metered rounds are for judgment — verify and integrate what the run "
-                "produces, answer its authorized questions, decide recovery — never for "
-                "rebuilding its work: co-building beside a delegated run is a metered "
-                "duplicate of already-paid work. After a terminal failure, retry or replace "
-                "through delegate_start(retry_of=..., prompt=...) only once cancellation and "
-                "terminal settlement are verified. Auxiliary or API-backed work must be an "
-                "explicit separate child, so its authorship and spend remain visible. When "
-                "no physical run exists and none can be started, record the typed zero-run "
-                "terminal through verify_and_record(contract_kind=delegation_zero_run, "
-                "zero_run_decision=incomplete|unknown, zero_run_basis=...); that receipt is "
-                "terminal for this actor — after it is durably recorded, do not start a "
-                "physical leaf in the same task."
-            )
-        note = (
-            f"EXECUTOR: your parent scheduled you on the delegated substrate ({route}). "
-            "You are a NANNY. "
-            + "Decide your delegation plan FIRST — right after reading your objective "
-            "and constraints, before any substantive work. "
-            + "Cost classes: "
-            "a subscription-lane run has known-zero marginal cost when the route reports "
-            "its settled spend as $0 (an estimated or undisclosed spend is estimated/unknown, "
-            "not zero); every token YOU think on is metered API money. "
-            "While the lane is healthy, delegate everything you can — even small tasks — "
-            "with delegate_start / delegate_wait, and verify what comes back rather than "
-            "believing it. After a delegated run SUCCEEDS, your job is to VERIFY and "
-            "INTEGRATE its output — never to rebuild the same work yourself on metered "
-            "tokens. Follow-up work (fixes, the next increment, a retry with a corrected "
-            "prompt) is delegated too, with a new "
-            "delegate_start(subagent_id=..., prompt=...); your own metered rounds "
-            "are for judgment — acceptance, integration, honest settlement — not for "
-            "co-building around a $0 run. If your run asks a question (delegate_wait "
-            "returns waiting_on_user), answer it from the task context with "
-            "delegate_answer; a question above your authority — money, scope, external "
-            "actions — is escalated with the escalate verb (parent-first; the reply "
-            "reaches your mailbox on a later round) while you keep waiting (a timeout_at "
-            "question benign-declines at the engine timeout; timeout_at=null waits until answered). "
-            "If your task text instructs you to execute the work natively yourself, that "
-            "instruction described the metered fallback and is superseded by this dispatch. "
-            "Route thinking-work (code, research, generation) through "
-            "delegate_start/delegate_wait; your own run_command/read_file rounds are for "
-            "verification, integration, and acceptance. The parent's step-by-step context "
-            "is the WORK ORDER for your delegated run's prompt, not a script for you to "
-            "execute natively. If a child asks for an omitted source range, answer from "
-            "the canonical task context with the exact range, source selector, and digest; "
-            "a disclosed partial preview is never complete authority."
-        )
-        if lane is not None and lane.provenance == "policy" and lane.effective_lane == "light":
-            note += (
-                " You run on the LIGHT model lane by dispatch policy: custody chores "
-                "(starting runs, waiting, reading results, relaying) belong on this "
-                "cheap lane. For a genuine acceptance or integration judgment you may "
-                "raise your own power with switch_model and drop back after — that is "
-                "the sanctioned escalation, not a workaround."
-            )
-        if decision.reset_at:
-            note += (
-                f" The route's plan window is currently spent and resets at "
-                f"{decision.reset_at}. Decide explicitly: wait for the reset, deliver "
-                "partial work, or say you fell back — do not drift into spending."
-            )
-        return note
-    if decision.reason in {"requested_native", "harness_not_configured"}:
-        return ""  # the ordinary case has nothing to announce
-    if decision.reset_at:
-        # D28's fallback, stated as the CAPABILITY DELTA it is: the parent asked for the
-        # already-paid substrate to be used when available, every profile of it is spent,
-        # and the work is proceeding on metered money instead. Destination 2 of 3 (the
-        # child's own prompt); the durable event and the parent's envelope carry the same
-        # two facts. The reset instant is named so the child can weigh waiting against
-        # spending instead of guessing.
-        return (
-            "EXECUTOR CAPABILITY DELTA: every plan window of the configured delegated "
-            f"substrate is spent (resets at {decision.reset_at}), so you FELL BACK to "
-            "METERED API tokens. Your parent asked for 'auto', which permits this "
-            "fallback rather than a wait — but it is real money that the subscription "
-            "would have covered: keep the work proportionate, and say in your result "
-            "that you ran below the substrate you were scheduled for and why."
-        )
+    route = decision.route.route_id if decision.route else ""
+    from ouroboros.supervisor_route import cognitive_route_provenance
+
+    provenance = cognitive_route_provenance(cognitive_route)
+    cognition = (f" Your cognitive route is {lane.model} ({provenance}); "
+                 "its calls bill as that route bills. You may change it with switch_model. "
+                 if provenance else " ")
     return (
-        f"EXECUTOR: the configured delegated substrate is unavailable "
-        f"({decision.reason}), so you are running on METERED API tokens. Your parent "
-        "asked for 'auto', which permits this — but say so in your result."
+        f"EXECUTOR: your parent selected the configured agent-session route ({route}). "
+        "You are its Ouroboros NANNY." + cognition + "For fresh work the host starts the exact leaf "
+        "before your first round. Restored supervision follows its continuation receipt; "
+        "the receipt states custody, and waiting is your own call "
+        "(delegate_wait when you want its facts). Your "
+        "supervisory rounds are for judgment — verify and integrate what the run "
+        "produces, answer its authorized questions, decide recovery — never for "
+        "rebuilding its work: co-building beside a delegated run is a "
+        "duplicate of already-paid work. After a terminal failure, replace through "
+        "delegate_start(prompt='') only once cancellation and terminal settlement are "
+        "verified; an unknown start outcome is retried with "
+        "delegate_start(retry_of=..., prompt=''). Auxiliary or API-backed work must be an "
+        "explicit separate child, so its authorship and spend remain visible. When "
+        "no physical run exists and none can be started, record the typed zero-run "
+        "terminal through verify_and_record(contract_kind=delegation_zero_run, "
+        "zero_run_decision=incomplete|unknown, zero_run_basis=...); that receipt is "
+        "terminal for this actor — after it is durably recorded, do not start a "
+        "physical leaf in the same task."
     )
 
 
@@ -161,75 +88,46 @@ def executor_blocked_outcome(
     *,
     availability: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
-    """The terminal ``(text, usage)`` of a child that was pinned and could not run.
+    """The terminal ``(text, usage)`` of a child the host could not start: one notice for API and session rows.
 
-    Deliberately NOT a fallback: the task ends unrun and typed, having spent nothing.
+    Deliberately NOT a fallback: the task ends unrun and typed, having spent nothing. The text and the usage carry
+    the same facts (the cause, the producer's detail, the reset instant, the current alternatives, not ranked), so
+    the parent reads why and what it may choose instead (#1241); ``reason_code`` keeps its codes.
     """
+    from ouroboros.task_finalization import TERMINAL_ORIGIN_HOST_NOTICE
+
     availability = availability if isinstance(availability, dict) else {}
-    if (
-        availability.get("route_kind") == "api_model"
-        or (decision.requested == "native" and decision.reason == "credentials_unavailable")
-    ):
-        alternatives = availability.get("alternatives")
-        alternatives = alternatives if isinstance(alternatives, list) else []
-        text = (
-            "⚠️ SUBAGENT_UNAVAILABLE: the selected API-model actor has no usable "
-            "credentials for its exact configured route. The task was NOT run and the "
-            "host did not substitute another model or substrate. Current configured "
-            "alternatives (not ranked): "
-            + json.dumps(alternatives, ensure_ascii=False, sort_keys=True)
-        )
-        return text, {
-            "execution_status": "infra_failed",
-            "reason_code": "subagent_executor_unavailable",
-            "unavailable_reason": "credentials_unavailable",
-            "alternatives": alternatives,
-            "host_fallback": False,
-        }
-    if decision.reason in ("delegate_tools_invisible", "delegate_visibility_unverified"):
-        # Q1A preflight (2026-08-10 amendments): the route is healthy but the
-        # child's MATERIALIZED toolset does not carry the delegate verbs — or
-        # the toolset introspection itself failed, so visibility is UNKNOWN,
-        # not disproven (distinct reason: the terminal states exactly what is
-        # known). Either way the pin cannot be honored, and the fix is tool
-        # policy/contract, not waiting for the route to recover.
-        detail = (
-            "the delegate tools (delegate_start/delegate_wait/delegate_cancel) "
-            "are not visible in its materialized toolset"
-            if decision.reason == "delegate_tools_invisible"
-            else "the toolset introspection failed, so the delegate tools' "
-            "(delegate_start/delegate_wait/delegate_cancel) visibility could "
-            "not be verified"
-        )
-        text = (
-            "⚠️ EXECUTOR_UNAVAILABLE: this subagent was pinned to the delegated "
-            f"substrate (executor='harness'), but {detail}, so the pin cannot be "
-            "honored. The task was NOT run on metered API tokens. Fix the tool "
-            "policy / task contract that hides the delegate verbs, or explicitly "
-            "select another Available subagent."
-        )
-        # Literal codes (not `decision.reason`) so the provenance drift guard
-        # keeps seeing every code the runtime can emit.
-        if decision.reason == "delegate_visibility_unverified":
-            return text, {"execution_status": "infra_failed", "reason_code": "delegate_visibility_unverified"}
-        return text, {"execution_status": "infra_failed", "reason_code": "delegate_tools_invisible"}
-    # The ":delegation_" wording branch retired with route_health's aggregate
-    # status refusal (cx-delegation sprint): the engine's belt capability was
-    # never a structural fact about Ouroboros's marker-based delegated runs,
-    # and the host no longer manufactures a "waiting will not heal it" verdict
-    # the engine did not give.
+    api_row = availability.get("route_kind") == "api_model" or (
+        decision.requested == "native" and decision.reason == "credentials_unavailable")
+    reason = "credentials_unavailable" if api_row else str(decision.reason or "configured_session_unavailable")
+    verbs = "delegate tools (delegate_start/delegate_wait/delegate_cancel)"
+    # Q1A preflight (2026-08-10): a healthy route whose child toolset hides the verbs, or whose introspection
+    # failed (visibility UNKNOWN, not disproven); the fix is tool policy, not waiting for the route.
+    cause = {
+        "credentials_unavailable": "its API-model route has no usable credentials",
+        "delegate_tools_invisible": f"the {verbs} are not visible in its materialized toolset; fix the tool "
+                                    "policy or task contract that hides them",
+        "delegate_visibility_unverified": f"the toolset introspection failed, so the visibility of the {verbs} "
+                                          "could not be verified",
+    }.get(reason, f"its route cannot run: {reason}")
+    alternatives = availability.get("alternatives") if isinstance(availability.get("alternatives"), list) else []
     text = (
-        "⚠️ EXECUTOR_UNAVAILABLE: this subagent was pinned to the delegated substrate "
-        f"(executor='harness') and the route cannot run: {decision.reason}."
+        f"⚠️ SUBAGENT_UNAVAILABLE: this subagent could not start: {cause}."
         + (f" It resets at {decision.reset_at}." if decision.reset_at else "")
-        + " The task was NOT run on metered API tokens, because that spend is exactly "
-        "what the pin exists to prevent. Reschedule once the route recovers, or "
-        "explicitly select another Available subagent."
+        # The producer's own words (a refused snapshot provision names the lock holder), not only a code (#1241).
+        + (f" {availability['detail']}" if availability.get("detail") else "")
+        + " The task was NOT run and spent nothing; the host did not substitute another model, route or substrate."
+        + (" Configured alternatives now (not ranked): " + json.dumps(alternatives, ensure_ascii=False, sort_keys=True)
+           if alternatives else "")
     )
-    return text, {
-        "execution_status": "infra_failed",
-        "reason_code": "subagent_executor_unavailable",
-    }
+    # The codes stay literal (the provenance drift guard reads them from this keyword).
+    return text, dict(
+        execution_status="infra_failed", unavailable_reason=reason, alternatives=alternatives, host_fallback=False,
+        terminal_origin=TERMINAL_ORIGIN_HOST_NOTICE,
+        reason_code=("delegate_tools_invisible" if reason == "delegate_tools_invisible"
+                     else "delegate_visibility_unverified" if reason == "delegate_visibility_unverified"
+                     else "subagent_executor_unavailable"),
+    )
 
 
 def _record_executor_resolution(
@@ -298,6 +196,44 @@ def _blocked_executor_terminal(cap_info: Dict[str, Any], task: Optional[Dict[str
     return text, usage, {"reasoning_notes": ["subagent_executor_unavailable"], "tool_calls": []}
 
 
+def _context_capacity_terminal(unfit: Any) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    """The named outcome of a known window that cannot hold a pooled task's start (``MinimumViewUnfit``).
+
+    In the reader's words: what the start needs against the route's limit, the step that changes it (for a
+    directly required handbook, the choices that remain), then the measured parts; the host switches nothing. Money
+    stays the ledger's answer, and an earlier attempt's or started run's effects stay theirs: this attempt's own
+    loop evidence is absent, never a zero, so nothing here claims the task had no effect.
+    """
+    from ouroboros.context_budget import REQUIRED_BOOK_CHOICES
+    from ouroboros.task_finalization import TERMINAL_ORIGIN_HOST_NOTICE
+
+    # The comparison the fitter refused on: input plus the reserve kept for the reply and the work, against the
+    # route's limit. The further room a start wants is no threshold (a start with less runs): named only as measured.
+    # The paths named are the ones every surface keeps: the room's model button, Settings › Models, Context Length.
+    # A window is a role's setting: a chat with its own model has none to correct, so only Main's is named.
+    limit, book = unfit.window_tokens, unfit.required_book_tokens
+    needs = -(-(unfit.estimated_input_tokens + unfit.response_reserve_tokens) // 1000) * 1000  # "about": rounded up
+    text = (f"⚠️ This model's context window is too small to start this work: the start needs about {needs:,} tokens "
+            f"(its input plus the room kept for the reply and the work), and the model's limit here is {limit:,}.")
+    if book:
+        text += (f" This task directly requires the whole development handbook (~{book:,} tokens); without it the "
+                 "start fits. " + REQUIRED_BOOK_CHOICES.format("; a Continue keeps it"))  # a Continue cause
+    else:
+        text += (" Choose a model with a larger window and send the request again: in the app, the model button under "
+                 "the message box sets it for this chat, and Settings › Models sets the default for chats that follow "
+                 "Main. For a local model, raise its Context Length in Settings and restart it. If this chat follows "
+                 "Main and the model's real limit is higher, set Main's window in Settings › Models.")
+    inside = [("core, request and tools", unfit.fixed_input_tokens - book), ("handbook", book),
+              ("further memory", unfit.memory_view_tokens)]
+    text += (f"\n\nMeasured, in tokens: input {unfit.estimated_input_tokens:,} ("
+             + "; ".join(f"{name} {value:,}" for name, value in inside if value)
+             + f") · reserve for the reply and the work {unfit.response_reserve_tokens:,} · limit {limit:,}"
+             + (f" · further room the start wanted {unfit.work_room_tokens:,}" if unfit.work_room_tokens else "") + ".")
+    usage = {"execution_status": "infra_failed", "reason_code": "context_capacity",
+             "terminal_origin": TERMINAL_ORIGIN_HOST_NOTICE, "loop_evidence_unavailable": True}
+    return text, usage, {"reasoning_notes": ["context_capacity"], "tool_calls": [], "loop_evidence_unavailable": True}
+
+
 def _persist_early_origin_stub(drive_root: Any, task: Dict[str, Any]) -> None:
     _persist_early_origin_stub_impl(drive_root, task, write_result=_agent().write_task_result)
 
@@ -349,50 +285,37 @@ def _initial_effort_for(task: Dict[str, Any], task_type: str) -> str:
     """The effort a task starts on.
 
     For a delegated child this is what ``resolve_subagent_dispatch`` derived and
-    wrote onto the record moments ago, which is ``resolve_effort(task_type)`` — read
-    back rather than recomputed so the loop runs the effort the record states. For
+    wrote onto the record moments ago — read back rather than recomputed so the
+    loop runs the effort the record states. For
     everything else, and for an unrecognized STORED value (durable data outlives the
     schema that wrote it), it is the task-type default directly — or, when the task
     names a model ROLE in its metadata (a consciousness wake-up), that role's effort
     slot: the role owns its effort the way it owns its account binding.
     """
     stored = str(task.get("reasoning_effort") or "").strip().lower()
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    if str(task.get("delegation_role") or "").lower() != "subagent":
+        # A level encoded in the model name wins over a pin and a default (``choose_effort``).
+        named = main_model_named_effort(metadata)
+        if named:
+            return named
     if stored in EFFORT_SCALE:
         return stored
-    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
     role = str(metadata.get("model_role") or "").strip().lower()
     return resolve_effort(role or task_type)
 
 
-def model_role_slot_override(task_metadata: Dict[str, Any]) -> Optional[Tuple[str, bool]]:
-    """The ``(model, use_local)`` pinned by a task's ``metadata.model_role``; ``None`` = Main.
+def main_model_named_effort(task_metadata: Dict[str, Any]) -> str:
+    """The level the task's own model name carries — its admitted lead, the role slot's
+    model or Main's (``route_spec.api_model_named_effort``) — '' when the model names none."""
+    from ouroboros.route_choice import task_lead
+    from ouroboros.route_spec import api_model_named_effort
 
-    A consciousness wake-up carries ``model_role="consciousness"`` (owner decision
-    В25=B): when the consciousness model slot is set, the turn runs on that model
-    with that slot's local flag; an empty slot means Main — the same model, the
-    same prefix, the same prompt cache. Roles without a single-model slot (Main
-    itself, the fallback chain) and unknown roles resolve to Main here; their
-    effort and account binding still follow the role (``_initial_effort_for``,
-    ``task_model_binding``).
-    """
     metadata = task_metadata if isinstance(task_metadata, dict) else {}
-    role = str(metadata.get("model_role") or "").strip().lower()
-    key = MODEL_ROLE_SETTINGS.get(role)
-    if not key or role in ("main", "fallback"):
-        return None
-    model = str(runtime_setting(key, "") or "").strip()
-    raw_local = str(runtime_setting(f"USE_LOCAL_{role.upper()}", "") or "").strip().lower()
-    use_local = raw_local in ("true", "1")
-    if not model:
-        # An empty model slot means Main's model — but the role's own local flag, when the
-        # owner set it and it differs from Main's, still decides the route (В25=B honors
-        # every slot; with equal flags nothing changes and the prefix stays Main's).
-        main_local = str(runtime_setting("USE_LOCAL_MAIN", "") or "").strip().lower() in ("true", "1")
-        main_model = str(runtime_setting("OUROBOROS_MODEL", "") or "").strip()
-        if not raw_local or use_local == main_local or not main_model:
-            return None
-        return main_model, use_local
-    return model, use_local
+    carried = task_lead(metadata)
+    override = None if carried else model_role_slot_override(metadata)
+    model = carried["model"] if carried else (override[0] if override else str(runtime_setting("OUROBOROS_MODEL", "") or ""))
+    return api_model_named_effort(model)
 
 
 def resolve_dispatch_axes(task: Dict[str, Any]) -> Optional[SubagentDispatch]:
@@ -433,17 +356,14 @@ def preflight_delegate_visibility(
     audit: nine children dispatched as nannies with the verbs invisible made zero
     delegated runs and burned ~$29-54 of metered API while telemetry said harness.
 
-    One check at toolset materialization (owner decision Q1A): an AUTO-resolved
-    executor falls back LOUDLY to native — the amended ``capability_delta``
-    (reason ``delegate_tools_invisible``, ``reduced=True``) and the corrected
-    dispatch fields are re-stamped onto the task record so telemetry does not
-    lie; an EXPLICIT ``harness`` pin becomes the typed blocked outcome that
-    terminalizes with zero spend (``executor_blocked_outcome``). A broken
-    introspection follows the same split: a pinned harness fails CLOSED (a probe
-    that cannot prove visibility cannot prove the pinned contract is executable),
-    an auto one proceeds fail-open with the probe failure disclosed as a
-    ``capability_delta`` note. Returns the (possibly amended) dispatch and
-    whether it amended.
+    One check at toolset materialization (owner decision Q1A). Only a configured
+    agent-session row dispatches onto the harness, and that row is a pin: hidden
+    verbs make it the typed blocked outcome that terminalizes with zero spend
+    (``executor_blocked_outcome``), with the amended ``capability_delta`` and
+    dispatch fields re-stamped onto the task record so telemetry does not lie. A
+    broken introspection fails CLOSED the same way: a probe that cannot prove
+    visibility cannot prove the pinned contract is executable. Returns the
+    (possibly amended) dispatch and whether it amended.
     """
     if (
         dispatch is None
@@ -474,7 +394,6 @@ def preflight_delegate_visibility(
             reason=derive_capability_reason(reasons, delta.substrate_disclosures),
             **changes)
 
-    pinned = isinstance(task.get("configured_subagent"), dict) or str(task.get("requested_executor") or "auto").strip().lower() == "harness"
     reason = "delegate_tools_invisible"
     try:
         available = set(tools.available_tools())
@@ -482,23 +401,9 @@ def preflight_delegate_visibility(
             return dispatch, False
     except Exception:
         log.warning("delegate visibility preflight: introspection failed", exc_info=True)
-        if not pinned:
-            # Fail-open for auto, but never silently: the note rides the delta.
-            return _stamp(dataclasses.replace(
-                dispatch,
-                delta=_append_reason(dispatch.delta, "delegate_visibility_unverified")))
-        # Pinned + broken probe blocks with the honest reason: visibility is
-        # UNKNOWN, not disproven.
+        # A broken probe blocks with the honest reason: visibility is UNKNOWN,
+        # not disproven.
         reason = "delegate_visibility_unverified"
-
-    if not pinned:
-        # F10 (sol #2): the auto fallback runs NATIVE, so lane/model/effort are
-        # re-resolved WITHOUT the harness light-lane policy — a native child of
-        # a heavy parent must not stay on policy-light with a cheap model. The
-        # re-resolution lives with the other dispatch policy in `subagents`.
-        from ouroboros.subagents import preflight_native_fallback_dispatch
-
-        return _stamp(preflight_native_fallback_dispatch(task, dispatch, reason))
     return _stamp(dataclasses.replace(
         dispatch,
         executor="blocked",
@@ -518,13 +423,11 @@ def reset_nanny_economics_marks(ctx: Any, *, route_dispatched: bool, delegate_ac
     DEFENSIVE, not load-bearing: ``_prepare_task_context`` builds a FRESH
     ToolContext per task, so nothing stale can leak today — this states the
     marks' lifecycle in one place and keeps it true even if a refactor ever
-    reuses a context (leaked cursors would mute or misfire the reminder)."""
+    reuses a context (leaked marks would misstate the facts line's nanny burn)."""
     ctx._nanny_route_dispatched = bool(route_dispatched)
-    ctx._nanny_finalization_injected = False
     ctx._nanny_metered_progress = None
     ctx._nanny_delegate_baseline = ({"round": 0, "cost": 0.0} if delegate_activity_seed else None)
     ctx._nanny_physical_activity_seed = False
-    ctx._nanny_reminder_mark = None
 
 
 def emit_dispatch_resolution(
@@ -574,11 +477,9 @@ def capability_delta_prompt_block(dispatch: Optional[SubagentDispatch]) -> str:
     parts: list[str] = []
     disclosures = capability_delta_disclosures(delta) if delta.get("reduced") else []
     if disclosures:
-        # `reduced` with NO disclosable axis is the executor-only case (an `auto`
-        # fallback the axis renderer deliberately keeps out of this list) — that
-        # fact reaches the child through `dispatch_executor_note` beside this
-        # block, so rendering "BELOW what your parent asked for:" over an empty
-        # list here told the child nothing and read as a broken sentence.
+        # `reduced` with NO disclosable axis (an executor-only reduction) renders
+        # nothing here: "BELOW what your parent asked for:" over an empty list
+        # told the child nothing and read as a broken sentence.
         # The parenthetical carries the typed DISPATCH axes only (B4): substrate
         # facts are completion-seam and never fuse into this dispatch sentence
         # (a fresh resolution carries none anyway).
@@ -589,7 +490,7 @@ def capability_delta_prompt_block(dispatch: Optional[SubagentDispatch]) -> str:
         )
         action = (
             "Do the work anyway — routed through your delegated run "
-            "(delegate_start / delegate_wait), not your own metered rounds — but say "
+            "(delegate_start / delegate_wait), not your own rounds — but say "
             if delta.get("effective_executor") == "harness"
             else "Do the work anyway, but say "
         )
@@ -597,9 +498,17 @@ def capability_delta_prompt_block(dispatch: Optional[SubagentDispatch]) -> str:
             "You are running BELOW what your parent asked for: "
             + "; ".join(disclosures)
             + f" ({reason_text}). " + action
-            + "so in blockers if the gap actually limited your answer — do not quietly "
+            + "so in your answer if the gap actually limited it — do not quietly "
             "return a weaker result as if it were full strength."
         )
     if delta.get("legacy_note"):
         parts.append(f"Ignored on your record: {delta['legacy_note']}.")
+    # The effort decision, when it moved or set aside the parent's request or a pin/name decided.
+    from ouroboros.settings_scales import effort_fact_phrase
+
+    fact = getattr(dispatch, "effort_fact", None)
+    phrase = effort_fact_phrase(fact) if isinstance(fact, dict) and fact else ""
+    if phrase:
+        whose = "Your delegated run's" if delta.get("effective_executor") == "harness" else "Your"
+        parts.append(f"{whose} {phrase}.")
     return "[CAPABILITY DELTA]\n" + "\n".join(parts) if parts else ""

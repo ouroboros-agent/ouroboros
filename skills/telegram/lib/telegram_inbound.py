@@ -15,9 +15,10 @@ import mimetypes
 import pathlib
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from .telegram_api import _MAX_TELEGRAM_DOWNLOAD_BYTES
+from .telegram_i18n import Index
 
 _FILE_KINDS = ("document", "video", "audio", "voice", "video_note")
 _DEFAULT_MIME = {"voice": "audio/ogg", "video_note": "video/mp4", "video": "video/mp4",
@@ -26,20 +27,15 @@ _DEFAULT_MIME = {"voice": "audio/ogg", "video_note": "video/mp4", "video": "vide
 _DEFAULT_EXT = {"voice": ".ogg", "video_note": ".mp4", "video": ".mp4", "audio": ".mp3", "document": ""}
 _UNSUPPORTED_KINDS = ("sticker", "animation", "location", "contact", "poll", "venue", "dice", "game")
 
-_TEXTS = {
-    "en": {
-        "too_large": "This file is {size} MiB; this integration accepts files up to 10 MiB. Send a smaller file or a link.",
-        "unsupported": "This kind of message isn't supported — send text, a photo, or a file (document, video, audio, voice).",
-    },
-    "ru": {
-        "too_large": "Файл весит {size} МиБ; эта интеграция принимает файлы не больше 10 МиБ. Пришлите файл поменьше или ссылку.",
-        "unsupported": "Такой тип сообщения не поддерживается — пришлите текст, фото или файл (документ, видео, аудио, голосовое).",
-    },
+_TEXTS_EN = {
+    "too_large": "This file is {size} MiB; this integration accepts files up to 10 MiB. Send a smaller file or a link.",
+    "unsupported": "This kind of message isn't supported — send text, a photo, or a file (document, video, audio, voice).",
 }
+_TEXTS = Index("inbound", _TEXTS_EN, "refusals of files and message kinds the bridge cannot relay")
 
 
-def _texts(lang: str) -> Dict[str, str]:
-    return _TEXTS["ru" if lang == "ru" else "en"]
+def _texts(lang: str) -> Mapping[str, str]:
+    return _TEXTS[lang]
 
 
 def inbound_file(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -83,7 +79,7 @@ def unsupported_text(lang: str) -> str:
 
 def refusal_text(info: Dict[str, Any], lang: str) -> str:
     size_mb = f"{int(info.get('size') or 0) / (1024 * 1024):.1f}"
-    return _texts(lang)["too_large"].format(size=size_mb)
+    return _texts(lang).format("too_large", size=size_mb)
 
 
 @dataclass

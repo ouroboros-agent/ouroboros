@@ -89,21 +89,6 @@ test('empty pages are walked over, never becoming a reading position or a newer 
     assert.equal(h.calls.length, spent, 'walking back across empty pages costs no request');
 });
 
-test('a resume carries each page row count and tolerates a saved page without one', async () => {
-    const h = harness({ fetch: cursor => cursor === 'before:A:1' ? page(1, { messages: [] }) : page(2) });
-    h.pager.acceptRecent(page(0));
-    await h.pager.older();
-    const saved = h.pager.exportResume();
-    assert.deepEqual(saved.pages.map(item => item.rows), [1, 0]);
-    assert.equal(saved.focus, 0, 'an empty page never becomes the saved reading position');
-    const legacy = harness();
-    const stripped = { focus: saved.focus, pages: saved.pages.map(({ rows: _rows, ...rest }) => rest) };
-    assert.equal((await legacy.pager.restore(stripped)).status, 'applied');
-    assert.equal(legacy.pager.getState().pageCount, 2);
-    assert.equal(legacy.pager.getState().canNewer, false);
-    assert.equal(legacy.pager.getState().firstPage.rows, 1, 'an unknown row count is learned on re-read');
-});
-
 test('a re-read page keeps its frozen boundaries while its row count is refreshed', async () => {
     let zero = false;
     const h = harness({ fetch: cursor => cursor === 'replay:A:0'
@@ -116,9 +101,9 @@ test('a re-read page keeps its frozen boundaries while its row count is refreshe
     await h.pager.newer();
     // The refreshed descriptor lives in the page list; its now-empty cache entry
     // is released at once, like any other empty page.
-    assert.deepEqual({ ...h.pager.exportResume().pages.find(item => item.index === 0) },
+    assert.deepEqual({ ...h.pager.getState().firstPage },
         { id: 'history-page-1-0', chain: 1, index: 0, requestCursor: 'replay:A:0',
-            nextCursor: 'before:A:1', hasMore: true, rows: 0 });
+            nextCursor: 'before:A:1', hasMore: true, rows: 0, loaded: true, coverage: null });
     assert.equal(h.pager.getState().cachedPages.some(item => item.index === 0), false);
     assert.equal(h.pager.getState().pageCount, 4, 'a refreshed row count mints no extra descriptor');
     assert.equal(h.pager.getState().canNewer, false);
@@ -238,6 +223,18 @@ test('latest starts a new frozen chain after success, retaining old protected co
     assert.equal(h.calls.at(-1).cursor, 'before:B:1');
 });
 
+test('a protected old page stays mounted after latest rebases the chain', async () => {
+    const h = harness({ fetch: cursor => cursor === null ? page(0, { chain: 'B' })
+        : page(Number(cursor.split(':').at(-1)), { chain: cursor.split(':')[1] }) });
+    h.pager.acceptRecent(page(0));
+    const old = await h.pager.older();
+    h.protectedIds.add(old.page.id);
+    await h.pager.latest();
+    assert.equal(h.pager.getState().firstPage.requestCursor, 'replay:B:0');
+    assert.ok(h.pager.getState().cachedPages.some(item => item.id === old.page.id),
+        'the reader still sees it until they leave it');
+});
+
 test('a failed latest read leaves the old chain available and retries the same request', async () => {
     let fail = true;
     const error = new Error('History source unavailable');
@@ -251,6 +248,25 @@ test('a failed latest read leaves the old chain available and retries the same r
     await h.pager.retry();
     assert.deepEqual(h.calls.map(call => call.cursor), [null, null]);
     assert.equal(h.pager.getState().firstPage.requestCursor, 'replay:B:0');
+});
+
+test('suspension aborts a page without losing the chain, and an old answer cannot replace a new visit', async () => {
+    const answers = [];
+    const h = harness({ fetch: () => new Promise(resolve => answers.push(resolve)) });
+    h.pager.acceptRecent(page(0));
+    const old = h.pager.older();
+    await Promise.resolve();
+    h.pager.suspend();
+    assert.equal(h.calls[0].signal.aborted, true);
+    assert.equal(h.pager.getState().cachedPages.length, 1);
+    assert.equal(h.released.length, 0);
+    const next = h.pager.older();
+    await Promise.resolve();
+    answers[0](page(1, { chain: 'obsolete' }));
+    assert.equal((await old).status, 'disposed');
+    answers[1](page(1));
+    assert.equal((await next).status, 'applied');
+    assert.deepEqual(h.applied.map(p => p.messages[0].text), ['Page A-0', 'Page A-1']);
 });
 
 test('destroy aborts the read, releases cached pages once, and rejects late applies', async () => {

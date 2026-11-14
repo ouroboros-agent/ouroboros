@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import ast
+import collections
 import contextlib
 import hashlib
+import json
+import math
 import os
 import pathlib
 import subprocess
@@ -21,16 +24,25 @@ BAND_MODULE_MAX_LINES = 1500
 MAX_MODULE_BYTES = 200_000
 TARGET_FUNCTION_LINES = 150
 MAX_FUNCTION_LINES = 300
-# Owner decision 2026-08-21: keep this only as a high-water alarm with ample
-# product headroom; module and per-function ratchets remain the primary gates.
-# Raised 2026-09-18 from 9500 after the count reached 9499 and the alarm had
-# turned into a hard gate.
-MAX_TOTAL_FUNCTIONS = 10000
 
 SIZE_RATCHET_MANIFEST_PATH = "ouroboros/size_ratchet_manifest.py"
+TEST_DURATIONS_PATH = "state/test-durations.json"  # under the data root
 
-# Module inventory covers tests/devtools. Only generated, vendored, or environment
-# directories remain outside the source ratchet.
+
+class SizeRatchetRefUnavailable(ValueError):
+    """A manifest-related git ref's blobs are not locally available in this checkout.
+
+    Distinct from a genuinely malformed manifest (which raises bare ``ValueError``).
+    The validator must STILL RUN tip-exactness against the live tree instead of
+    being wholesale disabled by the advisory lane's broad ``except Exception``
+    that swallowed every ValueError and reported "validator unavailable" on every
+    advisory run while CI still BLOCKED on the size-ratchet findings.
+    """
+
+
+# Module inventory covers product, runtime and devtools code. Generated, vendored and
+# environment directories remain outside the source ratchet, and so do test modules:
+# one home per behaviour makes some of them long, and the diff pulse states their lines.
 _MODULE_SKIP_DIR_NAMES = frozenset(
     {
         ".git",
@@ -43,11 +55,12 @@ _MODULE_SKIP_DIR_NAMES = frozenset(
         "dist",
         "node_modules",
         "python-standalone",
+        "tests",
         "venv",
     }
 )
 # Function inventory intentionally preserves the pre-v7 runtime-health scope.
-_FUNCTION_SKIP_DIR_NAMES = _MODULE_SKIP_DIR_NAMES | frozenset({"devtools", "tests"})
+_FUNCTION_SKIP_DIR_NAMES = _MODULE_SKIP_DIR_NAMES | frozenset({"devtools"})
 FUNCTION_COUNT_EXCLUDED_FILES = frozenset({"app.py", "demo_app.py", "launcher.py"})
 
 
@@ -94,6 +107,8 @@ class SizeRatchetInventory:
     function_debt: frozenset[tuple[str, str]]
     band_paths: frozenset[str]
     byte_debt: Mapping[str, int]
+    # Modules between the band and the hard gate (1501-1600 lines).
+    above_band_paths: frozenset[str] = frozenset()
 
 
 def _exact_repo_relative_path(raw: str | pathlib.Path) -> str:
@@ -311,6 +326,9 @@ def collect_size_ratchet_inventory(
             item.path for item in modules if TARGET_MODULE_LINES < item.line_count <= BAND_MODULE_MAX_LINES
         ),
         byte_debt={item.path: item.utf8_bytes for item in modules if item.utf8_bytes > MAX_MODULE_BYTES},
+        above_band_paths=frozenset(
+            item.path for item in modules if BAND_MODULE_MAX_LINES < item.line_count <= MAX_MODULE_LINES
+        ),
     )
 
 
@@ -341,13 +359,17 @@ def _git_source_snapshot(repo_dir: pathlib.Path, ref: str) -> Iterator[tuple[pat
                 raise ValueError(f"gated source at {ref} must be a regular file: {path}")
             entries.append((path, object_id))
 
-        batch = subprocess.run(
-            ["git", "cat-file", "--batch"],
-            cwd=root,
-            check=True,
-            input=b"".join(object_id + b"\n" for _path, object_id in entries),
-            capture_output=True,
-        ).stdout
+        # Avoid the observed parent/Git mutual pipe-write wait; blob validation stays below.
+        with tempfile.TemporaryFile() as source_ids:
+            source_ids.write(b"".join(object_id + b"\n" for _path, object_id in entries))
+            source_ids.seek(0)
+            batch = subprocess.run(
+                ["git", "cat-file", "--batch"],
+                cwd=root,
+                check=True,
+                stdin=source_ids,
+                capture_output=True,
+            ).stdout
         cursor = 0
         paths: list[str] = []
         for path, expected_id in entries:
@@ -355,8 +377,17 @@ def _git_source_snapshot(repo_dir: pathlib.Path, ref: str) -> Iterator[tuple[pat
             if header_end < 0:
                 raise ValueError(f"git cat-file omitted the header for {path} at {ref}")
             header = batch[cursor:header_end].split(b" ")
-            if len(header) != 3 or header[0] != expected_id or header[1] != b"blob":
-                raise ValueError(f"git cat-file returned the wrong object for {path} at {ref}")
+            if header == [expected_id, b"missing"]:
+                raise SizeRatchetRefUnavailable(
+                    f"git cat-file: object {expected_id.decode('ascii', errors='replace')} "
+                    f"for {path} at {ref} is not in the local object store"
+                )
+            if len(header) != 3 or header[0] != expected_id:
+                raise ValueError(f"git cat-file returned a malformed header for {path} at {ref}")
+            if header[1] != b"blob":
+                raise ValueError(
+                    f"git cat-file returned a non-blob object for {path} at {ref}: {header[1]!r}"
+                )
             try:
                 size = int(header[2])
             except ValueError as exc:
@@ -612,21 +643,46 @@ def _manifest_inventory_errors(
 ) -> list[str]:
     errors: list[str] = []
 
-    def compare_set(label: str, live: frozenset[Any], recorded: frozenset[Any]) -> None:
+    for label, live, recorded, kept in (
+        ("GIANT_PATHS", inventory.giant_paths, manifest.giant_paths, frozenset()),
+        ("FUNCTION_DEBT", inventory.function_debt, manifest.function_debt, frozenset()),
+        # A band entry stays while its module sits at 1501-1600 lines: such
+        # modules mostly drift across 1500 and back in changes that never touch
+        # them, and the entry keeps its recorded reason for the return.
+        ("BAND_PATHS", inventory.band_paths, frozenset(manifest.band_paths), inventory.above_band_paths),
+    ):
         for item in sorted(live - recorded):
             errors.append(f"{label} missing live entry: {item!r}")
-        for item in sorted(recorded - live):
+        for item in sorted(recorded - live - kept):
             errors.append(f"{label} contains stale entry: {item!r}")
-
-    compare_set("GIANT_PATHS", inventory.giant_paths, manifest.giant_paths)
-    compare_set("FUNCTION_DEBT", inventory.function_debt, manifest.function_debt)
-    compare_set("BAND_PATHS", inventory.band_paths, frozenset(manifest.band_paths))
     if dict(inventory.byte_debt) != dict(manifest.byte_debt):
         errors.append(f"BYTE_DEBT differs from live exact counts: live={dict(inventory.byte_debt)!r}")
-    if len(inventory.functions) > MAX_TOTAL_FUNCTIONS:
-        errors.append(
-            f"total function count exceeds {MAX_TOTAL_FUNCTIONS}: {len(inventory.functions)}"
-        )
+    return errors
+
+
+def _parent_base_fabrication_errors(
+    manifest: SizeRatchetManifest,
+    inventory: SizeRatchetInventory,
+) -> list[str]:
+    """A degraded parent base is refused only for debt its manifest declares and its own tree lacks.
+
+    Debt the parent's tree holds and its manifest omits makes that parent honestly red; its manifest
+    is then stricter than the tree and lends the tip nothing (a tip that keeps the debt fails its own
+    live check, and the transition reads the debt as new), so a fix-forward of a red parent passes.
+    A band entry of a module that grew above the band is the same under-declaration."""
+    errors: list[str] = []
+    for label, live, recorded, kept in (
+        ("GIANT_PATHS", inventory.giant_paths, manifest.giant_paths, frozenset()),
+        ("FUNCTION_DEBT", inventory.function_debt, manifest.function_debt, frozenset()),
+        ("BAND_PATHS", inventory.band_paths, frozenset(manifest.band_paths),
+         inventory.above_band_paths | inventory.giant_paths),
+    ):
+        for item in sorted(recorded - live - kept):
+            errors.append(f"{label} contains stale entry: {item!r}")
+    live_bytes = dict(inventory.byte_debt)
+    for path, recorded_bytes in sorted(dict(manifest.byte_debt).items()):
+        if recorded_bytes > live_bytes.get(path, 0):
+            errors.append(f"BYTE_DEBT declares more than the tree holds: {path!r}")
     return errors
 
 
@@ -644,6 +700,7 @@ def _bootstrap_baseline_errors(
 
 
 def _git_show_manifest(repo_dir: pathlib.Path, ref: str, manifest_path: str) -> str | None:
+    """Return None only when a readable tree lacks the manifest, never on a read failure."""
     result = subprocess.run(
         ["git", "show", f"{ref}:{manifest_path}"],
         cwd=repo_dir,
@@ -651,7 +708,19 @@ def _git_show_manifest(repo_dir: pathlib.Path, ref: str, manifest_path: str) -> 
         capture_output=True,
         text=True,
     )
-    return result.stdout if result.returncode == 0 else None
+    if result.returncode == 0:
+        return result.stdout
+    listed = subprocess.run(
+        ["git", "ls-tree", "--name-only", ref, "--", manifest_path],
+        cwd=repo_dir, check=False, capture_output=True, text=True,
+    )
+    if listed.returncode == 0 and not listed.stdout.strip():
+        return None
+    detail = (listed.stderr if listed.returncode else result.stderr).strip().splitlines()
+    raise SizeRatchetRefUnavailable(
+        f"size-ratchet comparison ref {ref} is unavailable in this checkout: "
+        f"{detail[0] if detail else 'git show failed'}"
+    )
 
 
 def _staged_manifest_inventory(
@@ -666,21 +735,23 @@ def _staged_manifest_inventory(
     try:
         staged = parse_size_ratchet_manifest(staged_text)
         inventory = collect_size_ratchet_inventory_at_ref(repo_dir, index_tree)
-    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+    except SizeRatchetRefUnavailable:
+        raise
+    except ValueError as exc:
         raise ValueError(f"staged: {exc}") from exc
     return staged_text, staged, inventory
 
 
 def _commit_parents(repo_dir: pathlib.Path, commit: str) -> list[str]:
-    """Exact parent SHAs of ``commit`` in parent order (empty for a root commit)."""
-    listed = subprocess.run(
-        ["git", "rev-list", "--parents", "-n", "1", commit],
+    """Read exact parents from the object: a shallow history walk hides them."""
+    raw = subprocess.run(
+        ["git", "cat-file", "commit", commit],
         cwd=repo_dir,
         check=True,
         capture_output=True,
-        text=True,
-    ).stdout.split()
-    return listed[1:]
+    ).stdout
+    header = raw.split(b"\n\n", 1)[0].split(b"\n")
+    return [line[len(b"parent "):].decode("ascii") for line in header if line.startswith(b"parent ")]
 
 
 def resolve_committed_manifest_text(
@@ -696,7 +767,8 @@ def resolve_committed_manifest_text(
     first-parent history replay. ``None`` means no committed manifest exists on
     ``HEAD`` or any of its parents: a bootstrap, accepted from the current tree
     (interval archaeology is an owner-accepted tradeoff — the official
-    repository CI enforces the pairwise base-vs-tip transition instead).
+    repository CI enforces the pairwise base-vs-tip transition instead). An
+    unreadable ``HEAD`` or parent raises: only absence authorizes a bootstrap.
     """
     root = pathlib.Path(repo_dir).resolve()
     head = subprocess.run(
@@ -746,6 +818,15 @@ def _staged_tree_without_index_lock(root: pathlib.Path) -> str:
         ).stdout.strip()
 
 
+def _partial_finding(comparison: str, exc: Exception, unchecked: str) -> str:
+    """Name the unreadable comparison and the checks it prevented."""
+    stderr = getattr(exc, "stderr", None) or ""
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", "replace")
+    detail = next(iter(stderr.strip().splitlines()), str(exc))
+    return f"partial: {comparison} unavailable ({type(exc).__name__}: {detail}); not checked: {unchecked}"
+
+
 def _validate_manifest_candidate(
     root: pathlib.Path,
     current_text: str,
@@ -759,8 +840,15 @@ def _validate_manifest_candidate(
     inventory = inventory if inventory is not None else collect_size_ratchet_inventory(root)
     errors = _manifest_inventory_errors(current, inventory)
 
-    previous_text = resolve_committed_manifest_text(root, manifest_path=manifest_path)
-    previous = parse_size_ratchet_manifest(previous_text) if previous_text is not None else None
+    try:
+        previous_text = resolve_committed_manifest_text(root, manifest_path=manifest_path)
+        previous = parse_size_ratchet_manifest(previous_text) if previous_text is not None else None
+    except (OSError, SyntaxError, ValueError, subprocess.CalledProcessError) as exc:
+        # Unreadable or unparseable is not absent. Keep the live exactness
+        # findings without allowing an unknown authority to authorize growth.
+        unchecked = "shrink-only transition" + (" and staged index" if include_staged else "")
+        errors.append(_partial_finding("committed size-ratchet manifest", exc, unchecked))
+        return errors
     if previous is None:
         errors.extend(f"bootstrap: {error}" for error in _bootstrap_baseline_errors(current, inventory))
     elif current_text != previous_text:
@@ -769,13 +857,23 @@ def _validate_manifest_candidate(
     if not include_staged:
         return errors
 
-    head_tree = subprocess.run(
-        ["git", "rev-parse", "HEAD^{tree}"], cwd=root, check=True, capture_output=True, text=True
-    ).stdout.strip()
-    index_tree = _staged_tree_without_index_lock(root)
+    try:
+        head_tree = subprocess.run(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=root, check=True, capture_output=True, text=True
+        ).stdout.strip()
+        index_tree = _staged_tree_without_index_lock(root)
+    except (OSError, subprocess.CalledProcessError, SizeRatchetRefUnavailable) as exc:
+        errors.append(_partial_finding("staged index tree", exc, "staged exactness and transition"))
+        return errors
     if index_tree == head_tree:
         return errors
-    staged_text, staged, staged_inventory = _staged_manifest_inventory(root, index_tree, manifest_path)
+    try:
+        staged_text, staged, staged_inventory = _staged_manifest_inventory(root, index_tree, manifest_path)
+    except (OSError, subprocess.CalledProcessError, SizeRatchetRefUnavailable) as exc:
+        # Malformed staged content still raises; unavailable objects retain
+        # the findings already collected and explicitly disclose the gap.
+        errors.append(_partial_finding("staged index inventory", exc, "staged exactness and transition"))
+        return errors
     if staged_text is None:
         if previous is None:
             errors.append("staged: size-ratchet bootstrap manifest is missing from the changed index")
@@ -802,13 +900,19 @@ def validate_size_ratchet(
     """Validate live and staged candidates against the merge-aware committed authority.
 
     Enforcement contract: the OFFICIAL repository's CI ``size_ratchet`` lane
-    BLOCKS on these findings (tip exactness plus the pairwise base-vs-tip
+    BLOCKS on these findings (tip exactness, except that a band entry may stay
+    while its module sits at 1501-1600 lines, plus the pairwise base-vs-tip
     transition); every local surface (default pytest lanes exclude the marker;
     ``check_worktree_readiness`` and ``codebase_health`` report the findings)
     only WARNS. There is no committed-history replay: the previous manifest
     resolves from ``HEAD`` or any of its parents, and a checkout with no
     committed manifest anywhere bootstraps from its own tree — a locally
     evolved fork is never trapped by structural debt it inherited.
+
+    An unreadable or unparseable committed authority, or an unavailable staged
+    tree/inventory, retains the live findings plus a ``partial:`` finding naming
+    the unchecked comparisons. It never becomes an empty PASS or a bootstrap.
+    Malformed live or staged candidate content still raises.
     """
     root = pathlib.Path(repo_dir).resolve()
     current_path = root.joinpath(*pathlib.PurePosixPath(manifest_path).parts)
@@ -853,7 +957,9 @@ def validate_size_ratchet_transition_against_base(
     first adoption re-runs with a post-adoption base); empty/unresolvable
     (force-push loss) degrades to HEAD's parent whose manifest is first
     validated against the parent's own tree (fabricated bases are refused);
-    no parent manifest at all = bootstrap, transition skipped."""
+    no parent manifest at all = bootstrap, transition skipped. An unreadable
+    tip, base or parent raises rather than passing as absent; unavailable
+    parent inventory produces a failing finding, never a false PASS."""
     root = pathlib.Path(repo_dir).resolve()
     tip_text = _git_show_manifest(root, "HEAD", manifest_path)
     if tip_text is None:
@@ -900,7 +1006,7 @@ def validate_size_ratchet_transition_against_base(
         # equality is exactly what the laundering constructs.
         try:
             parent_inventory = collect_size_ratchet_inventory_at_ref(root, parent_ref)
-            parent_errors = _manifest_inventory_errors(previous, parent_inventory)
+            parent_errors = _parent_base_fabrication_errors(previous, parent_inventory)
         except Exception as exc:
             parent_errors = [f"pairwise-parent: inventory failed: {type(exc).__name__}: {exc}"]
         if parent_errors:
@@ -972,16 +1078,14 @@ def compute_repo_complexity_metrics(
 def size_headroom_lines(
     inventory: SizeRatchetInventory, *, paths: Iterable[str] | None = None, limit: int = 5,
 ) -> list[str]:
-    """Informational capacity from the same inventory as validation, never a gate.
+    """Descriptive totals and per-unit capacity from the validation inventory.
 
     Show touched paths when supplied; otherwise show the closest ordinary
     boundaries before registered debt, so giant legacy files cannot hide a
     nearly-full ordinary module. Bounds are presentation only and disclosed.
     """
     selected = set(paths) if paths is not None else None
-    functions = len(inventory.functions)
-    lines = [f"Runtime functions: {functions}/{MAX_TOTAL_FUNCTIONS}; "
-             f"{MAX_TOTAL_FUNCTIONS - functions} remaining."]
+    lines = [f"Runtime functions: {len(inventory.functions)} (descriptive)."]
     modules = sorted(
         (m for m in inventory.modules if selected is None or m.path in selected),
         key=lambda m: (m.path in GIANT_PATHS or m.path in _CHECKED_IN_MANIFEST.byte_debt,
@@ -1009,6 +1113,224 @@ def size_headroom_lines(
     if len(functions_by_size) > limit:
         lines.append(f"{len(functions_by_size) - limit} more functions omitted.")
     return lines
+
+
+DIFF_PULSE_QUESTION = (
+    "Question: does each touched file still read as one coherent thought, and is all of this growth "
+    "needed, or could the same behaviour live in fewer concepts, branches or state?"
+)
+
+
+def _untracked_lines(path: pathlib.Path) -> int:
+    """Lines of an untracked file; 0 when unreadable or not UTF-8 text, as Git counts no lines of a binary."""
+    try:
+        return len(path.read_bytes().decode("utf-8").splitlines())
+    except (OSError, UnicodeDecodeError):
+        return 0
+
+
+def _declared_tests(source: str, path: str) -> tuple[int, collections.Counter]:
+    """A test module's items and its ``serial`` marks by resource, read from the text.
+
+    A test function counts once per row of its literal ``parametrize`` lists; a computed
+    list counts as one row and a bare mark under ``""``: what the source declares, not a
+    collection.
+    """
+    nodes = list(ast.walk(ast.parse(source, filename=path)))
+    calls = {id(node.func): node for node in nodes if isinstance(node, ast.Call)}
+    items, marks = 0, collections.Counter()
+    for node in nodes:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
+            items += math.prod(len(call.args[1].elts) for call in node.decorator_list
+                               if isinstance(call, ast.Call) and getattr(call.func, "attr", "") == "parametrize"
+                               and len(call.args) > 1 and isinstance(call.args[1], (ast.List, ast.Tuple)))
+        elif isinstance(node, ast.Attribute) and node.attr == "serial" and getattr(node.value, "attr", "") == "mark":
+            args = calls[id(node)].args if id(node) in calls else ()
+            marks[str(args[0].value) if args and isinstance(args[0], ast.Constant) else ""] += 1
+    return items, marks
+
+
+def _recorded_test_seconds(paths: list[str]) -> tuple[float, int] | None:
+    """What the last complete battery recorded for these test modules, on the slowest of
+    its systems, and how many it did not record; ``None`` without a readable table."""
+    from ouroboros import config
+
+    try:
+        table = json.loads((pathlib.Path(config.DATA_DIR) / TEST_DURATIONS_PATH).read_text(encoding="utf-8"))
+        systems = list(table["platforms"].values())
+        recorded = [max(files.get(path, 0) for files in systems) for path in paths
+                    if any(path in files for files in systems)]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    return sum(recorded) / 1000, len(paths) - len(recorded)
+
+
+def _blob_texts(root: pathlib.Path, specs: list[str]) -> dict[str, str | None]:
+    """The text of every git object spec (`rev:path`, `:path`), None where it is missing or absent from a
+    partial clone (never fetched): one `git cat-file --batch` for all of them (a spec holding whitespace is
+    read with its own `git show`)."""
+    from ouroboros.reference_books import _OFFLINE_GIT, _git_bytes
+
+    texts: dict[str, str | None] = {}
+    batched = [spec for spec in specs if not any(char.isspace() for char in spec)]
+    for spec in specs:
+        if spec not in batched:
+            raw = _git_bytes(root, "--no-optional-locks", "show", spec)
+            texts[spec] = None if raw is None else raw.decode("utf-8", "replace")
+    if not batched:
+        return texts
+    try:
+        done = subprocess.run(["git", "--no-optional-locks", "cat-file", "--batch"], cwd=str(root), timeout=120,
+                              input="".join(spec + "\n" for spec in batched).encode("utf-8"), capture_output=True,
+                              env={**os.environ, **_OFFLINE_GIT})
+        out = done.stdout if done.returncode == 0 else b""
+    except (OSError, subprocess.SubprocessError):
+        out = b""
+    position = 0
+    for spec in batched:  # `<oid> <type> <size>\n<bytes>\n`, or `<spec> missing\n`, in input order
+        end = out.find(b"\n", position)
+        if end < 0:
+            texts[spec] = None
+            continue
+        header = out[position:end].split()
+        position = end + 1
+        if len(header) == 3 and header[2].isdigit():
+            size = int(header[2])
+            texts[spec] = out[position:position + size].decode("utf-8", "replace")
+            position += size + 1
+        else:
+            texts[spec] = None
+    return texts
+
+
+def _suite_facts(
+    root: pathlib.Path, base: str, staged: bool, rows: Mapping[str, tuple[int, int]], new: Iterable[str],
+) -> tuple[str, list[str]]:
+    """The fact line's text on the suite and the sizes of ``rows``, the changed test sources
+    with their added and removed lines: test modules left the module band, not the pulse."""
+    from ouroboros.test_selection import is_test_module
+
+    tests = [path for path in rows if is_test_module(path)]
+    # One `git cat-file --batch` per side: a `git show` per changed test module cost a large PR's commit
+    # fifty seconds of pulse. A spec with whitespace would split in batch input; it is read alone.
+    at_base = _blob_texts(root, [f"{base}:{path}" for path in tests])
+    in_index = _blob_texts(root, [f":{path}" for path in tests]) if staged else {}
+
+    def current(path: str) -> str | None:
+        if staged:
+            return in_index.get(f":{path}")
+        try:
+            return (root / path).read_bytes().decode("utf-8", "replace")
+        except OSError:
+            return None
+
+    added = removed = unreadable = 0
+    marks: collections.Counter = collections.Counter()
+    sized: list[tuple[int, int, str, str]] = []
+    for path, (plus, minus) in rows.items():
+        text = current(path)
+        if text is not None:
+            lines = len(text.splitlines())
+            sized.append((minus - plus, -lines, path, f"{path} {lines} (+{plus}/-{minus})"))
+        if not is_test_module(path):
+            continue
+        try:
+            items, had = _declared_tests(at_base.get(f"{base}:{path}") or "", path)
+            count, has = _declared_tests(text or "", path)
+        except (SyntaxError, ValueError):  # mid-edit text: unread, never counted as none
+            unreadable += 1
+            continue
+        added, removed = added + max(count - items, 0), removed + max(items - count, 0)
+        marks.update(has - had)
+    items_fact = f"items +{added}/-{removed}" + (f" ({unreadable} unreadable)" if unreadable else "")
+    resources = ", ".join(sorted(name or "bare" for name in marks))
+    serial_fact = f"serial marks +{sum(marks.values())}" + (f" ({resources})" if marks else "")
+    created = sum(1 for path in new if path in rows and (is_test_module(path) or path.endswith(".test.js")))
+    recorded = _recorded_test_seconds([path for path in rows if is_test_module(path)])
+    seconds_fact = ("recorded test-seconds unknown" if recorded is None
+                    else f"{recorded[0]:.0f} recorded test-seconds of changed modules"
+                    + (f" ({recorded[1]} not recorded)" if recorded[1] else ""))
+    return f"tests: {items_fact}, new modules {created}, {serial_fact}, {seconds_fact}", [row[3] for row in sorted(sized)]
+
+
+def diff_pulse(
+    repo_dir: pathlib.Path, paths: Iterable[str] | None = None, *, staged: bool = False, limit: int = 5,
+) -> str:
+    """A change's size since its contribution base as one fact line, the touched books'
+    balance, then one fixed question; ``""`` when Git cannot measure the checkout.
+
+    The base is the book balance's (``reference_books.contribution_base``), so a branch's
+    earlier commits stay in the totals and the files they created stay listed as new;
+    without a cached official ref the line says so and measures from HEAD; it measures from
+    HEAD too, naming the base, when the base's side cannot be read here (a partial clone never
+    fetches it). With no diff readable at all, the touched books' balance stands alone. ``staged``
+    reads the index (what a commit or a review subject holds), otherwise the worktree and
+    its untracked files. ``paths`` names the modules and books shown (an edit's files);
+    omitted, every changed path is. A shown test source adds the suite's facts (declared
+    items, new test modules, ``serial`` marks, recorded test-seconds, its lines). A fact
+    for the mind, never a gate: one shape and one question for any size, and the list
+    bounds are presentation only, counting the rest.
+    """
+    from ouroboros.reference_books import _git_bytes, book_balance_note, contribution_base
+
+    root = pathlib.Path(repo_dir)
+    upstream, merge_base = contribution_base(root)
+
+    def diff(base: str, *options: str) -> bytes | None:
+        return _git_bytes(root, "--no-optional-locks", "diff", *(("--cached",) if staged else ()),
+                          "--no-renames", "-z", *options, base)
+
+    for base in ((merge_base, "HEAD") if merge_base else ("HEAD",)):
+        numstat = diff(base, "--numstat")
+        created = diff(base, "--name-only", "--diff-filter=A") if numstat is not None else None
+        if created is not None:
+            break
+    else:  # nothing to diff against here; the touched books keep whatever balance they have
+        return book_balance_note(root, [str(path) for path in paths or ()])
+    changed: dict[str, tuple[int, int]] = {}
+    for row in numstat.decode("utf-8", "replace").split("\0"):
+        plus, _, rest = row.partition("\t")
+        minus, _, path = rest.partition("\t")
+        if path:  # a binary file's "-" counts no lines
+            changed[path] = (int(plus) if plus.isdigit() else 0, int(minus) if minus.isdigit() else 0)
+    new = [path for path in created.decode("utf-8", "replace").split("\0") if path]
+    if not staged:
+        untracked = _git_bytes(root, "--no-optional-locks", "ls-files", "--others", "--exclude-standard", "-z")
+        for path in (untracked or b"").decode("utf-8", "replace").split("\0"):
+            if path:
+                changed[path] = (_untracked_lines(root / path), 0)
+                new.append(path)
+    shown = list(dict.fromkeys(str(path) for path in paths)) if paths is not None else list(changed)
+    modules: list[tuple[GatedModule, int, int]] = []
+    for path in shown:
+        try:
+            modules.extend((module, *changed.get(module.path, (0, 0)))
+                           for module in iter_gated_modules(root, repo_paths=[path]))
+        except (OSError, ValueError):  # deleted, outside the checkout or not UTF-8 text: no size to show
+            continue
+    # Most grown first, then the largest: where the change put its weight.
+    modules.sort(key=lambda row: (row[2] - row[1], -row[0].line_count, row[0].path))
+
+    def listed(items: list[str]) -> str:
+        more = f" (+{len(items) - limit} more)" if len(items) > limit else ""
+        return ", ".join(items[:limit]) + more if items else "none"
+
+    suite = ""
+    rows = {path: changed[path] for path in shown if path in changed and path.endswith((".py", ".js"))
+            and "tests" in pathlib.PurePosixPath(path).parts[:-1]}
+    if rows:
+        facts, test_sizes = _suite_facts(root, base, staged, rows, new)
+        suite = f"; {facts}, test module lines: {listed(test_sizes)}"
+
+    added, deleted = sum(plus for plus, _ in changed.values()), sum(minus for _, minus in changed.values())
+    named = f"{upstream.removeprefix('refs/remotes/')} merge-base {merge_base[:12]}"
+    since = (named if base == merge_base else f"HEAD (contribution diff from {named} unavailable)" if merge_base
+             else "HEAD (contribution base unavailable)")
+    sizes = [f"{module.path} {module.line_count} (+{plus}/-{minus})" for module, plus, minus in modules]
+    fact = (f"Diff pulse since {since}: files {len(changed)}, lines +{added}/-{deleted} (net {added - deleted:+d}); "
+            f"new files: {listed(new)}; module lines (target {TARGET_MODULE_LINES}, cap {MAX_MODULE_LINES}): "
+            f"{listed(sizes)}{suite}.")
+    return "\n".join(part for part in (fact, book_balance_note(root, shown), DIFF_PULSE_QUESTION) if part)
 
 
 def compute_complexity_metrics(sections: List[Tuple[str, str]]) -> Dict[str, Any]:
@@ -1043,6 +1365,9 @@ def compute_complexity_metrics(sections: List[Tuple[str, str]]) -> Dict[str, Any
             item.path for item in modules if TARGET_MODULE_LINES < item.line_count <= BAND_MODULE_MAX_LINES
         ),
         byte_debt={item.path: item.utf8_bytes for item in modules if item.utf8_bytes > MAX_MODULE_BYTES},
+        above_band_paths=frozenset(
+            item.path for item in modules if BAND_MODULE_MAX_LINES < item.line_count <= MAX_MODULE_LINES
+        ),
     )
     return _metrics_from_inventory(inventory)
 

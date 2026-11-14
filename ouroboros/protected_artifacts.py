@@ -3,19 +3,21 @@
 from __future__ import annotations
 
 import pathlib
+import posixpath
 from typing import Any, Dict, Iterable, List
 
 from ouroboros.shell_parse import (
+    inline_shell_command,
     is_absolute_path_text,
     shell_argv,
-    shell_command_string,
     slash_normalize_path_text,
     strip_leading_env_assignments,
     unwrap_env_argv,
 )
 from ouroboros.tool_access import ResolvedResourceBinding, resolve_shell_cwd
+from ouroboros.tool_access_paths import entry_path
 from ouroboros.tools.shell_guards import interpreter_family
-from ouroboros.workspace_executor import executor_ref_from_ctx, map_backend_path, map_host_path
+from ouroboros.workspace_executor import BackendPathNoMatch, executor_ref_from_ctx, map_backend_path, map_host_path
 
 _DEFAULT_DENIED_OPERATIONS = frozenset({
     "read_bytes",
@@ -97,8 +99,6 @@ _SHELL_COMMAND_OPERATIONS = {
     "gdb": "debug",
     "lldb": "debug",
 }
-_CMD_INLINE_SWITCHES = frozenset({"/c", "/k"})
-_POWERSHELL_INLINE_SWITCHES = frozenset({"-c", "-command", "/c"})
 _POWERSHELL_ENCODED_SWITCHES = frozenset({"-encodedcommand", "-enc", "-e"})
 _GIT_STATIC_INTROSPECTION_SUBCOMMANDS = frozenset({
     "blame",
@@ -112,8 +112,8 @@ _GIT_STATIC_INTROSPECTION_SUBCOMMANDS = frozenset({
 # text diff prints "Binary files differ" for them, never the bytes.
 _GIT_DIFF_CONTENT_FLAGS = frozenset({"--binary", "--ext-diff", "--textconv"})
 # Output-limiting flags under which `git diff` emits only file NAMES / stat
-# counts, never file content — safe regardless of binary-vs-text (the vcs_diff
-# FP shape: `git diff --stat` / `vcs_diff(stat=true|name_only=true)`).
+# counts, never file content — safe regardless of binary-vs-text (the vcs_read diff
+# FP shape: `git diff --stat` / `vcs_read(action=diff, stat=true|name_only=true)`).
 _GIT_DIFF_CONTENT_FREE_FLAGS = frozenset({
     "--stat", "--numstat", "--shortstat", "--dirstat",
     "--name-only", "--name-status", "--summary", "--compact-summary",
@@ -160,6 +160,7 @@ def _base_roots(
         getattr(ctx, "workspace_root", None),
         getattr(ctx, "repo_dir", None),
         getattr(ctx, "system_repo_dir", None),
+        getattr(ctx, "serving_repo_dir", None),
         getattr(ctx, "drive_root", None),
     )
     for value in values:
@@ -178,7 +179,9 @@ def _resolve_policy_path(
     ctx: Any,
     raw_path: str,
     binding: ResolvedResourceBinding | None = None,
+    entry: bool = False,
 ) -> pathlib.Path | None:
+    """A policy path's physical target; as an ``entry``, the directory entry it names (`entry_path`)."""
     text = str(raw_path or "").strip()
     if not text:
         return None
@@ -186,20 +189,23 @@ def _resolve_policy_path(
         path = pathlib.Path(text).expanduser()
     except (OSError, TypeError, ValueError):
         return None
-    if path.is_absolute():
-        return path.resolve(strict=False)
-    roots = _base_roots(ctx, binding)
-    if not roots:
-        return path.resolve(strict=False)
-    return (roots[0] / path).resolve(strict=False)
+    roots = [] if path.is_absolute() else _base_roots(ctx, binding)
+    path = roots[0] / path if roots else path
+    return entry_path(path) if entry else path.resolve(strict=False)
 
 
-def _backend_spellings_for_host_path(ctx: Any, path: pathlib.Path) -> set[str]:
+def _backend_spellings_for_host_path(ctx: Any, path: pathlib.Path, *, entry: bool = False) -> set[str]:
     try:
         executor = executor_ref_from_ctx(ctx)
         if executor is None:
             return set()
-        backend = map_host_path(executor, pathlib.Path(path))
+        if entry:
+            path = entry_path(path)
+            backend = next((m.backend_path for m in executor.mappings if path == m.host_path), None)
+            if backend is None:
+                backend = map_host_path(executor, path.parent).rstrip("/") + "/" + path.name
+        else:
+            backend = map_host_path(executor, pathlib.Path(path))
     except Exception:
         return set()
     return {backend, backend.rstrip("/")}
@@ -249,15 +255,18 @@ def _operation_denied(record: Dict[str, Any], operation: str) -> bool:
     return str(record.get("role") or "") == "black_box_reference" and operation in _DEFAULT_DENIED_OPERATIONS
 
 
-def _matches(candidate: pathlib.Path, protected_path: pathlib.Path) -> bool:
+def _matches(candidate: pathlib.Path, protected_path: pathlib.Path, entry: bool = False, *, lexical: bool = False) -> bool:
+    """``lexical``: an asked address, which may not exist, is covered at or below a protected address whether or not
+    a directory exists there (``ResolvedResourceBinding.requested_path``)."""
     try:
-        candidate_resolved = pathlib.Path(candidate).expanduser().resolve(strict=False)
+        candidate = pathlib.Path(candidate).expanduser()
+        candidate_resolved = entry_path(candidate) if entry else candidate.resolve(strict=False)
         protected_resolved = pathlib.Path(protected_path).expanduser().resolve(strict=False)
     except (OSError, TypeError, ValueError):
         return False
     if candidate_resolved == protected_resolved:
         return True
-    if protected_resolved.is_dir():
+    if lexical or protected_resolved.is_dir():
         try:
             candidate_resolved.relative_to(protected_resolved)
             return True
@@ -294,19 +303,30 @@ def block_reason_for_path(
     target: pathlib.Path,
     operation: str,
     binding: ResolvedResourceBinding | None = None,
+    *,
+    entry: bool = False,
 ) -> str:
+    """The policy refusal for one target, or "". An ``entry`` target is a directory entry read as itself:
+    it is never followed, and a policy path naming that entry (a symlink included) still covers it."""
+    # A re-anchored READ (a capture or source opened where its writer kept it) keeps the policy of the address it
+    # asked for as well as of the target it opened (``ResolvedResourceBinding.requested_path``). The asked address
+    # moved because nothing exists there, so a protected directory covers it lexically.
+    asked = getattr(binding, "requested_path", None)
+    targets = [(pathlib.Path(target), False)] + ([(pathlib.Path(asked), True)] if asked is not None and pathlib.Path(
+        target) == getattr(binding, "target_path", None) else [])
     for record in _artifact_records(ctx):
         if not _operation_denied(record, operation):
             continue
         for raw_path in record.get("paths") or []:
             protected_path = _resolve_policy_path(ctx, str(raw_path), binding)
             protected_spellings = _policy_backend_spellings(ctx, str(raw_path), protected_path)
-            target_backend_spellings = _backend_spellings_for_host_path(ctx, pathlib.Path(target))
-            if (
+            if any(
                 protected_path is not None
-                and _matches(pathlib.Path(target), protected_path)
-                or _backend_spelling_matches(pathlib.Path(target), protected_spellings)
-                or bool(protected_spellings & target_backend_spellings)
+                and _matches(candidate, protected_path, entry, lexical=lexical)
+                or entry and entry_path(candidate) == _resolve_policy_path(ctx, str(raw_path), binding, True)
+                or _backend_spelling_matches(candidate, protected_spellings)
+                or bool(protected_spellings & _backend_spellings_for_host_path(ctx, candidate, entry=entry))
+                for candidate, lexical in targets
             ):
                 artifact_id = str(record.get("id") or pathlib.Path(str(raw_path)).name or "protected artifact")
                 return (
@@ -397,9 +417,22 @@ def _resolve_candidate_path(ctx: Any, work_dir: pathlib.Path, text: str) -> path
         if is_absolute_path_text(text):
             try:
                 executor_ref = executor_ref_from_ctx(ctx)
-                return map_backend_path(executor_ref, text) if executor_ref is not None else path.resolve(strict=False)
             except Exception:
-                return path.resolve(strict=False)
+                executor_ref = None
+            if executor_ref is not None:
+                try:
+                    return map_backend_path(executor_ref, text)
+                except BackendPathNoMatch:
+                    pass  # Only a genuine no-match keeps the host spelling.
+                except Exception:
+                    # A matched but unmappable spelling (traversal) names the
+                    # container's lexical target, never a host reinterpretation.
+                    normalized = posixpath.normpath(slash_normalize_path_text(text))
+                    try:
+                        return map_backend_path(executor_ref, normalized)
+                    except Exception:
+                        return pathlib.Path(normalized)
+            return path.resolve(strict=False)
         return (pathlib.Path(work_dir) / path).resolve(strict=False)
     except (OSError, TypeError, ValueError):
         return None
@@ -467,18 +500,6 @@ def _glob_pattern_could_match_protected(
             if block:
                 return block
     return ""
-
-
-def _inline_shell_command(argv: list[str], shell_name: str) -> str:
-    if shell_name in {"bash", "sh", "zsh"}:
-        return shell_command_string(argv)
-    switches = _CMD_INLINE_SWITCHES if shell_name == "cmd" else _POWERSHELL_INLINE_SWITCHES
-    for idx, arg in enumerate(argv[1:], start=1):
-        if str(arg or "").strip().lower() in switches:
-            return " ".join(str(part) for part in argv[idx + 1:])
-    return ""
-
-
 
 
 def _is_high_risk_interpreter(name: str) -> bool:
@@ -569,7 +590,7 @@ def _git_diff_can_dump_content(argv: list[str]) -> bool:
     An output-limiting flag (`--stat`/`--name-only`/`--name-status`/…) makes the
     diff emit only file NAMES / stat counts — never content — regardless of
     binary-vs-text, so it cannot leak a protected artifact and the whole-work_dir
-    fallback is skipped (the documented `git diff --stat` / `vcs_diff(stat=true)`
+    fallback is skipped (the documented `git diff --stat` / `vcs_read(action=diff, stat=true)`
     false positive). Everything else — a BARE `git diff` (can dump a modified
     text file's content), a revision argument, a forced content flag
     (--binary/--ext-diff/--textconv), or a PATCH flag (`-p`/`-u`/`-U<n>`/`-W`/
@@ -793,7 +814,7 @@ def shell_block_reason(
     for (raw_argv, reads, writes, shell_syntax), row_cwd in zip(rows, sequential_effective_cwds(rows, work_dir)):
         argv = strip_leading_env_assignments(unwrap_env_argv(raw_argv))
         first = pathlib.PurePath(argv[0]).name.lower().removesuffix(".exe") if argv else ""
-        if first in {"cmd", "powershell", "pwsh"} and (inline := _inline_shell_command(argv, first)):
+        if first in {"cmd", "powershell", "pwsh"} and (inline := inline_shell_command(argv, first)):
             argv = shell_argv(inline)  # Retain the existing explicit Windows command-operand view.
         # Redirections are independent operations, including around allowed execution.
         write_targets = [*_writer_target_tokens_single(argv, direct_only=True, parse_redirects=False), *writes]

@@ -16,6 +16,7 @@ from ouroboros.config import CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION
 from tests._delegated_transport_shared import (  # noqa: F401  (autouse fixture applies on import)
     _delegating_ctx,
     _owned_gateway_uses_each_test_transport,
+    _select_transport_access,
     _started_request,
 )
 
@@ -41,14 +42,16 @@ def test_a_mutating_child_runs_live_in_a_private_snapshot_not_the_shared_tree(tm
     # The snapshot genuinely carries the target's current state.
     assert (scope_root / "README.md").read_text(encoding="utf-8") == "seed\n"
     assert payload["access"] == "workspace_write" and payload["isolation"] == "live"
+    assert payload["workspace"] == "copy"  # the default place; workspace='in_place' is the explicit other one
 
 
 def test_a_read_only_child_uses_the_same_transport_with_a_narrower_profile(tmp_path, monkeypatch):
     # One nanny, one transport: the ONLY difference is the derived profile and the run
     # shape it implies. `execution.isolation='live'` is agent-only in Claudexor — a
     # non-agent run carrying it is refused at the boundary — and a read-only child has
-    # nothing to write back anyway.
-    request, payload = _started_request(tmp_path, acting=False, monkeypatch=monkeypatch)
+    # nothing to write back anyway. #1609: technical access alone decides the shape, so
+    # the read-only child is the one whose selected row captured `readonly`.
+    request, payload = _started_request(tmp_path, acting=False, monkeypatch=monkeypatch, access="readonly")
     assert request["access"] == "readonly"
     assert request["mode"] == "ask"
     assert "execution" not in request
@@ -75,11 +78,22 @@ def test_naming_the_documented_default_starts_exactly_like_omitting_it(
     roots = [tmp_path / "omit", tmp_path / "named"]
     for root in roots:
         root.mkdir()
-    omitted, _ = _started_request(roots[0], acting=False, monkeypatch=monkeypatch)
+    # #1609: the read-only child is the one whose selected row captured `readonly`.
+    omitted, _ = _started_request(roots[0], acting=False, monkeypatch=monkeypatch, access="readonly")
     explicit, payload = _started_request(
-        roots[1], acting=False, monkeypatch=monkeypatch, start_kwargs=named_default)
+        roots[1], acting=False, monkeypatch=monkeypatch, start_kwargs=named_default, access="readonly")
     assert "execution" not in explicit
     assert payload["access"] == "readonly"
+    # These requests use different repositories. Keep the honest missing-DESIGN and
+    # missing-BIBLE disclosures and normalize only their exact source addresses before comparison.
+    for request, root in ((omitted, roots[0]), (explicit, roots[1])):
+        source = str(root / "repo/docs/DESIGN.md")
+        assert source in request["instructions"]
+        assert "No DESIGN content or navigation delivered" in request["instructions"]
+        request["instructions"] = request["instructions"].replace(source, "<selected-repo>/docs/DESIGN.md")
+        bible = str(root / "repo/BIBLE.md")
+        assert f"BIBLE.md source unavailable at {bible}" in request["instructions"]
+        request["instructions"] = request["instructions"].replace(bible, "<selected-repo>/BIBLE.md")
     assert {key: value for key, value in explicit.items() if key != "scope"} == {
         key: value for key, value in omitted.items() if key != "scope"}
 
@@ -115,6 +129,7 @@ def test_real_geometry_on_a_read_only_child_refuses_before_the_daemon(
 
     monkeypatch.setattr(_gw, "ClaudexorGateway", lambda *a, **k: _NeverReached())
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
+    _select_transport_access(monkeypatch, "readonly")  # #1609: the read-only child says so
     ctx = _delegating_ctx(tmp_path, acting=False, task_id="t-geometry")
     refused = json.loads(delegate._delegate_start(ctx, "audit the folder", **geometry).text)
     assert refused["status"] == "refused"
@@ -130,10 +145,21 @@ def test_real_geometry_on_a_read_only_child_refuses_before_the_daemon(
     assert blocked[0]["task_id"] == "t-geometry"
 
 
-def test_the_host_states_its_prohibitions_on_every_delegated_run(tmp_path, monkeypatch):
-    request, _ = _started_request(tmp_path, acting=True, monkeypatch=monkeypatch)
+@pytest.mark.parametrize("access", ["readonly", "workspace_write"])
+def test_the_host_states_its_prohibitions_on_every_delegated_run(tmp_path, monkeypatch, access):
+    request, _ = _started_request(tmp_path, acting=True, monkeypatch=monkeypatch, access=access)
     instructions = request["instructions"].lower()
-    assert "git commit" in instructions and "outside this root" in instructions
+    assert "do not run git commit, tag, push, rebase, reset" in instructions
+    assert "explicit task constraints and the assigned edit target still bind" in instructions
+    if access == "readonly":
+        assert "make no edits or writes" in instructions
+        assert "parent's existing read authority" in instructions
+    else:
+        # #2190 permits verification scratch and the named cache, without
+        # granting writes to another project or the operator's files.
+        assert ("you may edit inside this root, and outside it write only disposable process state "
+                "outside every git working tree and the shared download cache your host names, "
+                "never another project or the operator's files") in instructions
 
 
 def test_the_model_has_no_argument_that_could_widen_the_profile():
@@ -142,20 +168,53 @@ def test_the_model_has_no_argument_that_could_widen_the_profile():
     entry = next(e for e in delegate.get_tools() if e.name == "delegate_start")
     properties = set(entry.schema["parameters"]["properties"])
     # `retry_of` names an INVOCATION, not authority (ownership-checked replay);
+    # `continue_from` names a settled run of this task's line (custody-checked; access
+    # never wider) and `continue_carrier` only how the engine re-briefs it;
     # root/bucket/skill_name are a SELECTOR resolved through the same
-    # ResolvedResourceBinding authorizer as ordinary writes (R1 item 9).
+    # ResolvedResourceBinding authorizer as ordinary writes (R1 item 9); `effort` is reasoning
+    # depth inside the owner's effort range (a pin or a level in the model name keeps its own).
+    # D2 exposes ask/plan/agent and explicit readiness override; the retained ceiling still governs.
+    # `workspace` (owner 25.10, Q2-A) names WHERE a Git writer works inside the task's own write root,
+    # a private copy (default) or that root in place; it is never a path and never wider access.
+    # `attachment_paths`/`attachment_import` only select this task's own retained inputs (exact manifest
+    # relpaths) to attach as engine documents and whether to reuse their import; never a path or access.
+    # `input_files` selects already-readable files; its entries contain no permission or scope override.
     assert properties == {
-        "prompt", "subagent_id", "max_seconds", "retry_of", "root", "bucket", "skill_name",
-        "directory_strategy", "scope_paths", "access",
+        "prompt", "subagent_id", "max_seconds", "retry_of", "continue_from", "continue_carrier", "root",
+        "bucket", "skill_name", "directory_strategy", "scope_paths", "access", "effort", "mode",
+        "override_plan_readiness", "workspace", "attachment_paths", "attachment_import", "input_files",
     }
-    assert entry.schema["parameters"]["properties"]["root"]["enum"] == ["skill_payload"]
+    item = entry.schema["parameters"]["properties"]["input_files"]["items"]
+    assert set(item["properties"]) == {"root", "path"}
+    assert item["additionalProperties"] is False
+    assert entry.schema["parameters"]["properties"]["attachment_import"]["enum"] == ["reuse", "new"]
+    assert entry.schema["parameters"]["properties"]["attachment_paths"]["items"] == {"type": "string"}
+    assert entry.schema["parameters"]["properties"]["workspace"]["enum"] == ["copy", "in_place"]
+    from ouroboros.settings_scales import EFFORT_SCALE
+    assert entry.schema["parameters"]["properties"]["effort"]["enum"] == ["auto", *EFFORT_SCALE]
+    assert entry.schema["parameters"]["properties"]["continue_carrier"]["enum"] == ["auto", "packet"]
+    assert entry.schema["parameters"]["properties"]["root"]["enum"] == ["active_workspace", "skill_payload"]
     assert entry.schema["parameters"]["properties"]["access"]["enum"] == ["readonly", "workspace_write"]
-    assert not properties & {"mode", "isolation", "scope", "write_surface", "cwd"}
+    assert entry.schema["parameters"]["properties"]["mode"]["enum"] == ["ask", "plan", "agent"]
+    assert entry.schema["parameters"]["properties"]["override_plan_readiness"]["type"] == "boolean"
+    assert not properties & {"isolation", "scope", "write_surface", "cwd"}
 
 
-def test_a_read_only_task_cannot_obtain_workspace_write(tmp_path):
+def test_a_task_without_write_authority_gets_an_evidence_only_investigation_never_a_writer(tmp_path):
+    """#1609 (owner-approved): TECHNICAL access alone decides the run shape.
+
+    A task with no write authority used to be forced read-only whatever its selected
+    row captured. Now the captured writable access runs, but only as an evidence-only
+    ``investigation``: its private copy's authority source is the investigation one,
+    its capture is evidence, and nothing it produces can ever be integrated. Write
+    authority still decides PURPOSE, so none of these constraints becomes a writer;
+    an explicit ``readonly`` lowering still yields the old read-only Ask shape.
+    """
     from ouroboros.contracts.task_constraint import TaskConstraint
+    from ouroboros.delegate_registration_policy import INVESTIGATION_AUTHORITY, candidate_apply_possible
+    from ouroboros.subagents import DelegatedRunShape
     from ouroboros.tools.delegate import _derive_authority
+    from ouroboros.tools.delegate_integration import _mutation_authority
     from ouroboros.tools.registry import ToolContext
 
     for constraint in (
@@ -166,9 +225,19 @@ def test_a_read_only_task_cannot_obtain_workspace_write(tmp_path):
     ):
         ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_constraint=constraint)
         ctx.task_metadata = {"parent_task_id": "p"}
-        authority = _derive_authority(ctx)
-        assert authority.access == "readonly", constraint
-        assert authority.mode == "ask" and authority.isolation == ""
+        for kwargs, access in (({}, "workspace_write"), ({"access": "workspace_write"}, "workspace_write"),
+                               ({"access": "full"}, "full")):
+            authority = _derive_authority(ctx, **kwargs)
+            assert authority == DelegatedRunShape(access, "agent", "live", True, investigation=True), constraint
+            record, refusal = _mutation_authority(ctx, authority)
+            assert refusal is None, constraint
+            assert record["source"] == INVESTIGATION_AUTHORITY and record["capture_mode"] == "evidence"
+            assert candidate_apply_possible({"authority_source": record["source"]}) is False, constraint
+        lowered = _derive_authority(ctx, "readonly")
+        assert lowered == DelegatedRunShape("readonly", "ask"), constraint
+        assert lowered.mode == "ask" and lowered.isolation == "" and not lowered.investigation
+        record, refusal = _mutation_authority(ctx, lowered)
+        assert refusal is None and record["source"] == "readonly" and record["capture_mode"] == "none"
 
 
 @pytest.mark.parametrize("effective,entitled,widened", [
@@ -177,8 +246,6 @@ def test_a_read_only_task_cannot_obtain_workspace_write(tmp_path):
     ("workspace_write", "workspace_write", ""),
     ("workspace_write", "readonly", "workspace_write"),
     ("full", "workspace_write", "full"),
-    ("inherit_native", "workspace_write", "inherit_native"),
-    ("a-profile-from-a-future-engine", "workspace_write", "a-profile-from-a-future-engine"),
 ])
 def test_effective_access_is_verified_not_assumed(effective, entitled, widened):
     from ouroboros.tools.delegate import _widened_access
@@ -243,16 +310,19 @@ def test_a_succeeded_run_that_never_proved_its_profile_says_so_in_its_result():
     from ouroboros.subagents import delegated_run_shape
     from ouroboros.tools.delegate import _terminal_payload
 
+    # The read-only lane is an explicitly readonly run (#1609: a non-acting child that
+    # captured writable access is an investigation, not this lane).
+    readonly_lane = delegated_run_shape(False, "readonly")
     # A succeeded run with NO disclosed profile: unverified, and it says why.
     silent = {"lastSeq": 40, "summary": {"state": "succeeded"}}
-    evidence = _terminal_payload("run-1", silent, delegated_run_shape(False))["access_evidence"]
+    evidence = _terminal_payload("run-1", silent, readonly_lane)["access_evidence"]
     assert evidence["verified"] is False and evidence["effective"] == ""
     assert evidence["requested"] == "readonly" and evidence["state"] == "succeeded"
     assert "SUCCEEDED without ever disclosing" in evidence["note"]
 
     # A succeeded run that DID disclose one is verified, with no note.
     proven = {"lastSeq": 40, "summary": {"state": "succeeded", "effectiveAccess": "readonly"}}
-    evidence = _terminal_payload("run-1", proven, delegated_run_shape(False))["access_evidence"]
+    evidence = _terminal_payload("run-1", proven, readonly_lane)["access_evidence"]
     assert evidence == {"requested": "readonly", "effective": "readonly",
                         "verified": True, "state": "succeeded"}
 
@@ -260,7 +330,7 @@ def test_a_succeeded_run_that_never_proved_its_profile_says_so_in_its_result():
     # profile at all, so this is absence of evidence rather than a missing proof.
     for state in ("failed", "cancelled", "interrupted"):
         detail = {"lastSeq": 40, "summary": {"state": state}}
-        evidence = _terminal_payload("run-1", detail, delegated_run_shape(False))["access_evidence"]
+        evidence = _terminal_payload("run-1", detail, readonly_lane)["access_evidence"]
         assert evidence["verified"] is False, state
         assert "absence of evidence, not a breach" in evidence["note"], state
 
@@ -268,7 +338,7 @@ def test_a_succeeded_run_that_never_proved_its_profile_says_so_in_its_result():
     # `effectiveAccess ?? our own request`, so a payload carrying only the echo must
     # still read unverified.
     echo = {"lastSeq": 40, "summary": {"state": "succeeded", "access": "readonly"}}
-    assert _terminal_payload("run-1", echo, delegated_run_shape(False))[
+    assert _terminal_payload("run-1", echo, readonly_lane)[
         "access_evidence"]["verified"] is False
 
     # The mutating lane carries BOTH halves, and neither displaces the other.
@@ -331,7 +401,7 @@ def test_a_widened_run_is_cancelled_and_typed_not_reported_as_progress(tmp_path,
         task_id="t-nanny", route_id="some-route", model="m",
         project_id="prj", project_owned=False,
     )
-    out = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=1))
+    out = json.loads(delegate._read_run(ctx, "run-1"))
     delegate._CUSTODY.clear()
     assert out["status"] == "refused"
     assert out["reason"] == "access_profile_widened"
@@ -361,7 +431,7 @@ def test_a_delegated_run_can_only_be_touched_by_the_task_that_started_it(tmp_pat
     )
 
     for tool, call in (
-        ("delegate_wait", lambda ctx, rid: delegate._delegate_wait(ctx, rid, wait_sec=1)),
+        ("delegate_wait", lambda ctx, rid: delegate._read_run(ctx, rid)),
         # delegate_wait is the tick contract (str); cancel answers natively.
         ("delegate_cancel", lambda ctx, rid: delegate._delegate_cancel(ctx, rid, reason="x").text),
     ):
@@ -463,31 +533,40 @@ def test_the_guards_that_protect_a_delegated_run_fail_closed(tmp_path, monkeypat
     assert json.loads(delegate._delegate_cancel(ctx, "run-x").text)["reason"] == "run_not_owned"
     delegate._CUSTODY.clear()
 
-    # 2. A run with no knowable deadline gets a conservative cap, never an omitted one:
-    #    an omitted cap is Claudexor's 7-day schema bound on a run nobody can cancel.
+    # 2. A run with no knowable deadline and no lifetime sends NO cap. Retired pin (1A): the
+    #    6 h operation fallback, justified by a 7-day omission the pinned engine never had —
+    #    there omission is its run clock off; custody, Stop and money still end a run.
     bare = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     bare.task_id = "t-a"
     bare.task_metadata = {"root_task_id": "t-a"}          # no deadline_at at all
-    # The cap is the EXISTING task ceiling SSOT, not a second hardcoded one: a 1h guess
-    # would have truncated a headless/benchmark run that legitimately has no deadline.
     from ouroboros.config import get_task_abs_ceiling_sec
+    from ouroboros.delegate_registration_policy import CAP_BASIS_UNBOUNDED
 
-    assert delegate._bounded_max_seconds(bare, None) == int(get_task_abs_ceiling_sec())
+    assert get_task_abs_ceiling_sec() is None
+
+    def _seconds(context, requested):
+        return delegate.bounded_max_seconds(context, requested).seconds
+
+    assert _seconds(bare, None) == 0
+    assert delegate.bounded_max_seconds(bare, None).basis == CAP_BASIS_UNBOUNDED
+    # A finite configured lifetime is the window itself.
+    monkeypatch.setenv("OUROBOROS_TASK_ABS_CEILING_SEC", "7200")
+    assert _seconds(bare, None) == 7200
 
     # ...but never past Claudexor's own schema bound. The task ceiling clamps only from
     # BELOW, so an owner who raises it past a week would make every deadline-less start
     # send an out-of-schema value and get a 400 instead of a run.
     monkeypatch.setenv("OUROBOROS_TASK_ABS_CEILING_SEC", "1000000")
-    assert delegate._bounded_max_seconds(bare, None) == delegate._CLAUDEXOR_MAX_SECONDS
+    assert _seconds(bare, None) == delegate._CLAUDEXOR_MAX_SECONDS
 
     # ...and an EXPLICIT ask is clamped by the same bound. `max_seconds` is a
     # model-supplied tool argument with no maximum in its schema, so clamping only the
     # fallback branch left the ask itself able to sail past it — the same defect, one
     # branch over from the one that was fixed.
-    assert delegate._bounded_max_seconds(bare, 1_000_000) == delegate._CLAUDEXOR_MAX_SECONDS
-    assert delegate._bounded_max_seconds(bare, 120) == 120
+    assert _seconds(bare, 1_000_000) == delegate._CLAUDEXOR_MAX_SECONDS
+    assert _seconds(bare, 120) == 120
     # An explicit narrower ask still wins — the cap is a floor for the unknown case only.
-    assert delegate._bounded_max_seconds(bare, 120) == 120
+    assert _seconds(bare, 120) == 120
 
     # 3. P34P1.8: an EXPIRED deadline is NOT the same fact as having none.
     #    `deadline_remaining_sec` answers 0.0 for both, so the fallback above handed an
@@ -508,7 +587,7 @@ def test_the_guards_that_protect_a_delegated_run_fail_closed(tmp_path, monkeypat
                           "deadline_at": (utc_now() + datetime.timedelta(hours=1)).isoformat()}
     assert delegate.deadline_expired(live) is False
     # ...and the live deadline still NARROWS the bound, as it always did.
-    assert 0 < delegate._bounded_max_seconds(live, None) <= 3600
+    assert 0 < _seconds(live, None) <= 3600
 
     # The refusal is at the START, before the daemon is touched: nothing spent, nothing
     # registered, and the reason names the honest next move.

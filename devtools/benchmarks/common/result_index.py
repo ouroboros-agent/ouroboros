@@ -61,7 +61,7 @@ def read_result_index(run_dir: pathlib.Path) -> list[dict[str, Any]]:
 #     request rather than by the agent finishing, so an auditor must never read
 #     it as a fair-shot capability result; derived here with the whole set.
 _TRUNCATION_CODES_NOT_BEST_EFFORT = frozenset({
-    # ADDITIVE DELTA, two codes that terminate as infra failures rather than
+    # Codes that terminate as infra failures rather than
     # best-effort completions but are the same class for an AUDITOR: the attempt
     # was cut short by transport/provider death, never a fair shot at the task.
     # Adapters that lack a separate infra channel (the GAIA/OSWorld result rows)
@@ -72,6 +72,14 @@ _TRUNCATION_CODES_NOT_BEST_EFFORT = frozenset({
     # now terminalizes as infra_failed instead of "completed (best effort)".
     "llm_api_error",
     "provider_unavailable",
+    # Known-window admission exhausted size recovery before the task could
+    # finish; a host forecast stopped it, not a measured capability failure.
+    "context_overflow",
+    # The route's known window cannot hold the task's context at its start, or beside the handbook the task itself
+    # requires as it grows (agent_dispatch.py, context_renewal.py): host-stopped, never a fair shot at the task.
+    "context_capacity",
+    # Recovery ended before a usable answer; not a completed capability trial.
+    "output_recovery_exhausted",
 })
 
 RUNTIME_TRUNCATION_REASON_CODES = BEST_EFFORT_REASON_CODES | _TRUNCATION_CODES_NOT_BEST_EFFORT
@@ -128,7 +136,10 @@ def task_result_row(
 
     Pass ``runtime_result=<task result payload>`` (metadata or keyword) wherever the adapter
     holds one: ``runtime_outcome`` then discloses why the RUNTIME stopped, independently of
-    the adapter-stage ``reason_code`` this row's ``status`` describes."""
+    the adapter-stage ``reason_code`` this row's ``status`` describes.
+
+    An omitted or empty ``official_eval_status`` is ``unreported``: the caller made no claim.
+    ``not_run`` asserts the official evaluator never ran, so only an explicit value says it."""
     meta = dict(metadata or {})
     for key, value in overrides.items():
         if value is not None:
@@ -142,7 +153,7 @@ def task_result_row(
         "reason_code": str(meta.get("reason_code") or ""),
         "runtime_outcome": runtime_terminal_disclosure(meta.get("runtime_result")),
         "prediction_written": bool(meta.get("prediction_written")),
-        "official_eval_status": str(meta.get("official_eval_status") or "not_run"),
+        "official_eval_status": str(meta.get("official_eval_status") or "unreported"),
         "output_paths": meta.get("output_paths") or {},
         "error": str(meta.get("error") or ""),
         "details": meta.get("details") or {},

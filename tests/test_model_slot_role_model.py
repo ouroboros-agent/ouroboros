@@ -17,6 +17,8 @@ import pytest
 import ouroboros.config as config
 from ouroboros import fallback_cooldown as fcd
 from ouroboros import subagents
+from tests._shared import saved_settings
+from tests._store_shared import read_result
 
 
 @pytest.fixture(autouse=True)
@@ -36,10 +38,10 @@ def _owned_gateway_uses_each_test_transport(monkeypatch):
 
 # ---------------------------------------------------------------- accessors
 
-def test_heavy_and_light_empty_fall_back_to_main(monkeypatch):
-    monkeypatch.setenv("OUROBOROS_MODEL", "provider::main-x")
+def test_heavy_and_light_empty_fall_back_to_main(monkeypatch, tmp_path):
+    # A saved blank Light is "follow Main" (route keys read the document, route_choice); Heavy is env-read.
+    saved_settings(monkeypatch, tmp_path, OUROBOROS_MODEL="provider::main-x", OUROBOROS_MODEL_LIGHT="")
     monkeypatch.setenv("OUROBOROS_MODEL_HEAVY", "")
-    monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", "")
     assert config.get_heavy_model() == "provider::main-x"
     assert config.get_light_model() == "provider::main-x"
 
@@ -70,27 +72,12 @@ def test_fallback_chain_benchmark_dedupes_to_no_op(monkeypatch):
     assert config.get_fallback_models("same::model") == []
 
 
-def test_fallback_chain_reads_legacy_singular_env(monkeypatch):
-    monkeypatch.delenv("OUROBOROS_MODEL_FALLBACKS", raising=False)
-    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACK", "legacy::single")
-    assert config.get_fallback_models("primary") == ["legacy::single"]
-
-
-def test_fallback_chain_empty_means_no_fallback(monkeypatch):
-    # An explicitly empty/unset Fallbacks slot must NOT silently fall back to the shipped
-    # Anthropic default (which would cross an OpenAI-compatible/local owner into an
-    # unconfigured provider). The default reaches a default install via the env instead.
-    monkeypatch.delenv("OUROBOROS_MODEL_FALLBACKS", raising=False)
-    monkeypatch.delenv("OUROBOROS_MODEL_FALLBACK", raising=False)
+def test_fallback_chain_empty_means_no_fallback(monkeypatch, tmp_path):
+    # An explicitly empty Fallbacks slot (a SAVED blank: route keys read the document, route_choice) means
+    # no cross-model fallback; only an unauthored slot takes the install's proposal.
+    saved_settings(monkeypatch, tmp_path, OUROBOROS_MODEL_FALLBACKS="")
+    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "env/copy")  # a saved blank beats the environment's copy
     assert config.get_fallback_models("primary") == []
-
-
-def test_advisory_fallback_model_uses_main_when_light_empty(monkeypatch):
-    from ouroboros.tools.claude_advisory_review import _resolve_fallback_model
-    monkeypatch.setenv("OUROBOROS_MODEL", "provider::main-x")
-    monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", "")
-    # Empty Light must resolve to Main, never "" (which would call chat with no model id).
-    assert _resolve_fallback_model() == "provider::main-x"
 
 
 def test_parse_fallback_chain_ssot(monkeypatch):
@@ -99,9 +86,8 @@ def test_parse_fallback_chain_ssot(monkeypatch):
     # Raw chain: parsed, whitespace-trimmed, NO dedup, NO active-drop (those belong to
     # get_fallback_models on top).
     assert config.parse_fallback_chain() == ["a", "b", "a"]
-    monkeypatch.delenv("OUROBOROS_MODEL_FALLBACKS", raising=False)
-    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACK", "legacy")
-    assert config.parse_fallback_chain() == ["legacy"]
+    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACK", "legacy")  # the retired singular is no environment alias
+    assert config.parse_fallback_chain() == ["a", "b", "a"]
 
 
 def test_infer_model_category_recognizes_chain_link(monkeypatch):
@@ -332,39 +318,35 @@ def test_cooldown_error_kinds_include_rate_limit_but_not_in_retry_kinds():
 
 # ------------------------------------ credentialed-model resolver parses chain (C2)
 
-def test_resolve_credentialed_model_parses_fallbacks_chain(monkeypatch):
+def test_resolve_credentialed_model_parses_fallbacks_chain(monkeypatch, tmp_path):
     from ouroboros.provider_models import resolve_credentialed_model
-    # Only OpenRouter is credentialed in this environment.
-    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    # Only OpenRouter is credentialed in this install; Light saved blank follows Main (route_choice).
     for k in ("GIGACHAT_CREDENTIALS", "GIGACHAT_USER", "GIGACHAT_PASSWORD",
               "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CLOUDRU_FOUNDATION_MODELS_API_KEY"):
         monkeypatch.delenv(k, raising=False)
-    monkeypatch.setenv("OUROBOROS_MODEL", "gigachat::GigaChat")  # uncredentialed
     monkeypatch.setenv("OUROBOROS_MODEL_HEAVY", "")
-    monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", "")
     # First chain entry uncredentialed (gigachat), second routes via OpenRouter.
-    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "gigachat::nocreds, anthropic/claude-sonnet-4.6")
+    saved_settings(monkeypatch, tmp_path, OPENROUTER_API_KEY="or-key", OUROBOROS_MODEL="gigachat::GigaChat",
+                   OUROBOROS_MODEL_LIGHT="", OUROBOROS_MODEL_FALLBACKS="gigachat::nocreds, anthropic/claude-sonnet-4.6")
     # The resolver must parse the chain and return the credentialed SECOND entry — not
     # test the raw comma-string as one (broken) model id, nor skip past it.
     assert resolve_credentialed_model("gigachat::GigaChat") == "anthropic/claude-sonnet-4.6"
 
 
-def test_empty_light_slot_inherits_main_routing_even_when_models_match(monkeypatch):
-    """ENV PRESENCE decides the inherit-from-Main case, not string equality. A
+def test_empty_light_slot_inherits_main_routing_even_when_models_match(monkeypatch, tmp_path):
+    """SLOT PRESENCE decides the inherit-from-Main case, not string equality. A
     local-only install whose Main happens to equal the shipped Light default must
     still route the Light lane locally — it is running Main, not the Light slot."""
     from ouroboros.config import SETTINGS_DEFAULTS
     from ouroboros.subagents import _use_local_for_lane
 
     shared = SETTINGS_DEFAULTS["OUROBOROS_MODEL_LIGHT"]
-    monkeypatch.setenv("OUROBOROS_MODEL", shared)
-    monkeypatch.delenv("OUROBOROS_MODEL_LIGHT", raising=False)
-    monkeypatch.setenv("USE_LOCAL_MAIN", "true")
-    monkeypatch.delenv("USE_LOCAL_LIGHT", raising=False)
+    saved_settings(monkeypatch, tmp_path, OUROBOROS_MODEL=shared, OUROBOROS_MODEL_LIGHT="",  # a saved blank Light
+                   USE_LOCAL_MAIN=True, USE_LOCAL_LIGHT=False)
 
     assert _use_local_for_lane("light", shared) is True
     # A slot the owner really configured still governs itself.
-    monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", shared)
+    saved_settings(monkeypatch, None, OUROBOROS_MODEL_LIGHT=shared)
     assert _use_local_for_lane("light", shared) is False
 
 
@@ -418,61 +400,75 @@ def test_subagent_id_replaces_the_public_executor_axis(tmp_path, monkeypatch):
     assert "subagent_selector_conflict" in conflict
 
 
-def test_effort_is_not_an_owner_facing_axis(tmp_path, monkeypatch):
-    """There are THREE owner-facing axes and effort is not one of them (v6.87.28).
-
-    A parent declares the WORK: write_surface (what the child may do), model_lane
-    (how good the answer must be), executor (where it runs). A public `effort` broke
-    that twice — it was a second knob for the question `model_lane` already answers,
-    so `model_lane=light` with `effort=max` pinned the cheapest model to the
-    strongest reasoning with no rule to reconcile them; and a harness route carries
-    its own effort, so a parent asking `low` against a route pinned to `xhigh` had no
-    rule for who wins. The refusal names the withdrawal instead of calling a
-    parameter that was real for four releases 'unsupported'."""
+def test_effort_is_a_request_the_dispatch_decides_inside_the_range(tmp_path, monkeypatch):
+    """A parent may ask for a child's effort (`effort`, `auto` = omitted): scheduling records
+    the REQUEST and nothing more; the dispatch decides the level inside the owner's effort
+    range (`choose_effort`) and writes the decision beside it. An unknown tier is a typed
+    argument refusal; a pinned or model-named row is named in the queued result."""
+    from ouroboros.config import EFFORT_SCALE
     from ouroboros.tools.control import _schedule_task, schedule_subagent_properties
     from tests._shared import configure_test_subagent
 
-    subagent_id = configure_test_subagent(monkeypatch)
+    subagent_id = configure_test_subagent(monkeypatch, effort="")
+    props = schedule_subagent_properties()
+    assert props["effort"]["enum"] == ["auto", *EFFORT_SCALE] and props["effort"]["default"] == "auto"
 
-    assert "effort" not in schedule_subagent_properties()
-
-    ctx = _scheduling_ctx(tmp_path / "named")
-    out = _schedule_task(ctx, objective="o", expected_output="e", effort="xhigh")
-    assert "TOOL_ARG_ERROR" in out and "effort was withdrawn" in out
-    assert "model_lane" in out
+    ctx = _scheduling_ctx(tmp_path / "unknown")
+    out = _schedule_task(ctx, subagent_id=subagent_id, objective="o", expected_output="e", effort="turbo")
+    assert "TOOL_ARG_ERROR" in out and "effort must be auto or one of" in out
     assert ctx.event_queue.empty()
 
-    # The combination that had no answer is refused at the door, not ranked.
-    ctx = _scheduling_ctx(tmp_path / "conflict")
-    out = _schedule_task(ctx, objective="o", expected_output="e",
-                         model_lane="light", effort="max")
-    assert "TOOL_ARG_ERROR" in out
-    assert ctx.event_queue.empty()
+    # `auto` and omission are the same request: none.
+    for name, kwargs in (("auto", {"effort": "auto"}), ("omitted", {})):
+        ctx = _scheduling_ctx(tmp_path / name)
+        out = _schedule_task(ctx, subagent_id=subagent_id, objective="o", expected_output="e", **kwargs)
+        assert "TOOL_ARG_ERROR" not in out and "effort requested" not in out
+        event = ctx.event_queue.get_nowait()
+        assert event["requested_effort"] == "" and "reasoning_effort" not in event
 
-    # Scheduling states intent; nothing about effort is recorded there at all.
-    ctx = _scheduling_ctx(tmp_path / "omitted")
-    assert "TOOL_ARG_ERROR" not in _schedule_task(
-        ctx, subagent_id=subagent_id, objective="o", expected_output="e",
-    )
-    assert "reasoning_effort" not in ctx.event_queue.get_nowait()
+    ctx = _scheduling_ctx(tmp_path / "asked")
+    out = _schedule_task(ctx, subagent_id=subagent_id, objective="o", expected_output="e", effort="xhigh")
+    assert "effort requested: xhigh (decided at dispatch inside my human's range)" in out
+    assert ctx.event_queue.get_nowait()["requested_effort"] == "xhigh"
+
+    pinned = configure_test_subagent(monkeypatch, subagent_id="pinned", effort="low")
+    ctx = _scheduling_ctx(tmp_path / "pinned")
+    out = _schedule_task(ctx, subagent_id=pinned, objective="o", expected_output="e", effort="xhigh")
+    assert "effort requested: xhigh; my human pinned the row at low, which stands outside Cyber Pro" in out
+    # In Cyber Pro the request outranks the pin at dispatch, so the note says so instead.
+    monkeypatch.setattr("ouroboros.config._BOOT_RUNTIME_MODE", "cyber_pro")
+    ctx = _scheduling_ctx(tmp_path / "pinned-cyber")
+    out = _schedule_task(ctx, subagent_id=pinned, objective="o", expected_output="e", effort="xhigh")
+    assert "effort requested: xhigh (Cyber Pro: it outranks my human's pin low)" in out
+    # A consciousness-origin tree capped below Cyber Pro keeps the pin, as its dispatch does.
+    ctx = _scheduling_ctx(tmp_path / "pinned-capped")
+    ctx.task_metadata = {"runtime_mode_cap": "light"}
+    out = _schedule_task(ctx, subagent_id=pinned, objective="o", expected_output="e", effort="xhigh")
+    assert "effort requested: xhigh; my human pinned the row at low, which stands outside Cyber Pro" in out
 
 
-def test_effort_is_derived_from_the_owner_setting_at_dispatch(tmp_path, monkeypatch):
-    """Removing the knob did not remove the capability: the owner still controls
-    effort through `config.resolve_effort(task_type)`, exactly as they did whenever
-    the parameter was omitted — which was the normal case."""
+def test_effort_is_decided_at_dispatch_inside_the_owners_range(tmp_path, monkeypatch):
+    """With no request a child runs at the owner's recommended level; a request is clamped
+    into the range outside Cyber Pro; the decision is written onto the record as three
+    scalars beside the level the loop reads back."""
     from ouroboros.agent import resolve_dispatch_axes
 
+    monkeypatch.setattr("ouroboros.config._BOOT_RUNTIME_MODE", "pro")
     monkeypatch.setenv("OUROBOROS_EFFORT_TASK", "xhigh")
+    monkeypatch.setenv("OUROBOROS_EFFORT_MAX", "xhigh")
     task = {"id": "c1", "type": "task", "delegation_role": "subagent"}
     dispatch = resolve_dispatch_axes(task)
-    assert dispatch.effort == "xhigh"
-    assert task["reasoning_effort"] == "xhigh"
-    assert task["capability_delta"]["derived_effort"] == "xhigh"
+    assert dispatch.effort == task["reasoning_effort"] == task["capability_delta"]["derived_effort"] == "xhigh"
+    assert (task["effort_level"], task["effort_requested"], task["effort_source"]) == ("xhigh", "", "auto")
 
     monkeypatch.setenv("OUROBOROS_EFFORT_TASK", "low")
-    assert resolve_dispatch_axes({"id": "c2", "type": "task",
-                                  "delegation_role": "subagent"}).effort == "low"
+    monkeypatch.setenv("OUROBOROS_EFFORT_MAX", "medium")
+    asked = {"id": "c2", "type": "task", "delegation_role": "subagent", "requested_effort": "ultra"}
+    assert resolve_dispatch_axes(asked).effort == "medium"
+    assert (asked["effort_level"], asked["effort_requested"], asked["effort_source"]) == ("medium", "ultra", "auto")
+    monkeypatch.setattr("ouroboros.config._BOOT_RUNTIME_MODE", "cyber_pro")
+    cyber = {"id": "c3", "type": "task", "delegation_role": "subagent", "requested_effort": "ultra"}
+    assert resolve_dispatch_axes(cyber).effort == "ultra" and cyber["effort_source"] == "cyber"
 
 
 def test_a_stored_legacy_effort_is_ignored_with_the_reason_stated(tmp_path):
@@ -493,7 +489,7 @@ def test_a_stored_legacy_effort_is_ignored_with_the_reason_stated(tmp_path):
     assert task["reasoning_effort"] == dispatch.effort
     # ...and not dropped in silence.
     note = task["capability_delta"]["legacy_note"]
-    assert "reasoning_effort='max'" in note and "derived" in note
+    assert "reasoning_effort='max'" in note and "requested_effort" in note
     assert "Ignored on your record" in capability_delta_prompt_block(dispatch)
     # An ignored field is not a REDUCTION — nothing was taken away.
     assert task["capability_delta"]["reduced"] is False
@@ -550,12 +546,18 @@ def _enqueue_through_supervisor(tmp_path, monkeypatch, *, parent_lane: str = "",
     event["depth"] = 0
     event["delegation_role"] = ""
 
-    enqueued = []
+    from supervisor import queue
+    enqueued, running = [], {}
+    for key, value in {"DRIVE_ROOT": tmp_path, "PENDING": enqueued, "RUNNING": running,
+                       "QUEUE_SNAPSHOT_PATH": tmp_path / "state/queue_snapshot.json",
+                       "QUEUE_SEQ_COUNTER_REF": {"value": 0}, "ADMISSION_RESERVATIONS": {},
+                       "ACCEPTANCE_FENCES": {}, "BUDGET_ROOT_FENCES": {}}.items():
+        monkeypatch.setattr(queue, key, value)
 
     class FakeCtx:
         DRIVE_ROOT = tmp_path
-        PENDING = []
-        RUNNING = {}
+        PENDING = enqueued
+        RUNNING = running
         WORKERS = {0: SimpleNamespace(busy_task_id=None)}
 
         def load_state(self):
@@ -564,14 +566,12 @@ def _enqueue_through_supervisor(tmp_path, monkeypatch, *, parent_lane: str = "",
         def send_with_budget(self, chat_id, text, **kwargs):
             pass
 
-        def enqueue_task(self, task):
-            enqueued.append(task)
-
-        def persist_queue_snapshot(self, reason=""):
-            pass
+        enqueue_task = staticmethod(queue.enqueue_task)
+        persist_queue_snapshot = staticmethod(queue.persist_queue_snapshot)
 
     ev_module._handle_schedule_task(event, FakeCtx())
-    assert enqueued, "supervisor did not enqueue the task"
+    assert enqueued and enqueued[0] is queue.PENDING[0], "supervisor did not admit the task"
+    assert enqueued[0]["admitted_dispatch"] == "none"
     return enqueued[0]
 
 
@@ -737,12 +737,10 @@ def test_the_scheduling_intent_survives_a_queue_snapshot(tmp_path, monkeypatch):
 
     import json as _json
 
-    captured = {}
-    monkeypatch.setattr(q, "atomic_write_text",
-                        lambda path, text: captured.update(_json.loads(text)))
     monkeypatch.setattr(q, "PENDING", [task], raising=False)
     monkeypatch.setattr(q, "RUNNING", {}, raising=False)
     assert q.persist_queue_snapshot(reason="test") is True
+    captured = _json.loads(q.QUEUE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
 
     rows = captured.get("pending") or []
     assert rows, captured
@@ -957,7 +955,7 @@ def test_a_reduction_reaches_the_record_the_child_and_the_parents_readback(tmp_p
     # 2) the child's own prompt
     block = capability_delta_prompt_block(dispatch)
     assert "[CAPABILITY DELTA]" in block
-    assert "executor harness->blocked" in block
+    assert "executor harness->blocked" in block and "so in your answer if the gap actually limited it" in block
 
     # 3) the parent, when it READS the answer
     ctx = _scheduling_ctx(tmp_path / "readback")
@@ -979,7 +977,8 @@ def test_a_reduction_reaches_the_record_the_child_and_the_parents_readback(tmp_p
         sched_ctx, subagent_id=subagent_id, objective="o", expected_output="e",
     )
     assert "CAPABILITY_DELTA" not in scheduled
-    assert "subagent_id=session-actor" in scheduled
+    # The result names the engine by its handle; the stored key stays in durable records.
+    assert "subagent_id=claude=route-a" in scheduled and "session-actor" not in scheduled
     assert "route=agent_session" in scheduled
 
 
@@ -1019,7 +1018,7 @@ def test_an_explicit_harness_pin_is_a_typed_blocker_not_a_paid_reroute(tmp_path,
     assert dispatch.delta.reason == "configured_session_route_unavailable"
     assert dispatch.delta.reduced is True
 
-    # AUTO with no route: native, and quiet — nothing was asked for.
+    # A configured API row: native, and quiet — nothing was taken away.
     auto_task, auto_dispatch = _dispatched(tmp_path / "auto", monkeypatch, executor="auto")
     assert auto_dispatch.executor == "native" and auto_dispatch.blocked is False
     assert auto_task["capability_delta"]["reduced"] is False
@@ -1034,15 +1033,15 @@ def test_an_explicit_harness_pin_is_a_typed_blocker_not_a_paid_reroute(tmp_path,
 
     assert row("harness", None) == ("blocked", "harness_not_configured")
     assert row("harness", route_a) == ("harness", "harness_ready")
-    assert row("auto", None) == ("native", "harness_not_configured")
-    assert row("auto", route_a) == ("harness", "harness_ready")
     assert row("native", None) == ("native", "requested_native")
-    # An exhausted subscription window blocks a PIN and falls auto back, loudly.
+    # An exhausted subscription window blocks a PIN, with its reset time.
     spent = sub.resolve_subagent_executor("harness", route=route_a, reset_at="2030-01-01T00:00:00Z")
     assert (spent.executor, spent.reason) == ("blocked", "subscription_window_exhausted")
-    assert sub.resolve_subagent_executor("auto", route=route_a, reset_at="X").executor == "native"
-    # `blocked` is a resolution OUTCOME, never a request a parent may make.
-    assert "blocked" not in sub.SUBAGENT_EXECUTORS
+    # `blocked` is a resolution OUTCOME and `auto` never host-routes (owner D23):
+    # neither is a request a parent may make.
+    for not_a_request in ("blocked", "auto"):
+        with pytest.raises(ValueError):
+            sub.resolve_subagent_executor(not_a_request, route=route_a)
 
 
 def test_blocked_configured_session_terminals_unrun_without_a_model_round(tmp_path, monkeypatch):
@@ -1092,14 +1091,13 @@ def test_blocked_configured_session_terminals_unrun_without_a_model_round(tmp_pa
     )
 
     # The durable record keeps the selected session intent and typed failure.
-    result_path = drive / "task_results" / "pinned1.json"
-    record = json.loads(result_path.read_text(encoding="utf-8"))
+    record = read_result(drive, "pinned1")
     assert record["effective_executor"] == "blocked"
     assert record["model"] == "provider::parent"
     assert record["configured_subagent"]["selected_subagent_id"] == "session-actor"
     assert record["capability_delta"]["reason"] == "configured_session_route_unavailable"
     assert float(record.get("cost_usd") or 0.0) == 0.0
-    assert "NOT run on metered API tokens" in str(record.get("result") or "")
+    assert "NOT run and spent nothing" in str(record.get("result") or "")
 
 
 def test_legacy_heavy_migration_selects_an_exact_api_model(tmp_path, monkeypatch):
@@ -1125,12 +1123,13 @@ def test_legacy_heavy_migration_selects_an_exact_api_model(tmp_path, monkeypatch
 def test_legacy_model_global_ceiling_is_not_dispatch_authority(tmp_path, monkeypatch):
     """Scheduling reports requested effort; exact wire disclosure owns adaptation."""
     from ouroboros.agent import capability_delta_prompt_block
-    from ouroboros.llm import LLMClient
+    from tests._shared import write_legacy_capability_rows
 
     monkeypatch.setenv("OUROBOROS_MODEL", "provider::main")
     monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", "provider::cheap")
     monkeypatch.setenv("OUROBOROS_EFFORT_TASK", "max")
-    monkeypatch.setitem(LLMClient._EFFORT_CEILING_CACHE, "provider::cheap", "low")
+    monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path)
+    write_legacy_capability_rows(tmp_path, effort_ceilings={"provider::cheap": "low"})
 
     task, dispatch = _dispatched(
         tmp_path / "ceiling", monkeypatch, model_lane="light", _actor_effort="max",
@@ -1258,21 +1257,20 @@ def test_configured_actor_does_not_inherit_a_stale_heavy_parent(tmp_path, monkey
 
 
 def test_scheduler_effort_stays_pre_wire_until_exact_route_disclosure(tmp_path, monkeypatch):
-    """Legacy floors stay diagnostic; physical request usage reports any adjustment."""
+    """A stored legacy floor never moves scheduled effort; physical request usage reports any adjustment."""
     from ouroboros.agent import capability_delta_prompt_block
-    from ouroboros.llm import LLMClient
+    from tests._shared import write_legacy_capability_rows
 
     monkeypatch.setenv("OUROBOROS_MODEL", "provider::main")
     monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", "provider::cheap")
     monkeypatch.setenv("OUROBOROS_EFFORT_TASK", "none")
-    monkeypatch.setitem(LLMClient._EFFORT_FLOOR_CACHE, "provider::cheap", "low")
-    monkeypatch.setitem(LLMClient._EFFORT_FLOOR_LOADED, "provider::cheap", float("inf"))
+    monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path)
+    write_legacy_capability_rows(tmp_path, effort_floors={"provider::cheap": "low"})
 
     task, dispatch = _dispatched(
         tmp_path / "floor", monkeypatch, model_lane="light", _actor_effort="none",
     )
     delta = task["capability_delta"]
-    assert LLMClient.clamp_effort_for_route("provider::cheap", "none") == "low"
     assert delta["effective_effort"] == "none"
     assert delta["reduced"] is False
     assert capability_delta_prompt_block(dispatch) == ""
@@ -1423,6 +1421,7 @@ def test_one_resolution_writes_every_derived_field(tmp_path, monkeypatch):
     derived = dispatch.record_fields()
     assert set(derived) == {
         "effective_model_lane", "model", "use_local_model", "reasoning_effort",
+        "effort_level", "effort_requested", "effort_source",
         "effective_executor", "executor_route", "tool_profile", "capability_delta"}
     # Nothing derived leaks into the intent half, and nothing intended is rewritten.
     assert not set(derived) & set(SUBAGENT_INTENT_FIELDS)
@@ -1486,10 +1485,9 @@ def test_a_stored_auto_parent_lane_is_the_lane_of_record_not_the_cheapest(monkey
 
 
 def test_prompt_block_omits_the_broken_below_phrase_on_an_executor_only_delta():
-    """reduced=True with NO disclosable axis is the auto-fallback case (the axis
-    renderer deliberately keeps a non-pinned executor out of the list): the block
-    used to render "You are running BELOW what your parent asked for: " over an
-    empty list — a broken sentence duplicating dispatch_executor_note's job."""
+    """reduced=True with NO disclosable axis (an executor-only reduction the axis
+    renderer keeps out of the list): the block used to render "You are running
+    BELOW what your parent asked for: " over an empty list — a broken sentence."""
     from types import SimpleNamespace
 
     from ouroboros.agent import capability_delta_prompt_block
@@ -1508,171 +1506,40 @@ def test_prompt_block_omits_the_broken_below_phrase_on_an_executor_only_delta():
     block = capability_delta_prompt_block(
         SimpleNamespace(delta=_Delta(), executor_resolution=None))
     assert "BELOW what your parent asked" not in block
-    assert block == ""  # nothing else to say either: the executor note owns it
+    assert block == ""  # nothing else to say either
 
 
-# ---------------------------------------------------------------- B2: light-lane nanny policy
-
-
-def _harness_ready_dispatch(monkeypatch):
-    """Force the executor axis to a healthy harness route without a live daemon."""
-    route = subagents.DelegationRoute(route_id="codex")
-    monkeypatch.setattr(
-        subagents, "dispatch_executor_resolution",
-        lambda task: subagents.resolve_subagent_executor("auto", route=route),
-    )
-
-
-def test_auto_lane_on_harness_executor_defaults_to_light_by_policy(monkeypatch):
-    """B2 (poltergeist phase B): a harness-dispatched child whose request said
-    `auto` is a NANNY — its own rounds are custody chores around a $0 delegated
-    run, so the dispatch policy resolves it to the LIGHT lane instead of the
-    parent's expensive lane, and the provenance says the POLICY answered."""
-    monkeypatch.setenv("OUROBOROS_MODEL", "provider::main")
-    monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", "provider::cheap")
-    _harness_ready_dispatch(monkeypatch)
-
-    dispatch = subagents.resolve_subagent_dispatch(
-        {"id": "c1", "type": "task", "requested_model_lane": "auto",
-         "parent_model_lane": "main"},
-        task_type="task",
-    )
-    assert dispatch.executor == "harness"
-    assert dispatch.lane.effective_lane == "light"
-    assert dispatch.lane.model == "provider::cheap"
-    assert dispatch.lane.provenance == "policy"
-    assert dispatch.delta.as_dict()["lane_provenance"] == "policy"
-    # Not a reduction relative to itself: the policy IS the resolved baseline.
-    assert dispatch.lane.reduced is False
-
-
-def test_explicit_lane_always_wins_over_the_harness_policy(monkeypatch):
-    monkeypatch.setenv("OUROBOROS_MODEL", "provider::main")
-    monkeypatch.setenv("OUROBOROS_MODEL_HEAVY", "provider::strong")
-    monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", "provider::cheap")
-    _harness_ready_dispatch(monkeypatch)
-
-    dispatch = subagents.resolve_subagent_dispatch(
-        {"id": "c2", "type": "task", "requested_model_lane": "heavy"},
-        task_type="task",
-    )
-    assert dispatch.executor == "harness"
-    assert dispatch.lane.effective_lane == "heavy"
-    assert dispatch.lane.model == "provider::strong"
-    assert dispatch.lane.provenance == "requested"
-
-
-def test_a_required_lane_wins_over_the_harness_policy_default(monkeypatch):
-    """F9 (sol #1) admission→dispatch consistency: a child ADMITTED under a
-    satisfied `require_lane` constraint (auto request, parent on the required
-    lane) carries `required_model_lane` on its record — and the dispatch policy
-    default (auto+harness ⇒ light) must NOT apply over it. With the policy
-    suppressed, `auto` inherits the parent's lane, which is exactly the lane the
-    gate verified; the provenance honestly says "inherited"."""
-    monkeypatch.setenv("OUROBOROS_MODEL", "provider::main")
-    monkeypatch.setenv("OUROBOROS_MODEL_HEAVY", "provider::strong")
-    monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", "provider::cheap")
-    _harness_ready_dispatch(monkeypatch)
-
-    dispatch = subagents.resolve_subagent_dispatch(
-        {"id": "c-req", "type": "task", "requested_model_lane": "auto",
-         "parent_model_lane": "heavy", "required_model_lane": "heavy"},
-        task_type="task",
-    )
-    assert dispatch.executor == "harness"
-    assert dispatch.lane.effective_lane == "heavy"
-    assert dispatch.lane.model == "provider::strong"
-    assert dispatch.lane.provenance == "inherited"
-
-    # Stored garbage in the field is ignored — the policy applies as usual.
-    garbage = subagents.resolve_subagent_dispatch(
-        {"id": "c-junk", "type": "task", "requested_model_lane": "auto",
-         "parent_model_lane": "heavy", "required_model_lane": "warp-lane"},
-        task_type="task",
-    )
-    assert garbage.lane.effective_lane == "light"
-    assert garbage.lane.provenance == "policy"
-
-
-def test_preflight_native_fallback_reresolves_without_the_harness_policy(monkeypatch):
-    """F10 (sol #2, probe `native light policy`): a harness dispatch falsified at
-    the toolset preflight falls back to NATIVE — and must not stay on the
-    policy-light lane/cheap model the harness resolution chose. The fallback
-    re-resolves lane/model/effort as a native dispatch would (parent
-    inheritance), and the record, delta and envelope all describe it."""
-    from types import SimpleNamespace
-
-    from ouroboros.agent import preflight_delegate_visibility, resolve_dispatch_axes
-
-    monkeypatch.setenv("OUROBOROS_MODEL", "provider::main")
-    monkeypatch.setenv("OUROBOROS_MODEL_HEAVY", "provider::strong")
-    monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", "provider::cheap")
-    _harness_ready_dispatch(monkeypatch)
-
-    task = {"id": "c-fb", "type": "task", "delegation_role": "subagent",
-            "requested_model_lane": "auto", "parent_model_lane": "heavy",
-            "requested_executor": "auto"}
-    dispatch = resolve_dispatch_axes(task)
-    assert dispatch.lane.effective_lane == "light"  # the harness policy, pre-preflight
-    assert task["model"] == "provider::cheap"
-
-    tools = SimpleNamespace(available_tools=lambda: ["read_file", "web_search"])
-    amended, changed = preflight_delegate_visibility(tools, task, dispatch)
-    assert changed is True
-    assert amended.executor == "native"
-    # Lane and model re-resolved WITHOUT the harness policy: parent inheritance.
-    assert amended.lane.effective_lane == "heavy"
-    assert amended.lane.model == "provider::strong"
-    assert amended.lane.provenance == "inherited"
-    # Every stamped surface tells the re-resolved story.
-    assert task["effective_model_lane"] == "heavy"
-    assert task["model"] == "provider::strong"
-    assert task["effective_executor"] == "native"
-    assert task["capability_delta"]["effective_lane"] == "heavy"
-    assert task["capability_delta"]["lane_provenance"] == "inherited"
-    assert "delegate_tools_invisible" in task["capability_delta"]["reason"]
-    assert task["capability_delta"]["reduced"] is True
-    assert task["subagent_envelope"]["effective_lane"] == "heavy"
-    assert task["subagent_envelope"]["model"] == "provider::strong"
-    assert task["subagent_envelope"]["effective_executor"] == "native"
+# ---------------------------------------------------------------- lane inheritance, no dispatch policy
 
 
 def test_native_child_keeps_plain_inheritance(monkeypatch):
+    """A row-less child inherits its parent's lane even with the legacy harness key
+    set: the light-lane nanny policy is retired with the row-less harness path (owner
+    19.08: a nanny inherits the parent model, not Light). An explicit lane still wins."""
     monkeypatch.setenv("OUROBOROS_MODEL", "provider::main")
     monkeypatch.setenv("OUROBOROS_MODEL_HEAVY", "provider::strong")
-    monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "")
+    monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", "provider::cheap")
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "codex")
 
     dispatch = subagents.resolve_subagent_dispatch(
         {"id": "c3", "type": "task", "requested_model_lane": "auto",
-         "parent_model_lane": "heavy"},
+         "parent_model_lane": "heavy", "requested_executor": "auto"},
         task_type="task",
     )
     assert dispatch.executor == "native"
     assert dispatch.lane.effective_lane == "heavy"
+    assert dispatch.lane.model == "provider::strong"
     assert dispatch.lane.provenance == "inherited"
-
-
-def test_policy_light_with_an_empty_light_slot_lands_main_and_says_so(monkeypatch):
-    """The provenance names the DECISION source even when the slot outcome moves
-    the effective lane: policy said light, no light slot exists, the model is
-    Main — and the record must carry both facts, not blend them."""
-    monkeypatch.setenv("OUROBOROS_MODEL", "provider::main")
-    monkeypatch.delenv("OUROBOROS_MODEL_LIGHT", raising=False)
-    _harness_ready_dispatch(monkeypatch)
-
-    dispatch = subagents.resolve_subagent_dispatch(
-        {"id": "c4", "type": "task", "requested_model_lane": "auto"},
+    named = subagents.resolve_subagent_dispatch(
+        {"id": "c4", "type": "task", "requested_model_lane": "light", "parent_model_lane": "heavy"},
         task_type="task",
     )
-    assert dispatch.lane.provenance == "policy"
-    assert dispatch.lane.resolved_from == "light"
-    assert dispatch.lane.effective_lane == "main"
-    assert dispatch.lane.model == "provider::main"
+    assert (named.lane.effective_lane, named.lane.provenance) == ("light", "requested")
 
 
 def test_switch_model_never_rewrites_the_dispatch_lane_record(monkeypatch, tmp_path):
-    """B2 acceptance-model provenance: the nanny raising itself for an acceptance
-    round is a ToolContext override (visible per-round in llm_usage rows), never a
+    """Acceptance-model provenance: a child raising itself for an acceptance round
+    is a ToolContext override (visible per-round in llm_usage rows), never a
     rewrite of the durable dispatch resolution — the record keeps saying which
     lane the child was DISPATCHED on."""
     from ouroboros.tools.control import _switch_model
@@ -1682,7 +1549,7 @@ def test_switch_model_never_rewrites_the_dispatch_lane_record(monkeypatch, tmp_p
     monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", "provider::cheap")
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     record = {"effective_model_lane": "light", "model": "provider::cheap",
-              "capability_delta": {"lane_provenance": "policy"}}
+              "capability_delta": {"lane_provenance": "requested"}}
     ctx.task_metadata = dict(record)
 
     out = _switch_model(ctx, model="provider::main")
@@ -1705,6 +1572,7 @@ def test_switch_model_refuses_an_unknown_effort_instead_of_coercing(monkeypatch,
         "ouroboros.llm.LLMClient.available_models",
         lambda self: ["provider::main"],
     )
+    monkeypatch.setattr("ouroboros.config._BOOT_RUNTIME_MODE", "cyber_pro")  # Main applies a switch here only
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
 
     out = _switch_model(ctx, model="provider::main", effort="enormous")

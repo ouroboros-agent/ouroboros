@@ -7,10 +7,10 @@ import pytest
 from tests.test_tool_api_v2_public_surface import _registry_under_fake_home
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("tool", ["run_command", "run_script"])
 def test_fake_home_fixture_binds_the_actual_child_environment(tmp_path, monkeypatch, tool):
     monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_SAFETY_MODE", "off")
     registry, _repo, data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
     home = pathlib.Path.home()
     expected = {"HOME": str(home), "USERPROFILE": str(home),

@@ -27,6 +27,7 @@ if TYPE_CHECKING:  # pragma: no cover - annotation-only names, lazy under future
     from ouroboros.delegate_custody import RunCustody as _RunCustody
     from ouroboros.subagents import DelegatedRunShape
     from ouroboros.tools.registry import ToolContext
+    from ouroboros.tools.tool_result import ToolResult
 
 
 def _delegate():
@@ -40,6 +41,57 @@ def _delegate():
     from ouroboros.tools import delegate
 
     return delegate
+
+
+def retry_terminal_result(ctx: ToolContext, run_id: str, *, gateway: Any = None) -> ToolResult:
+    """Retrieve proven retry work without entering the nanny's live-control loop."""
+    from ouroboros import delegate_custody as custody
+    from ouroboros.claudexor_daemon import read_owned_gateway
+    from ouroboros.deadline_utils import window_within_deadline
+    from ouroboros.delegate_shared import _fail, _owned_run, delegate_result, retry_result_status
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable, _READ_TIMEOUT_SEC
+
+    drive = custody.custody_root(ctx)
+    status, entry, predecessor = retry_result_status(ctx, drive, run_id)
+    if status != custody.OWNED or entry is None or not predecessor:
+        refusal, _ = _owned_run(ctx, "delegate_wait", run_id)
+        return refusal or _fail("delegate_wait", "run_not_owned", "No retry result authority.")
+    retained = retained_terminal_result(ctx, run_id, retry_money=True)
+    if retained is not None:
+        return delegate_result({**retained, "owner_task_id": predecessor,
+            "result_reader_task_id": str(getattr(ctx, "task_id", "") or ""), "terminal_result_only": True})
+    borrowed = gateway is not None
+    try:  # the run's own engine (``execution_domain``) unless a caller lends its transport
+        from ouroboros.execution_domain import run_gateway
+        gateway = gateway if borrowed else run_gateway(entry, read_owned_gateway)
+        bound = float(window_within_deadline(ctx, int(_READ_TIMEOUT_SEC)))
+        if not getattr(gateway, "engine_version", ""):
+            gateway.handshake(timeout_sec=bound)
+        detail = gateway.get_run(run_id, timeout_sec=bound)
+        state = str(custody.summary_of(detail).get("state") or "")
+        if state not in custody.TERMINAL_STATES or state != entry.terminal_state:
+            return _fail("delegate_wait", "retry_result_not_terminal",
+                         "The engine did not confirm the recorded terminal result.", run_id=run_id)
+        # A retry admitted while this read was in flight makes this caller stale.
+        status, entry, current_owner = retry_result_status(ctx, drive, run_id)
+        if (status != custody.OWNED or entry is None or current_owner != predecessor
+                or entry.terminal_state != state):
+            return _fail("delegate_wait", "run_not_owned", "Retry result authority changed.", run_id=run_id)
+        from ouroboros.delegate_containment import granted_shape
+
+        payload = collect_and_deliver_terminal(ctx, run_id, detail, granted_shape(entry), entry, gateway)
+        return delegate_result({**payload, "owner_task_id": predecessor,
+                                "result_reader_task_id": str(getattr(ctx, "task_id", "") or ""),
+                                "terminal_result_only": True})
+    except ClaudexorUnavailable as exc:
+        retained = retained_terminal_after_gap(ctx, run_id, str(exc.code))
+        if retained is not None:
+            return delegate_result({**retained, "owner_task_id": predecessor,
+                "result_reader_task_id": str(getattr(ctx, "task_id", "") or ""), "terminal_result_only": True})
+        return _fail("delegate_wait", exc.code, str(exc), run_id=run_id)
+    finally:
+        if gateway is not None and not borrowed:
+            gateway.close()
 
 
 def _containment_breach(detail: Dict[str, Any], authority: "DelegatedRunShape") -> Optional[_Breach]:
@@ -172,11 +224,16 @@ def _containment_evidence(detail: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _terminal_payload(run_id: str, detail: Dict[str, Any],
-                      authority: "DelegatedRunShape") -> Dict[str, Any]:
+                      authority: "DelegatedRunShape",
+                      entry: Optional[_RunCustody] = None) -> Dict[str, Any]:
+    from ouroboros.effort_evidence import terminal_prompt_cache_ttl
     from ouroboros.gateways.claudexor import final_attempt_facts
 
     summary = _delegate().custody.summary_of(detail)
     observed = final_attempt_facts(detail, run_id)
+    start_ttl = ((entry.request_event if entry is not None else {}).get("prompt_cache_ttl")
+                 or (entry.prompt_cache_ttl if entry is not None else None))
+    ttl_facts = terminal_prompt_cache_ttl(observed, start_ttl)
     payload = {
         "status": "terminal",
         "run_id": run_id,
@@ -200,23 +257,41 @@ def _terminal_payload(run_id: str, detail: Dict[str, Any],
     }
     if isinstance(detail.get("attemptExecution"), list):
         payload["attempt_execution"] = detail["attemptExecution"]
+    if ttl_facts is not None or "prompt_cache_ttl" in observed:
+        payload["prompt_cache_ttl"] = ttl_facts
+    from ouroboros.delegate_continuation import terminal_continuity
+
+    # The engine's own continuation facts: `resumable` (why the work stopped, its
+    # limit window, which carriers can continue it) and one line per continued try.
+    payload.update(terminal_continuity(run_id, summary))
     if authority.delegated:
         payload["containment"] = _containment_evidence(detail)
+    # A retry may read already-completed work even when its recorded profile
+    # was breached. Preserve that evidence without entering live cancellation.
+    breach = _containment_breach(detail, authority)
+    if breach is not None:
+        payload["containment_breach"] = {
+            "code": breach.code, "detail": breach.detail, **breach.facts,
+        }
     facts = payload.get("outcome_facts")
     if isinstance(facts, dict) and str(facts.get("reason") or "") == "input_required":
         # The codex-shaped question (B4): that lane has no mid-run channel, so a
         # question arrives as this TERMINAL. There is deliberately NO rerun verb
         # here — the engine's rerun_with_feedback would start a run outside this
-        # task's custody trail — so the honest answer path is a plain new start.
+        # task's custody trail — so the answer is a continuation start this task holds.
         payload["input_required_note"] = (
             "This run ended NEEDING INPUT (outcome_facts.reason=input_required — "
             "see outcome_facts.work_state.required_inputs). Its harness has no "
-            "mid-run question channel, so the question arrives as this terminal. Answer it by "
-            "starting a plain NEW delegate_start(subagent_id=..., prompt=...) whose "
-            "prompt carries the original "
-            "assignment plus the answers; custody of the new run stays with you. "
+            "mid-run question channel, so the question arrives as this terminal. Answer it with "
+            f"delegate_start(subagent_id=..., continue_from='{run_id}', prompt=<your answers>) (a configured "
+            "session omits subagent_id): the NEW run continues "
+            "this work where the engine can, and its custody stays with you. "
             "Do not look for a rerun/decision verb — none exists on this surface."
         )
+        # The typed twin of the note (serial addressed turns): this lane's next
+        # turn is a NEW physical run (a continuation of this one), never this
+        # live session — the honest opposite of waiting_on_user's ``same_session``.
+        payload["continuation"] = "new_physical_run"
     return payload
 
 
@@ -225,8 +300,8 @@ def _access_evidence(detail: Dict[str, Any], expected: str) -> Dict[str, Any]:
 
     ``effectiveAccess`` is the only witness: ``summary["access"]`` is computed as
     ``effectiveAccess ?? the client's own request``, so reading it compares the request
-    against itself and always passes. A WIDER profile is already a breach before this
-    runs; an ABSENT one cannot be enforced on a run that is over — cancelling a
+    against itself and always passes. A WIDER profile stays unverified when a retry
+    reads completed work; an ABSENT one cannot be enforced on a run that is over — cancelling a
     succeeded run to punish missing evidence would destroy the result the lane exists
     to fetch (the v6.87.37 lesson) — so it is named here instead.
     """
@@ -235,6 +310,9 @@ def _access_evidence(detail: Dict[str, Any], expected: str) -> Dict[str, Any]:
     state = str(summary.get("state") or "")
     report = {"requested": expected, "effective": effective,
               "verified": bool(effective), "state": state}
+    if _delegate()._widened_access(detail, expected):
+        return {**report, "verified": False,
+                "note": "The engine applied a wider access profile than this run was granted."}
     if effective:
         return report
     if state in _delegate().custody.SUCCEEDED_STATES:
@@ -296,7 +374,12 @@ def _reported_cost(summary: Dict[str, Any], *, attempt_execution: Any = None) ->
     fix was written to eliminate — so a run that really charged money settled honestly in
     the ledger and then told the reasoning path the work was free.
     """
-    spend, estimated = _delegate().custody.disclosed_spend(summary, attempt_execution=attempt_execution)
+    from ouroboros.delegate_custody_usage import disclosed_cost
+    cash = disclosed_cost(summary, attempt_execution=attempt_execution)
+    spend, estimated = cash["cost_usd"], cash["cost_estimated"]
+    if cash["cost_partial"] and spend is not None:
+        return {**cash, "note": "Tracked spend is a known subtotal; some attempts have no price. "
+                "The total cost is unknown, and the subtotal is not an upper bound."}
     if spend is None:
         return {
             "cost_usd": None,
@@ -326,6 +409,79 @@ def _reported_cost(summary: Dict[str, Any], *, attempt_execution: Any = None) ->
     }
 
 
+def _retained_terminal_payload(ctx: ToolContext, entry: _RunCustody, *, full=None) -> Optional[Dict[str, Any]]:
+    """Present body-retained bytes; only the later delivery seam credits this reader."""
+    from ouroboros.delegate_collection import retained_payload
+    from ouroboros.delegate_output import staged_source_path, output_consumed_by_reader
+
+    root = _delegate().custody.custody_root(ctx)
+    full = full if full is not None else retained_payload(root, entry, require_complete=False)
+    if full is None:
+        return None
+    changed = bool(entry.superseded_by and full.get("superseded_by") != entry.superseded_by)
+    if changed:
+        full["superseded_by"] = entry.superseded_by
+    text = json.dumps(full, ensure_ascii=False, indent=2)
+    reader = str(getattr(ctx, "task_id", "") or "")
+    if reader and (changed or entry.output_source.get("task_id") != reader):
+        # Preserve the existing retry-reader source custody: identical bytes,
+        # independently readable by this successor, never an inherited EOF.
+        from ouroboros.delegate_output import retain_terminal_bytes
+        retained = retain_terminal_bytes(root, reader, entry.run_id, text, text.encode("utf-8"))
+        if retained is None:
+            return None
+        published = _delegate().custody.emit(root, _delegate().custody.OUTPUT_SPILLED, {
+                "run_id": entry.run_id, "task_id": entry.task_id, "source": retained["source"],
+                "artifact": retained["source"]["path"], "sha256": retained["sha256"],
+                "terminal_sha": entry.output_terminal_sha, "bytes": retained["bytes"],
+                "staged": True, "full_content": entry.output_complete, "total_chars": len(text)})
+        if retained["sha256"] != entry.output_sha or not published:
+            entry.output_consumed = False
+        entry.output_sha = retained["sha256"]
+        entry.output_source, entry.output_artifact = retained["source"], retained["source"]["path"]
+    path = str(staged_source_path(root, entry.output_source))
+    artifact = {"root": "artifact_store", "path": path, "abs_path": path, "source": entry.output_source,
+                "sha256": entry.output_sha, "chars": len(text), "lines": text.count("\n") + 1,
+                "bytes": entry.output_source.get("size")}
+    budget = _delegate().tool_result_limit("delegate_wait")
+    if entry.output_complete and len(text) <= budget - _delegate()._PAYLOAD_ENVELOPE_HEADROOM:
+        full["output_delivery"] = {"complete": True, "consumed": True, "inline_is_preview": False,
+            "total_chars": len(text), "artifact": None, "retained_sha256": entry.output_sha, "read_next": None,
+            "note": "The retained full terminal payload is inline; receipt follows actual full delivery."}
+        return full
+    return _delegate()._preview_payload(full, text, artifact, budget, full_ok=entry.output_complete,
+        full_note=full.get("primary_output_full"), consumed=output_consumed_by_reader(entry, str(getattr(ctx, "task_id", "") or "")))
+
+
+def resolved_terminal_payload(run_id, detail, authority, entry=None, gateway=None):
+    """Canonical terminal material, independent of retention and delivery."""
+    full = _terminal_payload(run_id, detail, authority, entry=entry)
+    if entry is not None:
+        _delegate().add_terminal_source_verification(full, entry)
+        if entry.mode == "plan":
+            from ouroboros.delegate_plan import terminal_plan
+
+            full["plan"] = terminal_plan(entry, gateway, detail)
+        if entry.promotion:
+            full["promotion"] = dict(entry.promotion)
+        if entry.superseded_by:  # its snapshot and work belong to that continuation's one capture now
+            full["superseded_by"] = entry.superseded_by
+    # Requested-vs-applied model, the review lane's own record (``model_identity_delta``,
+    # AgentSessionReviewExecutor's too): compared only when BOTH are non-empty —
+    # the engine writes aliases ('sonnet' beside 'claude-opus-5'), so a
+    # mismatch is an advisory disclosure, never a failure of the run.
+    requested_model = str(getattr(entry, "model", "") or "") if entry is not None else ""
+    applied_model = str(full.get("model") or "")
+    if requested_model and applied_model and requested_model != applied_model:
+        from ouroboros.delegate_custody_usage import model_identity_delta
+
+        full["capability_delta"] = [model_identity_delta(requested_model, applied_model)]
+    primary, full_ok, full_note = _delegate()._resolve_full_primary_output(
+        gateway, run_id, full.get("primary_output"))
+    full["primary_output"] = primary
+    return full, full_ok, full_note
+
+
 def _delivered_terminal_payload(ctx: ToolContext, run_id: str, detail: Dict[str, Any],
                                 authority: "DelegatedRunShape",
                                 entry: Optional[_RunCustody] = None,
@@ -340,25 +496,13 @@ def _delivered_terminal_payload(ctx: ToolContext, run_id: str, detail: Dict[str,
     preview has been resolved to the verified full artifact, because a payload built on
     a truncated preview delivers 256 KiB wearing the whole result's name.
     """
-    full = _terminal_payload(run_id, detail, authority)
-    if entry is not None:
-        _delegate().add_terminal_source_verification(full, entry)
-    # Requested-vs-applied model, the review lane's own lexicon and rule
-    # (AgentSessionReviewExecutor): compared only when BOTH are non-empty —
-    # the engine writes aliases ('sonnet' beside 'claude-opus-5'), so a
-    # mismatch is an advisory disclosure, never a failure of the run.
-    requested_model = str(getattr(entry, "model", "") or "") if entry is not None else ""
-    applied_model = str(full.get("model") or "")
-    if requested_model and applied_model and requested_model != applied_model:
-        full["capability_delta"] = [{
-            "kind": "capability_delta",
-            "requested": f"model {requested_model}",
-            "effective": f"model {applied_model}",
-            "reason": "session_route_resolves_its_own_model",
-        }]
-    primary, full_ok, full_note = _delegate()._resolve_full_primary_output(
-        gateway, run_id, full.get("primary_output"))
-    full["primary_output"] = primary
+    from ouroboros.delegate_output import output_consumed_by_reader
+
+    if entry is not None and entry.output_source:
+        retained = _retained_terminal_payload(ctx, entry)
+        if retained is not None:
+            return retained
+    full, full_ok, full_note = resolved_terminal_payload(run_id, detail, authority, entry, gateway)
     budget = _delegate().tool_result_limit("delegate_wait")
     text = json.dumps(full, ensure_ascii=False, indent=2)
     if len(text) <= budget - _delegate()._PAYLOAD_ENVELOPE_HEADROOM:
@@ -378,20 +522,184 @@ def _delivered_terminal_payload(ctx: ToolContext, run_id: str, detail: Dict[str,
             full["output_delivery"]["primary_output_full"] = full_note
         return full
     artifact = _delegate()._stage_full_output(ctx, run_id, text)
-    _delegate()._emit(ctx, _delegate().custody.OUTPUT_SPILLED, {"run_id": run_id, "total_chars": len(text),
-                                        "artifact": (artifact or {}).get("path", ""),
+    # The retained source names the ACTUAL staging task (this reader's context, which
+    # for a confirmed retry successor is not the run's starter) beside its store path.
+    source = (artifact or {}).get("source") or {}
+    landed = _delegate()._emit(ctx, _delegate().custody.OUTPUT_SPILLED, {"run_id": run_id, "total_chars": len(text),
+                                        "artifact": source.get("path") or (artifact or {}).get("path", ""),
+                                        **({"source": dict(source)} if source else {}),
                                         "bytes": (artifact or {}).get("bytes"),
                                         "sha256": (artifact or {}).get("sha256", ""),
                                         "staged": artifact is not None,
                                         "full_content": bool(full_ok and artifact is not None)})
-    if entry is not None and artifact is not None:
+    if landed and entry is not None and artifact is not None:
         if entry.output_consumed and entry.output_sha and artifact["sha256"] != entry.output_sha:
             # The ack named OTHER bytes: a re-stage of different content at the same
             # path owes a fresh acknowledgement — consumed never transfers by path.
             entry.output_consumed = False
         entry.output_sha = artifact["sha256"]
-        entry.output_artifact = artifact["path"]
+        entry.output_artifact = source.get("path") or artifact["path"]
+        entry.output_source = dict(source)
         entry.output_complete = bool(full_ok)
     return _delegate()._preview_payload(full, text, artifact, budget,
-                            consumed=bool(entry is not None and entry.output_consumed),
+                            consumed=bool(full_ok and artifact is not None and entry is not None
+                                and artifact["sha256"] == entry.output_sha
+                                and output_consumed_by_reader(entry, str(getattr(ctx, "task_id", "") or ""))),
                             full_ok=full_ok, full_note=full_note)
+
+
+def collect_and_deliver_terminal(ctx, rid, detail, authority, entry, gateway):
+    """Join the body collection; deliver retained output independently of other duties."""
+    from ouroboros import delegate_custody as custody
+    from ouroboros.delegate_collection import collect_terminal, observe_run, retained_payload, capture_projection, body_runtime
+    from ouroboros.delegate_custody_current import run
+
+    root = custody.custody_root(ctx)
+    if run(root, rid) is None:
+        # This process can hold a physical start whose STARTED publication failed.
+        # Re-publish only that known handle (never a second row for its invocation); never post another engine run.
+        custody.bind_started(root, entry)
+        if run(root, rid) is None:
+            full, complete, note = resolved_terminal_payload(rid, detail, authority, entry, gateway)
+            text = json.dumps(full, ensure_ascii=False, indent=2)
+            artifact = _delegate()._stage_full_output(ctx, rid, text)
+            payload = _delegate()._preview_payload(full, text, artifact,
+                _delegate().tool_result_limit("delegate_wait"), consumed=False, full_ok=complete, full_note=note)
+            payload["settlement"] = {"settled": False, "ledger_recorded": False}
+            payload["collection"] = {"status": "pending", "reason": "custody_publication_unconfirmed"}
+            return payload
+    try:
+        observe_run(root, entry, detail)
+    except (OSError, RuntimeError) as exc:
+        # The engine answer is already here. Preserve its existing honest
+        # whole/partial delivery even when its durable observation cannot land.
+        from dataclasses import replace
+        payload = _delivered_terminal_payload(ctx, rid, detail, authority,
+                                               replace(entry, output_source={}), gateway)
+        payload["settlement"] = _settlement_projection(entry)
+        payload["collection"] = {"status": "pending", "reason": "terminal_source_unavailable",
+                                 "error": type(exc).__name__}
+        _record_containment(ctx, entry, payload)
+        return payload
+    fresh = run(root, rid) or entry
+    if not fresh.settled or retained_payload(root, fresh) is None:
+        from ouroboros.delegate_capture_attempt import GENERATION
+        runtime = body_runtime(root)
+        collection = collect_terminal(root, rid, gateway=gateway,
+                                      staging_task_id=str(getattr(ctx, "task_id", "") or ""),
+                                      output_authority=authority, background=runtime is not None,
+                                      generation=runtime.runtime_id if runtime is not None else GENERATION,
+                                      output_retry=True)
+    else:
+        collection = {"status": "pending" if not fresh.settled else "retained",
+                      "reason": "available_output"}
+    entry = run(root, rid) or fresh
+    if retained_payload(root, entry, require_complete=False) is None:
+        retained = collection.get("output_retention") or {}
+        artifact = retained.get("artifact")
+        if artifact:
+            from ouroboros.artifacts import read_actor_source_bytes
+            source = artifact["source"]
+            text = read_actor_source_bytes(root, source["task_id"], source).decode("utf-8")
+            full = json.loads(text)
+            payload = _delegate()._preview_payload(full, text, artifact,
+                _delegate().tool_result_limit("delegate_wait"), consumed=False,
+                full_ok=retained.get("complete") is True, full_note=full.get("primary_output_full"))
+            payload["collection"] = {"status": "pending", "reason": "output_publication_unconfirmed"}
+            return payload
+        if collection.get("status") == "unavailable":
+            # An unavailable collector is not a contending one.
+            from ouroboros.delegate_shared import _fail, delegate_payload
+            note = (
+                "This run belongs to a review panel. Rejoin the original review operation to collect "
+                "its result; delegate_wait does not collect or settle panel-owned reviews."
+                if entry.review_owned else
+                "The terminal result cannot be collected through this wait. Inspect the recorded "
+                "custody and owning operation before choosing another action."
+            )
+            return delegate_payload(_fail(
+                "delegate_wait", str(collection.get("reason") or "collection_unavailable"), note,
+                run_id=rid, state=str(custody.summary_of(detail).get("state") or ""),
+                collection=collection, answered=True, last_seq=int(detail.get("lastSeq") or 0)))
+        return {"status": "observation_pending", "reason": "collection_in_progress", "run_id": rid,
+                "state": str(custody.summary_of(detail).get("state") or ""), "collection": collection,
+                "answered": True, "last_seq": int(detail.get("lastSeq") or 0)}
+    payload = _delivered_terminal_payload(ctx, rid, detail, authority, entry, gateway)
+    payload["settlement"] = _settlement_projection(entry, collection.get("settlement"))
+    payload["collection"] = {key: value for key, value in collection.items() if key != "output_retention"}
+    capture = collection.get("workspace_capture") or capture_projection(
+        root, entry, reader_task_id=str(getattr(ctx, "task_id", "") or ""))
+    if capture and entry.patch_captured and str(getattr(ctx, "task_id", "") or "") != entry.task_id:
+        capture = capture_projection(root, entry, reader_task_id=str(ctx.task_id))
+    if capture is not None:
+        payload["workspace_capture"] = capture
+    _record_terminal_delivery(ctx, entry, payload)
+    return payload
+
+
+def _settlement_projection(entry, result=None):
+    """Accounting and registration remain separately disclosed current facts."""
+    return {"retried": False, **(result or {}), "settled": entry.settled,
+            "ledger_recorded": entry.ledger_recorded,
+            "project_retired": not entry.project_owned and not entry.project_persistent,
+            "project_persistent": entry.project_persistent}
+
+
+def _record_terminal_delivery(ctx, entry, payload):
+    """Both terminal delivery paths disclose the same outstanding reader duties."""
+    custody = _delegate().custody
+    if (not (payload.get("output_delivery") or {}).get("complete")
+            and custody.record_settled_unread(custody.custody_root(ctx), entry)):
+        payload["result_not_collected"] = (
+            "THIS RESULT IS NOT COLLECTED YET: the run is settled and its "
+            "full output is staged, but nothing has read it to EOF. Read the "
+            "artifact with the read_file arguments in "
+            "output_delivery.read_next until it is covered end to end — a result you "
+            "have not read is not a result you may report.")
+    _record_containment(ctx, entry, payload)
+    if entry.task_id == str(getattr(ctx, "task_id", "") or ""):
+        from ouroboros.delegate_progress import emit_retained
+        emit_retained(ctx, entry.run_id)
+
+
+def retained_terminal_result(ctx, run_id, *, complete_only=True, retry_money=False):
+    """Read exact owned bytes before transport; pending collection is a separate fact."""
+    from ouroboros.delegate_custody_current import run
+    from ouroboros.delegate_collection import capture_projection, retained_payload, collection_pending, collect_terminal, body_runtime
+    from ouroboros.delegate_shared import retry_result_status
+    root = _delegate().custody.custody_root(ctx)
+    entry = run(root, run_id)
+    if entry is None or entry.terminal_state not in _delegate().custody.TERMINAL_STATES:
+        return None
+    if entry.task_id != str(getattr(ctx, "task_id", "") or ""):
+        if retry_result_status(ctx, root, run_id)[0] != _delegate().custody.OWNED:
+            return None
+    full = retained_payload(root, entry, require_complete=complete_only)
+    if (full is None or full.get("run_id") != run_id or full.get("state") != entry.terminal_state):
+        return None
+    if retry_money and not entry.settled:
+        from ouroboros.delegate_capture_attempt import GENERATION
+        runtime = body_runtime(root)
+        collect_terminal(root, run_id, output_retry=True, background=runtime is not None,
+                         generation=runtime.runtime_id if runtime is not None else GENERATION)
+        entry = run(root, run_id) or entry
+    payload = _retained_terminal_payload(ctx, entry, full=full)
+    if payload is not None:
+        pending = collection_pending(entry, root)
+        payload["current_observation"] = {"status": "retained", "basis": "retained_terminal_source"}
+        payload["settlement"] = _settlement_projection(entry)
+        payload["collection"] = {"status": "pending" if pending else "retained"}
+        capture = capture_projection(root, entry, reader_task_id=str(getattr(ctx, "task_id", "") or ""))
+        if capture is not None:
+            payload["workspace_capture"] = capture
+        _record_terminal_delivery(ctx, entry, payload)
+    return payload
+
+
+def retained_terminal_after_gap(ctx, run_id, reason):
+    """A retained exact result survives engine loss; observation failure is disclosed."""
+    payload = retained_terminal_result(ctx, run_id, complete_only=False)
+    if payload is not None:
+        payload["current_observation"] = {"status": "unavailable", "reason": reason,
+                                          "basis": "retained_terminal_source"}
+    return payload

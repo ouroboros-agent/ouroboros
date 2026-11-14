@@ -3,7 +3,7 @@
 Every case here is a POSITIVE pin drawn from a documented capinv-447 incident:
 it asserts that a legitimate capability SURVIVES the immune system, not that
 something is blocked. A guard change that turns any of these red is a
-capability regression by definition (CHECKLISTS item 21: "name the surviving
+capability regression by definition (CHECKLISTS item 7: "name the surviving
 positive path"). Deliberately NOT a framework — plain parametrized tests over
 the existing entry points; the exhaustive per-branch pins live next to their
 fixes (test_declared_params_honored, test_capability_effect_predicates,
@@ -74,56 +74,36 @@ def repo_ctx(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Incident X1/В23 — the ROOT principal reads/lists/searches its owner's home;
-# credential-shaped NAMES stopped being a read-authorization input (bytes are
-# masked at egress instead of the file being refused at ingress).
-# ---------------------------------------------------------------------------
+# File names and content do not infer read authority.
 
-def test_root_reads_credential_named_user_file_known_formats_masked_not_refused(user_files_ctx):
-    """The read is never refused for the file's name, and known credential
-    formats plus PEM blocks are still masked at egress. Owner answer 5=A
-    removed the 40-character opaque-run rule, so key material of an UNKNOWN
-    format (a bare AWS secret access key: no SECRET_TOKEN_PATTERN matches it)
-    now reaches the reader raw. Stated here rather than quietly dropped.
-
-    The rendered notice is asserted too: with a MIXED known+unknown input the
-    sentence the model reads has to match what actually happened, so the old
-    "raw credentials never enter model context" promise may not appear."""
+def test_root_reads_credential_named_user_file_unchanged(user_files_ctx):
     ctx, home = user_files_ctx
-    (home / ".aws" / "credentials").write_text(
-        "[default]\n" + AWS_SECRET_LINE + GITHUB_TOKEN_LINE + PEM_BLOCK, encoding="utf-8",
-    )
+    source = "[default]\n" + AWS_SECRET_LINE + GITHUB_TOKEN_LINE + PEM_BLOCK
+    (home / ".aws" / "credentials").write_text(source, encoding="utf-8")
     out = _read_file(ctx, ".aws/credentials", root="user_files")
-    assert not out.startswith("⚠️"), out[:200]          # the read itself succeeds
-    assert "[default]" in out                            # non-secret content survives
-    assert "ghp_abcdefghijklmnopqrstuvwxyz123456" not in out   # known format masked
-    assert "PRIVATE KEY" not in out                      # PEM block masked whole
-    assert "SECRET_BYTES_MASKED" in out                  # disclosure, not silence
-    assert "wJalrXUtnFEMI" in out                        # unknown format: delivered raw
-    assert "raw credentials never enter model context" not in out   # withdrawn promise
-    assert "secrets in unrecognized formats are not detected" in out
+    from ouroboros.tools.core_file_tools import delivered_source_prefix
+    assert delivered_source_prefix(ctx.last_read_view, out, len(out)) == source
+    assert "SECRET_BYTES_MASKED" not in out
 
 
 def test_root_lists_and_searches_credential_named_user_files(user_files_ctx):
-    """Names are never hidden and search reaches the file; its match lines carry
-    the same masking the read applies, on the same known formats (5=A: an
-    unknown-format secret is shown by both tools alike)."""
     ctx, home = user_files_ctx
     (home / ".aws" / "credentials").write_text(
-        "[default]\n" + AWS_SECRET_LINE + GITHUB_TOKEN_LINE, encoding="utf-8",
-    )
+        "[default]\n" + AWS_SECRET_LINE + GITHUB_TOKEN_LINE, encoding="utf-8")
     listing = _list_files(ctx, path=".aws", root="user_files")
-    assert ".aws/credentials" in _posix(listing)         # the name is not hidden
+    assert ".aws/credentials" in _posix(listing)
     found = _code_search(ctx, "token", root="user_files", path=".aws")
-    assert ".aws/credentials" in _posix(found)           # search reaches the file
-    assert "ghp_abcdefghijklmnopqrstuvwxyz123456" not in found  # match lines are masked
-    assert "SECRET_BYTES_MASKED" in found
+    assert ".aws/credentials" in _posix(found)
+    assert GITHUB_TOKEN_LINE.strip() in found and "SECRET_BYTES_MASKED" not in found
     raw = _code_search(ctx, "aws_secret_access_key", root="user_files", path=".aws")
-    assert "wJalrXUtnFEMI" in raw                        # same bytes as the read shows
+    assert "wJalrXUtnFEMI" in raw
 
 
-@pytest.mark.parametrize("operation", ["read", "list", "search"])
-@pytest.mark.parametrize("relpath", [".aws/credentials", ".bashrc"])
+@pytest.mark.parametrize(("relpath", "operation"), [
+    (".aws/credentials", "read"),
+    (".aws/credentials", "search"),
+    (".bashrc", "list"),
+])
 def test_root_read_authorization_is_location_only(user_files_ctx, operation, relpath):
     # decide-level pin: for read-family operations under the owner's home the
     # authorization answer is location-only — no name-shape veto.

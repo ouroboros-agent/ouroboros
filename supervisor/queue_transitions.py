@@ -9,7 +9,9 @@ QUIESCENCE state, driven entirely through the queue module:
 
 - the acceptance FENCE (open/inspect/seal a root so no new subtask is admitted
   while its acceptance review runs),
-- explicit BUDGET resume of a zero-dispatch task and its root latch,
+- explicit BUDGET resume of a zero-dispatch task and its root latch (the
+  exact mid-run continuation's single-use GRANT and its revocation live in
+  ``supervisor/budget_resume.py`` and are re-exported here),
 - fenced PROJECT deletion: cancel the project's tree, then tombstone only after
   the tree is provably quiescent,
 - shared live-subtree and timeout-retry lineage views used by cancellation and
@@ -22,6 +24,8 @@ nothing from ``task_lifecycle``, which re-exports these names so
 
 from __future__ import annotations
 
+import contextlib
+import copy
 import logging
 import pathlib
 import threading
@@ -44,9 +48,20 @@ def _queue_module():
 
 def transition_acceptance_fence(
     *, action: str, token: str, root_task_id: str = "", task_id: str = "", outcome: str = "",
-    expected_generation: Optional[int] = None,
+    expected_generation: Optional[int] = None, pooled_owner: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Atomically open, inspect, release, or seal a root admission fence."""
+    """Atomically open, inspect, release, or seal a root admission fence.
+
+    A pooled ``begin`` names its worker attempt (``pooled_owner``: task attempt and
+    pid) and is refused unless that attempt is the current RUNNING one (#1183);
+    direct callbacks pass none, needing no RUNNING row.
+    ``begin`` is idempotent for its requester: the same token, or the SAME owner with a
+    new one (its answer was lost), re-adopts the ``active`` row and rebinds it, so a dead
+    attempt's late events own no row. A consumed exact Resume can transfer its park-bound
+    fence to the new PID; a ``sealed`` row is never re-adopted. A token that
+    owns no row answers ``released`` + ``row_absent`` — idempotent after ``task_done``
+    cleared the fence, and never a seal. Every answer carries the row's real status.
+    """
     q = _queue_module()
     action = str(action or "").strip().lower()
     token = str(token or "").strip()
@@ -57,89 +72,149 @@ def transition_acceptance_fence(
         if action == "begin":
             if not root_task_id:
                 return {"ok": False, "status": "error", "error": "missing root_task_id"}
-            existing = q.ACCEPTANCE_FENCES.get(root_task_id)
-            if isinstance(existing, dict) and str(existing.get("token") or "") != token:
-                return {
-                    "ok": False,
-                    "status": "error",
-                    "error": f"acceptance fence already active for root {root_task_id}",
-                }
-            if isinstance(existing, dict):
-                row = existing
-            else:
+            matched_root, requester = root_task_id, str(task_id or root_task_id)
+            if pooled_owner is not None and not _current_acceptance_owner(q, requester, root_task_id, pooled_owner):
+                return {"ok": False, "status": "stale_attempt",
+                        "error": "acceptance requester is not the current worker attempt"}
+            row = q.ACCEPTANCE_FENCES.get(root_task_id)
+            if not isinstance(row, dict):
                 row = q.ACCEPTANCE_FENCES[root_task_id] = {
-                    "token": token,
-                    "root_task_id": root_task_id,
-                    "task_id": str(task_id or root_task_id),
-                    "status": "active",
-                    "opened_at": utc_now_iso(),
-                    "owner_message_generation": 0,
+                    "token": token, "root_task_id": root_task_id, "task_id": requester,
+                    "status": "active", "opened_at": utc_now_iso(), "owner_message_generation": 0,
+                    **({"pooled_owner": dict(pooled_owner)} if pooled_owner is not None else {}),
                 }
-            result = {
-                "ok": True,
-                "status": "active",
-                "root_task_id": root_task_id,
-                "token": token,
-                "owner_message_generation": int(row.get("owner_message_generation") or 0),
-                "queue_descendants": _live_descendants_locked(
-                    q, root_task_id, exclude_task_id=str(task_id or root_task_id),
-                ),
-            }
+            elif str(row.get("token") or "") != token or row.get("pooled_owner") != pooled_owner:
+                status = str(row.get("status") or "active")
+                if (status != "active" or str(row.get("task_id") or "") != requester
+                        or (row.get("pooled_owner") != pooled_owner and (row.get("token") == token
+                            or not _consumed_acceptance_handoff(q, row, requester, pooled_owner)))):
+                    return {"ok": False, "status": status,
+                            "error": f"acceptance fence already {status} for root {root_task_id}"}
+                row["token"] = token
+                if pooled_owner is not None:
+                    row["pooled_owner"] = dict(pooled_owner)
+                row.pop("paused_continuation", None)
         else:
             matched_root = next(
                 (rid for rid, row in q.ACCEPTANCE_FENCES.items() if str(row.get("token") or "") == token),
                 "",
             )
             if not matched_root:
-                return {"ok": False, "status": "error", "error": "unknown acceptance fence token"}
+                return {"ok": True, "status": "released", "token": token, "row_absent": True}
             row = q.ACCEPTANCE_FENCES[matched_root]
+        current_generation = int(row.get("owner_message_generation") or 0)
+        result = {"ok": True, "status": str(row.get("status") or "active"), "root_task_id": matched_root, "token": token}
+        if action != "end":
+            result["owner_message_generation"] = current_generation
+            result["queue_descendants"] = _live_descendants_locked(
+                q, matched_root, exclude_task_id=str(row.get("task_id") or matched_root),
+            )
             if action == "inspect":
-                return {
-                    "ok": True,
-                    "status": str(row.get("status") or "active"),
-                    "root_task_id": matched_root,
-                    "token": token,
-                    "owner_message_generation": int(row.get("owner_message_generation") or 0),
-                    "queue_descendants": _live_descendants_locked(
-                        q, matched_root, exclude_task_id=str(row.get("task_id") or matched_root),
-                    ),
-                }
-            normalized_outcome = str(outcome or "").strip().lower()
-            if normalized_outcome == "revision":
-                q.ACCEPTANCE_FENCES.pop(matched_root, None)
-                result = {
-                    "ok": True,
-                    "status": "released",
-                    "root_task_id": matched_root,
-                    "token": token,
-                }
-            elif (
-                expected_generation is not None
-                and int(row.get("owner_message_generation") or 0) != int(expected_generation)
-            ):
-                current_generation = int(row.get("owner_message_generation") or 0)
-                q.ACCEPTANCE_FENCES.pop(matched_root, None)
-                result = {
-                    "ok": True,
-                    "status": "released",
-                    "root_task_id": matched_root,
-                    "token": token,
-                    "generation_mismatch": True,
-                    "expected_generation": int(expected_generation),
-                    "owner_message_generation": current_generation,
-                }
-            else:
-                row["status"] = "sealed"
-                row["outcome"] = normalized_outcome or "terminal"
-                row["sealed_at"] = utc_now_iso()
-                result = {
-                    "ok": True,
-                    "status": "sealed",
-                    "root_task_id": matched_root,
-                    "token": token,
-                }
+                return result
+        elif (normalized_outcome := str(outcome or "").strip().lower()) == "revision":
+            q.ACCEPTANCE_FENCES.pop(matched_root, None)
+            result["status"] = "released"
+        elif expected_generation is not None and current_generation != int(expected_generation):
+            q.ACCEPTANCE_FENCES.pop(matched_root, None)
+            result.update(
+                status="released", generation_mismatch=True,
+                expected_generation=int(expected_generation), owner_message_generation=current_generation,
+            )
+        else:
+            row.update(status="sealed", outcome=normalized_outcome or "terminal", sealed_at=utc_now_iso())
+            result["status"] = "sealed"
     q.persist_queue_snapshot(reason=f"acceptance_fence_{result['status']}")
     return result
+
+
+def _consumed_acceptance_handoff(q: Any, fence: dict, task_id: str, owner: Any) -> bool:
+    """Rebind only the fence captured at this exact Pause, after its grant was consumed.
+
+    Called under Q after current pooled-worker validation. The park's old owner (pooled, or the
+    direct turn's ownerless row)/source, RUNNING handoff and durable grant must agree; no history or TTL.
+    """
+    from ouroboros.budget_pause import STATE_RESUMED
+    from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
+
+    if not isinstance(owner, dict) or fence.get("root_task_id") in q.BUDGET_ROOT_FENCES:
+        return False
+    task, binding = q.RUNNING[task_id]["task"], fence.get("paused_continuation")
+    resume, binding = task.get("_budget_pause_resume") or {}, dict(binding) if isinstance(binding, dict) else {}
+    parked = binding.pop("pooled_owner" if "pooled_owner" in fence else "direct_owner", None)
+    if (not isinstance(parked, dict) or ("pooled_owner" in fence and parked != fence["pooled_owner"])
+            or binding != {key: resume.get(key) for key in ("pause_id", "pause_generation", "source_ref")}
+            or parked.get("task_attempt") != owner["task_attempt"]):
+        return False
+    try:
+        from ouroboros.store import acquisition_budget
+        with acquisition_budget(0):
+            result = load_task_result(pathlib.Path(task.get("budget_drive_root") or q.DRIVE_ROOT), task_id, strict=True) or {}
+    except Exception:
+        return False
+    row = result.get("budget_pause") or {}
+    grant = row.get("grant") or {}
+    return bool(result.get("task_id") == task_id and result.get("status") not in _TRULY_TERMINAL_STATUSES
+                and row.get("state") == STATE_RESUMED
+                and row.get("root_task_id") == fence.get("root_task_id")
+                and row.get("task_attempt") == owner["task_attempt"]
+                and row.get("pause_id") == resume.get("pause_id") and row.get("source_ref")
+                and row["source_ref"] == resume.get("source_ref")
+                and row.get("pause_generation") == resume.get("pause_generation")
+                and grant.get("grant_id") and grant["grant_id"] == resume.get("grant_id")
+                and grant.get("generation") == resume.get("grant_generation")
+                and grant.get("consumed_at") and not grant.get("revoked_at"))
+
+
+def _current_acceptance_owner(q: Any, task_id: str, root_id: str, owner: Dict[str, Any]) -> bool:
+    """Positive pooled ownership, read in the begin's own queue-lock transaction."""
+    from supervisor import workers
+
+    meta = q.RUNNING.get(task_id)
+    task = meta.get("task") if isinstance(meta, dict) else None
+    if not isinstance(task, dict) or not isinstance(owner, dict):
+        return False
+    worker = workers.WORKERS.get(meta.get("worker_id"))
+    return bool(
+        type(owner.get("task_attempt")) is int and type(owner.get("pid")) is int
+        and owner["task_attempt"] == int(meta.get("attempt") or task.get("_attempt") or 1)
+        and task.get("id") == task_id and str(task.get("root_task_id") or task_id) == root_id
+        and worker is not None and worker.busy_task_id == task_id
+        and worker.proc.pid == owner["pid"] and worker.proc.is_alive()
+        and not getattr(worker, "reaping", False)
+    )
+
+
+def release_ended_attempt_fences_locked(fences: Dict[Any, Any], task_id: str, *, task_attempt: int,
+                                        pid: Optional[int] = None, paused_roots: Any = ()) -> bool:
+    """Drop the active fence a proven-ended pooled attempt began (#1183).
+
+    The caller holds the fences' owner (Q, or the boot restore's snapshot copy) and
+    proves the attempt ended (confirmed death, or a previous supervisor generation)
+    at the handoff that creates its successor, before any restore or admission
+    consumer reads them. Only an ``active`` row whose recorded ``pooled_owner`` is
+    exactly that attempt (and pid, when known) goes: direct, unattributed legacy,
+    sealed and foreign-owner rows, and a root under a budget/owner Pause fence,
+    stay. Independent paid review custody is not touched.
+    """
+    for key, row in list(fences.items()):
+        owner = row.get("pooled_owner") if isinstance(row, dict) else None
+        if (isinstance(owner, dict) and row.get("status") == "active" and row.get("task_id") == task_id
+                and owner.get("task_attempt") == task_attempt and (pid is None or owner.get("pid") == pid)
+                and str(row.get("root_task_id") or key) not in paused_roots):
+            fences.pop(key)
+            return True
+    return False
+
+
+def clear_acceptance_fence_for_attempt(task_id: str, *, task_attempt: int, pid: Optional[int] = None) -> bool:
+    """Release a confirmed-ended pooled attempt's own active fence and persist it."""
+    q = _queue_module()
+    with q._queue_lock:
+        if not release_ended_attempt_fences_locked(q.ACCEPTANCE_FENCES, task_id, task_attempt=task_attempt,
+                                                   pid=pid, paused_roots=q.BUDGET_ROOT_FENCES):
+            return False
+        q.persist_queue_snapshot(reason="acceptance_fence_attempt_ended")
+    return True
 
 
 def _live_descendants_locked(
@@ -173,6 +248,18 @@ def clear_acceptance_fence_for_root(root_task_id: str) -> bool:
         return q.ACCEPTANCE_FENCES.pop(root_task_id, None) is not None
 
 
+def release_turn_acceptance_fence(drive_root: Any, root_task_id: str) -> bool:
+    """An in-process turn that sends no ``task_done`` (Presence) releases its own root's row at its end."""
+    try:
+        if not _queue_module().owns_live_queue(drive_root) or not clear_acceptance_fence_for_root(root_task_id):
+            return False
+        _queue_module().persist_queue_snapshot(reason="acceptance_fence_turn_ended")
+        return True
+    except Exception:
+        log.warning("Turn %s could not release its acceptance fence", root_task_id, exc_info=True)
+        return False
+
+
 def clear_budget_root_fence_for_settled_tree(task: dict) -> bool:
     """Release a root budget fence once its tree has no live members left.
 
@@ -182,7 +269,9 @@ def clear_budget_root_fence_for_settled_tree(task: dict) -> bool:
     releases the latch as a class. A fence over a tree that still has PENDING
     or RUNNING members stays: only the last settling member clears it.
     Without this, cancelling a paused tree left the fence latched forever
-    (and the snapshot restore would resurrect it after a restart).
+    (and the snapshot restore would resurrect it after a restart). An owner
+    Pause latch also stays while its census names an answered root's running
+    upkeep or a run an ended member left: a terminal result is not ended execution.
     """
     q = _queue_module()
     if not isinstance(task, dict):
@@ -190,8 +279,14 @@ def clear_budget_root_fence_for_settled_tree(task: dict) -> bool:
     root_id = str(task.get("root_task_id") or task.get("id") or "").strip()
     if not root_id:
         return False
+    from supervisor.owner_pause_control import owner_latch_holds
+
+    held = (q.BUDGET_ROOT_FENCES.get(root_id) or {}).get(
+        "cause") == "owner_pause" and owner_latch_holds(q, root_id)
     with q._queue_lock:
         if root_id not in q.BUDGET_ROOT_FENCES:
+            return False
+        if held and (q.BUDGET_ROOT_FENCES.get(root_id) or {}).get("cause") == "owner_pause":
             return False
 
         def _member(row) -> bool:
@@ -218,11 +313,14 @@ def sweep_orphaned_budget_fences(pending, fences, drive_root) -> list:
     cannot outlive its tree across restarts.
     """
     try:
-        live_roots = {
-            str(t.get("root_task_id") or t.get("id") or "")
-            for t in pending if isinstance(t, dict)
-        }
-        orphaned = [root for root in list(fences) if root not in live_roots]
+        from supervisor.owner_pause_control import owner_latch_holds
+
+        live_roots = {str(t.get("root_task_id") or t.get("id") or "") for t in pending if isinstance(t, dict)}
+        # A running late phase or a run an ended member left is the owner-paused tree's
+        # member across Restart until settled (the census then releases the Pause).
+        q = _queue_module()
+        orphaned = [root for root in list(fences) if root not in live_roots and not (
+            (fences.get(root) or {}).get("cause") == "owner_pause" and owner_latch_holds(q, root, drive_root))]
         for root in orphaned:
             fences.pop(root, None)
         if orphaned:
@@ -250,72 +348,289 @@ def budget_pause_fact(task, fences=None):
     pause = task.get("_budget_pause") if isinstance(task, dict) else None
     if isinstance(pause, dict):
         return pause
+    from supervisor.events_budget import budget_fence_selected, budget_hold_fact
+
     fence_map = _queue_module().BUDGET_ROOT_FENCES if fences is None else fences
     root_id = str((task or {}).get("root_task_id") or (task or {}).get("id") or "")
     fence = fence_map.get(root_id)
-    if isinstance(fence, dict) and str(fence.get("status") or "") in {"active", "paused"}:
+    if (isinstance(fence, dict) and str(fence.get("status") or "") in {"active", "paused"}
+            and not budget_fence_selected(task, fence)):
+        # An explicit selection recorded against THIS fence released exactly one
+        # row; its siblings stay fenced (owner Q9).
         return fence
-    return None
+    from ouroboros.work_stop import continuation_refusal
+    return budget_hold_fact(task) or continuation_refusal(task) or None
 
 
-def resume_budget_paused_task(task_id: str) -> Dict[str, Any]:
-    """Explicitly resume one zero-dispatch task and, if needed, its root latch."""
+def queued_admitted_dispatch(task: Any) -> bool:
+    """A queued dispatch already admitted (``possible``), including an unselected
+    unsaved pause intent (#1729). Other pause/grant/hold/continuation carriers exclude it.
+    A root latch still keeps it queued; prior effects remain the tree custody's question.
+    """
+    from supervisor.events_budget import BUDGET_HOLD_KEY
+    from ouroboros.work_stop import record_policy
+
+    hold = task.get(BUDGET_HOLD_KEY) if isinstance(task, dict) else None
+    intent = isinstance(hold, dict) and record_policy(hold).get("needs_source")
+    return bool(isinstance(task, dict) and task.get("admitted_dispatch") == "possible"
+                and not any(task.get(key) for key in (
+                    "_owner_hold", "_budget_pause", "_budget_pause_resume", "_owner_wait_resume",
+                    "_terminalization_retry", "_continuation_prepared", *(() if intent else (BUDGET_HOLD_KEY,)))))
+
+
+def pending_member_replay_safe(q: Any, member: Dict[str, Any]) -> Tuple[bool, str]:
+    """Whether one PENDING row genuinely never dispatched (zero physical calls)."""
+    from supervisor.restart_retention import never_started, returned_before_body
+    from ouroboros.owner_wait import governing_continuation
+    from supervisor.schedule_occurrence import restore_allowed
+
+    if member.get("_owner_hold"):
+        return False, "owner_held"
+    if member.get("_continuation_prepared"):
+        return False, "continuation_publication_unconfirmed"
+    if "_working_recovery" in member:
+        # A locator alone does not authorize Resume: read its exact frozen source
+        # and the target attempt's durable launch evidence, as assignment does.
+        from supervisor.task_admission import _working_resume_granted
+
+        try:
+            if _working_resume_granted(member, q.DRIVE_ROOT):
+                return True, ""
+        except (OSError, ValueError, TypeError, KeyError):
+            log.warning("Saved work Resume evidence unavailable for %s", member.get("id"), exc_info=True)
+        return False, "dispatch_outcome_unknown"
+    if not restore_allowed(member):
+        return False, "dispatch_outcome_unknown"
+    if member.get("_owner_hold"):
+        return False, "owner_held"
+
+    pause = member.get("_budget_pause") or (member.get("_budget_pause_hold") or {}).get("replaced_fence_pause") or {}
+    legacy_saved_zero = (member.get("admitted_dispatch") in (None, "")
+                         and pause.get("status") == "paused_before_dispatch"
+                         and pause.get("replay_safe") is True and pause.get("physical_calls") == 0)
+    prestart_zero = (not governing_continuation(member) and pause.get("before_task_start") is True
+                     and pause.get("task_attempt") == 1
+                     and int(member.get("_attempt") or 1) == 1 and pause.get("replay_safe") is True
+                     and pause.get("physical_calls") == 0 and pause.get("cause") == "owner_pause")
+    if not (never_started(member) or legacy_saved_zero or prestart_zero or returned_before_body(member)):  # #2555
+        return False, "dispatch_outcome_unknown"
+    member_id = str(member.get("id") or "")
+    cost_fields = q.reconstruct_task_cost(
+        member_id, fields=True,
+        drive_root=pathlib.Path(member.get("budget_drive_root") or q.DRIVE_ROOT),
+    )
+    if cost_fields.get("cost_accounting_status") != "available":
+        return False, "accounting_unavailable"
+    retry_lineage = bool(
+        int(member.get("_attempt") or 1) > 1 and not (returned_before_body(member) or {}).get("seed_return")  # D5
+        or member.get("original_task_id") or member.get("timeout_retry_from")
+    )
+    return bool(
+        int(cost_fields.get("total_rounds") or 0) == 0
+        and not bool(cost_fields.get("ledger_integrity_degraded"))
+        and not retry_lineage
+    ), "replay_unsafe"
+
+
+def resume_budget_paused_task(task_id: str, *, selected_by: str = "") -> Dict[str, Any]:
+    from ouroboros.owner_pause import paused_gap
+    from ouroboros.pause_notices import gap_fact
+    from ouroboros.work_stop import resume_asked, resume_outcome
+
+    gap = paused_gap(_queue_module().DRIVE_ROOT, task_id)  # read before this Resume ends that Pause
+    answered = resume_asked(_queue_module(), task_id, selected_by=selected_by)  # and the control it answers about
+    seen: List[Dict[str, str]] = []  # what this Resume's own census found; the Pause's record keeps its own
+    outcome = _resume_budget_paused_task(task_id, selected_by=selected_by, gaps=seen)
+    gap = {"membership_gaps": gap_fact(seen, gap.get("membership_gaps"))} if seen else gap
+    return answered(resume_outcome({**outcome, **gap} if outcome.get("ok") else outcome))
+
+
+def _resume_budget_paused_task(task_id: str, *, selected_by: str = "",
+                               gaps: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
+    """Explicitly resume one budget-paused task and, if needed, its root latch.
+
+    A replay-safe ZERO-dispatch row is released as before. An EXACT continuation gets a single-use
+    ``grant_exact_budget_resume``, never a rerun. A lifted root fence releases a held row only after recording
+    its selection. ``selected_by`` names the MODEL-issued request (owner Q9); an empty value is the owner's own
+    act, which needs no root grant above itself. ``gaps`` receives the damaged rows each door's owner-Pause tree
+    census ties to no tree.
+    """
+    from ouroboros.control_actor import control_actor, observed_control_stop
+    from ouroboros.work_stop import clear_refusal, release_refusal, selection_record
     q = _queue_module()
     task_id = str(task_id or "").strip()
+    if refusal := release_refusal(observed_control_stop(q.DRIVE_ROOT), control_actor()):
+        return refusal
     if not task_id:
         return {"ok": False, "error": "missing_task_id"}
+    from supervisor.events_budget import (
+        _held_selection_authority, observe_held_budget_selection, select_held_budget_row,
+    )
+
+    external = observation = None
+    with q._queue_lock:
+        located = next((item for item in q.PENDING if str(item.get("id") or "") == task_id), None)
+        if refusal := release_refusal(observed_control_stop(
+                q.DRIVE_ROOT, located, budget=q.BUDGET_ROOT_FENCES), control_actor()):
+            return refusal
+    if located is None:
+        # A member parked WARM under the owner's Pause (its stack retained while a
+        # started critic finishes) wakes on the fence; the owner's own Resume and
+        # a model's selection reach it here.
+        from supervisor.budget_resume import resume_warm_owner_pause_root
+
+        warm = resume_warm_owner_pause_root(task_id, selected_by=selected_by, gaps=gaps)
+        if warm is not None:
+            return warm
+    if located is None and not selected_by:
+        from supervisor.owner_pause_resume import resume_terminal_tree
+
+        tree = resume_terminal_tree(task_id, gaps=gaps)
+        if tree is not None:
+            return tree
+    if located is None and not selected_by:
+        # An answered root's Pause: its deferred late review resumes, or nothing is left.
+        from supervisor.budget_resume import resume_late_phase
+
+        late = resume_late_phase(task_id, gaps=gaps)
+        if late is not None:
+            return late
+    with q._queue_lock:
+        located = next((item for item in q.PENDING if str(item.get("id") or "") == task_id), None)
+        if located is not None and not located.get("_budget_pause"):
+            from supervisor.restart_retention import pause_retention, park_saved_pause, RETAIN_SLEEP, RETAIN_OWNER_PAUSE
+
+            retention_root = pathlib.Path(located.get("budget_drive_root") or q.DRIVE_ROOT)
+            attempt = int(located.get("_attempt") or 1)
+            if pause_retention(retention_root, task_id, attempt) in {RETAIN_SLEEP, RETAIN_OWNER_PAUSE}:
+                parked = park_saved_pause(located, attempt, retention_root, pause_source="explicit_resume")
+                if not parked or not parked.get("_budget_pause"):
+                    return {"ok": False, "error": "sleep_retention_unwritable"}
+                located.update(parked)
+                located.pop("_owner_wait_resume", None)
+                if not q.publish_queue_snapshot(reason="saved_pause_retained"):  # durable before the Resume proceeds
+                    return {"ok": False, "error": "snapshot_not_persisted"}
+        exact = bool(located is not None and isinstance(located.get("_budget_pause"), dict)
+                     and located["_budget_pause"].get("exact_continuation"))
+        pause_reason = located["_budget_pause"].get("reason") if exact else None
+        result_root = pathlib.Path((located or {}).get("budget_drive_root") or q.DRIVE_ROOT)
+        located_state = copy.deepcopy(located)
+        needs_selection = located is not None and budget_pause_fact(located) is not None
+    if exact:
+        # Fresh custody at EVERY grant, read OUTSIDE the queue lock (a harness
+        # round trip is not a queue-lock tenant); the grant below re-locates the
+        # row and decides on this observation. A budget pause requests stops of
+        # uncovered runs; owner/technical pauses observe the sent work they retained.
+        from ouroboros.budget_pause import observe_task_runs
+        from ouroboros.owner_pause import fence_closed, read_fence
+
+        root_task_id = str(located_state.get("root_task_id") or task_id)
+        try:
+            owner_fence = read_fence(result_root, root_task_id)
+        except Exception:
+            return {"ok": False, "error": "owner_pause_custody_unreadable"}
+        # Owner Pause may overlay an already saved budget/sleep checkpoint.
+        owner_paused = pause_reason == "owner" or fence_closed(owner_fence)
+
+        external = observe_task_runs(result_root, task_id, reason="budget_resume_uncovered_cost",
+                                     request_stop=not (owner_paused or pause_reason == "authority"))
+        from supervisor.continuation_admission import action_writers
+        if not owner_paused:
+            blockers = action_writers(q, root_task_id, drive_root=result_root)
+            # External custody retains the exact door's own typed refusal below.
+            local = [b for b in blockers if b.get("task_id") == task_id and b.get("kind") not in {
+                "running_member", "dispatchable_member", "delegated_run", "custody_unreadable"} and not b.get("review_owned")]
+            if local:
+                return {"ok": False, "error": "owner_pause_effects_unsettled", "blockers": local}
+        if owner_paused:
+
+            # A saved loop is not proof that its handed tools/processes ended.
+            # Observe the existing whole-tree custody owner off the queue lock.
+            try:
+                external["owner_pause_tree"] = {"fence": owner_fence, "blockers": action_writers(
+                    q, root_task_id, drive_root=result_root, gaps=gaps,
+                    owner_pause_fence_id=str(owner_fence.get("fence_id") or "") if fence_closed(owner_fence) else "")}
+            except Exception as exc:
+                external["owner_pause_tree"] = {"error": str(exc)}
+    elif needs_selection:
+        observation = observe_held_budget_selection(q, task_id)
+        owner_fence = (observation.get("authority") or {}).get("owner_fence") or {}
+        root_id = str(located_state.get("root_task_id") or task_id)
+        from ouroboros.owner_pause import root_actor
+        if (not selected_by and owner_fence.get("fence_id") and queued_admitted_dispatch(located_state)
+                and root_actor(result_root, root_id, task_id)):
+            # An owner-paused root (or its retry's current attempt, #1730) whose own dispatch was
+            # admitted resumes only over this fresh, off-lock whole-tree observation (Pause A).
+            from supervisor.continuation_admission import action_writers
+
+            try:
+                observation["owner_pause_blockers"] = action_writers(
+                    q, root_id, drive_root=result_root, owner_pause_fence_id=str(owner_fence["fence_id"]), gaps=gaps)
+            except Exception as exc:
+                observation["owner_pause_blockers"] = [{"kind": "tree_census_unreadable", "detail": str(exc)[:200]}]
     with q._queue_lock:
         task = next((item for item in q.PENDING if str(item.get("id") or "") == task_id), None)
         if task is None:
             return {"ok": False, "error": "task_not_pending"}
+        if refusal := release_refusal(observed_control_stop(
+                q.DRIVE_ROOT, task, budget=q.BUDGET_ROOT_FENCES), control_actor()):
+            return refusal
         pause = task.get("_budget_pause") if isinstance(task.get("_budget_pause"), dict) else None
+        if pause and pause.get("exact_continuation"):
+            if task is not located or task != located_state:
+                return {"ok": False, "error": "selection_authority_changed"}
+            return grant_exact_budget_resume(task, pause, selected_by=selected_by, external=external)
+        if observation is not None:
+            if observation.get("error"):
+                return {"ok": False, "error": observation["error"]}
+            try:
+                current = _held_selection_authority(q, task)
+            except Exception:
+                return {"ok": False, "error": "selection_authority_unavailable"}
+            if task is not observation["candidate"] or current != observation["authority"]:
+                return {"ok": False, "error": "selection_authority_changed"}
+            if current["cancel_pending"] or current["owner_restart"]:
+                return {"ok": False, "error": "selection_owner_held"}
+        elif budget_pause_fact(task) is not None:
+            return {"ok": False, "error": "selection_observation_required"}
+
+        candidate_root = str(task.get("root_task_id") or task_id).strip()
+        if "owner_pause_blockers" in (observation or {}):  # a ``latch_pending`` Pause: the fence revalidated above
+            from supervisor.owner_pause_control import complete_owner_pause_latch
+            complete_owner_pause_latch(candidate_root, observation["authority"]["owner_fence"])
+        candidate_fence = q.BUDGET_ROOT_FENCES.get(candidate_root)
+        if (not selected_by and (task_id == candidate_root or "owner_pause_blockers" in (observation or {}))
+                and isinstance(candidate_fence, dict) and candidate_fence.get("cause") == "owner_pause"):
+            return _resume_unstarted_owner_paused_root(q, task, candidate_fence, observation)
+        hold = selection_record(task)
+        if hold:
+            return select_held_budget_row(q, task, hold, selected_by=selected_by, observation=observation)
         if not pause:
-            # A root marker blocks every already-pending sibling without
-            # copying pause state onto each task.  An explicit resume request
-            # may nominate any genuinely zero-dispatch member of that root.
-            candidate_root = str(task.get("root_task_id") or task_id).strip()
-            candidate_fence = q.BUDGET_ROOT_FENCES.get(candidate_root)
             if not isinstance(candidate_fence, dict):
                 return {"ok": False, "error": "task_not_budget_paused"}
-            pause = {
-                **candidate_fence,
-                "status": "paused_before_dispatch",
-                "physical_calls": 0,
-                "replay_safe": True,
-                "resume_policy": "manual_same_generation",
-            }
+            if isinstance(task.get("_budget_pause_resume"), dict):
+                return {"ok": False, "error": "resume_already_granted",
+                        "grant_id": str(task["_budget_pause_resume"].get("grant_id") or "")}
+            if observation is None:
+                return {"ok": False, "error": "task_not_budget_paused"}
+            pause = {**candidate_fence, "physical_calls": 0, "replay_safe": True}
         root_scope = str(pause.get("scope") or "") == "root"
         root_task_id = str(pause.get("root_task_id") or "").strip()
         fence = q.BUDGET_ROOT_FENCES.get(root_task_id) if root_scope and root_task_id else None
+        if (isinstance(fence, dict) and fence.get("cause") == "owner_pause" and task_id == root_task_id
+                and not selected_by):
+            return _resume_unstarted_owner_paused_root(q, task, fence, observation)
         if root_scope and not isinstance(fence, dict):
             return {"ok": False, "error": "root_budget_fence_missing", "action": "cancel_or_new_run"}
         if root_scope and str(pause.get("fence_id") or "") != str(fence.get("fence_id") or ""):
             return {"ok": False, "error": "replay_unsafe", "action": "cancel_or_new_run"}
-        def _pending_member_is_replay_safe(member: Dict[str, Any]) -> tuple[bool, str]:
-            member_id = str(member.get("id") or "")
-            cost_fields = q.reconstruct_task_cost(
-                member_id,
-                fields=True,
-                drive_root=pathlib.Path(member.get("budget_drive_root") or q.DRIVE_ROOT),
-            )
-            if cost_fields.get("cost_accounting_status") != "available":
-                return False, "accounting_unavailable"
-            retry_lineage = bool(
-                int(member.get("_attempt") or 1) > 1
-                or member.get("original_task_id") or member.get("timeout_retry_from")
-            )
-            return bool(
-                int(cost_fields.get("total_rounds") or 0) == 0
-                and not bool(cost_fields.get("ledger_integrity_degraded"))
-                and not retry_lineage
-            ), "replay_unsafe"
-
-        nominated_safe, nominated_error = _pending_member_is_replay_safe(task)
-        nominated_safe = bool(
-            nominated_safe
-            and pause.get("replay_safe")
-            and pause.get("physical_calls") == 0
-        )
+        authority = observation["authority"]  # a member's consumed Resume completes at its selection
+        if authority["owner_fence"] and (selected_by or not authority["consumed_resume"]):
+            return {"ok": False, "error": "selection_owner_held"}
+        nominated_safe, nominated_error = observation["safe"], observation["unsafe_error"]
+        # A zero-dispatch pause, or (owner 4A) held saved work this observation just revalidated: never a replay.
+        nominated_safe = bool(nominated_safe and (pause.get("replay_safe") and pause.get("physical_calls") == 0
+                                                  or pause.get("continuation") == "working" and "_working_recovery" in task))
         if not nominated_safe:
             return {
                 "ok": False,
@@ -323,35 +638,36 @@ def resume_budget_paused_task(task_id: str) -> Dict[str, Any]:
                 "action": "cancel_or_new_run",
             }
         if root_scope:
-            # Clearing one root latch makes every pending member assignable. Check
-            # those members together under the existing queue lock; completed
-            # historical siblings are deliberately irrelevant.
-            unsafe_members: list[str] = []
-            for member in q.PENDING:
-                member_id = str(member.get("id") or "")
-                member_root = str(member.get("root_task_id") or member_id)
-                if member_root != root_task_id or member_id == task_id:
-                    continue
-                member_safe, _member_error = _pending_member_is_replay_safe(member)
-                if not member_safe:
-                    unsafe_members.append(member_id)
-            if unsafe_members:
-                return {
-                    "ok": False,
-                    "error": "root_replay_unsafe",
-                    "unsafe_task_ids": unsafe_members,
-                    "action": "cancel_or_new_run",
-                }
+            # Root Resume selects the root alone; children remain behind this
+            # same fence until individually selected under its root grant (Q9).
+            from supervisor.events_budget import HOLD_ROOT_FENCE_MEMBER_SELECTION, hold_budget_row
 
-        resumed_at = utc_now_iso()
-        prior_pause = dict(pause)
-        task.pop("_budget_pause", None)
-        task["budget_resumed_at"] = resumed_at
-        if root_scope:
-            q.BUDGET_ROOT_FENCES.pop(root_task_id, None)
-        q.persist_queue_snapshot(
-            reason="budget_root_explicit_resume" if root_scope else "budget_pause_explicit_resume",
-        )
+            hold = hold_budget_row(
+                task, reason=HOLD_ROOT_FENCE_MEMBER_SELECTION,
+                extra={"root_task_id": root_task_id, "fence_id": fence["fence_id"]})
+            # Creating this hold changes authority. Observe again only AFTER
+            # that mutation, and require the exact post-mutation state below.
+            try:
+                expected = _held_selection_authority(q, task)
+            except Exception:
+                return {"ok": False, "error": "selection_authority_unavailable"}
+        else:
+            from ouroboros.presence_carrier import owner_resume_lift
+            if refusal := owner_resume_lift(task, result_root):  # the owner's Resume of a moved Presence turn (#2566)
+                return refusal
+            resumed_at = utc_now_iso()
+            prior_pause = dict(pause)
+            task.pop("_budget_pause", None)
+            task.pop("_budget_pause_hold", None)
+            clear_refusal(task)
+            task["budget_resumed_at"] = resumed_at
+            q.persist_queue_snapshot(reason="budget_pause_explicit_resume")
+    if root_scope:
+        observation = observe_held_budget_selection(q, task_id)
+        with q._queue_lock:
+            if observation.get("authority") != expected:
+                return {"ok": False, "error": "selection_authority_changed"}
+            return select_held_budget_row(q, task, hold, selected_by=selected_by, observation=observation)
     try:
         from ouroboros.task_results import STATUS_SCHEDULED, write_task_result
 
@@ -361,7 +677,7 @@ def resume_budget_paused_task(task_id: str) -> Dict[str, Any]:
             STATUS_SCHEDULED,
             reason_code="",
             resource_limit={
-                **prior_pause,
+                **prior_pause, "by": control_actor(),
                 "status": "resumed",
                 "resumed_at": resumed_at,
                 "auto_resume": False,
@@ -580,14 +896,14 @@ def evolution_stop_report(outcomes: Dict[str, List[str]]) -> tuple[List[str], bo
     """Compose honest ``/evolve off`` message lines from typed stop outcomes.
 
     ONE composer for both stop ingresses (owner chat and agent tool), so the
-    two surfaces cannot drift: "Cancelled" names only real cancellations,
+    two surfaces cannot drift: "Stopped" names only real cancellations,
     already-settled tasks are reported as what they are, and any task that is
     STILL LIVE (custody failure or a refused intent write) makes the stop
     INCOMPLETE — returned as ``(lines, incomplete)``.
     """
     lines: List[str] = []
     if outcomes.get("cancelled"):
-        lines.append("🛑 Cancelled evolution task(s): " + ", ".join(outcomes["cancelled"]))
+        lines.append("🛑 Stopped evolution task(s): " + ", ".join(outcomes["cancelled"]))
     settled = [*outcomes.get("already_settled", []), *outcomes.get("not_found", [])]
     if settled:
         lines.append("ℹ️ Already settled (nothing left to cancel): " + ", ".join(settled))
@@ -613,30 +929,42 @@ def _settled_status(drive_root: object, task_id: str) -> str:
     """The task's own already-settled durable status, or "" — fail-soft."""
     try:
         from ouroboros.task_results import load_task_result
-        from ouroboros.task_status import SETTLED_STATUSES
 
-        status = str((load_task_result(drive_root, task_id) or {}).get("status") or "")
-        return status if status in SETTLED_STATUSES else ""
+        return settled_status_of(load_task_result(drive_root, task_id) or {})
     except Exception:
         log.debug("settled-status read failed for %s", task_id, exc_info=True)
         return ""
 
 
-def task_subtree_is_live(task_id: str, *, ignore_intents: bool = False) -> bool:
-    """Cheap liveness pre-check for the HTTP cascade-cancel path (v6.82).
+def settled_status_of(row: Any) -> str:
+    """The row's terminal status, or "" (custody judges the row it prepared outside the lock)."""
+    from ouroboros.task_status import SETTLED_STATUSES
+
+    status = str((row or {}).get("status") or "")
+    return status if status in SETTLED_STATUSES else ""
+
+
+def task_subtree_is_live(task_id: str, *, ignore_intents: bool = False, count_runs: bool = True) -> bool:
+    """Cheap liveness check the HTTP Stop asks only for a settled or row-less cascade target.
 
     True when the task itself is queued/running, when it still has live
     descendants in the queue, when THIS process still runs its paid post-task
-    synthesis (the direct-chat turn's in-flight key), or when it holds an
-    ACTIVE durable cancel intent (or the legacy ``cancel_requested`` status
-    latch of pre-redesign files) — the intent's settle still has honest work
-    to do. Everything else is inactive and must keep today's 404 contract.
+    synthesis (the direct-chat turn's in-flight key), when its live review
+    operation still owns paid work, when a delegated run of its tree is still
+    open in custody (the cascade cancels it: ``stop_tree_runs``), or when it
+    holds an ACTIVE durable cancel intent (or the legacy ``cancel_requested``
+    status latch of pre-redesign files) — the intent's settle still has honest
+    work to do. Everything else is inactive and must keep today's 404 contract.
 
     ``ignore_intents=True`` is the PHYSICAL variant for the cascade
     postcondition (GR2-1e): the root's own cascade intent now survives until
     that postcondition passes, so the postcondition must judge queue/durable
     liveness only — counting the coordination intent itself would make the
     check circular and the cascade unable to ever report success.
+
+    ``count_runs=False`` asks whether anything besides the tree's open delegated
+    runs is live: a cascade whose only remaining work is runs whose cancel is in
+    flight is pending, not a cascade that cancelled nothing.
     """
     q = _queue_module()
     task_id = str(task_id or "").strip()
@@ -670,6 +998,16 @@ def task_subtree_is_live(task_id: str, *, ignore_intents: bool = False) -> bool:
     # cascade intent and the per-stage gate loses the Stop it was waiting on.
     if post_task_synthesis_in_flight(q.DRIVE_ROOT, task_id):
         return True
+    from ouroboros.review_operation import task_has_live_review_operation
+
+    if task_has_live_review_operation(q.DRIVE_ROOT, task_id):
+        return True
+    from ouroboros.delegate_custody_reconcile import tree_open_runs
+
+    # A run open in custody is physical work until custody records it settled, so an unconfirmed
+    # cancel keeps the cascade's postcondition unmet; unreadable custody raises like the review read.
+    if count_runs and tree_open_runs(q.DRIVE_ROOT, task_id):
+        return True
     if ignore_intents:
         return False
     try:
@@ -684,7 +1022,7 @@ def task_subtree_is_live(task_id: str, *, ignore_intents: bool = False) -> bool:
         return False
 
 
-def _live_retry_target_locked(q: Any, task_id: str) -> Tuple[str, str]:
+def _live_retry_target_locked(q: Any, task_id: str, *, results) -> Tuple[str, str]:
     """Resolve an old root id to its one validated live retry leaf.
 
     A live row is not lineage authority by itself: ingress fields can be stale
@@ -693,7 +1031,12 @@ def _live_retry_target_locked(q: Any, task_id: str) -> Tuple[str, str]:
     host-written result chain (old points to new; new points back to old), then
     require the live task row to satisfy the existing root-retry contract.
     Corrupt, overlong, cyclic, or ambiguous chains raise so custody leaves the
-    intent open and fails closed.
+    intent open and fails closed. The chain is walked — and its rows re-checked
+    under the lock — only when the requested row has ``superseded_by``: any
+    other task is its own physical id, and its live worker rewriting the row
+    between preparation and this lock changes nothing about who owns it (a
+    retry admitted meanwhile is still caught below as a live root-shaped row
+    outside the prepared chain).
     """
     requested = str(task_id or "").strip()
     if not requested:
@@ -712,12 +1055,12 @@ def _live_retry_target_locked(q: Any, task_id: str) -> Tuple[str, str]:
         if str(row.get("id") or "")
     }
 
-    from ouroboros.task_results import load_task_result, resolve_task_lineage
+    from ouroboros.task_results import resolve_task_lineage
 
-    requested_result = load_task_result(q.DRIVE_ROOT, requested, strict=True)
+    requested_result = results.prepared(requested)
     requested_shape = (
         requested_result
-        if isinstance(requested_result, dict)
+        if requested_result
         else live_by_id.get(requested, {})
     )
     requested_lineage = resolve_task_lineage(
@@ -744,8 +1087,9 @@ def _live_retry_target_locked(q: Any, task_id: str) -> Tuple[str, str]:
     except (TypeError, ValueError, OverflowError):
         max_edges = 0
     logical_root = requested
+    walks_chain = bool(str(requested_result.get("superseded_by") or "").strip())
     while True:
-        current = load_task_result(q.DRIVE_ROOT, current_id, strict=True) or {}
+        current = (results.load(current_id) if walks_chain else requested_result) or {}
         if current_id == requested:
             logical_root = str(current.get("root_task_id") or requested)
         superseded_by = str(current.get("superseded_by") or "").strip()
@@ -770,7 +1114,7 @@ def _live_retry_target_locked(q: Any, task_id: str) -> Tuple[str, str]:
             raise RuntimeError(
                 f"timeout retry lineage from {requested} contains a cycle"
             )
-        successor = load_task_result(q.DRIVE_ROOT, successor_id, strict=True) or {}
+        successor = results.load(successor_id) or {}
         if (
             str(successor.get("supersedes_task_id") or "") != current_id
             or str(successor.get("original_task_id") or "") != current_id
@@ -843,7 +1187,7 @@ def _live_retry_target_locked(q: Any, task_id: str) -> Tuple[str, str]:
         from ouroboros.task_status import SETTLED_STATUSES
 
         leaf_status = str(
-            (load_task_result(q.DRIVE_ROOT, current_id, strict=True) or {}).get("status")
+            (results.load(current_id) or {}).get("status")
             or ""
         )
         if leaf_status in SETTLED_STATUSES:
@@ -851,56 +1195,71 @@ def _live_retry_target_locked(q: Any, task_id: str) -> Tuple[str, str]:
     return requested, ""
 
 
-def task_has_live_ownership(task_id: str) -> bool:
-    """Whether live PHYSICAL ownership remains for this task: a RUNNING row, a
-    busy worker slot, the in-process direct-chat turn or its still-billing
-    post-task synthesis (GR6-1, the one predicate behind the class rule).
+def task_has_live_ownership(task_id: str, *, ignore_review_operation: str = '', ownership=None) -> bool:
+    """Executable/paused custody, including uncertainty. Durable terminality precedes post-task work,
+    so only False proves no owner. Cancel uses allow_settled_target=True to stop surviving spend
+    without replacing the result. Worker twin: task_status.task_has_live_queue_ownership."""
+    return bool(_task_ownership_reason(task_id, ignore_review_operation=ignore_review_operation, ownership=ownership))
 
-    The pipeline persists the durable terminal result BEFORE post-task
-    cognition ends, so "the status is settled" and "the worker is dead" are
-    two different facts — ``already_settled`` is a terminal answer ONLY when
-    this predicate is False. Cancel INGRESSES consult it and pass
-    ``allow_settled_target=True`` to ``request_cancel`` while ownership is
-    live, so custody kills the still-spending worker instead of no-oping;
-    completion-wins keeps the stored result either way. (The worker-process
-    twin — the agent tool cannot see the live maps — is
-    ``ouroboros.task_status.task_has_live_queue_ownership`` over the queue
-    snapshot.)
-    """
+
+def _task_ownership_reason(task_id: str, *, ignore_review_operation: str = '', ownership=None) -> str:
+    """Ownership's existing conservative check, preserving its uncertainty for settlement."""
     q = _queue_module()
     from supervisor import workers
 
     task_id = str(task_id or "").strip()
     if not task_id:
-        return False
+        return ""
+    from supervisor.task_ownership import BUSY, UNCHANGED, TaskOwnershipRead, prepare_retry_chain
+    from ouroboros.store import StoreBusy
+    from ouroboros.presence_runner import presence_turn_owned
+    from ouroboros.review_operation import task_has_live_review_operation
+    from ouroboros.owner_pause import FENCE_REQUESTED, FENCE_PAUSED, FENCE_RELEASED
+
+    ownership = ownership or TaskOwnershipRead(q.DRIVE_ROOT)
+    accessed = set()
+    def read(tid):
+        accessed.add(tid)
+        return ownership.load(tid)
+
+    try:
+        current = read(task_id)
+        if task_has_live_review_operation(q.DRIVE_ROOT, task_id, exclude_owner_id=ignore_review_operation,
+                                          result_loader=read):
+            return "task_live"
+        if presence_turn_owned(current, task_id, drive_root=q.DRIVE_ROOT):
+            return "task_live"  # no queue map holds it; its runner reads the intent (#2012)
+        fence = current.get("owner_pause") or {}
+        if not isinstance(fence, dict) or (fence and fence.get("state") not in
+                                           {FENCE_REQUESTED, FENCE_PAUSED, FENCE_RELEASED}):
+            return "liveness_unknown"
+        prepare_retry_chain(q, task_id, read)
+    except (OSError, ValueError, TypeError, RuntimeError) as exc:
+        return "store_busy" if isinstance(exc, StoreBusy) or isinstance(exc.__cause__, StoreBusy) else "liveness_unknown"
     with q._queue_lock:
+        checked = ownership.recheck(accessed)
+        if checked != UNCHANGED:
+            return "store_busy" if checked == BUSY else "liveness_unknown"
         if task_id in q.RUNNING:
-            return True
+            return "task_live"
         if any(
             worker.busy_task_id == task_id for worker in workers.WORKERS.values()
         ):
-            return True
-        # The in-process direct-chat turn is live PHYSICAL ownership too: it
-        # spends on the owner's behalf from inside the supervisor process and
-        # writes an ordinary durable running row, so it must be as
-        # addressable as a pooled worker (custody stops it cooperatively).
+            return "task_live"
+        # Direct turns and post-task synthesis still spend after a durable terminal row.
         if workers.direct_chat_turn(task_id) is not None:
-            return True
-        # The turn's paid post-task synthesis OUTLIVES the turn: the loop
-        # returns and ``_busy`` drops while the in-process worker thread still
-        # bills, so the pipeline's in-flight key is live physical ownership
-        # too — the stop ingress must not answer 404 while the spend
-        # continues, and custody keeps the intent open for the stage gate.
+            return "task_live"
         if post_task_synthesis_in_flight(q.DRIVE_ROOT, task_id):
-            return True
+            return "task_live"
+        # A dead attempt whose reap the reaper retains (slot reserved, terminal owed) is custody Stop must reach.
+        from supervisor.task_reaper import _deferred_reap_jobs
+        if any(str(job.get("task_id") or "") == task_id for job in _deferred_reap_jobs):
+            return "task_live"
         try:
-            retry_target, _retry_settled_status = _live_retry_target_locked(q, task_id)
-        except Exception:
-            # An indeterminate chain cannot prove that physical ownership is
-            # absent.  Fail open toward liveness so intent minting, which does
-            # the authoritative locked validation, decides the request.
-            return True
-        return bool(
+            retry_target, _retry_settled_status = _live_retry_target_locked(q, task_id, results=ownership)
+        except Exception as exc:
+            return "store_busy" if isinstance(exc, StoreBusy) or isinstance(exc.__cause__, StoreBusy) else "liveness_unknown"
+        return "task_live" if (
             retry_target != task_id
             and (
                 retry_target in q.RUNNING
@@ -909,7 +1268,63 @@ def task_has_live_ownership(task_id: str) -> bool:
                     for worker in workers.WORKERS.values()
                 )
             )
-        )
+        ) else ""
+
+
+def task_settlement_liveness(task_id: str) -> Optional[bool]:
+    """The probe a destructive custody settlement asks (``task_custody.settle_child_drive``):
+    True while ``task_has_live_ownership`` holds or the id waits in PENDING, None while a
+    reap of this task (its slot or a queued/deferred reap job) makes absence inconclusive
+    or the queue cannot be read, False only for proven absence. StoreBusy retains the
+    distinct busy cause. Callers without live maps cannot prove absence."""
+    q = _queue_module()
+    from supervisor import task_reaper, workers
+
+    task_id = str(task_id or "").strip()
+    if not getattr(q, "INITIALIZED", False):
+        return None  # empty maps outside the supervisor process prove no absence
+    try:
+        from supervisor.task_ownership import settlement_reads
+        from ouroboros.store import StoreBusy
+
+        locked = q._queue_lock._is_owned()
+        reads = settlement_reads(q.DRIVE_ROOT, task_id, locked=locked)
+        if reads is None:
+            return None
+        if not locked:
+            _task_ownership_reason(task_id, ownership=reads)  # Prepare before the mutation lock.
+        with q._queue_lock:
+            reason = _task_ownership_reason(task_id, ownership=reads)
+            if reason == "store_busy":
+                raise StoreBusy("ownership re-check found the store busy", reason="contention")
+            if reason == "liveness_unknown":
+                return None
+            if reason or any(str(row.get("id") or "") == task_id for row in q.PENDING):
+                return True
+            with q._reap_queue.mutex:
+                jobs = [*q._reap_queue.queue, *task_reaper._deferred_reap_jobs]
+            if any(worker.reaping and worker.busy_task_id == task_id for worker in workers.WORKERS.values()) \
+                    or any(isinstance(job, dict) and str(job.get("task_id") or "") == task_id for job in jobs):
+                return None  # a reap of this task is queued or holds its slot: its process may live
+        if not locked:
+            settlement_reads(q.DRIVE_ROOT, task_id, locked=False, prepared=reads)
+        return False
+    except StoreBusy:
+        raise  # The destructive caller reports contention, never a live owner.
+    except Exception:
+        log.warning("Settlement liveness of %s is unknown", task_id, exc_info=True)
+        return None
+
+
+@contextlib.contextmanager
+def task_settlement_interlock(stop: Any = None):
+    """The ownership interlock a drive settlement moves under (``task_custody.settle_child_drive``
+    ``guard``): the queue lock admission and assignment hold, so no occupant can be admitted,
+    assigned or retried between the settlement's last probe and the drive's move. Yields
+    whether the caller's generation is still open (``stop()`` False)."""
+    q = _queue_module()
+    with q._queue_lock:
+        yield not (callable(stop) and stop())
 
 
 def run_project_deletion(
@@ -988,7 +1403,7 @@ def run_project_deletion(
                     errors.append(f"{task_id}: cancel_intent_write_failed")
                     continue
                 try:
-                    q.cancel_task_by_id(task_id, cascade=True)
+                    q.cancel_task_by_id(task_id)
                 except Exception as exc:
                     errors.append(f"{task_id}: {type(exc).__name__}: {exc}")
             first_pass = False
@@ -1090,11 +1505,14 @@ def _close_campaign_after_owner_stop(exclude_task_id: str = "") -> None:
             _read_evolution_campaign,
             complete_evolution_campaign,
         )
-        from supervisor.state import load_state
+        from supervisor.state import control_is, load_state
 
-        if not bool(load_state().get("evolution_owner_stopped")):
+        campaign = _read_evolution_campaign()
+        # A KNOWN owner stop or a recorded stop intent (#1307); an unknown flag closes nothing.
+        if not (control_is(load_state(), "evolution_owner_stopped", True)
+                or isinstance(campaign.get("stop_intent"), dict)):
             return
-        if _read_evolution_campaign().get("status") not in {"active", "paused"}:
+        if campaign.get("status") not in {"active", "paused"}:
             return
         from supervisor.queue import PENDING, RUNNING, _queue_lock
 
@@ -1146,15 +1564,30 @@ def reconcile_terminal_task_projections(drive_root, task_id: str) -> None:
     except Exception:
         log.debug("owner_hurry terminal reconcile failed for %s", task_id, exc_info=True)
     try:
-        # #Q-2b structural expiry (owner decision 30=A): every still-open quiz
-        # dies with its author, and the already-rendered cards learn it live.
-        from ouroboros.owner_quiz import reconcile_terminal as quiz_reconcile
+        # The wait ends with its author; the unanswered card remains answerable.
+        from ouroboros.owner_quiz import reconcile_terminal as quiz_reconcile, quiz_states
 
         expired = quiz_reconcile(drive_root, str(task_id))
         if expired:
             from supervisor.message_bus import get_bridge
 
+            blocks = quiz_states(drive_root, str(task_id))
             for quiz_id in expired:
-                get_bridge().send_quiz_state(quiz_id, str(task_id), "expired_terminal")
+                block = blocks.get(quiz_id) or {}
+                get_bridge().send_quiz_state(quiz_id, str(task_id), "expired_terminal",
+                    chat_id=int(block.get("publication_chat_id", block.get("chat_id", 0)) or 0),
+                    wait_for_answer=False)
     except Exception:
         log.debug("owner_quiz terminal reconcile failed for %s", task_id, exc_info=True)
+
+
+# The exact-continuation grant lifecycle (#1196) lives in its own owner module;
+# ``grant_exact_budget_resume`` is used above, and ``revoke_exact_budget_resume``
+# is still addressed on THIS surface by ``worker_assignment`` (the same shape
+# ``supervisor.queue`` uses for this file).
+from supervisor.budget_resume import (  # noqa: E402, F401 -- intentional public re-export
+    grant_exact_budget_resume,
+    revoke_exact_budget_resume,
+)
+
+from supervisor.budget_resume_unstarted import _resume_unstarted_owner_paused_root  # noqa: E402, F401

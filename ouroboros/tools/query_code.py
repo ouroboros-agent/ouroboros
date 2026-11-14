@@ -6,8 +6,11 @@ import os
 import pathlib
 import re
 import time
+from collections import Counter
 from typing import Any, Callable, List
 
+from ouroboros import work_domain
+from ouroboros.config import runtime_setting
 from ouroboros.protected_artifacts import block_reason_for_path
 from ouroboros.tool_access import (
     ResolvedResourceBinding,
@@ -15,8 +18,7 @@ from ouroboros.tool_access import (
     path_is_relative_to,
 )
 from ouroboros.tools.registry import ToolContext, ToolEntry
-from ouroboros.config import runtime_setting
-
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, completed_local_read
 
 _OPS = (
     "relevant_files",
@@ -31,6 +33,12 @@ _OPS = (
     "architecture",
 )
 _MAX_LIMIT = 200
+_OP_OPTIONS = {
+    "symbols": {"kind", "lang"}, "definition": {"kind", "lang"},
+    "references": {"lang"}, "callers": {"lang"}, "callees": {"lang"},
+    "impact": {"lang", "depth"}, "structural": {"lang"},
+    "digest": {"lang"}, "relevant_files": {"lang"}, "architecture": set(),
+}
 # Structural walks read every candidate file, so bound them for an arbitrary
 # external root (a user_files target like /app or ~) the way search_code bounds
 # its scan — a file cap plus the shared wall-clock budget, symlink-confined.
@@ -50,19 +58,20 @@ def _walk_candidate_files(scope: pathlib.Path, repo_root: pathlib.Path) -> tuple
     so a structural query over an external user_files target cannot wander the
     whole filesystem. Stops at a file cap or the wall-clock budget and returns a
     disclosed-truncation note (P1, never silent)."""
-    if scope.is_file():
+    if work_domain.is_file(scope):
         return [scope], ""
-    root_resolved = repo_root.resolve(strict=False)
+    root_resolved = work_domain.settle(repo_root)
     deadline = time.monotonic() + _structural_wall_budget()
     files: list[pathlib.Path] = []
-    for dirpath, dirnames, filenames in os.walk(scope, followlinks=False):
+    for dirpath, dirnames, filenames in (work_domain.walk(scope) if work_domain.is_work(scope)
+                                       else os.walk(scope, followlinks=False)):
         if time.monotonic() > deadline:
             return files, f"walk stopped after {_structural_wall_budget():.0f}s wall budget (narrow path=)"
         dirnames.sort()
         for name in sorted(filenames):
             fp = pathlib.Path(dirpath) / name
             try:
-                rp = fp.resolve(strict=False)
+                rp = work_domain.settle(fp)
                 if rp != root_resolved and not path_is_relative_to(rp, root_resolved):
                     continue
             except Exception:
@@ -77,9 +86,9 @@ def _safe_path(repo_root: pathlib.Path, path: str) -> str:
     text = str(path or "").strip().replace("\\", "/")
     if not text or text == ".":
         return ""
-    target = (repo_root / text).resolve(strict=False)
+    target = work_domain.settle(repo_root / text)
     try:
-        return target.relative_to(repo_root.resolve(strict=False)).as_posix()
+        return target.relative_to(work_domain.settle(repo_root)).as_posix()
     except ValueError as exc:
         raise ValueError(f"path escapes root: {path}") from exc
 
@@ -89,75 +98,19 @@ def _visible_file(
     repo_root: pathlib.Path,
     rel_path: str,
     binding: ResolvedResourceBinding | None = None,
-    secret_check: Callable[[pathlib.Path], bool] | None = None,
+    runtime_check: Callable[[pathlib.Path], str] | None = None,
 ) -> bool:
     try:
-        target = (repo_root / rel_path).resolve(strict=False)
+        target = work_domain.settle(repo_root / rel_path)
     except Exception:
         return False
-    try:
-        from ouroboros.tools.core import is_restricted_subagent_profile as _is_local_readonly_subagent, _is_subagent_secret_repo_target
+    from ouroboros.tools.core_file_tools import _runtime_data_read_block
 
-        if _is_local_readonly_subagent(ctx) and (
-            secret_check(target) if secret_check else _is_subagent_secret_repo_target(target, repo_root, ctx=ctx)
-        ):
-            return False
-    except Exception:
-        pass
     return not (
-        block_reason_for_path(ctx, target, "read_bytes", binding)
+        (runtime_check(target) if runtime_check is not None else _runtime_data_read_block(ctx, target, root=binding.root if binding else ""))
+        or block_reason_for_path(ctx, target, "read_bytes", binding)
         or block_reason_for_path(ctx, target, "static_introspection", binding)
     )
-
-
-def _inventory_rows(
-    ctx: ToolContext,
-    inventory: Any,
-    repo_root: pathlib.Path,
-    opts: dict[str, Any],
-    binding: ResolvedResourceBinding | None = None,
-    secret_check: Callable[[pathlib.Path], bool] | None = None,
-) -> list[str]:
-    from ouroboros.code_intelligence import (
-        impact_files,
-        relevant_files,
-        symbol_callees,
-        symbol_callers,
-        symbol_definitions,
-        symbol_references,
-    )
-
-    op = str(opts.get("op") or "")
-    query = str(opts.get("query") or "")
-    path = str(opts.get("path") or "")
-    kind = str(opts.get("kind") or "any")
-    depth = int(opts.get("depth") or 1)
-    limit = int(opts.get("limit") or 40)
-    offset = int(opts.get("offset") or 0)
-    rows: list[str] = []
-    if op in {"symbols", "definition"}:
-        for file, symbol in symbol_definitions(inventory, query, path=path, kind=kind or "any"):
-            if _visible_file(ctx, repo_root, file.path, binding, secret_check):
-                rows.append(f"{file.path}:{symbol.line_start} {symbol.kind} {symbol.signature or symbol.name}")
-    elif op == "references":
-        for file, ref in symbol_references(inventory, query, path=path):
-            if _visible_file(ctx, repo_root, file.path, binding, secret_check):
-                rows.append(f"{file.path}:{ref.line} {query}{' in ' + ref.enclosing if ref.enclosing else ''}")
-    elif op in {"callers", "callees"}:
-        iterator = symbol_callers(inventory, query, path=path) if op == "callers" else symbol_callees(inventory, query, path=path)
-        for file, call in iterator:
-            if _visible_file(ctx, repo_root, file.path, binding, secret_check):
-                rows.append(f"{file.path}:{call.line} {call.enclosing + ' -> ' if call.enclosing else ''}{call.name}")
-    elif op == "impact":
-        for file, reason in impact_files(inventory, path or query, depth=depth):
-            if _visible_file(ctx, repo_root, file.path, binding, secret_check):
-                rows.append(f"{file.path}  {reason}")
-    elif op == "relevant_files":
-        for idx, (file, score, reason) in enumerate(relevant_files(inventory, query, limit=min(_MAX_LIMIT, offset + limit)), 1):
-            if _visible_file(ctx, repo_root, file.path, binding, secret_check):
-                top_symbols = ", ".join(symbol.name for symbol in file.symbols[:5])
-                rows.append(f"{idx}. {file.path} score={score:.2f} reason={reason}{' symbols=' + top_symbols if top_symbols else ''}")
-    return rows
 
 
 def _structural(
@@ -166,12 +119,11 @@ def _structural(
     query: str,
     path: str,
     lang: str,
-    limit: int,
     binding: ResolvedResourceBinding | None = None,
-    secret_check: Callable[[pathlib.Path], bool] | None = None,
+    runtime_check: Callable[[pathlib.Path], str] | None = None,
 ) -> list[str]:
-    # Conservative first step: use tree-sitter when available, otherwise a Python
-    # ast fallback plus literal matching. Query may be a tree-sitter S-expression
+    # Tree-sitter node types or a Python AST fallback, never literal matching.
+    # Query may be a tree-sitter S-expression
     # like "(function_definition)" or a node type such as "FunctionDef".
     import ast
 
@@ -191,6 +143,10 @@ def _structural(
     # false-matches a comment and never echoes source, and a missing grammar surfaces a
     # visible structural_unavailable:<lang> marker instead of a silent guess.
     from ouroboros.code_intelligence import _TS_LANGUAGES, _language, _ts_parser
+    from ouroboros.code_search_rg import MAX_FILE_SIZE_BYTES, search_skip_reason
+
+    deadline = time.monotonic() + _structural_wall_budget()
+    skipped = Counter()
 
     def _file_lang_grammar(fp: pathlib.Path):
         lid = _language(fp)
@@ -215,10 +171,16 @@ def _structural(
         try:
             tree = parser.parse(text.encode("utf-8"))
         except Exception:
+            skipped["parse_error"] += 1
             return None
+        if tree.root_node.has_error:
+            skipped["syntax_error_partial_tree"] += 1
         found: list[str] = []
         stack = [tree.root_node]
         while stack:
+            if time.monotonic() > deadline:
+                skipped["time_limit"] += 1
+                break
             node = stack.pop()
             if node.type == ts_node_type:
                 found.append(f"{rel}:{int(node.start_point[0]) + 1} {node.type}")
@@ -226,15 +188,19 @@ def _structural(
         return found
 
     want_grammar = _filter_grammar(lang)
-    scope = (repo_root / (path or ".")).resolve(strict=False)
+    scope = work_domain.settle(repo_root / (path or "."))
     candidates, walk_note = _walk_candidate_files(scope, repo_root)
     rows: list[str] = []
     unavailable_seen: set = set()
-    cap = min(max(1, limit), _MAX_LIMIT)
+    # Page size is not a collection cap. Keep a distinct, disclosed work bound.
+    cap = 20000
     for fp in candidates:
+        if time.monotonic() > deadline:
+            skipped["time_limit"] += 1
+            break
         if len(rows) >= cap:
             break
-        if not fp.is_file():
+        if not work_domain.is_file(fp):
             continue
         lang_id, grammar = _file_lang_grammar(fp)
         # Skip non-code files (no grammar, not python) unless the user explicitly filtered
@@ -248,13 +214,25 @@ def _structural(
             rel = fp.relative_to(repo_root).as_posix()
         except ValueError:
             continue
-        if not _visible_file(ctx, repo_root, rel, binding, secret_check):
+        if not _visible_file(ctx, repo_root, rel, binding, runtime_check):
+            skipped["policy_excluded"] += 1
             continue
         if not ts_node_type:
             continue
+        reason = search_skip_reason(fp)
+        if reason:
+            skipped[reason] += 1
+            continue
         try:
-            text = fp.read_text(encoding="utf-8", errors="replace")
+            raw = work_domain.read_bytes(fp, limit=MAX_FILE_SIZE_BYTES + 1)
+            if len(raw) > MAX_FILE_SIZE_BYTES or b"\0" in raw:
+                skipped["oversized_or_binary"] += 1
+                continue
+            text = raw.decode("utf-8", errors="replace")
+        except work_domain.WorkDomainUnsettled:
+            raise
         except Exception:
+            skipped["read_error"] += 1
             continue
         if lang_id == "python":
             ts = _ts_rows("python", rel, text)
@@ -264,6 +242,7 @@ def _structural(
             try:
                 tree = ast.parse(text)
             except SyntaxError:
+                skipped["python_ast_syntax_error"] += 1
                 continue
             for node in ast.walk(tree):
                 if node.__class__.__name__.casefold() == ts_node_type.casefold():
@@ -278,10 +257,32 @@ def _structural(
             rows.extend(ts)
     if walk_note:
         rows.append(f"structural_walk_truncated: {walk_note}")
+    if len(rows) >= cap:
+        rows = rows[:cap] + [f"structural_rows_truncated: selected row cap {cap}"]
+    rows.extend(f"structural_limit: {reason}={count}" for reason, count in sorted(skipped.items()))
     return rows
 
 
 def _query_code(
+    ctx: ToolContext, op: str, _resolved_binding: ResolvedResourceBinding | None = None, **options: Any,
+) -> str:
+    """Keep an unsettled work process outside the ordinary completed-local-read projection."""
+    try:
+        return _query_code_read(ctx, op, _resolved_binding, **options)
+    except work_domain.WorkDomainUnsettled as exc:
+        observed = exc.result
+        def text(value):
+            return value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value or "")
+        partial = (f"\nObserved command result (not a completed query): exit_code={observed.returncode}"
+                   f"\nstdout:\n{text(observed.stdout)}\nstderr:\n{text(observed.stderr)}" if observed is not None else "")
+        return _publish_tool_result(ctx, ToolResult(
+            status="error", code="TOOL_ERROR",
+            text=f"⚠️ QUERY_CODE_ERROR: WorkDomainUnsettled: {exc}{partial}",
+            meta={"backend_settled": False, "process_not_started": False}))
+
+
+@completed_local_read
+def _query_code_read(
     ctx: ToolContext,
     op: str,
     _resolved_binding: ResolvedResourceBinding | None = None,
@@ -302,6 +303,13 @@ def _query_code(
         return f"⚠️ TOOL_ARG_ERROR (query_code): op must be one of {', '.join(_OPS)}."
     if op not in ("symbols", "digest") and not str(query or "").strip():
         return f"⚠️ TOOL_ARG_ERROR (query_code): op '{op}' requires query."
+    for name, value, default in (("kind", kind, "any"), ("lang", lang, "any"), ("depth", depth, 1)):
+        if value != default and name not in _OP_OPTIONS[op]:
+            return f"⚠️ TOOL_ARG_ERROR (query_code): op '{op}' does not read {name}."
+    if op == "digest" and query:
+        return "⚠️ TOOL_ARG_ERROR (query_code): digest does not read query; use path to select its scope."
+    if op == "architecture" and path not in ("", "."):
+        return "⚠️ TOOL_ARG_ERROR (query_code): architecture reads its target from query, not path."
     try:
         binding = _resolved_binding or build_resolved_resource_binding(
             ctx,
@@ -318,30 +326,12 @@ def _query_code(
     try:
         normalized_root = binding.root
         if normalized_root == "system_repo":
-            try:
-                from ouroboros.tool_access import active_tool_profile
-
-                if active_tool_profile(ctx) == "acting_subagent":
-                    return "⚠️ TOOL_ACCESS_BLOCKED: query_code root=system_repo is not available to acting subagents."
-            except Exception:
-                pass
             repo_root = binding.base_path
         elif normalized_root == "active_workspace":
             repo_root = binding.base_path
         elif normalized_root == "skill_payload":
             repo_root = binding.base_path
         elif normalized_root == "user_files":
-            # Read-only structured intelligence over an EXTERNAL workspace target
-            # (e.g. the SWE-bench dig-direct /app) — R1. Restricted subagents must
-            # not read arbitrary owner home; the main/live task is allowed. An
-            # empty path is a HARD ERROR: it will not scan the entire home.
-            try:
-                from ouroboros.tool_access import active_tool_profile
-
-                if active_tool_profile(ctx) in ("acting_subagent", "local_readonly_subagent"):
-                    return "⚠️ TOOL_ACCESS_BLOCKED: query_code root=user_files is not available to subagents."
-            except Exception:
-                pass
             if not str(path or "").strip():
                 raise ValueError(
                     "root=user_files requires an explicit path (e.g. '/app' or a project subdir); "
@@ -353,10 +343,10 @@ def _query_code(
             # home-membership rejection; the credential/control-plane block
             # reasons still apply inside resolve_user_file_path.
             target = binding.target_path
-            if target.is_dir():
-                repo_root = target.resolve(strict=False)
-            elif target.is_file():
-                repo_root = target.parent.resolve(strict=False)
+            if work_domain.is_dir(target):
+                repo_root = work_domain.settle(target)
+            elif work_domain.is_file(target):
+                repo_root = work_domain.settle(target.parent)
             else:
                 raise ValueError(f"user_files path does not exist: {str(path).strip()}")
         else:
@@ -370,16 +360,45 @@ def _query_code(
     except ValueError as exc:
         return f"⚠️ TOOL_ARG_ERROR (query_code): {exc}"
 
+    from ouroboros.tools.core_file_tools import _runtime_data_read_check
+
+    runtime_check = _runtime_data_read_check(ctx, root=binding.root)
+    if scoped_path and work_domain.is_file(repo_root / scoped_path) and not _visible_file(
+        ctx, repo_root, scoped_path, binding, runtime_check,
+    ):
+        # A scope header must not re-expose a protected operand omitted by the
+        # existing resource policy. The reason is independent of its spelling.
+        return "⚠️ TOOL_ACCESS_BLOCKED: selected source is unavailable to this resource view."
     limit = min(max(1, int(limit or 40)), _MAX_LIMIT)
     offset = max(0, int(offset or 0))
-    secret_check = None
-    try:
-        from ouroboros.tools.core_secret_paths import is_restricted_subagent_profile, make_subagent_secret_target_check
+    from ouroboros.code_navigation import NavigationView
 
-        if op != "architecture" and is_restricted_subagent_profile(ctx):
-            secret_check = make_subagent_secret_target_check(repo_root, ctx=ctx)
-    except Exception:
-        pass  # Preserve the existing per-target fallback on policy preparation failure.
+    view = NavigationView()
+    deadline = time.monotonic() + _structural_wall_budget()
+
+    def admitted(target: pathlib.Path) -> bool:
+        return _visible_file(ctx, repo_root, target.relative_to(repo_root).as_posix(), binding, runtime_check)
+
+    def admitted_inventory(scope: str, parse: bool = True, name: str = ""):
+        """This resource view's inventory; every inventory consumer shares its admission."""
+        from ouroboros.code_intelligence import build_code_inventory
+        from ouroboros.protected_artifacts import protected_artifact_paths
+        from ouroboros.tools.core_secret_paths import is_restricted_subagent_profile
+
+        exclude_paths: list[pathlib.Path] = list(protected_artifact_paths(ctx, binding))
+        # Do not cache an external/ephemeral user_files target's inventory in the
+        # live code-intel cache. Cache writes retain their existing actor/mode
+        # contract independently of file visibility; Cyber acting tasks may persist.
+        persist = not (exclude_paths or normalized_root == "user_files" or is_restricted_subagent_profile(ctx))
+        inventory = build_code_inventory(
+            repo_root, drive_root=pathlib.Path(ctx.drive_root), persist=persist, exclude_paths=exclude_paths,
+            scope=scope, path_allowed=admitted, parse=parse, name=name,
+        )
+        inventory.files = [
+            file for file in inventory.files
+            if _visible_file(ctx, repo_root, file.path, binding, runtime_check)
+        ]
+        return inventory
 
     try:
         if op == "architecture":
@@ -391,62 +410,52 @@ def _query_code(
                     "⚠️ TOOL_ARG_ERROR (query_code): op architecture requires "
                     "root=active_workspace or system_repo."
                 )
-            from ouroboros.code_intelligence_architecture import architecture_fact_rows
+            from ouroboros.code_intelligence_architecture import ARCHITECTURE_LIMIT_MARKER, architecture_fact_rows
 
             try:
-                rows = architecture_fact_rows(repo_root, query)
+                # A bare-symbol owner_of reads source through the same admission.
+                rows = architecture_fact_rows(repo_root, query, inventory=lambda: admitted_inventory(""))
+                view.notes = ["method: pinned architecture carriers; scope: repository; path targets are in query"]
             except ValueError as exc:
                 return f"⚠️ TOOL_ARG_ERROR (query_code): {exc}"
+            view.limits = [row for row in rows if row.startswith(ARCHITECTURE_LIMIT_MARKER)]
+            view.incomplete = bool(view.limits)
+            rows = [row for row in rows if not row.startswith(ARCHITECTURE_LIMIT_MARKER)]
         elif op == "structural":
-            # Collect through the requested page (offset+limit, like relevant_files
-            # above): collecting only `limit` rows made rows[offset:] empty on every
-            # page after the first and blamed the query for it (#447 D6).
+            # Collection is bounded by the walk and row work caps, never by page
+            # size; offset/limit page the collected rows below (#447 D6).
             rows = _structural(
                 ctx, repo_root, query, scoped_path, str(lang or "any"),
-                min(_MAX_LIMIT, offset + limit), binding, secret_check
+                binding, runtime_check
             )
+            view.notes = [f"method: tree-sitter / Python ast; scope: {scoped_path or '.'}; lang={lang}",
+                          "universe: independent bounded filesystem walk (not the Git inventory)"]
+            markers = [row for row in rows if row.startswith(("structural_walk_truncated:", "structural_rows_truncated:", "structural_limit:"))]
+            view.limits.extend(markers)
+            view.incomplete = bool(markers)
+            rows = [row for row in rows if row not in markers]
         else:
-            from ouroboros.code_intelligence import build_code_inventory
-            from ouroboros.protected_artifacts import protected_artifact_paths
+            inventory_scope = scoped_path
+            if op == "impact" or (op in {"references", "callers"} and work_domain.is_file(repo_root / scoped_path)):
+                inventory_scope = ""
+            # Occurrence scans parse only token-matched current sources, so these two
+            # operations start from admitted paths instead of a repository-wide parse;
+            # definition parses outlines only where current bytes can hold the name.
+            inventory = admitted_inventory(inventory_scope, parse=op not in {"references", "callers"},
+                                           name=query if op == "definition" else "")
+            from ouroboros.code_navigation import inventory_view
 
-            exclude_paths: list[pathlib.Path] = list(protected_artifact_paths(ctx, binding))
-            persist = True
-            if exclude_paths or normalized_root == "user_files":
-                # Do not cache an external/ephemeral user_files target's inventory
-                # in the live code-intel cache.
-                persist = False
-            try:
-                from ouroboros.tools.core import is_restricted_subagent_profile as _is_local_readonly_subagent, _is_subagent_secret_repo_target
-
-                if _is_local_readonly_subagent(ctx):
-                    persist = False
-                    exclude_paths = [
-                        p for p in repo_root.rglob("*")
-                        if (secret_check(p) if secret_check else _is_subagent_secret_repo_target(p, repo_root, ctx=ctx))
-                    ]
-            except Exception:
-                pass
-            inventory = build_code_inventory(repo_root, drive_root=pathlib.Path(ctx.drive_root), persist=persist, exclude_paths=exclude_paths)
-            inventory.files = [
-                file for file in inventory.files
-                if _visible_file(ctx, repo_root, file.path, binding, secret_check)
-            ]
-            if op == "digest":
-                # Whole-repo map (folded from the former codebase_digest tool):
-                # a compact file/symbol inventory to orient in an unfamiliar repo.
-                from ouroboros.code_intelligence import render_codebase_digest
-                digest_text = render_codebase_digest(inventory)
-                if normalized_root == "user_files":
-                    # Same В23 egress seam: a secret-shaped file/symbol NAME in
-                    # the owner's home must not surface raw (#447 s2r2).
-                    from ouroboros.secret_masking import mask_secret_bytes
-
-                    digest_text, _masked = mask_secret_bytes(digest_text)
-                return digest_text
-            rows = _inventory_rows(ctx, inventory, repo_root, {
-                "op": op, "query": query, "path": scoped_path, "kind": kind,
-                "depth": depth, "limit": limit, "offset": offset,
-            }, binding, secret_check)
+            if op == "impact" and ("/" in query or "\\" in query):
+                query = _safe_path(repo_root, query)
+            view = inventory_view(
+                inventory, op=op, query=query, path=scoped_path, kind=kind, lang=lang,
+                depth=depth, deadline=deadline, path_allowed=admitted,
+            )
+            rows = view.rows
+    except work_domain.WorkDomainUnsettled:
+        raise
+    except ValueError as exc:
+        return f"⚠️ TOOL_ARG_ERROR (query_code): {exc}"
     except Exception as exc:
         return f"⚠️ QUERY_CODE_ERROR: {type(exc).__name__}: {exc}"
 
@@ -454,85 +463,21 @@ def _query_code(
     shown = rows[offset:offset + limit]
     next_offset = offset + limit
     label = query or scoped_path or "."
-    # Collection stops at min(_MAX_LIMIT, offset+limit) for the ops that page a
-    # capped collector (structural, relevant_files): a full collection there
-    # means more matches MAY exist, so "No results" / "N of N" would be a
-    # success-shaped lie about completeness (#447 S3). Ops whose collectors
-    # return the complete set must NOT claim a cap they never applied.
-    collection_capped = (
-        op in ("structural", "relevant_files")
-        and total >= min(_MAX_LIMIT, offset + limit)
-    )
-    if not shown:
-        if collection_capped:
-            return (
-                f"⚠️ QUERY_CODE_TRUNCATED: collection for op `{op}` `{label}` stops at "
-                f"{_MAX_LIMIT} rows and offset={offset} lies beyond what was collected. "
-                "Narrow the query or path= instead of paging past the cap."
-            )
-        return f"No results for op `{op}` `{label}`. {_empty_hint(op, label)}"
-    def _mask_user_files_rows(text: str) -> str:
-        # Same egress seam as read_file/search (#447 В23): in query_code
-        # snippets over the owner's home, bytes in a recognized credential
-        # format or a PEM block are masked; secrets in unrecognized formats
-        # are not detected.
-        from ouroboros.tools.core_secret_paths import is_restricted_subagent_profile
-
-        if normalized_root != "user_files" and not is_restricted_subagent_profile(ctx):
-            return text
-        from ouroboros.secret_masking import mask_secret_bytes
-
-        masked, count = mask_secret_bytes(text)
-        if count:
-            masked += (
-                f"\n⚠️ SECRET_BYTES_MASKED: {count} span(s) matched a recognized "
-                "credential format or a PEM block and were replaced with ***; "
-                "secrets in unrecognized formats are not detected."
-            )
-        return masked
-
-    header = f"{op} `{label}` — {len(shown)} of {total}"
+    header = f"{op} `{label}` — {len(shown)} of {'at least ' if view.incomplete else ''}{total}"
     if next_offset < total:
         header += f" — next offset={next_offset}"
-    elif collection_capped:
-        # The collector filled exactly the requested page: "N of N" would claim
-        # completeness it never verified, below the 200 cap included.
-        header += (
-            f" — collection capped at {_MAX_LIMIT}; more may exist (narrow query/path=)"
-            if total >= _MAX_LIMIT
-            else f" — more may exist; continue with offset={next_offset}"
-        )
-    return _mask_user_files_rows(header + "\n\n" + "\n".join(shown)) + _next_step_hint(op)
-
-
-def _empty_hint(op: str, label: str) -> str:
-    """Op-specific recovery hint — do NOT reflexively redirect to search_code."""
-    if op in ("definition", "references", "callers", "callees", "impact"):
-        return (
-            f"Check the exact symbol name (these ops match a defined symbol, not text). "
-            f"Use op=relevant_files query=\"{label}\" to find where to look, or op=symbols to list what's defined."
-        )
-    if op == "symbols":
-        return "Narrow with path= to a file/dir, or use op=relevant_files to locate the area first."
-    if op == "structural":
-        return ("structural needs a node type, not free text — an AST class for Python (FunctionDef/ClassDef) "
-                "or a tree-sitter node for other langs (function_declaration for Go, struct_item for Rust, etc.). "
-                "Add lang=go|rust|... to filter by language.")
-    if op == "relevant_files":
-        return "Rephrase the task in domain words, or use search_code for an exact string you expect in the source."
-    return "Verify the symbol/path; use search_code only for plain-text/regex matches."
-
-
-def _next_step_hint(op: str) -> str:
-    """Suggest the natural follow-up op so results chain instead of dead-ending."""
-    hints = {
-        "relevant_files": "\n\nNext: read_file(...) the top hit, or query_code(op=symbols, path=...) to list its symbols.",
-        "symbols": "\n\nNext: query_code(op=definition/references, query=<name>) on a symbol of interest.",
-        "definition": "\n\nNext: query_code(op=references/callers, query=<name>) to see how it is used.",
-        "callers": "\n\nNext: read_file(...) a caller, or query_code(op=impact, query=<name>) for blast radius.",
-        "callees": "\n\nNext: query_code(op=definition, query=<callee>) to read what it calls.",
-    }
-    return hints.get(op, "")
+    if not shown:
+        header += (f" — offset={offset} is beyond the {total} collected rows" if offset else
+                   " — no selected evidence within the searched coverage")
+    if view.incomplete:
+        header = "⚠️ QUERY_CODE_TRUNCATED: " + header
+    if offset:
+        view.notes.append("page re-scanned; rows can shift if files changed (no snapshot)")
+    if view.notes:
+        header += "\n" + "\n".join("  · " + note for note in view.notes)
+    if view.limits:
+        header += "\nlimits: " + "; ".join(dict.fromkeys(view.limits))
+    return header + ("\n\n" + "\n".join(shown) if shown else "")
 
 
 def get_tools() -> List[ToolEntry]:
@@ -540,30 +485,27 @@ def get_tools() -> List[ToolEntry]:
         ToolEntry("query_code", {
             "name": "query_code",
             "description": (
-                "Read-only structured code intelligence over the active workspace — prefer this "
-                "over grep/find/sed-as-reader for anything symbol-aware. Start with "
-                "op=relevant_files (task text -> the files to read) when you don't yet know where "
-                "to look; op=digest maps an unfamiliar repo FIRST; then symbols/definition/"
-                "references/callers/callees/impact/structural for precise navigation. Use search_code "
-                "only for plain text/regex. Symbol intelligence (digest/symbols/definition/references/"
-                "callers/callees/impact) is polyglot via tree-sitter (Python/JS/TS/Go/Rust/Java/Ruby/C/"
-                "...); op=structural (node-type queries) is polyglot too — tree-sitter for every supported "
-                "language (Python/JS/TS/Go/Rust/Java/Ruby/C/C++/C#/PHP/Kotlin/Swift/Scala/Lua/Bash), with a "
-                "visible structural_unavailable:<lang> marker when a grammar is missing (Python also has a "
-                "stdlib-ast fallback). op=architecture answers over the Ouroboros repo's pinned inventories "
-                "(domain manifest, facade/persistence/frozen-contract carriers): query='<fact> <argument>' with "
-                "fact one of owner_of, domain_dependencies, facade_consumers, persistence_entities_written_by, "
-                "protected_contracts_affected (argument = path/symbol, domain id, facade/name, writer, or a "
-                "comma-separated changed-path list). Returns compact file:line anchors and signatures/snippets, "
-                "never full bodies."
+                "Read-only code navigation with source evidence and explicit scope/limits. "
+                "symbols gives local outlines, including qualified declarators; definition also gives labelled "
+                "syntax name-field candidates. references finds exact-token occurrences (including strings/comments); "
+                "callers filters syntactic callee positions, callees finds calls in selected definition ranges. "
+                "These are not resolved symbol bindings: aliases and dynamic names need separate queries. "
+                "impact accepts a file or symbol and shows occurrence evidence and filesystem import candidates; "
+                "every depth hop remains a candidate. digest pages scoped file outlines with directory rollups; "
+                "relevant_files ranks scoped files by task words. structural queries grammar node types in a "
+                "separate bounded filesystem walk (Python also supports AST class names). Missing grammar or "
+                "partial coverage is disclosed. architecture reads pinned repository carriers with query='<fact> "
+                "<argument>': owner_of, domain_dependencies, facade_consumers, persistence_entities_written_by, "
+                "protected_contracts_affected. Pages rescan current files, not an immutable snapshot. "
+                "Use search_code for arbitrary literal/regex search; inspect source anchors to assess meaning."
             ),
             "parameters": {"type": "object", "properties": {
-                "op": {"type": "string", "enum": list(_OPS), "description": "Operation: relevant_files (where to look), digest (whole-repo map), symbols, definition, references, callers, callees, impact, structural, architecture (domain/facade/persistence/protected facts)."},
-                "query": {"type": "string", "default": "", "description": "Exact symbol name (definition/references/callers/...), AST node type (structural), task text (relevant_files), or '<fact> <argument>' (architecture). Empty for digest."},
-                "path": {"type": "string", "default": "", "description": "Optional file/dir scope or definition disambiguator. REQUIRED for root=user_files (the explicit target dir/file, e.g. '/app' or '/app/src'); it is never the whole home."},
+                "op": {"type": "string", "enum": list(_OPS), "description": "Operation: relevant_files (where to look), digest (scoped paged outline), symbols, definition, references, callers, callees, impact, structural, architecture (domain/facade/persistence/protected facts)."},
+                "query": {"type": "string", "default": "", "description": "Exact name/token (definition/references/callers), file or symbol (impact), AST node type (structural), task text (relevant_files), or '<fact> <argument>' (architecture). Empty for digest."},
+                "path": {"type": "string", "default": "", "description": "Directory scopes search. File scopes symbols/definition/callees/digest/relevant_files; references/callers use it as an ordering selector while searching root. Impact target is query; file path may select a symbol definition or repeat the file target. REQUIRED for root=user_files (the explicit target dir/file, e.g. '/app' or '/app/src'); it is never the whole home."},
                 "lang": {"type": "string", "enum": ["python", "javascript", "typescript", "go", "rust", "java", "ruby", "c", "cpp", "csharp", "php", "kotlin", "swift", "scala", "lua", "bash", "any"], "default": "any"},
-                "kind": {"type": "string", "enum": ["function", "async_function", "class", "constant", "any"], "default": "any"},
-                "depth": {"type": "integer", "default": 1, "description": "Graph depth for impact."},
+                "kind": {"type": "string", "enum": ["function", "async_function", "class", "constant", "variable", "method", "constructor", "struct", "union", "interface", "enum", "trait", "impl", "protocol", "type", "module", "namespace", "object", "macro", "any"], "default": "any"},
+                "depth": {"type": "integer", "default": 1, "description": "1..5 candidate import hops for impact; only unique filesystem candidates expand, never proven binding."},
                 "root": {"type": "string", "enum": ["active_workspace", "system_repo", "skill_payload", "user_files"], "default": "active_workspace", "description": "active_workspace/system_repo are code roots; skill_payload selects one exact skill with bucket + skill_name; user_files runs read-only intelligence over an EXTERNAL target dir/file named by path= (e.g. /app), never the whole home."},
                 "bucket": {"type": "string", "enum": ["external", "clawhub", "ouroboroshub", "native", "user_repo"], "description": "Required with root=skill_payload; selects the physical skill source."},
                 "skill_name": {"type": "string", "description": "Required with root=skill_payload; exact skill directory identity."},

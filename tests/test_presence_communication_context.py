@@ -39,7 +39,7 @@ def _render(tmp_path, value):
     return json.JSONDecoder().raw_decode(raw)[0], section
 
 
-@pytest.mark.parametrize("provider", ["telegram", "slack", "email", "custom"])
+@pytest.mark.parametrize("provider", ["telegram", "slack", "custom"])
 def test_current_route_never_uses_wildcard_or_proactive_room(tmp_path, provider):
     value = _value(provider=provider)
     before = deepcopy(value)
@@ -110,11 +110,15 @@ def test_early_reply_guidance_preserves_profile_topics_and_completion(tmp_path):
     rendered, section = _render(tmp_path, value)
     guidance = rendered["communication"]["speaking_during_work"]
 
+    assert "what your participation adds" in guidance
+    assert "social warmth do not require a mention" in guidance
+    assert "Observation or private consideration may stay silent" in guidance
+    assert "When you undertake long work that calls for a response here" in guidance
     assert "available selected transport send tool" in guidance
     assert "then continue the work" in guidance
     assert "queued is not delivered" in guidance
     assert "early acknowledgement is not the final result" in guidance
-    assert "presence_finish" in rendered["completion"]
+    assert "finish_task" in rendered["completion"]
     assert value["instructions"] in section and "Current working knowledge." in section
     assert rendered["profile"]["profile_fingerprint"] == "a" * 64
 

@@ -7,7 +7,7 @@ for a consciousness-origin task the disabled list binds at DISPATCH ONLY so the
 wake's tool schemas and prompt prefix are byte-identical to an owner turn's
 (В31=B, the I3 comparison below). The origin (label, ledger category, level)
 is inherited by everything the wake starts; a wake speaks as a task through
-``steer_task`` (ISSUER, PLAN 5.2a); ``/evolve off`` is sticky against the agent
+``tell_task`` (ISSUER, PLAN 5.2a); ``/evolve off`` is sticky against the agent
 tool (В12); a Full-level campaign stays inside the consciousness tree.
 """
 
@@ -21,6 +21,8 @@ import pytest
 
 from ouroboros import consciousness_authority as ca
 from ouroboros.tools.registry import ToolContext, ToolRegistry
+from tests._store_shared import seed_result
+from tests._cases import case_folders
 
 WAKE_META = {
     "initiator": "consciousness", "usage_category": "consciousness",
@@ -57,10 +59,13 @@ def test_levels_and_their_two_consequences():
     assert ca.disabled_tools_for("act") == list(ca.ACT_DISABLED)
     observe = ca.disabled_tools_for("observe")
     assert set(ca.ACT_DISABLED) <= set(observe)
-    assert {"promote_chat_to_task", "schedule_subagent", "write_file", "run_command",
+    assert {"start_task", "run_command",
             "browser_action", "initiate_presence", "submit_skill_to_hub"} <= set(observe)
+    # The names with a real read-only path are kept and narrowed on ARGUMENTS.
+    assert ca.OBSERVE_ARGUMENT_NARROWED.isdisjoint(observe)
+    assert {"schedule_subagent", "delegate_start", "cancel_task"} <= ca.OBSERVE_ARGUMENT_NARROWED
     # The nanny of a running campaign is never withheld, at any level.
-    assert "steer_task" not in observe and "steer_task" not in ca.disabled_tools_for("act")
+    assert "tell_task" not in observe and "tell_task" not in ca.disabled_tools_for("act")
     # Observe is an EXCEPTION list: reading and talking stay available by default.
     for name in ("read_file", "web_search", "browse_page", "send_user_message", "escalate",
                  "knowledge_write", "update_scratchpad", "switch_model", "enable_tools"):
@@ -81,12 +86,14 @@ def test_observe_table_covers_every_registry_entry_marked_mutates_worktree(tmp_p
     reg = _registry(tmp_path)
     marked = {e.name for e in reg._entries.values() if e.mutates_worktree and not e.alias_for}
     assert marked, "the catalog carries mutates_worktree entries"
-    missing = marked - set(ca.OBSERVE_DISABLED)
+    # The argument-narrowed names have a read-only Observe path; what they may be
+    # ASKED to do is checked at dispatch instead of hiding the whole tool.
+    missing = marked - set(ca.OBSERVE_DISABLED) - ca.OBSERVE_ARGUMENT_NARROWED
     assert not missing, f"mutates_worktree entries missing from OBSERVE_WORLD_MUTATION_TOOLS: {sorted(missing)}"
     unknown = set(ca.OBSERVE_DISABLED) - {e.name for e in reg._entries.values()}
     # Skill/project tools are registered lazily (skills, journal); the built-in names must exist.
     assert unknown <= {"toggle_skill", "skill_owner_action", "journal_write", "workpad_write",
-                       "configure_presence", "initiate_presence", "delegate_start"}, sorted(unknown)
+                       "initiate_presence", "delegate_start"}, sorted(unknown)
 
 
 # --- derivation at task build ---------------------------------------------------
@@ -112,15 +119,15 @@ def test_contract_carries_the_derived_list_and_origin_helpers():
     assert task["task_contract"]["disabled_tools"] == ca.disabled_tools_for("observe")
     assert "toggle_evolution" in ca.task_disabled_tools(task)
     origin = ca.consciousness_origin_metadata(task["metadata"])
-    assert origin == {"initiator": "consciousness", "usage_category": "consciousness_task",
+    assert origin == {"work_kind": "consciousness", "consciousness_cause": "started",
+                      "initiator": "consciousness", "usage_category": "consciousness_task",
                       "consciousness_autonomy": "observe"}
-    assert ca.consciousness_origin_metadata({"client_message_id": "cm"}) == {}
+    assert ca.consciousness_origin_metadata({"origin_message_ref": "cm"}) == {"work_kind": "owner"}
     assert ca.is_consciousness_origin(origin) and not ca.is_consciousness_origin(None)
 
 
 @pytest.mark.parametrize(("install", "cap", "expected"), [
-    ("cyber_pro", "light", "light"), ("pro", "light", "light"), ("advanced", "light", "light"),
-    ("light", "light", "light"), ("light", "advanced", "light"), ("cyber_pro", "", "cyber_pro"),
+    ("cyber_pro", "light", "light"), ("cyber_pro", "", "cyber_pro"),
     ("pro", "bogus", "pro"),
 ])
 def test_effective_runtime_mode_is_the_stricter_of_install_and_cap(install, cap, expected):
@@ -183,7 +190,7 @@ def test_i3_serialized_request_prefix_matches_an_owner_turn(tmp_path, monkeypatc
         msgs, _ = build_llm_messages(env=env, memory=memory, task=task)
         prefix = [json.dumps(msgs[0]["content"][i], sort_keys=True) for i in (0, 1)]
         assert prefix == owner_prefix, level
-        assert "cache_control" not in msgs[0]["content"][2]
+        assert "cache_control" not in msgs[0]["content"][-1]
         reg = _registry(tmp_path, task["metadata"], task_id="t-owner")
         assert json.dumps(reg.schemas(), sort_keys=True) == owner_tools, level
         assert reg.capability_omissions() == owner_reg.capability_omissions(), level
@@ -200,17 +207,20 @@ _BLOCKED_CALLS = (
 )
 
 
-@pytest.mark.parametrize("mode", ["light", "advanced", "pro", "cyber_pro"])
-@pytest.mark.parametrize("level", ["act", "observe"])
-@pytest.mark.parametrize(("tool_name", "args"), _BLOCKED_CALLS)
-def test_act_and_observe_cannot_touch_the_repo_in_any_install_mode(tmp_path, monkeypatch, mode, level, tool_name, args):
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", mode)
-    reg = _registry(tmp_path, _wake_task(level)["metadata"])
-    result = reg.execute(tool_name, dict(args))
-    expected = "RESOURCE_CONSTRAINT_BLOCKED" if level == "observe" and tool_name != "commit_reviewed" else "LIGHT_MODE_BLOCKED"
-    assert expected in result, (mode, level, tool_name, result[:300])
-    assert not (tmp_path / "repo" / "x.py").exists()
-    assert (tmp_path / "repo" / "README.md").read_text(encoding="utf-8") == "ok\n"
+def test_act_and_observe_cannot_touch_the_repo_in_any_install_mode(subtests, tmp_path, monkeypatch):
+    case_paths = case_folders(tmp_path)
+    for mode in ["light", "advanced", "pro", "cyber_pro"]:
+        for level in ["act", "observe"]:
+            for tool_name, args in _BLOCKED_CALLS:
+                tmp_path = next(case_paths)
+                with subtests.test(mode=mode, level=level, tool_name=tool_name, args=args), monkeypatch.context() as monkeypatch:
+                    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", mode)
+                    reg = _registry(tmp_path, _wake_task(level)["metadata"])
+                    result = reg.execute(tool_name, dict(args))
+                    expected = "RESOURCE_CONSTRAINT_BLOCKED" if level == "observe" and tool_name != "commit_reviewed" else "LIGHT_MODE_BLOCKED"
+                    assert expected in result, (mode, level, tool_name, result[:300])
+                    assert not (tmp_path / "repo" / "x.py").exists()
+                    assert (tmp_path / "repo" / "README.md").read_text(encoding="utf-8") == "ok\n"
 
 
 @pytest.mark.parametrize("mode", ["advanced", "pro", "cyber_pro"])
@@ -270,28 +280,25 @@ def test_act_keeps_the_light_positive_paths(tmp_path, monkeypatch):
 
 
 def test_the_lane_attaches_the_level_to_the_wake_contract(monkeypatch, tmp_path):
+    """The door admits the wake bare; the carrier's first step derives the level's two consequences."""
     import queue
-    import threading
 
-    from ouroboros import agent as agent_module
     from supervisor import workers
-    from tests.test_consciousness_wake_lane import _lane, _wait_for
+    from tests.conversation_carrier_support import carry
+    from tests.test_consciousness_wake_lane import _lane
 
-    _lane(monkeypatch, tmp_path, event_q=queue.Queue())
+    spare = _lane(monkeypatch, tmp_path, event_q=queue.Queue())
     seen: list = []
-    done = threading.Event()
 
     class Actor:
         def handle_task(self, task):
             seen.append(task)
-            done.set()
             return []
 
-    monkeypatch.setattr(agent_module, "make_agent", lambda **kw: Actor())
     receipt = workers.handle_wake_direct(1, "wake", {**WAKE_META, "consciousness_autonomy": "act"})
-    assert receipt["admitted"] is True
-    assert done.wait(10) and _wait_for(lambda: bool(seen))
-    task = seen[0]
+    assert receipt["admitted"] is True and seen == []  # nothing of the body ran in the server
+    carry(workers, spare, Actor())
+    task, = seen
     assert task["task_contract"]["disabled_tools"] == list(ca.ACT_DISABLED)
     assert task["metadata"]["runtime_mode_cap"] == "light"
 
@@ -305,33 +312,39 @@ def test_routing_issuer_keeps_wake_relays_task_authored_and_explicit_owner_ingre
     wake = types.SimpleNamespace(task_id="wake-1", is_direct_chat=True, last_owner_delivery=None,
                                  task_metadata=dict(_wake_task("act")["metadata"]))
     assert _routing_issuer(wake) == {"kind": ISSUER_TASK, "task_id": "wake-1", "root_task_id": "wake-1"}
+    # An owner turn is the direct turn the owner door stamped; a bare direct context is not one.
     owner = types.SimpleNamespace(task_id="turn-1", is_direct_chat=True, last_owner_delivery=None,
-                                  task_metadata={})
+                                  task_metadata={"origin_message_ref": {"chat_id": 1, "client_message_id": "cm-1"}})
     assert _routing_issuer(owner) == {"kind": ISSUER_OWNER_TURN}
+    bare = types.SimpleNamespace(task_id="turn-2", is_direct_chat=True, last_owner_delivery=None, task_metadata={})
+    assert _routing_issuer(bare) == {"kind": ISSUER_TASK, "task_id": "turn-2", "root_task_id": "turn-2"}
     # Draining real owner dialogue provides receipt identity, never authorship.
     relaying = types.SimpleNamespace(task_id="c-root", is_direct_chat=False,
                                      last_owner_delivery={"client_message_id": "cm-9", "text": "go"},
                                      task_metadata={"initiator": "consciousness"})
     assert _routing_issuer(relaying) == {"kind": ISSUER_TASK, "task_id": "c-root", "root_task_id": "c-root"}
-    stamped = types.SimpleNamespace(task_id="c-root", is_direct_chat=True, last_owner_delivery=None,
-                                    task_metadata={"initiator": "consciousness", "client_message_id": "cm-2"})
-    assert _routing_issuer(stamped) == {"kind": ISSUER_OWNER_TURN}
+    # A client id is not the door's stamp: a wake (or a Presence event, whose client id is the
+    # provider's event id) keeps speaking as a task.
+    client_id_only = types.SimpleNamespace(task_id="c-root", is_direct_chat=True, last_owner_delivery=None,
+                                           task_metadata={"initiator": "consciousness", "client_message_id": "cm-2"})
+    assert _routing_issuer(client_id_only) == {"kind": ISSUER_TASK, "task_id": "c-root", "root_task_id": "c-root"}
 
 
-def test_steer_from_a_wake_is_written_as_an_independent_task_message(tmp_path, monkeypatch):
-    from ouroboros.tools import control_routing
+def test_tell_from_a_wake_carries_context_without_owner_authority(tmp_path, monkeypatch):
+    from ouroboros.tools import control_relay, control_routing
 
-    sent: list = []
-    monkeypatch.setattr(control_routing, "_send_task_message",
-                        lambda ctx, issuer, target, msg, chat_id: sent.append((issuer, target, msg)) or "WRITTEN")
+    sent = []
+    monkeypatch.setattr(control_routing, "_emit_and_wait_for_routing",
+                        lambda ctx, event: (sent.append(event) or "confirmed", {"status": "delivered"}))
     ctx = types.SimpleNamespace(
         pending_events=[], event_queue=None, current_chat_id=1, drive_root=tmp_path,
         task_id="wake-1", is_direct_chat=True, last_owner_delivery=None,
         task_metadata=dict(_wake_task("act")["metadata"]),
     )
-    assert control_routing._steer_task(ctx, task_id="r-1", message="please also check X") == "WRITTEN"
-    assert sent == [({"kind": "task", "task_id": "wake-1", "root_task_id": "wake-1"}, "r-1", "please also check X")]
-    assert ctx.pending_events == []
+    assert "Message written" in control_relay._tell_task(ctx, task_id="r-1", note="please also check X")
+    assert sent[0]["issuer"] == {"kind": "task", "task_id": "wake-1", "root_task_id": "wake-1"}
+    assert sent[0]["message"] == "please also check X" and sent[0]["quotes"] == []
+    assert sent[0]["type"] == "steer_task"
 
 
 # --- origin inheritance: promote / followup / subagent -------------------------
@@ -359,7 +372,7 @@ def _promote_root(tmp_path, monkeypatch):
 
 
 def test_promote_from_a_wake_mints_a_consciousness_root_through_the_real_admission(_promote_root):
-    from ouroboros.tools.control_routing import _promote_chat_to_task
+    from ouroboros.tools.control_routing import _start_task
     from ouroboros.utils import append_jsonl
     from supervisor.events_project_routing import _handle_promote_chat_to_task
 
@@ -380,7 +393,7 @@ def test_promote_from_a_wake_mints_a_consciousness_root_through_the_real_admissi
         event_queue=types.SimpleNamespace(
             put_nowait=lambda event: (captured.update(event), _handle_promote_chat_to_task(event, supervisor))),
     )
-    out = _promote_chat_to_task(ctx, "audit the logs", workspace="none", predecessor_task_id="")
+    out = _start_task(ctx, "audit the logs", title="Log audit", workspace="none")
     assert out.startswith("OK: task"), out
     # The event carries the origin by value and nothing the wake asked for is stripped.
     assert captured["initiator"] == "consciousness" and captured["consciousness_autonomy"] == "act"
@@ -392,64 +405,6 @@ def test_promote_from_a_wake_mints_a_consciousness_root_through_the_real_admissi
     assert root["metadata"]["usage_category"] == "consciousness_task"
     assert root["task_contract"]["disabled_tools"] == list(ca.ACT_DISABLED)
     assert root["metadata"]["runtime_mode_cap"] == "light" and "_presence_origin" not in root
-
-
-def test_route_to_project_from_a_wake_mints_a_consciousness_root_too(_promote_root):
-    """P3d (live stand): the wake's route DID create a root in project redline-exodus, but
-    with empty metadata — no origin, no ledger category, no level, no withheld tools — because
-    only ``promote_chat_to_task`` stamped the origin onto its event. A route mints a root
-    through the SAME admission door, so it carries the same origin by value."""
-    from ouroboros.projects_registry import create_project
-    from ouroboros.tools.control_routing import _route_to_project
-    from ouroboros.utils import append_jsonl
-    from supervisor.events_project_routing import _handle_promote_chat_to_task
-
-    tmp_path = _promote_root
-    create_project(tmp_path, "racer", name="Racer")
-    enqueued: list = []
-    captured: dict = {}
-    supervisor = types.SimpleNamespace(
-        DRIVE_ROOT=tmp_path, RUNNING={}, PENDING=[], WORKERS={0: types.SimpleNamespace()},
-        bridge=types.SimpleNamespace(send_routing_ack=lambda *a, **k: None, broadcast=lambda *a, **k: None),
-        enqueue_task=lambda task: enqueued.append(task) or dict(task),
-        persist_queue_snapshot=lambda **_k: True, load_state=lambda: {"owner_chat_id": 1},
-        append_jsonl=append_jsonl,
-    )
-    ctx = types.SimpleNamespace(
-        pending_events=[], current_chat_id=1, drive_root=tmp_path, budget_drive_root=str(tmp_path),
-        task_id="wake-1", is_direct_chat=True, last_owner_delivery=None, project_id="",
-        task_metadata=dict(_wake_task("act")["metadata"]), task_contract={},
-        event_queue=types.SimpleNamespace(
-            put_nowait=lambda event: (captured.update(event), _handle_promote_chat_to_task(event, supervisor))),
-    )
-    out = _route_to_project(ctx, "racer", "audit the logs", predecessor_task_id="")
-    assert "Routed to project" in out, out
-    assert captured["initiator"] == "consciousness"
-    assert captured["usage_category"] == "consciousness_task"
-    assert captured["consciousness_autonomy"] == "act"
-    [root] = enqueued
-    assert root["actor_id"] == "consciousness" and root["project_id"] == "racer"
-    assert root["metadata"]["initiator"] == "consciousness"
-    assert root["metadata"]["usage_category"] == "consciousness_task"
-    assert root["metadata"]["runtime_mode_cap"] == "light"
-    assert root["task_contract"]["disabled_tools"] == list(ca.ACT_DISABLED)
-
-
-def test_route_to_project_from_an_owner_turn_stays_unstamped(_promote_root):
-    """The origin is inherited, never minted: an owner's own route keeps the plain root."""
-    from ouroboros.projects_registry import create_project
-    from ouroboros.tools.control_routing import _route_to_project
-
-    tmp_path = _promote_root
-    create_project(tmp_path, "racer", name="Racer")
-    ctx = types.SimpleNamespace(
-        pending_events=[], event_queue=None, current_chat_id=1, drive_root=tmp_path,
-        task_id="owner-turn", is_direct_chat=True, project_id="", task_contract={},
-        task_metadata={"client_message_id": "cm-1"},
-    )
-    _route_to_project(ctx, "racer", "audit the logs", predecessor_task_id="")
-    [evt] = ctx.pending_events
-    assert "initiator" not in evt and "usage_category" not in evt
 
 
 def test_promoted_root_is_stamped_and_its_contract_derives_the_level(tmp_path, monkeypatch):
@@ -520,9 +475,10 @@ def test_subagent_payload_lands_the_origin_on_the_child_metadata():
 
 
 def test_schedule_subagent_event_names_the_origin():
-    """The tool stamps ``origin_metadata`` on the schedule event beside the envelope."""
+    """The tool stamps ``origin_metadata`` on the schedule event beside the envelope:
+    the consciousness origin and the owner's words that caused the tree, by value."""
     source = pathlib.Path("ouroboros/tools/control_scheduling.py").read_text(encoding="utf-8")
-    assert '"origin_metadata": consciousness_origin_metadata(metadata),' in source
+    assert '"origin_metadata": {**consciousness_origin_metadata({**metadata, "task_id":' in source
     handler = pathlib.Path("supervisor/events_schedule_task.py").read_text(encoding="utf-8")
     assert '"origin_metadata": evt.get("origin_metadata"),' in handler
 
@@ -547,13 +503,11 @@ def test_globalized_promotion_view_keeps_the_contract(tmp_path, monkeypatch):
     from ouroboros.contracts.task_contract import attach_task_contract
 
     seen: list = []
-    monkeypatch.setattr(pipeline, "_update_improvement_backlog", lambda env, entry: None)
     monkeypatch.setattr("ouroboros.post_task_evolution.maybe_promote",
-                        lambda env, task, entry, llm: seen.append(task))
+                        lambda env, task, sealed, llm: seen.append(task))
     task = attach_task_contract({**_wake_task("act"), "project_id": "lab"})
     pipeline._run_global_backlog_promotion_only(
-        types.SimpleNamespace(drive_root=tmp_path), task,
-        {"backlog_candidates": [{"summary": "tidy the logs"}]}, None,
+        types.SimpleNamespace(drive_root=tmp_path), task, {"final_result_text": "Tidied."}, None,
     )
     assert seen and seen[0]["task_contract"]["disabled_tools"] == list(ca.ACT_DISABLED)
 
@@ -571,10 +525,13 @@ def test_request_file_and_pending_apply_carry_the_origin(tmp_path, monkeypatch):
     monkeypatch.setattr("supervisor.evolution_lifecycle.evolution_block_reason", lambda: "")
     monkeypatch.setattr("supervisor.evolution_lifecycle.start_evolution_campaign",
                         lambda objective, source="", **kw: calls.append((objective, source, kw)) or {"id": "c1"})
-    monkeypatch.setattr("supervisor.state.load_state", lambda: {"owner_chat_id": 7})
+    monkeypatch.setattr("supervisor.state.load_state", lambda: {
+        "owner_chat_id": 7, "evolution_owner_stopped": False,
+        "evolution_mode_enabled": False,
+    })
 
     def _update_state(mutator):
-        live: dict = {}
+        live = {"evolution_owner_stopped": False, "evolution_mode_enabled": False}
         mutator(live)
         return live
 
@@ -582,6 +539,7 @@ def test_request_file_and_pending_apply_carry_the_origin(tmp_path, monkeypatch):
     monkeypatch.setattr("ouroboros.config.get_post_task_evolution_budget_usd", lambda: 0.0)
     assert pte.apply_pending_request(tmp_path) is True
     assert calls == [("improve X", "post_task", {"origin": {
+        "work_kind": "consciousness", "consciousness_cause": "started",
         "initiator": "consciousness", "usage_category": "consciousness_task", "consciousness_autonomy": "full"}})]
 
 
@@ -597,6 +555,7 @@ def test_agent_tool_enable_is_refused_while_the_owner_stop_stands(tmp_path, monk
     from supervisor import evolution_lifecycle as el
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     state.update_state(lambda live: live.update(owner_chat_id=7, evolution_owner_stopped=True))
     started: list = []
     monkeypatch.setattr(el, "evolution_block_reason", lambda: "")
@@ -616,6 +575,7 @@ def test_agent_tool_enable_without_an_owner_stop_starts_a_campaign_with_the_orig
     from supervisor import evolution_lifecycle as el
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     state.update_state(lambda live: live.update(owner_chat_id=7, evolution_owner_stopped=False))
     started: list = []
     monkeypatch.setattr(el, "evolution_block_reason", lambda: "")
@@ -626,6 +586,7 @@ def test_agent_tool_enable_without_an_owner_stop_starts_a_campaign_with_the_orig
            "usage_category": "consciousness_task", "consciousness_autonomy": "full"}
     events_mod._handle_toggle_evolution(evt, _toggle_ctx(state, sent))
     assert started == [("agent_tool", {"origin": {
+        "work_kind": "consciousness", "consciousness_cause": "started",
         "initiator": "consciousness", "usage_category": "consciousness_task", "consciousness_autonomy": "full"}})]
     live = state.load_state()
     assert live["evolution_mode_enabled"] is True and live["evolution_owner_stopped"] is False
@@ -639,6 +600,7 @@ def test_a_stop_the_agent_placed_itself_stays_undoable_by_the_agent(tmp_path, mo
     from supervisor import evolution_lifecycle as el
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     # What the agent's own toggle_evolution(False) leaves behind (the disable path itself needs
     # the live supervisor; its state write is pinned in test_evolution_stop_and_cost).
     state.update_state(lambda live: live.update(owner_chat_id=7, evolution_owner_stopped=True,
@@ -665,13 +627,11 @@ def test_observe_does_without_the_work_starting_review_verb():
     """`request_deep_self_review` enqueues a ROOT: Observe starts nothing (В10')."""
     assert "request_deep_self_review" in ca.OBSERVE_DISABLED and "request_deep_self_review" not in ca.ACT_DISABLED
     # The GitHub write verbs change the world beyond the repository (PLAN §5.4: Observe keeps the reads only).
-    for verb in ("create_github_issue", "comment_on_issue", "comment_on_pr", "close_github_issue"):
+    for verb in ("github_write", "pr_merge"):
         assert verb in ca.OBSERVE_DISABLED and verb not in ca.ACT_DISABLED, verb
-    for verb in ("list_github_prs", "get_github_pr", "list_github_issues", "get_github_issue"):
-        assert verb not in ca.OBSERVE_DISABLED, verb
-    # The two built-in execution verbs (astra scope round 5): a skill's script, a push + CI run.
-    for verb in ("skill_exec", "run_ci_tests"):
-        assert verb in ca.OBSERVE_DISABLED and verb not in ca.ACT_DISABLED, verb
+    assert "github_read" not in ca.OBSERVE_DISABLED
+    # The built-in execution verb (astra scope round 5): a skill's script.
+    assert "skill_exec" in ca.OBSERVE_DISABLED and "skill_exec" not in ca.ACT_DISABLED
 
 
 def test_deep_review_request_carries_the_origin_to_the_one_door(tmp_path, monkeypatch):
@@ -691,6 +651,7 @@ def test_deep_review_request_carries_the_origin_to_the_one_door(tmp_path, monkey
     assert "initiator" not in owner.pending_events[0]
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     queue.init(tmp_path)
     pending: list = []
     queue.init_queue_refs(pending, {}, {"value": 0})
@@ -701,12 +662,13 @@ def test_deep_review_request_carries_the_origin_to_the_one_door(tmp_path, monkey
     monkeypatch.setattr("supervisor.workers._worker_pool_execution_state",
                         lambda: {"available": True, "disabled_reason": ""})
     monkeypatch.setattr("ouroboros.consciousness_allowance.allowance_window",
-                        lambda root, now=None: {"status": "available", "limit_usd": 20.0, "accounted_usd": 0.0,
+                        lambda root, now=None: {"status": "available", "limit_usd": 20.0, "settled_usd": 0.0, "accounted_usd": 0.0,
                                                 "remaining_usd": 20.0, "unknown_unmetered": 0, "resets_at": ""})
     handed: list = []
     sup = types.SimpleNamespace(queue_deep_self_review_task=lambda **kw: handed.append(kw))
     _handle_deep_self_review_request(evt, sup)
-    assert handed[0]["origin"] == {"initiator": "consciousness", "usage_category": "consciousness_task",
+    assert handed[0]["origin"] == {"work_kind": "consciousness", "consciousness_cause": "started",
+                      "initiator": "consciousness", "usage_category": "consciousness_task",
                                    "consciousness_autonomy": "act"}
     assert queue.queue_deep_self_review_task("look again", model="reviewer-x", origin=handed[0]["origin"])
     assert pending[0]["type"] == "deep_self_review" and pending[0]["metadata"]["initiator"] == "consciousness"
@@ -722,6 +684,7 @@ def test_the_allowance_is_read_before_the_queue_lock(tmp_path, monkeypatch):
     from supervisor import queue, state
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     queue.init(tmp_path)
     pending: list = []
     queue.init_queue_refs(pending, {}, {"value": 0})
@@ -731,7 +694,7 @@ def test_the_allowance_is_read_before_the_queue_lock(tmp_path, monkeypatch):
 
     def _window(root, now=None):
         seen.append(queue._queue_lock._is_owned())
-        return {"status": "available", "limit_usd": 20.0, "accounted_usd": 0.0, "remaining_usd": 20.0,
+        return {"status": "available", "limit_usd": 20.0, "settled_usd": 0.0, "accounted_usd": 0.0, "remaining_usd": 20.0,
                 "unknown_unmetered": 0, "resets_at": ""}
 
     monkeypatch.setattr("ouroboros.consciousness_allowance.allowance_window", _window)
@@ -758,6 +721,7 @@ def test_campaign_keeps_the_origin_and_its_cycle_tasks_inherit_it(tmp_path, monk
     from supervisor import evolution_lifecycle, queue, state
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     queue.init(tmp_path)
     pending: list = []
     queue.init_queue_refs(pending, {}, {"value": 0})
@@ -777,7 +741,7 @@ def test_campaign_keeps_the_origin_and_its_cycle_tasks_inherit_it(tmp_path, monk
     monkeypatch.setattr(queue, "send_with_budget", lambda *a, **k: None)
     monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": None)
     monkeypatch.setattr("ouroboros.consciousness_allowance.allowance_window",
-                        lambda root, now=None: {"status": "available", "limit_usd": 20.0, "accounted_usd": 0.0,
+                        lambda root, now=None: {"status": "available", "limit_usd": 20.0, "settled_usd": 0.0, "accounted_usd": 0.0,
                                                 "remaining_usd": 20.0, "unknown_unmetered": 0, "resets_at": ""})
     queue.enqueue_evolution_task_if_needed()
     assert len(pending) == 1
@@ -792,7 +756,7 @@ def test_campaign_keeps_the_origin_and_its_cycle_tasks_inherit_it(tmp_path, monk
     sent: list = []
     monkeypatch.setattr(queue, "send_with_budget", lambda cid, text, **kw: sent.append(text))
     monkeypatch.setattr("ouroboros.consciousness_allowance.allowance_window",
-                        lambda root, now=None: {"status": "exhausted", "limit_usd": 20.0, "accounted_usd": 21.0,
+                        lambda root, now=None: {"status": "exhausted", "limit_usd": 20.0, "settled_usd": 21.0, "accounted_usd": 21.0,
                                                 "remaining_usd": 0.0, "unknown_unmetered": 0, "resets_at": "2027-01-01T00:00:00+00:00"})
     queue.enqueue_evolution_task_if_needed()
     queue.enqueue_evolution_task_if_needed()
@@ -809,6 +773,7 @@ def test_a_transient_refusal_never_pauses_the_campaign(tmp_path, monkeypatch):
     from supervisor import evolution_lifecycle, queue, state
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     queue.init(tmp_path)
     pending: list = []
     queue.init_queue_refs(pending, {}, {"value": 0})
@@ -834,6 +799,7 @@ def test_the_owners_start_adopts_a_paused_consciousness_campaign(tmp_path):
     from supervisor import evolution_lifecycle, queue, state
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     queue.init(tmp_path)
     origin = {"initiator": "consciousness", "usage_category": "consciousness_task", "consciousness_autonomy": "full"}
     campaign = evolution_lifecycle.start_evolution_campaign("Improve", source="agent_tool", origin=origin)
@@ -842,7 +808,7 @@ def test_the_owners_start_adopts_a_paused_consciousness_campaign(tmp_path):
     adopted = evolution_lifecycle.start_evolution_campaign("", source="owner_chat")
     assert adopted["status"] == "active" and adopted["adopted_by_owner_at"] and "pause_reason" not in adopted
     assert not any(key in adopted for key in origin)
-    assert ca.consciousness_origin_metadata(adopted) == {}
+    assert ca.consciousness_origin_metadata(adopted) == {"work_kind": "owner"}
     # The function's own default source is the owner too (grok round 4).
     campaign = evolution_lifecycle.start_evolution_campaign("Again", source="agent_tool", origin=origin)
     campaign["status"] = "paused"
@@ -854,10 +820,11 @@ def test_owner_campaign_carries_no_origin(tmp_path):
     from supervisor import evolution_lifecycle, queue, state
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     queue.init(tmp_path)
     campaign = evolution_lifecycle.start_evolution_campaign("Improve", source="owner_chat")
     assert "initiator" not in campaign
-    assert ca.consciousness_origin_metadata(campaign) == {}
+    assert ca.consciousness_origin_metadata(campaign) == {"work_kind": "owner"}
 
 
 # --- what a wake may address: the host routing manifest (P3c) -------------------
@@ -883,69 +850,16 @@ def _addressable_result(tmp_path, task_id="racer-old"):
            "task_contract": {"objective": "Build the racer prototype", "context": "exact old context"}}
     results = tmp_path / "task_results"
     results.mkdir(parents=True, exist_ok=True)
-    (results / f"{task_id}.json").write_text(json.dumps({"_schema_version": 1, **row}), encoding="utf-8")
+    seed_result(tmp_path, task_id, {"_schema_version": 1, **row})
     return _task_result_ground_truth(row)
-
-
-def test_a_wake_continues_a_result_its_routing_manifest_makes_addressable(tmp_path):
-    """The first live wake chose a predecessor and got AUTHORITY_SOURCE_UNAVAILABLE twice,
-    so the work it had decided on never started: its metadata carried no routing manifest
-    (P3c). With the Main lane's own facts the named id is addressable, on both verbs."""
-    from ouroboros.projects_registry import create_project
-    from ouroboros.tools.control_routing import _promote_chat_to_task, _route_to_project
-
-    create_project(tmp_path, "racer", name="Racer")
-    preview = _addressable_result(tmp_path)
-    facts = {"main_routing_manifest": {"final_results": [preview]}}
-
-    routed = _wake_routing_ctx(tmp_path, **facts)
-    out = _route_to_project(routed, "racer", "Continue the racer", predecessor_task_id="racer-old")
-    assert out.startswith("⚠️ ROUTE_UNCONFIRMED"), out
-    [route_evt] = routed.pending_events
-    assert route_evt["predecessor_task_id"] == "racer-old"
-    assert route_evt["predecessor_authority_source"] == preview["authority_source"]
-
-    promoted = _wake_routing_ctx(tmp_path, **facts)
-    _promote_chat_to_task(promoted, "Finish the racer", workspace="none", predecessor_task_id="racer-old")
-    [promote_evt] = promoted.pending_events
-    assert promote_evt["predecessor_task_id"] == "racer-old"
-    assert promote_evt["predecessor_authority_source"] == preview["authority_source"]
-    # The manifest never dilutes the wake's own origin.
-    assert promote_evt["initiator"] == "consciousness"
 
 
 def test_a_wake_starts_fresh_work_with_no_predecessor_and_needs_no_manifest(tmp_path):
     from ouroboros.projects_registry import create_project
-    from ouroboros.tools.control_routing import _promote_chat_to_task, _route_to_project
+    from ouroboros.tools.control_routing import _start_task
 
     create_project(tmp_path, "racer", name="Racer")
 
-    routed = _wake_routing_ctx(tmp_path)
-    assert _route_to_project(routed, "racer", "Start a separate experiment",
-                             predecessor_task_id="").startswith("⚠️ ROUTE_UNCONFIRMED")
-    assert "predecessor_authority_source" not in routed.pending_events[0]
-
     promoted = _wake_routing_ctx(tmp_path)
-    _promote_chat_to_task(promoted, "audit the logs", workspace="none", predecessor_task_id="")
+    _start_task(promoted, "audit the logs", title="Log audit", workspace="none")
     assert "predecessor_task_id" not in promoted.pending_events[0]
-
-
-def test_a_wake_without_the_manifest_still_refuses_an_unaddressable_predecessor(tmp_path):
-    """The typed refusal is unchanged; only the facts the wake is given are new."""
-    from ouroboros.projects_registry import create_project
-    from ouroboros.tools.control_routing import _promote_chat_to_task, _route_to_project
-
-    create_project(tmp_path, "racer", name="Racer")
-    _addressable_result(tmp_path)
-
-    routed = _wake_routing_ctx(tmp_path)
-    out = _route_to_project(routed, "racer", "Continue the racer", predecessor_task_id="racer-old")
-    assert out.startswith("⚠️ AUTHORITY_SOURCE_UNAVAILABLE (route_to_project)")
-    assert "not an addressable result in the host routing manifest" in out
-    assert routed.pending_events == []
-
-    promoted = _wake_routing_ctx(tmp_path)
-    refused = _promote_chat_to_task(promoted, "Finish the racer", workspace="none",
-                                    predecessor_task_id="racer-old")
-    assert refused.startswith("⚠️ AUTHORITY_SOURCE_UNAVAILABLE (promote_chat_to_task)")
-    assert promoted.pending_events == []

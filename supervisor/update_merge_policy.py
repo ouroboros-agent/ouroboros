@@ -41,6 +41,7 @@ HOT_CODE_PATHS = frozenset({
     # monoliths keeps the label (same parity rule as the D04 block above).
     "ouroboros/tools/control_events.py",
     "ouroboros/tools/control_routing.py",
+    "ouroboros/tools/control_relay.py",
     "ouroboros/tools/control_runtime.py",
     # v7 D07 split leaves: the rest of the hot control monolith moved out with
     # the D07 lane and keeps the label (same parity rule as the D04 block).
@@ -68,8 +69,7 @@ HOT_CODE_PATHS = frozenset({
     "supervisor/worker_health.py",
     # v7 D01 split leaves: code that moved out of the hot loop monolith keeps
     # the label (same parity rule as the D04 block above).
-    "ouroboros/loop_acceptance.py",
-    "ouroboros/loop_acceptance_review.py",
+    "ouroboros/delivery_seal.py",
     "ouroboros/loop_budget.py",
     "ouroboros/loop_delivery.py",
     "ouroboros/loop_forced_finalization.py",
@@ -77,6 +77,14 @@ HOT_CODE_PATHS = frozenset({
     "ouroboros/loop_model_call.py",
     "ouroboros/loop_nudges.py",
     "ouroboros/loop_round_limits.py",
+    # Initial routing, the round handover and primary return/wait moved from
+    # the loop/control owners; their conflict labels follow those bodies.
+    "ouroboros/route_choice.py",
+    "ouroboros/loop_routes.py",
+    "ouroboros/owner_model.py",
+    # join_ledger received the direct-child reads of the hot forced-finalization
+    # leaf: the label follows the moved body.
+    "ouroboros/tools/join_ledger.py",
 })
 
 
@@ -148,7 +156,8 @@ def carrier_guidance(conflicts: List[str]) -> str:
         "already synced mechanically, and carrier conflicts confined to declared version spans "
         "were already resolved to the target's side. A carrier still in your list degraded to "
         "manual resolution (a broken or duplicate span anchor, or a conflict outside the spans): "
-        "make its version tokens match VERSION exactly. In the README Version History table keep "
+        "make its version tokens match VERSION exactly (under a development marker the download "
+        "links keep the target's published release instead). In the README Version History table keep "
         "BOTH sides' rows (never delete this fork's local history rows); resolve prose conflicts "
         "on their merits."
     )
@@ -179,8 +188,9 @@ def assisted_objective(tx: Dict[str, Any]) -> str:
         "supervisor: MERGE_HEAD is set and the combined tree is staged for review. Do NOT run any git "
         "command (fetch/merge/commit/checkout are blocked) — the merge is already staged for you. "
         f"{work} Do not discard either side merely because a file is normally restricted. When ready, "
-        "run `preflight_review` with the commit message, then `commit_reviewed` (it will create the reviewed "
-        "2-parent merge commit), then `request_restart` to finish landing the update. "
+        "run `commit_reviewed` with the commit message (it will create the reviewed 2-parent merge commit; "
+        "`preflight_reviewer` optionally buys one early look first), then `request_restart` to finish landing the "
+        "update. "
         f"Terminal contract: if this task ends WITHOUT that reviewed merge commit landing (given up, "
         f"cancelled, or review not passed), the supervisor rolls the repository back to the pre-update "
         f"state; your resolution work is normally preserved (best-effort) on branch failed-update-{target} "

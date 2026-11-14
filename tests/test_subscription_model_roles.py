@@ -11,13 +11,23 @@ setup = subscription_transport  # The imported live-wait fixture depends on this
 reviewer_wait = wait_fixture
 
 from ouroboros.model_slots import (
-    MODEL_ACCOUNTS_KEY, MODEL_CONTEXT_WINDOWS_KEY,
+    MODEL_ACCOUNTS_KEY, MODEL_CONTEXT_WINDOWS_KEY, MODEL_PROCESSING_PREFERENCES_KEY,
     model_role_option, normalize_model_role_options,
 )
 from ouroboros.provider_models import (
     model_has_credentials_in_settings, parse_claudexor_model, provider_for_model,
     resolve_model_target,
 )
+
+
+def test_image_generation_has_no_settings_default_or_chat_role():
+    from ouroboros.settings_defaults import SETTINGS_DEFAULTS
+    from ouroboros.settings_setup_contract import build_setup_contract
+
+    assert "OUROBOROS_MODEL_IMAGE" not in SETTINGS_DEFAULTS
+    assert all(slot["slot"] != "image" for slot in build_setup_contract()["modelSlots"])
+    with pytest.raises(ValueError):
+        normalize_model_role_options(MODEL_ACCOUNTS_KEY, {"image": "profile"})
 
 
 def test_equal_model_names_keep_distinct_main_and_light_accounts():
@@ -51,14 +61,9 @@ def test_manual_context_above_catalog_is_an_assertion_not_an_adapter_cap():
 
 @pytest.mark.parametrize("key, raw", [
     (MODEL_ACCOUNTS_KEY, {"main": True}),
-    (MODEL_ACCOUNTS_KEY, {"main": {"pin": "profile"}}),
     (MODEL_ACCOUNTS_KEY, {"fallback": "a,b"}),
-    (MODEL_ACCOUNTS_KEY, {"unknown": "profile"}),
     (MODEL_ACCOUNTS_KEY, "not JSON"),
     (MODEL_CONTEXT_WINDOWS_KEY, {"main": -1}),
-    (MODEL_CONTEXT_WINDOWS_KEY, {"main": True}),
-    (MODEL_CONTEXT_WINDOWS_KEY, {"main": 1.2}),
-    (MODEL_CONTEXT_WINDOWS_KEY, {"main": "1000000"}),
 ])
 def test_malformed_options_cannot_silently_drop_a_pin_or_invent_capacity(key, raw):
     with pytest.raises(ValueError):
@@ -73,6 +78,35 @@ def test_config_read_accepts_object_and_json_and_is_idempotent():
     assert normalized == normalize_settings_raw(normalized)
     assert json.loads(normalized[MODEL_ACCOUNTS_KEY]) == {"main": "profile"}
     assert json.loads(normalized[MODEL_CONTEXT_WINDOWS_KEY]) == {"light": 872000}
+
+
+@pytest.mark.parametrize(("encoded", "key", "valid"), [
+    pytest.param(False, MODEL_ACCOUNTS_KEY, "private-account-value", id='False-OUROBOROS_MODEL_ACCOUNTS-private-account-value'),
+    pytest.param(False, MODEL_PROCESSING_PREFERENCES_KEY, "economy", id='False-OUROBOROS_MODEL_PROCESSING_PREFERENCES-economy'),
+    pytest.param(True, MODEL_CONTEXT_WINDOWS_KEY, 0, id='True-OUROBOROS_MODEL_CONTEXT_WINDOWS-0'),
+])
+def test_unknown_role_diagnostic_names_keys_without_applying_or_disclosing_values(key, valid, encoded):
+    from ouroboros.config import normalize_settings_raw, prepare_settings_for_persist
+
+    options = {"safety": valid, "saftey\n\x1b[31m": "private-unused-value", "future_role": 0}
+    raw = json.dumps(options) if encoded else options
+    for consumer in (normalize_settings_raw, prepare_settings_for_persist):
+        with pytest.raises(ValueError) as error:
+            consumer({key: raw})
+        message = str(error.value)
+        assert key in message and "future_role" in message and "saftey\\n\\x1b[31m" in message
+        assert "\n" not in message and "\x1b" not in message
+        assert "private-unused-value" not in message and "private-account-value" not in message
+        assert "compatible application version" in message and "do not reset" in message
+    assert options == {"safety": valid, "saftey\n\x1b[31m": "private-unused-value", "future_role": 0}
+    parsed, canonical = normalize_model_role_options(key, {"safety": valid})
+    assert parsed == json.loads(canonical) == {"safety": valid}
+
+
+@pytest.mark.parametrize("raw", [[], 42, True])
+def test_role_map_shape_error_does_not_misdiagnose_an_unknown_role(raw):
+    with pytest.raises(ValueError, match="must be a JSON object"):
+        normalize_model_role_options(MODEL_CONTEXT_WINDOWS_KEY, raw)
 
 
 def test_managed_selection_does_not_need_or_fabricate_an_api_key():
@@ -99,105 +133,47 @@ def test_persisted_wait_switch_changes_only_the_named_model_role():
 
 def test_managed_model_account_roundtrips_actor_and_reviewer_configuration():
     from ouroboros.configured_subagents import normalize_configured_subagents
-    from ouroboros.reviewer_slot_config import parse_reviewer_slots
+    from ouroboros.reviewer_slot_config import review_pool_rows
     route = {"kind": "api_model", "target_id": "claudexor::codex=same", "credential_profile_id": "named"}
-    actor = {"subagent_id": "actor", "recommended_use": "Review", "route": route}
+    actor = {"subagent_id": "actor", "recommended_use": "Review", "route": route, "review_eligible": True}
     parsed, encoded = normalize_configured_subagents({"enabled": True, "items": [actor]})
     assert parsed.items[0].route.credential_profile_id == "named"
     assert json.loads(encoded)['items'][0]['route'] == route
-    slots = parse_reviewer_slots(json.dumps({
-        group: [{"slot_id": group, "route": {"kind": "api_chat", "target_id": route['target_id'], "profile_id": "named"}}]
-        for group in ("triad", "scope")
-    }))
-    assert slots.triad[0].profile_id == slots.scope[0].profile_id == "named"
+    # The same row IS the reviewer row (the pool reads the catalog): the pin rides along.
+    (row,) = review_pool_rows({"OUROBOROS_SUBAGENTS": encoded})
+    assert (row.slot_id, row.profile_id) == ("actor", "named")
 
 
 @pytest.mark.parametrize("pin", ["", "named"])
 def test_empty_subscription_model_is_rejected_before_actor_or_reviewer_serialization(pin):
     from ouroboros.configured_subagents import normalize_configured_subagents
-    from ouroboros.reviewer_slot_config import parse_reviewer_slots
+    from ouroboros.reviewer_slot_config import review_pool_rows
 
     target = "claudexor::codex="
+    row = {"subagent_id": "actor", "recommended_use": "Review", "review_eligible": True,
+           "route": {"kind": "api_model", "target_id": target, "credential_profile_id": pin}}
     with pytest.raises(ValueError):
-        normalize_configured_subagents({"enabled": True, "items": [{
-            "subagent_id": "actor", "recommended_use": "Review", "route": {
-                "kind": "api_model", "target_id": target, "credential_profile_id": pin}}]})
+        normalize_configured_subagents({"enabled": True, "items": [row]})
     with pytest.raises(ValueError):
-        parse_reviewer_slots(json.dumps({group: [{"slot_id": group, "route": {
-            "kind": "api_chat", "target_id": target, "profile_id": pin}}]
-            for group in ("triad", "scope")}))
+        review_pool_rows({"OUROBOROS_SUBAGENTS": json.dumps({"enabled": True, "items": [row]})})
 
 
-def test_persist_referenced_reviewer_keeps_other_roles_and_native_delivery():
-    from ouroboros.model_slots import apply_model_role_override
-    from ouroboros.reviewer_slot_config import parse_reviewer_slots, roster_env_override
-    actor = {"subagent_id": "shared", "recommended_use": "Review", "route": {
-        "kind": "api_model", "target_id": "claudexor::codex=old", "credential_profile_id": "old"}}
-    original = {"OUROBOROS_SUBAGENTS": json.dumps({"enabled": True, "items": [actor]}),
-                "OUROBOROS_REVIEWER_SLOTS": json.dumps({group: [{"slot_id": group, "subagent_id": "shared"}]
-                                                        for group in ("triad", "scope")})}
-    saved = apply_model_role_override(original, role="reviewer:triad", model="claudexor::codex=new",
-                                      credential_profile_id="new", use_local=False)
-    roster = json.loads(saved['OUROBOROS_SUBAGENTS'])
-    assert roster['items'][0] == actor
-    with roster_env_override(saved['OUROBOROS_SUBAGENTS']):
-        slots = parse_reviewer_slots(saved['OUROBOROS_REVIEWER_SLOTS'])
-    assert slots.triad[0].native_retrieval and slots.scope[0].native_retrieval
-    assert slots.triad[0].target_id == "claudexor::codex=new" and slots.triad[0].profile_id == "new"
-    assert slots.scope[0].target_id == "claudexor::codex=old" and slots.scope[0].profile_id == "old"
-    assert apply_model_role_override(saved, role="reviewer:triad", model="claudexor::codex=new",
-                                      credential_profile_id="new", use_local=False) == saved
-
-
-@pytest.mark.parametrize("roster", [None, "", '{"enabled":false,"items":[]}'])
-def test_persist_default_reviewer_omits_untouched_deep_row_and_roster(roster):
-    from ouroboros.model_slots import apply_model_role_override
-    from ouroboros.subscription_install_presets import preview_api_reviewer_slots
-
-    original = {"OUROBOROS_REVIEWER_SLOTS": "", "OUROBOROS_MODEL_DEEP_SELF_REVIEW": "openai::owner-deep"}
-    if roster is not None:
-        original["OUROBOROS_SUBAGENTS"] = roster
-    before = json.loads(preview_api_reviewer_slots(original))
-    identity = before["triad"][0]["slot_id"]
-    saved = apply_model_role_override(original, role=f"reviewer:{identity}", model="claudexor::codex=new",
-                                      credential_profile_id="new-pin", use_local=False)
-    after = json.loads(saved["OUROBOROS_REVIEWER_SLOTS"])
-    expected = dict(before)
-    expected.pop("deep_review")
-    expected["triad"][0]["route"] = {"kind": "api_chat", "target_id": "claudexor::codex=new", "profile_id": "new-pin"}
-    assert after == expected
-    assert saved.get("OUROBOROS_SUBAGENTS") == original.get("OUROBOROS_SUBAGENTS")
-    assert ("OUROBOROS_SUBAGENTS" in saved) is (roster is not None)
-    assert saved["OUROBOROS_MODEL_DEEP_SELF_REVIEW"] == "openai::owner-deep"
-    assert original["OUROBOROS_REVIEWER_SLOTS"] == ""
-
-
-def test_persist_default_deep_reviewer_authors_only_its_selected_assignment():
-    from ouroboros.model_slots import apply_model_role_override
-    from ouroboros.subscription_install_presets import preview_api_reviewer_slots
-
-    original = {"OUROBOROS_REVIEWER_SLOTS": "", "OUROBOROS_MODEL_DEEP_SELF_REVIEW": "openai::owner-deep"}
-    before = json.loads(preview_api_reviewer_slots(original))
-    saved = apply_model_role_override(original, role="reviewer:deep_review_slot_1", model="claudexor::codex=review",
-                                      credential_profile_id="review-pin", use_local=False)
-    after = json.loads(saved["OUROBOROS_REVIEWER_SLOTS"])
-    before["deep_review"]["route"] = {"kind": "api_chat", "target_id": "claudexor::codex=review", "profile_id": "review-pin"}
-    assert after == before
-    assert "OUROBOROS_SUBAGENTS" not in saved
-
-
-def test_default_reviewer_wait_persists_through_the_real_owner_writer_without_deep_materialization(reviewer_wait, monkeypatch):
+def test_a_reviewer_wait_persists_through_the_real_owner_writer_into_the_catalog_row(reviewer_wait, monkeypatch):
+    """A review pool seat's wait card: ``persist_role`` writes the chosen model and
+    pin into THAT catalog row through the real owner writer, leaves the other rows
+    alone, authors no review lanes key, and a replay of the same decision writes
+    nothing."""
     from ouroboros import config, model_wait
-    from ouroboros.subscription_install_presets import preview_api_reviewer_slots
 
     root, _, _, controller, _, decide = reviewer_wait
     monkeypatch.setattr(config, "SETTINGS_PATH", root / "settings.json")
-    initial = {"OUROBOROS_REVIEWER_SLOTS": "", "OUROBOROS_MODEL_DEEP_SELF_REVIEW": "openai::owner-deep"}
+    helper = {"subagent_id": "helper", "recommended_use": "Helps.", "route": {"kind": "api_model", "target_id": "openai/gpt-5.6-luna"}}
+    critic = {"subagent_id": "critic", "recommended_use": "Reviews.", "review_eligible": True, "effort": "low",
+              "route": {"kind": "api_model", "target_id": "openai/gpt-5.6-sol"}}
+    initial = {"OUROBOROS_SUBAGENTS": json.dumps({"enabled": True, "items": [helper, critic]})}
     (root / "settings.json").write_text(json.dumps(initial))
-    defaults = json.loads(preview_api_reviewer_slots(initial))
-    slot = defaults["triad"][0]["slot_id"]
     row = {"wait_id": "reviewer-wait", "revision": 1, "task_attempt": 1,
-           "state": "waiting", "role": f"reviewer:{slot}"}
+           "state": "waiting", "role": "reviewer:critic"}
     model_wait.mutate_wait(root, "task-one", row["wait_id"], lambda _: row)
     controller.waits[row["wait_id"]] = dict(row)
     body = _action_for({**row, "task_id": "task-one"}, "switch", model=MODEL,
@@ -205,11 +181,11 @@ def test_default_reviewer_wait_persists_through_the_real_owner_writer_without_de
     response = decide(body)
     assert response.status_code == 202 and json.loads(response.body)["saved"] is True
     saved = json.loads((root / "settings.json").read_text())
-    panel = json.loads(saved["OUROBOROS_REVIEWER_SLOTS"])
-    assert panel["triad"][0]["route"]["profile_id"] == "reviewer-pin"
-    assert panel["triad"][1:] == defaults["triad"][1:] and panel["scope"] == defaults["scope"]
-    assert "deep_review" not in panel and saved["OUROBOROS_MODEL_DEEP_SELF_REVIEW"] == initial["OUROBOROS_MODEL_DEEP_SELF_REVIEW"]
-    assert not saved.get("OUROBOROS_SUBAGENTS")
+    assert "OUROBOROS_REVIEWER_SLOTS" not in saved
+    items = json.loads(saved["OUROBOROS_SUBAGENTS"])["items"]
+    assert items[0] == helper
+    assert items[1]["route"] == {"kind": "api_model", "target_id": MODEL, "credential_profile_id": "reviewer-pin"}
+    assert items[1]["review_eligible"] is True and items[1]["effort"] == "low"
     stamp = (root / "settings.json").stat().st_mtime_ns
     assert decide(body).status_code == 200
     assert (root / "settings.json").stat().st_mtime_ns == stamp

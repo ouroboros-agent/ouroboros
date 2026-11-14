@@ -16,9 +16,9 @@ from ouroboros.utils import truncate_review_artifact
 # Bounded structured findings on the public actor projection: the bound is the
 # ROW COUNT, never a second aggressive cut of the finding bodies — capping the
 # only owner-reachable copy of reviewer text is the class v6.70.0 removed. The
-# per-string bound mirrors plan review's MAX_FINDING_TEXT_CHARS (2000), not the
-# 200-char path-list default; the durable remainder stays addressable through
-# the actor's existing response_ref, so no full-set hash is needed.
+# per-string bound is 2000 characters (not the 200-char path-list default); the
+# durable remainder stays addressable through the actor's existing
+# response_ref, so no full-set hash is needed.
 MAX_PROJECTED_ACTOR_FINDINGS = 8
 PROJECTED_FINDING_TEXT_CHARS = 2000
 _PROJECTED_FINDING_KEYS = (
@@ -132,32 +132,70 @@ def review_executions_from_actor_usage(actors: Any) -> List[Dict[str, str]]:
     return normalize_review_executions(executions)
 
 
+# Host-owned owner labels per review surface (a closed table beside the renderer,
+# never a client list); an unknown surface renders raw, disclosed.
+_SURFACE_LABELS = {
+    "plan_review": "Plan reviewer", "task_acceptance": "Acceptance reviewer",
+    "multi_model_review": "Commit reviewer", "triad": "Commit reviewer",
+    "commit_gate": "Commit reviewer", "scope_review": "Scope reviewer",
+    "skill_review": "Skill reviewer", "advisory_review": "Preflight reviewer",
+    "deep_self_review": "Deep-review reviewer",
+}
+
+
+def _reviewer_verb(surface: str, phase: str, actor: Any) -> str:
+    """The verb comes from the ACTOR's typed facts, never from the phase name."""
+    states = {str(getattr(actor, "operation_state", "") or ""), str(getattr(actor, "status", "") or "")}
+    if "not_dispatched" in states:  # a $0 refusal is never "didn't answer" (06 invariant 25)
+        return "wasn't sent " + ("the plan" if surface == "plan_review" else "its request")
+    if phase == "answer_received":
+        return "answer received, verdict being read"
+    if getattr(actor, "transport_status", "") == "interrupted":
+        return "was interrupted; its answer may be lost"
+    if actor is None or phase == "started":
+        return "started"
+    if getattr(actor, "status", "") == "empty":
+        return "gave an empty answer"
+    if getattr(actor, "status", "") == "error" or getattr(actor, "ok", None) is False:
+        return "didn't answer"
+    if getattr(actor, "parse_status", "") == "valid":
+        return "answered"
+    return "returned an unreadable verdict" if getattr(actor, "parse_status", "") == "malformed" else "answer received, verdict being read"
+
+
 def review_actor_progress_text(surface: str, phase: str, slot: Any, actor: Any = None) -> str:
-    """Describe one frozen request and its own receipt, never global last-run state."""
-    route = getattr(slot, "route", "")
-    requested = [
-        f"model={getattr(slot, 'model', '') or 'not specified'}",
-        f"route={getattr(route, 'value', route) or 'not specified'}",
-    ]
-    for key, label in (("session_target", "target"), ("session_profile", "profile"), ("effort", "effort")):
-        if value := getattr(slot, key, ""):
-            requested.append(f"{label}={value}")
-    text = f"Review {surface} [{getattr(slot, 'slot_id', '')}]: {phase}; requested " + ", ".join(requested)
-    if actor is not None:
-        usage = getattr(actor, "usage", {}) or {}
-        executions = review_executions_from_actor_usage([{"usage": usage}])
-        if not executions:
-            text += "; observed execution: not reported"
-        for row in executions:
-            if row['kind'] == 'harness':
-                text += ("; observed execution: harness" + (f":{row['harness_id']}" if row.get('harness_id') else "")
-                         + f", model={row.get('model') or 'not reported'}")
-            else:
-                text += (f"; {row['kind']} execution: sent model={row.get('model') or 'not reported'}"
-                         ", provider-observed model=not reported")
-        if usage.get("applied_profile"):
-            text += f", profile={usage['applied_profile']}"
-        text += f"; state={getattr(actor, 'operation_state', '') or getattr(actor, 'status', '')}"
+    """One owner sentence per reviewer row: who it is (the frozen route display name),
+    what it was asked for at start, and at settlement whether it answered, how it ran
+    (observed harness/model/account, or that this was not reported) or why it did not
+    (the engine's reported sentence, quoted; a spent window's reset instant). No code,
+    id or custody state reaches the row; the record keeps them."""
+    label = _SURFACE_LABELS.get(surface) or f"{surface.replace('_', ' ')} reviewer"
+    verb = _reviewer_verb(surface, phase, actor)
+    text = f"{label} {getattr(slot, 'model', '') or 'not specified'} {verb}"
+    usage = getattr(actor, "usage", {}) or {} if actor is not None else {}
+    reset_at = str(getattr(actor, "reset_at", "") or "") if actor is not None else ""
+    if verb == "started":
+        route = getattr(slot, "route", "")
+        asked = [f"effort {getattr(slot, 'effort', '')}"] if str(getattr(route, "value", route)) == "agent_session" and getattr(slot, "effort", "") else []
+        asked += [f"account {slot.session_profile}"] if getattr(slot, "session_profile", "") else []
+        text += f" — {', '.join(asked)}." if asked else "."
+    elif verb == "answered":
+        row = (review_executions_from_actor_usage([{"usage": usage}]) or [{}])[0]
+        if row.get("kind") == "harness":
+            ran = row.get("model") or row.get("harness_id", "")
+            text += (f" — ran as {ran}" if ran else " — how it ran was not reported") + (
+                "" if row.get("model") else ("; which model served it was not reported" if ran else ""))
+        elif row:
+            text += f" — sent as {row.get('model') or 'not reported'}; the provider did not report which model served it"
+        else:
+            text += " — how it ran was not reported"
+        text += (f" (account {usage['applied_profile']})" if usage.get("applied_profile") else "") + "."
+    else:
+        cause = str(getattr(actor, "reported_cause", "") or "").replace("\n", " ")
+        if verb == "didn't answer" and cause:
+            text += f' — "{cause}"'
+        else:
+            text += f" — its window resets at {reset_at}." if reset_at else "."
     return str(redact_projection(text).value)
 
 

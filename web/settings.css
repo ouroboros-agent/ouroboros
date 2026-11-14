@@ -1,105 +1,340 @@
+/* Settings (settings.js): the home and the pages opened from it. The page box is the container both layouts read:
+   narrower than 56rem one column shows the home or the open page; from 56rem the home stands beside the page as a
+   rail. Each column scrolls by itself and keeps its place; a page's first row is its Back, which stays at the top.
+   A column's top inset is `--settings-top`: the page's Back row reads it too. */
+#page-settings { container: settingspage / inline-size; }
 .settings-shell {
     flex: 1;
+    min-width: 0;
     min-height: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
     overflow: hidden;
-    padding: 0 20px 16px;
 }
-
-.settings-tabs-bar {
-    padding: 0;
-    background: transparent;
-    backdrop-filter: none;
-}
-
-.settings-mobile-back {
-    display: none;
-}
-
-.settings-scroll {
-    flex: 1;
+.settings-home,
+.settings-page {
+    --settings-top: var(--space-2);
+    min-width: 0;
     min-height: 0;
     overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: var(--settings-top) var(--page-header-padding-x) 56px;
+}
+html[data-layout="docked"] .app-page-header[data-empty] ~ .settings-shell :is(.settings-home, .settings-page) { --settings-top: 20px; }
+:root[data-window-chrome="integrated"][data-layout="docked"] .app-page-header[data-empty] ~ .settings-shell :is(.settings-home, .settings-page) {
+    --settings-top: calc(var(--space-4) + var(--window-chrome-top));
+}
+html[data-layout="stack"] :is(.settings-home, .settings-page) { padding-inline: 12px; }
+.settings-levels { display: grid; min-width: 0; min-height: 0; }
+.settings-levels > .settings-page { grid-area: 1 / 1; }
+.settings-shell[data-settings-view="page"] > .settings-home,
+.settings-shell[data-settings-view="home"] > .settings-levels,
+.settings-page[hidden] { display: none; }
+.settings-column {
     display: flex;
     flex-direction: column;
-    gap: 18px;
-    padding: 4px 2px 88px;
+    gap: var(--space-4);
+    width: 100%;
+    max-width: 720px;
+    margin-inline: 0 auto;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+/* Wide: the home is a rail beside the page. Its card says only who and how many; the count opens the list. Until a
+   row is pressed the home stands alone, in the middle of the window and as wide as at a desk (no page is opened for
+   it: a page reads when it is shown), so the window has no empty half. */
+@container settingspage (min-width: 56rem) {
+    .settings-shell[data-settings-view="home"] .settings-home-column { margin-inline: auto; }
+    .settings-shell[data-settings-view="page"] { grid-template-columns: 348px minmax(0, 1fr); }
+    .settings-shell[data-settings-view="page"] > .settings-home { display: block; padding-inline-end: var(--space-3); }
+    .settings-shell[data-settings-view="page"] .settings-page { padding-inline-start: var(--space-4); }
+    .settings-shell[data-settings-view="page"] .settings-door-answer { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+    .settings-shell[data-settings-view="page"] .settings-needs:not([data-all]) { display: none; }
+    .settings-shell[data-settings-view="page"] .settings-being-count { color: var(--text-primary); font-weight: 600; }
 }
 
-.settings-panel {
-    display: none;
-    flex-direction: column;
-    gap: 18px;
-}
-
-.settings-panel.active {
+/* A page's chrome: Back naming where it leads, then the title. The page module draws only what is under them: one
+   lead sentence if it has one (.settings-page-lead, first in its body), then objects of rows.
+   Back stays at the top while the page scrolls. A sticky row is held inside its scroller's padding, so with `top: 0`
+   what scrolled showed in the page's top inset above it. The row's own box holds that inset instead: it starts at the
+   page's top edge (the negative margin), keeps Back where it stood (the same padding) and stays there (the negative
+   `top`), on the room's colour, so what scrolls passes under it and never shows above it. It reaches 12 px into the
+   side gutters the same way, over the soft shadow a card casts beside itself. */
+.settings-back-row {
+    position: sticky;
+    top: calc(-1 * var(--settings-top, 0px));
+    z-index: 1;
     display: flex;
+    align-items: center;
+    box-sizing: content-box;
+    min-height: var(--control-h-sm);
+    margin: calc(-1 * var(--settings-top, 0px)) calc(-1 * var(--space-3)) var(--space-1);
+    padding: var(--settings-top, 0px) var(--space-3) 0;
+    background: var(--bg-primary);
 }
-
-/* Design-system tokens only (docs/DESIGN.md); guarded by
-   tests/test_web_typography_static.py. */
-.settings-section-copy {
+/* On a phone the header above a page keeps its ☰ over that row, so the button's soft shadow is not cut where the row
+   begins (over the home nothing changes: its first card lies over that shadow, as on every page). */
+html[data-layout="stack"] #page-settings > .app-page-header:has(~ .settings-shell[data-settings-view="page"]) { position: relative; z-index: 2; }
+.settings-back {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    margin-inline-start: -4px;
+    padding: 0 var(--space-1) 0 0;
+    border: 0;
+    border-radius: 999px;
+    background: none;
+    color: var(--text-secondary);
+    font: inherit;
+    font-size: var(--type-body);
+    font-weight: 500;
+    line-height: var(--line-title);
+    cursor: pointer;
+    white-space: nowrap;
+}
+.settings-back > svg { flex: none; width: 14px; height: 14px; }
+@media (hover: hover) { .settings-back:hover { color: var(--text-primary); } }
+.settings-back:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: 2px; }
+.settings-page-title {
+    margin: 0;
+    color: var(--text-primary);
+    font-size: var(--type-page);
+    font-weight: 600;
+    line-height: var(--line-title);
+    overflow-wrap: anywhere;
+}
+.settings-page-body { display: flex; flex-direction: column; gap: var(--space-4); min-width: 0; }
+.settings-page-lead {
+    margin: 0;
     color: var(--text-meta);
     font-size: var(--type-body);
     line-height: var(--line-body);
-    max-width: 900px;
 }
+.settings-page-body > .settings-page-lead:first-child { margin-top: calc(var(--space-1) - var(--space-4)); }
+/* An object of a page: its title if it has one, one lead, then its rows; what an install rarely changes folds at
+   its end (details[data-settings-fold], named More with what it holds). */
+.settings-card { display: flex; flex-direction: column; gap: var(--space-3); min-width: 0; }
+/* A title stands as tall as a card's small action, so a card with one and a card without start alike. */
+.settings-card-title { display: flex; align-items: center; min-width: 0; min-height: var(--control-h-sm); margin: 0; color: var(--text-primary); font-size: var(--type-section); font-weight: 600; line-height: var(--line-title); }
+.settings-card-lead { margin: 0; color: var(--text-meta); font-size: var(--type-body); line-height: var(--line-body); }
+.settings-card-title + .settings-card-lead { margin-top: calc(-1 * var(--space-2)); }
+.settings-rows { display: flex; flex-direction: column; gap: var(--space-2); min-width: 0; }
+.settings-rows > .ui-row + .ui-row { margin-top: 0; }
+details[data-settings-fold] > .settings-rows { margin-top: var(--space-3); }
 
-.settings-shell .form-section,
-.settings-card {
+/* The home (settings_home.js): Ouroboros's card, search, then groups of quiet doors, each saying its one answer;
+   the open page's door is marked. */
+.settings-home-list { display: flex; flex-direction: column; gap: var(--space-4); min-width: 0; }
+.settings-group { display: flex; flex-direction: column; gap: var(--space-2); }
+.settings-group-title {
+    margin: 0;
+    padding: 0 var(--space-1);
+    color: var(--text-meta);
+    font-size: var(--type-meta);
+    font-weight: 600;
+    line-height: var(--line-meta);
+}
+.settings-door-list { --card-pad: var(--space-2); display: flex; flex-direction: column; gap: 2px; }
+.settings-door {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+    column-gap: var(--space-3);
+    width: 100%;
+    min-height: 56px;
+    padding: var(--space-2) var(--space-3);
+    border: 0;
+    border-radius: var(--radius-inner);
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: start;
+    cursor: pointer;
+    transition: var(--motion-tone);
+}
+@media (hover: hover) { .settings-door:hover { background: var(--tone-quiet-hover); } }
+.settings-door:active { filter: var(--press); }
+.settings-door:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: 2px; }
+.settings-door[aria-current="page"] { background: var(--tone-crimson-soft); }
+.settings-door[aria-current="page"] :is(.settings-door-title, .settings-door-answer, .settings-door-end) { color: var(--tone-crimson-soft-ink); }
+.settings-door[aria-current="page"] .settings-door-glyph { background: transparent; color: var(--tone-crimson-soft-ink); }
+.settings-door-glyph {
+    display: grid;
+    place-items: center;
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: var(--surface-tray);
+    color: var(--text-secondary);
+}
+.settings-door-glyph > svg:not(.settings-gauge) { width: 18px; height: 18px; }
+/* A glyph that says a fact: the Access level as ascending bars, the share of the budget spent as an arc. What is
+   reached is drawn in the glyph's ink, the rest of the scale faint. */
+.settings-gauge-rail { opacity: 0.22; }
+.settings-door-words { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.settings-door-title { color: var(--text-primary); font-size: var(--type-body); font-weight: 600; line-height: var(--line-title); }
+.settings-door-answer { color: var(--text-meta); font-size: var(--type-meta); line-height: var(--line-meta); overflow-wrap: anywhere; }
+.settings-door-answer:empty { display: none; }
+.settings-door-end { display: flex; align-items: center; gap: var(--space-2); color: var(--text-disabled); }
+.settings-search-empty { margin: 0; padding: 0 var(--space-1); color: var(--text-meta); font-size: var(--type-body); line-height: var(--line-body); }
+
+/* Ouroboros's own card, in its voice (ui.css gives .settings-voice the voice's materials on a dark document): who it
+   is, its state, and what waits for the owner here as lines of the card, each with its one action. */
+.settings-voice { background: var(--voice-ouroboros-card); color: var(--text-primary); }
+.settings-being {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: center;
+    gap: var(--space-3) var(--space-4);
+}
+.settings-being-avatar {
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    background: var(--surface-tray) url("/static/logo.jpg") center / cover no-repeat;
+}
+.settings-being-words { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.settings-being-name { color: var(--text-primary); font-size: var(--type-section); font-weight: 600; line-height: var(--line-title); }
+.settings-being-state {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0 6px;
+    color: var(--text-meta);
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+}
+.settings-being-sep { color: var(--text-disabled); }
+.settings-being-count { padding: 0; border: 0; background: none; color: inherit; font: inherit; text-align: start; cursor: pointer; }
+.settings-being-count:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: 2px; border-radius: 6px; }
+.settings-needs { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.settings-needs[hidden] { display: none; }
+.settings-needs > .settings-need {
+    grid-template-columns: 22px minmax(0, 1fr) auto;
+    grid-template-areas: "lead words actions" "lead meta actions";
+    row-gap: 2px;
+    min-height: 40px;
+    padding: var(--space-1) 0;
+    background: transparent;
+}
+.settings-need-lead { grid-area: lead; display: grid; place-items: center; }
+.settings-need > .ui-row-title { grid-area: words; display: block; overflow: visible; }
+.settings-need > .ui-row-meta { grid-area: meta; }
+.settings-need > .ui-row-actions { grid-area: actions; grid-column: auto; grid-row: auto; flex-wrap: nowrap; justify-content: flex-end; }
+/* A long list shows its first lines (two on a phone, three on a desk) and one quiet line that opens the rest. */
+.settings-needs-more { align-self: flex-start; display: none; }
+.settings-needs:not([data-all]) > .settings-need:nth-child(n + 4) { display: none; }
+html[data-layout="stack"] .settings-needs:not([data-all]) > .settings-need:nth-child(n + 3) { display: none; }
+.settings-needs:not([data-all], [data-count="3"]) > .settings-needs-more,
+html[data-layout="stack"] .settings-needs:not([data-all]) > .settings-needs-more { display: inline-flex; }
+
+/* Search: one capsule field over the list. */
+.settings-search {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    height: 40px;
+    padding: 0 var(--space-4);
+    border-radius: 999px;
+    background: var(--surface-capsule);
+    box-shadow: var(--elev-rest);
+    color: var(--text-secondary);
+    cursor: text;
+}
+.settings-search > svg { flex: none; width: 16px; height: 16px; }
+.settings-search > input {
+    flex: 1 1 auto;
+    min-width: 0;
+    padding: 0;
+    border: 0;
+    outline: 0;
+    background: transparent;
+    color: var(--text-primary);
+    font: inherit;
+    font-size: var(--type-body);
+    -webkit-appearance: none;
+    appearance: none;
+}
+.settings-search > input::placeholder { color: var(--text-disabled); }
+.settings-search > input::-webkit-search-cancel-button { -webkit-appearance: none; appearance: none; }
+.settings-search:focus-within { box-shadow: var(--elev-rest), 0 0 0 3px var(--focus-accent-ring); }
+
+/* The section (settings_controls.js settingsSection; DESIGN.md principle 7): a .ui-card holding the title row, one
+   lead in owner words, the controls, and the former copy behind one Details disclosure. The section is the size
+   container its segmented rows measure against (the tray below is one too, for the rows it holds). */
+.settings-shell .form-section {
     display: flex;
     flex-direction: column;
-    gap: 14px;
-    padding: 18px;
-}
-
-.settings-shell .form-section {
+    gap: var(--space-3);
     margin-bottom: 0;
+    container: settingsbox / inline-size;
 }
-
-.settings-shell .form-section.compact {
-    margin-top: 0;
-}
-
-.settings-shell .form-section.danger {
-    border-color: rgba(220, 38, 38, 0.18);
-    background: rgba(239, 68, 68, 0.05);
-}
+/* The Danger Zone is the red tone on the object. */
+.settings-shell .form-section.danger { background: var(--tone-red); }
 
 .settings-shell .form-section h3 {
     margin-bottom: 0;
 }
 
-.settings-card h3 {
-    margin: 0;
-}
-
-.settings-card-head {
+/* The title row: the title, and the section's quiet actions docked at its end. */
+.settings-section-head {
     display: flex;
-    align-items: flex-start;
+    flex-wrap: wrap;
+    align-items: center;
     justify-content: space-between;
-    gap: 14px;
+    gap: var(--space-2) var(--space-3);
+}
+.settings-section-head > h3 { flex: 1 1 12rem; min-width: 0; }
+
+.settings-section-lead,
+.settings-section-copy {
+    margin: 0;
+    color: var(--text-meta);
+    font-size: var(--type-body);
+    line-height: var(--line-body);
+    max-width: 72ch;
+    overflow-wrap: anywhere;
 }
 
+/* A provider card's inset lives in its head and body (the disclosure's summary is the head), so the card itself
+   has none: the inset token is set to nothing on this scope, never the padding property. */
 .settings-provider-card {
+    --card-pad: 0;
     overflow: hidden;
 }
 
-.settings-provider-card summary {
-    list-style: none;
-    cursor: pointer;
+/* The card head: its disclosure (title and hint) and the card's own Add key, docked right
+   (docs/DESIGN.md §6: a section-level action belongs in its group's header). */
+.settings-provider-head {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: 16px 18px;
+}
+
+.settings-provider-toggle {
+    flex: 1 1 auto;
+    min-width: 0;
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 16px;
-    padding: 16px 18px;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--text-primary);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
 }
 
-.settings-provider-card summary::-webkit-details-marker {
-    display: none;
+.settings-provider-toggle:focus-visible {
+    outline: 2px solid var(--focus-accent-border);
+    outline-offset: 4px;
+    border-radius: var(--radius-inner);
 }
+
+.settings-provider-head > .btn { flex: 0 0 auto; }
 
 .settings-provider-title {
     display: flex;
@@ -119,6 +354,7 @@
     color: var(--text-meta);
     font-size: var(--type-meta);
     line-height: var(--line-meta);
+    font-weight: 400;
     text-align: right;
 }
 
@@ -129,67 +365,34 @@
     padding: 0 18px 18px;
 }
 
-/* Collapsed "More providers" wrapper: rarely used provider cards (Cloud.ru,
-   GigaChat) stay mounted inside it whether it is open or not. The summary
-   reuses the provider-card visual grammar (shared ui-card border/background
-   variables) so it reads as a peer of the cards above it. */
-.settings-more-providers > summary {
-    list-style: none;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 16px;
-    padding: 16px 18px;
-    border: 1px solid var(--ui-card-border);
-    border-radius: var(--radius);
-    background: var(--ui-card-bg);
-    font-weight: 600;
-    color: var(--text-primary);
-}
-
-.settings-more-providers > summary::-webkit-details-marker {
-    display: none;
-}
-
-.settings-more-providers-body {
+/* Key rows: the account-row anatomy (name and status, meta line, actions docked right) with the
+   key's own fields and quiet result lines under the two lines (docs/DESIGN.md §6). */
+.connection-rows {
     display: flex;
     flex-direction: column;
-    gap: 18px;
-    padding-top: 18px;
+    gap: var(--space-2);
 }
 
-/* Collapsed subsection INSIDE a form section (Agents → Delegation → Advanced):
-   the same "More options" grammar as the provider wrapper above, one step
-   quieter because it sits within a section rather than beside cards. Two path
-   roots nobody edits in a normal week must not cost the tab its scannability. */
-.settings-subsection > summary {
-    list-style: none;
-    cursor: pointer;
-    padding: 8px 0;
+.harness-account-row.connection-row {
+    grid-template-areas: "main actions" "meta actions" "fields fields";
+}
+
+.connection-fields {
+    grid-area: fields;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    min-width: 0;
+    margin-top: var(--space-2);
+}
+
+.connection-fields > .settings-inline-status:empty { display: none; }
+
+.connection-note {
+    color: var(--text-meta);
     font-size: var(--type-meta);
     line-height: var(--line-meta);
-    color: var(--text-meta);
-    border-top: 1px solid var(--divider);
-}
-
-.settings-subsection > summary::-webkit-details-marker {
-    display: none;
-}
-
-.settings-subsection > summary::before {
-    content: "▸ ";
-}
-
-.settings-subsection[open] > summary::before {
-    content: "▾ ";
-}
-
-.settings-subsection-body {
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-    padding: 4px 0 8px;
+    overflow-wrap: anywhere;
 }
 
 .settings-extension-sections {
@@ -201,6 +404,16 @@
 .settings-extension-section {
     padding: 12px 14px;
 }
+/* On a skill's own page (settings_extension_forms.js) each registered section is an object of the page; the page's
+   title already names a lone section, so its own head is not repeated. */
+.settings-page-body .settings-extension-section {
+    padding: var(--card-pad);
+    border-radius: var(--radius-object);
+    background: var(--surface-object);
+    box-shadow: var(--elev-rest);
+}
+.settings-page-body .settings-extension-section:only-child > .settings-extension-section-head { display: none; }
+.settings-page-body .settings-extension-section-head > strong { font-size: var(--type-section); line-height: var(--line-title); font-weight: 600; }
 
 .settings-extension-section-head {
     display: flex;
@@ -226,9 +439,10 @@
     line-height: var(--line-body);
 }
 
-.settings-shell .form-row {
+.settings-shell .form-row,
+.connection-fields .form-row {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr));
     gap: 14px;
     margin-bottom: 0;
 }
@@ -239,66 +453,45 @@
 }
 
 .settings-shell .form-grid.two {
-    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
 }
 
 .settings-shell .form-grid.four {
-    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr));
 }
 
 .settings-shell .form-field {
     min-width: 0;
-    gap: 8px;
 }
 
-/* Uppercase micro-label retired (docs/DESIGN.md "Hierarchy rule"). */
+/* A field's name reads as every `.ui-field` name does: meta size and ink, regular weight, close above its field.
+   Uppercase micro-label retired (docs/DESIGN.md "Hierarchy rule"). */
 .settings-shell .form-field label {
     font-size: var(--type-meta);
     line-height: var(--line-meta);
-    font-weight: 600;
     color: var(--text-meta);
     text-transform: none;
     letter-spacing: normal;
 }
 
 
-.mcp-servers-list {
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-}
-
-.mcp-server-card {
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-    padding: 14px;
-}
-
-.mcp-server-card-head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 12px;
-}
-
-.mcp-server-card-title {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-}
-
-.mcp-server-card-actions,
+/* A tool server's form (mcp_settings.js): a tick with its words, and the chip of a sign-in state or an imported
+   entry, a flat status tint (DESIGN "Status and chips"): the state word in its hue, never pressable. */
 .mcp-server-enabled {
     display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 8px;
+    align-items: flex-start;
+    gap: var(--space-2);
+    color: var(--text-primary);
+    font-size: var(--type-body);
+    line-height: var(--line-body);
 }
+.mcp-server-enabled > .ui-checkbox { flex: none; margin-top: 2px; }
 
 .mcp-server-status {
-    width: fit-content;
-    padding: 3px 8px;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    padding: 1px var(--space-2);
+    border-radius: var(--pill-radius);
     font-size: var(--type-meta);
     line-height: var(--line-meta);
     background: var(--status-neutral-bg);
@@ -309,16 +502,24 @@
 .mcp-server-status-danger { color: var(--status-error-fg); background: var(--status-error-bg); }
 .mcp-server-status-muted { color: var(--status-neutral-fg); }
 
-.mcp-tools-disclosure {
-    border-radius: 12px;
-    border: 1px solid rgba(var(--neutral-rgb), 0.06);
-    padding: 10px 12px;
+/* A remote server's sign-in: one fact and one button; the paste and the app registration under Details. */
+.mcp-sign-in { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.mcp-sign-in[hidden] { display: none; }
+.mcp-sign-in-details { flex-basis: 100%; }
+.mcp-sign-in-details label { display: grid; gap: 6px; margin: 8px 0; }
+
+.mcp-server-form {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
 }
 
-.mcp-tools-disclosure summary {
-    cursor: pointer;
-    color: var(--text-secondary);
-}
+.mcp-server-facts { margin: 0; display: flex; flex-direction: column; gap: var(--space-1); }
+.mcp-server-facts > div { display: flex; flex-wrap: wrap; gap: 0 var(--space-3); font-size: var(--type-meta); line-height: var(--line-meta); }
+.mcp-server-facts dt { flex: 0 1 9em; color: var(--text-meta); }
+.mcp-server-facts dd { flex: 1 1 16rem; min-width: 0; margin: 0; color: var(--text-primary); overflow-wrap: anywhere; }
+/* The tools a server lists stand at the end of their card, after its facts. */
+.mcp-server-facts:empty { display: none; }
 
 .mcp-tools-list {
     display: flex;
@@ -349,45 +550,21 @@
 .settings-inline-note[data-tone="warn"] { color: var(--status-warn-fg); }
 .settings-inline-note[data-tone="error"] { color: var(--status-error-fg); }
 
-/* Utility: hide elements that start as hidden and are revealed via JS */
-.local-model-hidden {
-    display: none !important;
-}
-
 /* Local model download progress bar */
+.local-model-progress-wrap[hidden] { display: none; }
 .local-model-progress-wrap {
-    margin-top: 8px;
     height: 6px;
-    border-radius: var(--radius-xs);
+    border-radius: var(--pill-radius);
     background: rgba(var(--neutral-rgb), 0.08);
     overflow: hidden;
 }
 
 .local-model-progress-bar {
     height: 100%;
-    border-radius: var(--radius-xs);
+    border-radius: var(--pill-radius);
     background: var(--accent);
     width: 0%;
     transition: width 0.4s ease;
-}
-
-/* Install Local Runtime button */
-.local-model-install-btn {
-    margin-top: 10px;
-}
-
-.settings-unsaved-indicator {
-    color: var(--status-warn-fg);
-    font-weight: 600;
-    min-width: 126px;
-    opacity: 0;
-    visibility: hidden;
-    text-align: right;
-}
-
-.settings-unsaved-indicator.is-visible {
-    opacity: 1;
-    visibility: visible;
 }
 
 .settings-toolbar {
@@ -396,72 +573,76 @@
     align-items: center;
     gap: 10px;
 }
+/* Rows that wrap on a phone (a toolbar, a secret's buttons, an account's actions and its resources, an action row
+   of three controls or more such as the local model's Start, Stop and Test):
+   under a finger their controls take the touch minimum as their own height through the control tokens (the lock
+   writes the box), so no reach covers a neighbour (DESIGN "Touch and containment"). */
+@media (pointer: coarse) {
+    :is(.settings-toolbar, .secret-input-row, .harness-account-actions, .account-resource-panel,
+        .settings-extension-actions, .harness-maintenance-actions),
+    .settings-shell .ui-action-row:has(> .btn ~ .btn ~ .btn) {
+        --control-h: var(--touch-target-min);
+        --control-h-sm: var(--touch-target-min);
+    }
+}
 
-/* A single action with a durable result belongs to one row: the result stays
-   readable on the left while the action keeps a stable right edge. */
+/* One reader left, outside Settings: the Skills › Browse cards (skill_browse.js). Settings and Dashboard › Updates
+   compose ui.css .ui-action-row; this goes with its last reader, once Skills composes the shared row too. */
 .settings-action-row {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
+    display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: var(--space-3);
     min-width: 0;
 }
-
-.settings-action-row > .settings-inline-status {
-    min-width: 0;
-}
-
-.settings-action-row > .btn-default {
-    justify-self: end;
-}
-
-.settings-footer {
-    flex-shrink: 0;
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    justify-content: space-between;
-    gap: var(--space-3);
-    padding: var(--space-3) 2px 0;
-    border-top: 1px solid rgba(var(--neutral-rgb), 0.06);
-    background: linear-gradient(180deg, rgba(var(--shell-rgb), 0), rgba(var(--shell-rgb), 0.92) 55%);
-}
-
-.settings-footer-actions,
-.settings-footer-status {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 10px;
-}
-
-.settings-footer-actions {
-    flex: 0 0 auto;
-}
-
-.settings-footer-status {
-    flex: 1 1 auto;
-    justify-content: flex-end;
-    min-width: 0;
-}
-
-.settings-footer-status #settings-status {
-    min-width: 0;
-    max-width: 52ch;
-    flex: 1 1 220px;
+.settings-action-row > :first-child {
+    flex: 1 1 0;
+    min-width: min(100%, var(--result-copy-min-width));
     overflow-wrap: anywhere;
-    text-align: right;
 }
+.settings-action-row > :last-child:not(:first-child) {
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 100%;
+    margin-inline-start: auto;
+    white-space: normal;
+}
+.settings-action-row > :empty { display: none; }
 
+/* A secret's field row: the input, then its buttons at the field's middle, however many the row has. */
 .secret-input-row {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) auto auto;
-    gap: 10px;
-    align-items: stretch;
+    grid-auto-flow: column;
+    grid-template-columns: minmax(0, 1fr);
+    grid-auto-columns: auto;
+    gap: var(--space-2);
+    align-items: center;
 }
 
 .secret-input-row input {
     min-width: 0;
+}
+
+.settings-secret-source,
+.settings-secret-status {
+    grid-column: 1 / -1;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+/* Show puts the value in the masked input's own cell (the input steps aside);
+   the buttons keep to its first line rather than stretching with a long value. */
+.settings-secret-value {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+    -webkit-user-select: text;
+    user-select: text;
+    cursor: text;
+}
+
+.settings-secret-value:not([hidden]) ~ .btn {
+    align-self: start;
 }
 
 .available-subagents-editor {
@@ -472,7 +653,6 @@
 }
 
 .available-subagents-toolbar,
-.available-subagent-head,
 .available-subagent-actions {
     display: flex;
     flex-wrap: wrap;
@@ -484,6 +664,13 @@
 .available-subagents-toolbar .btn-default,
 .available-subagent-actions {
     margin-left: auto;
+}
+
+/* Reserve the intent slot even when Settings' Save bar owns the dirty word:
+   the first edit never re-wraps or collapses a toolbar line above the cards. */
+.available-subagents-intent {
+    min-width: 8rem;
+    min-height: calc(var(--type-meta) * var(--line-meta));
 }
 
 .available-subagents-count,
@@ -507,17 +694,23 @@
     gap: var(--space-2);
 }
 
-/* Compact card (docs/DESIGN.md §6 row anatomy): head → Description → route
-   controls → one meta line. Inner rhythm is one space token and the card
-   padding three, so three cards fit a laptop-height Settings body. */
+/* Open card (docs/DESIGN.md §6 row anatomy): head → current exceptions →
+   labelled Source and Model, then Account / Effort / Access → Description →
+   one meta line → Processing and Details & history. The card is a size
+   container, so its own width, not the viewport, picks the field columns. */
 .available-subagent-row {
     display: flex;
     flex-direction: column;
-    gap: var(--space-1);
+    gap: var(--space-2);
     padding: var(--space-3);
-    border: 1px solid var(--surface-border);
-    border-radius: var(--radius);
-    background: var(--surface-card-soft);
+    border: 1px solid transparent;
+    border-radius: var(--radius-inner);
+    background: var(--surface-tray);
+    container: subagentcard / inline-size;
+}
+
+.available-subagent-row [hidden] {
+    display: none;
 }
 
 /* An entry the owner tried to save with an error is emphasised, not dimmed. */
@@ -526,12 +719,52 @@
     background: var(--status-error-bg);
 }
 
+/* The title side wraps inside its own basis; the Reviewer mark and the actions
+   keep the end slot. Whether the head wraps depends on the card width only, so
+   no status word or caption moves the Reviewer box (docs/DESIGN.md §6). */
+.available-subagent-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: var(--space-2);
+}
+
+.available-subagent-title {
+    display: flex;
+    flex: 1 1 16rem;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-1) var(--space-2);
+    min-width: 0;
+    min-height: 34px;
+}
+
+/* Source beside a wide Model, then Account / Effort / Access; fewer columns as
+   the card narrows. Tracks yield to the card (minmax(0, …)). */
 .available-subagent-route {
     display: grid;
-    /* A track minimum yields to the container: the viewport query does not know
-       the Settings column width, so the floor is capped at 100% of the row. */
-    grid-template-columns: repeat(auto-fit, minmax(min(100%, 130px), 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: var(--space-2);
+}
+
+.available-subagent-field-model {
+    grid-column: span 2;
+}
+
+@container subagentcard (max-width: 34rem) {
+    .available-subagent-route {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .available-subagent-field-model {
+        grid-column: 1 / -1;
+    }
+}
+
+@container subagentcard (max-width: 22rem) {
+    .available-subagent-route {
+        grid-template-columns: minmax(0, 1fr);
+    }
 }
 
 .available-subagent-heading {
@@ -541,7 +774,18 @@
     font-weight: 600;
 }
 
-/* Two short words on one line; the full sentence is the status's title. */
+/* The per-row owner switch leads the card head. Padding buys a comfortable
+   pointer target around the 14px native box; the matching negative margin
+   keeps the head's own rhythm (docs/DESIGN.md §6). */
+.available-subagent-enable {
+    display: inline-flex;
+    align-items: center;
+    padding: var(--space-2);
+    margin: calc(-1 * var(--space-2));
+    cursor: pointer;
+}
+
+/* One short availability word; the full sentence is the status's title. */
 .available-subagent-head .settings-inline-status {
     min-width: 0;
     white-space: nowrap;
@@ -571,44 +815,80 @@
 }
 
 .available-subagent-meta {
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-
-.available-subagent-meta[data-run-history] {
-    white-space: normal;
     overflow-wrap: anywhere;
 }
 
-.available-subagent-actions .btn-default {
-    min-height: 34px;
-    padding: 0 11px;
+/* A current exception in words (a specific refusal, a marked row switched off):
+   the status title needs a hover a phone lacks. */
+.available-subagent-status-reason {
+    color: var(--status-warn-fg);
+    font-size: var(--type-meta);
+    line-height: var(--line-body);
+    overflow-wrap: anywhere;
 }
 
-.settings-secret-list {
+.available-subagent-reviewer {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    min-height: 34px;
+    color: var(--text-primary);
+    font-size: var(--type-body);
+    cursor: pointer;
+}
+
+/* Details & history: label beside value, stacked on a narrow card. */
+.available-subagent-facts {
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: var(--space-1);
+    margin: var(--space-1) 0 0;
 }
 
-.settings-custom-secret-row {
+.available-subagent-facts > div {
     display: grid;
-    /* A track minimum yields to the container: the viewport query does not know
-       the Settings column width, so the two fields shrink and Remove keeps its own. */
-    grid-template-columns: minmax(0, 0.65fr) minmax(0, 1.35fr) auto;
-    gap: 10px;
-    align-items: start;
-    padding: var(--space-3);
+    grid-template-columns: minmax(0, 8rem) minmax(0, 1fr);
+    gap: var(--space-2);
 }
 
-.settings-custom-secret-remove {
-    align-self: end;
-    padding-inline: var(--space-3);
+/* A row whose level is in the model name: the effort facet reads, it does not edit. */
+.available-subagent-readonly {
+    display: flex;
+    align-items: center;
+    color: var(--text-meta);
 }
 
-.settings-model-grid,
-.settings-effort-grid {
+.available-subagent-facts dt {
+    color: var(--text-meta);
+    font-size: var(--type-meta);
+    font-weight: 600;
+}
+
+.available-subagent-facts dd {
+    margin: 0;
+    color: var(--text-meta);
+    font-size: var(--type-meta);
+    overflow-wrap: anywhere;
+}
+
+@container subagentcard (max-width: 28rem) {
+    .available-subagent-facts > div {
+        grid-template-columns: minmax(0, 1fr);
+        gap: 0;
+    }
+}
+
+.available-subagents-review-empty,
+.available-subagents-review-copies {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+    color: var(--status-warn-fg);
+    font-size: var(--type-meta);
+}
+
+.settings-model-grid {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 14px;
@@ -652,6 +932,8 @@
 
 .settings-effort-card {
     gap: 10px;
+    /* The tray's own width, not the viewport, decides when a segmented group wraps. */
+    container: settingsbox / inline-size;
 }
 
 .settings-effort-card label {
@@ -663,104 +945,31 @@
     letter-spacing: normal;
 }
 
-.settings-effort-group {
-    display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 8px;
-}
-
-/* .ui-segment — SSOT base look for a segmented single-select button (sibling of
-   .app-tab). Settings-specific overrides (column counts, accent colors) stay on
-   .settings-effort-*; the resting look + centering live here. The flex centering
-   fixes labels that sat top-left in taller cells (the effort-button bug). */
-.ui-segment {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    text-align: center;
-    min-height: 38px;
-    line-height: 1.2;
-    border: 1px solid rgba(var(--neutral-rgb), 0.08);
-    background: rgba(var(--neutral-rgb), 0.04);
-    color: var(--text-secondary);
-    border-radius: 12px;
-    padding: 10px 12px;
-    cursor: pointer;
-    font-size: var(--button-font-size);
-    font-weight: 600;
-}
-
-.settings-effort-btn.active,
-.settings-effort-btn:hover {
-    color: var(--text-primary);
-    border-color: rgba(232, 93, 111, 0.35);
-    background: rgba(232, 93, 111, 0.12);
-}
-
-/* Review enforcement toggle: 2 columns. */
-[data-enforcement-group].settings-effort-group {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-
-[data-update-channel-group].settings-effort-group {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-}
-
-/* Task-result review keeps its compact 3-column shape. */
-[data-task-review-group].settings-effort-group {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-}
-
-/* Max review cycles: five short segments (1 / 2 / 3 / 5 / ∞) on one row. */
-[data-review-cycles-group].settings-effort-group {
-    grid-template-columns: repeat(5, minmax(0, 1fr));
-}
-
-/* Shared disabled segmented-button style. */
-.settings-effort-btn:disabled {
-    cursor: not-allowed;
-    opacity: 0.55;
-}
-.settings-effort-btn:disabled:hover {
-    background: rgba(var(--neutral-rgb), 0.04);
-    border-color: rgba(var(--neutral-rgb), 0.08);
-    color: var(--text-secondary);
-    transform: none;
-}
-
-
-/* The warn foreground, not the raw --amber: #f59e0b over the 12% amber wash is
-   ~2:1 on the light surface and unreadable when selected. --status-warn-fg is
-   the token that already carries a legible warn tint per theme. */
-[data-enforcement-group] .settings-effort-btn[data-effort-value="advisory"].active,
-[data-enforcement-group] .settings-effort-btn[data-effort-value="advisory"]:hover {
-    color: var(--status-warn-fg);
-    border-color: var(--status-warn-border);
-    background: var(--status-warn-bg);
-}
-
-[data-enforcement-group] .settings-effort-btn[data-effort-value="blocking"].active,
-[data-enforcement-group] .settings-effort-btn[data-effort-value="blocking"]:hover {
-    color: var(--text-primary);
-    border-color: rgba(232, 93, 111, 0.5);
-    background: var(--accent-18);
+/* The local toggle's checkbox and gap: one pair of dimensions for the toggles and for the
+   notes that line up with their label text (Startup & background). */
+:root {
+    --local-toggle-box: 14px;
+    --local-toggle-gap: 6px;
 }
 
 .local-toggle {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
+    gap: var(--local-toggle-gap);
     font-size: var(--type-meta);
     line-height: var(--line-meta);
     color: var(--text-meta);
     cursor: pointer;
-    white-space: nowrap;
+    min-width: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
 }
 
 .local-toggle input[type="checkbox"] {
+    flex-shrink: 0;
     accent-color: var(--accent);
-    width: 14px;
-    height: 14px;
+    width: var(--local-toggle-box);
+    height: var(--local-toggle-box);
     cursor: pointer;
 }
 
@@ -768,130 +977,43 @@
     color: var(--status-warn-fg);
 }
 
-.settings-test-result {
-    display: none;
-    margin-top: 4px;
-    color: var(--text-meta);
-    font-size: var(--type-meta);
-    line-height: var(--line-meta);
-}
-
 @media (max-width: 980px) {
-    .settings-shell {
-        padding: 0 14px 14px;
+    .harness-account-row.connection-row {
+        grid-template-areas: "main" "meta" "fields" "actions";
     }
 
-    .settings-model-grid,
-    .settings-effort-grid {
+    .settings-model-grid {
         grid-template-columns: 1fr;
     }
 }
 
 @media (max-width: 760px) {
-    .settings-provider-card summary,
-    .settings-footer {
-        align-items: stretch;
+    .settings-provider-toggle {
         flex-direction: column;
-    }
-
-    .settings-footer-actions,
-    .settings-footer-status {
-        justify-content: flex-start;
-        align-items: stretch;
-    }
-
-    .settings-footer-status #settings-status,
-    .settings-unsaved-indicator {
-        text-align: left;
+        align-items: flex-start;
+        gap: var(--space-1);
     }
 
     .settings-provider-hint {
         text-align: left;
     }
 
+    /* A narrow field row: the input on its own line, the buttons under it from the left. */
     .secret-input-row {
-        grid-template-columns: minmax(0, 1fr) auto auto;
+        display: flex;
+        flex-wrap: wrap;
     }
-    .secret-input-row > input { grid-column: 1 / -1; }
-    .secret-input-row > button:first-of-type { grid-column: 2; }
-
-    .settings-card-head,
-    .settings-custom-secret-row {
-        grid-template-columns: 1fr;
-        align-items: stretch;
-    }
-
-    .available-subagent-route {
-        grid-template-columns: 1fr;
-    }
+    .secret-input-row > input,
+    .secret-input-row > .settings-secret-value { flex: 1 1 100%; }
 
     .available-subagents-toolbar .btn-default {
         margin-left: 0;
     }
 
-    .settings-action-row {
-        grid-template-columns: 1fr;
-        align-items: start;
-    }
-
-    .settings-action-row > .settings-inline-status:empty {
-        display: none;
-    }
-
-    .settings-action-row > .btn-default {
-        justify-self: end;
-    }
-
-    .settings-effort-group {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-
-    [data-update-channel-group].settings-effort-group,
-    [data-task-review-group].settings-effort-group {
-        grid-template-columns: repeat(3, minmax(0, 1fr));
-    }
-
-    [data-review-cycles-group].settings-effort-group {
-        grid-template-columns: repeat(5, minmax(0, 1fr));
-    }
 }
 
 @media (max-width: 640px) {
-    /* Mobile settings keep horizontal tab pills; back element remains hidden compat. */
-    .settings-shell {
-        padding: 0 10px 10px;
-    }
-
-    .settings-tabs-bar {
-        padding: 0;
-    }
-
-    .settings-tabs {
-        flex-wrap: nowrap;
-        gap: 8px;
-        padding: 8px 2px 10px;
-        overflow-x: auto;
-    }
-
-    .settings-tab {
-        flex: 0 0 auto;
-        min-height: 38px;
-        padding: 8px 14px;
-        font-size: var(--pill-font-size);
-        white-space: nowrap;
-        border-radius: 999px;
-    }
-
-    .settings-mobile-back {
-        display: none !important;
-    }
-
-    .settings-shell .form-section {
-        padding: 14px;
-    }
-
-    .settings-provider-card summary,
-    .settings-more-providers > summary {
+    .settings-provider-head {
         padding: 14px 14px;
     }
 
@@ -900,61 +1022,578 @@
     }
 }
 
-/* track-migration:begin — Removed after remaining form consumers adopt ui-control. */
-.settings-shell .form-field input:not(.ui-control):not(.ui-checkbox),
-.settings-shell .form-field select:not(.ui-control):not(.ui-checkbox),
-.settings-shell .form-field textarea:not(.ui-control):not(.ui-checkbox),
-.settings-shell .available-subagent-row input:not(.ui-control):not(.ui-checkbox),
-.settings-shell .available-subagent-row select:not(.ui-control):not(.ui-checkbox),
-.settings-shell .available-subagent-row textarea:not(.ui-control):not(.ui-checkbox),
-.settings-shell .model-role-row input:not(.ui-control):not(.ui-checkbox),
-.settings-shell .model-role-row select:not(.ui-control):not(.ui-checkbox) {
-    width: 100%;
-    min-width: 0;
-    padding: 10px 12px;
-    border-radius: 12px;
-    border: 1px solid var(--surface-border);
-    background: rgba(var(--composer-rgb), 0.88);
+
+/* Account resource disclosure (the Accounts store owns its data). */
+.account-resource-panel {
+    grid-column: 1 / -1;
+    margin-top: var(--space-3);
+    background: var(--bg-primary);
     color: var(--text-primary);
     font-size: var(--type-body);
-    font-family: inherit;
-    outline: none;
-    transition: border-color 0.2s, box-shadow 0.2s, background 0.2s;
+    line-height: var(--line-body);
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+.account-resource-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    margin-bottom: var(--space-4);
+}
+.account-resource-head h5 {
+    font-size: var(--type-body);
+    color: var(--text-primary);
+    font-weight: 600;
+    margin: 0;
+}
+.resource-age {
+    font-size: var(--type-meta);
+    color: var(--text-meta);
+}
+.resource-columns {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: var(--space-5);
+}
+.resource-section h6 {
+    font-size: var(--type-body);
+    color: var(--text-primary);
+    font-weight: 600;
+    margin: 0 0 var(--space-3);
+}
+.resource-fact {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--space-4);
+    margin-bottom: var(--space-2);
+}
+.resource-fact dt {
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+    color: var(--text-meta);
+    min-width: 0;
+}
+.resource-fact dd {
+    margin: 0;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    min-width: 0;
+}
+.resource-window {
+    margin: 0 0 var(--space-4);
+}
+.resource-window .resource-fact {
+    margin-bottom: var(--space-2);
+}
+.resource-track {
+    height: var(--space-1);
+    border-radius: var(--pill-radius);
+    background: var(--surface-tray);
+    overflow: hidden;
+    margin-bottom: var(--space-1);
+}
+.resource-fill {
+    width: var(--resource-used);
+    height: 100%;
+    background: var(--text-meta);
+    border-radius: var(--pill-radius);
+}
+.resource-window[data-spent="true"] .resource-fill {
+    background: var(--amber);
+}
+.resource-reset-section {
+    margin-top: var(--space-4);
+    padding-top: var(--space-4);
+    border-top: 1px solid var(--divider);
+}
+.resource-reset-section > h6 {
+    font-size: var(--type-body);
+    color: var(--text-primary);
+    margin: 0 0 var(--space-2);
+    font-weight: 600;
+}
+.resource-offer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-4);
+    padding: var(--space-3) 0;
+}
+.resource-offer + .resource-offer {
+    border-top: 1px solid var(--divider);
+}
+.resource-offer-title {
+    font-size: var(--type-body);
+    color: var(--text-primary);
+    font-weight: 600;
+    margin-bottom: var(--space-1);
+}
+.resource-offer-copy {
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+    color: var(--text-meta);
+}
+.resource-offer .btn {
+    flex-shrink: 0;
+}
+.resource-message {
+    padding: var(--space-3);
+    margin-bottom: var(--space-4);
+    border-radius: var(--radius-inner);
+    background: var(--surface-tray);
+    color: var(--text-primary);
+    font-size: var(--type-body);
+    line-height: var(--line-body);
+}
+.resource-message[data-tone="warn"] {
+    color: var(--status-warn-fg);
+    background: var(--status-warn-bg);
+}
+.resource-message[data-tone="ok"] {
+    color: var(--status-ok-fg);
+    background: var(--status-ok-bg);
+}
+.resource-message strong {
+    font-size: var(--type-body);
+    color: var(--text-primary);
+    font-weight: 600;
+    display: block;
+}
+.resource-message small {
+    font-size: var(--type-meta);
+    color: var(--text-meta);
+    display: block;
+    line-height: var(--line-meta);
+    margin-top: var(--space-1);
 }
 
-.settings-shell .form-field input:not(.ui-control):not(.ui-checkbox)::placeholder,
-.settings-shell .form-field textarea:not(.ui-control):not(.ui-checkbox)::placeholder,
-.settings-shell .available-subagent-row input:not(.ui-control):not(.ui-checkbox)::placeholder,
-.settings-shell .available-subagent-row textarea:not(.ui-control):not(.ui-checkbox)::placeholder,
-.secret-input:not(.ui-control)::placeholder {
-    color: rgba(var(--neutral-rgb), 0.24);
+.resource-reset-offer + .resource-reset-offer {
+    border-top: 1px solid var(--divider);
+    padding-top: var(--space-3);
+    margin-top: var(--space-3);
+}
+@media (max-width: 980px) {
+    .account-resource-panel {
+        padding: var(--space-3);
+    }
+    .resource-columns {
+        grid-template-columns: minmax(0, 1fr);
+        gap: var(--space-2);
+    }
+    .resource-section + .resource-section {
+        border-top: 1px solid var(--divider);
+        padding-top: var(--space-3);
+    }
+    .resource-offer {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: var(--space-3);
+    }
+    .account-resource-head {
+        align-items: flex-start;
+    }
+    .resource-offer .btn {
+        align-self: flex-start;
+    }
 }
 
-.settings-shell .form-field input:not(.ui-control):not(.ui-checkbox):focus,
-.settings-shell .form-field select:not(.ui-control):not(.ui-checkbox):focus,
-.settings-shell .form-field textarea:not(.ui-control):not(.ui-checkbox):focus,
-.settings-shell .available-subagent-row input:not(.ui-control):not(.ui-checkbox):focus,
-.settings-shell .available-subagent-row select:not(.ui-control):not(.ui-checkbox):focus,
-.settings-shell .available-subagent-row textarea:not(.ui-control):not(.ui-checkbox):focus,
-.settings-shell .model-role-row input:not(.ui-control):not(.ui-checkbox):focus,
-.settings-shell .model-role-row select:not(.ui-control):not(.ui-checkbox):focus {
-    border-color: var(--focus-accent-border);
-    box-shadow: 0 0 0 3px var(--focus-accent-ring);
+.resource-provenance {
+    margin-top: var(--space-4);
+    font-size: var(--type-meta);
+    color: var(--text-meta);
+}
+.resource-provenance summary {
+    cursor: pointer;
+    min-height: var(--touch-target-min);
+}
+.resource-provenance dl { margin-top: var(--space-2); }
+
+/* Header rows keep long credentials inside their own column, including WebKit. */
+.mcp-headers-fields { display: flex; flex-direction: column; gap: var(--space-2); min-width: 0; }
+.mcp-headers-fields .settings-section-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); flex-wrap: wrap; }
+.mcp-headers-fields h4 { margin: 0; font-size: var(--type-body); font-weight: 600; color: var(--text-primary); }
+.mcp-headers-fields p { margin: 0; }
+.mcp-header-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) auto; gap: var(--space-2); min-width: 0; }
+.mcp-header-row > button { justify-self: start; align-self: center; }
+.mcp-header-row .form-field, .mcp-header-row .secret-input-row { min-width: 0; }
+.mcp-import-entry { display: flex; flex-direction: column; gap: var(--space-1); overflow-wrap: anywhere; }
+.mcp-import-entry-head { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
+.mcp-import-choice { display: inline-flex; align-items: center; gap: var(--space-2); cursor: pointer; }
+@media (max-width: 600px) {
+    .mcp-header-row { grid-template-columns: minmax(0, 1fr); }
 }
 
-.settings-shell .form-field textarea:not(.ui-control):not(.ui-checkbox) {
-    min-height: 84px;
+/* About (This computer › About): a centred block in its card, its name at the page size and the versions as one meta line. */
+.about-body { display: flex; flex-direction: column; align-items: center; gap: var(--space-4); padding-block: var(--space-4); text-align: center; }
+.about-logo { width: 96px; height: 96px; border-radius: var(--radius-object); object-fit: cover; }
+.about-title { margin: 0; color: var(--text-primary); font-size: var(--type-page); line-height: var(--line-title); font-weight: 600; }
+.about-version { margin: var(--space-1) 0 0; color: var(--text-meta); font-size: var(--type-meta); line-height: var(--line-meta); }
+.about-desc { max-width: 480px; margin: 0; color: var(--text-secondary); font-size: var(--type-body); line-height: var(--line-body); }
+.about-credits { display: flex; flex-direction: column; gap: var(--space-2); font-size: var(--type-body); }
+.about-links { display: flex; gap: var(--space-4); justify-content: center; margin-top: var(--space-1); }
+.about-links a { color: var(--accent); text-decoration: none; }
+
+/* ---- A page of Settings: cards of rows ---------------------------------------------------------------------------
+   One recipe for every page (settings_ui.js, model_roles.js, settings_local_model.js, mcp_settings.js,
+   subagents_settings.js, settings_accounts.js, settings_extension_forms.js) and for the rows of the Dashboard tabs'
+   settings cards (dashboard.js mountTabSettings). The card, its title, lead, rows and fold are the shell's rules above
+   ("An object of a page"); here stand the card's head and note, the row, the door, the head of a list's entry, the
+   choice that carries a sentence, and after them what one page alone adds. Width is read from a row's own box (ui.css
+   makes .ui-row its container) or its list's, never from the window. */
+
+/* A card's head: its title, the result of what its list did or a word about the whole card, and its one action at
+   the end. In a narrow card the action goes under the title, which keeps its line. */
+.settings-card-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-3); }
+.settings-card-head > .settings-card-title { flex: 1 1 10rem; }
+.settings-card-head > .ui-result { flex: 0 1 auto; min-height: 0; }
+.settings-card-head > .ui-result:empty { display: none; }
+.settings-card-head + .settings-card-lead { margin-top: calc(-1 * var(--space-2)); }
+/* Choices kept while their master switch is off say so once, in the card's head (the page shows and hides it). */
+.settings-card-held[hidden] { display: none; }
+/* A note under a card's rows: meta words at the card's own edge. */
+.settings-card-note { margin: 0; color: var(--text-meta); font-size: var(--type-meta); line-height: var(--line-meta); }
+.settings-card-note:empty { display: none; }
+/* Cards one module binds as a whole stand 16 px apart, as the page's own cards do; a lead that opens such a stack
+   sits under the page's title like the page's own. What ends a page (Remove, Duplicate, Turn off) stands under its
+   last card, at the rows' edge. */
+.settings-stack { display: flex; flex-direction: column; gap: var(--space-4); min-width: 0; }
+.settings-stack:empty { display: none; }
+.settings-page-body > .settings-stack:first-child > .settings-page-lead:first-child { margin-top: calc(var(--space-1) - var(--space-4)); }
+.settings-foot { padding: 0 var(--space-1); }
+
+/* settings rows */
+/* A row that saves itself (settings_controls.js settingsRow) stands on the shared .ui-row, at least 52 px tall: its
+   name, one meta line with the row's result after it, its control at the end. The result is words in the meta line,
+   so an empty one takes no line, and Undo is a link in that sentence. A number is typed in a short field with its
+   unit beside it ("No limit" next to a bound that may be unlimited) and a choice of many is a list, both as tall as
+   a button with the value in the semibold weight; a path or an address has a longer field. */
+.settings-row,
+.settings-head { box-sizing: border-box; min-height: 52px; }
+.settings-row > .ui-row-meta { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 var(--space-2); }
+/* Main, a fallback or a role whose key cannot send: its line says so in the warning colour (these rows have no tinted
+   body, so the light theme's unset warning word would leave it unmarked). */
+#page-settings :is(.ui-row-meta, .models-main-meta, [data-setting-meta])[data-tone="warn"] { color: var(--status-warn-fg); }
+.settings-row-result { min-height: 0; }
+.settings-row [data-setting-meta]:empty,
+.settings-row-result:empty,
+.settings-row-fact:empty { display: none; }
+/* A row with nothing under its name stands on one line: its meta line takes no room and its name is centred against
+   the control. The words of a meta line stand in its child elements, as settingsRow draws them. */
+.settings-row > .ui-row-meta:has(> *):not(:has(> :not(:empty))) { display: none; }
+.settings-row > .ui-row-title:not(:has(+ .ui-row-meta > :not(:empty))) { grid-row: 1 / span 2; }
+.settings-row > .ui-row-actions > .ui-control { width: 14rem; max-width: 100%; }
+.settings-row[data-kind="text"] > .ui-row-actions > .ui-control { width: 18rem; }
+.settings-row > .ui-row-actions > select.ui-control,
+.settings-row-field > .ui-control { height: var(--control-h); padding-block: 0; font-weight: 600; }
+.settings-row-field { display: inline-flex; align-items: center; gap: var(--space-1); min-width: 0; }
+.settings-row-field > .ui-control { width: 4.5rem; text-align: end; font-variant-numeric: tabular-nums; }
+.settings-row-unit { color: var(--text-secondary); font-size: var(--type-body); line-height: var(--line-body); }
+.settings-row > .settings-row-more { grid-column: 1 / -1; }
+.settings-row-copy { margin: 0; max-width: 72ch; color: var(--text-meta); font-size: var(--type-meta); line-height: var(--line-meta); }
+.settings-row [aria-busy="true"] { cursor: progress; }
+/* What a row shows at its end when it is a fact, not a control: a door's value before its sign, a saved choice, an
+   address. A value that reports trouble takes the warning's ink. */
+.settings-row-value { min-width: 0; color: var(--text-meta); font-size: var(--type-body); font-weight: 600; line-height: var(--line-body); overflow-wrap: anywhere; }
+.settings-row-value[data-tone="warn"] { color: var(--status-warn-fg); }
+a.settings-row-value { color: var(--accent); text-decoration: none; }
+.settings-row-end { display: inline-flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: var(--space-2); min-width: 0; }
+/* A door row: the whole tray is the press. Its sign stands at its end (settings_controls.js doorSign), drawn here
+   once as the home's two glyphs, whatever the element holds: › opens a page of Settings, ↗ (`data-out`) leaves it. */
+button.settings-row { width: 100%; color: inherit; font: inherit; text-align: start; cursor: pointer; transition: var(--motion-tone); }
+@media (hover: hover) { :is(button.settings-row, .settings-head):hover { background: var(--tone-quiet-hover); } }
+button.settings-row:active { filter: var(--press); }
+button.settings-row:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: 2px; }
+.settings-row-chevron {
+    flex: none;
+    width: 14px;
+    height: 14px;
+    overflow: hidden;
+    color: var(--text-disabled);
+    background: currentColor;
+    font-size: 0;
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m9 18 6-6-6-6'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m9 18 6-6-6-6'/%3E%3C/svg%3E");
+    -webkit-mask-size: contain;
+    mask-size: contain;
+}
+.settings-row-chevron[data-out] {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M7 17 17 7'/%3E%3Cpath d='M7 7h10v10'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M7 17 17 7'/%3E%3Cpath d='M7 7h10v10'/%3E%3C/svg%3E");
+}
+/* A row that leads with a mark (Costs' kinds of account): the mark stands beside both lines. */
+.settings-row[data-lead] { grid-template-columns: auto minmax(0, 1fr) auto; grid-template-areas: "mark words actions" "mark meta actions"; }
+/* In a narrow row a door, a switch, a stored key's state and a short number keep their place at the row's end
+   (ui.css moves a narrow row's actions under its words; a strip, a list, a longer field and a number with "No limit"
+   do go there). A row that leads with a mark says its value as a third line and keeps its sign at the end. */
+@container (max-width: 28rem) {
+    .settings-row:is([data-kind="door"], [data-kind="switch"], [data-kind="secret"], [data-kind="number"]:not([data-no-limit])) > :is(.ui-row-title, .ui-row-meta) { grid-column: 1; }
+    .settings-row:is([data-kind="door"], [data-kind="switch"], [data-kind="secret"], [data-kind="number"]:not([data-no-limit])) > .ui-row-actions { grid-column: 2; grid-row: 1 / span 2; flex-wrap: nowrap; justify-content: flex-end; }
+    .settings-row[data-lead] > :is(.ui-row-title, .ui-row-meta) { grid-column: 2; }
+    .settings-row[data-lead] > .ui-row-actions { display: contents; }
+    .settings-row[data-lead] .settings-row-value { grid-column: 2; grid-row: 3; }
+    .settings-row[data-lead] .settings-row-chevron { grid-column: 3; grid-row: 1 / span 3; align-self: center; }
+    .settings-row[data-lead] > .settings-head-glyph { grid-row: 1 / span 3; align-self: start; }
+}
+
+/* A head: one entry of a list (an agent, a tool server, a provider, a key, a fallback). Its mark, its name with one
+   line of state (the press that opens its page; under a finger it reaches the touch minimum through ui.css
+   .ui-hit-area, inside its own row), then its switch or its actions and its sign, which keep the row's end; a head
+   with buttons (`data-actions`) puts them under the words in a narrow row, the sign still at its end. */
+.settings-head { grid-template-columns: auto minmax(0, 1fr) auto; grid-template-areas: "mark words actions"; cursor: pointer; transition: var(--motion-tone); }
+.settings-head-glyph {
+    grid-area: mark;
+    display: grid;
+    place-items: center;
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: var(--surface-tray);
+    color: var(--text-secondary);
+    font-size: 16px;
+}
+.settings-head-glyph > :is(svg, img) { width: 16px; height: 16px; }
+.settings-head-glyph > img { margin: 0; border-radius: 3px; object-fit: contain; }
+.settings-head-glyph .harness-identity-label { display: none; }
+/* A fallback's place in the order stands where a mark would. */
+.settings-head-order { width: 22px; height: 22px; background: var(--status-neutral-bg); color: var(--status-neutral-fg); font-size: var(--type-meta); font-weight: 600; font-variant-numeric: tabular-nums; }
+.settings-head-open {
+    grid-area: words;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    min-width: 0;
+    padding: 0;
+    border: 0;
+    border-radius: var(--radius-inner);
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-align: start;
+    cursor: pointer;
+}
+.settings-head-open:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: 2px; }
+.settings-head-open > .ui-row-title { display: flex; flex-wrap: wrap; align-items: center; gap: 0 6px; overflow: visible; }
+.settings-head > .ui-row-actions { grid-area: actions; flex-wrap: nowrap; justify-content: flex-end; }
+@container (max-width: 28rem) {
+    .settings-head[data-actions] { grid-template-areas: "mark words" "mark actions"; grid-template-columns: auto minmax(0, 1fr); }
+    .settings-head[data-actions] > .ui-row-actions { justify-content: flex-start; }
+    .settings-head[data-actions] .settings-row-chevron { margin-inline-start: auto; }
+}
+/* The chip beside a head's name says what stands in the way (a sign-in, a model that is not offered) or what the
+   entry is (Reviewer). */
+.settings-chip { padding: 1px 8px; font-size: var(--type-meta); font-weight: 600; line-height: var(--line-meta); }
+
+/* A choice whose every option needs a line of meaning (settings_controls.js kind `choices`; the update channel on
+   Dashboard › Updates): the options stand one under another, each a tray; the chosen one is filled and stands. While
+   a restart waits, the option in force and the chosen one carry a word. A row of choices that is its card's one row
+   answers the card's title: its one line reads as the card's lead, and its own name is kept for a screen reader. */
+.settings-row[data-kind="choices"] {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: "words" "meta" "actions";
+    padding: 0;
+    background: none;
+}
+.settings-row[data-kind="choices"] > .ui-row-actions { display: block; margin-top: var(--space-2); }
+.settings-rows > .settings-row[data-kind="choices"]:only-child > .ui-row-title { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.settings-rows > .settings-row[data-kind="choices"]:only-child > .ui-row-meta { margin-top: calc(-1 * var(--space-3)); font-size: var(--type-body); line-height: var(--line-body); }
+.settings-choices { display: flex; flex-direction: column; gap: var(--space-2); width: 100%; min-width: 0; }
+.settings-choice {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: 2px;
+    width: 100%;
+    padding: var(--space-3) var(--space-4);
+    border: 1px solid transparent;
+    border-radius: var(--radius-inner);
+    background: var(--surface-tray);
+    color: var(--text-primary);
+    font: inherit;
+    text-align: start;
+    cursor: pointer;
+    transition: var(--motion-tone);
+}
+@media (hover: hover) { .settings-choice:not(:disabled):not([aria-checked="true"], [aria-pressed="true"]):hover { background: var(--tone-quiet-hover); } }
+.settings-choice:not(:disabled):active { filter: var(--press); }
+.settings-choice:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: 2px; }
+.settings-choice:is([aria-checked="true"], [aria-pressed="true"]) { background: var(--tone-crimson-soft); color: var(--tone-crimson-soft-ink); box-shadow: var(--elev-rest); }
+.settings-choice[aria-busy="true"] { cursor: progress; }
+.settings-choice-name { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: var(--type-body); font-weight: 600; line-height: var(--line-title); }
+.settings-choice-note { color: var(--text-meta); font-size: var(--type-meta); line-height: var(--line-meta); }
+.settings-choice:is([aria-checked="true"], [aria-pressed="true"]) .settings-choice-note { color: inherit; }
+.settings-choice-mark {
+    padding: 1px var(--space-2);
+    border-radius: 999px;
+    background: var(--status-neutral-bg);
+    color: var(--status-neutral-fg);
+    font-size: var(--type-meta);
+    font-weight: 600;
+    line-height: var(--line-meta);
+}
+.settings-choice-mark:empty { display: none; }
+.settings-choice[aria-checked="true"] .settings-choice-mark { background: var(--status-warn-bg); color: var(--status-warn-fg); }
+/* Access is a ladder: each level's mark shows how far up it stands (four bars, as many lit as the level). */
+[data-setting-row="OUROBOROS_RUNTIME_MODE"] .settings-choice {
+    --bar-lit: currentColor;
+    --bar-dim: color-mix(in srgb, currentColor 28%, transparent);
+    --bar-1: var(--bar-lit);
+    --bar-2: var(--bar-dim);
+    --bar-3: var(--bar-dim);
+    --bar-4: var(--bar-dim);
+    grid-template-columns: auto minmax(0, 1fr);
+    column-gap: var(--space-3);
+    align-items: center;
+}
+[data-setting-row="OUROBOROS_RUNTIME_MODE"] .settings-choice::before {
+    content: "";
+    grid-row: 1 / span 2;
+    width: 18px;
+    height: 16px;
+    color: var(--text-secondary);
+    background:
+        linear-gradient(var(--bar-1) 0 0) 0 100% / 3px 5px no-repeat,
+        linear-gradient(var(--bar-2) 0 0) 5px 100% / 3px 9px no-repeat,
+        linear-gradient(var(--bar-3) 0 0) 10px 100% / 3px 13px no-repeat,
+        linear-gradient(var(--bar-4) 0 0) 15px 100% / 3px 16px no-repeat;
+}
+[data-setting-row="OUROBOROS_RUNTIME_MODE"] .settings-choice[aria-checked="true"]::before { color: inherit; }
+[data-setting-row="OUROBOROS_RUNTIME_MODE"] .settings-choice:nth-child(n+2) {
+    --bar-2: var(--bar-lit);
+}
+[data-setting-row="OUROBOROS_RUNTIME_MODE"] .settings-choice:nth-child(n+3) {
+    --bar-3: var(--bar-lit);
+}
+[data-setting-row="OUROBOROS_RUNTIME_MODE"] .settings-choice:nth-child(n+4) {
+    --bar-4: var(--bar-lit);
+}
+
+/* ---- What one page adds -------------------------------------------------------------------------------------------- */
+
+/* Agents (subagents_settings.js): the list's filters, a head's line of what the agent is for (two lines at most), and
+   an agent's page, whose form keeps the card recipe of setup (.available-subagent-*), each part in its own card;
+   the page is the container their columns read, as a card is in setup. */
+.agents-filters { display: flex; flex-wrap: wrap; gap: var(--space-1); margin-inline: calc(-1 * var(--space-1)); }
+.agents-filters > .filter-chip { --control-h: var(--control-h-sm); }
+/* Under a finger the small capsules reach 8px past their look: in a narrow card Add agent wraps to stand right above
+   the filters, so the two rows part by both reaches and neither covers the other (DESIGN "Touch and containment"). */
+@media (pointer: coarse) { .agents-filters { margin-top: var(--space-1); } }
+.agents-root .settings-head-open > .ui-row-meta { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
+.agent-page { container: subagentcard / inline-size; }
+.agent-page .available-subagent-purpose textarea { min-height: 84px; max-height: none; }
+.agent-status { margin: 0; }
+/* How it runs: Source, Model and Account side by side, then a Reasoning effort wide enough to say its Auto whole,
+   beside Access; one field a line once the page is too narrow for three. */
+.agent-page .available-subagent-field-model:has(+ .available-subagent-field > [data-subagent-field="account"]) { grid-column: auto; }
+.agent-page .available-subagent-field:has(> [data-subagent-effort-facet]) { grid-column: span 2; }
+@container subagentcard (max-width: 34rem) {
+    .agent-page .available-subagent-route { grid-template-columns: minmax(0, 1fr); }
+    .agent-page .available-subagent-route > .available-subagent-field { grid-column: auto; }
+}
+
+/* Models (model_roles.js): the Main model leads its page (its mark, its name at the page size, where it runs,
+   Change). */
+.models-main { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3) var(--space-4); cursor: pointer; }
+.settings-head-glyph.models-main-glyph { flex: none; width: 52px; height: 52px; font-size: 26px; }
+.settings-head-glyph.models-main-glyph > svg { width: 26px; height: 26px; }
+.models-main-words { flex: 1 1 11rem; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.models-kicker { color: var(--text-meta); font-size: var(--type-meta); line-height: var(--line-meta); }
+.models-main-name { color: var(--text-primary); font-size: var(--type-page); font-weight: 600; line-height: var(--line-title); overflow-wrap: anywhere; }
+.models-main-meta { color: var(--text-meta); font-size: var(--type-meta); line-height: var(--line-meta); overflow-wrap: anywhere; }
+.models-main-meta:empty { display: none; }
+/* A role that follows another says so more quietly than a role with a model of its own. */
+.settings-row-value[data-follows] { color: var(--text-secondary); font-weight: 500; }
+/* A role's page: the shared role editor as a form of labelled fields in its card, Save under them, then its fold. */
+.models-role .model-role-editor { gap: var(--space-3); }
+.model-role-row[data-solo] { display: flex; flex-direction: column; gap: var(--space-3); min-width: 0; }
+.model-role-row[data-solo] > .model-role-controls,
+.models-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr)); align-items: start; gap: var(--space-3); }
+.model-role-field { min-width: 0; }
+.model-role-field > :is(select, .ui-model-chooser) { width: 100%; min-width: 0; }
+.model-role-row[data-solo] > .model-role-notes:not(:has(> :not(:empty))) { display: none; }
+.model-role-row[data-solo] .model-role-meta { margin-top: 0; }
+.model-role-row[data-solo] > .model-role-details { margin-top: 0; }
+.models-role .model-role-copy { margin: 0; }
+.local-model-state { margin: 0; }
+
+/* The plain pages (settings_ui.js): a slider with its value and its one action (the interface size, the app tone's
+   level), and Your rules, one field as wide as its card at the reading size. */
+.settings-slider { display: inline-flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: var(--space-2); min-width: 0; }
+.settings-slider[hidden] { display: none; }
+.settings-slider input[type="range"] { width: 140px; min-width: 0; max-width: 100%; accent-color: var(--accent-light); }
+.settings-slider input[type="range"]:disabled { opacity: var(--control-disabled-opacity); cursor: not-allowed; }
+.settings-slider input[type="range"]:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: 2px; }
+.settings-slider output { min-width: 4ch; text-align: end; color: var(--text-meta); font-size: var(--type-meta); line-height: var(--line-meta); font-variant-numeric: tabular-nums; }
+textarea.ui-control.settings-rules-text {
+    width: 100%;
+    min-height: 12rem;
+    font-size: var(--type-body);
+    line-height: var(--line-body);
     resize: vertical;
 }
 
-.settings-shell .form-field select:not(.ui-control):not(.ui-checkbox),
-.settings-shell .available-subagent-row select:not(.ui-control):not(.ui-checkbox) {
-    appearance: none;
-    padding-right: 36px;
-    background-image: var(--select-arrow);
-    background-repeat: no-repeat;
-    background-position: right 12px center;
+/* Accounts and keys (settings_accounts.js; harness_accounts.js, settings_connections.js, settings_secrets.js): the
+   list is cards of heads and rows; a provider's page and a key's page are cards too. */
+/* The engine in one line under the providers, with its one press. */
+.accounts-engine { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-1) var(--space-2); }
+.accounts-engine > .ui-status { min-width: 0; overflow-wrap: anywhere; }
+
+/* A stored key's row: at rest the word Saved and Replace (or Add), which keep the row's end at every width; that
+   press opens its field under the words, across the row, with Show and Remove beside it. */
+.accounts-secret > .ui-row-actions { flex-wrap: nowrap; justify-content: flex-end; }
+.accounts-secret-field { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); min-width: 0; margin-top: var(--space-1); }
+.accounts-secret-field[hidden] { display: none; }
+.accounts-secret-field > :is(.ui-control, .settings-secret-value) { flex: 1 1 12rem; min-width: 0; }
+.accounts-secret-field > :is(.settings-secret-source, .settings-secret-status) { flex: 1 1 100%; }
+.accounts-secret-field > :is(.settings-secret-source, .settings-secret-status):empty { display: none; }
+
+/* A key's page: its fields side by side while they fit, then Save and Test with one result line. */
+.accounts-key-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: var(--space-3); align-items: start; }
+.accounts-key .ui-action-row > .ui-result:empty { display: none; }
+.accounts-key .settings-card-note code { overflow-wrap: anywhere; }
+
+/* A provider's page. The engine's line with its two presses stands under the lead; then the glance, the program's
+   row in a card of its own, and the accounts. The family itself is no object here: its two cards are. */
+.accounts-service { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-2) var(--space-3); min-width: 0; }
+.accounts-service > .agents-service { flex: 1 1 16rem; align-items: center; }
+.accounts-service .agents-service-banner { padding: 0; }
+.accounts-service .agents-service-diagnostics { margin: var(--space-2) 0 0; }
+.agent-family-list > .agent-family-card { gap: var(--space-4); padding: 0; border: 0; background: none; }
+.agent-family-program:empty,
+.agent-family-accounts[hidden] { display: none; }
+.agent-family-accounts > .agent-family-id { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 var(--space-3); }
+.agent-family-accounts > .agent-family-login:empty { display: none; }
+/* Many accounts at a glance: one bar for each, as tall as the quota it has left (--accounts-bar-left, written by the
+   page for each bar); a spent one is its rail, one out of rotation a short rail, and the one that needs sign-in stands
+   in the owner's hue. */
+.accounts-bars { display: flex; align-items: flex-end; gap: 3px; height: 52px; }
+.accounts-bar { flex: 1 1 0; display: flex; align-items: flex-end; max-width: 16px; height: 100%; overflow: hidden; border-radius: 4px; background: rgba(var(--neutral-rgb), 0.1); }
+.accounts-bar > b { display: block; width: 100%; height: var(--accounts-bar-left, 0%); border-radius: 4px; background: var(--text-secondary); }
+.accounts-bar[data-state="need"] > b { min-height: 6px; background: var(--mark-owner); }
+.accounts-bar[data-state="off"] { align-self: flex-end; height: 22%; }
+/* An account: its mark (the owner's dot while it needs sign-in, else what is left of its window), its name and login
+   state, its facts, then Sign in while it is needed, its place in rotation as a switch, and More. What is rare (Sign
+   in again, Remove) shows with More, whose panel holds the account's resources. A row that needs sign-in is tinted. */
+.agent-family-accounts .harness-account-row {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-areas: "mark main actions" "mark meta actions";
+    column-gap: var(--space-3);
+    row-gap: var(--space-1);
+    box-sizing: border-box;
+    min-height: 52px;
+    padding: var(--space-3);
+    background: var(--surface-tray);
 }
-
-
-/* track-migration:end */
+.agent-family-accounts .harness-account-row[data-tone="warn"] { background: var(--status-warn-bg); }
+.harness-account-mark { grid-area: mark; display: grid; place-items: center; min-width: 22px; color: var(--text-secondary); }
+.agent-family-accounts .harness-account-actions { align-items: center; justify-content: flex-end; gap: var(--space-2); }
+.harness-account-actions > [data-resources] { margin: 0; }
+.harness-account-actions > [data-resources][aria-expanded="false"] ~ [data-rare] { display: none; }
+.agent-family-accounts .account-resource-panel { margin-top: var(--space-2); }
+.agent-family-accounts .account-resource-head { flex-wrap: wrap; }
+.agent-family-accounts .account-resource-head > h5 { overflow-wrap: normal; }
+@container (max-width: 28rem) {
+    .agent-family-accounts .harness-account-row > :is(.harness-account-main, .harness-account-meta, .harness-account-actions) { grid-column: 2 / -1; }
+    .agent-family-accounts .harness-account-row > .harness-account-actions { grid-row: 3; justify-content: flex-start; margin-top: var(--space-1); }
+    .agent-family-accounts .harness-account-row > .account-resource-panel { grid-row: 4; }
+}

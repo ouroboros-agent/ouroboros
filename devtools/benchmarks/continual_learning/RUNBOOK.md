@@ -9,10 +9,14 @@ Field-tested configuration and operational hazards from the 2026-07-20 full 1-se
 - Model `openrouter/anthropic/claude-sonnet-4.6`, **effort low pinned uniformly** across every
   engine task type (engine defaults drift between releases — v6.71 flipped review effort to
   high; pin them all).
-- Review gate `OUROBOROS_TASK_REVIEW_MODE=required` + `OUROBOROS_REVIEW_ENFORCEMENT=blocking`
-  with **`max_improvement_passes` pinned to 1** (adapter does this automatically; see the
-  review-mode ablation in METHODOLOGY — unbounded convergence is 2.6× the cost for no measured
-  gain on the toolchain-oracle domain, and burns the full per-issue step budget on doomed issues).
+- Review gate `OUROBOROS_TASK_REVIEW_MODE=required`: the host's result review runs at delivery.
+  **2026-11-12:** the release that retires `OUROBOROS_REVIEW_ENFORCEMENT` ends "a FAIL holds the
+  answer": the FAIL is shown to the agent, which decides. Rows after it are a new methodology,
+  never compared with earlier rows. The adapter still pins
+  **`max_improvement_passes` to 1**, which the result review ignores; the paid bound is
+  `OUROBOROS_REVIEW_MAX_CYCLES` (see the review-mode ablation in METHODOLOGY — unbounded
+  convergence is 2.6× the cost for no measured gain on the toolchain-oracle domain, and burns
+  the full per-issue step budget on doomed issues).
 - **`max_workers: 3` in system-params — mandatory at scale.** Worker pool size drives engine
   container RSS: 10 workers ≈ 0.8GB/container, 3 workers ≈ 0.35GB. Capacity formula:
   `concurrent_containers × per-container-RSS ≤ 0.8 × Docker-VM memory limit`
@@ -26,15 +30,22 @@ Field-tested configuration and operational hazards from the 2026-07-20 full 1-se
   Disclosure (net-resilience sprint): `OUROBOROS_TRANSIENT_RETRY_MAX` no longer bounds a
   REMOTE pre-dispatch transport outage. That class (`transport_unavailable`, $0 released
   attempts) now waits and redials at the round level. CLB solve tasks carry no
-  `deadline_at` and the waiting itself spends $0, so the binding rail here is the
-  supervisor's absolute per-attempt ceiling (`OUROBOROS_TASK_ABS_CEILING_SEC`, default 6h),
-  not a deadline or budget rail: a dead egress holds the task up to that ceiling instead of
-  failing it after the burst. The wait is visible as durable `network_wait` events in the
-  isolated server's `events.jsonl`. Note: idle-rail survival via waiting progress notes
-  requires a real chat thread; headless tasks without a `chat_id` keep the idle rail
-  (reaper) as an additional bound on the wait. A transport death AFTER dispatch (the
-  socket dies mid-request) is repeated by the primary dispatch at most twice per round as
-  new physical attempts. One call has one outer attempt budget
+  `deadline_at` and the waiting itself spends $0, so the rails that can bind here are the
+  OPTIONAL ones you configure, not a window the wait invents. A managed (queued) task's
+  outage episode carries no wait bound of its own: `loop_transport` measures its window from
+  the owner deadline, and with no `deadline_at` there is none (no other operation invents
+  one either). Set `OUROBOROS_TASK_ABS_CEILING_SEC` if
+  you want a finite per-attempt lifetime (the runtime ships `unlimited`); otherwise only
+  Stop/cancel and the budget bind a headless CLB solve task. Silence past
+  `OUROBOROS_TASK_IDLE_TIMEOUT_SEC` (measured from last real progress) brings attention,
+  never a stop (#1376): a dated notice to the task and to an ancestor that waits on it. A dead egress holds the task up to whichever
+  bound is actually set instead of failing it after the burst — and with none of them set it
+  holds indefinitely. The wait is visible as durable `network_wait` events in the isolated
+  server's `events.jsonl`. Note: waiting progress notes count as progress only with a real
+  chat thread, so a headless task without a `chat_id` gets that attention during a long
+  wait. A transport
+  death AFTER dispatch (the socket dies mid-request) is repeated by the primary dispatch at
+  most twice per round as new physical attempts. One call has one outer attempt budget
   (`OUROBOROS_TRANSIENT_RETRY_MAX` bounds every attempt of the call, repeats included),
   within which up to three `llm_api_error` rows can be typed transport-death failures (the
   first death plus at most two repeats), reserving up to three upper bounds against

@@ -26,7 +26,8 @@ artifact / a recorded WIRE fact / the byte truth of the worktree:
   write → boot looks the stash up by attempt id, restores the owner's work
   uncommitted and clears the marker (nothing was applied); (b) a half-written
   ``pending_boot_smoke`` tx whose merge commit never reached HEAD → boot rolls
-  back typed (no junk ``failed-update-*`` ref is minted for a non-attempt);
+  back typed (no junk ``failed-update-*`` ref is minted for a non-attempt) and
+  keeps a clear-only handoff that the next boot, in a fresh process, clears;
   (c) merge applied + crash before the restart smoke → boot runs the smoke,
   finalizes, restores the stashed dirty work and clears the tx.
 * S21 — CANCELLATION WITH CHAT LINEAGE (the wave-2 W2-F1 counterpart of S7): the
@@ -38,8 +39,8 @@ artifact / a recorded WIRE fact / the byte truth of the worktree:
   ``cancel_receipt`` block on the stored result, and the same
   requested→claimed→settled forensics.
 * S22 — EVOLUTION ABSORB KILL-RECOVERY: a REAL evolution cycle (campaign seeded,
-  supervisor mints the task, the scripted agent lands a reviewed commit through
-  the blocking triad+scope organ) settles with auto-restart disabled, which (W4-F3,
+  supervisor mints the task, the scripted Cyber Pro agent explicitly authors
+  in place through the review organ) settles with auto-restart disabled, which (W4-F3,
   owner 5 = A) skips ONLY the restart: generation A pins that the exact
   restart-verify marker IS still written and the tree stays up, then SIGKILLs the
   tree and removes the marker — the durable state a crash between the campaign's
@@ -108,6 +109,7 @@ from tests.system_e2e.test_system_scenarios_w3b import (
     _roster,
     _wait_step,
 )
+from tests.system_e2e.test_system_scenarios_w3a import _Again, _HoldingStubModel
 
 from devtools.benchmarks.common.server_runner import (
     _api,
@@ -163,6 +165,9 @@ def test_fake_daemon_interactive_answer_contract(tmp_path):
             assert empty.get("status") == "rejected"
             # Still pending after both refusals; the real answer delivers.
             assert pending_interactions(gateway.get_run(run_id)), "refusal consumed the question"
+            # More than three observations must not make the terminal go backwards.
+            observed = [gateway.get_run(run_id)["lastSeq"] for _ in range(8)]
+            assert observed == sorted(observed) and observed[-1] > 3
             answered = gateway.answer_interaction(run_id, iid, [
                 {"questionId": "q1", "selectedLabels": [FAKE_ANSWER_LABEL], "freeText": None}])
             assert answered.get("status") == "delivered"
@@ -170,6 +175,8 @@ def test_fake_daemon_interactive_answer_contract(tmp_path):
             # The run resumes: the next poll is terminal with settlement facts,
             # and a late duplicate answer is already_resolved, never a re-run.
             done = gateway.get_run(run_id)
+            assert done["lastSeq"] >= observed[-1]
+            assert gateway.get_run(run_id)["lastSeq"] == done["lastSeq"]
             assert (done.get("summary") or {}).get("state") == "succeeded"
             assert (done.get("summary") or {}).get("waitingOnUser") is False
             assert pending_interactions(done) == []
@@ -253,7 +260,6 @@ def _configured_managed_install(root: pathlib.Path):
 
 
 @pytest.mark.integration
-@pytest.mark.serial
 def test_s18_carrier_conflict_resolves_to_official_version_and_transfers_carriers(
         tmp_path_factory, monkeypatch):
     require_lane(LANE_MOCK)
@@ -372,7 +378,6 @@ def _seed_exhausted_budget(data_root: pathlib.Path, limit_usd: float) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.serial
 def test_s19_conflicting_update_refused_typed_with_tree_intact(
         tmp_path_factory, monkeypatch):
     require_lane(LANE_MOCK)
@@ -464,7 +469,9 @@ data = pathlib.Path(sys.argv[2])
 from supervisor import git_ops
 git_ops.init(clone, data, "")
 from supervisor.update_merge import (
+    MARKER_CLEANUP_RETRY_PHASE,
     finalize_managed_update_on_boot,
+    read_update_tx_strict,
     stash_local_changes_for_update,
     write_update_tx,
 )
@@ -535,8 +542,27 @@ write_update_tx({"phase": "pending_boot_smoke", "pre_update_sha": head0,
                  "stash_sha": "", "local_work_carrier": "none",
                  "rollback_attempted": False})
 boot_b = finalize_managed_update_on_boot(True)
+# The rollback keeps a clear-only handoff until the restored process starts.
+status_b, handoff_b = read_update_tx_strict()
+assert status_b == "valid", (status_b, handoff_b)
+assert handoff_b.get("phase") == MARKER_CLEANUP_RETRY_PHASE, handoff_b
+assert handoff_b.get("gate_blocked_reason") == "rollback_restart_pending", handoff_b
+resumed_b = subprocess.run(
+    [sys.executable, "-c",
+     "import json,pathlib,sys; from supervisor import git_ops; "
+     "git_ops.init(pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), ''); "
+     "from supervisor.update_merge import finalize_managed_update_on_boot; "
+     "print(json.dumps(finalize_managed_update_on_boot(True)))",
+     str(clone), str(data)],
+    cwd=str(clone), capture_output=True, text=True,
+)
+assert resumed_b.returncode == 0, (resumed_b.stdout, resumed_b.stderr)
+boot_b_resumed = json.loads(resumed_b.stdout.strip().splitlines()[-1])
+assert boot_b_resumed.get("finalized") is True, boot_b_resumed
+assert not boot_b_resumed.get("rolled_back"), boot_b_resumed
 report["half_written"] = {
     "boot": boot_b,
+    "resumed_boot": boot_b_resumed,
     "head": _git("rev-parse", "HEAD"), "head0": head0,
     "branch": _git("rev-parse", "--abbrev-ref", "HEAD"),
     "porcelain": _git("status", "--porcelain"),
@@ -587,7 +613,6 @@ print(json.dumps(report))
 
 
 @pytest.mark.integration
-@pytest.mark.serial
 def test_s20_crash_mid_apply_boot_finalize_and_rollback_are_honest(tmp_path_factory):
     require_lane(LANE_MOCK)
     root = tmp_path_factory.mktemp("s20")
@@ -652,7 +677,6 @@ S21_PROJECT_NAME = "s21 lineage"  # a file-less project: its thread IS the linea
 
 
 @pytest.mark.integration
-@pytest.mark.serial
 def test_s21_chat_lineage_cancel_delivers_receipt_to_outbox_and_chat(
         e2e_clone, tmp_path_factory):
     require_lane(LANE_MOCK)
@@ -724,7 +748,7 @@ def test_s21_chat_lineage_cancel_delivers_receipt_to_outbox_and_chat(
             chat_row = chat_rows[-1]
             assert chat_row.get("direction") == "system", chat_row
             assert int(chat_row.get("chat_id") or 0) == lineage_chat, chat_row
-            assert f"Task {task_id} was cancelled" in str(chat_row.get("text") or ""), chat_row
+            assert f"Task {task_id} was stopped" in str(chat_row.get("text") or ""), chat_row
 
             # (b) The details-panel block on the durable result (the W2-F1 fact
             # a chatless task never gets).
@@ -734,7 +758,7 @@ def test_s21_chat_lineage_cancel_delivers_receipt_to_outbox_and_chat(
                          else None), 90)
             assert receipt, oracle.task_result(task_id)
             assert receipt.get("settled_status") == "cancelled", receipt
-            assert receipt.get("outcome") == "cancelled", receipt
+            assert receipt.get("outcome") == "stopped", receipt
             assert receipt.get("delivery_id") == delivery_id, receipt
             assert isinstance(receipt.get("salvage"), dict), receipt
 
@@ -757,7 +781,29 @@ def test_s21_chat_lineage_cancel_delivers_receipt_to_outbox_and_chat(
 
 S22_DOC_PATH = "docs/notes/system_e2e_s22_evolution.md"
 S22_COMMIT_MESSAGE = "docs: system_e2e S22 evolution cycle note"
+
+
+def _s22_continue_after_review(body):
+    """Cyber's clean review is feedback, not an author decision to commit."""
+    try:
+        calls = {c["id"]: c["function"]["name"] for m in body["messages"] for c in m.get("tool_calls", [])}
+        message = next(m for m in reversed(body["messages"])
+                       if m.get("role") == "tool" and calls.get(m.get("tool_call_id")) == "commit_reviewed")
+        feedback = json.loads(message["content"].split("\n", 1)[1])
+        critic = feedback["review_outcome"]
+        if critic["status"] == "reviewing":
+            return _Again(S22_SCRIPT[2])  # collect the original wave, never buy a replacement
+        assert critic["status"] == "reviewed" and critic["phase"] == "review_only"
+        reference = feedback["review_reference"]
+    except (AssertionError, KeyError, ValueError, StopIteration) as exc:
+        return {"final": f"E2E_SCRIPT_ERROR: expected exposed S22 commit feedback: {exc}"}
+    return {"tool": "commit_reviewed", "arguments": {**S22_SCRIPT[2]["arguments"],
+            "review_reference": reference, "author_disposition": {
+                "disposition": "accepted", "rationale": "I read the completed review and accept this exact S22 note."}}}
+
+
 S22_SCRIPT = [
+    {"tool": "prepare_self_change", "arguments": {"in_place": True}},
     {"tool": "write_file", "arguments": {
         "root": "system_repo",
         "path": S22_DOC_PATH,
@@ -768,10 +814,33 @@ S22_SCRIPT = [
         "paths": [S22_DOC_PATH],
         "skip_advisory_review": True,
         "skip_tests": True,
-        "goal": "Land the S22 evolution note through the blocking review organ.",
+        "goal": "Land the S22 evolution note through the review organ in the serving checkout.",
         "scope": f"{S22_DOC_PATH} only.",
     }},
+    _s22_continue_after_review,
 ]
+
+
+@pytest.mark.parametrize("status", ["reviewing", "reviewed", "failed"])
+def test_scripted_s22_author_collects_feedback_before_an_explicit_decision(status):
+    """A default-lane check of S22's scripted author; ``test_s<N>_`` names are server scenarios."""
+    reference = {"surface": "commit", "task_id": "s22", "attempt": 1}
+    feedback = {"review_reference": reference,
+                "review_outcome": {"status": status, "phase": "review_only"}}
+    body = {"messages": [
+        {"role": "assistant", "tool_calls": [{"id": "review", "function": {"name": "commit_reviewed"}}]},
+        {"role": "tool", "tool_call_id": "review", "content": "Review feedback\n" + json.dumps(feedback)}]}
+    answer = _s22_continue_after_review(body)
+    if status == "reviewing":
+        assert isinstance(answer, _Again) and answer.step == S22_SCRIPT[2]
+    elif status == "reviewed":
+        assert answer["tool"] == "commit_reviewed"
+        assert answer["arguments"]["review_reference"] == reference
+        assert answer["arguments"]["author_disposition"]["disposition"] == "accepted"
+        assert {k: v for k, v in answer["arguments"].items()
+                if k not in {"review_reference", "author_disposition"}} == S22_SCRIPT[2]["arguments"]
+    else:
+        assert answer["final"].startswith("E2E_SCRIPT_ERROR:")
 
 
 def _campaign(data_root: pathlib.Path) -> dict:
@@ -797,6 +866,40 @@ def _cycle_outcome_checkpoints(data_root: pathlib.Path) -> list:
     return rows
 
 
+S22_FIXTURE_SUITE = "tests/test_system_e2e_s22_fixture.py"
+
+
+def _s22_one_failing_test_suite(clone: pathlib.Path) -> None:
+    """The private clone's whole suite becomes ONE failing test, committed beneath the cycle.
+
+    Evolution forces the full post-commit battery even under skip_tests (tools/git.py: evolution
+    publication requires a full run), and the cycle settles only after the commit tool returns.
+    Since the test diet (owner 5A, #2825) a full run has no total budget at all: it ends by its
+    own tests, and ``OUROBOROS_PREFLIGHT_TIMEOUT_SEC`` bounds a selected run only
+    (``preflight_runner._resolve_preflight_timeout``), so the knob that once ended this battery
+    red at once left the whole suite running past the settle wait (CI run 42197878988). S22's
+    subject is the absorb crash window, not qualification: here the battery runs the suite this
+    clone carries, one test that fails at once, and the browser suite goes with the rest (no
+    Node lane), so the red post-commit run ends within seconds on every host and withholds only
+    the push, keeping the commit and the open transaction. The commit is the cycle's base, so
+    the evolution commit itself touches only its note and HEAD~1 still carries a tests/ tree.
+    """
+    from ouroboros.preflight_node import TESTS_GLOB, WEB_DIR
+
+    browser_suite = (pathlib.PurePosixPath(WEB_DIR) / pathlib.PurePosixPath(TESTS_GLOB).parent).as_posix()
+    _git(["rm", "-r", "-q", "tests", browser_suite], clone)
+    fixture = clone / S22_FIXTURE_SUITE
+    fixture.parent.mkdir(parents=True, exist_ok=True)
+    fixture.write_text(
+        '"""system_e2e S22: the post-commit battery of this clone ends red at once."""\n\n\n'
+        "def test_s22_post_commit_battery_ends_red_at_once():\n"
+        '    raise AssertionError("system_e2e S22 fixture: red by design")\n',
+        encoding="utf-8")
+    _git(["add", S22_FIXTURE_SUITE], clone)
+    _git(["commit", "-q", "--no-verify", "-m", "system_e2e S22 fixture: a one-test suite that fails at once"],
+         clone)
+
+
 def _sigkill_server_tree(server) -> None:
     pids = process_tree_pids(server.proc.pid)
     os.killpg(os.getpgid(server.proc.pid), signal.SIGKILL)
@@ -809,7 +912,6 @@ def _sigkill_server_tree(server) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.serial
 @pytest.mark.skipif(sys.platform != "linux",
                     reason="process-group SIGKILL + /proc scans are Linux-only")
 def test_s22_absorb_kill_recovery_absorbs_once_and_never_twice(
@@ -817,6 +919,7 @@ def test_s22_absorb_kill_recovery_absorbs_once_and_never_twice(
     require_lane(LANE_MOCK)
     root = tmp_path_factory.mktemp("s22")
     clone = clone_repo(root)          # PRIVATE clone: this scenario moves HEAD
+    _s22_one_failing_test_suite(clone)  # the forced post-commit battery ends red at once (see there)
     data_root = pathlib.Path(root) / "data"
     seed_owner_state(data_root, evolution_enabled=True)
     campaign_seed = _campaign(data_root)
@@ -831,8 +934,7 @@ def test_s22_absorb_kill_recovery_absorbs_once_and_never_twice(
     monkeypatch.setenv("OUROBOROS_EVOLUTION_AUTO_RESTART", "false")
 
     settings_kwargs = dict(
-        OUROBOROS_RUNTIME_MODE="advanced",       # light hard-blocks evolution
-        OUROBOROS_REVIEW_ENFORCEMENT="blocking",  # the landed commit PROVES the organ passed
+        OUROBOROS_RUNTIME_MODE="cyber_pro",  # explicit in-place authoring is Cyber Pro only (#1620)
     )
     marker_glob = "pending_restart_verify*"
     state_dir = data_root / "state"
@@ -840,7 +942,7 @@ def test_s22_absorb_kill_recovery_absorbs_once_and_never_twice(
     # ---- Generation A: the real evolution cycle, killed mid-absorb ----------
     commit_sha = ""
     transaction_id = ""
-    with ScriptedStubModel(S22_SCRIPT) as stub:
+    with _HoldingStubModel(S22_SCRIPT) as stub:
         server = start_server(clone, root, keyless_settings(stub, **settings_kwargs))
         killed = False
         try:
@@ -882,8 +984,12 @@ def test_s22_absorb_kill_recovery_absorbs_once_and_never_twice(
                 "commit_sha": commit_sha,
             }, marker
             assert server.proc.poll() is None, "auto-restart off must not restart the tree"
-            assert "triad_review" in stub.kinds() and "scope_review" in stub.kinds(), (
+            assert "triad_review" in stub.kinds() and "two_part_review" in stub.kinds(), (
                 stub.kinds())
+            # Cyber Pro permits an override: independently prove this panel passed.
+            records = ArtifactOracle(data_root).task_drive(str(tx["task_id"])).review_ledger_records()
+            commits = [row for row in records if row.get("surface") == "commit_gate"]
+            assert commits and commits[-1]["verdict"]["per_question"] == {"change": "PASS", "coupling": "PASS"}, commits
 
             # HARD CRASH in the window.
             _sigkill_server_tree(server)
@@ -1013,7 +1119,6 @@ S23_SCRIPT = [
 
 
 @pytest.mark.integration
-@pytest.mark.serial
 def test_s23_interactive_delegated_run_pauses_answers_and_resumes(
         e2e_clone, tmp_path_factory):
     require_lane(LANE_MOCK)

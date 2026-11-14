@@ -1,4 +1,4 @@
-"""CPL4-C18 pins: startup sweep of mailboxes whose task settled off-path.
+"""CPL4-C18 pins: the drive-custody pass sweeps mailboxes whose task settled off-path.
 
 A mailbox (and its acks file) goes only when the task's durable result is
 SETTLED; no result, a non-terminal result, or an unclassifiable filename
@@ -16,13 +16,15 @@ from ouroboros.owner_mailbox import (
     write_owner_message,
 )
 from ouroboros.task_result_schema import stamp_task_result_schema
+from ouroboros import maintenance_jobs, server_maintenance, store_import
+from tests._store_shared import seed_result
 
 
 def _settle(root, task_id, status="completed"):
     results = root / "task_results"
     results.mkdir(parents=True, exist_ok=True)
     row = stamp_task_result_schema({"task_id": task_id, "status": status})
-    (results / f"{task_id}.json").write_text(json.dumps(row), encoding="utf-8")
+    seed_result(root, task_id, row)
 
 
 def test_settled_task_mailbox_swept_others_kept(tmp_path):
@@ -64,9 +66,22 @@ def test_orphan_acks_without_mailbox_left_alone(tmp_path):
     assert _ack_path(tmp_path, "t-ghost").exists()
 
 
-def test_startup_prune_sweeps_run_the_mailbox_sweep():
+def test_the_drive_custody_pass_runs_the_mailbox_sweep():
     import inspect
 
     import ouroboros.server_maintenance as sm
 
-    assert "sweep_settled_owner_mailboxes" in inspect.getsource(sm._startup_prune_sweeps)
+    assert "sweep_settled_owner_mailboxes" in inspect.getsource(sm._run_drive_custody_pass)
+    assert "sweep_settled_owner_mailboxes" not in inspect.getsource(sm._run_reconcile_prunes)
+
+
+def test_drive_pass_records_an_event_when_only_a_mailbox_was_removed(tmp_path, monkeypatch):
+    store_import.ensure_current_store(tmp_path)
+    write_owner_message(tmp_path, "goodbye", "t-done")
+    _settle(tmp_path, "t-done")
+    monkeypatch.setattr(server_maintenance, "DATA_DIR", tmp_path)
+    server_maintenance._run_drive_custody_pass()
+    row = maintenance_jobs.job(tmp_path, "drive_settlement")
+    events = [json.loads(line) for line in (tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert row and events and events[-1]["type"] == "headless_task_drive_prune"
+    assert events[-1]["report"]["mailboxes"]["removed"] == ["t-done"]

@@ -10,6 +10,7 @@ free-form provider prose.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import logging
 import pathlib
@@ -44,12 +45,13 @@ OPTIONAL_REQUEST_FIELDS = OPTIONAL_SAMPLING_FIELDS + (
     "output_config",
     "thinking",
     "parallel_tool_calls",
-    "stream", "stream_options",
+    "stream", "stream_options", "prompt_cache_key",
 )
 NESTED_REASONING_FIELD = "extra_body.reasoning"
 NESTED_THINKING_FIELD = "extra_body.thinking"
 ANTHROPIC_REASONING_FIELDS = ("thinking", "output_config")
-DROP_FIELDS = frozenset((*OPTIONAL_REQUEST_FIELDS, NESTED_REASONING_FIELD))
+CACHE_HINT_FIELDS = ("cache_control.ttl", "tools.cache_control", "cache_control")  # narrowest first: cache_hint_holders
+DROP_FIELDS = frozenset((*OPTIONAL_REQUEST_FIELDS, NESTED_REASONING_FIELD, *CACHE_HINT_FIELDS))
 
 TOOL_DIALECTS = frozenset({
     "none",
@@ -61,12 +63,23 @@ TOOL_DIALECTS = frozenset({
 TOOL_CHOICE_FAMILIES = frozenset({
     "omitted", "auto", "none", "required", "any", "allowed_tools", "named", "other",
 })
-FUNCTION_STRICTNESS_VALUES = frozenset({"none", "plain", "strict", "mixed"})
+# Per-tool `strict` states in canonical order; a profile names the set its function tools
+# carry, or "none". Historical schema-1 "plain"/"strict"/"mixed" (absent, false and
+# malformed collapsed) stay legal to decode, but no payload produces them, so exact
+# profile equality keeps their stored evidence from authorizing any current profile.
+FUNCTION_STRICT_STATES = ("absent", "false", "true", "malformed")
+LEGACY_FUNCTION_STRICTNESS_VALUES = frozenset({"plain", "strict", "mixed"})
+FUNCTION_STRICTNESS_VALUES = LEGACY_FUNCTION_STRICTNESS_VALUES | {"none", *(
+    "+".join(combo) for size in range(1, len(FUNCTION_STRICT_STATES) + 1)
+    for combo in itertools.combinations(FUNCTION_STRICT_STATES, size))}
 _REGISTERED_DIALECT_TRANSITIONS = frozenset({
     ("tool", "function", "openai_chat_custom"),
     ("tool", "openai_chat_custom", "function"),
 })
 
+# The provider refused the VALUE of the host's optional temperature hint: the host may
+# withdraw its preference; the field is not thereby unsupported, nor an explicit value removable.
+HINT_WITHDRAWAL_REASON = "provider_refused_hint_value"
 WIRE_REASON_CODES = frozenset({
     "requested_wire_form",
     "provider_recovery_succeeded",
@@ -76,6 +89,7 @@ WIRE_REASON_CODES = frozenset({
     "provider_rejected_tool_dialect",
     "provider_metadata_constraint",
     "task_local_availability_fallback",
+    HINT_WITHDRAWAL_REASON,
 })
 
 WIRE_SEMANTIC_KINDS = frozenset({
@@ -113,14 +127,8 @@ def canonical_sha256(value: Any) -> str:
 
 def physical_candidate_bytes(payload: Mapping[str, Any]) -> bytes:
     """Serialize the exact final payload with the physical-send digest basis."""
-    return json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-        default=str,
-    ).encode("utf-8")
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+                      default=str).encode("utf-8")
 
 
 def physical_candidate_sha256(payload: Mapping[str, Any]) -> str:
@@ -298,18 +306,10 @@ def tool_choice_names(choice: Any) -> Tuple[str, ...]:
 
 
 def tool_choice_requires_call(choice: Any) -> bool:
-    family = tool_choice_family(choice)
-    if family in {"required", "any", "named"}:
-        return True
-    if family != "allowed_tools" or not isinstance(choice, Mapping):
-        return False
-    allowed = choice.get("allowed_tools")
-    mode = str(
-        (allowed.get("mode") if isinstance(allowed, Mapping) else None)
-        or choice.get("mode")
-        or "auto"
-    ).strip().lower()
-    return mode == "required"
+    return (
+        tool_choice_family(choice) in {"required", "any", "named"}
+        or tool_choice_allowed_mode(choice) == "required"
+    )
 
 
 def tool_choice_allowed_mode(choice: Any) -> str:
@@ -379,18 +379,16 @@ def _tool_choice_digest(choice: Any) -> str:
 
 
 def function_strictness(payload: Mapping[str, Any]) -> str:
-    strict_values = []
+    """Name the exact `strict` states of the function tools: a Responses-backed route
+    tries strict mode for an ABSENT key, so absent is not an explicit ``false``."""
+    states = set()
     for tool in payload.get("tools") or []:
-        if not isinstance(tool, Mapping):
-            continue
-        function = tool.get("function")
+        function = tool.get("function") if isinstance(tool, Mapping) else None
         if isinstance(function, Mapping):
-            strict_values.append(bool(function.get("strict")))
-    if not strict_values:
-        return "none"
-    if all(strict_values):
-        return "strict"
-    return "mixed" if any(strict_values) else "plain"
+            value = function.get("strict")
+            states.add("absent" if "strict" not in function else "true" if value is True
+                       else "false" if value is False else "malformed")
+    return "+".join(state for state in FUNCTION_STRICT_STATES if state in states) or "none"
 
 
 def _routing_digest(payload: Mapping[str, Any]) -> str:
@@ -605,7 +603,8 @@ def validate_wire_action(action: Any) -> Dict[str, Any]:
         if not isinstance(raw_fields, (list, tuple)) or not raw_fields:
             return {}
         fields = [str(value).strip() for value in raw_fields]
-        if any(not value or value not in DROP_FIELDS for value in fields):
+        droppable = ("temperature",) if reason_code == HINT_WITHDRAWAL_REASON else DROP_FIELDS
+        if any(value not in droppable for value in fields):
             return {}
         return {
             "kind": kind,
@@ -679,11 +678,7 @@ def validate_wire_action_for_profile(
     if fields.intersection(ANTHROPIC_REASONING_FIELDS):
         if carrier == "anthropic.adaptive":
             fields.update(ANTHROPIC_REASONING_FIELDS)
-        elif carrier == "anthropic.disabled" and fields == {"thinking"}:
-            pass
-        elif carrier.startswith("anthropic.") and fields == {"thinking"}:
-            pass
-        else:
+        elif not (carrier.startswith("anthropic.") and fields == {"thinking"}):
             return {}
     normalized["fields"] = sorted(fields)
     return normalized
@@ -829,11 +824,13 @@ def wire_action_identity(action: Mapping[str, Any]) -> str:
     A newer observation for the same effort source supersedes an older one;
     keeping contradictory historical targets would manufacture a conflict
     after provider drift instead of learning the latest successful contract.
+    A hint withdrawal and a field drop are different evidence: neither replaces the other.
     """
     if action.get("kind") == "set_value":
         return f"set:{action.get('field')}:{action.get('from')}"
     if action.get("kind") == "drop_field":
-        return "drop:" + ",".join(action.get("fields") or [])
+        kind = "hint" if action.get("reason_code") == HINT_WITHDRAWAL_REASON else "drop"
+        return f"{kind}:" + ",".join(action.get("fields") or [])
     return f"dialect:{action.get('axis')}:{action.get('from')}"
 
 
@@ -870,10 +867,7 @@ def _read_wire_action_records_at(
     try:
         data = read_json_dict(_state_path(drive_root)) or {}
         schema_version = data.get("schema_version")
-        if (
-            type(schema_version) is not int
-            or schema_version != REQUEST_WIRE_SCHEMA_VERSION
-        ):
+        if type(schema_version) is not int or schema_version != REQUEST_WIRE_SCHEMA_VERSION:
             return ()
         entries = data.get("profiles")
         entry = entries.get(profile.fingerprint) if isinstance(entries, Mapping) else None
@@ -882,33 +876,44 @@ def _read_wire_action_records_at(
         return ()
 
 
-def read_wire_action_records(
-    profile: RequestWireProfile,
-    *,
-    now: Any = None,
-) -> Tuple[StoredWireAction, ...]:
+def read_wire_action_records(profile: RequestWireProfile, *, now: Any = None) -> Tuple[StoredWireAction, ...]:
     return _read_wire_action_records_at(canonical_wire_evidence_root(), profile, now=now)
 
 
-def _read_wire_actions_at(
-    drive_root: Any,
-    profile: RequestWireProfile,
-    *,
-    now: Any = None,
-) -> Tuple[Dict[str, Any], ...]:
-    return tuple(_wire_action_dict(record.action) for record in _read_wire_action_records_at(
-        drive_root, profile, now=now
-    ))
+def _read_wire_actions_at(drive_root: Any, profile: RequestWireProfile, *,
+                          now: Any = None) -> Tuple[Dict[str, Any], ...]:
+    records = _read_wire_action_records_at(drive_root, profile, now=now)
+    return tuple(_wire_action_dict(record.action) for record in records)
 
 
-def read_wire_actions(
-    profile: RequestWireProfile,
-    *,
-    now: Any = None,
-) -> Tuple[Dict[str, Any], ...]:
-    return tuple(_wire_action_dict(record.action) for record in read_wire_action_records(
-        profile, now=now
-    ))
+def read_wire_actions(profile: RequestWireProfile, *, now: Any = None) -> Tuple[Dict[str, Any], ...]:
+    return tuple(_wire_action_dict(record.action) for record in read_wire_action_records(profile, now=now))
+
+
+_CACHE_HINTS = frozenset((*CACHE_HINT_FIELDS, "prompt_cache_key"))
+
+
+def endpoint_cache_hint_refusal(provider: str, base_url: Any, *, now: Any = None, drive_root: Any = None) -> str:
+    """The earliest fresh ``observed_at`` of a learned drop of a prompt-cache hint by any model of
+    ``provider`` at ``base_url``, else ``""``: what Settings says this server has taught."""
+    endpoint = normalize_endpoint(base_url)
+    try:
+        data = read_json_dict(_state_path(drive_root or canonical_wire_evidence_root())) or {}
+    except Exception:
+        return ""
+    entries = data.get("profiles") if endpoint and data.get("schema_version") == REQUEST_WIRE_SCHEMA_VERSION else None
+    route, seen = {"provider": provider, "endpoint_sha256": canonical_sha256(endpoint)}, []
+    for entry in entries.values() if isinstance(entries, Mapping) else ():
+        stored = entry.get("profile") if isinstance(entry, Mapping) else None
+        if not isinstance(stored, Mapping) or any(stored.get(key) != value for key, value in route.items()):
+            continue
+        for record in entry.get("records") if isinstance(entry.get("records"), list) else ():
+            action = record.get("action") if isinstance(record, Mapping) else None
+            if (isinstance(action, Mapping) and action.get("kind") == "drop_field"
+                    and _CACHE_HINTS & set(action.get("fields") or ())
+                    and _age_seconds(record.get("observed_at"), now=now) < REQUEST_WIRE_TTL_SEC):
+                seen.append(str(record["observed_at"]))
+    return min(seen, default="")
 
 
 def _commit_wire_compatibility_at(
@@ -925,11 +930,7 @@ def _commit_wire_compatibility_at(
         action = validate_durable_wire_action_for_profile(item.profile, item.action)
         if not action:
             return WireStoreCommitResult(False, "invalid_pending_action")
-        current = grouped.get(item.profile.fingerprint)
-        if current is None:
-            grouped[item.profile.fingerprint] = (item.profile, [action])
-        else:
-            current[1].append(action)
+        grouped.setdefault(item.profile.fingerprint, (item.profile, []))[1].append(action)
     if not grouped:
         return WireStoreCommitResult(True)
     result: Dict[str, Tuple[Dict[str, Any], ...]] = {}
@@ -937,10 +938,7 @@ def _commit_wire_compatibility_at(
     def _mutate(current: Dict[str, Any]) -> Dict[str, Any]:
         if current:
             schema_version = current.get("schema_version")
-            if (
-                type(schema_version) is not int
-                or schema_version != REQUEST_WIRE_SCHEMA_VERSION
-            ):
+            if type(schema_version) is not int or schema_version != REQUEST_WIRE_SCHEMA_VERSION:
                 raise ValueError("unsupported request-wire store schema")
             if not isinstance(current.get("profiles"), dict):
                 raise ValueError("malformed request-wire store profiles")

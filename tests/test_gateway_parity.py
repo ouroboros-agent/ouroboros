@@ -13,12 +13,14 @@ from ouroboros.gateway.contracts import (
     AvailableSubagentsSettingsMeta,
     ChatInbound,
     ChatOutbound,
+    MessageAnnotationOutbound,
     ClaudexorCredentialProfileDeleteResponse,
     ClaudexorLoginJobProblem,
     ClaudexorLoginJobResponse,
     ClaudexorStatusReads,
     ClaudexorStatusResponse,
     ClaudexorVendorCredentialDisposition,
+    OnboardingAttemptResponse,
     OnboardingCompleteRequest,
     OnboardingCompleteResponse,
     OnboardingPresetFailureResponse,
@@ -33,6 +35,9 @@ from ouroboros.gateway.contracts import (
     QuizOption,
     DecisionRequest,
     DecisionResponse,
+    DesktopAutostartResponse,
+    EvolutionDataResponse,
+    EvolutionRefresh,
     QuizOutbound,
     QuizStateOutbound,
     LogOutbound,
@@ -46,11 +51,16 @@ from ouroboros.gateway.contracts import (
     SkillPublishPreflightResponse,
     StateResponse,
     TaskCostBreakdown,
+    TaskCostSlice,
+    TaskCreateRequest,
     TaskCreateResponse,
     TaskDetailResponse,
+    QuestionRoom,
     TaskEvent,
     TaskEventCursor,
     TaskEventsRequest,
+    TaskCancelRequest,
+    TaskPauseRequest, TaskPauseResponse, TaskContinueRequest, TaskContinueResponse, ContinuationOffer,
     TaskHurryRequest,
     TaskHurryResponse,
     TypingOutbound,
@@ -65,8 +75,13 @@ from ouroboros.gateway.contracts import (
     UploadResponse,
     VideoOutbound,
 )
+from ouroboros.gateway.contracts import ClaudexorPassiveReadError, ClaudexorQuotaResponse
+from ouroboros.gateway.contracts import (
+    SecretConsumer, SecretDecisionRequest, SecretDecisionResponse, SecretEvent, SecretKeyState, SecretOutcome,
+    SecretRequestField, SecretRequestMeta,
+)
 from ouroboros.gateway.router import collect_routes
-from ouroboros.gateway.widgets import WidgetTab, WidgetsResponse
+from ouroboros.gateway.widgets import WidgetFaultRequest, WidgetFaultResponse, WidgetTab, WidgetsResponse
 
 
 def _js_typedef_fields(text: str, name: str) -> set[str]:
@@ -121,9 +136,11 @@ def test_provider_test_gateway_contract_shape_is_exact():
     request_hints = get_type_hints(ProviderTestRequest, include_extras=True)
     response_hints = get_type_hints(ProviderTestResponse, include_extras=True)
 
-    assert set(request_hints) == {"provider_id", "overrides"}
-    assert _notrequired_fields(ProviderTestRequest) == {"overrides"}
+    assert set(request_hints) == {"provider_id", "overrides", "connection", "api_key_setting"}
+    assert _notrequired_fields(ProviderTestRequest) == {"overrides", "connection", "api_key_setting"}
     assert request_hints["provider_id"] is str
+    assert get_args(request_hints["connection"]) == (str,)
+    assert get_args(get_args(request_hints["api_key_setting"])[0]) == ("OPENAI_COMPATIBLE_API_KEY", "OPENAI_API_KEY")
     overrides_type = get_args(request_hints["overrides"])[0]
     assert get_origin(overrides_type) is dict
     assert get_args(overrides_type) == (str, str)
@@ -139,11 +156,60 @@ def test_provider_test_gateway_contract_shape_is_exact():
     assert _js_typedef_properties(text, "ProviderTestRequest") == {
         ("string", "provider_id"),
         ("Object<string, string>=", "overrides"),
+        ("string=", "connection"),
+        ("('OPENAI_COMPATIBLE_API_KEY'|'OPENAI_API_KEY')=", "api_key_setting"),
     }
     assert _js_typedef_properties(text, "ProviderTestResponse") == {
         ("boolean", "ok"),
         ("string=", "error"),
     }
+
+
+def test_claudexor_quota_view_has_separate_required_contract():
+    hints = get_type_hints(ClaudexorQuotaResponse, include_extras=True)
+    assert set(hints) == {
+        "view", "profiles", "quota", "quota_absences", "unified_accounts",
+        "reads", "read_errors", "timings_ms",
+        "resources", "availability_scope",
+    }
+    assert ClaudexorQuotaResponse.__total__
+    assert _notrequired_fields(ClaudexorQuotaResponse) == {"resources", "availability_scope"}
+    assert get_args(hints["view"]) == ("quota",)
+    assert hints["reads"] is ClaudexorStatusReads
+    assert hints["unified_accounts"] is bool
+    phases, error_type = get_args(hints["read_errors"])
+    assert set(get_args(phases)) == {"discovery", "accounts", "quota"}
+    assert error_type is ClaudexorPassiveReadError
+    assert get_args(hints["timings_ms"]) == (str, int)
+    errors = get_type_hints(ClaudexorPassiveReadError, include_extras=True)
+    assert errors["code"] is str
+    assert get_args(errors["status_code"]) == (int,)
+    assert _notrequired_fields(ClaudexorPassiveReadError) == {"status_code"}
+    assert not {"view", "read_errors", "timings_ms"} & set(ClaudexorStatusResponse.__annotations__)
+    text = (pathlib.Path(__file__).resolve().parent.parent
+            / "web" / "modules" / "api_types.js").read_text(encoding="utf-8")
+    assert _js_typedef_properties(text, "ClaudexorQuotaResponse") == {
+        ("'quota'", "view"), ("Object", "profiles"),
+        ("Array<Object>", "quota"), ("Array<Object>", "quota_absences"),
+        ("boolean", "unified_accounts"), ("ClaudexorStatusReads", "reads"),
+        ("Object<'discovery'|'accounts'|'quota', ClaudexorPassiveReadError>", "read_errors"),
+        ("Object<string, number>", "timings_ms"),
+        ("Array<Object>=", "resources"),
+        ("Object=", "availability_scope"),
+    }
+    assert _js_typedef_properties(text, "ClaudexorPassiveReadError") == {
+        ("string", "code"), ("number=", "status_code"),
+    }
+
+
+def test_full_claudexor_status_scope_has_optional_typed_and_js_parity():
+    hints = get_type_hints(ClaudexorStatusResponse, include_extras=True)
+    assert get_origin(hints["availability_scope"]) is dict
+    assert not ClaudexorStatusResponse.__total__
+    text = (pathlib.Path(__file__).resolve().parent.parent
+            / "web" / "modules" / "api_types.js").read_text(encoding="utf-8")
+    assert "availability_scope" in _js_typedef_fields(text, "ClaudexorStatusResponse")
+    assert _js_typedef_fields(text, "ClaudexorStatusResponse") == set(hints)
 
 
 def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
@@ -167,13 +233,30 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     extra = tokens - contract_tokens
     assert not missing, f"HTTP_ENDPOINTS includes routes not mounted by gateway.router: {sorted(missing)}"
     assert not extra, f"gateway.router mounts routes missing from HTTP_ENDPOINTS: {sorted(extra)}"
-    text = (pathlib.Path(__file__).resolve().parent.parent / "web" / "modules" / "api_types.js").read_text(
-        encoding="utf-8"
-    )
+    modules = pathlib.Path(__file__).resolve().parent.parent / "web" / "modules"
+    text = (modules / "api_types.js").read_text(encoding="utf-8")
+    assert "import('./task_activity_types.js').ActiveChatActivity" in text
+    text += "\n" + (modules / "task_activity_types.js").read_text(encoding="utf-8")
+    # The owner-decision ingress twin (gateway/decision_contracts.py) is re-exported the same way.
+    for name in ("DecisionRequest", "DecisionResponse"):
+        assert f"import('./decision_types.js').{name}" in text
+    text += "\n" + (modules / "decision_types.js").read_text(encoding="utf-8")
+    for name in ("CommandInbound", "PanicAcceptedOutbound", "OnboardingAttemptResponse"):
+        assert f"import('./client_contract_types.js').{name}" in text
+    text += "\n" + (modules / "client_contract_types.js").read_text(encoding="utf-8")
+    for name in ("EvolutionRefresh", "EvolutionDataResponse"):
+        assert f"import('./evolution_types.js').{name}" in text
+    text += "\n" + (modules / "evolution_types.js").read_text(encoding="utf-8")
+    for name in ("UpdateMergePlan", "UpdatePreflightRequest", "UpdatePreflightResponse", "UpdateApplyRequest",
+                 "UpdateApplySuccessResponse", "UpdateApplyErrorResponse", "UpdateProgressChangedOutbound",
+                 "UpdateStatusReadyOutbound"):
+        assert f"import('./update_types.js').{name}" in text
+    text += "\n" + (modules / "update_types.js").read_text(encoding="utf-8")
     version = (pathlib.Path(__file__).resolve().parent.parent / "VERSION").read_text(encoding="utf-8").strip()
     assert f"GATEWAY_CONTRACT_VERSION = '{version}'" in text
     settings_meta_fields = {
         "custom_secret_keys", "setup_contract", "available_subagents", "policy_state", "restart_state",
+        "connections", "main_connection_choice", "known_spend_gaps", "effects", "tokens",
     }
     assert settings_meta_fields <= set(SettingsMeta.__annotations__)
     assert _js_typedef_fields(text, "SettingsMeta") == settings_meta_fields
@@ -181,6 +264,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "StateResponse",
         "ActiveDirectTurn",
         "ActiveChatActivity",
+        "ContextAttemptFact",
         "TypingOutbound",
         "HealthResponse",
         "SettingsMeta",
@@ -188,6 +272,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "ProviderTestRequest",
         "ProviderTestResponse",
         "UiPreferencesResponse",
+        "DesktopAutostartResponse",
         "ChatInbound",
         "ChatOutbound",
         "PhotoOutbound",
@@ -228,14 +313,19 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "OnboardingSubagentsPreviewResponse",
         "OnboardingPresetProjection",
         "OnboardingCompleteResponse",
+        "OnboardingAttemptResponse",
         "OnboardingPresetFailureResponse",
         "SettingsPostCommitFailureResponse",
         "ClaudexorLoginJobResponse",
         "ClaudexorLoginJobProblem",
+        "ClaudexorPassiveReadError",
+        "ClaudexorQuotaResponse",
         "ClaudexorCredentialProfileDeleteResponse",
         "ClaudexorVendorCredentialDisposition",
         "WidgetTab",
         "WidgetsResponse",
+        "WidgetFaultRequest",
+        "WidgetFaultResponse",
     ):
         assert re.search(rf"@typedef \{{Object\}} {name}\b", text), f"api_types.js missing {name}"
     api_client = (pathlib.Path(__file__).resolve().parent.parent / "web" / "modules" / "api_client.js").read_text(
@@ -249,20 +339,26 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     # loop above cannot see a new @property, so an ABI field added on the Python side would otherwise
     # never have to appear in the browser's typedef (ARCHITECTURE.md §11.3).
     for cls in (ChatInbound, ChatOutbound, PhotoOutbound, VideoOutbound, DocumentOutbound,
-                UploadResponse, TaskCreateResponse, AttachmentManifestEntry,
+                # #1539: the optional root starting effort joins the request mirror field by field.
+                UploadResponse, TaskCreateRequest, TaskCreateResponse, AttachmentManifestEntry,
                 DecisionRequest, DecisionResponse, LinkAction, LinksOutbound, QuizOption, QuizOutbound, QuizStateOutbound,
+                # The integration-secret form (showSecretHitl / saveSecretToken) and its metadata.
+                SecretConsumer, SecretDecisionRequest, SecretDecisionResponse, SecretEvent, SecretKeyState,
+                SecretOutcome, SecretRequestField, SecretRequestMeta,
                 # widgets-lifecycle W1b: the owner's per-card start-mode override is checked field by field.
-                UiPreferencesResponse,
+                UiPreferencesResponse, DesktopAutostartResponse,
                 ActiveDirectTurn, ActiveChatActivity, TypingOutbound,
                 StateResponse, UpdateMergePlan,
                 UpdatePreflightRequest, UpdatePreflightResponse, UpdateApplyRequest,
                 UpdateApplySuccessResponse, UpdateApplyErrorResponse,
-                UpdateStatusReadyOutbound, TaskCostBreakdown, TaskDetailResponse,
+                UpdateStatusReadyOutbound, TaskCostBreakdown, TaskCostSlice, TaskDetailResponse, QuestionRoom,
+                TaskCancelRequest, TaskPauseRequest, TaskPauseResponse,
+                TaskContinueRequest, TaskContinueResponse, ContinuationOffer,
                 TaskHurryRequest, TaskHurryResponse, OwnerHurryProjection,
                 TaskEvent, TaskEventCursor, TaskEventsRequest,
                 OwnerSkillPresenceRuntimeRequest, OwnerSkillPresenceRuntimeResponse,
                 OnboardingCompleteRequest, OnboardingPresetProjection,
-                OnboardingSubagentsPreviewResponse, OnboardingCompleteResponse,
+                OnboardingSubagentsPreviewResponse, OnboardingCompleteResponse, OnboardingAttemptResponse,
                 OnboardingPresetFailureResponse, AvailableSubagentsSettingsMeta,
                 SettingsPostCommitFailureResponse,
                 ProviderTestRequest, ProviderTestResponse,
@@ -271,7 +367,9 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
                 ClaudexorCredentialProfileDeleteResponse,
                 ClaudexorVendorCredentialDisposition,
                 ClaudexorStatusReads, ClaudexorStatusResponse,
-                WidgetTab, WidgetsResponse):
+                ClaudexorPassiveReadError, ClaudexorQuotaResponse,
+                WidgetTab, WidgetsResponse, WidgetFaultRequest, WidgetFaultResponse,
+                EvolutionDataResponse, EvolutionRefresh):
         expected = set(get_type_hints(cls, include_extras=True))
         actual = _js_typedef_fields(text, cls.__name__)
         # ABI 7.0 (ABI-3): the alias JSDoc lines were cleaned up in the F3.3
@@ -364,21 +462,56 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     # stamp the typed fields only for registry-tracked turns (optional).
     # (__required_keys__ ignores NotRequired on some 3.10 setups, so inspect
     # the declared annotations instead.)
-    assert _notrequired_fields(ActiveDirectTurn) == {"model_waits", "task_attempt"}, (
-        "ActiveDirectTurn keeps its required base; waits and attempt are optional live-owner facts"
+    assert _notrequired_fields(ActiveDirectTurn) == {"model_waits", "task_attempt", "model_activity", "turn_phase",
+                                                   "executor", "carrier", "context_attempt", "lead"}, (
+        "ActiveDirectTurn keeps its required base; waits, attempt, start phase, the lane's carrier facts and the "
+        "published lead are optional"
     )
-    assert _notrequired_fields(ActiveChatActivity) == {"model_waits", "task_attempt", "required_question"}, (
-        "ActiveChatActivity keeps the same required base and optional wait/attempt facts"
-    )
+    assert _notrequired_fields(ActiveChatActivity) == {
+        "model_waits", "model_activity", "context_attempt", "task_attempt", "turn_phase", "executor", "carrier", "required_question", "required_question_unavailable", "project_admission_hold", "pause_cause", "owner_wait",
+        "status", "outcome_axes", "reason_code", "cancel_origin", "delegated_runs_unreconciled", "root_phase_checkpoint",
+        "timeout_retry_from", "original_task_id",
+        "finishing_reviews", "late_work", "can_resume", "cancelable", "presence_pause",
+        "last_line", "last_line_at", "tool_calls", "detached", "project_name", "lead",
+    }, "ActiveChatActivity adds optional outcome/retry/review evidence without changing required activity facts"
+    from ouroboros.physical_attempt_context import ContextAttemptFact
+
+    js = (pathlib.Path(__file__).resolve().parent.parent / "web" / "modules" / "task_activity_types.js").read_text(
+        encoding="utf-8")
+    assert _js_typedef_fields(js, "ContextAttemptFact") == set(ContextAttemptFact.__annotations__)
+    assert {name for name in ("ActiveDirectTurn", "ActiveChatActivity") if "context_attempt" in _js_typedef_fields(
+        js, name)} == {"ActiveDirectTurn", "ActiveChatActivity"}
     activity_fields = get_type_hints(ActiveChatActivity, include_extras=True)
-    assert {key: value for key, value in activity_fields.items() if key != "required_question"} == get_type_hints(ActiveDirectTurn, include_extras=True), (
+    question_keys = {"required_question", "required_question_unavailable", "project_admission_hold", "pause_cause", "owner_wait"}
+    question_keys |= {"status", "outcome_axes", "reason_code", "cancel_origin", "delegated_runs_unreconciled", "root_phase_checkpoint",
+                      "timeout_retry_from", "original_task_id"}
+    question_keys |= {"finishing_reviews", "late_work", "can_resume", "cancelable", "presence_pause"}
+    question_keys |= {"last_line", "last_line_at", "tool_calls", "detached", "project_name"}
+    assert {key: value for key, value in activity_fields.items() if key not in question_keys} == get_type_hints(ActiveDirectTurn, include_extras=True), (
         "ActiveChatActivity must mirror ActiveDirectTurn's field shape so one client reducer hydrates both"
     )
     from ouroboros.gateway.schema import json_schema_for
 
     activity_schema = json_schema_for(ActiveChatActivity)
+    context_schema = activity_schema["properties"]["context_attempt"]
+    assert set(context_schema["properties"]["previous"]["properties"]) == set(ContextAttemptFact.__annotations__) - {"previous"}
     assert activity_schema["properties"].pop("required_question")["type"] == "object"
-    assert "required_question" not in activity_schema["required"]
+    assert activity_schema["properties"].pop("required_question_unavailable")["type"] == "boolean"
+    assert activity_schema["properties"].pop("project_admission_hold")["type"] == "object"
+    assert activity_schema["properties"].pop("pause_cause")["type"] == "string"
+    assert activity_schema["properties"].pop("owner_wait")["type"] == "object"
+    for field in ("can_resume", "cancelable", "presence_pause"):
+        assert activity_schema["properties"].pop(field)["type"] == "boolean"
+    for field in ("status", "reason_code", "timeout_retry_from", "original_task_id"):
+        assert activity_schema["properties"].pop(field)["type"] == "string"
+    for field in ("outcome_axes", "cancel_origin", "root_phase_checkpoint", "late_work"):
+        assert activity_schema["properties"].pop(field)["type"] == "object"
+    assert activity_schema["properties"].pop("finishing_reviews")["type"] == "boolean"
+    assert activity_schema["properties"].pop("delegated_runs_unreconciled") == {"type": "array", "items": {"type": "string"}}
+    for field, kind in {"last_line": "string", "last_line_at": "string", "tool_calls": "integer",
+                        "detached": "boolean", "project_name": "string"}.items():
+        assert activity_schema["properties"].pop(field)["type"] == kind
+    assert not question_keys & set(activity_schema["required"])
     assert activity_schema == json_schema_for(ActiveDirectTurn), (
         "the shared activity shape must preserve flat keys, types and requiredness"
     )
@@ -389,8 +522,9 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     turn_decl = re.search(r"@typedef \{Object\} ActiveDirectTurn\b([\s\S]*?)\*/", text)
     assert turn_decl and set(re.findall(
         r"@property \{[^}]*=\} (\w+)", turn_decl.group(1)
-    )) == {"model_waits", "task_attempt"}, (
-        "ActiveDirectTurn browser mirror keeps wait/attempt facts optional"
+    )) == {"model_waits", "task_attempt", "model_activity", "context_attempt", "turn_phase", "executor", "carrier",
+           "lead"}, (
+        "ActiveDirectTurn browser mirror keeps wait/attempt/start-phase, sent-attempt, carrier facts and the lead optional"
     )
     typing_decl = re.search(r"@typedef \{Object\} TypingOutbound\b([\s\S]*?)\*/", text)
     assert typing_decl
@@ -449,6 +583,8 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     assert re.search(r"@property \{boolean=\} worker_saturation_warning\b", text), "ChatOutbound missing worker_saturation_warning"
     assert "review_projection" in get_type_hints(ChatOutbound, include_extras=True)
     assert re.search(r"@property \{Object=\} review_projection\b", text)
+    assert "review_overrides" in get_type_hints(ChatOutbound, include_extras=True)  # the work's card field, on page load
+    assert re.search(r"@property \{Object=\} review_overrides\b", text)
     assert "setup_contract" in text
     assert re.search(r"@property \{string=\} error\b", text), "SkillDeleteResponse missing optional error"
     assert {"chat", "command", "photo", "video", "links", "quiz", "quiz_state", "typing", "log", "heartbeat", "extension_lifecycle"} <= set(WS_MESSAGE_TYPES)
@@ -466,12 +602,20 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "project_chat_id",
         "routing_token",
         "cause",
+        "reasoning_effort",
+        "routing_notice_carrier",
+        "reply_to",
         "status",
         "options",
         "attachment_manifest",
         "suppress_bubble",
-        "ts",
+        "ts", "project_name", "target_task_ids", "target_titles"
     }
+    # The notice carrier is one literal pair in both mirrors: an ACK and the System row beside it read the same words.
+    for cls in (MessageAnnotationOutbound, ChatOutbound):
+        carrier = get_type_hints(cls, include_extras=True)["routing_notice_carrier"]
+        assert get_args(get_args(carrier)[0]) == ("routing_ack", "system"), cls.__name__
+    assert len(re.findall(r'@property \{"routing_ack"\|"system"=\} routing_notice_carrier\b', text)) == 2
 
 
 def test_gateway_money_contracts_keep_unavailable_distinct_from_zero():
@@ -504,6 +648,7 @@ def test_skill_lifecycle_queue_contract_matches_runtime_shape():
 
 def test_skill_delete_contract_matches_runtime_shape():
     fields = set(SkillDeleteResponse.__annotations__)
+    assert "state_delete_pending" not in fields
 
     assert {
         "ok",
@@ -635,12 +780,16 @@ def test_decision_comment_limit_and_optional_index_pinned_across_python_and_js()
         name for name, annotation in DecisionRequest.__annotations__.items()
         if (getattr(annotation, "__forward_arg__", None) or str(annotation)).startswith("NotRequired[")
     }
-    assert optional == {"option_index", "comment", "revision", "action", "auto_continue",
-                        "model", "credential_profile_id", "use_local", "persist_role"}
-    request_decl = re.search(r"@typedef \{Object\} DecisionRequest\b([\s\S]*?)\*/", text)
+    assert optional == {"option_index", "comment", "reason", "revision", "action", "auto_continue",
+                        "model", "credential_profile_id", "use_local", "persist_role", "values"}
+    decisions = (pathlib.Path(__file__).resolve().parent.parent / "web" / "modules" / "decision_types.js").read_text(
+        encoding="utf-8"
+    )
+    request_decl = re.search(r"@typedef \{Object\} DecisionRequest\b([\s\S]*?)\*/", decisions)
     assert request_decl
     assert "@property {number=} option_index" in request_decl.group(1)
     assert "@property {string=} comment" in request_decl.group(1)
+    assert "@property {Object=} values" in request_decl.group(1)  # a card press's optional form values
 
     # The settled quiz card replayed from history carries the recorded answer:
     # the chosen index when there was one, and the owner's verbatim words —
@@ -681,3 +830,40 @@ def test_quiz_option_recommendation_is_an_additive_optional_field_in_both_langua
     )
     option_decl = re.search(r"@typedef \{Object\} QuizOption\b([\s\S]*?)\*/", text)
     assert option_decl and "@property {boolean=} recommended" in option_decl.group(1)
+
+
+def test_cost_presentation_has_a_closed_nullable_wire_shape():
+    from typing import get_args, get_type_hints
+    from ouroboros.cost_projection import CostPresentation
+
+    hints = get_type_hints(CostPresentation)
+    assert set(hints) == {'scope', 'tracked_amount', 'has_unpriced', 'tracked_final', 'accounting_open', 'has_rows'}
+    assert set(get_args(hints['scope'])) == {'own', 'root_tree'}
+    assert _contains_none(hints['tracked_amount'])
+    assert _contains_none(get_type_hints(ChatOutbound, include_extras=True)['cost_presentation'])
+
+
+def test_owner_continuation_envelopes_are_exported():
+    from ouroboros.gateway import contracts
+    for cls in (TaskPauseRequest, TaskPauseResponse, TaskContinueRequest, TaskContinueResponse, ContinuationOffer):
+        assert cls.__name__ in contracts.__all__
+
+
+def test_vendor_program_contracts_have_complete_javascript_twins():
+    from ouroboros.gateway import management_contracts as contracts
+
+    text = (pathlib.Path(__file__).resolve().parent.parent
+            / "web/modules/management_contract_types.js").read_text(encoding="utf-8")
+    prefixes = ("ClaudexorSelectedProgram", "ClaudexorProgram", "ClaudexorNewest", "ClaudexorMaintenance")
+    types = [value for name, value in vars(contracts).items()
+             if name.startswith(prefixes) and hasattr(value, "__annotations__")]
+    for cls in types:
+        assert _js_typedef_fields(text, cls.__name__) == set(get_type_hints(cls)), cls.__name__
+    operation = get_type_hints(contracts.ClaudexorMaintenanceOperation, include_extras=True)
+    assert contracts.ClaudexorMaintenanceOperation.__total__
+    assert _notrequired_fields(contracts.ClaudexorMaintenanceOperation) == {"profileCleanup"}
+    assert get_args(operation["outcome"]) == ("changed", "not_changed", "changed_elsewhere", "unknown")
+    entry = get_type_hints(contracts.ClaudexorMaintenanceEntry)
+    assert get_args(entry["updateAvailable"]) == ("yes", "no", "cannot_tell")
+    assert not {"mechanism", "targetVersion"} & operation.keys()
+    assert not {"maintainable", "targets", "installed", "releaseTested", "previous", "available"} & entry.keys()

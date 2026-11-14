@@ -2,21 +2,24 @@
 
 from __future__ import annotations
 
-from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, completed_local_read, publish_no_effect
 
+from ouroboros.tools.arg_feedback import payload_item_feedback, with_argument_notes
+
+import copy
+import json
 import logging
 import os
 import pathlib
 import re
 import subprocess
 import uuid
-from typing import Any, Dict, List
+from typing import Dict, List
 
 from ouroboros.artifacts import artifact_store_path_block_reason, copy_file_to_task_artifacts
 from ouroboros.project_facts import filter_out_project_store as _filter_out_project_store  # noqa: F401
 from ouroboros.project_facts import project_store_access_block as _project_store_access_block
 from ouroboros.protected_artifacts import block_reason_for_path
-from ouroboros.secret_masking import mask_secret_bytes
 from ouroboros.tools.registry import ToolContext, ToolEntry, active_repo_dir_for  # noqa: F401
 from ouroboros.tool_access import (
     ResolvedResourceBinding,
@@ -46,31 +49,22 @@ from ouroboros.contracts.skill_payload_policy import (
     is_skill_create_typo,
     resolve_skill_payload_target,
 )
+from ouroboros.tools.core_secret_paths import is_restricted_subagent_profile  # noqa: F401
 from ouroboros.tools.core_file_tools import (  # noqa: F401
     _ListingFailure,
     _MEMORY_AT_DRIVE_MEMORY,
-    _raw_owner_secret_access_allowed,
     _SKILL_OWNER_STATE_FILENAMES,
-    _SUBAGENT_SECRET_FILE_NAMES,
     _access_or_block,
-    _annotate_reread,
     _coerce_line_window,
     _coerce_start_char,
     _data_list,
     _data_read,
     _direct_resource_binding,
-    _filter_subagent_secret_listing,
-    _filter_subagent_secret_repo_listing,
     _is_cognitive_data_path,
     _is_skill_owner_state_target,
-    _is_subagent_secret_data_path,
-    _is_subagent_secret_repo_path,
-    _is_subagent_secret_repo_target,
-    make_subagent_secret_target_check,
     _list_dir,
     _list_files,
     _list_user_files_dir,
-    _local_readonly_resource_block,
     _normalize_data_read_path,
     _profile_roots_hint,
     _read_file,
@@ -78,8 +72,9 @@ from ouroboros.tools.core_file_tools import (  # noqa: F401
     _repo_list,
     _repo_read,
     _root_display_path,
-    is_restricted_subagent_profile,
+    _runtime_data_read_check,
 )
+from ouroboros.delegate_reply import REPLY_TO_SCHEMA, validate_reply_target
 from ouroboros.tools.core_artifacts import (  # noqa: F401
     _MAX_DOCUMENT_FILE_BYTES,
     _MAX_PHOTO_FILE_BYTES,
@@ -94,11 +89,13 @@ from ouroboros.tools.core_artifacts import (  # noqa: F401
     QuizValidationError,
     _MAX_LINK_ACTIONS,
     _MAX_QUIZ_OPTIONS,
+    ESCALATE_TOOL_SCHEMA,
     _escalate,
     _send_links,
     validate_link_actions,
     validate_quiz_payload,
 )
+from ouroboros.tools.cards import SHOW_CARD_TOOL_SCHEMA, _show_card
 
 log = logging.getLogger(__name__)
 
@@ -206,22 +203,25 @@ def _str_match_replace(
     """Shared exact, byte-level, single-occurrence replacement for both str-replace
     editors — the repo editor (``git._str_replace_editor``) and the data-plane editor
     (``_edit_text``) — so they give IDENTICAL match feedback (deferral 4). Returns
-    ``(new_text, None)`` on a unique match, else ``(None, error_message)`` with the
-    count==0 file preview / count>1 positional hints. ``error_tag`` is the caller's
-    error prefix (e.g. ``STR_REPLACE_ERROR`` / ``EDIT_TEXT_ERROR``)."""
+    ``(new_text, None)`` on a unique match, else ``(None, error_message)``: a miss
+    carries the bounded edit-miss locator (plus the whole file when it is small),
+    duplicates name positions. ``error_tag`` is the caller's error prefix (e.g.
+    ``EDIT_TEXT_ERROR``)."""
     count = text.count(old_str)
     if count == 0:
-        preview = text[:2000]
+        from ouroboros.tools.edit_ops import locate_edit_miss, whole_file_preview
         return None, (
             f"⚠️ {error_tag}: old_str not found in {display_path}.\n"
-            f"File preview (first 2000 chars):\n{preview}"
+            f"{locate_edit_miss(text, old_str)}{whole_file_preview(text)}"
         )
     if count > 1:
+        from ouroboros.tools.edit_ops import edit_source_line
+
         positions = []
         start = 0
         for _ in range(min(count, 5)):
             idx = text.index(old_str, start)
-            positions.append(f"line {text[:idx].count(chr(10)) + 1}")
+            positions.append(f"line {edit_source_line(text, idx)}")
             start = idx + 1
         return None, (
             f"⚠️ {error_tag}: old_str found {count} times in {display_path} "
@@ -232,30 +232,34 @@ def _str_match_replace(
 
 
 def _check_data_shrink_guard(
-    target: pathlib.Path, new_content: str, force: bool = False
+    target: pathlib.Path, new_content: str, force: bool = False, *, recovery: str = ""
 ) -> "str | None":
     """Block likely accidental truncation of an EXISTING data-plane file on OVERWRITE,
     unless force=True (deferral 5). Mirrors the repo shrink-guard
     (``git._check_shrink_guard``) but WITHOUT the ``git ls-files`` tracking check — the
     data plane is not a git tree. Skips a non-existent target (a fresh create is any
-    size) and appends (the caller only invokes this on overwrite). Never raises."""
+    size) and appends (the caller only invokes this on overwrite). ``recovery``
+    replaces the full-write next step; exact editors pass
+    ``edit_ops.EXACT_EDIT_SHRINK_RECOVERY``. Never raises."""
     from ouroboros.config import get_runtime_mode
     from ouroboros.runtime_mode_policy import mode_has_unrestricted_agency
 
     if force or mode_has_unrestricted_agency(get_runtime_mode()):
         return None
+    from ouroboros import work_domain  # a work file's previous bytes: the confined intake
+
     try:
-        if not target.exists():
+        if not work_domain.exists(target):
             return None
-        old_len = len(target.read_text(encoding="utf-8"))
+        old_len = len(work_domain.read_text(target))
         new_len = len(new_content)
         if old_len > 0 and new_len < old_len * 0.7:
             pct = round(new_len / old_len * 100)
             return (
                 f"⚠️ WRITE_BLOCKED: new content for '{target.name}' is {pct}% of original "
                 f"({old_len} -> {new_len} chars). This looks like accidental truncation. "
-                f"Use edit_text for surgical edits, or pass force=true to confirm an "
-                f"intentional rewrite."
+                + (recovery or "Use edit_text for surgical edits, or pass force=true to confirm an "
+                   "intentional rewrite.")
             )
     except Exception:
         return None
@@ -391,9 +395,9 @@ def _data_write(
             matches = True
     if matches and not cyber:
         return (
-            "⚠️ DATA_WRITE_BLOCKED: settings.json is the canonical owner-edited "
-            "file. Tool-level writes must route through /api/settings (which "
-            "applies key-by-key policy — OUROBOROS_RUNTIME_MODE is owner-only "
+            "⚠️ DATA_WRITE_BLOCKED: settings.json is the canonical owner-edited file. Tool-level writes must route "
+            "through /api/settings, declaring headers X-Ouroboros-Actor: ouroboros and X-Ouroboros-Task-Id: <your "
+            "task id> (it applies key-by-key policy — OUROBOROS_RUNTIME_MODE is owner-only "
             "and dropped on POST; other keys flow through normally). To change "
             "owner-only values, stop the agent, edit ~/Ouroboros/data/settings.json "
             "directly, then restart."
@@ -477,13 +481,22 @@ def _data_write(
             repair_task=bool(existing_tc and existing_tc.has_selected_skill))
         if _cas:
             return _cas
-    p.parent.mkdir(parents=True, exist_ok=True)
+    from ouroboros import work_domain  # a payload in a work checkout is written as the work domain
+
+    work = work_domain.is_work(p)
+    if not work:
+        p.parent.mkdir(parents=True, exist_ok=True)
     if mode == "overwrite":
         # Deferral 5: block likely-accidental truncation of an existing data-plane file
         # (e.g. settings.json, skill state) unless force=true. Append is exempt.
         if (shrink := _check_data_shrink_guard(p, content, force)):
             return shrink
-        write_text_atomic(p, content)  # crash-safe full overwrite (G)
+        if work:
+            work_domain.write_text(p, content)
+        else:
+            write_text_atomic(p, content)  # crash-safe full overwrite (G)
+    elif work:
+        work_domain.write_text(p, content, append=True)
     else:
         with p.open("a", encoding="utf-8") as f:
             f.write(content)  # append is intentionally NOT atomized
@@ -530,6 +543,23 @@ def _data_write(
     return result
 
 
+def _land_root_bytes(target: pathlib.Path, content: str, *, append: bool = False) -> None:
+    """Land a non-repository root's file: a work path AS THE WORK DOMAIN (``work_domain.write_text``: made, written
+    and resolved in its container), any other path exactly as before (its folder made, an atomic overwrite or a
+    non-atomic append)."""
+    from ouroboros import work_domain
+
+    if work_domain.is_work(target):
+        work_domain.write_text(target, content, append=append)
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if append:
+        with target.open("a", encoding="utf-8", newline="") as fh:
+            fh.write(content)
+    else:
+        write_text_atomic(target, content)
+
+
 def _join_write_results(results: List[str]) -> str:
     rendered = "\n".join(results) if results else "⚠️ TOOL_ARG_ERROR: files must contain {path, content} objects."
     if any(str(line).lstrip().startswith("⚠️") for result in results for line in str(result).splitlines()):
@@ -537,21 +567,42 @@ def _join_write_results(results: List[str]) -> str:
     return rendered
 
 
+# Consumed item fields own both schema and pre-write validation. Extras remain
+# schema-permitted: their value determines omission versus a typed refusal.
+_WRITE_FILE_ITEM_PROPERTIES = {"path": {"type": "string"}, "content": {"type": "string"}}
+_WRITE_FILE_ITEM_KEYS = tuple(_WRITE_FILE_ITEM_PROPERTIES)
+
+
 def _write_file(
     ctx: ToolContext,
     path: str = "",
     content: str = "",
     files: List[Dict[str, str]] | None = None,
-    root: str = "active_workspace",
+    root: str | None = None,
     mode: str = "overwrite",
     force: bool = False,
     bucket: str = "",
     skill_name: str = "",
     _resolved_binding: ResolvedResourceBinding | tuple[ResolvedResourceBinding, ...] | None = None,
 ) -> str:
+    from ouroboros.tools.tool_resolution import inferred_file_root
+
+    paths = [str(item.get("path") or "") for item in files if isinstance(item, dict)] if files else [path]
+    root, root_error = inferred_file_root(ctx, "write_file", root, paths)
+    if root_error:
+        return root_error
     normalized, block = _access_or_block(ctx, root, "write")
     if block:
-        return block
+        return publish_no_effect(ctx, block, tool_name="write_file")
+    notes = []
+    if files is not None:
+        refusal, notes = payload_item_feedback(
+            ctx, files, _WRITE_FILE_ITEM_PROPERTIES, item_label="file",
+            options={"root": normalized, "mode": mode, "force": force,
+                     "bucket": bucket, "skill_name": skill_name},
+        )
+        if refusal:
+            return refusal
     try:
         if _resolved_binding is None and files:
             bindings: ResolvedResourceBinding | tuple[ResolvedResourceBinding, ...] = tuple(
@@ -559,7 +610,7 @@ def _write_file(
                     ctx, None, root=normalized, operation="write",
                     path=str(item.get("path") or ""), bucket=bucket, skill_name=skill_name,
                 )
-                for item in files if isinstance(item, dict)
+                for item in files
             )
         else:
             bindings = _direct_resource_binding(
@@ -580,43 +631,19 @@ def _write_file(
     if normalized in {"active_workspace", "system_repo"}:
         from ouroboros.tools.git import _repo_write
 
-        return _repo_write(
+        result = _repo_write(
             ctx, path=path, content=content, files=files or [], mode=mode, force=force,
             display_root=normalized, _resolved_binding=bindings,
         )
-    if normalized == "runtime_data":
+        return with_argument_notes(ctx, result, notes)
+    if normalized in {"runtime_data", "skill_payload"}:
         if files:
             results = []
             binding_iter = iter(binding_items)
             for item in files:
-                if not isinstance(item, dict):
-                    continue
+                rel = str(item.get("path") or "")
+                body = str(item.get("content") or "")
                 item_binding = next(binding_iter, None)
-                if item_binding is None:
-                    results.append("⚠️ TOOL_ARG_ERROR: files must contain {path, content} objects.")
-                    continue
-                results.append(_data_write(
-                    ctx,
-                    str(item.get("path") or ""),
-                    str(item.get("content") or ""),
-                    mode=mode,
-                    display_root=normalized,
-                    force=force,
-                    _resolved_binding=item_binding,
-                ))
-            return _join_write_results(results)
-        return _data_write(
-            ctx, path=path, content=content, mode=mode, display_root=normalized,
-            force=force, _resolved_binding=binding_items[0],
-        )
-    if normalized == "skill_payload":
-        if files:
-            results = []
-            binding_iter = iter(binding_items)
-            for item in files:
-                rel = str(item.get("path") or "") if isinstance(item, dict) else ""
-                body = str(item.get("content") or "") if isinstance(item, dict) else ""
-                item_binding = next(binding_iter, None) if isinstance(item, dict) else None
                 if item_binding is None:
                     results.append("⚠️ TOOL_ARG_ERROR: files must contain {path, content} objects.")
                     continue
@@ -631,7 +658,7 @@ def _write_file(
                     force=force,
                     _resolved_binding=item_binding,
                 ))
-            return _join_write_results(results)
+            return with_argument_notes(ctx, _join_write_results(results), notes)
         return _data_write(
             ctx, path=path, content=content, mode=mode, bucket=bucket,
             skill_name=skill_name, display_root=normalized, force=force,
@@ -642,8 +669,6 @@ def _write_file(
             results = []
             binding_iter = iter(binding_items)
             for item in files:
-                if not isinstance(item, dict):
-                    continue
                 rel_path = str(item.get("path") or "")
                 item_binding = next(binding_iter, None)
                 if item_binding is None:
@@ -657,28 +682,26 @@ def _write_file(
                     if block_reason:
                         results.append(f"⚠️ WRITE_FILE_BLOCKED: artifact_store path blocked: {block_reason}")
                         continue
-                target.parent.mkdir(parents=True, exist_ok=True)
                 body = str(item.get("content") or "")
                 if mode == "append":
                     # Batch items honor the declared mode like the single-file path below:
                     # silently overwriting here destroyed every prior chunk of a chunked
                     # large-file write while reporting success (#447 D2).
-                    with target.open("a", encoding="utf-8", newline="") as fh:
-                        fh.write(body)  # append is intentionally NOT atomized
+                    _land_root_bytes(target, body, append=True)  # append is intentionally NOT atomized
                 else:
                     # Deferral 5: batch items overwrite too — shrink-guard each (parity with the
                     # single-file path), force=true bypasses.
                     if (shrink := _check_data_shrink_guard(target, body, force)):
                         results.append(shrink)
                         continue
-                    write_text_atomic(target, body)  # crash-safe (G)
+                    _land_root_bytes(target, body)  # crash-safe (G)
                 result = f"OK: wrote {_root_display_path(normalized, rel_path)} ({len(body)} chars)"
                 if normalized == "user_files":
                     record = copy_file_to_task_artifacts(ctx, target, kind="user_file")
                     if record:
                         result += f"\nARTIFACT_OUTPUTS: registered user file -> artifact_store:{record.get('name')}"
                 results.append(result)
-            return _join_write_results(results)
+            return with_argument_notes(ctx, _join_write_results(results), notes)
         target = binding_items[0].target_path
         if normalized == "artifact_store":
             block_reason = artifact_store_path_block_reason(
@@ -686,16 +709,14 @@ def _write_file(
             )
             if block_reason:
                 return f"⚠️ WRITE_FILE_BLOCKED: artifact_store path blocked: {block_reason}"
-        target.parent.mkdir(parents=True, exist_ok=True)
         if mode == "append":
-            with target.open("a", encoding="utf-8", newline="") as fh:
-                fh.write(content)  # append is intentionally NOT atomized
+            _land_root_bytes(target, content, append=True)  # append is intentionally NOT atomized
         else:
             # Deferral 5: shrink-guard the full overwrite (e.g. active_workspace rewrites)
             # — force=true bypasses, matching the tool-schema `force` description.
             if (shrink := _check_data_shrink_guard(target, content, force)):
                 return shrink
-            write_text_atomic(target, content)  # crash-safe full overwrite (G)
+            _land_root_bytes(target, content)  # crash-safe full overwrite (G)
         result = f"OK: wrote {_root_display_path(normalized, path)} ({len(content)} chars)"
         if normalized == "user_files":
             record = copy_file_to_task_artifacts(ctx, target, kind="user_file")
@@ -709,21 +730,41 @@ def _write_file(
 def _edit_text(
     ctx: ToolContext,
     path: str,
-    old_str: str,
-    new_str: str,
-    root: str = "active_workspace",
+    old_str: str | None = None,
+    new_str: str | None = None,
+    root: str | None = None,
     bucket: str = "",
     skill_name: str = "",
     force: bool = False,
+    edits: List[Dict[str, str]] | None = None,
     _resolved_binding: ResolvedResourceBinding | None = None,
 ) -> str:
-    from ouroboros.config import get_runtime_mode
-    from ouroboros.runtime_mode_policy import mode_has_unrestricted_agency
+    from ouroboros.tools.tool_resolution import inferred_file_root
 
-    cyber = mode_has_unrestricted_agency(get_runtime_mode())
+    root, root_error = inferred_file_root(ctx, "edit_text", root, [path])
+    if root_error:
+        return publish_no_effect(ctx, root_error, tool_name="edit_text")
+    if edits is not None:
+        if old_str is not None or new_str is not None:
+            return publish_no_effect(ctx, "⚠️ EDIT_TEXT_ERROR: use either edits or old_str/new_str, not both.", tool_name="edit_text")
+        if not isinstance(edits, list) or not edits:
+            return publish_no_effect(ctx, "⚠️ EDIT_TEXT_ERROR: edits must be a non-empty array.", tool_name="edit_text")
+        from ouroboros.tools.edit_ops import _edit_batch
+
+        if any(not isinstance(item, dict) or "path" in item for item in edits):
+            return publish_no_effect(ctx, "⚠️ EDIT_TEXT_ERROR: each edit must contain old_str/new_str/count only; path belongs to the call.", tool_name="edit_text")
+        return _edit_batch(
+            ctx, [{"path": path, **item} for item in edits], root=root,
+            bucket=bucket, skill_name=skill_name, force=force,
+            _resolved_binding=tuple(_resolved_binding for _ in edits) if _resolved_binding else None,
+            source_tool="edit_text",
+        )
+    if not isinstance(old_str, str) or not old_str or not isinstance(new_str, str):
+        return publish_no_effect(ctx, "⚠️ EDIT_TEXT_ERROR: old_str must be non-empty and new_str must be a string.", tool_name="edit_text")
+
     normalized, block = _access_or_block(ctx, root, "edit")
     if block:
-        return block
+        return publish_no_effect(ctx, block, tool_name="edit_text")
     try:
         binding = _direct_resource_binding(
             ctx, _resolved_binding, root=normalized, operation="edit", path=path,
@@ -731,21 +772,17 @@ def _edit_text(
         )
     except Exception as exc:
         prefix = "SKILL_PAYLOAD_ARG_ERROR" if normalized == "skill_payload" else "EDIT_TEXT_ERROR"
-        return f"⚠️ {prefix}: {exc}"
-    reason = block_reason_for_path(ctx, binding.target_path, "write", binding)
-    protected_block = (
-        f"⚠️ EDIT_TEXT_BLOCKED: protected artifact path blocked: {reason}" if reason else ""
-    )
-    if protected_block:
-        return protected_block
+        return publish_no_effect(ctx, f"⚠️ {prefix}: {exc}", tool_name="edit_text")
+    from ouroboros.tools.edit_ops import _edit_mutation_block
+
+    if mutation_block := _edit_mutation_block(ctx, binding, path):
+        if mutation_block.startswith("skill provenance") and (normalized == "skill_payload" or binding.skill_name):
+            return publish_no_effect(ctx, f"⚠️ STR_REPLACE_BLOCKED: {mutation_block}", tool_name="edit_text")
+        return publish_no_effect(ctx, f"⚠️ EDIT_TEXT_BLOCKED: {mutation_block}", tool_name="edit_text")
     bound_skill_payload = bool(
         binding.skill_name
         and binding.source in {"external", "clawhub", "ouroboroshub", "native", "user_repo"}
     )
-    if native_block := _native_payload_mutation_block_reason(
-        binding.target_path, binding.state_drive_root,
-    ):
-        return f"⚠️ EDIT_TEXT_BLOCKED: {native_block}."
     if normalized in {"active_workspace", "system_repo"} and not bound_skill_payload:
         from ouroboros.tools.git import _str_replace_editor
 
@@ -761,51 +798,32 @@ def _edit_text(
             drive_root=pathlib.Path(ctx.drive_root),
         )
         if short_form.ignored_reason:
-            result += f"\n⚠️ SKILL_SHORT_FORM_IGNORED: {short_form.ignored_reason}."
+            from ouroboros.tools.tool_result import append_published_text
+
+            # The editor's typed receipt (its changed paths) stays paired with the returned text.
+            result = append_published_text(ctx, result, f"\n⚠️ SKILL_SHORT_FORM_IGNORED: {short_form.ignored_reason}.")
         return result
     selected_payload = normalized == "skill_payload" or bound_skill_payload
     try:
         target = binding.target_path
-        if not cyber and selected_payload and (
-            _binding_skill_control_plane_path(binding)
-            or is_skill_control_plane_path(target, binding.state_drive_root)
-        ):
-            return (
-                "⚠️ STR_REPLACE_BLOCKED: skill provenance, launcher seed, "
-                "marketplace, dependency, and self-authored markers are "
-                "control-plane state. Edit user-authored payload files instead."
-            )
-        if normalized == "runtime_data" and not cyber:
-            if is_skill_control_plane_path(target, binding.state_drive_root):
-                return (
-                    "⚠️ EDIT_TEXT_BLOCKED: skill provenance, launcher seed, "
-                    "marketplace, dependency, and self-authored markers are "
-                    "control-plane state. Edit user-authored payload files instead."
-                )
-            if (b := _project_store_access_block(_normalize_data_read_path(ctx, path))):
-                return b
-            if (
-                _is_workspace_executor_control_state_path(target, binding.base_path)
-                or _is_workspace_executor_control_state_path(target, binding.state_drive_root)
-            ):
-                return (
-                    "⚠️ EDIT_TEXT_BLOCKED: workspace executor process records are "
-                    "owner/runtime control-plane state. Use process/service lifecycle "
-                    "tools instead of editing state/workspace_executor_processes directly."
-                )
-        if normalized == "artifact_store":
-            block_reason = artifact_store_path_block_reason(target, base_path=binding.base_path)
-            if block_reason:
-                return f"⚠️ EDIT_TEXT_BLOCKED: artifact_store path blocked: {block_reason}"
-        text = target.read_text(encoding="utf-8")
+        from ouroboros import work_domain  # a work file is read and written as the work domain
+
+        try:
+            text = work_domain.read_text(target)
+        except FileNotFoundError:
+            return publish_no_effect(ctx, f"⚠️ EDIT_TEXT_ERROR: file not found: {_root_display_path(normalized, path)}", tool_name="edit_text")
+        except OSError as exc:
+            return publish_no_effect(ctx, f"⚠️ EDIT_TEXT_ERROR: {type(exc).__name__}: {exc}", tool_name="edit_text")
         new_text, match_error = _str_match_replace(
             text, old_str, new_str, _root_display_path(normalized, path), "EDIT_TEXT_ERROR"
         )
         if match_error:
-            return match_error
-        # Exact replace and full overwrite share the intentional-shrink contract.
-        if (shrink := _check_data_shrink_guard(target, new_text, force)):
-            return shrink
+            return publish_no_effect(ctx, match_error, tool_name="edit_text")
+        from ouroboros.tools.edit_ops import _edit_content_block, newline_normalization_note
+
+        newline_note = newline_normalization_note(target)
+        if content_block := _edit_content_block(binding, new_text, force):
+            return publish_no_effect(ctx, content_block, tool_name="edit_text")
         constraint = normalize_task_constraint(getattr(ctx, "task_constraint", None))
         repair = selected_payload and constraint and constraint.has_selected_skill
         if repair:
@@ -816,36 +834,53 @@ def _edit_text(
             )
             if refusal:
                 return refusal
-        write_text_atomic(target, new_text)
+        from ouroboros.tools.edit_ops import edit_source_line, numbered_edit_preview
+
+        replacement_offset = text.index(old_str)
+        replacement_line = edit_source_line(text, replacement_offset)
+        if work_domain.is_work(target):
+            work_domain.write_text(target, new_text)
+        else:
+            write_text_atomic(target, new_text)
         if repair:
             from ouroboros.skill_repair_admission import advance_repair_expected_hash
 
             advance_repair_expected_hash(binding.state_drive_root, constraint, task_id=ctx.task_id)
         if selected_payload:
-            replacement_line = new_text[:new_text.index(new_str)].count("\n") + 1
-            context_start = max(0, replacement_line - 3)
-            context_lines = new_text.splitlines()[
-                context_start:replacement_line + len(new_str.splitlines()) + 2
-            ]
-            context_preview = "\n".join(
-                f"{context_start + index + 1:>4}| {line}"
-                for index, line in enumerate(context_lines)
-            )
-            return (
+            context_preview = numbered_edit_preview(new_text, [replacement_offset])
+            result = (
                 f"✅ Replaced in {_root_display_path(normalized, path)} "
                 f"(line {replacement_line}; resolved_root={binding.base_path}; "
                 f"source={binding.source}).\nContext:\n{context_preview}\n\n"
                 "File is on disk but NOT committed.\n"
                 "Run skill_review for this skill before enabling or declaring it ready."
             )
+            from ouroboros.tools.git_repo_edit import _with_path_facts
+
+            # A bound payload in active_workspace/system_repo is written here, not by the Git editor: the same
+            # typed receipt of the target this binding resolved names it for the result review.
+            return _with_path_facts(ctx, "edit_text", result + (f"\n{newline_note}" if newline_note else ""),
+                                    binding.base_path, [target.relative_to(binding.base_path).as_posix()])
         result = (
             f"OK: edited {_root_display_path(normalized, path)} "
-            f"(resolved_root={binding.base_path}; source={binding.source})"
+            f"(line {replacement_line}; resolved_root={binding.base_path}; source={binding.source})"
         )
+        from ouroboros.tools.edit_ops import _partial_write_failure, numbered_edit_preview
+
+        result += f"\nContext:\n{numbered_edit_preview(new_text, [replacement_offset])}"
         if normalized == "user_files":
-            record = copy_file_to_task_artifacts(ctx, target, kind="user_file")
-            if record:
-                result += f"\nARTIFACT_OUTPUTS: registered user file -> artifact_store:{record.get('name')}"
+            try:
+                record = copy_file_to_task_artifacts(ctx, target, kind="user_file")
+                if not record:
+                    raise OSError("user file recovery copy was not registered")
+            except Exception as exc:  # the edit itself landed; say so instead of a refusal
+                rel = target.relative_to(binding.base_path).as_posix()
+                return _partial_write_failure(
+                    ctx, [rel], "edit_text", "EDIT_TEXT_ERROR",
+                    f"{rel} WAS written but its user artifact registration failed: {exc}", binding)
+            result += f"\nARTIFACT_OUTPUTS: registered user file -> artifact_store:{record.get('name')}"
+        if newline_note:
+            result += f"\n{newline_note}"
         return result
     except FileNotFoundError:
         return f"⚠️ EDIT_TEXT_ERROR: file not found: {_root_display_path(normalized, path)}"
@@ -860,9 +895,11 @@ from ouroboros.code_search_rg import (  # noqa: E402
     _search_wall_clock_sec,
     is_search_skippable as _is_search_skippable,  # noqa: F401 — re-exported for tests/call sites
     search_skip_reason as _search_skip_reason, matches_include,
+    MATCH_WINDOW_CHARS, match_window, search_text,
 )
 
 
+@completed_local_read
 def _code_search(ctx: ToolContext, query: str, path: str = ".",
                  regex: bool = False, max_results: int = 200,
                  include: str = "", root: str = "active_workspace",
@@ -871,6 +908,19 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
     """Search repo text with optional regex, path, glob, and result cap."""
     if not query:
         return "⚠️ SEARCH_ERROR: query is required."
+    if not isinstance(query, str):
+        return "⚠️ SEARCH_ERROR: query must be a string."
+    # Validate a regex query UP FRONT, before any path fact: an invalid pattern is an
+    # error whatever the path, and the contract holds for BOTH the ripgrep path and the
+    # Python fallback. ripgrep accepts some malformed patterns permissively (e.g. an
+    # unterminated '[' yields "no matches" instead of erroring), so without this the rg
+    # path would silently swallow an invalid regex while only the fallback rejected it.
+    # Non-regex queries are matched literally and need no check.
+    if regex:
+        try:
+            re.compile(query)
+        except re.error as e:
+            return f"⚠️ SEARCH_ERROR: invalid regex: {e}"
     normalized, block = _access_or_block(ctx, root, "search")
     if block:
         return block
@@ -883,7 +933,7 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
         return f"⚠️ USER_FILES_PATH_BLOCKED: {exc}"
     except Exception as exc:
         return f"⚠️ SEARCH_ERROR: {type(exc).__name__}: {exc}"
-    if normalized == "runtime_data" and (b := _project_store_access_block(_normalize_data_read_path(ctx, path))):
+    if normalized == "runtime_data" and (b := _project_store_access_block(binding.target_path.relative_to(binding.base_path).as_posix())):
         return b
 
     max_results = min(max(1, max_results), _MAX_SEARCH_RESULTS)
@@ -891,8 +941,6 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
     display_path = binding.target_path.relative_to(root_path).as_posix() if normalized in {"active_workspace", "system_repo"} else path
     display_search_path = _root_display_path(normalized, display_path)
     search_root = binding.target_path
-    if not search_root.exists():
-        return f"⚠️ SEARCH_ERROR: path not found: {display_search_path}"
     if normalized != "user_files":
         # Reject a search ROOT that escapes its resource root (e.g. the requested path is an
         # in-tree symlink pointing outside — untrusted child project/deliverable trees) BEFORE
@@ -901,25 +949,33 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
             search_root.relative_to(root_path.resolve(strict=False))
         except ValueError:
             return f"⚠️ SEARCH_ERROR: path escapes root: {display_search_path}"
+    runtime_check = _runtime_data_read_check(ctx, root=binding.root)
+    if runtime_block := runtime_check(search_root):
+        return runtime_block
     protected_root_block = block_reason_for_path(
         ctx, search_root, "static_introspection", binding
     )
     if protected_root_block:
         return protected_root_block
+    # An admitted, absent path is an ordinary discovery miss: a typed warning
+    # (parity with list_files/read_file), never a denial or an invalid query.
+    from ouroboros import work_domain
+    from ouroboros.evidence_packs import materialize_tree
+
+    # A work root is searched by held descriptors only (``work_domain``): no service process opens its paths, so the
+    # ripgrep path is the service's own roots' and a link is named, never followed.
+    work = work_domain.is_work(search_root)
+    search_kind = work_domain.kind(search_root) if work else ""
+    if not work:
+        materialize_tree(search_root)  # a task's packed checkpoint handles are written back before the walk
+    if not (search_kind not in ("", "missing") if work else search_root.exists()):
+        return f"⚠️ SEARCH_NOT_FOUND: path not found: {display_search_path}"
     protected_root_read_block = block_reason_for_path(
         ctx, search_root, "read_bytes", binding
     )
-    if protected_root_read_block and search_root.is_file():
+    if protected_root_read_block and (search_kind == "file" if work else search_root.is_file()):
         return protected_root_read_block
-    subagent_readonly = is_restricted_subagent_profile(ctx)
-    secret_check = None
-    if subagent_readonly:
-        secret_repo = root_path if normalized in {"active_workspace", "system_repo"} else active_repo_dir_for(ctx)
-        secret_check = make_subagent_secret_target_check(secret_repo, ctx=ctx)
-        block_msg = _local_readonly_resource_block(ctx, normalized, search_root, root_path, action="SEARCH", secret_check=secret_check)
-        if block_msg:
-            return block_msg
-    root_resolved = root_path.resolve(strict=False)
+    root_resolved = work_domain.settle(root_path)  # a work root keeps its spelling; any other resolves as before
     _rt_search_root = str(root_resolved) if normalized == "runtime_data" else ""
     # Filter receipt (D3, capinv-447): every file present under the search root
     # but excluded before reading is COUNTED by typed reason, so "No matches"
@@ -938,13 +994,13 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
             rel_parts = fp.relative_to(root_resolved).parts
         except Exception:
             return _drop("escapes_root")
-        # runtime_data per-project store is reachable only via scoped knowledge tools.
+        # runtime_data per-project store is reachable only via project-scoped tools.
         if normalized == "runtime_data" and rel_parts and str(rel_parts[0]).casefold() == "projects":
             return _drop("project_store_scoped")
-        if subagent_readonly and _local_readonly_resource_block(ctx, normalized, fp, root_path, action="SEARCH", secret_check=secret_check):
-            return _drop("restricted_subagent")
         if normalized == "user_files" and user_files_path_block_reason(ctx, fp, operation="search"):
             return _drop("user_files_policy")
+        if runtime_check(fp):
+            return _drop("runtime_data_policy")
         if block_reason_for_path(ctx, fp, "read_bytes", binding):
             return _drop("protected_artifact")
         skip = _search_skip_reason(fp)
@@ -952,55 +1008,22 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
             return _drop(skip)
         return True
 
-    def _mask_user_files_matches(result_text: str) -> str:
-        # Same egress seam as _read_file (#447 В23): a search over the owner's
-        # home surfaces file CONTENT in the match lines, so bytes in a
-        # recognized credential format or a PEM block are masked here too, on
-        # BOTH the rg path and the Python fallback; secrets in unrecognized
-        # formats are not detected. Names/paths stay; masked values become ***.
-        if normalized != "user_files" and not subagent_readonly:
-            return result_text
-        if normalized == "user_files" and _raw_owner_secret_access_allowed(ctx):
-            return result_text
-        masked_text, masked = mask_secret_bytes(result_text)
-        if masked:
-            masked_text += (
-                f"\n⚠️ SECRET_BYTES_MASKED: {masked} span(s) in these matches matched "
-                "a recognized credential format or a PEM block and were replaced with "
-                "***; secrets in unrecognized formats are not detected. Reference the "
-                "masked ones by location, not value."
-            )
-        return masked_text
-
-    # Validate a regex query UP FRONT so the invalid-regex contract holds for BOTH the
-    # ripgrep path and the Python fallback. ripgrep accepts some malformed patterns
-    # permissively (e.g. an unterminated '[' yields "no matches" instead of erroring),
-    # so without this the rg path would silently swallow an invalid regex while only the
-    # fallback rejected it. Non-regex queries are matched literally and need no check.
-    # (Checked before the wall-clock budget below: an invalid regex returns immediately,
-    # so there is no point starting the timer for it.)
-    if regex:
-        try:
-            re.compile(query)
-        except re.error as e:
-            return f"⚠️ SEARCH_ERROR: invalid regex: {e}"
-
     import time as _time
     _search_t0 = _time.monotonic()  # start the wall-clock budget BEFORE rg, so a
     # subsequent fallback degradation shares ONE budget (not a fresh 2nd one).
     try:
         from ouroboros.code_search_rg import format_search_result, search_with_rg
 
-        if search_root.is_dir():
+        if not work and search_root.is_dir():
             rg_result = search_with_rg(
                 search_root, query, regex=bool(regex), include=include,
                 max_results=max_results, path_allowed=_path_allowed_for_rg,
             )
-            return _mask_user_files_matches(format_search_result(
+            return format_search_result(
                 display_path=display_search_path, root_name=normalized,
                 root_path=root_path, query=query, regex=bool(regex),
                 max_results=max_results, result=rg_result, dropped=search_drops,
-            ))
+            )
     except (FileNotFoundError, RuntimeError, subprocess.SubprocessError, OSError) as e:
         # Degrade to the policy-aware Python scanner for rg absent/failed/timeout
         # AND OSError (wrong-arch/non-executable bundled rg -> 'Exec format
@@ -1023,10 +1046,10 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
     deadline_hit = False
     # search_code on a single FILE: os.walk yields nothing for a file path, which
     # would make the search a silent no-op. Feed the scanner a one-file "walk".
-    if search_root.is_file():
+    if (search_kind == "file") if work else search_root.is_file():
         _walker = [(str(search_root.parent), [], [search_root.name])]
     else:
-        _walker = os.walk(str(search_root))
+        _walker = work_domain.walk(search_root) if work else os.walk(str(search_root))
     # Bound TOTAL (rg attempt + this fallback walk) to one budget, but always grant
     # the fallback a small floor so an rg that ate the budget still makes some progress.
     _search_deadline = max(_search_t0 + _search_wall_clock_sec(), _time.monotonic() + 5.0)
@@ -1037,7 +1060,7 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
             deadline_hit = True  # ran out of TIME (distinct from the file-count cap)
             break
         # Prune skipped dirs in-place. For runtime_data, also prune the top-level
-        # per-project store (reachable only via the scoped knowledge tools).
+        # per-project store (reachable only via the project-scoped tools).
         from ouroboros.code_intelligence import SKIP_DIRS
 
         # SKIP_DIRS pruning is a documented walk convention (parity with rg's
@@ -1058,26 +1081,17 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
                 else:
                     kept_dirs.append(d)
             dirnames[:] = kept_dirs
-        if subagent_readonly:
-            kept_dirs = []
-            for d in dirnames:
-                if _local_readonly_resource_block(ctx, normalized, pathlib.Path(dirpath) / d, root_path, action="SEARCH", secret_check=secret_check):
-                    _drop("restricted_subagent")
-                else:
-                    kept_dirs.append(d)
-            dirnames[:] = kept_dirs
-
         for fname in sorted(filenames):
             fp = pathlib.Path(dirpath) / fname
 
             if not matches_include(fname, include):
                 continue
 
-            if subagent_readonly and _local_readonly_resource_block(ctx, normalized, fp, root_path, action="SEARCH", secret_check=secret_check):
-                _drop("restricted_subagent")
-                continue
             if normalized == "user_files" and user_files_path_block_reason(ctx, fp, operation="search"):
                 _drop("user_files_policy")
+                continue
+            if runtime_check(fp):
+                _drop("runtime_data_policy")
                 continue
             if block_reason_for_path(ctx, fp, "read_bytes", binding):
                 _drop("protected_artifact")
@@ -1091,7 +1105,7 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
             # and _list_dir): a resolved file escaping the root — e.g. an in-tree symlink in an
             # untrusted child project/deliverable tree — must never have its target read out.
             try:
-                fp.resolve(strict=False).relative_to(root_resolved)
+                work_domain.settle(fp).relative_to(root_resolved)
             except (OSError, ValueError):
                 _drop("escapes_root")
                 continue
@@ -1101,7 +1115,7 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
                 break
 
             try:
-                text = fp.read_text(encoding="utf-8", errors="replace")
+                text, decodable = search_text(work_domain.read_bytes(fp) if work else fp.read_bytes())
             except Exception:
                 _drop("read_error")
                 continue
@@ -1109,9 +1123,13 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
             files_searched += 1
             rel = fp.relative_to(root_path).as_posix()
 
+            # These lines are read_file's own (universal newlines, splitlines, code points).
             for lineno, line in enumerate(text.splitlines(), 1):
-                if pattern.search(line):
-                    matches.append(f"{_root_display_path(normalized, rel)}:{lineno}: {line.rstrip()}")
+                if found := pattern.search(line):
+                    shown = line.rstrip() if len(line) <= MATCH_WINDOW_CHARS else match_window(
+                        line, found.start(), found.end(), count=sum(1 for _ in pattern.finditer(line)),
+                        read_line=lineno if decodable else 0)
+                    matches.append(f"{_root_display_path(normalized, rel)}:{lineno}: {shown}")
                     if len(matches) >= max_results:
                         truncated = True
                         break
@@ -1127,27 +1145,19 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
         "may be incomplete; narrow the path or glob, or raise OUROBOROS_SEARCH_CODE_WALL_SEC."
         if deadline_hit else ""
     )
-    # Typed disclosure, not invisibility (capinv-447): a restricted subagent is
-    # TOLD how many secret/control files its search could not see, mirroring the
-    # listing filters' hidden-entries marker.
     protected_omitted = search_drops.get("protected_artifact", 0)
-    restricted_omitted = search_drops.get("restricted_subagent", 0)
-    restricted_note = (
-        f" {restricted_omitted} secret/control file(s) omitted from this subagent's search."
-        if restricted_omitted else ""
-    )
     # Filter receipt for the remaining ordinary exclusions (D3): oversized,
     # symlinks, excluded names, unreadable, policy-scoped — never silent.
     from ouroboros.code_search_rg import format_dropped_files_note
 
     other_dropped_note = format_dropped_files_note({
         key: count for key, count in search_drops.items()
-        if key not in ("protected_artifact", "restricted_subagent")
+        if key != "protected_artifact"
     })
     if not matches:
         suffix = f" {protected_omitted} protected artifact file(s) omitted." if protected_omitted else ""
         cap_note = f" Scan stopped after {_MAX_SEARCH_FILES_SCANNED} files — narrow the path or glob." if files_capped else ""
-        return f"No matches found for {'regex' if regex else 'literal'} `{query}` in {display_search_path} ({files_searched} files searched).{suffix}{restricted_note}{other_dropped_note}{cap_note}{deadline_note}"
+        return f"No matches found for {'regex' if regex else 'literal'} `{query}` in {display_search_path} ({files_searched} files searched).{suffix}{other_dropped_note}{cap_note}{deadline_note}"
 
     header = f"Found {len(matches)} match{'es' if len(matches) != 1 else ''} in {display_search_path} ({files_searched} files searched)"
     if files_capped:
@@ -1158,60 +1168,39 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
         header += " — stopped at the time budget (results may be incomplete)"
     if protected_omitted:
         header += f" — {protected_omitted} protected artifact file(s) omitted"
-    if restricted_omitted:
-        header += f" — {restricted_omitted} secret/control file(s) omitted from this subagent's search"
     if other_dropped_note:
         header += " —" + other_dropped_note.rstrip(".")
-    return _mask_user_files_matches(header + "\n\n" + "\n".join(matches))
-
-
-def _durable_descendant_of(
-    drive_root: pathlib.Path,
-    task_id: str,
-    task: Dict[str, Any],
-    ancestor_id: str,
-    *,
-    max_hops: int = 64,
-) -> bool:
-    """Follow the durable parent chain; shared-root labels are not ancestry proof."""
-
-    from ouroboros.task_status import load_effective_task_result
-
-    current_id = str(task_id or "")
-    current = task if isinstance(task, dict) else {}
-    seen = {current_id}
-    for _hop in range(max_hops):
-        parent_id = str(current.get("parent_task_id") or "").strip()
-        if not parent_id:
-            return False
-        if parent_id == ancestor_id:
-            return True
-        if parent_id in seen:
-            return False
-        seen.add(parent_id)
-        current = load_effective_task_result(drive_root, parent_id)
-        if not current:
-            return False
-        current_id = parent_id
-    return False
+    return header + "\n\n" + "\n".join(matches)
 
 
 def _forward_to_worker(
-    ctx: ToolContext, task_id: str, message: str, relayed_from_task_id: str = "",
+    ctx: ToolContext, task_id: str, message: str, relayed_from_task_id: str = "", reply_to: dict | None = None,
 ) -> str:
-    """Write a task-tree message into a running task's mailbox: one writer for a
-    descendant (an ancestor's or relayed sibling's message) and for any active
-    independent root the host lists (a message from an independent task, owner
-    6C). Never owner text; WRITTEN, not read -- the recipient drains it later."""
-    from ouroboros.owner_mailbox import PROVENANCE_INDEPENDENT_TASK, write_task_message
-    from ouroboros.peer_roster import host_listed_independent_root
-    from ouroboros.task_results import STATUS_RUNNING, validate_task_id
+    """Write task context to the recipient's mailbox, never owner text.
+    Descendants receive ancestor/relayed context; contributions inside one tree
+    (parent, sibling, any task sharing the root) retain their relation. Listed
+    roots and inline Presence receive independent task context. Receipts prove
+    persistence, not a read, in the recipient's drive."""
+    from ouroboros.owner_mailbox import (
+        PEER_RELATION_LABELS, PROVENANCE_INDEPENDENT_TASK, PROVENANCE_PEER_TASK, TASK_MESSAGE_MAX_CHARS,
+        write_task_message,
+    )
+    from ouroboros.peer_roster import (
+        durable_descendant_of, independent_message_target, peer_contribution_admission,
+    )
+    from ouroboros.task_results import STATUS_REQUESTED, STATUS_RUNNING, STATUS_SCHEDULED, validate_task_id
     from ouroboros.task_status import FINAL_STATUSES, load_effective_task_result
 
     try:
         tid = validate_task_id(task_id)
+        reply_to = validate_reply_target(ctx, reply_to, recipient=tid)
     except ValueError as exc:
         return f"⚠️ TOOL_ARG_ERROR (forward_to_worker): {exc}"
+    if len(str(message or "")) > TASK_MESSAGE_MAX_CHARS:
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(
+            f"⚠️ TOOL_ARG_ERROR (forward_to_worker): message is {len(str(message))} chars; the "
+            f"limit is {TASK_MESSAGE_MAX_CHARS} chars. Nothing was written — shorten the "
+            "message (it is never truncated or spilled to an artifact).")))
     metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
     status_drive_root = pathlib.Path(str(metadata.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
     data = load_effective_task_result(status_drive_root, tid)
@@ -1220,13 +1209,12 @@ def _forward_to_worker(
         return _publish_tool_result(ctx, ToolResult(status="unavailable", code="LEGACY_UNAVAILABLE", text=(f"⚠️ TASK_NOT_FOUND: task {tid} is not registered.")))
     if status in FINAL_STATUSES:
         return _publish_tool_result(ctx, ToolResult(status="blocked", code="LEGACY_BLOCKED", text=(f"⚠️ TASK_NOT_ACTIVE: task {tid} is already {status}.")))
-    if status != STATUS_RUNNING:
-        return _publish_tool_result(ctx, ToolResult(status="blocked", code="LEGACY_BLOCKED", text=(f"⚠️ TASK_NOT_ACTIVE: task {tid} is {status or 'unknown'}, not running.")))
-    # AR2-6: no NEW steering writes while a cancellation is pending. The
-    # effective status honestly stays ``running`` (cancel_state=pending rides
-    # beside it), so the checks above pass — consult the same predicate the
-    # steer_task/mailbox routes use, covering BOTH carriers (durable intent +
-    # legacy latch), and refuse typed.
+    # A requested child's mailbox exists in its recorded drive from the request on: its words are
+    # read when it starts, or stay in its result as unread mail, the same receipt a queued one gives.
+    if status not in (STATUS_RUNNING, STATUS_SCHEDULED, STATUS_REQUESTED):
+        return _publish_tool_result(ctx, ToolResult(status="blocked", code="LEGACY_BLOCKED", text=(f"⚠️ TASK_NOT_ACTIVE: task {tid} is {status or 'unknown'}, neither running nor queued.")))
+    # Cancellation may still report running; consult intent and legacy latch
+    # before accepting new steering, just as steer_task/mailbox do.
     try:
         from ouroboros.cancel_intents import cancel_pending
 
@@ -1243,21 +1231,33 @@ def _forward_to_worker(
         return "⚠️ TASK_FORBIDDEN: forward_to_worker requires an active task context."
     relayed_from = str(relayed_from_task_id or "").strip()
     provenance = "ancestor_task"
+    relation = ""
     listed_root = None
-    if not _durable_descendant_of(status_drive_root, tid, data, current_task_id):
-        listed_root = host_listed_independent_root(status_drive_root, tid)
-        if listed_root is None:
-            return f"⚠️ TASK_FORBIDDEN: task {tid} is neither a descendant of the current task nor an active independent root the host lists."
-        if relayed_from:
-            return f"⚠️ TASK_FORBIDDEN: a relayed message reaches only your own descendants; task {tid} is an independent root."
-        provenance = PROVENANCE_INDEPENDENT_TASK
+    if not durable_descendant_of(status_drive_root, tid, data, current_task_id):
+        # Same-tree peer admission precedes the independent roster; it refuses
+        # relay and reads cancellation strictly.
+        relation, refusal = peer_contribution_admission(
+            status_drive_root, current_task_id, metadata, tid, data, relayed_from=relayed_from)
+        if refusal is not None:
+            return _publish_tool_result(ctx, refusal)
+        if relation:
+            provenance = PROVENANCE_PEER_TASK
+        else:
+            listed_root = independent_message_target(status_drive_root, tid, data)
+            if listed_root is None:
+                return (f"⚠️ TASK_FORBIDDEN: task {tid} is neither a descendant of the current task, nor a task "
+                        "in its tree (the parent nor a sibling nor any task sharing its root), nor an active "
+                        "independent root the host lists or an inline Presence mailbox.")
+            if relayed_from:
+                return f"⚠️ TASK_FORBIDDEN: a relayed message reaches only your own descendants; task {tid} is an independent recipient."
+            provenance = PROVENANCE_INDEPENDENT_TASK
     if relayed_from:
         try:
             relayed_from = validate_task_id(relayed_from)
         except ValueError as exc:
             return f"⚠️ TOOL_ARG_ERROR (forward_to_worker): {exc}"
         source = load_effective_task_result(status_drive_root, relayed_from)
-        if not source or not _durable_descendant_of(
+        if not source or not durable_descendant_of(
             status_drive_root, relayed_from, source, current_task_id,
         ):
             return (
@@ -1267,20 +1267,67 @@ def _forward_to_worker(
         provenance = "peer_via_ancestor"
     child_drive = str(data.get("child_drive_root") or data.get("headless_child_drive_root") or data.get("drive_root") or "").strip()
     if not child_drive and listed_root is not None:
-        # A root drains its own listed drive, else the canonical root -- never the SENDER's drive.
-        child_drive = str(listed_root.get("drive_root") or "").strip() or str(status_drive_root)
-    mailbox_drive = pathlib.Path(child_drive) if child_drive else pathlib.Path(ctx.drive_root)
-    written = write_task_message(
-        mailbox_drive,
-        message,
-        task_id=tid,
-        source_task_id=current_task_id,
-        provenance=provenance,
-        relayed_from_task_id=relayed_from,
-        msg_id=uuid.uuid4().hex,
-    )
+        child_drive = str(listed_root.get("drive_root") or "").strip()
+    # The recipient drains ITS recorded drive, else the canonical status root — never
+    # the sender's ``ctx.drive_root`` (a forked sender's private execution drive).
+    mailbox_drive = pathlib.Path(child_drive) if child_drive else status_drive_root
+    from ouroboros.install_identity import StoreForeign
+
+    try:
+        written = write_task_message(
+            mailbox_drive,
+            message,
+            task_id=tid,
+            source_task_id=current_task_id,
+            provenance=provenance,
+            relayed_from_task_id=relayed_from,
+            msg_id=uuid.uuid4().hex,
+            relation=relation,
+            **({"reply_to": reply_to} if reply_to else {}),
+        )
+    except StoreForeign as exc:
+        return _publish_tool_result(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=(
+            f"⚠️ TASK_FOREIGN_INSTALL: task {tid}'s mailbox {exc}; the message was NOT delivered."),
+            meta={"reason": exc.reason, "path": str(exc.path)}))
     if not written:
         return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ERROR", text=(f"⚠️ TASK_MESSAGE_UNWRITTEN: message to task {tid} was not persisted.")))
+    from ouroboros.owner_mailbox import MAIL_QUEUED, MAIL_RETAINED_UNREAD, mail_write_receipt, mailbox_drain_ended
+
+    try:
+        drain_ended = mailbox_drain_ended(mailbox_drive, tid)
+    except Exception:
+        drain_ended = False
+    receipt = mail_write_receipt(status, drain_ended=drain_ended)["receipt"]
+    if receipt == MAIL_RETAINED_UNREAD:
+        return (f"Message forwarded to task {tid}: written to its mailbox ({MAIL_RETAINED_UNREAD}); task {tid}'s "
+                "own drain has already ended, so no checkpoint will read it: its result keeps it as unread mail. "
+                "Files cannot be attached to messages between tasks.")
+    if listed_root is not None and listed_root.get("target_kind") == "inline_presence":
+        observation = json.dumps(listed_root["execution_observation"], ensure_ascii=False, sort_keys=True)
+        return (f"Message forwarded to task {tid}: written to its mailbox as a message from this task "
+                "(independent_task, never owner text). This proves persistence, not that its model read it; "
+                "if the turn continues, its checkpoint can read it. "
+                f"execution_observation={observation}. Files cannot be attached to messages between tasks.")
+    # A Presence root reached from inside its own tree keeps the shared execution
+    # observation on the receipt (persistence proof, not a read), as the roster path gives it.
+    presence = data.get("execution_observation") if provenance == PROVENANCE_PEER_TASK else None
+    observed = (f" execution_observation={json.dumps(presence, ensure_ascii=False, sort_keys=True)}."
+                if isinstance(presence, dict) and presence.get("kind") == "presence" else "")
+    as_peer = PEER_RELATION_LABELS.get(relation, {}).get("receipt") or relation
+    if receipt == MAIL_QUEUED:
+        as_from = (f" as a message from a peer task ({as_peer}; never owner text or an ancestor's steering)"
+                   if provenance == PROVENANCE_PEER_TASK else " as a message from this task (never owner text)"
+                   if listed_root is not None else "")
+        return (f"Message forwarded to task {tid}: written to its mailbox{as_from} ({MAIL_QUEUED}); task {tid} has not "
+                "started, so nothing has read it: it reads it when it starts, and if it ends unstarted its result keeps "
+                f"it as unread mail.{observed} Files cannot be attached to messages between tasks.")
+    if provenance == PROVENANCE_PEER_TASK:
+        # A Presence turn may already be over: persistence is proven, a read is not.
+        read_note = ("This proves persistence, not that its model read it; if the turn continues, "
+                     "its checkpoint can read it." if observed else "it reads it at its next checkpoint.")
+        return (f"Message forwarded to task {tid}: written to its mailbox as a message from a peer task "
+                f"({as_peer}; never owner text or an ancestor's steering){'.' if observed else ';'} "
+                f"{read_note}{observed} Files cannot be attached to messages between tasks.")
     if listed_root is not None:
         return (f"Message forwarded to task {tid}: written to its mailbox as a message from this task "
                 "(never owner text); it reads it at its next checkpoint. Files cannot be attached to messages between tasks.")
@@ -1288,40 +1335,51 @@ def _forward_to_worker(
 
 
 def get_tools() -> List[ToolEntry]:
+    from ouroboros.tools.edit_ops import _EDIT_BATCH_ITEM_PROPERTIES, _EDIT_BATCH_ITEM_REQUIRED, _FILE_ROOT_DESCRIPTION
     return [
         ToolEntry("read_file", {
             "name": "read_file",
             "description": (
                 "Read a UTF-8 text file from a declared resource root. "
-                "Default root=active_workspace (the user's workspace or the Ouroboros repo in self-modification tasks). "
+                "With root omitted, relative paths use active_workspace; absolute paths select their permitted physical root, including user_files for home paths. "
                 "Use max_lines (default 2000) and start_line (default 1) to read large files in chunks. "
-                "The result header shows root:path and 'lines X\u2013Y of Z' so you know where and how much you read. "
+                "The result header shows root:path and 'lines X\u2013Y of Z'; each displayed source line has a cat -n style number and tab. "
+                "Line numbers are display guides, not file content: exclude them when copying edit context. "
                 "Prefer this over cat/head/sed-as-reader in run_command; to locate code first use query_code "
                 "(symbols/definitions/callers) or search_code (text/regex), then read_file the hit."
             ),
             "parameters": {"type": "object", "properties": {
                 "path": {"type": "string"},
-                "root": {"type": "string", "enum": ["active_workspace", "system_repo", "runtime_data", "task_drive", "skill_payload", "artifact_store", "user_files", "subagent_projects", "deliverables"], "default": "active_workspace"},
+                "root": {"type": "string", "enum": ["active_workspace", "system_repo", "runtime_data", "task_drive", "skill_payload", "artifact_store", "user_files", "subagent_projects", "deliverables"], "description": _FILE_ROOT_DESCRIPTION},
                 "max_lines": {"type": "integer", "default": 2000,
                               "description": "Maximum number of lines to return (default 2000)."},
                 "start_line": {"type": "integer", "default": 1,
                                "description": "1-indexed line to start reading from (default 1 = beginning)."},
                 "start_char": {"type": "integer", "default": 0,
-                               "description": "Sub-line cursor: skip this many characters of the selected "
-                                              "window before rendering. Use it to advance WITHIN a single "
-                                              "line longer than the delivery limit (the result would "
-                                              "otherwise be cut at the tool-result budget)."},
+                               "description": "Source-character cursor: skip this many characters (Unicode code points) "
+                                              "of the selected source window before adding display line numbers. Use it "
+                                              "to advance WITHIN a single line longer than what one turn can hold; a "
+                                              "partial result view names the exact start_char of its omitted range."},
+                "max_chars": {"type": "integer", "minimum": 1,
+                              "description": "Exact source-character budget for THIS view of the selected window, counted "
+                                             "after start_char; display line numbers are not counted. Choose the piece instead "
+                                             "of having the result cut from outside; the header names the next start_char. "
+                                             "Omit for the whole window."},
                 "bucket": {"type": "string", "description": "Required only for root=skill_payload."},
                 "skill_name": {"type": "string", "description": "Required only for root=skill_payload."},
             }, "required": ["path"]},
         }, _read_file),
         ToolEntry("list_files", {
             "name": "list_files",
-            "description": "List files under a resource root directory.",
+            "description": "List a directory, or use depth/include for a bounded live tree. Gaps make complete=false. "
+                           "Generated subtrees are skipped only in code roots; symlink directories are not followed.",
             "parameters": {"type": "object", "properties": {
                 "path": {"type": "string", "default": "."},
-                "root": {"type": "string", "enum": ["active_workspace", "system_repo", "runtime_data", "task_drive", "skill_payload", "artifact_store", "user_files", "subagent_projects", "deliverables"], "default": "active_workspace"},
+                "root": {"type": "string", "enum": ["active_workspace", "system_repo", "runtime_data", "task_drive", "skill_payload", "artifact_store", "user_files", "subagent_projects", "deliverables"], "description": _FILE_ROOT_DESCRIPTION},
                 "max_entries": {"type": "integer", "default": 500},
+                "depth": {"type": "integer", "minimum": 1, "maximum": 20, "default": 1, "description": "Tree levels; depth=1 with no include preserves the ordinary one-directory listing."},
+                "include": {"type": "string", "description": "Optional basename glob, including braces such as *.{py,js}; directories are traversed but not returned as matches."},
+                "max_scan": {"type": "integer", "minimum": 1, "maximum": 20000, "default": 2000, "description": "Opt-in tree's examined-entry bound, not just match count; one additional lookahead detects a cut directory. Packed checkpoints are omitted with a direct listing recipe."},
                 "bucket": {"type": "string", "description": "Required only for root=skill_payload."},
                 "skill_name": {"type": "string", "description": "Required only for root=skill_payload."},
             }, "required": []},
@@ -1329,24 +1387,21 @@ def get_tools() -> List[ToolEntry]:
         ToolEntry("write_file", {
             "name": "write_file",
             "description": (
-                "For canonical output use root=artifact_store (created lazily), e.g. path=report.txt. Do not assume its physical directory already exists. "
-                "Write UTF-8 file(s) to a declared resource root. "
-                "Default root=active_workspace. "
-                "OK messages show root:path. "
-                "Overwriting an existing repo file returns the unified diff vs the "
-                "previous version — CHECK IT; invalid .py/.json content is blocked "
-                "before writing (force=true bypasses). "
-                "Use mode='append' to write a large file in chunks across multiple calls "
-                "(useful when the full content exceeds a single LLM output budget). "
-                "Set bucket/skill_name ONLY for root=skill_payload (skill authoring); leave empty for normal file edits."
+                (
+                'Create, overwrite or append UTF-8 files using path+content or files=[...]. Canonical output uses '
+                'root=artifact_store, created lazily. Omitted root selects active_workspace for relative paths and the '
+                'permitted physical root for absolute paths. Repo overwrites return a diff; check it. Invalid '
+                "Python/JSON is blocked unless force=true. Use mode='append' for chunks. bucket/skill_name apply only "
+                'to skill_payload.'
+            )
             ),
             "parameters": {"type": "object", "properties": {
                 "path": {"type": "string"},
                 "content": {"type": "string"},
-                "files": {"type": "array", "items": {"type": "object", "properties": {
-                    "path": {"type": "string"}, "content": {"type": "string"},
-                }, "required": ["path", "content"]}},
-                "root": {"type": "string", "enum": ["active_workspace", "system_repo", "runtime_data", "task_drive", "skill_payload", "artifact_store", "user_files"], "default": "active_workspace"},
+                "files": {"type": "array", "items": {"type": "object",
+                    "properties": {k: dict(v) for k, v in _WRITE_FILE_ITEM_PROPERTIES.items()},
+                    "required": list(_WRITE_FILE_ITEM_KEYS)}},
+                "root": {"type": "string", "enum": ["active_workspace", "system_repo", "runtime_data", "task_drive", "skill_payload", "artifact_store", "user_files"], "description": _FILE_ROOT_DESCRIPTION},
                 "mode": {"type": "string", "enum": ["overwrite", "append"], "default": "overwrite"},
                 "force": {"type": "boolean", "default": False, "description": "Bypass the shrink guard for an intentional full rewrite on any root where it applies (active_workspace via the repo guard; runtime_data/task_drive/skill_payload/artifact_store/user_files via the data-plane guard)."},
                 "bucket": {
@@ -1362,60 +1417,64 @@ def get_tools() -> List[ToolEntry]:
         ToolEntry("edit_text", {
             "name": "edit_text",
             "description": (
-                "Replace exactly one occurrence of old_str with new_str in a file. "
-                "Default root=active_workspace. Result messages show root:path. "
-                "For several edits at once, repeated identical replacements, or "
-                "counted replace-all, prefer edit_batch (one atomic call). "
+                "Replace exactly one occurrence of old_str with new_str in a file, "
+                "or pass edits=[{old_str,new_str,count?}, ...] for ordered atomic "
+                "replacements in that SAME file. Do not mix the forms. "
+                "With root omitted, relative paths use active_workspace; absolute paths select their permitted physical root, including user_files for home paths. Result messages show root:path. "
+                "For several files use edit_batch or apply_patch; editor calls run one after another in call order. "
                 "Set bucket/skill_name ONLY for root=skill_payload (skill authoring); leave empty for normal edits."
             ),
             "parameters": {"type": "object", "properties": {
                 "path": {"type": "string"},
                 "old_str": {"type": "string"},
                 "new_str": {"type": "string"},
-                "root": {"type": "string", "enum": ["active_workspace", "system_repo", "runtime_data", "task_drive", "skill_payload", "artifact_store", "user_files"], "default": "active_workspace"},
+                "edits": {"type": "array", "minItems": 1, "items": {"type": "object",
+                          "properties": {k: dict(v) for k, v in _EDIT_BATCH_ITEM_PROPERTIES.items() if k != "path"},
+                          "required": [k for k in _EDIT_BATCH_ITEM_REQUIRED if k != "path"]}},
+                "root": {"type": "string", "enum": ["active_workspace", "system_repo", "runtime_data", "task_drive", "skill_payload", "artifact_store", "user_files"], "description": _FILE_ROOT_DESCRIPTION},
                 "bucket": {"type": "string", "description": "Skill payload bucket — set ONLY when root=skill_payload; leave empty otherwise."},
                 "skill_name": {"type": "string", "description": "Skill slug — set ONLY when root=skill_payload; leave empty otherwise."},
-                "force": {"type": "boolean", "default": False, "description": "Bypass the shrink guard for a deliberate large data-plane deletion (>30% smaller)."},
-            }, "required": ["path", "old_str", "new_str"]},
+                "force": {"type": "boolean", "default": False, "description": "Confirm an intentional shrink (>30% smaller)."},
+            }, "required": ["path"]},
         }, _edit_text, is_code_tool=True),
         ToolEntry("send_photo", {
             "name": "send_photo",
             "description": (
-                "Send an image to the owner's chat. "
+                "Send an image to this work's room (Presence-bound: local, not the place conversation). "
                 "Preferred: use file_path to send a local file. "
                 "Legacy: use image_base64 with raw base64 or __last_screenshot__. "
                 "Use after browse_page(output='screenshot') or browser_action(action='screenshot')."
             ),
             "parameters": {"type": "object", "properties": {
-                "file_path": {"type": "string", "description": "Local file path to image (preferred)"},
+                "file_path": {"type": "string", "description": "Local image path (preferred): relative to the active workspace, or absolute."},
                 "image_base64": {"type": "string", "description": "Base64-encoded image data or __last_screenshot__"},
                 "caption": {"type": "string", "description": "Optional caption for the photo"},
             }, "required": []},
         }, _send_photo),
         ToolEntry("send_video", {
             "name": "send_video",
-            "description": "Send a video to the owner's chat (e.g. an anime animation). Requires a local file_path.",
+            "description": "Send a local video file to this work's room (Presence-bound: local, not the place conversation), with an optional caption. Requires file_path.",
             "parameters": {"type": "object", "properties": {
-                "file_path": {"type": "string", "description": "Local file path to video (preferred)"},
+                "file_path": {"type": "string", "description": "Local video path: relative to the active workspace, or absolute."},
                 "caption": {"type": "string", "description": "Optional caption for the video"},
             }, "required": ["file_path"]},
         }, _send_video),
         ToolEntry("send_file", {
             "name": "send_file",
             "description": (
-                "Send an arbitrary document/file to the owner's chat (e.g. a report, .md/.csv/.html, "
+                "Send an arbitrary document/file to this work's room (Presence-bound: local, not the place conversation; e.g. a report, .md/.csv/.html, "
                 "PDF, archive, or code file — anything that is not an image or video). "
                 "Requires a local file_path; large files use a captured download reference. Deliver a finished file result "
                 "the owner can download, rather than only describing it or sending a screenshot."
             ),
             "parameters": {"type": "object", "properties": {
-                "file_path": {"type": "string", "description": "Local file path to the document/file"},
+                "file_path": {"type": "string", "description": "Local file path: relative to the active workspace, or absolute."},
                 "caption": {"type": "string", "description": "Optional caption for the file"},
             }, "required": ["file_path"]},
         }, _send_file),
         ToolEntry("send_links", {
             "name": "send_links",
-            "description": "Send one or more HTTP(S) links as prominent clickable buttons in the owner's chat.",
+            "description": "Send one or more HTTP(S) links as prominent clickable buttons in this work's room (Presence-bound: local, not the place conversation).",
             "parameters": {"type": "object", "properties": {
                 "title": {"type": "string", "description": "Optional heading above the buttons"},
                 "links": {"type": "array", "minItems": 1, "maxItems": _MAX_LINK_ACTIONS, "items": {
@@ -1425,21 +1484,23 @@ def get_tools() -> List[ToolEntry]:
                     }, "required": ["label", "url"]}},
             }, "required": ["links"]},
         }, _send_links),
+        ToolEntry("show_card", copy.deepcopy(SHOW_CARD_TOOL_SCHEMA), _show_card,
+                  # Owner-chat delivery like send_file; an app runs only in the opaque sandbox frame.
+                  safety_policy="skip"),
         ToolEntry("search_code", {
             "name": "search_code",
             "description": (
-                "Search for a pattern in the repository code. "
-                "Literal search by default; set regex=True for regular expressions. "
-                "Scoped to path (default: entire active workspace). "
-                "Skips binaries, caches, vendor dirs, and files >1MB. "
-                "Returns up to max_results matches (default 200) with root:file:line context. "
-                "Use this for plain-text/regex matches (prefer it over grep/find-as-search in run_command); "
-                "for symbol-aware lookups (definitions, callers, references, impact) prefer query_code."
+                (
+                'Search literal text (default) or regex under root/path. Returns root:file:line matches with context; '
+                'long lines include a read_file range around the first match. Skips binaries, caches, vendor '
+                'directories and files over 1MB. max_results bounds matches. Use query_code for definitions, callers, '
+                'references or impact.'
+            )
             ),
             "parameters": {"type": "object", "properties": {
                 "query": {"type": "string", "description": "Search pattern (literal or regex)"},
-                "path": {"type": "string", "default": ".", "description": "Subdirectory to search (relative to repo root)"},
-                "root": {"type": "string", "enum": ["active_workspace", "system_repo", "runtime_data", "task_drive", "skill_payload", "artifact_store", "user_files", "subagent_projects", "deliverables"], "default": "active_workspace"},
+                "path": {"type": "string", "default": ".", "description": "Subdirectory to search, relative to the selected root"},
+                "root": {"type": "string", "enum": ["active_workspace", "system_repo", "runtime_data", "task_drive", "skill_payload", "artifact_store", "user_files", "subagent_projects", "deliverables"], "description": _FILE_ROOT_DESCRIPTION},
                 "bucket": {"type": "string", "description": "Required only for root=skill_payload."},
                 "skill_name": {"type": "string", "description": "Required only for root=skill_payload."},
                 "regex": {"type": "boolean", "default": False, "description": "Treat query as a regular expression"},
@@ -1447,49 +1508,28 @@ def get_tools() -> List[ToolEntry]:
                 "include": {"type": "string", "default": "", "description": "Basename glob, including brace alternatives (e.g. '*.py', '*.{js,css}'); applies on every backend"},
             }, "required": ["query"]},
         }, _code_search),
-        ToolEntry("escalate", {
-            "name": "escalate",
-            "description": (
-                "Escalate a decision up the responsibility chain instead of guessing. "
-                "List 2-6 real options, mark your recommendation with recommended=true on that option, "
-                "and let each option's detail name what it gains and what it costs. "
-                "A root task asks the OWNER (a typed quiz card with option buttons); "
-                "a subagent asks its PARENT task (a typed mailbox frame the parent "
-                "answers with forward_to_worker or escalates higher, verbatim). "
-                "By default name your recommended option as the assumption and keep working: "
-                "the card stays answerable, and a late answer still arrives. "
-                "Set wait_for_answer=true (a live root, ordinary conversation included) when the next step "
-                "is irreversible or costly to redo, or the choice is the owner's to make "
-                "(spending, publishing, deleting); your judgment decides. The task then waits after the "
-                "current tool batch without model calls; waiting questions in one batch share one wait, "
-                "which ends on the first incoming message."
-            ),
-            "parameters": {"type": "object", "properties": {
-                "question": {"type": "string", "description": "The decision being escalated (markdown renders in chat)"},
-                "options": {"type": "array", "items": {"type": "object", "properties": {
-                    "label": {"type": "string", "description": "Short option label (button text, max 120)"},
-                    "detail": {"type": "string", "description": "Optional one-line consequence of this option (max 500)"},
-                    "recommended": {"type": "boolean", "description": "True on the ONE option you recommend"},
-                }, "required": ["label"]}, "description": "2-6 mutually exclusive options"},
-                "stake": {"type": "string", "description": "What depends on this decision (optional, max 500)"},
-                "assumption": {"type": "string", "description": "For optional clarification, the assumption you continue under (max 500); may be empty for required waiting."},
-                "wait_for_answer": {"type": "boolean", "default": False, "description": "Live roots: wait for addressed owner input before another model round."},
-                "max_wait_minutes": {"type": "integer", "description": "Optional bound for wait_for_answer: resume with a system notice after N minutes if no answer arrives (the card stays open)."},
-            }, "required": ["question", "options"]},
-        }, _escalate),
+        # A fresh copy per catalog, as the inline literals are.
+        ToolEntry("escalate", copy.deepcopy(ESCALATE_TOOL_SCHEMA), _escalate),
         ToolEntry("forward_to_worker", {
             "name": "forward_to_worker",
             "description": (
-                "Write an addressed task-tree message into a running task's mailbox: a child "
-                "or descendant of yours (delivered as the ancestor's message), or any active "
-                "independent root the host lists (delivered as a message from an independent "
-                "task). It is never labelled owner dialogue, files cannot be attached, and the "
-                "result says the message was written, not read: the task drains it at its next "
-                "checkpoint."
+                "Write an addressed task-tree message into a running, queued or requested task's mailbox: a child "
+                "or descendant of yours (delivered as the ancestor's message), any other task in your "
+                "tree — your parent, a sibling, or any task sharing your root (delivered as a message "
+                "from a peer task naming the relation — a contribution it weighs, never steering; relay "
+                "is refused there), or any active independent root the host lists or a source-bound "
+                "inline Presence turn (a message from an independent task). Presence observation gaps "
+                "are disclosed, also when the Presence root is in your own tree; a write never "
+                "proves a read. It is never labelled owner dialogue, files cannot be attached, the body "
+                "is limited to 8000 chars (longer is refused, never truncated), and the "
+                "result says written, not read: a running task drains it at its next checkpoint, a queued "
+                "one when it starts, and a task that ends without reading it keeps it as unread mail in its "
+                "result. To wait for a reply without spending model rounds, call await_messages."
             ),
             "parameters": {"type": "object", "properties": {
-                "task_id": {"type": "string", "description": "ID of the running task to forward to"},
-                "message": {"type": "string", "description": "Message text to forward"},
+                "task_id": {"type": "string", "description": "ID of the running, queued or requested task to forward to"},
+                "message": {"type": "string", "description": "Message text to forward (at most 8000 chars)"},
+                "reply_to": REPLY_TO_SCHEMA,
                 "relayed_from_task_id": {"type": "string", "description":
                     "Optional sibling/descendant task whose output this ancestor relays. "
                     "The recipient sees both peer and ancestor provenance."},

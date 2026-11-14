@@ -1,7 +1,7 @@
 """Durable per-extension health vector for live->broken regression detection.
 
-A small immune-system instrument (BIBLE P1 "discrepancy between expected and actual
-state — immediate alert"; P3 health invariants): if an extension that was live at a
+A small immune-system instrument (BIBLE P1 material state discrepancies;
+P3 health invariants): if an extension that was live at a
 prior code version stops loading after a self-modification + restart, record the
 regression and surface it to the owner/agent. This is warning-only — it never
 disables a skill and never mutates git. The record lives next to the other per-skill
@@ -16,7 +16,7 @@ import pathlib
 from typing import Any, Dict, List, Optional
 
 from ouroboros.contracts.schema_versions import with_schema_version
-from ouroboros.skill_loader import skill_state_dir
+from ouroboros.skill_loader import skill_state_dir, skill_state_dir_path
 from ouroboros.utils import append_jsonl, read_json_dict, update_json_locked, utc_now_iso
 
 log = logging.getLogger(__name__)
@@ -37,7 +37,8 @@ def health_path(drive_root: pathlib.Path, skill_name: str) -> pathlib.Path:
 
 
 def read_extension_health(drive_root: pathlib.Path, skill_name: str) -> Optional[Dict[str, Any]]:
-    return read_json_dict(health_path(drive_root, skill_name))
+    # Non-creating: a missing state dir reads like a missing file (None).
+    return read_json_dict(skill_state_dir_path(pathlib.Path(drive_root), skill_name) / HEALTH_FILENAME)
 
 
 def record_extension_health(
@@ -59,7 +60,9 @@ def record_extension_health(
     ``newly_regressed`` (returned, not persisted) marks the live->broken transition
     so callers can log/alert once per transition rather than every restart.
     Worker observations are qualifiers only: they never replace server authority or
-    advance the server's ``last_known_good``.
+    advance the server's ``last_known_good``; one equal to the recorded worker
+    observation but for its time is not written again (every worker birth repeats it),
+    so a worker observation's ``ts`` names when workers first saw it so.
     """
     process = "worker" if process == "worker" else "server"
     now = utc_now_iso()
@@ -84,6 +87,11 @@ def record_extension_health(
             observations["server"] = dict(legacy, process="server")
         prior_server = observations.get("server")
         prior_status = str(prior_server.get("status") or "") if isinstance(prior_server, dict) else ""
+        prior_worker = observations.get("worker")
+        if process == "worker" and "observations" in prior and isinstance(prior_worker, dict) \
+                and {**prior_worker, "ts": now} == observed:
+            result.update(prior, newly_regressed=False)
+            return None  # the same worker observation again: nothing new to record
         observations[process] = observed
         last_known_good = prior.get("last_known_good")
         if not isinstance(last_known_good, dict):
@@ -217,9 +225,10 @@ def regressed_extensions(drive_root: pathlib.Path) -> List[Dict[str, Any]]:
         # false CRITICAL (its health.json can outlive the payload).
         name = str(record.get("skill") or skill_dir.name)
         try:
-            from ouroboros.skill_loader import find_skill, load_enabled
+            from ouroboros.skill_loader import find_skill
 
-            if find_skill(pathlib.Path(drive_root), name) is None or not load_enabled(pathlib.Path(drive_root), name):
+            skill = find_skill(pathlib.Path(drive_root), name)
+            if skill is None or not skill.enabled:  # the effective switch: a required package stays alarmed
                 continue
         except Exception:
             pass

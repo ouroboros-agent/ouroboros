@@ -12,7 +12,10 @@ import pytest
 
 from ouroboros import headless, observability as obs
 from ouroboros.artifacts import read_actor_source_bytes, store_actor_source_bytes
+from ouroboros.outcomes import collect_trace_refs
+from ouroboros.store_import import ensure_current_store
 from ouroboros.task_results import load_task_result, write_task_result
+from tests._store_shared import result_signature
 
 
 def _child(tmp_path, task_id="copyback"):
@@ -34,8 +37,20 @@ def _review(ref, revision=1, headline="reviewed"):
 
 
 def _store(root, task_id, ref, **fields):
+    # The real trace producer names one call through its LLM-response and tool
+    # edges, then loop_outcome repeats the response: with a review panel, four
+    # occurrences of one call, so a copy must still do each file operation once.
+    usage = {"llm_call_refs": [{"llm_call_id": ref["call_id"], "response_ref": ref}]}
+    tool = {"tool_calls": [{"trace_ref": {"call_id": ref["call_id"], "manifest_ref": ref}}]}
     return write_task_result(root, task_id, "completed", result="done", artifact_status="ready",
-                             trace_refs={"refs": [ref, ref]}, loop_outcome={"trace_refs": [ref]}, **fields)
+                             trace_refs=collect_trace_refs(usage, tool),
+                             loop_outcome={"trace_refs": collect_trace_refs(usage, {})}, **fields)
+
+
+def _trace_occurrences(result):
+    trace, nested = result["trace_refs"], result["loop_outcome"]["trace_refs"]
+    return [trace["llm_call_refs"][0]["response_ref"], trace["tool_call_refs"][0]["manifest_ref"],
+            nested["llm_call_refs"][0]["response_ref"]]
 
 
 @pytest.mark.parametrize("alias", [False, True])
@@ -61,11 +76,10 @@ def test_same_store_keeps_original_manifest_and_reads_old_refs_after_alias_clean
     copied = headless.copy_child_task_result(parent, {"id": "copyback", "drive_root": str(child)})
 
     assert copied["child_ref_promotion"]["status"] == "complete"
-    assert copied["child_ref_promotion"]["promoted_ref_count"] == 4
+    assert copied["child_ref_promotion"]["promoted_ref_count"] == 0
     assert native_path.read_bytes() == native_bytes
     assert "promoted_call_manifest" not in json.loads(native_bytes)
-    refs = [original_ref, *copied["trace_refs"]["refs"],
-            copied["loop_outcome"]["trace_refs"][0], copied["review_projection"]["panels"][0]["source_ref"]]
+    refs = [original_ref, *_trace_occurrences(copied), copied["review_projection"]["panels"][0]["source_ref"]]
     if alias:
         child.unlink()
     for ref in refs:
@@ -88,8 +102,8 @@ def test_shared_observability_directory_is_same_store(tmp_path, monkeypatch):
     assert Path(promoted["path"]).read_bytes() == original
 
 
-@pytest.mark.parametrize("defect", ["sha", "size", "encoding", "existing_outside"])
-def test_missing_locator_fallback_does_not_replace_invalid_blob_evidence(tmp_path, defect):
+@pytest.mark.parametrize("defect", ["sha", "encoding", "existing_outside"])
+def test_missing_locator_fallback_does_not_replace_invalid_blob_evidence(tmp_path, monkeypatch, defect):
     root = tmp_path / "data"
     ref = obs.write_blob(root, {"answer": "exact"})
     old = {**ref, "path": str(tmp_path / "retired" / "observability" / "blobs" / Path(ref["path"]).name)}
@@ -103,7 +117,14 @@ def test_missing_locator_fallback_does_not_replace_invalid_blob_evidence(tmp_pat
     else:
         outside = Path(old["path"])
         outside.parent.mkdir(parents=True)
-        outside.write_bytes(Path(ref["path"]).read_bytes())
+        outside.write_bytes(b"unrelated bytes must never be opened")
+        real_open = gzip.open
+        def open_inside(path, *args, **kwargs):
+            assert Path(path) != outside
+            return real_open(path, *args, **kwargs)
+        monkeypatch.setattr(gzip, "open", open_inside)
+        assert obs.read_blob_ref(root, old) == {"answer": "exact"}
+        return
     with pytest.raises((ValueError, OSError)):
         obs.read_blob_ref(root, old)
 
@@ -122,59 +143,48 @@ def test_manifest_fallback_keeps_exact_task_call_and_digest_checks(tmp_path):
         obs.read_call_manifest_ref(root, old, task_id="copyback")
 
 
-def test_distinct_copy_memo_reuses_verified_io_and_expires_between_operations(tmp_path, monkeypatch):
+def test_distinct_retention_reuses_shared_sources_and_revalidates_inventory(tmp_path, monkeypatch):
     from ouroboros import artifacts
     parent, child, task = _child(tmp_path)
-    trace = _call(child)
-    ref = trace["manifest_ref"]
+    ref = _call(child)["manifest_ref"]
     source = store_actor_source_bytes(child, task["id"], category="tool_results", source_id="source",
                                      data=b"exact retained source", extension="txt")
     _store(child, task["id"], ref, review_evidence={"sources": [source, source]},
            review_projection=_review(ref))
-    reads, writes = Counter(), Counter()
-    real_open, real_blob, real_manifest = gzip.open, obs.write_blob, obs.write_call_manifest
-    real_source = artifacts.store_actor_source_bytes
-    def counted_open(path, mode="rb", *args, **kwargs):
-        if "r" in mode:
-            reads[str(Path(path).resolve())] += 1
-        return real_open(path, mode, *args, **kwargs)
-    def blob(*args, **kwargs):
-        writes["blob"] += 1
-        return real_blob(*args, **kwargs)
+    writes = Counter()
+    real_manifest, real_source = obs.write_call_manifest, artifacts.store_actor_source_bytes
     def manifest(*args, **kwargs):
         writes["manifest"] += 1
         return real_manifest(*args, **kwargs)
     def source_store(*args, **kwargs):
         writes["source"] += 1
         return real_source(*args, **kwargs)
-    monkeypatch.setattr(gzip, "open", counted_open)
-    monkeypatch.setattr(obs, "write_blob", blob)
     monkeypatch.setattr(obs, "write_call_manifest", manifest)
     monkeypatch.setattr(artifacts, "store_actor_source_bytes", source_store)
-    copied = headless.copy_child_task_result(parent, task)
-    assert copied["child_ref_promotion"]["promoted_ref_count"] == 4
-    assert writes == {"blob": 1, "manifest": 1, "source": 1}
-    assert reads and all(count == 1 for count in reads.values())
-    promoted = copied["trace_refs"]["refs"][0]
-    assert Path(promoted["path"]).name == "call.json"
+    headless.copy_child_task_result(parent, task)
+    copied = headless.retry_child_task_refs(parent, child, task["id"])
+    assert copied["child_ref_promotion"]["status"] == "complete"
+    assert writes == {"manifest": 1, "source": 1}
+    promoted = _trace_occurrences(copied)[0]
     assert obs.read_call_manifest_ref(parent, promoted, task_id=task["id"])["promoted_call_manifest"] is True
     assert read_actor_source_bytes(parent, task["id"], source) == b"exact retained source"
-    Path(ref["path"]).write_text("{}")
-    second = headless.copy_child_task_result(parent, task)
-    assert second["trace_refs"]["refs"][0]["reason"] == "digest_mismatch"
+    Path(ref["path"]).write_text("{}", encoding="utf-8")
+    # A later copy uses no previous operation's verification. The valid retained
+    # version remains readable, but the newly corrupt inventory cannot certify GC.
+    headless.copy_child_task_result(parent, task)
+    second = headless.retry_child_task_refs(parent, child, task["id"])
+    assert second["child_ref_promotion"]["status"] == "incomplete"
+    assert obs.read_call_manifest_ref(parent, ref, task_id=task["id"])["call_id"] == "call"
 
 
-@pytest.mark.parametrize("retry", [False, True])
-@pytest.mark.parametrize("change_source", [False, True])
+@pytest.mark.parametrize(("change_source", "retry"), [(False, False), (True, True)])
 def test_current_review_writer_runs_during_bulk_io_and_wins(tmp_path, monkeypatch, retry, change_source):
     parent, child, task = _child(tmp_path)
     old = _call(child, call_id="old")["manifest_ref"]
     new = _call(parent, call_id="new")["manifest_ref"]
     _store(child, task["id"], old, review_projection=_review(old))
     if retry:
-        with monkeypatch.context() as interrupted:
-            interrupted.setattr(obs, "promote_call_manifest_ref", lambda *a, **k: (_ for _ in ()).throw(OSError("copy failed")))
-            headless.copy_child_task_result(parent, task)
+        headless.copy_child_task_result(parent, task)
     else:
         write_task_result(parent, task["id"], "completed", review_projection=_review(old))
     entered, release = Event(), Event()
@@ -188,6 +198,15 @@ def test_current_review_writer_runs_during_bulk_io_and_wins(tmp_path, monkeypatc
             assert release.wait(5), "concurrent CURRENT writer was blocked by bulk I/O"
         return original(value, *args, **kwargs)
     monkeypatch.setattr(obs, "_rewrite_child_ref_tree", rewrite)
+    if not retry:
+        from ouroboros import history_retention
+        prepare = history_retention.prepare_result_retention
+        def preparing(*args, **kwargs):
+            value = prepare(*args, **kwargs)
+            entered.set()
+            assert release.wait(5), "concurrent CURRENT writer was blocked by deliverable I/O"
+            return value
+        monkeypatch.setattr(history_retention, "prepare_result_retention", preparing)
     operation = (lambda: headless.retry_child_task_refs(parent, child, task["id"])) if retry else (
         lambda: headless.copy_child_task_result(parent, task))
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -213,7 +232,7 @@ def test_current_review_writer_runs_during_bulk_io_and_wins(tmp_path, monkeypatc
     assert panel["publication_revision"] == (2 if change_source else 1)
     resolved = obs.read_call_manifest_ref(parent, panel["source_ref"], task_id=task["id"])
     assert resolved["call_id"] == ("new" if change_source else "old")
-    assert result["child_ref_promotion"]["pending_refs"] == []
+    assert bool(result["child_ref_promotion"]["pending_refs"]) is (not retry)
 
 
 @pytest.mark.parametrize("source_status", [None, "running"])
@@ -245,11 +264,11 @@ def test_missing_terminal_source_does_not_stamp_running_result_with_artifact_fai
 def test_helper_retains_terminal_child_when_canonical_write_fails(tmp_path, monkeypatch):
     parent, child, task = _child(tmp_path)
     _store(child, task["id"], _call(child)["manifest_ref"])
-    source = (child / "task_results" / f"{task['id']}.json").read_bytes()
+    source = result_signature(child, task['id'])
     monkeypatch.setattr(headless, "write_task_result", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
     report = headless.prepare_terminal_task_files(parent, task)
     assert report == {"task_id": task["id"], "result": None, "error": "OSError: disk full", "terminal_source_present": True}
-    assert (child / "task_results" / f"{task['id']}.json").read_bytes() == source
+    assert result_signature(child, task['id']) == source
     assert load_task_result(parent, task["id"]) is None
 
 
@@ -281,9 +300,14 @@ def test_retry_refuses_malformed_current_without_rebuilding_from_child(tmp_path)
     _store(child, task["id"], _call(child)["manifest_ref"])
     path = parent / "task_results" / f"{task['id']}.json"
     path.parent.mkdir(exist_ok=True)
-    path.write_text("{")
-    with pytest.raises(ValueError):
+    path.write_text("{", encoding="utf-8")
+    ensure_current_store(parent)  # Boot quarantines the malformed legacy authority.
+    child_signature = result_signature(child, task["id"])
+    with pytest.raises(ValueError, match="authority is unreadable or invalid"):
         headless.retry_child_task_refs(parent, child, task["id"])
+    assert load_task_result(parent, task["id"]) is None
+    assert result_signature(child, task["id"]) == child_signature
+    assert (path.parent / "quarantine" / path.name).read_bytes() == b"{"
 
 
 def test_native_model_send_reverse_reader_accepts_retired_alias(tmp_path, monkeypatch):

@@ -1,44 +1,122 @@
-"""Thin Claudexor v3 thread operations for delegated plan reviewers."""
+"""Shared Claudexor thread operations and reviewer continuity receipts."""
 
 from __future__ import annotations
 
 import json
+import re
+from pathlib import Path
 from typing import Any, Dict
+
+
+DELEGATED_REVIEW_THREAD_MIN_VERSION = "3.23.0"
+
+
+def require_delegated_review_threads(gateway: Any) -> None:
+    """Require the negotiated release that supports host-owned thread roots.
+
+    The handshake's engine version is the feature floor. There is no separate
+    delegated-thread capability flag and an older engine cannot substitute a
+    fresh conversation for the requested persistent review.
+    """
+    from ouroboros.gateways.claudexor import engine_at_least
+    from ouroboros.review_execution import ReviewRouteUnavailable
+
+    version = str(getattr(gateway, "engine_version", "") or "")
+    if (not re.fullmatch(r"\d+\.\d+\.\d+", version)
+            or not engine_at_least(version, DELEGATED_REVIEW_THREAD_MIN_VERSION)):
+        raise ReviewRouteUnavailable(
+            "Persistent writable review requires Claudexor "
+            f"{DELEGATED_REVIEW_THREAD_MIN_VERSION} or newer; "
+            f"the negotiated engine is {version or 'unknown'}",
+            code="review_checking_thread_unsupported",
+        )
 
 
 def ensure_review_thread(
     gateway: Any, custody: Any, thread_id: str, *, route: Any, root: str,
-    surface: str, slot_id: str, task_id: str,
+    surface: str, slot_id: str, task_id: str, access: str = "readonly",
+    workspace_root: str = "", ephemeral: bool = False,
 ) -> str:
-    """Create the initial sticky read-only thread; otherwise retain its id."""
+    """Keep author identity separate from a persistent delegated checking copy.
+
+    The host owns the writable copy and its evidence. The thread binds that
+    copy at creation; subsequent turns never retarget it or recreate the thread.
+    Read-only seats retain the in-place Ask path. ``ephemeral``: the root is
+    host-minted and registers nothing (``delegate_registration_policy.resolve_registration``).
+    """
+    writable = access != "readonly"
+    if writable:
+        require_delegated_review_threads(gateway)
+        if (not workspace_root or not Path(workspace_root).is_absolute()
+                or Path(workspace_root).resolve() == Path(root).resolve()):
+            from ouroboros.review_execution import ReviewRouteUnavailable
+
+            raise ReviewRouteUnavailable(
+                "Persistent writable review requires its separate checking copy",
+                code="review_thread_workspace_invalid",
+            )
     if thread_id:
         return thread_id
     key = custody.idempotency_key(
         "review_thread", surface, slot_id, task_id, route.route_id,
         str(getattr(route, "profile_id", "") or ""), root,
+        *((access, workspace_root) if writable else ()),
     )
+    try:
+        return ensure_execution_thread(
+            gateway, route=route, root=root, mode="agent" if writable else "ask",
+            access=access, workspace_root=workspace_root if writable else "",
+            title=f"Ouroboros {surface} · {slot_id}", idempotency_key=key, ephemeral=ephemeral)
+    except ValueError as exc:
+        from ouroboros.review_execution import ReviewRouteUnavailable
+
+        raise ReviewRouteUnavailable(str(exc), code="review_thread_id_missing") from exc
+
+
+def ensure_execution_thread(gateway: Any, *, route: Any, root: str, mode: str, access: str,
+                            workspace_root: str, title: str, idempotency_key: str, ephemeral: bool = False) -> str:
+    """Create a thread binding one stable project and, when supplied, its private copy; on a
+    host-minted root (``ephemeral``) the engine registers nothing and keeps it in its global partition."""
     request: Dict[str, Any] = {
-        "title": f"Ouroboros {surface} · {slot_id}",
-        "scope": {"kind": "project", "root": root},
-        "mode": "ask", "workspace": "in_place", "authPreference": "subscription",
+        "title": title,
+        "scope": {"kind": "project", "root": root, **({"ephemeral": True} if ephemeral else {})},
+        "mode": mode,
+        "workspace": "delegated" if workspace_root else "in_place",
+        "authPreference": "subscription",
         "primaryHarness": route.route_id, "eligibleHarnesses": [route.route_id],
-        "access": "readonly",
+        "access": access,
     }
+    if workspace_root:
+        request["workspaceRoot"] = workspace_root
     profile_id = str(getattr(route, "profile_id", "") or "")
     if profile_id:
         request["credentialProfileId"] = profile_id
-    return str(gateway.create_thread(request, idempotency_key=key).get("id") or "")
+    created = gateway.create_thread(request, idempotency_key=idempotency_key)
+    created_id = str(created.get("id") or "").strip() if isinstance(created, dict) else ""
+    if not created_id:
+        raise ValueError("Claudexor thread creation returned no thread identity")
+    return created_id
+
+
+def thread_turn_request(run_request: Dict[str, Any]) -> Dict[str, Any]:
+    """The turn body a recorded thread start sends: its geometry kept, the thread owning its project and
+    execution address. The append and its noncreating lookup (``delegate_accepted.locate``) send the same."""
+    request = {
+        key: value for key, value in run_request.items()
+        if key not in {"_use_thread", "_thread_id", "scope", "execution"}
+    }
+    execution = run_request.get("execution") or {}
+    geometry = {key: execution[key] for key in ("workspaceKind", "scopePaths", "isolation") if key in execution}
+    if geometry:
+        request["execution"] = geometry
+    return request
 
 
 def start_review_thread_turn(
     gateway: Any, thread_id: str, run_request: Dict[str, Any], *, idempotency_key: str,
 ) -> Dict[str, Any]:
-    """Strip run-only fields and append through the public thread pipeline."""
-    request = {
-        key: value for key, value in run_request.items()
-        if key not in {"_use_thread", "_thread_id", "scope", "execution"}
-    }
-    return gateway.start_thread_turn(thread_id, request, idempotency_key=idempotency_key)
+    """Append the recorded start's turn (``thread_turn_request``) under its invocation key."""
+    return gateway.start_thread_turn(thread_id, thread_turn_request(run_request), idempotency_key=idempotency_key)
 
 
 def profile_rotation_receipts(gateway: Any, run_id: str) -> list[dict]:
@@ -123,15 +201,20 @@ def profile_continuity_receipt(
 
 def review_thread_receipt(
     gateway: Any, thread_id: str, run_id: str, turn_id: str, *,
-    expected_profile: str = "", applied_profile: str = "",
+    expected_profile: str = "", applied_profile: str = "", run_names: Any = (),
 ) -> dict:
-    """Require the completed run's exact turn/session/continuity binding."""
+    """Require the completed run's exact turn/session/continuity binding.
+
+    ``run_names`` are the run's names from its detail (``custody.held_run_names``): a turn
+    answered before its run bound hands back only the job id, and the turn records the run id.
+    """
     detail = gateway.get_thread(thread_id)
     turns = [row for row in (detail.get("turns") or []) if isinstance(row, dict)]
+    names = {run_id, *run_names}
     turn = next(
         (row for row in reversed(turns)
          if (
-             str(row.get("runId") or "") == run_id
+             str(row.get("runId") or "") in names
              and (not turn_id or str(row.get("id") or "") == turn_id)
          )),
         None,

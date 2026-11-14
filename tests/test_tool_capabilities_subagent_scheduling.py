@@ -6,7 +6,9 @@ core membership, registry and schema visibility, the required-capability
 fail-fast, the top-level control surface under workspace focus, executor-ref
 inheritance, and the capability omission manifest.
 """
-import json
+import pytest
+
+from tests._store_shared import read_result
 
 
 # ---------------------------------------------------------------------------
@@ -149,8 +151,12 @@ def test_local_readonly_subagent_initial_schemas_are_allowlisted(tmp_path):
     )
 
     names = {s["function"]["name"] for s in initial_tool_schemas(registry)}
-    assert LOCAL_READONLY_SUBAGENT_TOOL_NAMES <= names
-    assert "enable_tools" not in names
+    # A granted compat alias stays callable but is advertised only through its canonical name.
+    aliases = {name for name in LOCAL_READONLY_SUBAGENT_TOOL_NAMES if registry._entries[name].alias_for}
+    assert aliases == {"ocr_pdf"}
+    assert LOCAL_READONLY_SUBAGENT_TOOL_NAMES - aliases <= names
+    assert not aliases & names and {registry._entries[name].alias_for for name in aliases} <= names
+    assert "enable_tools" in names  # loads permitted schemas only (#1860)
     assert "schedule_subagent" in names
     assert "verify_and_record" not in names
     assert "write_file" not in names
@@ -160,8 +166,12 @@ def test_local_readonly_subagent_initial_schemas_are_allowlisted(tmp_path):
     schemas = {s["function"]["name"]: s["function"] for s in initial_tool_schemas(registry)}
     for tool_name in ("read_file", "list_files", "search_code"):
         root_enum = schemas[tool_name]["parameters"]["properties"]["root"]["enum"]
-        assert "user_files" not in root_enum
-    assert set(schemas["search_code"]["parameters"]["properties"]["root"]["enum"]) == {"active_workspace", "system_repo", "skill_payload"}
+        assert "user_files" in root_enum
+    # Owner T4=A (#1105): the Deliverables root is readable/searchable by a read-only child.
+    assert set(schemas["search_code"]["parameters"]["properties"]["root"]["enum"]) == {
+        "active_workspace", "system_repo", "skill_payload", "deliverables",
+        "runtime_data", "task_drive", "artifact_store", "user_files", "subagent_projects",
+    }
     action_schema = schemas["browser_action"]["parameters"]["properties"]["action"]
     assert "evaluate" not in action_schema["enum"]
     assert "send_photo" not in schemas["browse_page"]["description"]
@@ -194,13 +204,13 @@ def test_workspace_parent_keeps_the_ordinary_top_level_control_surface(tmp_path,
     names = {schema["function"]["name"] for schema in initial_tool_schemas(registry)}
 
     assert "plan_task" in names
-    assert "task_acceptance_review" in names
+    assert "review_change" in names  # a task's result is reviewed as review_change(subject="result")
     assert "commit_reviewed" in names
     assert "request_restart" in names
 
-    registry.override_handler("task_acceptance_review", lambda ctx=None, **_kwargs: "review-ok")
+    registry.override_handler("review_change", lambda ctx=None, **_kwargs: "review-ok")
     registry.override_handler("commit_reviewed", lambda ctx=None, **_kwargs: "commit-ok")
-    assert registry.execute("task_acceptance_review", {}) == "review-ok"
+    assert registry.execute("review_change", {"subject": "result"}) == "review-ok"
     assert registry.execute("commit_reviewed", {"commit_message": "system target"}) == "commit-ok"
 
 
@@ -292,12 +302,13 @@ def test_schedule_subagent_inherits_workspace_executor_ref(tmp_path, monkeypatch
     assert event["executor_ref"] == executor_ref
     assert event["metadata"]["executor_ref"] == executor_ref
     child_id = event["task_id"]
-    persisted = json.loads((data / "task_results" / f"{child_id}.json").read_text(encoding="utf-8"))
+    persisted = read_result(data, child_id)
     assert persisted["executor_ref"] == executor_ref
     assert persisted["task_contract"]["resource_policy"]["protected_artifacts"][0]["paths"] == ["/workspace/executable"]
 
 
-def test_capability_omission_manifest_surfaces_extension_discovery_failure(tmp_path, monkeypatch):
+@pytest.mark.parametrize('broken', [False, True])
+def test_capability_omission_manifest_surfaces_extension_discovery_failure(tmp_path, monkeypatch, broken):
     from ouroboros import extension_loader
     from ouroboros.tools import tool_discovery
     from ouroboros.tools.registry import ToolRegistry
@@ -310,12 +321,14 @@ def test_capability_omission_manifest_surfaces_extension_discovery_failure(tmp_p
             return False
 
     registry = ToolRegistry(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
-    monkeypatch.setattr(extension_loader, "_lock", BoomLock())
+    if broken:
+        monkeypatch.setattr(extension_loader, "_lock", BoomLock())
 
     registry.schemas()
-    tool_discovery.set_registry(registry)
+    monkeypatch.setattr(tool_discovery, "_registry", registry)  # never leak an unrestricted fallback into later tests
     text = tool_discovery._list_available_tools(registry._ctx)
 
-    assert "CAPABILITY_OMISSION_MANIFEST" in text
-    assert "extensions" in text
-    assert "boom" in text
+    assert "Current callable catalog" in text
+    assert ("boom" in text) is broken
+    if broken:
+        assert "CAPABILITY_OMISSION_MANIFEST" in text and "extensions" in text

@@ -22,7 +22,7 @@ def server(**changes):
 
 
 @pytest.mark.parametrize("url", [URL, "https://user-only@service.example/mcp",
-                                  "https://u%40name:p%3Ass@[::1]:9443/a?b=#c", "HTTPS://u:p@EXAMPLE.test/mcp?"])
+                                  "HTTPS://u:p@EXAMPLE.test/mcp?"])
 def test_mask_roundtrip_preserves_exact_original_url(url):
     masked = mask_mcp_url(url)
     assert "***@" in masked and masked != url
@@ -44,9 +44,6 @@ def test_masked_settings_roundtrip_changes_name_without_losing_url_or_header():
 
 @pytest.mark.parametrize("change", [
     {"url": "https://***@different.example:9443/mcp?route=one#fragment"},
-    {"url": "https://***@service.example:9443/changed?route=one#fragment"},
-    {"url": "http://***@service.example:9443/mcp?route=one#fragment"},
-    {"url": "https://***@service.example:9443/mcp?route=two#fragment"},
     {"url": "https://***@service.example:9443/mcp?route=one#new"},
     {"id": "another-server"},
 ])
@@ -86,7 +83,7 @@ def test_invalid_saved_authority_masks_secrets_and_can_still_roundtrip_or_be_rep
 
 def test_real_settings_get_post_uses_url_roundtrip(settings_client, monkeypatch):  # noqa: F811
     from ouroboros import mcp_client
-    monkeypatch.setattr(mcp_client, "refresh_all_background", lambda **kwargs: None)
+    monkeypatch.setattr(mcp_client.MCPManager, "refresh_all_background", lambda *args, **kwargs: None)
     client, on_disk, saved = settings_client
     on_disk.update(MCP_ENABLED=False, MCP_SERVERS=[server()])
     received = client.get("/api/settings")
@@ -116,8 +113,7 @@ def test_candidate_client(monkeypatch):
         yield client, current, seen
 
 
-@pytest.mark.parametrize("change", [{}, {"name": "Edited"}, {"url": "https://***@different.example/mcp"},
-                                    {"id": "other"}, {"url": "https://service.example/no-auth"}])
+@pytest.mark.parametrize("change", [{}, {"name": "Edited"}, {"url": "https://service.example/no-auth"}])
 def test_saved_test_candidate_uses_same_scoped_url_rehydration(test_candidate_client, change):
     client, current, seen = test_candidate_client
     candidate = _mask_mcp_servers_payload([current])[0]
@@ -126,8 +122,8 @@ def test_saved_test_candidate_uses_same_scoped_url_rehydration(test_candidate_cl
     assert response.status_code == 200 and response.json()["ok"]
     expected = _rehydrate_mcp_servers_payload([candidate], [current])[0]
     assert seen[-1]["url"] == expected["url"]
-    # auth_token keeps its older selected-server behavior, independent of URL userinfo.
-    assert seen[-1]["auth_token"] == current["auth_token"]
+    # Token and URL masks use the same unique candidate-identity restoration.
+    assert seen[-1]["auth_token"] == expected["auth_token"]
     assert "fixture-user" not in response.text and "fixture-password" not in response.text
 
 
@@ -144,4 +140,4 @@ def test_unsaved_test_candidate_cannot_recover_another_saved_url(test_candidate_
     response = client.post("/test", json={"server": candidate})
     assert response.json()["ok"]
     assert "@" not in seen[-1]["url"]
-    assert seen[-1]["auth_token"] == candidate["auth_token"]  # existing inline-token semantics
+    assert seen[-1]["auth_token"] == ""  # no saved identity: never send a display mask

@@ -9,8 +9,7 @@ from __future__ import annotations
 import inspect
 import os
 import pathlib
-
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from typing import TYPE_CHECKING
 
@@ -66,12 +65,12 @@ def active_repo_dir_for(ctx: Any) -> pathlib.Path:
         if workspace_mode:
             return workspace_path
 
-    from ouroboros.tool_access import project_room_lens_dir
+    from ouroboros.tool_access import folderless_scratch_dir, project_room_lens_dir
 
     room = project_room_lens_dir(ctx)
     if room is not None:
         return room
-    return pathlib.Path(getattr(ctx, "repo_dir"))
+    return folderless_scratch_dir(ctx) or pathlib.Path(getattr(ctx, "repo_dir"))
 
 
 def system_repo_dir_for(ctx: Any) -> pathlib.Path:
@@ -80,11 +79,13 @@ def system_repo_dir_for(ctx: Any) -> pathlib.Path:
     return pathlib.Path(getattr(ctx, "system_repo_dir", None) or getattr(ctx, "repo_dir"))
 
 
-_PATH_NORMALIZED_TOOLS = frozenset({"read_file", "write_file", "edit_text", "list_files", "search_code", "query_code"})
-_TOP_LEVEL_PATH_WRITE_TOOLS = frozenset({"write_file", "edit_text"})
+_PATH_NORMALIZED_TOOLS = frozenset({"read_file", "write_file", "edit_text", "apply_patch", "edit_batch", "list_files", "search_code", "query_code"})
+_ROOT_SELECTED_READ_TOOLS = frozenset({"read_file", "list_files", "search_code"})
 
 
 _ROOT_ARG_REPO_WRITE_TOOLS = frozenset({"write_file", "edit_text", "apply_patch", "edit_batch"})
+# Every editor retains the same explicit wrong-root redirect before a write.
+_TOP_LEVEL_PATH_WRITE_TOOLS = _ROOT_ARG_REPO_WRITE_TOOLS
 
 
 @dataclass(frozen=True)
@@ -92,7 +93,7 @@ class _DispatchPathNormalization:
     """Exact dispatch note plus any explicit root required before dispatch."""
 
     text: str = ""
-    required_root: Literal["active_workspace"] | None = None
+    required_root: Literal["active_workspace", "mixed"] | None = None
 
 
 def _payload_write_paths(name: str, args: Dict[str, Any]) -> List[str]:
@@ -131,6 +132,89 @@ def _payload_write_paths(name: str, args: Dict[str, Any]) -> List[str]:
     return [p for p in paths if str(p or "").strip()]
 
 
+def body_relative_path(ctx: Any, item: Any, *, own_body_copy: bool) -> str | None:
+    """Repo-relative identity of a bound target that lands on Ouroboros's body.
+
+    A target physically inside the serving repository is the body. An admitted
+    copy of the body (``own_body_copy``: the existing ``workspace_copies``
+    provenance) is the body too for targets in its own repo lanes; a foreign
+    project's copy stays foreign. ``None`` for every other target.
+    """
+    target = getattr(item, "target_path", None)
+    if target is None:
+        return None
+    bases = [system_repo_dir_for(ctx)]
+    if own_body_copy and item.root in {"active_workspace", "system_repo"} \
+            and item.source in {"active_workspace", "system_repo"}:
+        bases.append(pathlib.Path(item.base_path))
+    physical = pathlib.Path(target).resolve(strict=False)
+    for base in bases:
+        try:
+            return physical.relative_to(pathlib.Path(base).resolve(strict=False)).as_posix()
+        except ValueError:
+            continue
+    return None
+
+
+def protected_repo_write_paths(ctx: Any, name: str, args: Dict[str, Any],
+                               binding: Any, *, workspace_mode: bool,
+                               acting_system_worktree: bool) -> list[str]:
+    """Only members of a mixed binding that land on the body reach the protected gate."""
+    if binding is not None:
+        return [rel for item in _binding_items(binding)
+                if (rel := body_relative_path(ctx, item, own_body_copy=acting_system_worktree)) is not None]
+    root = str(args.get("root") or "active_workspace")
+    if (workspace_mode and not acting_system_worktree) or root not in {"active_workspace", "system_repo"}:
+        return []
+    from ouroboros.tool_access import canonical_repo_relative_path
+
+    return [canonical_repo_relative_path(ctx, root, path)
+            for path in _payload_write_paths(name, args)]
+
+
+def _root_containing_absolute_path(ctx: Any, name: str, text: str) -> str:
+    """Owner 7A: the root that physically contains an absolute path given WITHOUT
+    a root — among the roots THIS profile may use for the tool's operation plus
+    the actor's lineage task roots — or "" when none holds it. The deepest
+    containing base wins (``runtime_data`` holds the task roots, the owner home
+    holds Deliverables); the path itself is never rewritten, so the `01aea0663`
+    mirror stays closed. The file-tool twin of ``tool_access._select_process_target``."""
+    if not _registry().is_absolute_path_text(text):
+        return ""
+    from ouroboros.tool_access import (
+        active_tool_profile, decide_tool_access, lineage_read_base,
+        path_is_relative_to, profile_readable_root_paths,
+    )
+
+    operation = _TARGET_BINDING_OPERATIONS[name]
+    try:
+        target = pathlib.Path(text).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return ""
+    holders = [(label, base) for label, base in profile_readable_root_paths(ctx, operation=operation)
+               if path_is_relative_to(target, base)]
+    profile = active_tool_profile(ctx)
+    for label in ("task_drive", "artifact_store"):
+        if decide_tool_access(profile=profile, root=label, operation=operation).allow:
+            base = lineage_read_base(ctx, label, target)
+            if base is not None:
+                holders.append((label, base))
+    return max(holders, key=lambda item: len(str(item[1])), default=("", None))[0]
+
+
+def inferred_file_root(ctx: Any, name: str, root: str | None, paths: list[str]) -> tuple[str, str]:
+    """Use the existing physical root selector for an omitted file root."""
+    if root:
+        return root, ""
+    selected = {
+        _root_containing_absolute_path(ctx, name, path) or "active_workspace"
+        for path in paths
+    }
+    if len(selected) > 1:
+        return "", "⚠️ TOOL_ARG_ERROR: paths infer different roots; pass an explicit common root or use separate calls."
+    return next(iter(selected), "active_workspace"), ""
+
+
 def _normalize_dispatch_path_args_result(
     ctx: Any,
     name: str,
@@ -148,25 +232,63 @@ def _normalize_dispatch_path_args_result(
     (read_file/list_files/search_code) are auto-routed to
     ``root='active_workspace'`` with a visible note appended AFTER the result
     (trailing, so first-line failure classification is never masked),
-    and writes (write_file/edit_text) return an actionable
+    and all file editors return an actionable
     ROOT_REQUIRED_ACTIVE_WORKSPACE redirect instead of a generic access denial.
     The destination root still passes every downstream gate (profile access
     decision, protected-path guards, subagent filters) — only the label is
     corrected, never the authority. ``query_code`` is excluded: its
-    root=user_files external-target contract handles absolute paths natively."""
+    root=user_files external-target contract handles absolute paths natively.
+    Owner 7A: an absolute path with NO ``root`` runs under the permitted root
+    that physically contains it (``_root_containing_absolute_path``), the path
+    itself untouched; a NAMED root is never re-rooted."""
     if name not in _PATH_NORMALIZED_TOOLS:
         return _DispatchPathNormalization()
-    root_arg = str(args.get("root") or "active_workspace")
+    root_arg = str(args.get("root") or "")
+    if not root_arg and name in _ROOT_ARG_REPO_WRITE_TOOLS:
+        paths = _payload_write_paths(name, args)
+        selected = {
+            _root_containing_absolute_path(ctx, name, path) or "active_workspace"
+            for path in paths
+        }
+        if len(selected) > 1:
+            return _DispatchPathNormalization(
+                text="⚠️ TOOL_ARG_ERROR: paths infer different roots; pass an explicit common root or use separate calls.",
+                required_root="mixed",
+            )
+        if selected and next(iter(selected)) != "active_workspace":
+            args["root"] = root_arg = next(iter(selected))
+    if not root_arg and name in _ROOT_SELECTED_READ_TOOLS:
+        selected = _root_containing_absolute_path(ctx, name, str(args.get("path") or ""))
+        if selected and selected != "active_workspace":
+            args["root"] = root_arg = selected
+    root_arg = root_arg or "active_workspace"
     if root_arg in ("active_workspace", "system_repo"):
         try:
+            from ouroboros.body_candidate import serving_alias_root
+
             norm_root = active_repo_dir_for(ctx) if root_arg == "active_workspace" else system_repo_dir_for(ctx)
+            # A bound candidate keeps the serving spelling of a body path (`repo/x`, the
+            # absolute serving path) naming the same file it named on the binding write.
+            serving_alias = serving_alias_root(ctx, norm_root)
+
+            def _normalize(text: str) -> str:
+                text = text.strip().replace("\\", "/")
+                relative = _registry().normalize_root_relative(norm_root, text)
+                if serving_alias is not None and relative == text:
+                    relative = _registry().normalize_root_relative(serving_alias, text)
+                return relative
+
             for _key in ("path", "dir"):
                 if isinstance(args.get(_key), str) and args[_key]:
-                    args[_key] = _registry().normalize_root_relative(norm_root, args[_key])
-            if isinstance(args.get("files"), list):
-                for _f in args["files"]:
+                    args[_key] = _normalize(args[_key])
+            for entries in (args.get("files"), args.get("edits")):
+                for _f in entries if isinstance(entries, list) else []:
                     if isinstance(_f, dict) and isinstance(_f.get("path"), str) and _f["path"]:
-                        _f["path"] = _registry().normalize_root_relative(norm_root, _f["path"])
+                        _f["path"] = _normalize(_f["path"])
+            if name == "apply_patch" and isinstance(args.get("patch"), str):
+                from ouroboros.tools.edit_ops import normalize_patch_paths
+
+                args["patch"] = normalize_patch_paths(args["patch"], _normalize)
         except Exception:
             pass
         return _DispatchPathNormalization()
@@ -190,10 +312,14 @@ def _normalize_dispatch_path_args_result(
     for _key in ("path", "dir"):
         if isinstance(args.get(_key), str) and args[_key]:
             candidates.append(args[_key])
-    if isinstance(args.get("files"), list):
-        for _f in args["files"]:
+    for entries in (args.get("files"), args.get("edits")):
+        for _f in entries if isinstance(entries, list) else []:
             if isinstance(_f, dict) and isinstance(_f.get("path"), str) and _f["path"]:
                 candidates.append(_f["path"])
+    if name == "apply_patch" and isinstance(args.get("patch"), str):
+        from ouroboros.tools.edit_ops import patch_target_paths
+
+        candidates.extend(patch_target_paths(args["patch"]))
     hits = [text for text in candidates if _under_workspace(text)]
     if not hits:
         return _DispatchPathNormalization()
@@ -238,18 +364,17 @@ _TOOL_ARG_ALIASES: dict[str, dict[str, str]] = {
 }
 
 
-_IGNORE_ROOT_ARG_TOOLS = frozenset({
-    "commit_reviewed",
-    "vcs_commit_reviewed",
-})
+# Empty: the commit tools declare ``root`` and refuse every root but the system
+# repository themselves; the name stays for ``registry.py``'s re-export.
+_IGNORE_ROOT_ARG_TOOLS: frozenset[str] = frozenset()
 
 
 _GENERIC_VCS_TARGET_TOOLS = frozenset({
-    "vcs_status",
-    "vcs_diff",
+    "vcs_read",
     "vcs_pull_ff",
     "vcs_restore",
     "vcs_revert",
+    "review_change",
 })
 
 
@@ -284,6 +409,8 @@ _VERIFY_RUN_KINDS = frozenset({
 
 
 def _target_binding_operation(name: str, args: dict[str, Any]) -> str | None:
+    if name == "review_change" and str(args.get("subject") or "").strip() == "result":
+        return None  # a result review reads this task's own result, never a workspace target
     operation = _TARGET_BINDING_OPERATIONS.get(name)
     if operation is not None:
         return operation
@@ -296,11 +423,13 @@ def _target_binding_operation(name: str, args: dict[str, Any]) -> str | None:
     # CONDITIONAL, never a static map entry (R1 item 1): delegate_start becomes
     # target-bound only when it explicitly selects an exact skill payload; a
     # plain or retry call keeps its current active-workspace behavior untouched.
-    # ONLY the known selector value binds here — any other root value falls
-    # through to the handler's TYPED unsupported_root refusal instead of an
-    # untyped ValueError from binding construction (gate fix 9).
+    # ONLY a COMPLETE known selector binds here — any other root value or an
+    # incomplete selector falls through to the handler's TYPED unsupported_root /
+    # payload_selector_incomplete refusal instead of an untyped ValueError from
+    # binding construction (gate fix 9, #1304).
     if (name == "delegate_start"
             and str(args.get("root") or "").strip() == "skill_payload"
+            and str(args.get("bucket") or "").strip() and str(args.get("skill_name") or "").strip()
             and not str(args.get("retry_of") or "").strip()):
         return "write"
     return None
@@ -344,6 +473,10 @@ def _normalize_tool_call_args(entry: "ToolEntry", args: dict[str, Any]) -> None:
             args[canonical] = args.pop(alias)
     if tool_name in _IGNORE_ROOT_ARG_TOOLS and "root" in args and "root" not in accepted:
         args.pop("root", None)
+    if tool_name == "delegate_start" and str(args.get("root") or "").strip() == "active_workspace":
+        # #1304: the schema's documented default IS omission (the #882 rule), removed
+        # before the configured-session selector check and the payload binder read it.
+        args.pop("root")
 
 
 def _prepare_public_builtin_args(entry: "ToolEntry", args: dict[str, Any]) -> str:
@@ -416,22 +549,49 @@ def _build_builtin_target_binding(ctx: Any, name: str, args: dict[str, Any]) -> 
             skill_name=str(args.get("skill_name") or ""),
         )
     root = str(args.get("root") or "active_workspace")
-    if name in {"edit_batch", "apply_patch"} and root not in {"active_workspace", "system_repo"}:
-        # The repo-only handler owns this typed argument refusal. Resolving an
-        # unsupported payload first would ask for selectors it cannot accept.
-        return None
     bucket = str(args.get("bucket") or "")
     skill_name = str(args.get("skill_name") or "")
 
-    def _one(path: str) -> Any:
+    def _one(path: str, selected_operation: str = operation) -> Any:
         return _registry().build_resolved_resource_binding(
             ctx,
             root=root,
-            operation=operation,
+            operation=selected_operation,
             path=path or ".",
             bucket=bucket,
             skill_name=skill_name,
         )
+
+    # Repository selection is a dispatch fact, shared by the handler and every
+    # guard. A path filter is resolved inside that selected repository; it must
+    # never choose the repository by itself.
+    if name == "vcs_read":
+        repository = str(args.get("repository") or ".")
+        selected = _one(repository)
+        repo = selected.target_path
+        if not repo.is_dir() or (args.get("repository") and not (repo / ".git").exists()):
+            raise ValueError("repository must name a Git worktree root inside the selected root")
+        path = str(args.get("path") or "")
+        if path:
+            from ouroboros.tools.vcs_read import repository_entry
+
+            normalized_path = repository_entry(
+                ctx, root, repo, path, worktree_spelling=str(args.get("action") or "") in {"status", "diff"})
+            parts = pathlib.PurePosixPath(normalized_path).parts
+            if (pathlib.PurePosixPath(normalized_path).is_absolute() or ".." in parts
+                    or normalized_path.startswith(":") or not normalized_path.strip()):
+                raise ValueError("path must be a literal repository-relative path")
+            # The target is the entry Git reads: matchers that resolve still see a symlink's
+            # current referent, ancestry checks see the entry; confinement uses the referent.
+            target = pathlib.Path(os.path.normpath(repo / normalized_path))
+            if not target.resolve(strict=False).is_relative_to(repo):
+                raise ValueError("path escapes the selected repository")
+        else:
+            target = repo
+        # Preserve the original resource root for Presence grants and relative
+        # protected-artifact policy paths. Git executes only in the selected
+        # worktree, carried separately from those policy coordinates.
+        return replace(selected, target_path=target, repository_path=repo)
 
     if name == "write_file" and args.get("files"):
         return tuple(
@@ -440,9 +600,10 @@ def _build_builtin_target_binding(ctx: Any, name: str, args: dict[str, Any]) -> 
             if isinstance(item, dict)
         )
     if name == "apply_patch":
-        from ouroboros.tools.edit_ops import patch_target_paths
+        from ouroboros.tools.edit_ops import _parse_patch
 
-        return tuple(_one(path) for path in patch_target_paths(str(args.get("patch") or "")))
+        ops, error = _parse_patch(str(args.get("patch") or ""))
+        return tuple(_one(op.path, "edit" if op.kind == "update" else "write") for op in ops) if not error else ()
     if name == "edit_batch":
         return tuple(
             _one(str(item.get("path") or ""))
@@ -460,7 +621,38 @@ def _binding_items(binding: Any) -> tuple[Any, ...]:
 
 def _binding_set_targets_system_repo(ctx: Any, binding: Any) -> bool:
     items = _binding_items(binding)
-    return bool(items) and all(_registry().binding_targets_system_repo(ctx, item) for item in items)
+    return bool(items) and any(_registry().binding_targets_system_repo(ctx, item) for item in items)
+
+
+def serving_body_refusal(ctx: Any, binding: Any, *, intrinsic: bool) -> str:
+    """A managed deployment's refusal of a repository mutation that lands in the serving checkout itself
+    (``deployment_policy.body_replacement_refusal``): an edit there or a moved HEAD reaches the program at its next
+    restart. A bound body candidate, an isolated child's worktree and every other workspace answer "", as does an
+    unmanaged install. ``intrinsic`` tools act on the context's own body root (the candidate, when one is bound)."""
+    from ouroboros.body_candidate import serving_repo_dir_for
+    from ouroboros.deployment_policy import body_replacement_refusal
+    from ouroboros.tool_access import path_is_relative_to
+
+    refusal = body_replacement_refusal()
+    if not refusal:
+        return ""
+    serving = serving_repo_dir_for(ctx).resolve(strict=False)
+    items = () if intrinsic else _binding_items(binding)
+    targets = [item.repository_path or item.target_path for item in items] or [system_repo_dir_for(ctx)]
+    return refusal if any(path_is_relative_to(pathlib.Path(target).resolve(strict=False), serving)
+                          for target in targets) else ""
+
+
+def required_extension_refusal(binding: Any) -> str:
+    """A managed deployment's refusal of a file edit landing in a package it requires, or starting a second package
+    of that name under the data skills folder (``deployment_extensions.payload_write_refusal``); "" otherwise, and
+    always unmanaged. A shell or process outside these editors is the deployment's operating-system boundary."""
+    from ouroboros.deployment_extensions import payload_write_refusal
+
+    for item in _binding_items(binding):
+        if refusal := payload_write_refusal(item.target_path, data_root=item.state_drive_root):
+            return refusal
+    return ""
 
 
 def _user_files_binding_reaches_repo(ctx: Any, binding: Any) -> bool:
@@ -476,10 +668,10 @@ def _user_files_binding_reaches_repo(ctx: Any, binding: Any) -> bool:
     """
     from ouroboros.tool_access import path_is_relative_to
 
-    repo = system_repo_dir_for(ctx)
+    repos = {system_repo_dir_for(ctx), pathlib.Path(getattr(ctx, "serving_repo_dir", None) or system_repo_dir_for(ctx))}
     return any(
         item.root == "user_files" and item.target_path is not None
-        and path_is_relative_to(pathlib.Path(item.target_path), repo)
+        and any(path_is_relative_to(pathlib.Path(item.target_path), repo) for repo in repos)
         for item in _binding_items(binding)
     )
 
@@ -487,7 +679,7 @@ def _user_files_binding_reaches_repo(ctx: Any, binding: Any) -> bool:
 def _binding_set_is_light_restricted(ctx: Any, binding: Any) -> bool:
     """Whether light mode must treat this file/VCS target as internal state."""
     items = _binding_items(binding)
-    return bool(items) and all(
+    return bool(items) and any(
         _registry().binding_targets_system_repo(ctx, item)
         or (item.root == "runtime_data" and item.source == "runtime_data")
         for item in items
@@ -532,6 +724,25 @@ def _light_binding_failure_result(
     return redirect
 
 
+def delegate_payload_binding_refusal(ctx: Any, exc: Exception) -> ToolResult:
+    """A complete skill-payload selector the binder could not resolve (#1304): a typed,
+    definite no-run that names the selector and its repair, plus the one durable
+    START_BLOCKED attempt row a pre-custody refusal owes (D5)."""
+    from ouroboros.delegate_evidence import record_start_blocked
+    from ouroboros.delegate_shared import _fail
+
+    record_start_blocked(ctx, str(getattr(ctx, "task_id", "") or ""), "payload_selector_unresolved")
+    return _fail("delegate_start", "payload_selector_unresolved",
+                 f"root='skill_payload' with this bucket/skill_name selects no payload you can write: {exc}. "
+                 "Name an installed skill exactly, or omit root (root='active_workspace') for ordinary "
+                 "workspace delegation.", definitely_unrun=True)
+
+
+_VCS_READ_ROOTS = (" vcs_read itself takes root='active_workspace' or 'system_repo' only. A delegated run's private copy "
+                   "is read with read_file/list_files by its path; after the run, its saved result through the run "
+                   "result's patch_read/manifest_read, or vcs_read(action='diff', base=<baseline_id>, head=<result_commit>).")
+
+
 def _binding_error_text(name: str, root: str, exc: Exception) -> str | ToolResult:
     detail = str(exc)
     if detail.startswith("SKILL_REDIRECT_BLOCKED:"):
@@ -546,7 +757,7 @@ def _binding_error_text(name: str, root: str, exc: Exception) -> str | ToolResul
         "read_file", "list_files", "search_code",
     }:
         return f"⚠️ USER_FILES_PATH_BLOCKED: {detail}"
-    if root == "skill_payload" and name in {"write_file", "edit_text"}:
+    if root == "skill_payload" and name in {"write_file", "edit_text", "edit_batch", "apply_patch"}:
         return f"⚠️ SKILL_PAYLOAD_ARG_ERROR: {detail}"
     prefixes = {
         "read_file": "READ_FILE_ERROR",
@@ -555,8 +766,9 @@ def _binding_error_text(name: str, root: str, exc: Exception) -> str | ToolResul
         "query_code": "TOOL_ARG_ERROR (query_code)",
         "write_file": "WRITE_FILE_ERROR",
         "edit_text": "EDIT_TEXT_ERROR",
-        "vcs_status": "GIT_ERROR",
-        "vcs_diff": "GIT_ERROR",
+        "edit_batch": "EDIT_BATCH_ERROR",
+        "apply_patch": "APPLY_PATCH_ERROR",
+        "vcs_read": "GIT_ERROR",
         "vcs_pull_ff": "PULL_ERROR",
         "vcs_restore": "RESTORE_ERROR",
         "vcs_revert": "REVERT_ERROR",
@@ -571,8 +783,14 @@ def _binding_error_text(name: str, root: str, exc: Exception) -> str | ToolResul
     text = f"⚠️ {prefixes.get(name, 'TOOL_ERROR')}: {type(exc).__name__}: {detail}"
     if name == "query_code":
         return ToolResult(status="error", code="TOOL_ARG_ERROR", text=text)
-    if name in {"vcs_status", "vcs_diff"}:
-        return ToolResult(status="ok", code="GIT_ERROR", text=text)
+    if name == "vcs_read":  # the profile's vcs roots above are wider than this reader's own two
+        if isinstance(exc, ValueError):
+            # A root, repository or path the call named wrongly is the call's own argument fault, typed
+            # like query_code's (status error, so tools.jsonl and the task feed count it); a failure of
+            # the binding machinery itself (OSError, RuntimeError) stays the Git terminal below.
+            return ToolResult(status="error", code="TOOL_ARG_ERROR",
+                              text=f"⚠️ TOOL_ARG_ERROR (vcs_read): {detail}{_VCS_READ_ROOTS}")
+        return ToolResult(status="ok", code="GIT_ERROR", text=text + _VCS_READ_ROOTS)
     if name not in prefixes:
         return ToolResult(status="error", code="TOOL_ERROR", text=text)
     return text
@@ -639,6 +857,9 @@ def _resolve_python_predispatch(
                 "⚠️ PYTHON_INTERPRETER_UNAVAILABLE: Ouroboros could not prove "
                 "the target interpreter for this launch surface "
                 f"({python_resolution.error_reason}). The process was not started."
+                + (" The skill's Python packages need their own environment: toggle_skill enabled=true re-points "
+                   "or reinstalls it; an explicitly named interpreter runs as written."
+                   if python_resolution.error_reason == "skill_env_python_unavailable" else "")
             ),
             meta={"reason": python_resolution.error_reason},
         )

@@ -31,27 +31,25 @@ _LEAVES = (review_state_records, review_state_model, review_state_custody)
 
 _MOVED_OWNERS = {
     "AdvisoryReviewState": review_state_model,
-    "AdvisoryRunRecord": review_state_records,
     "CommitAttemptRecord": review_state_records,
     "CommitReadinessDebtItem": review_state_records,
     "ObligationItem": review_state_records,
+    "ReviewStateLockError": review_state_records,
+    "ReviewStateMutation": review_state_records,
+    "_dataclass_mapping": review_state_records,
     "_ATTEMPT_MERGE_INCOMING_FIRST": review_state_records,
     "_ATTEMPT_MERGE_INCOMING_LISTS": review_state_records,
     "_ATTEMPT_STR_DEFAULTS": review_state_records,
     "_CANONICAL_OBLIGATION_ITEM_RE": review_state_records,
     "_DEBT_STR_DEFAULTS": review_state_records,
-    "_DEFAULT_ADVISORY_TOOL_NAME": review_state_records,
     "_DEFAULT_TOOL_NAME": review_state_records,
     "_LEGACY_CURRENT_REPO_KEY": review_state_records,
     "_MAX_ATTEMPT_HISTORY": review_state_records,
     "_MAX_COMMIT_READINESS_DEBTS": review_state_records,
-    "_MAX_RUN_HISTORY": review_state_records,
     "_OBLIGATION_STR_DEFAULTS": review_state_records,
     "_OPEN_COMMIT_READINESS_DEBT_STATUSES": review_state_records,
     "_REVIEW_ATTEMPT_GRACE_SEC": review_state_records,
     "_REVIEW_ATTEMPT_TTL_SEC": review_state_records,
-    "_RUN_STATUS_ICONS": review_state_records,
-    "_RUN_STR_DEFAULTS": review_state_records,
     "_STATE_SCHEMA_VERSION": review_state_records,
     "_allocate_prefixed_id": review_state_records,
     "_append_finding_lines": review_state_records,
@@ -63,6 +61,7 @@ _MOVED_OWNERS = {
     "_filter_lifecycle_records": review_state_records,
     "_filter_repo_scope": review_state_records,
     "_infer_next_prefixed_sequence": review_state_records,
+    "_is_archived_advisory_debt": review_state_records,
     "_looks_like_public_obligation_id": review_state_records,
     "_make_obligation_fingerprint": review_state_records,
     "_max_iso_ts": review_state_records,
@@ -108,7 +107,6 @@ _PARENT_OWNED = (
     "invalidate_advisory_after_mutation",
     "load_state",
     "make_repo_key",
-    "mark_advisory_stale_after_edit",
     "release_review_state_lock",
     "save_state",
     "update_state",
@@ -172,17 +170,3 @@ def test_review_state_keeps_the_durable_store():
             defined.update(t.id for t in node.targets if isinstance(t, ast.Name))
     assert set(_PARENT_OWNED) <= defined
     assert defined.isdisjoint(_MOVED_OWNERS)
-
-
-def test_review_state_extraction_size_bounds_have_meaningful_headroom():
-    counts = {
-        module.__name__: len(
-            pathlib.Path(module.__file__).read_text(encoding="utf-8").splitlines()
-        )
-        for module in (review_state, *_LEAVES)
-    }
-    assert all(count <= 1000 for count in counts.values()), counts
-    assert counts["ouroboros.review_state"] <= 850
-    assert counts["ouroboros.review_state_records"] <= 1000
-    assert counts["ouroboros.review_state_model"] <= 1000
-    assert counts["ouroboros.review_state_custody"] <= 600

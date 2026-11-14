@@ -1,9 +1,18 @@
-"""Custody helpers for exact source coverage of oversized work orders."""
+"""Custody helpers for exact source coverage of oversized work orders.
+
+Snapshot adoption copies unresolved source bindings and their verified ranges
+into ``work_order_source_request.inherited_sources`` beside the new request.
+These are flat, independent copies: no predecessor history read is needed to
+verify or answer a successor's sources. Each source keeps its original brief
+fingerprint; the successor's own fingerprint still identifies its new request.
+"""
 
 from __future__ import annotations
 
+import copy
 import re
-from typing import Any, Dict, List, Mapping, Tuple
+from types import SimpleNamespace
+from typing import Any, Dict, List, Mapping, Tuple, Optional
 
 
 def _strict_int(value: Any) -> int | None:
@@ -21,7 +30,7 @@ def _merge_verified_source_range(entry: Any, start: Any, end: Any) -> None:
         total = _strict_int(request.get("complete_chars"))
         if total is None or right > total:
             return
-    ranges = list(getattr(entry, "verified_source_ranges", []) or [])
+    ranges = [tuple(pair) for pair in (getattr(entry, "verified_source_ranges", []) or [])]
     ranges.append((left, right))
     ranges.sort()
     merged: List[Tuple[int, int]] = []
@@ -33,10 +42,60 @@ def _merge_verified_source_range(entry: Any, start: Any, end: Any) -> None:
     entry.verified_source_ranges = merged
 
 
-def work_order_source_verification(custody: Any) -> Dict[str, Any]:
-    """Return the durable, typed completeness fact for an oversized brief."""
+def _source_entries(entry: Any) -> List[Any]:
+    request = getattr(entry, "work_order_source_request", {}) or {}
+    return [entry, *(SimpleNamespace(**binding) for binding in request.get("inherited_sources", []))]
 
-    request = getattr(custody, "work_order_source_request", {}) or {}
+
+def inherit_source_obligations(previous: Any, binding: Dict[str, Any]) -> None:
+    """Copy unresolved custody at snapshot adoption; add to the new brief, never replace it."""
+    inherited = []
+    for entry in _source_entries(previous):
+        if _source_verification(entry)["can_authorize"]:
+            continue
+        request = dict(entry.work_order_source_request)
+        request.pop("inherited_sources", None)
+        inherited.append({
+            "work_order_source_request": request,
+            "work_order_fingerprint": entry.work_order_fingerprint,
+            "work_order_coverage": entry.work_order_coverage,
+            "verified_source_ranges": entry.verified_source_ranges,
+        })
+    if inherited:
+        request = binding["work_order_source_request"]
+        binding["work_order_source_request"] = copy.deepcopy({
+            **request, "inherited_sources": [*request.get("inherited_sources", []), *inherited]})
+
+
+def source_request_for_response(entry: Any, response: Any) -> Dict[str, Any]:
+    """Select the bound source by its digest AND selector before exact byte validation."""
+    if isinstance(response, Mapping):
+        for source in _source_entries(entry):
+            request = source.work_order_source_request
+            if (request.get("complete_sha256") == response.get("complete_sha256")
+                    and request.get("source") == response.get("source")):
+                return request
+    return entry.work_order_source_request  # The ordinary validator names the mismatch.
+
+
+def work_order_source_verification(custody: Any) -> Dict[str, Any]:
+    """The existing completeness gate covers every source carried by this patch."""
+    sources = [_source_verification(entry) for entry in _source_entries(custody)]
+    required = [source for source in sources if source["status"] != "not_required"]
+    if not required:
+        return sources[0]
+    incomplete = next((source for source in required if not source["can_authorize"]), None)
+    result = dict(incomplete or required[0])
+    if len(required) > 1:
+        result["sources"] = required
+    return result
+
+
+def _source_verification(custody: Any) -> Dict[str, Any]:
+    """Return the durable, typed completeness fact for ONE oversized brief."""
+
+    request = dict(getattr(custody, "work_order_source_request", {}) or {})
+    request.pop("inherited_sources", None)
     if str(getattr(custody, "work_order_coverage", "") or "") != "partial" and not request:
         return {"status": "not_required", "can_authorize": True}
     total = _strict_int(request.get("complete_chars")) if isinstance(request, Mapping) else None
@@ -109,8 +168,25 @@ def record_source_range_verified(
     }
     landed = custody_module.emit(drive_root, custody_module.SOURCE_RANGE_VERIFIED, payload)
     if landed:
-        _merge_verified_source_range(custody, left, right)
+        apply_source_range_receipt(custody, payload)
     return landed
+
+
+def apply_source_range_receipt(entry: Any, row: Mapping[str, Any]) -> None:
+    """Merge a receipt only into the matching source, in live custody and replay."""
+    facts = {key: row.get(key) for key in (
+        "start_char", "end_char", "complete_sha256", "source", "text_sha256", "text_chars")}
+    if _source_range_matches(entry, **facts):
+        _merge_verified_source_range(entry, facts["start_char"], facts["end_char"])
+    request = entry.work_order_source_request
+    inherited = []
+    for binding in request.get("inherited_sources", []):
+        source = SimpleNamespace(**binding)
+        if _source_range_matches(source, **facts):
+            _merge_verified_source_range(source, facts["start_char"], facts["end_char"])
+        inherited.append({**binding, "verified_source_ranges": source.verified_source_ranges})
+    if inherited:
+        entry.work_order_source_request = {**request, "inherited_sources": inherited}
 
 
 def _source_delivery_record(interaction_id: str, source: Mapping[str, Any]) -> Dict[str, Any]:
@@ -181,6 +257,12 @@ def apply_source_delivery_confirmation(entry: Any, row: Mapping[str, Any]) -> No
 
 
 def _source_range_receipt_valid(
+    custody: Any, **facts: Any,
+) -> bool:
+    return any(_source_range_matches(entry, **facts) for entry in _source_entries(custody))
+
+
+def _source_range_matches(
     custody: Any, *, start_char: Any, end_char: Any, complete_sha256: Any,
     source: Any, text_sha256: Any, text_chars: Any,
 ) -> bool:
@@ -211,10 +293,30 @@ def record_started_custody(
     selected_subagent_id: str,
     config_fingerprint: str, work_order_fingerprint: str, work_order_coverage: str,
     work_order_source_request: Dict[str, Any], authority_fingerprint: str,
-    snapshot_id: str, target_root: str, baseline_sha: str, authority_source: str,
+    snapshot_id: str, execution_binding_fingerprint: str, target_root: str,
+    baseline_sha: str, authority_source: str,
     resource_ref: Dict[str, Any], capture_mode: str, processing: Mapping[str, Any] | None = None,
-) -> bool:
-    """Write the one STARTED custody row, including the source binding."""
+    prompt_cache_ttl: Mapping[str, Any] | None = None,
+    continuation_of: str = "", capture_id: str = "", snapshot_task_id: str = "", max_seconds_basis: str = "",
+    row_effort: Optional[str] = None, plan_facts: Optional[dict] = None, daemon_store_id: str = "", engine_ref: Optional[dict] = None,
+) -> Tuple[str, bool]:
+    """Write the one STARTED custody row, including the source binding: ``(run id custody holds, durable)``.
+
+    The row converges with any other writer of the same invocation (``delegate_accepted.bind_started``):
+    when a recovery read already bound its accepted work, under the job id or the run id, that run keeps
+    this start's facts and its name is the one returned, so one custody and cost row remains. Without
+    the decision lock nothing is published: the run stays this process's ``started_uncustodied`` handle.
+
+    ``continuation_of`` names the prior run this start explicitly continues
+    (``delegate_continuation``); ``capture_id``/``snapshot_task_id`` bind a run
+    that continues IN that run's snapshot. They ride the STARTED row so the
+    lineage and the hand-over replay with every other start fact. ``max_seconds_basis``
+    records HOW ``seconds`` was decided (``delegate_registration_policy.CAP_BASIS_*``)
+    beside the cap itself, so a later expiry can be told apart from the nanny's
+    own deadline or lifetime. ``daemon_store_id`` is the store the start's own receipt named
+    (``delegate_custody.admitted_store_id``); "" leaves the run unbound.
+    ``engine_ref`` independently keeps the managed endpoint chosen before POST.
+    """
 
     from ouroboros import delegate_custody as custody_module
 
@@ -228,6 +330,7 @@ def record_started_custody(
         profile_id=route.profile_id,
         effort=route.effort,
         processing_preference=(processing or {}).get("requested"),
+        prompt_cache_ttl=dict(prompt_cache_ttl) if isinstance(prompt_cache_ttl, Mapping) and prompt_cache_ttl else None,
         project_id=project_id,
         project_owned=project_owned,
         project_persistent=project_persistent,
@@ -236,6 +339,7 @@ def record_started_custody(
         ledger_root=str(drive),
         idempotency_key=key,
         invocation_id=invocation_id,
+        daemon_store_id=str(daemon_store_id or ""),
         selected_subagent_id=selected_subagent_id,
         config_fingerprint=config_fingerprint,
         work_order_fingerprint=work_order_fingerprint,
@@ -243,8 +347,9 @@ def record_started_custody(
         work_order_source_request=work_order_source_request,
         authority_fingerprint=authority_fingerprint,
         snapshot_id=snapshot_id,
-        execution_root=(root if snapshot_id or (resource_ref.get("workspace_kind") == "directory"
-                                               and resource_ref.get("strategy") == "direct") else ""),
+        execution_root=(root if snapshot_id or (resource_ref.get("workspace_kind") in ("directory", "git")
+                                               and resource_ref.get("strategy") in ("direct", "in_place")) else ""),
+        execution_binding_fingerprint=execution_binding_fingerprint,
         baseline_sha=baseline_sha,
         target_root=target_root,
         authority_source=authority_source,
@@ -253,21 +358,35 @@ def record_started_custody(
         mode=authority.mode,
         isolation=authority.isolation,
         delegated=authority.delegated,
+        **(plan_facts or {}),
+        continuation_of=str(continuation_of or ""),
+        capture_id=str(capture_id or ""),
+        snapshot_task_id=str(snapshot_task_id or ""),
+        engine_ref=dict(engine_ref or {}),
     )
-    return custody_module.record_started(
+    entry, recorded = custody_module.bind_started(
         drive,
         entry,
         shape={
             "effort": route.effort, "access": access, "mode": authority.mode,
+            **({"row_effort": str(row_effort)} if row_effort is not None else {}),
             "isolation": authority.isolation, "delegated": authority.delegated,
-            "root": root, "max_seconds": seconds, "capture_mode": capture_mode,
+            "root": root, "max_seconds": seconds, "max_seconds_basis": str(max_seconds_basis or ""),
+            "capture_mode": capture_mode,
         },
-    )
+    )[:2]
+    if recorded and entry.promotion:
+        from ouroboros.delegate_plan import promotion_notice
+
+        promotion_notice(ctx, entry)
+    return entry.run_id, recorded
 
 
 __all__ = [
     "_merge_verified_source_range",
     "add_terminal_source_verification",
+    "apply_source_range_receipt",
+    "inherit_source_obligations",
     "prepare_work_order_start_binding",
     "record_started_custody",
     "record_source_range_verified",
@@ -276,6 +395,7 @@ __all__ = [
     "merge_source_delivery_confirmations",
     "apply_source_delivery_confirmation",
     "source_apply_refusal",
+    "source_request_for_response",
     "work_order_source_verification",
 ]
 

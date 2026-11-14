@@ -62,24 +62,37 @@ def normalize_check_argv(check: Any) -> List[str] | None:
     argv (``'["go","test"]'`` → ``["go","test"]``) via ``recover_stringified_argv``; a genuine
     command string runs as a NON-login ``sh -c`` one-liner — non-login so it inherits the
     bootstrapped PATH instead of a profile-reset PATH, matching run_command's toolchain
-    resolution. A list/tuple becomes a trimmed argv. Empty / other type → ``None``."""
+    resolution. A list/tuple keeps every argument, including an empty one (``pytest -m ""``),
+    and only drops ``None``; a blank ``argv[0]`` is refused instead of shifting the
+    arguments. Empty / other type → ``None``."""
     if isinstance(check, str):
         text = check.strip()
         if not text:
             return None
         recovered = recover_stringified_argv(text)
-        return recovered if recovered is not None else ["sh", "-c", text]
+        if recovered is not None:
+            if not recovered or not str(recovered[0] or "").strip():
+                return None
+            return recovered
+        return ["sh", "-c", text]
     if isinstance(check, (list, tuple)):
-        argv = [str(part) for part in check if str(part or "").strip()]
-        return argv or None
+        if not check or not str(check[0] or "").strip():
+            return None
+        return [str(part) for part in check if part is not None]
     return None
 
 
 def shell_argv(raw_cmd: Any) -> List[str]:
-    if isinstance(raw_cmd, list):
-        return [str(x) for x in raw_cmd if str(x).strip()]
+    """The argv a guard inspects: a list/tuple keeps every element and a command string
+    keeps every token ``shlex`` yields, including an empty quoted one (``''``). An empty
+    argument still occupies a position the program sees (``git -C ''`` keeps the cwd and
+    ``sh -c '' x`` runs an empty body), so dropping it would show the guard a different
+    command than the one that executes. Only an unparseable string falls back to plain
+    whitespace words, which never contain an empty one."""
+    if isinstance(raw_cmd, (list, tuple)):
+        return [str(x) for x in raw_cmd]
     try:
-        return [str(x) for x in shlex.split(str(raw_cmd or "")) if str(x).strip()]
+        return shlex.split(str(raw_cmd or ""))
     except ValueError:
         return [str(x) for x in str(raw_cmd or "").split() if str(x).strip()]
 
@@ -341,11 +354,11 @@ def shell_tokens_typed(raw_cmd: Any) -> List[tuple[str, bool]] | None:
     try:
         lexer = shlex.shlex(text, posix=True, punctuation_chars=_PUNCTUATION_CHARS)
         lexer.whitespace_split = True
-        raw = [t for t in lexer if t]
+        raw = list(lexer)
     except ValueError:
         return None
     return [
-        (_unmark(t), _LITERAL_MARK not in t and all(ch in _PUNCTUATION_CHARS for ch in t))
+        (_unmark(t), bool(t) and _LITERAL_MARK not in t and all(ch in _PUNCTUATION_CHARS for ch in t))
         for t in raw
     ]
 
@@ -715,6 +728,36 @@ def shell_command_string(argv: List[str]) -> str:
         if arg == "-c" or (arg.startswith("-") and not arg.startswith("--") and "c" in arg[1:]):
             return argv[idx + 1] if idx + 1 < len(argv) else ""
     return ""
+
+
+# An explicit Windows interpreter takes everything after its inline switch as its own
+# command text (cmd /c|/k, PowerShell -c|-Command). After PowerShell's -File script or
+# -CommandWithArgs command, the remaining argv are passed on as that one's arguments.
+_CMD_INLINE_SWITCHES = frozenset({"/c", "/k"})
+_POWERSHELL_INLINE_SWITCHES = frozenset({"-c", "-command", "/c"})
+_POWERSHELL_ARGUMENT_SWITCHES = frozenset({"-file", "-f", "-commandwithargs", "-cwa"})
+
+
+def inline_operand_start(argv: List[str], shell_name: str, *, strict: bool = False) -> int:
+    """Index where an explicit ``cmd``/``powershell``/``pwsh`` inline command operand begins
+    (``len(argv)`` after a trailing switch), 0 when there is none. ``strict`` stops at a
+    PowerShell switch that passes the remaining argv to a script as arguments."""
+    switches = _CMD_INLINE_SWITCHES if shell_name == "cmd" else _POWERSHELL_INLINE_SWITCHES
+    for idx, arg in enumerate(argv[1:], start=1):
+        word = str(arg or "").strip().lower()
+        if word in switches:
+            return idx + 1
+        if strict and shell_name != "cmd" and word in _POWERSHELL_ARGUMENT_SWITCHES:
+            return 0
+    return 0
+
+
+def inline_shell_command(argv: List[str], shell_name: str) -> str:
+    """The inline command text an explicit shell receives, joined; "" when there is none."""
+    if shell_name in {"bash", "sh", "zsh"}:
+        return shell_command_string(argv)
+    start = inline_operand_start(argv, shell_name)
+    return " ".join(str(part) for part in argv[start:]) if start else ""
 
 
 def shell_argv_with_inline(raw_cmd: Any) -> List[str]:

@@ -51,6 +51,14 @@ separately:
 The launcher fails loudly when any of these are absent; `--dry-run` works
 without them.
 
+The launcher renders and exports Required result review. Its fidelity report
+separates that request from the external adapter's executing configuration and
+pre-review output producer, which this tree cannot attest. Checked-in patch
+recipes are historical examples, not deployment evidence. Qualification of the
+launcher with synthetic callable inputs establishes neither a live external
+adapter nor score parity; the selected external `src/systems/ouroboros/` source
+and its runtime configuration are needed to establish that chain.
+
 ## v6.56.0 operator patches for the pinned adapter
 
 See `operator_patches/README.md` — three host/runtime incompatibilities of the
@@ -129,10 +137,11 @@ audit sidecar of raw per-instance rewards.
 
 The pinned external adapter enforces model slots, effort, worker pool,
 evolution flag, budget, and OpenRouter provider routing through its own
-interface; the launcher feeds those from `settings_base.json`. Three template
+interface; the launcher feeds those from `settings_base.json`. Two template
 knobs are **declared but not forwarded** by the pinned adapter —
-`OUROBOROS_SAFETY_MODE=light` and `OUROBOROS_REVIEW_ENFORCEMENT=blocking`
-(docker path drops both) and
+`OUROBOROS_SAFETY_MODE=light` (the docker path drops it; the retired
+`OUROBOROS_REVIEW_ENFORCEMENT=blocking` left the template on 2026-11-12, and
+rows after that release are a new methodology) and
 `CLBENCH_SOLVE_DISABLED_TOOLS` (incl. `claude_code_edit`) — the launcher
 exports them, records the gap in the manifest, and prints loud warnings. See
 METHODOLOGY.md "Template fidelity" for the two-line adapter patch that closes

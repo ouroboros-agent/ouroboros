@@ -44,7 +44,7 @@ def test_search_code_has_result_limit():
     from ouroboros.tool_capabilities import FOREGROUND_MUTATIVE_TOOLS
     # Publication can create a remote branch/commit/PR. Its outer timeout must
     # not return while that foreground mutator is still running.
-    assert FOREGROUND_MUTATIVE_TOOLS == frozenset({"submit_skill_to_hub"})
+    assert FOREGROUND_MUTATIVE_TOOLS == frozenset({"submit_skill_to_hub", "write_file", "edit_text", "edit_batch", "apply_patch"})
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +188,7 @@ def test_search_code_registered():
 
 
 @pytest.mark.parametrize("profile", ["local_readonly_subagent", "acting_subagent"])
-def test_search_code_ripgrep_path_filters_protected_files(tmp_path, monkeypatch, profile):
+def test_search_code_ripgrep_preserves_read_parity_and_protected_artifacts(tmp_path, monkeypatch, profile):
     """The rg fast path must receive only files that passed Ouroboros gates."""
     import json
     from ouroboros.contracts.task_constraint import TaskConstraint
@@ -201,8 +201,10 @@ def test_search_code_ripgrep_path_filters_protected_files(tmp_path, monkeypatch,
     (repo / "auth").mkdir()
     (repo / "auth" / "secret.py").write_text("needle ordinary auth source\n", encoding="utf-8")
     (data / "auth").mkdir(parents=True)
-    protected = data / "auth" / "secret.py"
-    protected.write_text("needle runtime private bytes\n", encoding="utf-8")
+    runtime_source = data / "auth" / "secret.py"
+    runtime_source.write_text("needle runtime source bytes\n", encoding="utf-8")
+    protected = repo / "oracle.py"
+    protected.write_text("needle protected task artifact\n", encoding="utf-8")
     seen = tmp_path / "seen.json"
     fake_rg_py = tmp_path / "fake_rg.py"
     fake_rg_py.write_text(
@@ -228,12 +230,17 @@ def test_search_code_ripgrep_path_filters_protected_files(tmp_path, monkeypatch,
 
     registry = ToolRegistry(repo_dir=repo, drive_root=data)
     registry._ctx.task_constraint = TaskConstraint(mode=profile, write_root=str(repo), surface="external_workspace")
+    registry._ctx.task_contract = {"resource_policy": {"protected_artifacts": [{
+        "id": "oracle", "role": "black_box_reference", "paths": [str(protected)],
+    }]}}
     result = registry.execute("search_code", {"query": "needle"})
     assert "safe.py" in result
     assert "active_workspace:auth/secret.py" in result
-    assert "runtime private bytes" not in result
+    assert "runtime source bytes" in result
+    assert "protected task artifact" not in result
     candidates = json.loads(seen.read_text(encoding="utf-8"))
     assert str(repo / "auth" / "secret.py") in candidates
+    assert str(runtime_source) in candidates
     assert str(protected) not in candidates
 
 

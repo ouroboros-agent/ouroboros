@@ -4,6 +4,7 @@ import subprocess
 
 import supervisor.git_ops as git_ops
 import supervisor.update_merge as update_merge
+from ouroboros.dialogue_store import THREAD_FORMAT
 
 
 def _git(repo, *args):
@@ -19,6 +20,12 @@ def _init_repo(tmp_path):
     _git(repo, "config", "commit.gpgsign", "false")
     (repo / "a.txt").write_text("base\n")
     (repo / "BIBLE.md").write_text("constitution\n")
+    (repo / "ouroboros").mkdir()
+    # A tree bearing every store a current release carries, its dialogue store naming the thread format it
+    # reads: the ordinary rollback resets at once.
+    for name in ("store.py", "usage_store.py", "dialogue_store.py"):
+        (repo / "ouroboros" / name).write_text("# store\n", encoding="utf-8")
+    (repo / "ouroboros" / "dialogue_store.py").write_text(f"THREAD_FORMAT = {THREAD_FORMAT!r}\n", encoding="utf-8")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "base")
     head = _git(repo, "symbolic-ref", "--short", "HEAD").stdout.strip()
@@ -182,8 +189,8 @@ def test_build_and_apply_clean_merge(tmp_path, monkeypatch):
     ok, msg = update_merge.apply_managed_merge_update(head, plan["merge_commit"])
     assert ok, msg
     assert (repo / "b.txt").exists()
-    restored, note = update_merge.restore_update_stash(stash_sha, context="test")
-    assert restored, note
+    result = update_merge.restore_update_stash(stash_sha, context="test")
+    assert result.status == "restored", result
     assert (repo / "c.txt").read_text() == "local untracked\n"
     # Base was fast-forwardable, so official history lands as-is: HEAD is the
     # target itself, with no synthetic merge commit carrying local work.
@@ -201,7 +208,8 @@ def test_rollback_managed_update(tmp_path, monkeypatch):
     import supervisor.workers as workers
     gate_calls = []
     monkeypatch.setattr(workers, "close_repo_writer_admission", lambda reason: gate_calls.append(("close", reason)))
-    monkeypatch.setattr(workers, "open_repo_writer_admission", lambda expected_reason="": gate_calls.append(("open", expected_reason)))
+    monkeypatch.setattr(workers, "open_repo_writer_admission_after_update_abort",
+                        lambda expected_reason="": gate_calls.append(("open", expected_reason)) or True)
     # simulate a bad update landed on top.
     (repo / "bad.txt").write_text("bad\n")
     _git(repo, "add", "-A")
@@ -245,7 +253,8 @@ def test_finalize_rolls_back_after_unhealthy_boot(tmp_path, monkeypatch):
     import supervisor.workers as workers
     gate_calls = []
     monkeypatch.setattr(workers, "close_repo_writer_admission", lambda reason: gate_calls.append(("close", reason)))
-    monkeypatch.setattr(workers, "open_repo_writer_admission", lambda expected_reason="": gate_calls.append(("open", expected_reason)))
+    monkeypatch.setattr(workers, "open_repo_writer_admission_after_update_abort",
+                        lambda expected_reason="": gate_calls.append(("open", expected_reason)) or True)
     (repo / "bad.txt").write_text("bad\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "bad update")
@@ -274,7 +283,8 @@ def test_native_host_mismatch_rolls_back_even_when_core_booted(tmp_path, monkeyp
                         lambda: {"ok": False, "stdout": "build_required", "returncode": 1})
     import supervisor.workers as workers
     monkeypatch.setattr(workers, "close_repo_writer_admission", lambda reason: True)
-    monkeypatch.setattr(workers, "open_repo_writer_admission", lambda expected_reason="": True)
+    monkeypatch.setattr(workers, "open_repo_writer_admission_after_update_abort",
+                        lambda expected_reason="": True)
     result = update_merge.finalize_managed_update_on_boot(supervisor_ready=True)
     assert result["finalized"] is False and result["rolled_back"] is True
     assert result["smoke"]["stdout"] == "build_required"
@@ -317,7 +327,8 @@ def test_rollback_still_resets_when_the_forensics_ref_cannot_be_written(tmp_path
     pre = _git(repo, "rev-parse", "HEAD").stdout.strip()
     _wire_git_ops(monkeypatch, repo, tmp_path / "data")
     monkeypatch.setattr(workers, "close_repo_writer_admission", lambda reason: True)
-    monkeypatch.setattr(workers, "open_repo_writer_admission", lambda expected_reason="": True)
+    monkeypatch.setattr(workers, "open_repo_writer_admission_after_update_abort",
+                        lambda expected_reason="": True)
     (repo / "bad.txt").write_text("bad\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "bad update")

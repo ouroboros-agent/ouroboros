@@ -1,22 +1,22 @@
-"""The paid `e2e-live` CI job: the live E2E stand (devtools/e2e_live) on a nightly
-cron or an OPTED-IN manual dispatch, sized to a $30 cap, skipped honestly without
-its secret.
+"""The paid `e2e-live` CI job: the live E2E stand (devtools/e2e_live) on an
+OPTED-IN manual dispatch only, sized to a $30 cap, skipped honestly without its
+secret.
 
-Pinned as a contract, not as text: the job fires only on its OWN cron string or a
-dispatch whose `e2e_live` input is true (never a plain dispatch — the pre-tag
-3-OS matrix must not spend money — nor push, pull_request, tag, or the keyless
-lane's cron); the input changes no other job's gate; the nightly checks out and
-seeds the `ouroboros` branch tip (a schedule fires on the default branch, the
-promoted release line) while a dispatch seeds its own sha; it names
+Pinned as a contract, not as text: the job fires only on a dispatch whose
+`e2e_live` input is true (never a plain dispatch — the pre-tag 3-OS matrix must
+not spend money — nor push, pull_request, tag, or any schedule: the workflow
+carries none); the input changes no other job's gate;
+the dispatch checks out and seeds its own sha; it names
 exactly one secret, `OUROBOROS_E2E_LIVE_OPENROUTER_KEY`, gated through a
 non-secret job-level env (GitHub rejects `secrets.*` inside `if:`); a missing
 secret is one step-summary line and a green exit, not a red run and not a
 pretend run; the stand is invoked with the operator's flag set on a clean
 detached seed of the checked-out sha; the run size is FEASIBLE under the cap by
 the stand's own worst-case reservation rule computed from the code (a set that
-can never be admitted would be a nightly red by construction); artifacts are
+can never be admitted would be a red run by construction); artifacts are
 uploaded even on failure and never include a lane settings file (0600, carries
-the key); and the step summary renders EVERY manifest shape — verdicts on
+the key) or a lane data tree — the lane servers' journals travel only as the
+stand's key-redacted traces/ bundle; and the step summary renders EVERY manifest shape — verdicts on
 completion, the typed refusal or error otherwise — and never fails on its own.
 """
 
@@ -40,9 +40,7 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 CI_PATH = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 JOB = "e2e-live"
 SECRET = "OUROBOROS_E2E_LIVE_OPENROUTER_KEY"
-LIVE_CRON = "17 3 * * *"
 DISPATCH_INPUT = "e2e_live"
-NIGHTLY_REF = "ouroboros"
 SKIP_LINE = f"skipped: secret {SECRET} not configured"
 TOTAL_BUDGET_USD = 30.0
 
@@ -63,7 +61,8 @@ def _job_text() -> str:
 
 
 def _stand_step() -> dict:
-    return next(step for step in _job()["steps"] if "run_live_lanes" in str(step.get("run", "")))
+    return next(step for step in _job()["steps"] if "run_live_lanes" in str(step.get("run", ""))
+                and "--stub" not in step["run"])
 
 
 def _stand_args() -> dict[str, str | None]:
@@ -79,35 +78,39 @@ def _stand_args() -> dict[str, str | None]:
     return args
 
 
-def test_the_paid_lane_fires_only_on_its_own_cron_or_an_opted_in_dispatch():
+def test_the_paid_lane_fires_only_on_an_opted_in_dispatch():
     workflow = _workflow()
     triggers = workflow.get("on") or workflow.get(True)
-    crons = [str(entry["cron"]) for entry in triggers["schedule"]]
-    assert LIVE_CRON in crons, crons
+    # The workflow carries no schedule at all, and the gate refuses one anyway
+    # (tests/test_platform_ci_events.py evaluates it per event).
+    assert "schedule" not in triggers, triggers
     # The opt-in: a boolean dispatch input, OFF by default, naming the cost and
     # the secret. A plain `gh workflow run CI --ref <branch>` (the pre-tag 3-OS
     # matrix) therefore never runs the paid lane.
     inputs = triggers["workflow_dispatch"]["inputs"]
-    assert list(inputs) == [DISPATCH_INPUT], inputs
+    # Besides the opt-in, a dispatch carries only the tests-only scope's own inputs
+    # (`scope`, `macos`; tests/test_platform_ci_events.py evaluates them per event).
+    assert set(inputs) == {DISPATCH_INPUT, "scope", "macos"}, inputs
     spec = inputs[DISPATCH_INPUT]
     assert spec["type"] == "boolean" and spec["default"] is False, spec
     assert "$30" in spec["description"] and SECRET in spec["description"], spec
     condition = " ".join(str(_job()["if"]).split())
     assert condition == (
-        f"(github.event_name == 'workflow_dispatch' && github.event.inputs.{DISPATCH_INPUT} == 'true')"
-        f" || (github.event_name == 'schedule' && github.event.schedule == '{LIVE_CRON}')"
+        f"github.event_name == 'workflow_dispatch' && github.event.inputs.{DISPATCH_INPUT} == 'true'"
+        " && inputs.scope != 'tests'"
     )
-    # The input gates THIS job only: no other job reads dispatch inputs, so the
+    # The opt-in gates THIS job only: no other job reads it, so the
     # `github.event_name == 'workflow_dispatch'` gates elsewhere keep firing on
     # every dispatch exactly as before the block gained inputs.
     for name, job in workflow["jobs"].items():
         if name != JOB:
-            assert "inputs" not in str(job.get("if", "")), (name, job.get("if"))
+            assert DISPATCH_INPUT not in str(job.get("if", "")), (name, job.get("if"))
     assert _job()["runs-on"] == "ubuntu-latest"
     # One SM1 lane with --self-mod: the task, the evolution cycle, the absorb
-    # wait and two hermetic preflight suites on a 4-vCPU runner.
+    # wait and two hermetic preflight suites on a 4-vCPU runner; the bound
+    # itself is derived from the stand's waits in the test below.
     assert int(_job()["timeout-minutes"]) >= 120
-    # No job downstream of the release chain may wait for a paid nightly lane.
+    # No job downstream of the release chain may wait for a paid opt-in lane.
     for name, job in workflow["jobs"].items():
         needs = job.get("needs") or []
         assert JOB not in ([needs] if isinstance(needs, str) else needs), name
@@ -125,7 +128,7 @@ def test_the_secret_is_gated_through_a_non_secret_env_and_named_once():
     assert stand["env"] == {SECRET: f"${{{{ secrets.{SECRET} }}}}"}
     assert _stand_args()["--key-env"] == SECRET
     for step in job["steps"]:
-        if "run_live_lanes" not in str(step.get("run", "")):
+        if step != stand:
             assert SECRET not in str(step.get("env", {})), step
 
 
@@ -147,32 +150,106 @@ def test_a_missing_secret_is_one_summary_line_and_a_green_exit():
 def test_the_stand_runs_with_the_operator_flag_set_on_a_clean_seed_of_the_checkout():
     args = _stand_args()
     assert args["--source-repo"] == "$GITHUB_WORKSPACE"
-    # HEAD of the checkout, never $GITHUB_SHA: on a schedule GITHUB_SHA names
-    # the DEFAULT branch (main) while the checkout below is the ouroboros tip.
+    # HEAD of the checkout: the stand seeds exactly the commit the checkout
+    # step below materialized.
     assert args["--seed"] == "HEAD"
     assert args["--out"].startswith("$RUNNER_TEMP/")
     assert args["--self-mod"] is None
     assert float(args["--total-budget"]) == TOTAL_BUDGET_USD
-    assert int(args["--task-timeout"]) == 2400 and float(args["--watch-interval"]) == 60
+    # 75 minutes (owner decision on #1501): at 2400 all four runs hit the deadline
+    # with review still in flight; the model and the money fence stay as they were.
+    assert int(args["--task-timeout"]) == 4500 and float(args["--watch-interval"]) == 60
     assert "--stub" not in args and "--profile" not in args and "--model" not in args
     # The seed's `git describe` and the release admission gate read history and tags.
     checkout = _job()["steps"][0]
     assert checkout["uses"].startswith("actions/checkout@")
-    # Nightly = the development line's tip; dispatch = the dispatched sha.
+    # The dispatched sha, with no event-dependent branch.
     assert checkout["with"] == {
-        "ref": f"${{{{ github.event_name == 'schedule' && '{NIGHTLY_REF}' || github.sha }}}}",
+        "ref": "${{ github.sha }}",
         "fetch-depth": 0, "persist-credentials": False,
     }
     # The gate's node lane and the UI probe need node 22 and Chromium, as in ui-smoke.
     steps = _job()["steps"]
     assert any(step.get("uses", "").startswith("actions/setup-node@") for step in steps)
-    assert any("playwright install --with-deps chromium" in str(step.get("run", "")) for step in steps)
+    assert any("scripts/ci_browser_install.py chromium" in str(step.get("run", "")) for step in steps)
+
+
+# The stand's fixed waits around one awaited SM1 task, each bounded on its own.
+# devtools/e2e_live/scenarios.py: the task POST (60); LaneContext.wait_task's
+# grace past the deadline (300), the cancel POST after a timeout
+# (IsolatedServer.cancel_task, 300: it answers once the task is torn down) and
+# the wait after it (300), the durable-row wait (180); run_sm1's wait for the
+# wave's review-ledger record and its llm_usage event wait (90 each); the palette check's
+# two page loads after the restart (goto and ready selector, 60 + 60 each,
+# devtools/e2e_live/ui_probe.py).
+# devtools/benchmarks/common/server_runner.py: the health wait wait_for_absorb
+# runs once it sees the absorb (180); the server stop at teardown (15 + 5).
+# devtools/e2e_live/run_live_lanes.py: the /api/state read after the absorb
+# (10) and the orphan scan at teardown (30).
+# Sub-minute per-call bounds (a poll's overshoot past its deadline, the
+# computed-style reads, screenshots, the browser launch) ride the provisioning
+# margin below.
+STAND_FIXED_WAITS_SEC = (60 + 300 + 300 + 300 + 180 + 90 + 90 + 2 * (60 + 60)
+                         + 180 + (15 + 5) + 10 + 30)
+# Checkout with history, the Python env, node 22, Chromium with its apt deps,
+# and the summary and upload steps after the stand.
+PROVISION_MARGIN_SEC = 15 * 60
+
+
+def test_the_job_bound_outlasts_the_stand_worst_case(monkeypatch):
+    """The stand, not GitHub, must end the run: a job killed mid-wait loses the
+    finalized manifest, the step summary's verdict and the traces bundle. The
+    worst case is server ready + the task (+ fixed waits) + the direct adoption's
+    wait (bounded by --ready-timeout) + the absorb wait (``confirm_absorb``
+    reuses --task-timeout) + the post-restart health wait,
+    read from the stand's own parser over the job's exact argv, so raising
+    --task-timeout without the job bound trips here, and the bound passes only
+    with room for provisioning."""
+    from devtools.e2e_live import run_live_lanes
+
+    monkeypatch.setattr(run_live_lanes.tempfile, "gettempdir", lambda: "/tmp")
+    argv = shlex.split(_stand_step()["run"].replace("\\\n", " "))[3:]
+    parsed = run_live_lanes.parse_args(argv)
+    worst = 2 * (parsed.task_timeout + parsed.ready_timeout) + parsed.ready_timeout + STAND_FIXED_WAITS_SEC
+    bound = int(_job()["timeout-minutes"]) * 60
+    rehearsal = next(step for step in _job()["steps"] if step.get("id") == "rehearsal")
+    stub = run_live_lanes.parse_args(shlex.split(rehearsal["run"].replace("\\\n", " "))[3:])
+    stub_worst = stub.task_timeout + 2 * stub.ready_timeout + STAND_FIXED_WAITS_SEC
+    rehearsal_bound = int(rehearsal["timeout-minutes"]) * 60
+    assert rehearsal_bound >= stub_worst, (rehearsal_bound, stub_worst)
+    assert bound >= worst + PROVISION_MARGIN_SEC + rehearsal_bound, (bound, worst, rehearsal_bound)
+
+
+def test_keyless_rehearsal_precedes_and_gates_the_only_paid_attempt():
+    steps = _job()["steps"]
+    rehearsal = next(step for step in steps if step.get("id") == "rehearsal")
+    paid = _stand_step()
+    assert steps.index(rehearsal) < steps.index(paid)
+    assert "--stub" in rehearsal["run"] and "--self-mod" not in rehearsal["run"]
+    assert '--seed HEAD' in rehearsal['run'] and '--scenarios SM1' in rehearsal['run']
+    assert '"$RUNNER_TEMP/e2e_stub"' in rehearsal['run']
+    assert "--key-env" not in rehearsal["run"] and not rehearsal.get("env")
+    stub_argv = shlex.split(rehearsal["run"].replace("\\\n", " "))
+    assert stub_argv[stub_argv.index("--task-timeout") + 1] == _stand_args()["--task-timeout"]
+    assert not rehearsal.get("continue-on-error")
+    assert paid["if"] == "success() && env.HAS_E2E_LIVE_KEY == 'true' && steps.rehearsal.outcome == 'success'"
+    # Evaluate the actual step expression, including failure/skip/cancel and an absent key.
+    from types import SimpleNamespace
+    expression = paid["if"].replace("&&", " and ")
+    for outcome in ("success", "failure", "skipped", "cancelled"):
+        for key, prior_success in (("true", True), ("false", True), ("true", False)):
+            admitted = eval(expression, {"__builtins__": {}}, {
+                "success": lambda: prior_success,
+                "env": SimpleNamespace(HAS_E2E_LIVE_KEY=key),
+                "steps": SimpleNamespace(rehearsal=SimpleNamespace(outcome=outcome)),
+            })
+            assert admitted is (key == "true" and prior_success and outcome == "success")
 
 
 def test_the_run_size_is_feasible_under_the_cap_by_the_worst_case_reservation_rule():
     """Every requested attempt must be admissible when each earlier attempt spent
     its whole reservation — the stand records an inadmissible one as `not_run`
-    and fails the verdict, which would make the nightly red by construction."""
+    and fails the verdict, which would make every run red by construction."""
     args = _stand_args()
     per_task, attempts = float(args["--per-task-usd"]), int(args["--attempts"])
     scenarios = [s for s in str(args["--scenarios"]).split(",") if s]
@@ -197,7 +274,7 @@ def test_the_summary_header_and_the_job_comment_state_the_current_reservation_ar
     """rc.15 review MINOR 4: the summary header carried the retired 2x rule ($360
     for the full set). Its numbers are re-derived here from the stand's own ledger
     (per-task x (roots + the self-mod evolution root)), so a rule change trips
-    this pin instead of leaving stale arithmetic in the nightly report; the run's
+    this pin instead of leaving stale arithmetic in the run report; the run's
     OWN reservations are rendered from the manifest's budget_preflight."""
     args = _stand_args()
     budget = RunBudget(TOTAL_BUDGET_USD, float(args["--per-task-usd"]), self_mod=args["--self-mod"] is None)
@@ -217,14 +294,24 @@ def test_artifacts_upload_even_on_failure_and_never_a_lane_settings_file():
     upload = next(step for step in steps if step.get("uses", "").startswith("actions/upload-artifact@"))
     assert upload["if"] == "always() && env.HAS_E2E_LIVE_KEY == 'true'"
     paths = [line.strip() for line in str(upload["with"]["path"]).splitlines() if line.strip()]
-    root = "${{ runner.temp }}/e2e_live/"
-    assert all(path.startswith(root) for path in paths), paths
-    rel = [path[len(root):] for path in paths]
+    roots = ["${{ runner.temp }}/e2e_live/", "${{ runner.temp }}/e2e_stub/"]
+    assert all(any(path.startswith(root) for root in roots) for path in paths), paths
+    relative_by_root = [[path[len(root):] for path in paths if path.startswith(root)] for root in roots]
+    assert relative_by_root[0] == relative_by_root[1]
+    rel = relative_by_root[0]
     assert "run_manifest.json" in rel and "lanes/*/result.json" in rel
     assert any(path.endswith(".png") for path in rel), rel
+    # The lane servers' journals travel ONLY as the stand's key-redacted traces/ bundle
+    # (devtools/e2e_live/traces.py): the one recursive glob, never a lane's data/ tree.
+    assert "lanes/*/traces/**" in rel, rel
     for path in rel:
-        assert "**" not in path and "settings" not in path and not path.endswith("/*"), path
+        assert "settings" not in path and not path.endswith("/*") and "data" not in path.split("/"), path
+        assert "**" not in path or path == "lanes/*/traces/**", path
     assert upload["with"]["if-no-files-found"] in ("warn", "ignore")
+    # Diagnostics only: a failed upload never reddens the job, the stand's own step still does.
+    assert upload.get("continue-on-error") is True
+    stand = next(step for step in steps if "devtools.e2e_live.run_live_lanes" in str(step.get("run", "")))
+    assert "continue-on-error" not in stand, stand
     summary = next(step for step in steps if "GITHUB_STEP_SUMMARY" in str(step.get("run", ""))
                    and SKIP_LINE not in str(step.get("run", "")))
     assert summary["if"] == "always() && env.HAS_E2E_LIVE_KEY == 'true'"

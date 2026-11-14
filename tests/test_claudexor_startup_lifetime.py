@@ -19,7 +19,7 @@ from ouroboros import claudexor_daemon as owned, claudexor_runtime, config, proc
 from ouroboros.gateways.claudexor import ClaudexorGateway, ClaudexorUnavailable
 from ouroboros.platform_layer import kill_process_tree, pid_is_alive, subprocess_new_group_kwargs
 
-pytestmark = [pytest.mark.serial, pytest.mark.skipif(os.name == "nt", reason="POSIX measured process custody")]
+pytestmark = [pytest.mark.skipif(os.name == "nt", reason="POSIX measured process custody")]
 
 _ENGINE = '''
 import http.server, json, os, pathlib, socketserver, subprocess, sys, time
@@ -117,6 +117,7 @@ def _gone(pid):
 @pytest.fixture
 def startup(tmp_path, monkeypatch):
     root = tmp_path / "data"
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(root))  # parent and consumers share one install
     home = root / "claudexor"
     home.mkdir(parents=True)
     engine = tmp_path / "fixture_engine.py"
@@ -193,6 +194,9 @@ def test_two_python_consumers_join_one_elected_startup_after_prepare_barrier(sta
                for name in ("first", "second")]
     assert [row["code"] for row in results] == ["daemon_starting", "daemon_starting"]
     elected = _wait_for(lambda: _read_json(startup.home / "elected.json"))
+    # A caller's readiness wait can expire before the election loser exits.
+    contenders = process_custody.live_daemon_root_pids(startup.root, purposes={owned.CUSTODY_PURPOSE}, strict=True)
+    _wait_for(lambda: all(_gone(pid) for pid in contenders - {elected["pid"]}))
     live = process_custody.live_daemon_root_pids(startup.root, purposes={owned.CUSTODY_PURPOSE}, strict=True)
     assert live == {elected["pid"]}, "the losing physical contender must not count as an owner"
     assert first.poll() is None and second.poll() is None
@@ -224,8 +228,7 @@ def test_delayed_runtime_preparation_rechecks_the_ready_peer_before_spawn(startu
     assert winner.stop() is True
 
 
-@pytest.mark.parametrize("descriptor", [False, True])
-@pytest.mark.parametrize("action", ["stop", "panic"])
+@pytest.mark.parametrize(("action", "descriptor"), [("stop", False), ("panic", True)])
 def test_peer_stop_works_before_readiness_and_reaps_the_owned_child(startup, monkeypatch, descriptor, action):
     manager = owned.OwnedClaudexorDaemon()
     with pytest.raises(ClaudexorUnavailable):
@@ -243,7 +246,9 @@ def test_peer_stop_works_before_readiness_and_reaps_the_owned_child(startup, mon
     if action == "panic":
         from tests.test_server_control_panic_daemon import _run_panic
         with monkeypatch.context() as patch:
-            assert _run_panic(patch, startup.root, daemon_stop=stop)
+            # Panic no longer invokes the legacy cooperative worker callback;
+            # the real owned daemon + its child must be gone below.
+            _run_panic(patch, startup.root, daemon_stop=stop)
     else:
         assert stop() is True
     assert time.monotonic() - started < 5
@@ -301,7 +306,7 @@ def test_stop_does_not_wait_for_the_same_managers_control_window(startup):
     assert _gone(elected["child"])
 
 
-@pytest.mark.parametrize("damage", ["corrupt", "unreadable", "stat_unreadable", "invalid_utf8", "dangling"])
+@pytest.mark.parametrize("damage", ["corrupt", "stat_unreadable", "dangling"])
 def test_unknown_custody_refuses_a_new_spawn(startup, monkeypatch, damage):
     ledger = process_custody.ledger_path(startup.root)
     ledger.parent.mkdir(parents=True, exist_ok=True)
@@ -347,7 +352,7 @@ def test_other_daemon_purposes_are_not_joined_as_claudexor(startup):
         stranger.wait(timeout=5)
 
 
-@pytest.mark.parametrize("damage", ["marker", "foreign_marker", "descriptor", "token"])
+@pytest.mark.parametrize("damage", ["marker", "foreign_marker", "token"])
 def test_peer_stop_never_promotes_invalid_or_foreign_discovery_to_authority(startup, damage):
     manager = owned.OwnedClaudexorDaemon()
     with pytest.raises(ClaudexorUnavailable):

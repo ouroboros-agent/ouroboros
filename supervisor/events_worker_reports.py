@@ -2,8 +2,8 @@
 
 Heartbeats and dispatch resolution keep the liveness rails honest, metrics and
 forwarded log lines reach the owner's panel, the acceptance fence is
-acknowledged back to the worker, and a bounded external-wait lease spares the
-idle rail alone.
+acknowledged back to the worker, a bounded external-wait lease spares the
+idle rail alone, and a translation-memory write reaches the open windows.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import logging
 import pathlib
 import time
 from typing import Any, Dict
+from ouroboros.cost_projection import LIVE_ROOT_COSTS
 from ouroboros.utils import atomic_write_json, utc_now_iso
 from ouroboros.outcomes import normalize_outcome_axes
 from supervisor.events_chat_delivery import _bound_project_chat_id
@@ -20,18 +21,59 @@ log = logging.getLogger(__name__)
 
 
 from supervisor.log_addressing import address_ctx_event as _address_ctx
-from ouroboros.cost_projection import live_root_cost_projection
+
+
+def _heartbeat_source_time(evt: Dict[str, Any], meta: Dict[str, Any]) -> float | None:
+    """When the worker SPOKE this heartbeat, if it can belong to the attempt RUNNING holds.
+
+    The worker stamps ``ts`` in its own process when it queues the beat; the drain may serve it
+    much later (the telemetry lane once ran 1 h 49 min behind), so the moment of handling is no
+    evidence that the task is alive now. A beat spoken before this attempt started is an earlier
+    attempt's; one dated after the host's own now is clamped to now. No parsable stamp, no
+    liveness evidence (``None``).
+    """
+    from ouroboros.deadline_utils import parse_deadline_ts
+
+    stamped = parse_deadline_ts(evt.get("ts"))
+    if stamped is None:
+        return None
+    spoken = min(stamped.timestamp(), time.time())
+    try:
+        started_at = float(meta.get("started_at") or 0.0)
+    except (TypeError, ValueError):
+        started_at = 0.0
+    return None if spoken < started_at else spoken
 
 
 def _handle_task_heartbeat(evt: Dict[str, Any], ctx: Any) -> None:
+    """Liveness stamp and live frame for one running task; a no-op once it left RUNNING.
+
+    Reads no store (cost law L4): ``last_heartbeat_at`` advances to the beat's own source
+    time when that is newer (``_heartbeat_source_time``: a drained backlog never makes a task
+    look freshly alive, and a late earlier beat never moves the stamp back), and a root's cost
+    figure is the one ``LIVE_ROOT_COSTS`` holds, read again only when the root's money moved.
+    Mutates the RUNNING entry IN PLACE (the ``_handle_llm_usage`` rule): a write-back would
+    resurrect a task a cross-thread cancel popped between the get and the write.
+    """
     task_id = str(evt.get("task_id") or "")
     if task_id and task_id in ctx.RUNNING:
-        meta = ctx.RUNNING.get(task_id) or {}
-        meta["last_heartbeat_at"] = time.time()
+        meta = ctx.RUNNING.get(task_id)
+        if not isinstance(meta, dict):
+            return
+        spoken = _heartbeat_source_time(evt, meta)
+        try:
+            stamped = float(meta.get("last_heartbeat_at") or 0.0)
+        except (TypeError, ValueError):
+            stamped = 0.0
         phase = str(evt.get("phase") or "")
-        if phase:
-            meta["heartbeat_phase"] = phase
-        ctx.RUNNING[task_id] = meta
+        if spoken is not None and spoken > stamped:
+            meta["last_heartbeat_at"] = spoken
+            if phase:
+                meta["heartbeat_phase"] = phase
+            if evt.get("_carrier_rss"):  # a lane carrier's own size on its newest beat: the lane's vitals
+                from supervisor.conversation_lane import note_carrier_rss
+
+                note_carrier_rss(getattr(ctx, "WORKERS", {}).get(meta.get("worker_id")), evt["_carrier_rss"])
         task = meta.get("task") if isinstance(meta.get("task"), dict) else {}
         started_at = float(meta.get("started_at") or 0.0)
         runtime_sec = round(max(0.0, time.time() - started_at), 1) if started_at > 0 else None
@@ -47,7 +89,7 @@ def _handle_task_heartbeat(evt: Dict[str, Any], ctx: Any) -> None:
             _hb_chat_id = _bound_project_chat_id(ctx, task_id, task.get("parent_task_id"), task.get("root_task_id")) or int(task.get("chat_id") or 0)
         except (TypeError, ValueError):
             _hb_chat_id = 0
-        cost_fields = live_root_cost_projection(task_id, task, evt, ctx.DRIVE_ROOT)
+        cost_fields = LIVE_ROOT_COSTS.fields(ctx.DRIVE_ROOT, task_id, task, evt)
         try:
             ctx.bridge.push_log({
                 "ts": evt.get("ts", utc_now_iso()),
@@ -104,6 +146,87 @@ def _handle_task_dispatch_resolved(evt: Dict[str, Any], ctx: Any) -> None:
     ctx.persist_queue_snapshot(reason="dispatch_resolved")
 
 
+def _handle_task_focus_updated(evt: Dict[str, Any], ctx: Any) -> None:
+    """Project a root-authored focus into the existing RUNNING snapshot."""
+    from ouroboros.focus import compact_focus
+    from supervisor.queue import _queue_lock
+
+    task_id = str(evt.get("task_id") or "").strip()
+    focus = compact_focus(evt.get("focus"))
+    if not task_id or focus is None or str(focus.get("author_task_id") or "") != task_id:
+        return
+    changed = False
+    with _queue_lock:
+        meta = ctx.RUNNING.get(task_id)
+        task = meta.get("task") if isinstance(meta, dict) else None
+        if not isinstance(task, dict):
+            return
+        if str(task.get("parent_task_id") or "").strip() or str(task.get("delegation_role") or "") == "subagent":
+            return
+        # The event is advisory transport.  The canonical result remains the
+        # lifecycle authority, so a focus queued just before completion cannot
+        # resurrect a terminal task in the queue projection.
+        drive_root = meta.get("budget_drive_root") if isinstance(meta, dict) else None
+        drive_root = drive_root or task.get("budget_drive_root") or getattr(ctx, "DRIVE_ROOT", None)
+        if drive_root:
+            try:
+                from ouroboros.task_results import STATUS_RUNNING, load_task_result
+
+                durable = load_task_result(drive_root, task_id)
+                if not isinstance(durable, dict) or str(durable.get("status") or "") != STATUS_RUNNING:
+                    return
+                durable_focus = compact_focus(durable.get("focus"))
+                if durable_focus != focus:
+                    return
+            except Exception:
+                return
+        prior_task = compact_focus(task.get("focus"))
+        if prior_task and str(prior_task.get("authored_at") or "") >= str(focus.get("authored_at") or ""):
+            return
+        task["focus"] = focus
+        changed = True
+    if changed:
+        ctx.persist_queue_snapshot(reason="task_focus_updated")
+
+
+def _handle_ui_i18n_updated(evt: Dict[str, Any], ctx: Any) -> None:
+    """A turn wrote the translation memory (``pin_ui_translation``); this process holds the
+    windows, so it tells them to read the memory again. The file is the truth: the frame
+    carries only which revision now exists."""
+    language, revision = evt.get("language"), evt.get("revision")
+    if not isinstance(language, str) or not language.strip() or type(revision) is not int or revision < 0:
+        return
+    ctx.bridge.broadcast({"type": "ui_i18n_updated", "language": language.strip(), "revision": revision})
+
+
+def _handle_mcp_signed_in(evt: Dict[str, Any], ctx: Any) -> None:
+    """A turn finished a remote MCP server's sign-in (``remote_mcp_sign_in``); this process owns the tool
+    catalog, so it lists that server again, on its own thread: a listing waits on the network."""
+    server_id = evt.get("server_id")
+    if not isinstance(server_id, str) or not server_id.strip():
+        return
+
+    def _list() -> None:
+        try:
+            from ouroboros.mcp_client import ensure_configured_from_settings, get_manager
+
+            ensure_configured_from_settings()
+            get_manager().refresh_server(server_id.strip())
+        except Exception:
+            log.warning("MCP listing after sign-in failed for %s", server_id, exc_info=True)
+
+    import threading
+
+    threading.Thread(target=_list, name="mcp-signed-in", daemon=True).start()
+
+
+def _handle_update_progress_changed(evt: Dict[str, Any], ctx: Any) -> None:
+    """A turn saved the update description (``record_update_description``); this process
+    holds the windows, so it asks them to read the update status again. The record is the
+    truth: the frame carries nothing else."""
+    ctx.bridge.broadcast({"type": "update_progress_changed"})
+
+
 def _handle_task_metrics(evt: Dict[str, Any], ctx: Any) -> None:
     payload = {
         "ts": str(evt.get("ts") or utc_now_iso()),
@@ -116,8 +239,9 @@ def _handle_task_metrics(evt: Dict[str, Any], ctx: Any) -> None:
         "outcome_axes": normalize_outcome_axes(evt),
         "reason_code": str(evt.get("reason_code") or ""),
     }
-    if "routing_tool_calls" in evt:
-        payload["routing_tool_calls"] = None if evt["routing_tool_calls"] is None else int(evt["routing_tool_calls"])
+    for key in ("routing_tool_calls", "completion_tool_calls", "rounds"):
+        if key in evt:
+            payload[key] = None if evt[key] is None else int(evt[key])
     if "tool_call_counts" in evt:
         counts = evt["tool_call_counts"]
         payload["tool_call_counts"] = dict(counts) if isinstance(counts, dict) else None
@@ -132,7 +256,14 @@ def _handle_task_metrics(evt: Dict[str, Any], ctx: Any) -> None:
 
 
 def _handle_log_event(evt: Dict[str, Any], ctx: Any) -> None:
-    """Forward live events; persist durable task checkpoints."""
+    """Address and forward one live frame; persist the one nested kind whose producer owns no row.
+
+    A ``task_checkpoint`` arrives already durable: its producer appended the
+    events.jsonl row (and the progress.jsonl row of a System checkpoint) before
+    queueing the frame (``loop_messages._emit_checkpoint_event``, owner 1A(3)),
+    with lineage and chat stamped by value, so this handler — which under the
+    two-lane bus may run after the task left RUNNING — only addresses and pushes.
+    """
     data = evt.get("data")
     if not isinstance(data, dict):
         return
@@ -147,7 +278,7 @@ def _handle_log_event(evt: Dict[str, Any], ctx: Any) -> None:
         log.debug("Failed to forward live log event", exc_info=True)
     # task_start_settings_reload_failed is a durable owner disclosure (#285):
     # without persistence the fact evaporates on the next page load.
-    if data.get("type") in ("task_checkpoint", "task_start_settings_reload_failed"):
+    if data.get("type") == "task_start_settings_reload_failed":
         try:
             ctx.append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", payload)
         except Exception:
@@ -175,10 +306,14 @@ def _handle_skill_lifecycle(evt: Dict[str, Any], ctx: Any) -> None:
 
 
 def _handle_acceptance_fence(evt: Dict[str, Any], ctx: Any) -> None:
-    """Apply a worker's acceptance fence under the supervisor queue lock, then ack."""
-    token = str(evt.get("token") or "").strip().lower()
-    if not token or len(token) > 64 or any(ch not in "0123456789abcdef" for ch in token):
-        log.warning("Rejected malformed acceptance-fence token")
+    """Apply a worker's acceptance fence under the supervisor queue lock, then ack.
+
+    The ack belongs to ONE request: ``<token>.<req>.json``. begin/inspect/end share
+    the fence token, so a late answer must never be readable as another request's.
+    """
+    token, req = (str(evt.get(key) or "").strip().lower() for key in ("token", "req"))
+    if any(not part or len(part) > 64 or any(ch not in "0123456789abcdef" for ch in part) for part in (token, req)):
+        log.warning("Rejected malformed acceptance-fence token or request id")
         return
     try:
         from supervisor.queue import transition_acceptance_fence
@@ -188,6 +323,8 @@ def _handle_acceptance_fence(evt: Dict[str, Any], ctx: Any) -> None:
             token=token,
             root_task_id=str(evt.get("root_task_id") or ""),
             task_id=str(evt.get("task_id") or ""),
+            # A legacy event without it keeps the unattributed (pre-#1183) begin.
+            pooled_owner=evt.get("pooled_owner") if isinstance(evt.get("pooled_owner"), dict) else None,
             outcome=str(evt.get("outcome") or ""),
             expected_generation=(
                 int(evt["expected_generation"])
@@ -198,7 +335,7 @@ def _handle_acceptance_fence(evt: Dict[str, Any], ctx: Any) -> None:
         log.warning("Acceptance-fence transition failed", exc_info=True)
         result = {"ok": False, "status": "error", "error": f"{type(exc).__name__}: {exc}"}
     ack_dir = pathlib.Path(ctx.DRIVE_ROOT) / "state" / "acceptance_fence_acks"
-    ack_path = ack_dir / f"{token}.json"
+    ack_path = ack_dir / f"{token}.{req}.json"
     try:
         now = time.time()
         prior = sorted(ack_dir.glob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
@@ -213,51 +350,3 @@ def _handle_acceptance_fence(evt: Dict[str, Any], ctx: Any) -> None:
         # Loud: without the acknowledgement the worker fails closed rather than
         # reviewing against a possibly-racing subtree.
         log.error("Could not acknowledge acceptance-fence transition", exc_info=True)
-
-
-def _handle_external_wait_lease(evt: Dict[str, Any], ctx: Any) -> None:
-    """Typed idle-rail lease (poltergeist phase B, B3): a worker holding a bounded
-    ``delegate_wait`` window over a live delegated run declares that its silence
-    is a legitimate host-side hold, not idleness.
-
-    The lease spares ONLY the idle rail (`_enforce_task_timeouts_locked` reads
-    ``external_wait_lease_until`` into its ``progressing`` disjunction); the
-    explicit deadline, the absolute ceiling, budget fences and cancel are
-    untouched. The expiry is re-clamped here against the absolute ceiling so a
-    malformed worker value can never mint an unbounded reprieve, and a release
-    (``until_ts <= 0``) drops the lease immediately — but only when it NAMES the
-    stored grant's ``lease_id`` (F5b lease identity). Mutate IN PLACE — see
-    ``_handle_llm_usage``: a write-back would resurrect a task a cross-thread
-    cancel popped between the get and the write.
-    """
-    task_id = str(evt.get("task_id") or "")
-    _running = getattr(ctx, "RUNNING", None)
-    if not task_id or not isinstance(_running, dict):
-        return
-    meta = _running.get(task_id)
-    if not isinstance(meta, dict):
-        return
-    try:
-        until = float(evt.get("until_ts") or 0.0)
-    except (TypeError, ValueError):
-        until = 0.0
-    lease_id = str(evt.get("lease_id") or "")
-    if until > 0:
-        from ouroboros.delegate_progress import EXTERNAL_WAIT_LEASE_CEILING_SEC
-
-        meta["external_wait_lease_until"] = min(
-            until, time.time() + float(EXTERNAL_WAIT_LEASE_CEILING_SEC))
-        meta["external_wait_lease_run_id"] = str(evt.get("run_id") or "")
-        meta["external_wait_lease_id"] = lease_id
-    else:
-        # A release must NAME the grant it retires (F5b): an abandoned,
-        # executor-killed wait thread's late release event would otherwise blank
-        # the NEWER grant the task's next wait just made. A release without an
-        # id (legacy emitter), or one matching the stored grant (or a stored
-        # grant without an id), clears as before.
-        stored = str(meta.get("external_wait_lease_id") or "")
-        if lease_id and stored and stored != lease_id:
-            return
-        meta.pop("external_wait_lease_until", None)
-        meta.pop("external_wait_lease_run_id", None)
-        meta.pop("external_wait_lease_id", None)

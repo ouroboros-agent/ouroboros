@@ -14,7 +14,8 @@ oversight.
 
 Consumption belongs inside the physical send closure. Only protocol-complete
 assemblies leave it as responses; partial bytes stay in private observability
-custody and never become an assistant message or a successful settlement.
+custody and never become an assistant message. Received monetary evidence
+survives independently of the response's completeness or cancellation.
 """
 
 from __future__ import annotations
@@ -56,6 +57,9 @@ class ProviderStreamError(IncompleteProviderStream):
     A provider fact, not an unknown outcome: no ``code``; the body's numeric
     ``error.code`` becomes ``status_code`` so the classifier files it through
     its ordinary status ladder, and a frame without one is ``stream_rejected``.
+    ``explicit_timeout`` is read from typed fields only, never the message: an
+    HTTP-shaped 408/504, OpenRouter's ``metadata.error_type=timeout``, or
+    Anthropic's documented ``error.type=timeout_error`` (API errors contract).
     """
 
     code = ""
@@ -67,6 +71,9 @@ class ProviderStreamError(IncompleteProviderStream):
         code = error.get("code")
         numeric = isinstance(code, int) and not isinstance(code, bool) and 100 <= code <= 599
         self.status_code = code if numeric else 200
+        metadata = error.get("metadata") if isinstance(error.get("metadata"), dict) else {}
+        self.explicit_timeout = ((numeric and code in (408, 504)) or metadata.get("error_type") == "timeout"
+                                 or error.get("type") == "timeout_error")
         # Without an HTTP-shaped code the frame is the provider's own terminal
         # verdict on this stream (an overload/api_error shape, a finish_reason of
         # "error"): filed like a rejected body — provider_error, no same-request
@@ -74,6 +81,10 @@ class ProviderStreamError(IncompleteProviderStream):
         self.stream_rejected = not numeric
         self.type = str(error.get("type") or error.get("code") or "provider_stream_error")
         self.provider_message = str(error.get("message") or "")
+        # OpenRouter's opt-in routing receipt (``X-OpenRouter-Metadata``) rides beside
+        # ``error``: each upstream attempt's provider, model and status, never its text.
+        receipt = body.get("openrouter_metadata")
+        self.openrouter_metadata = copy.deepcopy(receipt) if isinstance(receipt, dict) else None
         self.stream_usage = copy.deepcopy(usage) if isinstance(usage, dict) and usage else None
         # Keep producer facts in body/private evidence. Text-only pre-routing
         # classifiers must not turn an HTTP-200 SSE failure into a free rejection.
@@ -110,14 +121,29 @@ def _index(value: Any) -> int:
 def _adjacent(last: Any, item: dict) -> bool:
     """Continuation of the last record: ``type`` and ``id`` absent on either side or equal.
 
-    Discreteness of opaque payloads (``reasoning.encrypted`` data, signatures)
-    rides on the provider's ``id``: two id-less records of one type would fuse.
-    Every recorded encrypted record carries an id; text records must stay
-    id-less-mergeable, which is the #856 fix itself.
+    Unsigned text records must stay id-less-mergeable (the #856 fix itself); a signed
+    record is closed by its signature (``_closed_by_signature``). Opaque
+    ``reasoning.encrypted`` data stays discrete only by the provider's ``id``: it
+    usually carries one, and two id-less encrypted records in a row would fuse
+    (recorded without an id, never yet two in a row).
     """
     return isinstance(last, dict) and all(
         last.get(key) is None or item.get(key) is None or last.get(key) == item.get(key)
         for key in ("type", "id"))
+
+
+def _closed_by_signature(last: dict, item: dict) -> bool:
+    """A signature is the last fact of the record it signs: content after it opens the next one.
+
+    OpenRouter streams the thinking blocks of one Anthropic answer id-less, each ending
+    in a signature-only delta (a signature arrives whole, in one delta), and their
+    ``index`` is a block ordinal there while Gemini repeats 0, so ``index`` cannot be
+    the boundary; a delta that adds nothing still joins the signed record. A record
+    fused from two blocks is refused on replay; OpenRouter's own SDK fuses them too
+    (keeping the first signature), so it is no reference for this boundary.
+    """
+    return (isinstance(last.get("signature"), str) and bool(last["signature"])
+            and any(item.get(field) for field in ("text", "summary", "data", "signature")))
 
 
 def _snapshot(target: dict, update: dict) -> None:
@@ -129,8 +155,13 @@ def _snapshot(target: dict, update: dict) -> None:
             target[key] = copy.deepcopy(value)
 
 
-def _delta(target: dict, update: dict, note: Callable[[str], None]) -> None:
-    """Fold one delta into the assembly; a shape or identity conflict is noted, never raised."""
+def _delta(target: dict, update: dict, note: Callable[[str], None], *,
+           chat_path: tuple | None = None) -> None:
+    """Fold a delta; disclose shape/identity conflicts without raising.
+
+    Only Chat messages supply ``chat_path`` (choice, index, then wire fields),
+    so call-name compatibility cannot change unrelated names or native deltas.
+    """
     for key, value in update.items():
         current = target.get(key)
         if value is None:
@@ -141,7 +172,7 @@ def _delta(target: dict, update: dict, note: Callable[[str], None]) -> None:
             if not isinstance(current, dict):
                 note(f"{key}: object delta onto {type(current).__name__}; kept first shape")
                 continue
-            _delta(current, value, note)
+            _delta(current, value, note, chat_path=(*chat_path, key) if chat_path is not None else None)
         elif isinstance(value, list):
             if current is None:
                 current = target[key] = []
@@ -149,11 +180,24 @@ def _delta(target: dict, update: dict, note: Callable[[str], None]) -> None:
                 note(f"{key}: list delta onto {type(current).__name__}; kept first shape")
                 continue
             for item in value:
-                _merge_list_item(key, current, item, note)
+                _merge_list_item(key, current, item, note,
+                                 chat_path=(*chat_path, key) if chat_path is not None else None)
         elif isinstance(value, str) and key not in _IDENTITY_KEYS:
             if current is not None and not isinstance(current, str):
                 note(f"{key}: text delta onto {type(current).__name__}; kept first shape")
                 continue
+            if key == "name" and current and value and chat_path is not None and (
+                    (len(chat_path) == 3 and chat_path[2] == "function_call")
+                    or (len(chat_path) == 5 and chat_path[2] == "tool_calls"
+                        and chat_path[4] in {"function", "custom"})):
+                # Chat call names alone tolerate a repeat of the accumulated value.
+                # This compatibility choice interprets a,a as a rather than aa;
+                # other fragments still append, without guessing a callable name.
+                address = ".".join(str(part) for part in (*chat_path, key))
+                if current == value:
+                    note(f"{address}: equal name value not appended")
+                    continue
+                note(f"{address}: different name values concatenated")
             target[key] = (current or "") + value
         elif key in _IDENTITY_KEYS:
             if current is None:
@@ -166,11 +210,12 @@ def _delta(target: dict, update: dict, note: Callable[[str], None]) -> None:
             target[key] = copy.deepcopy(value)
 
 
-def _merge_list_item(key: str, current: list, item: Any, note: Callable[[str], None]) -> None:
+def _merge_list_item(key: str, current: list, item: Any, note: Callable[[str], None], *,
+                     chat_path: tuple | None = None) -> None:
     """List identity is a property of the wire field: ``reasoning_details`` records are
-    reassembled by type transition (every delta repeats a frame-local ``index`` that is
-    not a record key, as the wire's own reference client documents); every other list
-    keys on ``index``, and an index-less tool-call fragment continues the last call."""
+    reassembled by type transition and closed by their signature (the ``index`` they
+    carry is no record key on every route); every other list keys on ``index``, and an
+    index-less tool-call fragment continues the last call."""
     if not isinstance(item, dict):
         current.append(copy.deepcopy(item))
         return
@@ -178,7 +223,7 @@ def _merge_list_item(key: str, current: list, item: Any, note: Callable[[str], N
     if key == "reasoning_details":
         if "type" not in item:
             note(f"{key}: item without type")
-        if current and _adjacent(current[-1], item):
+        if current and _adjacent(current[-1], item) and not _closed_by_signature(current[-1], item):
             match = current[-1]
     else:
         index = item.get("index")
@@ -197,7 +242,12 @@ def _merge_list_item(key: str, current: list, item: Any, note: Callable[[str], N
     if match is None:
         current.append(copy.deepcopy(item))
     else:
-        _delta(match, item, note)
+        _delta(match, item, note,
+               chat_path=(*chat_path, match.get("index", "last")) if chat_path is not None else None)
+
+
+def _has_text(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
 
 
 def _tool_call_problem(call: Any) -> str:
@@ -238,11 +288,12 @@ class _Accumulator:
 
 
 class ChatAccumulator(_Accumulator):
-    def __init__(self, expected_choices: int = 1):
+    def __init__(self, expected_choices: int = 1, on_generation_id: Callable | None = None):
         super().__init__()
         self.body: dict = {"object": "chat.completion"}
         self.choices: dict[int, dict] = {}
         self.expected_choices = expected_choices
+        self.on_generation_id = on_generation_id
 
     def accept(self, event: str, data: str) -> None:
         if self.done:
@@ -259,6 +310,8 @@ class ChatAccumulator(_Accumulator):
         if not isinstance(chunk, dict):
             self._note(f"chunk is {type(chunk).__name__}, not an object; skipped")
             return
+        if self.on_generation_id is not None:
+            self.on_generation_id(chunk.get("id"))
         if isinstance(chunk.get("error"), dict):
             _snapshot(self.body, {key: value for key, value in chunk.items()
                                   if key not in {"choices", "usage", "object"}})
@@ -300,7 +353,7 @@ class ChatAccumulator(_Accumulator):
         substantive = any(value not in (None, "", [], {}) for key, value in delta.items() if key != "role")
         if choice.get("finish_reason") and substantive:
             self._note(f"choice {index}: content after finish_reason {choice['finish_reason']!r}; accepted")
-        _delta(choice["message"], delta, self._note)
+        _delta(choice["message"], delta, self._note, chat_path=("choice", index))
         logprobs = update.get("logprobs")
         if isinstance(logprobs, dict):
             _delta(choice.setdefault("logprobs", {}), logprobs, self._note)
@@ -354,6 +407,26 @@ class ChatAccumulator(_Accumulator):
     def _reject(self, detail: str) -> None:
         raise RejectedProviderStream(f"Stream rejected after terminal framing: {detail}",
                                      usage=self.body.get("usage"), anomalies=self.anomalies)
+
+    def output_received(self) -> bool:
+        """Whether a typed model-output field carried non-blank text before the stream ended.
+
+        Content, reasoning text or summary, encrypted reasoning data and tool-call argument
+        text count; a role, an id, a name-only call start, usage and keep-alives do not.
+        """
+        for choice in self.choices.values():
+            message = choice["message"]
+            details = message.get("reasoning_details")
+            calls = message.get("tool_calls")
+            payloads = [call.get(kind) for call in (calls if isinstance(calls, list) else [])
+                        if isinstance(call, dict) for kind in ("function", "custom")]
+            if (any(_has_text(message.get(key)) for key in ("content", "reasoning", "reasoning_content"))
+                    or any(isinstance(row, dict) and any(_has_text(row.get(key)) for key in ("text", "summary", "data"))
+                           for row in (details if isinstance(details, list) else []))
+                    or any(isinstance(payload, dict) and (_has_text(payload.get("arguments")) or _has_text(payload.get("input")))
+                           for payload in (*payloads, message.get("function_call")))):
+                return True
+        return False
 
     def partial(self) -> dict:
         body = copy.deepcopy(self.body)
@@ -481,6 +554,12 @@ class AnthropicAccumulator(_Accumulator):
                                      usage=self.body.get("usage") if self.usage_final else None,
                                      anomalies=self.anomalies)
 
+    def output_received(self) -> bool:
+        """Text, thinking or redacted-thinking data, or tool input text (``ChatAccumulator`` rule)."""
+        return (any(isinstance(block, dict) and any(_has_text(block.get(key)) for key in ("text", "thinking", "data"))
+                    for block in self.blocks.values())
+                or any(_has_text(fragment) for fragment in self.inputs.values()))
+
     def partial(self) -> dict:
         return {**copy.deepcopy(self.body), "content": [copy.deepcopy(self.blocks[key]) for key in sorted(self.blocks)]}
 
@@ -519,12 +598,81 @@ class _SSEFrames:
 
 
 class _StreamAssembly:
-    def __init__(self, response: Any, native: bool, expected_choices: int):
-        self.accumulator = AnthropicAccumulator() if native else ChatAccumulator(expected_choices)
+    def __init__(self, response: Any, native: bool, expected_choices: int, *, defer_binding: bool = False):
+        from ouroboros.usage_accounting import (
+            AttemptReservation, current_physical_attempt_drive_root, last_physical_attempt_capture,
+        )
+
+        capture, root = last_physical_attempt_capture(), current_physical_attempt_drive_root()
+        self.reservation = (AttemptReservation(capture.attempt_id, root, capture.model, capture.provider, None)
+                            if capture is not None and root is not None else None)
+        self.defer_binding = defer_binding
+        self.pending_generations = []
+        self.generation_id = ""
+        self.generation_conflict = False
+        self.conflicting_generation_id = ""
+        self.generation_binding_error = ""
+        self.generation_bound = False
+        self.accumulator = (AnthropicAccumulator() if native else
+                            ChatAccumulator(expected_choices, self.observe_generation))
         self.frames = _SSEFrames()
         self.raw: list[bytes] = []
         headers = getattr(response, "headers", {})
-        self.generation_id = headers.get("x-generation-id", "")
+        self.observe_generation(headers.get("x-generation-id"))
+
+    def observe_generation(self, generation_id: Any) -> None:
+        """Bind once at first observation; preserve one conflicting observation too."""
+        if (not isinstance(generation_id, str) or not generation_id
+                or generation_id == self.generation_id or self.generation_conflict):
+            return
+        if self.generation_id:
+            self.generation_conflict = True
+            self.conflicting_generation_id = generation_id
+        else:
+            self.generation_id = generation_id
+        self.pending_generations.append(generation_id)
+        # The prior ID's write cannot certify a newly observed conflict.
+        # Parsing can raise before the async caller drains this pending write.
+        self.generation_bound = False
+        if not self.defer_binding:
+            self.bind_pending_generations()
+
+    def bind_pending_generations(self) -> None:
+        """One transaction per newly observed ID; async callers join off-loop."""
+        pending, self.pending_generations = self.pending_generations, []
+        self.generation_bound = False
+        try:
+            from ouroboros.usage_accounting import bind_provider_generation
+
+            for generation_id in pending:
+                bind_provider_generation(generation_id, reservation=self.reservation)
+            self.generation_bound = bool(self.reservation) and not self.generation_binding_error
+        except Exception as exc:
+            # Evidence retention must not turn a usable answer into a retry.
+            self.generation_binding_error = type(exc).__name__
+
+    def preserve_failure_usage(self, error: BaseException) -> None:
+        """Money survives read/close/cancel errors independently of reply completeness."""
+        from ouroboros._usage_response import provider_cost_value
+
+        usage = self.accumulator.body.get("usage")
+        usage = copy.deepcopy(usage) if isinstance(usage, dict) else {}
+        complete_usage = (self.accumulator.usage_final if isinstance(self.accumulator, AnthropicAccumulator)
+                          else self.accumulator.done)
+        if not complete_usage:
+            # message_start and unfinished Chat streams can carry partial counters.
+            # An explicit price remains authoritative even on a partial message.
+            if not any(provider_cost_value(usage.get(key)) is not None for key in ("cost", "total_cost")):
+                usage = {}
+        received = getattr(error, "stream_usage", None)
+        if isinstance(received, dict):
+            cost = next((value for source in (received, usage) for key in ("cost", "total_cost")
+                         if (value := provider_cost_value(source.get(key))) is not None), None)
+            _snapshot(usage, received)
+            if cost is not None:
+                usage["cost"] = cost
+        if usage:
+            error.stream_usage = usage
 
     def feed(self, chunk: bytes) -> bool:
         self.raw.append(chunk)
@@ -536,9 +684,11 @@ class _StreamAssembly:
         return self.accumulator.done
 
     def retain(self, *, complete: bool, error: BaseException | None = None) -> dict:
+        if error is not None:
+            self.preserve_failure_usage(error)
         from ouroboros import config
         from ouroboros.observability import persist_call, write_blob
-        from ouroboros.usage_accounting import current_usage_scope, last_physical_attempt_capture
+        from ouroboros.usage_accounting import current_usage_scope, last_physical_attempt_capture, current_physical_attempt_drive_root
 
         capture = last_physical_attempt_capture()
         scope = current_usage_scope()
@@ -546,12 +696,21 @@ class _StreamAssembly:
         facts = {"attempt_id": attempt_id, "complete": complete,
                  "generation_id": self.generation_id or self.accumulator.body.get("id", ""),
                  "anomalies": self.accumulator.anomaly_facts()}
+        if error is not None:  # a failed reply's typed shape, never its text
+            facts["model_output_received"] = self.accumulator.output_received()
+        if self.generation_conflict:
+            facts["generation_conflict"] = True
+            facts["conflicting_generation_id"] = self.conflicting_generation_id
+        if self.generation_bound:
+            facts["generation_bound"] = True
+        if self.generation_binding_error:
+            facts["generation_binding_error"] = self.generation_binding_error
         evidence = {"wire_base64": base64.b64encode(b"".join(self.raw)).decode("ascii"),
                     "partial_assembly": self.accumulator.partial(), **facts}
         try:
             if not attempt_id:
                 raise RuntimeError("stream has no physical attempt identity")
-            root = scope.drive_root if scope is not None else config.DATA_DIR
+            root = current_physical_attempt_drive_root() or (scope.drive_root if scope is not None else config.DATA_DIR)
             # Raw frames can contain private native signatures. Only the blob
             # reference and structural facts enter the ordinary public projection.
             raw_ref = write_blob(root, evidence, kind="json")
@@ -597,13 +756,22 @@ def consume_stream(stream: Any, *, native: bool = False, expected_choices: int =
 
 
 async def consume_stream_async(stream: Any, *, expected_choices: int = 1) -> AssembledResponse:
+    from ouroboros._usage_wait import presend_off_loop
+
     response = getattr(stream, "response", stream)
-    assembly = _StreamAssembly(response, False, expected_choices)
+    assembly = _StreamAssembly(response, False, expected_choices, defer_binding=True)
     try:
+        if assembly.pending_generations:
+            await presend_off_loop(assembly.bind_pending_generations)
         async for chunk in response.aiter_bytes():
-            if assembly.feed(chunk):
+            done = assembly.feed(chunk)
+            if assembly.pending_generations:
+                await presend_off_loop(assembly.bind_pending_generations)
+            if done:
                 break
         body = assembly.result()
+        if assembly.pending_generations:
+            await presend_off_loop(assembly.bind_pending_generations)
         await response.aclose()
     except BaseException as exc:
         assembly.retain(complete=assembly.accumulator.done, error=exc)

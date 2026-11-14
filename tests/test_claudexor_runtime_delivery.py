@@ -8,13 +8,14 @@ import json
 import os
 import pathlib
 import shutil
+import stat
 import subprocess
 import tarfile
+import zipfile
 
 import pytest
 
 from ouroboros import claudexor_runtime as runtime
-
 
 BUILD_SHA = "1" * 40
 OLD_BUILD_SHA = "2" * 40
@@ -154,7 +155,7 @@ def test_tracked_pin_names_a_cli_capable_release():
     of this proposal converged on while the pin was still pre-CLI 3.6.0)."""
     pin = runtime.load_runtime_pin()
     assert pin is not None
-    assert pin.version == "3.12.4"
+    assert pin.version == "6.0.0"
     assert pin.cli_entrypoint == "claudexor.bundle.cjs"
 
 
@@ -270,7 +271,7 @@ def test_seed_install_uses_bundled_node_and_records_real_source(tmp_path, monkey
     monkeypatch.setattr(
         platform,
         "probe_node_version",
-        lambda candidate: NODE_VERSION if candidate == str(node) else "",
+        lambda candidate: NODE_VERSION if pathlib.Path(candidate).is_file() else "",
     )
     manager = runtime.ClaudexorRuntimeManager(pin)
     probes = []
@@ -282,7 +283,9 @@ def test_seed_install_uses_bundled_node_and_records_real_source(tmp_path, monkey
 
     command = manager.ensure()
     target = runtime.managed_runtime_dir(pin)
-    assert command == [str(node), str(target / pin.entrypoint)]
+    kept = pathlib.Path(command[0])  # the bundle's Node copied in once: the daemon outlives the app
+    assert command == [str(kept), str(target / pin.entrypoint)] and kept.read_bytes() == node.read_bytes()
+    assert kept.parents[2].parent == runtime.managed_runtime_root() / "node"
     assert probes and all(probe_pin == pin for _, probe_pin in probes)
     metadata = json.loads((target / "managed-runtime.json").read_text(encoding="utf-8"))
     assert metadata["archive_source"] == "bundle_seed"
@@ -344,7 +347,7 @@ def test_clean_source_install_fetches_exact_managed_node_in_the_same_ensure(
     assert not (source_root / "node-standalone").exists()
     metadata = json.loads(
         (
-            runtime.managed_node_dir(pin, "linux-x64")
+            pathlib.Path(command[0]).parents[2]
             / "managed-node.json"
         ).read_text(encoding="utf-8")
     )
@@ -434,8 +437,6 @@ def test_preserved_node_reader_accepts_exact_supported_metadata_schemas(
 
 @pytest.mark.parametrize("payload", [
     {"schema_version": 3, "version": NODE_VERSION, "platform": "linux-x64"},
-    {"schema_version": True, "version": NODE_VERSION, "platform": "linux-x64"},
-    {"schema_version": "2", "version": NODE_VERSION, "platform": "linux-x64"},
     {"schema_version": 2, "version": "bad", "platform": "linux-x64"},
     [],
 ])
@@ -508,7 +509,8 @@ def test_cli_command_installs_exact_closure_and_managed_node_npm_tree(tmp_path, 
     monkeypatch.setattr(manager, "_probe", lambda _command, _pin: NODE_VERSION)
 
     command = manager.ensure_cli_command()
-    node_root = runtime.managed_node_dir(pin, "linux-x64") / "node-standalone"
+    node_root = pathlib.Path(command[0]).parents[1]
+    assert node_root.parent.name.startswith(runtime.managed_node_dir(pin, "linux-x64").name + ".g-")
     assert command == [str(node_root / "bin" / "node"),
                        str(runtime.managed_runtime_dir(pin) / "claudexor.bundle.cjs")]
     assert (node_root / "lib/node_modules/npm/bin/npm-cli.js").read_bytes() == b"npm cli\n"
@@ -520,7 +522,66 @@ def test_cli_command_installs_exact_closure_and_managed_node_npm_tree(tmp_path, 
     assert len(fetches) == 1
 
 
-def test_cli_toolchain_rejects_npm_links_and_windows_before_fetch(tmp_path, monkeypatch):
+def test_windows_cli_command_installs_exact_closure_and_managed_node_npm_tree(tmp_path, monkeypatch):
+    _data_plane(monkeypatch, tmp_path)
+    source_root = tmp_path / "bundle"
+    closure = _archive(
+        source_root / "claudexor-runtime" / "runtime.tar.gz",
+        entrypoint="claudexord.bundle.cjs",
+        cli_entrypoint="claudexor.bundle.cjs",
+    )
+    distribution = f"node-v{NODE_VERSION}-win-x64"
+    node_member = f"{distribution}/node.exe"
+    npm_cli = f"{distribution}/node_modules/npm/bin/npm-cli.js"
+    npm_package = f"{distribution}/node_modules/npm/package.json"
+    node_archive = tmp_path / f"{distribution}.zip"
+    with zipfile.ZipFile(node_archive, "w") as bundle:
+        bundle.writestr(node_member, b"node\n")
+        bundle.writestr(npm_cli, b"npm cli\n")
+        bundle.writestr(npm_package, b"{}\n")
+    pin = _pin(
+        closure,
+        node_artifacts=_node_artifacts(exact_key="win32-x64", exact_archive=node_archive),
+        entrypoint="claudexord.bundle.cjs",
+        cli_entrypoint="claudexor.bundle.cjs",
+    )
+
+    import ouroboros.platform_layer as platform
+
+    monkeypatch.setattr(platform, "bundled_resource_bases", lambda: [source_root])
+    monkeypatch.setattr(platform, "node_distribution_platform", lambda: "win32-x64")
+    monkeypatch.setattr(
+        platform, "embedded_node_candidates",
+        lambda base: [pathlib.Path(base) / "node-standalone" / "node.exe"],
+    )
+    monkeypatch.setattr(platform, "probe_node_version", lambda candidate: (
+        NODE_VERSION if pathlib.Path(candidate).is_file() else ""))
+    fetches = []
+
+    def fetch_fixture(artifact, destination):
+        fetches.append(artifact.archive_url)
+        pathlib.Path(destination).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(node_archive, destination)
+        return runtime.verify_node_archive(destination, artifact)
+
+    monkeypatch.setattr(runtime, "fetch_node_archive", fetch_fixture)
+    manager = runtime.ClaudexorRuntimeManager(pin)
+    monkeypatch.setattr(manager, "_probe", lambda _command, _pin: NODE_VERSION)
+
+    command = manager.ensure_cli_command()
+    node_root = pathlib.Path(command[0]).parent
+    assert node_root.parent.name.startswith(runtime.managed_node_dir(pin, "win32-x64").name + ".g-")
+    assert command == [str(node_root / "node.exe"), str(runtime.managed_runtime_dir(pin) / "claudexor.bundle.cjs")]
+    assert (node_root / "node_modules/npm/bin/npm-cli.js").read_bytes() == b"npm cli\n"
+    assert (node_root / "node_modules/npm/package.json").read_bytes() == b"{}\n"
+    node_metadata = json.loads((node_root.parent / "managed-node.json").read_text())
+    assert node_metadata["schema_version"] == 2
+    assert node_metadata["archive_npm_cli"] == npm_cli
+    assert manager.ensure_cli_command() == command
+    assert fetches == [pin.node_artifacts["win32-x64"].archive_url]
+
+
+def test_node_archive_rejects_npm_links(tmp_path, monkeypatch):
     distribution = f"node-v{NODE_VERSION}-linux-x64"
     node_member = f"{distribution}/bin/node"
     npm_cli = f"{distribution}/lib/node_modules/npm/bin/npm-cli.js"
@@ -549,19 +610,142 @@ def test_cli_toolchain_rejects_npm_links_and_windows_before_fetch(tmp_path, monk
         )
     assert excinfo.value.code == "runtime_node_archive_invalid"
 
+def test_windows_node_archive_extracts_reviewed_npm(tmp_path):
+    distribution = f"node-v{NODE_VERSION}-win-x64"
+    node_member = f"{distribution}/node.exe"
+    npm_cli = f"{distribution}/node_modules/npm/bin/npm-cli.js"
+    archive = tmp_path / "node.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr(node_member, b"node")
+        bundle.writestr(npm_cli, b"npm")
+    artifact = runtime.NodeRuntimeArtifact(
+        archive_url="https://node.example.test/node.zip",
+        sha256=hashlib.sha256(archive.read_bytes()).hexdigest(),
+        size_bytes=archive.stat().st_size,
+        executable=node_member,
+    )
+    destination = tmp_path / "out/node-standalone/node.exe"
+    destination.parent.mkdir(parents=True)
+    npm_root = runtime.ClaudexorRuntimeManager._managed_npm_cli(destination).parent.parent
+    runtime.ClaudexorRuntimeManager._extract_node_archive(
+        archive, artifact, destination, archive_npm_cli=npm_cli, npm_root=npm_root
+    )
+    assert destination.read_bytes() == b"node"
+    assert (npm_root / "bin" / "npm-cli.js").read_bytes() == b"npm"
+
+
+@pytest.mark.parametrize("nested_name", ("D:escaped.js", "lib/stream:entry.js"))
+def test_windows_node_archive_rejects_drive_relative_or_stream_in_nested_npm_path(tmp_path, nested_name):
+    distribution = f"node-v{NODE_VERSION}-win-x64"
+    node_member = f"{distribution}/node.exe"
+    npm_cli = f"{distribution}/node_modules/npm/bin/npm-cli.js"
+    archive = tmp_path / "node.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr(node_member, b"node")
+        bundle.writestr(npm_cli, b"npm")
+        bundle.writestr(f"{distribution}/node_modules/npm/{nested_name}", b"unsafe")
+    artifact = runtime.NodeRuntimeArtifact(
+        archive_url="https://node.example.test/node.zip",
+        sha256=hashlib.sha256(archive.read_bytes()).hexdigest(),
+        size_bytes=archive.stat().st_size,
+        executable=node_member,
+    )
+    destination = tmp_path / "out/node-standalone/node.exe"
+    destination.parent.mkdir(parents=True)
+    npm_root = runtime.ClaudexorRuntimeManager._managed_npm_cli(destination).parent.parent
+
+    with pytest.raises(runtime.ClaudexorRuntimeError) as excinfo:
+        runtime.ClaudexorRuntimeManager._extract_node_archive(
+            archive, artifact, destination, archive_npm_cli=npm_cli, npm_root=npm_root
+        )
+    assert excinfo.value.code == "runtime_node_archive_invalid"
+
+
+def test_official_windows_zip_shape_extracts_only_node_and_the_npm_tree(tmp_path):
+    # The shape measured in the pinned node-v24.16.0-win-x64.zip: MS-DOS entries
+    # (create_system 0, no Unix type bits), explicit directory entries, and shell
+    # launchers beside node.exe that the managed toolchain must not materialize.
+    distribution = f"node-v{NODE_VERSION}-win-x64"
+    npm_cli = f"{distribution}/node_modules/npm/bin/npm-cli.js"
+    archive = tmp_path / "node.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        for name in (f"{distribution}/", f"{distribution}/node_modules/",
+                     f"{distribution}/node_modules/npm/", f"{distribution}/node_modules/npm/bin/",
+                     f"{distribution}/node_modules/corepack/"):
+            entry = zipfile.ZipInfo(name)
+            entry.create_system, entry.external_attr = 0, 0x10
+            bundle.writestr(entry, b"")
+        for name, payload in ((f"{distribution}/node.exe", b"node"), (npm_cli, b"npm"),
+                              (f"{distribution}/node_modules/npm/package.json", b"{}"),
+                              (f"{distribution}/node_modules/corepack/package.json", b"{}"),
+                              (f"{distribution}/npm.cmd", b"@echo off"),
+                              (f"{distribution}/npm.ps1", b"#ps"), (f"{distribution}/npx.cmd", b"@echo off")):
+            entry = zipfile.ZipInfo(name)
+            entry.create_system, entry.external_attr = 0, 0x20
+            bundle.writestr(entry, payload)
+    artifact = runtime.NodeRuntimeArtifact(
+        archive_url="https://node.example.test/node.zip",
+        sha256=hashlib.sha256(archive.read_bytes()).hexdigest(),
+        size_bytes=archive.stat().st_size,
+        executable=f"{distribution}/node.exe",
+    )
+    destination = tmp_path / "out/node-standalone/node.exe"
+    destination.parent.mkdir(parents=True)
+    npm_root = runtime.ClaudexorRuntimeManager._managed_npm_cli(destination).parent.parent
+
+    runtime.ClaudexorRuntimeManager._extract_node_archive(
+        archive, artifact, destination, archive_npm_cli=npm_cli, npm_root=npm_root
+    )
+
+    extracted = sorted(path.relative_to(destination.parent).as_posix()
+                       for path in destination.parent.rglob("*") if path.is_file())
+    assert extracted == ["node.exe", "node_modules/npm/bin/npm-cli.js", "node_modules/npm/package.json"]
+
+
+@pytest.mark.parametrize(
+    ("special_member", "file_type"),
+    (("node", stat.S_IFCHR), ("npm", stat.S_IFIFO), ("npm", stat.S_IFLNK)),
+)
+def test_windows_node_archive_rejects_special_members(tmp_path, special_member, file_type):
+    distribution = f"node-v{NODE_VERSION}-win-x64"
+    node_member = f"{distribution}/node.exe"
+    npm_cli = f"{distribution}/node_modules/npm/bin/npm-cli.js"
+    archive = tmp_path / "node.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        for name, payload in ((node_member, b"node"), (npm_cli, b"npm")):
+            if special_member == "node" and name == node_member or special_member == "npm" and name == npm_cli:
+                entry = zipfile.ZipInfo(name)
+                entry.create_system = 3
+                entry.external_attr = (file_type | 0o777) << 16
+                bundle.writestr(entry, payload)
+            else:
+                bundle.writestr(name, payload)
+    artifact = runtime.NodeRuntimeArtifact(
+        archive_url="https://node.example.test/node.zip",
+        sha256=hashlib.sha256(archive.read_bytes()).hexdigest(),
+        size_bytes=archive.stat().st_size,
+        executable=node_member,
+    )
+    destination = tmp_path / "out/node-standalone/node.exe"
+    destination.parent.mkdir(parents=True)
+    npm_root = runtime.ClaudexorRuntimeManager._managed_npm_cli(destination).parent.parent
+
+    with pytest.raises(runtime.ClaudexorRuntimeError) as excinfo:
+        runtime.ClaudexorRuntimeManager._extract_node_archive(
+            archive, artifact, destination, archive_npm_cli=npm_cli, npm_root=npm_root
+        )
+    assert excinfo.value.code == "runtime_node_archive_invalid"
+
+def test_windows_cli_toolchain_accepts_reviewed_node_artifact(tmp_path, monkeypatch):
     _data_plane(monkeypatch, tmp_path)
     closure = _archive(tmp_path / "runtime.tar.gz", cli_entrypoint="claudexor.bundle.cjs")
     pin = _pin(closure, cli_entrypoint="claudexor.bundle.cjs")
     import ouroboros.platform_layer as platform
+
     monkeypatch.setattr(platform, "node_distribution_platform", lambda: "win32-x64")
-    monkeypatch.setattr(runtime, "fetch_node_archive", lambda *_a, **_kw: (
-        pytest.fail("Windows local CLI must refuse before fetching a toolchain")))
-    monkeypatch.setattr(runtime, "fetch_runtime_archive", lambda *_a, **_kw: (
-        pytest.fail("Windows local CLI must refuse before fetching a closure")))
-    with pytest.raises(runtime.ClaudexorRuntimeError) as excinfo:
-        runtime.ClaudexorRuntimeManager(pin).ensure_cli_command()
-    assert excinfo.value.code == "runtime_cli_platform_unsupported"
-    assert not runtime.managed_runtime_root().exists()
+    key, selected = runtime.ClaudexorRuntimeManager(pin)._cli_node_artifact(pin)
+    assert key == "win32-x64"
+    assert selected == pin.node_artifacts["win32-x64"]
 
 
 def test_managed_pin_never_falls_back_to_random_path_binary(tmp_path, monkeypatch):
@@ -655,6 +839,78 @@ def test_status_is_read_only_and_exposes_update_before_and_after_staging(
         engine_build_sha=pin.build_sha,
     )
     assert ready["state"] == "ready"
+
+
+def test_status_never_stages_a_lower_pin_under_a_newer_engine(tmp_path, monkeypatch):
+    """Planned restarts keep a newer engine (server_restart), so its lower pin never 'activates'."""
+    _data_plane(monkeypatch, tmp_path)
+    archive = _archive(tmp_path / "runtime.tar.gz")
+    pin = _pin(archive)
+    manager = runtime.ClaudexorRuntimeManager(pin)
+
+    def serving(version, *, running=True):
+        return manager.status(running=running, engine_version=version, engine_build_sha=OLD_BUILD_SHA)
+
+    assert serving("3.5.0")["state"] == "newer_serving"  # not installed yet: no update either
+    target = runtime.managed_runtime_dir(pin)
+    target.mkdir(parents=True)
+    (target / "managed-runtime.json").write_text("{broken", encoding="utf-8")
+    assert serving("3.5.0")["state"] == "error"  # a damaged target still asks for repair
+    _metadata(target, version=pin.version, build_sha=pin.build_sha, source="download")
+    target_meta = json.loads((target / "managed-runtime.json").read_text(encoding="utf-8"))
+    target_meta.update(archive_sha256=pin.sha256, archive_size=pin.size_bytes)
+    (target / "managed-runtime.json").write_text(json.dumps(target_meta), encoding="utf-8")
+
+    for newer in ("3.4.1", "3.5.0", "10.0.0"):
+        status = serving(newer)
+        assert (status["state"], status["staged_version"], status["target_version"]) == (
+            "newer_serving", "", pin.version), newer
+    # Same release on another build, an older engine and unordered spellings keep the staged update.
+    for other in (pin.version, "3.3.9", "v3.5.0", "3.5.0-rc.1", ""):
+        status = serving(other)
+        assert (status["state"], status["staged_version"]) == ("update_staged", pin.version), other
+    assert serving("3.5.0", running=False)["state"] == "ready"  # no live handshake, no serving claim
+    override = tmp_path / "claudexord-override"
+    override.write_text("fixture\n", encoding="utf-8")
+    monkeypatch.setenv("OUROBOROS_CLAUDEXOR_BIN", str(override))
+    assert serving("3.5.0")["state"] == "ready"  # an explicit override keeps its own answer
+
+
+def test_status_names_a_newer_engine_before_the_lower_pin_is_installed(tmp_path, monkeypatch):
+    """A successor reads status before the ensure that installs its lower tree: no 'Update & connect'."""
+    _data_plane(monkeypatch, tmp_path)
+    pin = _pin(_archive(tmp_path / "runtime.tar.gz"))
+    manager = runtime.ClaudexorRuntimeManager(pin)
+
+    def serving(version, *, running=True):
+        return manager.status(running=running, engine_version=version, engine_build_sha=OLD_BUILD_SHA)
+
+    _metadata(runtime.managed_runtime_root() / f"3.5.0-{OLD_BUILD_SHA[:12]}", version="3.5.0",
+              build_sha=OLD_BUILD_SHA)  # the outgoing generation's tree; the target is absent
+    status = serving("3.5.0")
+    assert [status[key] for key in ("state", "version", "target_version", "staged_version", "source")] == [
+        "newer_serving", "3.5.0", pin.version, "", "cache"]
+    assert not runtime.managed_runtime_dir(pin).exists()
+    # No handshake, unordered spellings, the pin's release on another build and an older engine keep the update.
+    for version, running in (("3.5.0", False), ("v3.5.0", True), ("3.5.0-rc.1", True), ("", True),
+                             (pin.version, True), ("3.3.9", True)):
+        assert serving(version, running=running)["state"] == "update_available", version
+    lock = runtime.managed_runtime_root() / "install.lock"
+    lock.write_text("", encoding="utf-8")  # another process is installing the lower tree
+    assert serving("3.5.0")["state"] == "installing"
+    lock.unlink()
+
+    def offline(*_args, **_kwargs):
+        raise runtime.ClaudexorRuntimeError("runtime_download_failed", "offline")
+
+    monkeypatch.setattr(manager, "_install", offline)
+    with pytest.raises(runtime.ClaudexorRuntimeError):
+        manager.ensure()
+    assert serving("3.5.0")["state"] == "error"  # a failed install still asks for repair
+    override = tmp_path / "claudexord-override"
+    override.write_text("fixture\n", encoding="utf-8")
+    monkeypatch.setenv("OUROBOROS_CLAUDEXOR_BIN", str(override))
+    assert serving("3.5.0")["state"] == "ready"
 
 
 def test_status_distinguishes_fresh_missing_from_a_corrupt_target(tmp_path, monkeypatch):

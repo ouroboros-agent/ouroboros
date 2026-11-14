@@ -1,38 +1,38 @@
-"""Repair and run: real UI ingress, managed worker, review and installed execution."""
+"""Ask Ouroboros to fix: real UI ingress, managed worker, review and installed execution."""
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 from pathlib import Path
-import subprocess
 
 import pytest
 
 from devtools.benchmarks.common.server_runner import _api
 from ouroboros.skill_loader import compute_content_hash
+from tests._shared import producer_evidence_dir
+from tests.candidate_checkout import candidate_checkout
 from tests.system_e2e.harness import (
-    ArtifactOracle, ScriptedStubModel, clone_repo, keyless_settings, start_server, wait_until,
+    ArtifactOracle, ScriptedStubModel, keyless_settings, start_server, wait_until,
 )
 
 
+@pytest.fixture
+def repair_clone(tmp_path):
+    if os.environ.get("OUROBOROS_RUN_UI_SMOKE") != "1":
+        pytest.skip("set OUROBOROS_RUN_UI_SMOKE=1")
+    source = Path(__file__).resolve().parents[1]
+    with candidate_checkout(source, tmp_path / "clone", origin_proof=True) as candidate:
+        yield candidate
+
+
 @pytest.mark.ui_browser
-@pytest.mark.serial
-def test_repair_button_records_owner_intent_and_runs_the_installed_skill(tmp_path):
+def test_repair_button_records_owner_intent_and_runs_the_installed_skill(tmp_path, repair_clone):
     if os.environ.get("OUROBOROS_RUN_UI_SMOKE") != "1":
         pytest.skip("set OUROBOROS_RUN_UI_SMOKE=1")
     playwright = pytest.importorskip("playwright.sync_api")
-    source = Path(__file__).resolve().parents[1]
-    clone = clone_repo(tmp_path / "source")
-    # clone_repo captures HEAD; this developer scenario exercises the complete
-    # candidate, including an uncommitted fix, in a disposable clone only.
-    patch = subprocess.check_output(["git", "diff", "--binary", "HEAD"], cwd=source)
-    if patch:
-        subprocess.run(["git", "apply", "--binary", "-"], input=patch, cwd=clone, check=True)
     name = "repair_owner_probe"
-    evidence = Path(os.environ.get("OUROBOROS_UI_SCREENSHOT_DIR", str(tmp_path)))
-    evidence.mkdir(parents=True, exist_ok=True)
+    evidence = producer_evidence_dir(tmp_path, "repair-owner-intent", env="OUROBOROS_UI_SCREENSHOT_DIR")
     body = (
         "async def status(request):\n    return {'value': 'repaired'}\n"
         "def register(api):\n"
@@ -48,7 +48,7 @@ def test_repair_button_records_owner_intent_and_runs_the_installed_skill(tmp_pat
         {"tool": "toggle_skill", "arguments": {"skill": name, "enabled": True}},
     ]
     with ScriptedStubModel(script, final_answer="The repaired skill is running.") as stub:
-        server = start_server(clone, tmp_path / "runtime", keyless_settings(
+        server = start_server(repair_clone, tmp_path / "runtime", keyless_settings(
             stub, OUROBOROS_MAX_WORKERS=1, OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS=True,
         ))
         try:
@@ -84,42 +84,50 @@ def test_repair_button_records_owner_intent_and_runs_the_installed_skill(tmp_pat
                 browser = pw.chromium.launch(headless=True)
                 try:
                     page = browser.new_page(viewport={"width": 1280, "height": 850})
-                    page.route("**/api/marketplace/ouroboroshub/catalog*", lambda route: route.fulfill(json={"results": []}))
                     page.goto(server.base_url + "/#skills")
                     card = page.locator(f'.skills-card[data-skill="{name}"]')
-                    card.get_by_role("button", name="Repair and run", exact=True).wait_for()
+                    card.get_by_role("button", name="Ask Ouroboros to fix", exact=True).wait_for()
                     page.screenshot(path=str(evidence / "repair-and-run-card.png"))
-                    card.get_by_role("button", name="Repair and run", exact=True).click()
+                    card.get_by_role("button", name="Ask Ouroboros to fix", exact=True).click()
                     dialog = page.get_by_role("dialog")
-                    assert "stays running" in dialog.inner_text()
+                    assert "turns it on when it is ready" in dialog.inner_text()
                     page.screenshot(path=str(evidence / "repair-and-run-confirmation.png"))
                     with page.expect_request("**/api/command") as command:
-                        dialog.get_by_role("button", name="Repair and run", exact=True).click()
+                        dialog.get_by_role("button", name="Ask Ouroboros", exact=True).click()
                     request = command.value.post_data_json
                     assert "visible_text" not in request
+                    assert request["ui_control"] == {"name": "skill_repair"}  # the page names the press (#2778)
+                    assert "Repair and run" in request["cmd"]
                     assert request["task_constraint"]["allow_enable"] is False
                     admission = wait_until(lambda: oracle._json(f"state/skills/{name}/repair_admission.json"), 45)
                     task_id = admission["task_id"]
                     result = server.wait_task(task_id, timeout=240)
                     assert result["status"] == "completed", result
                     stored = oracle.task_result(task_id)
-                    ref = stored["origin_message_ref"]
+                    # The press is my human's request; the prompt the page composed is the host's words, never quoted
+                    # as theirs: no owner row carries it and the task's objective names its author.
+                    press = stored["metadata"]["ui_control"]
+                    assert press["name"] == "skill_repair" and press["pressed_at"]
+                    assert stored["metadata"]["objective_author"] == {"kind": "ui_control", "control": "skill_repair"}
+                    assert not stored.get("origin_message_ref"), stored.get("origin_message_ref")  # no owner message names it
+                    assert stored["metadata"].get("origin_suppressed") is True  # my human's own act started it
                     rows = [json.loads(line) for line in oracle.chat_bytes().splitlines() if line]
-                    owner = next(row for row in rows if row.get("client_message_id") == ref["client_message_id"] and row.get("direction") == "in")
-                    assert owner["text"] == request["cmd"] == stored["origin_message_text"]
-                    assert "Repair and run" in owner["text"]
+                    assert not [row for row in rows if row.get("direction") == "in"], "no owner row speaks the prompt"
                     assert stored["task_constraint"]["allow_enable"] is False
                     assert admission["base_content_hash"] == initial_hash
                     actions = [row for row in oracle.events("owner_api_action") if row.get("task_id") == task_id]
                     enabled = next(row for row in actions if row.get("action") == "skill_enable" and row.get("ok"))
-                    assert enabled["source_ref"]["ref"] == ref
+                    assert enabled["source_ref"] == {"kind": "control", "control": "skill_repair", "ts": press["pressed_at"]}
                     assert enabled["actor"] == "agent_tool"
+                    ref = enabled["source_ref"]
                     assert stub.script_consumed() and stub.kinds().count("skill_review") >= 3
                     assert "repair shell works" in json.dumps(oracle.tools_rows())
                     wait_until(lambda: oracle._json(f"state/skills/{name}/enabled.json").get("enabled"), 30)
                     companions = wait_until(lambda: _api(server.base_url, "GET", "/api/skills/daemons").get("companions", {}).get(name + ":worker"), 30)
                     assert companions["pid"] > 0
-                    assert (drive / "state" / "skills" / name / "ready.txt").read_text() == "ready"
+                    # The pid exists from the spawn; the file is the worker's first act once Python is up.
+                    ready = drive / "state" / "skills" / name / "ready.txt"
+                    assert wait_until(lambda: ready.is_file() and ready.read_text() == "ready", 30), "the companion never wrote ready.txt"
                     # The hash is a one-time entry pointer; app navigation owns
                     # later page changes in the already-loaded SPA.
                     page.click('[data-nav-page="widgets"]')
@@ -128,7 +136,7 @@ def test_repair_button_records_owner_intent_and_runs_the_installed_skill(tmp_pat
                     (evidence / "repair-and-run.json").write_text(json.dumps({
                         "task_id": task_id, "origin": ref, "initial_hash": initial_hash,
                         "final_hash": compute_content_hash(payload), "companion_pid": companions["pid"],
-                        "candidate_patch_sha256": hashlib.sha256(patch).hexdigest(),
+                        "candidate_identity": repair_clone.identity,
                         "review_delivery": "real pipeline, controlled loopback reviewer models",
                     }, indent=2) + "\n")
                     _api(server.base_url, "POST", f"/api/skills/{name}/toggle", {"enabled": False})

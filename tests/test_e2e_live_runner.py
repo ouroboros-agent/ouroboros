@@ -106,7 +106,7 @@ def test_scenario_table_shape():
         assert isinstance(row.settings_overrides, dict)
         assert callable(row.acceptance) and callable(row.stub_script)
     sm1 = scenarios.SCENARIOS["SM1"].settings_overrides
-    assert sm1 == {"OUROBOROS_RUNTIME_MODE": "advanced", "OUROBOROS_REVIEW_ENFORCEMENT": "blocking"}
+    assert sm1 == {"OUROBOROS_RUNTIME_MODE": "advanced"}
     roster = json.loads(scenarios.SCENARIOS["SW1"].overrides("openai-compatible::mock-child")["OUROBOROS_SUBAGENTS"])
     assert roster["items"][0]["route"]["target_id"] == "openai-compatible::mock-child"
     assert scenarios.SCENARIOS["SW1"].overrides("x")["OUROBOROS_MAX_SUBAGENT_DEPTH"] == 1
@@ -121,14 +121,6 @@ def test_scenario_table_shape():
     assert [s["tool"] for s in sw1["agent"] if isinstance(s, dict) and "tool" in s] == [
         "plan_task", "schedule_subagent", "schedule_subagent"]
     assert sum(1 for s in sw1["agent"] if callable(s)) == 3  # wait_tasks + two child dispositions
-
-
-def test_css_accent_helpers_only_touch_the_root_token():
-    css = ":root {\n    --accent: #c93545;\n    --accent-light: #f07a86;\n}\n.x { --accent: red; }\n"
-    assert scenarios.accent_value(css) == "#c93545"
-    changed = scenarios.css_with_accent(css, "#2f7de1")
-    assert scenarios.accent_value(changed) == "#2f7de1"
-    assert changed.count("#2f7de1") == 1 and "--accent-light: #f07a86" in changed and "--accent: red" in changed
 
 
 def test_lane_count_and_stagger_bounds(monkeypatch):
@@ -202,20 +194,24 @@ def test_preflight_worker_cap_reaches_every_lane_and_is_recorded(tmp_path, monke
     stand must set the runtime's own lever to ``max(2, 16 // lanes)`` in the process every lane
     server inherits, override an ambient value, and record the applied number in the manifest
     and in each lane row. The runtime reads exactly that key (pinned here, not modified)."""
-    from ouroboros import preflight_runner
+    from ouroboros import host_memory, preflight_probe, preflight_runner, test_parallelism
     _short_tmp(monkeypatch)
-    assert run_live_lanes.PREFLIGHT_WORKERS_ENV == preflight_runner._PREFLIGHT_WORKERS_ENV
-    assert run_live_lanes.PREFLIGHT_WORKERS_FLOOR == preflight_runner._MIN_PREFLIGHT_WORKERS
+    assert run_live_lanes.PREFLIGHT_WORKERS_ENV == test_parallelism.WORKERS_ENV
+    assert run_live_lanes.PREFLIGHT_WORKERS_FLOOR == preflight_runner.MIN_PREFLIGHT_WORKERS
     assert run_live_lanes.parse_args(["--stub", "--lanes", "1"]).preflight_test_workers == 16
     assert run_live_lanes.parse_args(["--stub", "--lanes", "4"]).preflight_test_workers == 4
     assert run_live_lanes.parse_args(["--stub", "--lanes", "6"]).preflight_test_workers == 2   # floor at MAX_LANES
     monkeypatch.setenv(run_live_lanes.PREFLIGHT_WORKERS_ENV, "128")   # the operator shell must lose
+    # The stand is the outermost runner here: no inherited test slot or busy host caps its lever.
+    monkeypatch.setenv(test_parallelism.NESTED_WORKERS_ENV, "16")
+    monkeypatch.setattr(test_parallelism, "physical_memory",
+                        lambda: host_memory.MemorySnapshot(100 * 1024 ** 3, 100 * 1024 ** 3))
     seen: dict = {}
 
     def lane(job, args, out, template, stagger, states, seed, budget=None, *, key="", seed_sha=""):
         seen[job] = (os.environ.get(run_live_lanes.PREFLIGHT_WORKERS_ENV),
                      run_live_lanes._lane_row(job, args)["preflight_test_workers"],
-                     preflight_runner._preflight_worker_count())
+                     preflight_probe._preflight_worker_count())
         return _fake_lane(job, args, out, template, stagger, states, seed, budget, key=key, seed_sha=seed_sha)
 
     monkeypatch.setattr(run_live_lanes, "run_lane", lane)
@@ -263,15 +259,23 @@ def test_config_sha256_is_secret_free_and_key_independent():
 # The run-wide budget ledger
 # --------------------------------------------------------------------------- #
 
-def test_lane_spend_sums_the_settled_product_ledger_and_counts_unknown_costs(tmp_path):
-    """rc.15 run3: telemetry summed 114.81, the product ledger 141.63 (skill review, advisory, synthesis write no row)."""
-    (state := tmp_path / "data" / "state").mkdir(parents=True)
-    rows = [{"state": "settled", "cost_final": True, "cost_usd": 1.5}, {"state": "settled", "cost_final": True, "cost_usd": 0.25},
-            {"state": "settled", "cost_final": True, "cost_usd": None}, {"state": "settled", "cost_final": False, "cost_usd": 99.0},
-            {"state": "pending", "cost_usd": 99.0}, {"state": "settled", "cost_final": True, "cost_usd": True}, "not json"]
-    (state / "usage_attempts.jsonl").write_text("\n".join(r if isinstance(r, str) else json.dumps(r) for r in rows) + "\n", encoding="utf-8")
-    assert run_live_lanes.lane_spend(tmp_path / "data") == (1.75, 2)
-    assert run_live_lanes.lane_spend(tmp_path / "absent") == (0.0, 0)
+def test_lane_spend_reads_the_usage_store_of_a_store_era_lane(tmp_path):
+    from ouroboros import usage_accounting as ua
+    from ouroboros import usage_store
+
+    data = tmp_path / "data"
+    (data / "state").mkdir(parents=True)
+    for cost, final in ((1.5, True), (0.25, True), (None, True), (99.0, False)):
+        held = ua.reserve_attempt(ua.AttemptRequest(model="m", provider="test", drive_root=data, task_id="t",
+                                                    root_task_id="t", reservation_usd=0.0, global_limit_usd=1000.0))
+        ua.mark_dispatched(held)
+        ua.settle_attempt(held, {}, cost_usd=cost, cost_final=final)
+    ua.reserve_attempt(ua.AttemptRequest(model="m", provider="test", drive_root=data, task_id="t",
+                                         root_task_id="t", reservation_usd=99.0, global_limit_usd=1000.0))
+    usage_store.forget(data)
+    assert run_live_lanes.lane_spend(data) == (100.75, 2)  # the estimate is spent, never final; no price is unknown, not absent
+    assert pytest.raises(run_live_lanes.LaneSpendAbsent, run_live_lanes.lane_spend, tmp_path / "absent")
+    # A journal-era ``--seed`` lane is read as the store would hold its history: tests/test_e2e_live_attempt_faults.py.
 
 
 def _ask(budget, job, root_tasks, root, waits: list | None = None, *, index: int = 0):
@@ -295,7 +299,7 @@ def test_run_budget_waits_on_in_flight_reservations_and_refuses_only_what_can_ne
     budget = run_live_lanes.RunBudget(20.0, 8.0, reader=lambda root: (spend.get(root.name, 0.0), 0))
     assert budget.reservation(1) == 8.0 and budget.reservation(2) == 16.0 and budget.reservation(0) == 8.0
     ok, facts = budget.admit(("SM1", 1), 1, tmp_path / "a", dispatch_index=0)
-    assert ok and facts == {"cap_usd": 20.0, "spent_usd": 0.0, "reserved_usd": 0.0, "reservation_usd": 8.0,
+    assert ok and facts == {"cap_usd": 20.0, "spent_usd": 0.0, "unknown_liability_usd": 0.0, "reserved_usd": 0.0, "reservation_usd": 8.0,
                             "unknown_cost_rows": 0, "waited_sec": 0.0}
     assert budget.ceiling(("SM1", 1)) == 8.0            # its own reservation, never the whole cap
     ok, facts = budget.admit(("SW1", 1), 1, tmp_path / "b", dispatch_index=1)
@@ -433,10 +437,10 @@ def test_submit_injects_no_budget_profile_into_the_stand_roots(monkeypatch):
     bodies: list = []
     monkeypatch.setattr(scenarios, "_api", lambda base, method, path, payload=None, timeout=0:
                         bodies.append((method, path, payload)) or {"task_id": "t-1"})
-    assert _ctx().submit("do it", metadata={"force_plan": True, "force_plan_source": "swarm"}) == "t-1"
+    assert _ctx().submit("do it", metadata={"purpose": "probe"}) == "t-1"
     (method, path, body), = bodies
     assert (method, path) == ("POST", "/api/tasks") and body["timeout_sec"] == 1
-    assert body["metadata"] == {"source": "e2e_live", "delegation_role": "root", "force_plan": True, "force_plan_source": "swarm"}
+    assert body["metadata"] == {"source": "e2e_live", "delegation_role": "root", "purpose": "probe"}
     assert not hasattr(scenarios, "STAND_BUDGET_PROFILE") and "budget_profile" not in json.dumps(body)
 
 
@@ -658,8 +662,8 @@ def test_confirm_absorb_requires_positive_evidence(tmp_path, monkeypatch):
     first = _commit(clone, "one")
     data_root = tmp_path / "data"
     _campaign(data_root, 0)
-    state = {"sha": first[:8], "uptime": 100}
-    monkeypatch.setattr(run_live_lanes, "_api", lambda base, method, path, payload=None, timeout=0: dict(state))
+    state = {"sha": first[:8], "born": time.time() - 100}  # served uptime runs on while real Git work below takes time
+    monkeypatch.setattr(run_live_lanes, "_api", lambda *_a, **_k: {"sha": state["sha"], "uptime": int(time.time() - state["born"])})
     pre = run_live_lanes.self_mod_snapshot(_FakeServer(), clone, data_root)
     assert pre["head"] == first and pre["sha"] == first[:8] and pre["cycles"] == 0 and pre["state_read"]
     # No promotion: the runtime declined, and a liveness check alone would have said PASS.
@@ -671,14 +675,14 @@ def test_confirm_absorb_requires_positive_evidence(tmp_path, monkeypatch):
     second = _commit(clone, "two")
     _campaign(data_root, 1, {"commit_sha": second, "cycle_outcome": "absorbed", "restart_verified": True,
                              "verified_by": "boot_reconciliation"})
-    state.update({"sha": second[:8], "uptime": 100})
+    state["sha"] = second[:8]
     out = run_live_lanes.confirm_absorb(_FakeServer(absorb={"absorbed": True, "reason": "absorbed"}), clone,
                                         data_root, pre, timeout=1, ready_timeout=1)
     assert out["confirmed"] is False and out["reason"] == "not_restarted" and out["head_moved"] is True
     assert out["transaction"] == {"commit_sha": second, "cycle_outcome": "absorbed", "restart_verified": True,
                                   "verified_by": "boot_reconciliation"}
     # Every fact present: counter advanced, sha moved, uptime reset, healthy, serving the clone HEAD.
-    state["uptime"] = 0
+    state["born"] = time.time()
     out = run_live_lanes.confirm_absorb(_FakeServer(absorb={"absorbed": True, "reason": "absorbed"}), clone,
                                         data_root, pre, timeout=1, ready_timeout=1)
     assert out["confirmed"] is True and out["reason"] == "absorbed" and out["serving_head"] is True
@@ -749,9 +753,13 @@ class _FakeUI:
         if self.fail_goto is not None:
             raise self.fail_goto
 
+    def color_scheme(self, scheme):
+        self.calls.append(("color_scheme", scheme))
+        self.scheme = scheme
+
     def computed_property(self, selector, prop):
         self.calls.append(("computed_property", selector, prop))
-        return scenarios.SM1_NEW_ACCENT
+        return self.scheme if prop == "--native-color-scheme" else scenarios.SM1_NEW_ACCENT
 
     send_chat = rebind = lambda self, *a, **k: None
 
@@ -772,7 +780,8 @@ def _sm1_ui_tail(ctx: scenarios.LaneContext) -> None:
     """Exercise the production oracle, including both documents, without a paid task."""
     if "commit_landed" not in ctx.checks:
         ctx.check("commit_landed", True)
-    scenarios.check_sm1_rendered_palette(ctx, scenarios.SM1_REQUIRED_PALETTE)
+    ctx.restart()
+    scenarios.check_sm1_rendered_palette(ctx, scenarios.SM1_REQUIRED_PALETTE, served=True, seed_css="")
 
 
 def test_ui_client_opens_on_first_use_and_restart_reopens_against_the_new_server(tmp_path):
@@ -787,9 +796,9 @@ def test_ui_client_opens_on_first_use_and_restart_reopens_against_the_new_server
     assert calls[1] == ("close", "http://127.0.0.1:1") and calls[2] == ("open", "http://127.0.0.1:2")
     assert ctx.checks == {"commit_landed": True, "ui_app_palette": True, "ui_onboarding_palette": True,
                           "ui_computed_style": True} and ctx.ui_reason == "" and "ui_reason" not in ctx.facts
-    assert ctx.screenshots == [str(tmp_path / "sm1_app_after_restart.png"),
-                               str(tmp_path / "sm1_onboarding_after_restart.png")]
-    assert [c for c in calls if c[0] == "goto"] == [("goto", "/"), ("goto", "/onboarding")]
+    assert ctx.screenshots == [str(tmp_path / f"sm1_{document}_{theme}_after_restart.png")
+                               for document in ("app", "onboarding") for theme in ("light", "dark")]
+    assert [c for c in calls if c[0] == "goto"] == [("goto", "/"), ("goto", "/"), ("goto", "/onboarding"), ("goto", "/onboarding")]
     ctx.close_ui()
     ctx.close_ui()                                   # idempotent
     assert [c for c in calls if c[0] == "close"] == [("close", "http://127.0.0.1:1"), ("close", "http://127.0.0.1:2")]
@@ -819,8 +828,9 @@ def test_closed_target_degrades_the_ui_checks_typed_and_keeps_every_other_check(
                           "ui_computed_style": False}
     assert ctx.ui_reason == ctx.facts["ui_reason"] == "ui_unavailable:TargetClosedError"
     assert ctx.facts["ui_errors"] == ["TargetClosedError: Target page, context or browser has been closed"]
-    assert not any(ctx.facts["palette_computed"]["app"].values()) and ctx.screenshots == []
-    assert [c[0] for c in calls] == ["open", "goto", "close"]   # closed on the failure, later calls no-ops
+    assert not any(value for theme in ctx.facts["palette_computed"]["app"].values() for value in theme.values())
+    assert ctx.screenshots == []
+    assert [c[0] for c in calls] == ["open", "color_scheme", "goto", "close"]   # closed on the failure, later calls no-ops
 
 
 class _NoopServer:
@@ -828,12 +838,20 @@ class _NoopServer:
     __init__ = start = stop = lambda self, *a, **k: None
 
 
+_STOP_UNCONFIRMED = ["restart successor 4242: process group 4242 still has live members, not signalled"]
+
+
+class _UnconfirmedStopServer(_NoopServer):
+    """``IsolatedServer.stop`` returns every exit it could not prove."""
+    stop = lambda self: list(_STOP_UNCONFIRMED)  # noqa: E731
+
+
 def _attempt_row(tmp_path, monkeypatch, sid: str, acceptance=lambda ctx: ctx.check("scenario_ok", True), *,
-                 flags: str = "") -> dict:
-    """One ``run_attempt`` of ``sid`` under ``<tmp_path>/<sid>``: a fresh git seed, the real template, the no-op
-    server, ``acceptance`` in the scenario's place (default: one passing check); ``<sid>/out`` keeps the artifacts."""
+                 flags: str = "", server=_NoopServer) -> dict:
+    """One ``run_attempt`` of ``sid`` under ``<tmp_path>/<sid>``: a fresh git seed, the real template, the ``server``
+    double, ``acceptance`` in the scenario's place (default: one passing check); ``<sid>/out`` keeps the artifacts."""
     _short_tmp(monkeypatch)
-    monkeypatch.setattr(run_live_lanes, "IsolatedServer", _NoopServer)
+    monkeypatch.setattr(run_live_lanes, "IsolatedServer", server)
     monkeypatch.setitem(run_live_lanes.SCENARIOS, sid, dataclasses.replace(scenarios.SCENARIOS[sid], acceptance=acceptance))
     root = tmp_path / sid
     root.mkdir()
@@ -864,7 +882,7 @@ def test_lane_with_a_dead_browser_target_is_checks_failed_not_infra_error(tmp_pa
     assert row["facts"]["ui_reason"] == "ui_unavailable:TargetClosedError"
     assert row["ui"] == {"available": False, "reason": "ui_unavailable:TargetClosedError"}
     # lane start: availability probe opened and closed; use: opened after the restart, dead, closed
-    assert [c[0] for c in calls] == ["open", "close", "open", "goto", "close"]
+    assert [c[0] for c in calls] == ["open", "close", "open", "color_scheme", "goto", "close"]
     stored = json.loads((tmp_path / "SM1" / "out" / "lanes" / "SM1_a1" / "result.json").read_text(encoding="utf-8"))
     assert stored["status"] == "fail" and stored["facts"]["ui_reason"] == "ui_unavailable:TargetClosedError"
 
@@ -890,7 +908,8 @@ def test_absorb_wait_and_check_follow_the_scenarios_expects_absorb(tmp_path, mon
         lane = tmp_path / sid / "out" / "lanes" / f"{sid}_a1" / "data"
         state = json.loads((lane / "state" / "state.json").read_text(encoding="utf-8"))
         assert json.loads((lane / "settings.json").read_text())["OUROBOROS_POST_TASK_EVOLUTION"] == ("true" if sid == "SM1" else "false")
-        assert state["owner_chat_id"] == 1 and "evolution_mode_enabled" not in state, state
+        assert state["owner_chat_id"] == 1 and state["evolution_mode_enabled"] is False, state
+        assert state["initialization_id"]  # a positive first-boot witness, not a guessed state
         assert not (lane / "state" / "evolution_campaign.json").exists(), sid
 
 
@@ -1051,8 +1070,7 @@ def test_commit_refusal_facts_name_every_typed_refusal():
     ledger = {"attempts": [
         {"attempt": 1, "phase": "preflight", "status": "blocked", "block_reason": "tests_preflight_blocked"},
         {"attempt": 2, "phase": "blocking_review", "status": "blocked", "block_reason": "scope_blocked"},
-        {"attempt": 3, "phase": "late_wait", "status": "reviewing", "block_reason": "review_late_result_pending"}],
-        "advisory_runs": [{"status": "stale"}, {"status": "bypassed"}]}
+        {"attempt": 3, "phase": "late_wait", "status": "reviewing", "block_reason": "review_late_result_pending"}]}
     tools = [
         {"tool": "preflight_review", "status": "ok",
          "result_preview": '{\n  "status": "preflight_blocked",\n  "error": "⚠️ PREFLIGHT_BLOCKED: VERSION is not in scope'},
@@ -1064,7 +1082,7 @@ def test_commit_refusal_facts_name_every_typed_refusal():
     assert facts["refusal_codes"] == ["PREFLIGHT_BLOCKED", "REVIEW_PENDING", "SCOPE_REVIEW_BLOCKED", "TESTS_PREFLIGHT_BLOCKED"]
     assert [a["block_reason"] for a in facts["commit_attempts"]] == [
         "tests_preflight_blocked", "scope_blocked", "review_late_result_pending"]
-    assert facts["advisory_run_statuses"] == ["stale", "bypassed"]
+    assert "advisory_run_statuses" not in facts
     assert facts["review_tool_calls"][1] == {"tool": "commit_reviewed", "status": "blocked", "code": "TESTS_PREFLIGHT_BLOCKED"}
     assert facts["terminal_status"] == "failed" and facts["terminal_reason_code"] == "budget_exhausted"
 
@@ -1075,38 +1093,41 @@ def test_sm1_changes_the_shared_palette_for_both_documents():
     assert scenarios.SM1_CSS_PATHS == ("web/ui.css",)
     prompt = scenarios.sm1_prompt()
     assert "web/ui.css" in prompt and "/onboarding" in prompt and "docs/DESIGN.md" in prompt
-    assert "both browser documents" in prompt
+    assert "both browser documents" in prompt and "both the Light and Dark themes" in prompt
     assert "skip_" not in prompt.lower() and "do not bump" not in prompt.lower() and "bumped in the same diff" in prompt
     script = scenarios.sm1_stub_script(REPO_ROOT)["agent"]
-    writes = [s for s in script if s.get("tool") == "write_file"]
+    writes = [s for s in script if isinstance(s, dict) and s.get("tool") == "write_file"]
     written = [w["arguments"]["path"] for w in writes]
     assert written[0] == scenarios.SM1_CSS_PATH
     assert "web/style.css" not in written and "web/onboarding.css" not in written
-    commit = next(s for s in script if s.get("tool") == "commit_reviewed")["arguments"]
+    commit = next(s for s in script if isinstance(s, dict) and s.get("tool") == "commit_reviewed")["arguments"]
     assert commit["paths"] == written and "commit_message" in commit
     assert not any(key.startswith("skip_") for key in commit), "the stub rehearsal takes the full user path like the paid prompt"
+    # Decision 3A: the preflight is the author's optional choice, never a mandatory step of the path.
+    assert "preflight_review" not in prompt and not any(isinstance(s, dict) and s.get("tool") == "preflight_review" for s in script)
     text = writes[0]["arguments"]["content"]
     original = (REPO_ROOT / scenarios.SM1_CSS_PATH).read_text(encoding="utf-8")
-    assert scenarios.accent_value(text) == scenarios.SM1_NEW_ACCENT
+    assert {theme: tokens["--accent"] for theme, tokens in scenarios.css_theme_tokens(text).items()} == {
+        theme: scenarios.SM1_NEW_ACCENT for theme in scenarios.SM1_THEMES}, "what the paid prompt asks, in both themes"
     # Hermetic preflight can already be running on the target-accent candidate.
     if scenarios.accent_value(original) != scenarios.SM1_NEW_ACCENT:
         assert text != original
     assert len(text.splitlines()) == len(original.splitlines())
     palette = scenarios.sm1_palette_tokens(text)
     assert scenarios.SM1_REQUIRED_PALETTE <= palette.keys() and all(palette.values())
-    assert all(f"--accent-{alpha}" in palette for alpha in ("04", "05", "08", "10", "12", "18", "22", "25", "35", "45", "55", "65"))
-    for document in ("web/index.html", "web/onboarding_template.html"):
-        assert 'href="/static/ui.css"' in (REPO_ROOT / document).read_text(encoding="utf-8")
+    assert all(f"--accent-{alpha}" in palette for alpha in ("08", "10", "12", "14", "18", "22", "25", "35", "45", "55"))
+    for document, prefix in (("web/index.html", "/static"), ("web/onboarding_template.html", "/onboarding/static")):
+        assert f'href="{prefix}/ui.css"' in (REPO_ROOT / document).read_text(encoding="utf-8")
 
 
 def test_sm1_stub_bumps_the_release_carriers_through_the_sync_ssot(tmp_path):
     """The stub's bump is a strictly-greater release version whose carriers come from
     ``release_sync`` (no hand list) and pass the product's own release admission gate; the
-    acceptance's advisory-row and vision-evidence readers tell the real rows from the audited ones."""
+    acceptance's vision-evidence reader tells the real rows from the others."""
     from ouroboros.commit_admission import release_metadata_preflight
     from ouroboros.tools.release_sync import CARRIER_SPAN_PATHS
 
-    writes = [s for s in scenarios.sm1_stub_script(REPO_ROOT)["agent"] if s.get("tool") == "write_file"]
+    writes = [s for s in scenarios.sm1_stub_script(REPO_ROOT)["agent"] if isinstance(s, dict) and s.get("tool") == "write_file"]
     carriers = {w["arguments"]["path"]: w["arguments"]["content"] for w in writes
                 if w["arguments"]["path"] not in scenarios.SM1_CSS_PATHS}
     assert {"VERSION", "README.md"} <= set(carriers) <= CARRIER_SPAN_PATHS
@@ -1114,19 +1135,23 @@ def test_sm1_stub_bumps_the_release_carriers_through_the_sync_ssot(tmp_path):
     bumped = carriers["VERSION"].strip()
     assert scenarios.version_is_bumped(seed, bumped) and f"| {bumped} |" in carriers["README.md"]
     root = tmp_path / "carriers"
+    root.mkdir()
+    # Release admission reads Git scope, so materialize carriers in a disposable
+    # repository rather than a bare directory.
+    subprocess.run(["git", "init", "-q"], cwd=str(root), check=True)
     for rel in sorted(CARRIER_SPAN_PATHS):
         if (REPO_ROOT / rel).is_file():
             (root / rel).parent.mkdir(parents=True, exist_ok=True)
             (root / rel).write_text(carriers.get(rel) or (REPO_ROOT / rel).read_text(encoding="utf-8"), encoding="utf-8")
     assert release_metadata_preflight(root, scenarios.SM1_COMMIT_MESSAGE, ["VERSION"]) is None
+    assert scenarios.release_carriers_desync_at(root, _commit(root, "coherent release")) == ""
+    (root / "pyproject.toml").write_text('[project]\nversion = "0.0.0"\n', encoding="utf-8")
+    assert "pyproject.toml" in scenarios.release_carriers_desync_at(root, _commit(root, "broken carrier"))
     assert scenarios.sm1_next_version("7.0.0-rc.14") == "7.0.0-rc.15" and scenarios.sm1_next_version("7.0.0") == "7.0.1"
     # A seed cloned from an older ref carries the newer tags: the stub skips taken versions.
     assert scenarios.sm1_next_version("7.0.0-rc.14", {"v7.0.0-rc.15", "v7.0.0-rc.16"}) == "7.0.0-rc.17"
     assert scenarios.sm1_next_version("7.0.0", {"v7.0.1"}) == "7.0.2"
     assert not scenarios.version_is_bumped("7.0.0-rc.14", "7.0.0-rc.14") and not scenarios.version_is_bumped("7.0.0-rc.14", "7.0.0-rc.13")
-    assert scenarios.advisory_run_is_real({"status": "fresh"}) and scenarios.advisory_run_is_real({"status": "stale", "raw_result": "[]"})
-    assert not scenarios.advisory_run_is_real({"status": "bypassed", "bypass_reason": "skip_advisory_review"})
-    assert not scenarios.advisory_run_is_real({"status": "stale", "raw_result": "⚠️ ADVISORY_SKIPPED: prompt too large"})
     rows = [{"tool": "vlm_query"}, {"tool": "browser_action", "args": {"action": "click"}}, {"tool": "read_file"}]
     assert [r["tool"] for r in scenarios.vision_evidence_rows(rows)] == ["vlm_query"]
 
@@ -1420,7 +1445,7 @@ def test_ui_client_prefers_the_suite_interface_when_it_has_this_surface(monkeypa
             self.opened = True
             return self
 
-        goto = computed_property = send_chat = screenshot = rebind = close = lambda self, *a, **k: None
+        goto = color_scheme = computed_property = send_chat = screenshot = rebind = close = lambda self, *a, **k: None
 
     fake = type(sys)("tests.system_e2e.interfaces")
     fake.PlaywrightUIClient = Landed
@@ -1434,13 +1459,12 @@ def test_ui_client_prefers_the_suite_interface_when_it_has_this_surface(monkeypa
 # --------------------------------------------------------------------------- #
 
 @pytest.mark.integration
-@pytest.mark.serial
 def test_stub_sm1_end_to_end_on_a_real_isolated_server(tmp_path):
     """Real server, loopback stub model, no key: the commit lands through the review organ
     (the shared palette plus the release-carrier bump, no skip flags, through the same hermetic
-    tests preflight as the paid prompt), the durable rows and receipts exist, the
-    seed is a clean detached clone of this tree's HEAD and the manifest names the stub as
-    the model."""
+    tests preflight as the paid prompt), its real test run qualifies its adoption, the server re-execs into it and
+    serves it to a real browser, the seed is a clean detached clone of this tree's HEAD and the manifest names the stub as
+    the model. Machinery only: its critics are canned (``stub_lane.MACHINERY_ONLY``)."""
     if str(os.environ.get("OUROBOROS_E2E_DEEP") or "").strip().lower() != "mock":
         pytest.skip("set OUROBOROS_E2E_DEEP=mock to run the stub rehearsal (spawns a real isolated server)")
     out = tmp_path / "out"
@@ -1470,6 +1494,10 @@ def test_orphan_after_stop_fails_a_passing_lane_with_a_typed_reason(tmp_path):
     run_live_lanes._apply_orphan_scan(absent, None)   # no procfs (macOS, Windows): a typed fact, no check
     assert absent["status"] == "pass" and absent["orphan_scan"] == "unavailable:no_procfs"
     assert absent["no_orphans_after_stop"] is None and "no_orphans_after_stop" not in absent["checks"]
+    stuck = row()   # an exit the server stop could not prove fails it alike, with or without procfs
+    run_live_lanes._apply_orphan_scan(stuck, None, _STOP_UNCONFIRMED)
+    assert (stuck["status"], stuck["reason_code"], stuck["server_stop_unconfirmed"]) == ("fail", "checks_failed", _STOP_UNCONFIRMED)
+    assert stuck["checks"] == {"fake": True, "server_stop_confirmed": False} and "server_stop_unconfirmed" not in clean
     dirty = row()
     run_live_lanes._apply_orphan_scan(dirty, [os.getpid()])
     assert dirty["status"] == "fail" and dirty["reason_code"] == "checks_failed"
@@ -1491,3 +1519,57 @@ def test_orphan_after_stop_fails_a_passing_lane_with_a_typed_reason(tmp_path):
     assert recorded["status"] == "fail" and recorded["reason_code"] == "checks_failed"
     index = [json.loads(ln) for ln in (out / "result_index.jsonl").read_text(encoding="utf-8").splitlines() if ln.strip()]
     assert [(r["instance_id"], r["status"], r["reason_code"]) for r in index] == [("SM1_a1", "fail", "checks_failed")]
+
+
+def test_prune_clones_keeps_the_clone_while_the_lane_stop_is_unconfirmed(tmp_path, monkeypatch):
+    """``--prune-clones`` deletes a lane's clone only after a confirmed server stop and a clean or unavailable
+    ``/proc`` scan: a successor that may still run from the clone keeps its source, and the row names why."""
+    monkeypatch.setattr(run_live_lanes, "PROCFS_AVAILABLE", False)
+
+    def clone_after(name: str, server=_NoopServer) -> tuple[dict, pathlib.Path]:
+        (tmp_path / name).mkdir()
+        row = _attempt_row(tmp_path / name, monkeypatch, "SK1", flags="--prune-clones", server=server)
+        return row, tmp_path / name / "SK1" / "out" / "lanes" / "SK1_a1" / "clone"
+
+    row, clone = clone_after("confirmed")
+    assert row["status"] == "pass" and "server_stop_unconfirmed" not in row and not clone.exists()
+    row, clone = clone_after("unconfirmed", _UnconfirmedStopServer)
+    assert row["server_stop_unconfirmed"] == _STOP_UNCONFIRMED and row["status"] == "fail" and (clone / "VERSION").is_file()
+    from tests.system_e2e import harness   # the lane's own /proc oracle: one survivor carries its data root
+    monkeypatch.setattr(run_live_lanes, "PROCFS_AVAILABLE", True)
+    monkeypatch.setattr(harness, "wait_until", lambda predicate, timeout, interval=0.5: False)
+    monkeypatch.setattr(harness, "pids_with_env_value", lambda value: [os.getpid()])
+    row, clone = clone_after("orphaned")
+    assert row["checks"]["no_orphans_after_stop"] is False and (clone / "VERSION").is_file()
+
+
+def test_a_restart_after_an_unconfirmed_stop_starts_no_second_server(tmp_path, monkeypatch):
+    """A non-self-mod restart stops the lane server first; while that stop is unconfirmed no second server starts on
+    the same clone and data root: a typed refusal, the final stop's diagnostics, the clone kept under prune."""
+    started: list = []
+
+    class _Stuck(_UnconfirmedStopServer):
+        start = lambda self, **_k: started.append(self)  # noqa: E731
+
+    row = _attempt_row(tmp_path, monkeypatch, "SK1", lambda ctx: ctx.restart(), flags="--prune-clones", server=_Stuck)
+    assert len(started) == 1, "no second server on a data root whose server may still run"
+    assert row["status"] == "infra_error" and row["refusal"]["type"] == "RuntimeError"
+    assert _STOP_UNCONFIRMED[0] in row["refusal"]["message"] and row["server_stop_unconfirmed"] == _STOP_UNCONFIRMED
+    assert (tmp_path / "SK1" / "out" / "lanes" / "SK1_a1" / "clone" / "VERSION").is_file()
+
+
+def test_sw1_api_fallback_saves_room_mode_without_one_shot_metadata(monkeypatch):
+    from types import SimpleNamespace
+    from devtools.e2e_live import scenarios
+
+    calls, submitted = [], []
+    def api(base, method, path, body, **kwargs):
+        calls.append((method, path, body))
+        return {"ok": True, "subagents_mode": "swarm"}
+    monkeypatch.setattr(scenarios, "_api", api)
+    ctx = SimpleNamespace(ui=None, ui_reason="no browser", server=SimpleNamespace(base_url="http://localhost"),
+                          submit=lambda *args, **kwargs: submitted.append(kwargs) or "",
+                          check=lambda *args, **kwargs: None)
+    scenarios.run_sw1(ctx)
+    assert calls == [("POST", "/api/owner/subagents-mode", {"mode": "swarm"})]
+    assert submitted == [{}]

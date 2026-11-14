@@ -161,7 +161,9 @@ def test_media_tools_visible_to_workspace_tasks(tmp_path):
         workspace_root=workspace,
         workspace_mode="external",
     ))
-    assert registry.get_schema_by_name("ocr_pdf") is not None
+    assert registry.get_schema_by_name("extract_pdf_text") is not None
+    assert registry.get_schema_by_name("ocr_pdf") is None  # compatibility entry remains callable
+    assert registry._entries["ocr_pdf"].handler is registry._entries["extract_pdf_text"].handler
     assert registry.get_schema_by_name("youtube_transcript") is not None
 
 
@@ -199,7 +201,6 @@ def test_attachment_label_sanitized_for_manifest(tmp_path):
 def test_oversized_attachment_image_not_native_injected(tmp_path):
     """An attachment image over the 8MB native-inject cap stays manifest-readable but is NOT
     base64-injected into the message (no context/provider byte-bomb); a small one IS injected."""
-    import json
     from ouroboros.artifacts import task_artifact_dir_path
     from ouroboros.context import build_user_content
 
@@ -207,8 +208,13 @@ def test_oversized_attachment_image_not_native_injected(tmp_path):
     drive.mkdir()
     attach = task_artifact_dir_path(drive, "t", create=True) / "attachments"
     attach.mkdir(parents=True, exist_ok=True)
-    (attach / "big.png").write_bytes(b"\x89PNG\r\n" + b"\0" * (9 * 1024 * 1024))
-    (attach / "small.png").write_bytes(b"\x89PNG\r\n" + b"\0" * 1024)
+    import base64
+    from tests.test_live_image_delivery import pixels
+
+    small = pixels()
+    big = small + bytes(9 * 1024 * 1024)
+    (attach / "big.png").write_bytes(big)
+    (attach / "small.png").write_bytes(small)
     task = {
         "id": "t", "drive_root": str(drive), "text": "look",
         "attachment_images": [
@@ -216,9 +222,13 @@ def test_oversized_attachment_image_not_native_injected(tmp_path):
             {"relpath": "attachments/small.png", "mime": "image/png", "is_image": True, "label": "small"},
         ],
     }
-    blob = json.dumps(build_user_content(task))
-    assert "small.png" in blob  # small image natively injected (its _source_path appears)
-    assert "big.png" not in blob  # oversized image skipped (manifest-readable only, no data URL)
+    content = build_user_content(task)
+    image, = [block for block in content if block["type"] == "image_url"]
+    assert base64.b64decode(image["image_url"]["url"].split(",", 1)[1]) == small
+    assert image["_source_path"].endswith("small.png")
+    note = next(block["text"] for block in content if block["type"] == "text" and "big.png" in block["text"])
+    assert "exceeds the 8 MiB automatic attachment read budget" in note and "Original:" in note
+    assert (attach / "big.png").read_bytes() == big
 
 
 def test_resolve_ffmpeg_chain_sibling_then_imageio_then_path(tmp_path, monkeypatch):
@@ -284,11 +294,8 @@ def test_media_user_files_admission_read_parity(tmp_path, monkeypatch):
     assert fp is not None
 
 
-def test_media_restricted_subagent_secret_data_path_blocked(tmp_path):
-    """SC-6 read_file parity: a restricted (read-only/acting) subagent cannot
-    read secret/owner-control data paths via read_file; ocr_pdf/extract_video_frames
-    must not admit them either now that the whole runtime-data drive is an
-    admission root."""
+def test_media_child_reads_credential_named_runtime_content(tmp_path):
+    """Helpers receive the same runtime file bytes as their parent."""
     from types import SimpleNamespace
     from ouroboros.tools.media import _resolve_local_file
 
@@ -303,8 +310,7 @@ def test_media_restricted_subagent_secret_data_path_blocked(tmp_path):
         task_constraint={"mode": "local_readonly_subagent"},
     )
     fp, err = _resolve_local_file(ctx, str(doc), max_bytes=10**7)
-    assert fp is None
-    assert "PATH_BLOCKED" in err and "secret or owner-control" in err
+    assert fp == doc and err == ""
 
 
 def test_media_split_drive_child_canonical_owner_state_blocked(tmp_path, monkeypatch):
@@ -331,8 +337,5 @@ def test_media_split_drive_child_canonical_owner_state_blocked(tmp_path, monkeyp
     )
     fp, err = _resolve_local_file(ctx, str(owner_state), max_bytes=10**7)
     assert fp is None
-    # Both refusals are correct: POSIX hits the restricted-subagent secret/
-    # owner-control denial; Windows path-shape hits the earlier workspace-
-    # overlap user_files denial first. Blocked-by-a-typed-path-guard is the pin.
-    assert "PATH_BLOCKED" in err
-    assert ("secret or owner-control" in err) or ("overlaps the Ouroboros repo/runtime workspace" in err)
+    # This is the same ordinary-mode skill owner-state rule as the parent.
+    assert "DATA_READ_BLOCKED" in err or "USER_FILES_PATH_BLOCKED" in err

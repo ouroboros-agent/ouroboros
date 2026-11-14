@@ -45,7 +45,7 @@ TRUTHY_ROUTE = re.compile(
 # (repo-relative path, exact stripped line) -> (occurrences, why it stays)
 ALLOWED = {
     ("supervisor/terminal_delivery.py", "if not chat_id:"): (
-        3,
+        2,
         "lineage_chat_id() answers with the task's OWN chat: a project-homed run "
         "gets its room, and 0 means the run was never homed. Delivering an "
         "unhomed answer into the hidden partition would add rows to the "
@@ -60,16 +60,12 @@ ALLOWED = {
         "chat_id means 'the event carried no chat' and the owner chat is the "
         "fallback address, not the hidden partition.",
     ),
-    ("supervisor/worker_chat_lane.py", "if not chat_id:"): (
-        1,
-        "Auto-resume gate, where owner_chat_id 0 means 'no owner chat "
-        "configured' rather than the panel.",
-    ),
-    ("supervisor/terminal_delivery.py", "if not tid or not core_text or not chat_id:"): (
+    ("supervisor/terminal_delivery.py", "if not tid or not (core_text or quiet) or not chat_id:"): (
         1,
         "lineage_chat_id() again: 0 means the run was never homed, and pushing "
         "an unhomed answer into a partition with no reader would add rows to the "
-        "chat log a benchmark parses for its final answer.",
+        "chat log a benchmark parses for its final answer. A wake's silent finish "
+        "(#1814) changed only the answer condition, not this chat test.",
     ),
 }
 

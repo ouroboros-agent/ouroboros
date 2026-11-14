@@ -57,24 +57,9 @@ class StagedSkill:
             )
 
 
-def _is_sensitive(path: pathlib.PurePosixPath) -> bool:
-    """Use the review denylist so marketplace cannot import sensitive filenames."""
-    try:
-        from ouroboros.tools.review_helpers import (
-            _SENSITIVE_EXTENSIONS,
-            _SENSITIVE_NAMES,
-        )
-    except Exception:  # pragma: no cover — defensive, the module exists
-        return False
-    name_lower = path.name.lower()
-    if name_lower in _SENSITIVE_NAMES:
-        return True
-    return any(name_lower.endswith(ext) for ext in _SENSITIVE_EXTENSIONS)
-
-
 def _is_loadable_binary(path: pathlib.PurePosixPath) -> bool:
     try:
-        from ouroboros.skill_review import _LOADABLE_BINARY_EXTENSIONS
+        from ouroboros.skill_review_packs import _LOADABLE_BINARY_EXTENSIONS
     except Exception:  # pragma: no cover
         return False
     name_lower = path.name.lower()
@@ -180,8 +165,8 @@ def stage(
                             rel_path = pathlib.PurePosixPath(*parts[1:])
                             if not rel_path.parts:
                                 continue
+                    # A credential-like name (`.env`, `credentials.json`) refuses nothing: review judges its bytes.
                     for finding, reason in (
-                        (_is_sensitive(rel_path), f"Archive contains sensitive-shape filename {rel_path}"),
                         (_has_review_opaque_dir(rel_path), f"Archive contains review-opaque dependency directory {rel_path}"),
                         (_is_loadable_binary(rel_path), f"Archive contains loadable-binary file {rel_path}"),
                     ):
@@ -246,6 +231,54 @@ def stage(
         raise
 
 
+def copy_tree_checked(source: pathlib.Path, staging_dir: pathlib.Path) -> int:
+    """Copy a skill folder from a source clone into ``staging_dir`` under the archive policy.
+
+    The same bounds as an archive: no symlinks, no traversal, review-opaque or loadable-binary files
+    refused outside Cyber Pro (advice there), per-file and total size caps, a file-count cap. The
+    loader's cache names (``.git``, ``__pycache__``, ``node_modules``...) are not copied: they are never
+    part of a release digest either. Returns the number of files copied; a refusal removes ``staging_dir``.
+    """
+    from ouroboros.skill_loader import _SKILL_DIR_CACHE_NAMES as skip
+
+    advisory = mode_has_unrestricted_agency(get_runtime_mode())
+    source = pathlib.Path(source)
+    total = count = 0
+    staging_dir.mkdir(parents=True, exist_ok=False)
+    try:
+        pending = [source]
+        while pending:
+            directory = pending.pop()
+            for path in sorted(directory.iterdir()):
+                if path.name in skip:
+                    continue
+                rel = pathlib.PurePosixPath(path.relative_to(source).as_posix())
+                _reject_if(path.is_symlink(), f"Skill file {rel} is a symlink (rejected)")
+                if path.is_dir():
+                    pending.append(path)
+                    continue
+                if _is_loadable_binary(rel):
+                    reason = f"Skill contains loadable-binary file {rel}"
+                    if not advisory:
+                        raise FetchError(reason)
+                    log.warning("Cyber Pro skill copy advice: %s", reason)
+                size = path.stat().st_size
+                _reject_if(size > _MAX_PER_FILE_BYTES, f"Skill file {rel} is {size} bytes (cap {_MAX_PER_FILE_BYTES})")
+                total += size
+                count += 1
+                _reject_if(total > _MAX_TOTAL_BYTES, f"Skill exceeds {_MAX_TOTAL_BYTES} bytes")
+                _reject_if(count > _MAX_FILE_COUNT, f"Skill exceeds file count cap {_MAX_FILE_COUNT}")
+                target = staging_dir / pathlib.Path(*rel.parts)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(path, target)
+        _reject_if(not ((staging_dir / "SKILL.md").is_file() or (staging_dir / "skill.json").is_file()),
+                   "Skill folder has no SKILL.md or skill.json")
+        return count
+    except Exception:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
+
+
 def land_staged_tree(staging: pathlib.Path, target_dir: pathlib.Path, *, replacement_suffix: str) -> None:
     """Atomically swap a staged tree into place, restoring old content on move failure."""
     staging = pathlib.Path(staging)
@@ -290,6 +323,7 @@ def _common_top_prefix(members: List[zipfile.ZipInfo]) -> str:
 __all__ = [
     "FetchError",
     "StagedSkill",
+    "copy_tree_checked",
     "land_staged_tree",
     "stage",
 ]

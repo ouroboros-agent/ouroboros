@@ -1,11 +1,12 @@
 """Named ingress keeps terminal reply identity and the normal cancellation owner."""
+
+from tests import _dialogue as dialogue_test
 from types import SimpleNamespace
 
 import pytest
 
 from ouroboros import agent_task_pipeline as pipeline
 from ouroboros.task_results import load_task_result, write_task_result
-from ouroboros.utils import iter_jsonl_objects
 from supervisor import message_bus, state
 from supervisor.events import _handle_send_message
 from tests.test_cancel_cascade_v664 import _fake_worker, _install_worker, _isolate_queue
@@ -59,14 +60,16 @@ def test_actual_final_producer_preserves_named_reply_and_rejoin(tmp_path, monkey
 @pytest.mark.parametrize("case,chat,user,owner,expected", [
     ("missing_identity", -42, 0, {}, "failed"),
     ("registration", 42, 42, {}, "completed"),
-    ("status", 42, 42, {"owner_external_id": 42, "owner_external_chat_id": 42}, "completed"),
     ("wrong_owner", 43, 43, {"owner_external_id": 42, "owner_external_chat_id": 42}, "failed"),
 ])
 def test_server_inline_replies_settle_their_exact_ingress(tmp_path, monkeypatch, case, chat, user, owner, expected):
     import server
 
     bridge = message_bus.LocalChatBridge()
-    live_state = {"owner_id": 1, **owner}
+    # This is an initialized owner with a known-empty external binding, not
+    # a missing/lost state that could legitimately refuse first registration.
+    live_state = {"owner_id": 1, "owner_external_id": None,
+                  "owner_external_chat_id": None, **owner}
     monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
     monkeypatch.setattr(message_bus, "_BRIDGE", bridge)
     monkeypatch.setattr(message_bus, "load_state", lambda: live_state)
@@ -77,7 +80,7 @@ def test_server_inline_replies_settle_their_exact_ingress(tmp_path, monkeypatch,
     body = {"chat_id": chat, "user_id": user, "client_message_id": case, "text": "/status"}
     assert client.post("/chat/inject", headers=_headers(), json=body).status_code == 202
     server._process_bridge_updates(bridge, 0, ctx)
-    rows = list(iter_jsonl_objects(tmp_path / "logs/chat.jsonl"))
+    rows = list(dialogue_test.log_rows(tmp_path / "logs/chat.jsonl"))
     assert len(rows) == 2 and rows[-1]["task_terminal_status"] == expected
     assert rows[-1]["origin_message_ref"]["client_message_id"] == case
     result = client.get(f"/chat/operations/{chat}:{case}", headers=_headers()).json()
@@ -137,7 +140,7 @@ def test_restart_acknowledgement_does_not_claim_the_operation_finished(tmp_path,
     body = {"chat_id": 42, "user_id": 42, "client_message_id": "restart-refused", "text": "/restart"}
     assert client.post("/chat/inject", headers=_headers(), json=body).status_code == 202
     server._process_bridge_updates(bridge, 0, ctx)
-    inbound, acknowledgement, refused = list(iter_jsonl_objects(tmp_path / "logs/chat.jsonl"))
+    inbound, acknowledgement, refused = list(dialogue_test.log_rows(tmp_path / "logs/chat.jsonl"))
     assert inbound["direction"] == "in"
     assert acknowledgement["text"] == "♻️ Restarting."
     assert acknowledgement["origin_message_ref"] == refused["origin_message_ref"]

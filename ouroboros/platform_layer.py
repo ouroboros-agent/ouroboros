@@ -16,6 +16,10 @@ import sys
 import threading
 import time
 from typing import Any, Callable, List, Optional
+from ouroboros.platform_peer import local_connection_peer  # noqa: F401 — platform facade
+from ouroboros.platform_process_target import (  # noqa: F401 — platform facade
+    capture_process_stop_target, observe_child_exit, retained_child_group,
+)
 
 log = logging.getLogger(__name__)
 
@@ -25,18 +29,16 @@ IS_MACOS = sys.platform == "darwin"
 IS_LINUX = sys.platform.startswith("linux")
 
 PATH_SEP = ";" if IS_WINDOWS else ":"
-_SUBPROCESS_NO_WINDOW = (
-    getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if IS_WINDOWS else 0
-)
+SHUTDOWN_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+_SUBPROCESS_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if IS_WINDOWS else 0
+WINDOWS_CREATE_SUSPENDED = getattr(subprocess, "CREATE_SUSPENDED", 0x4)
 _PATH_BOOTSTRAPPED = False
 
 # POSIX signal numbers -> names, the same on every platform. ``signal.Signals``
 # knows only the host's own signals, so a child that died of SIGKILL would be
 # named "SIG9" wherever the reader lacks that signal (Windows).
-_POSIX_SIGNAL_NAMES = {
-    1: "SIGHUP", 2: "SIGINT", 3: "SIGQUIT", 6: "SIGABRT", 9: "SIGKILL",
-    11: "SIGSEGV", 13: "SIGPIPE", 14: "SIGALRM", 15: "SIGTERM",
-}
+_POSIX_SIGNAL_NAMES = {1: "SIGHUP", 2: "SIGINT", 3: "SIGQUIT", 6: "SIGABRT", 9: "SIGKILL",
+                       11: "SIGSEGV", 13: "SIGPIPE", 14: "SIGALRM", 15: "SIGTERM"}
 
 
 def posix_signal_name(signum: int) -> str:
@@ -54,11 +56,7 @@ def posix_signal_name(signum: int) -> str:
 def executable_name_candidates(name: str) -> List[str]:
     """Platform spellings for an executable stored in a known directory."""
     base = str(name or "").strip()
-    if not base:
-        return []
-    if IS_WINDOWS:
-        return [f"{base}.cmd", f"{base}.exe", f"{base}.bat", base]
-    return [base]
+    return ([f"{base}.cmd", f"{base}.exe", f"{base}.bat", base] if IS_WINDOWS else [base]) if base else []
 
 
 def local_zoneinfo():
@@ -82,22 +80,42 @@ def local_zoneinfo():
     return datetime.datetime.now().astimezone().tzinfo or datetime.timezone.utc
 
 
+def is_mount_point(path: pathlib.Path | str) -> bool:
+    """Include Linux same-device bind/volume mounts that stat-based ismount misses.
+
+    Linux's mountinfo names mounts in this process's namespace. An unreadable
+    table raises OSError: callers about to move a directory must not guess."""
+    target = pathlib.Path(path).resolve()
+    if os.path.ismount(target):
+        return True
+    if not IS_LINUX:
+        return False
+    with open("/proc/self/mountinfo", encoding="utf-8", errors="surrogateescape") as mounts:
+        return any(len(fields) >= 6 and re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), fields[4]) == str(target)
+                   for fields in map(str.split, mounts))
+
+
 def is_container_env() -> bool:
     """Return whether explicit env or Docker sentinel indicates a container."""
     # /.dockerenv is Docker's Linux sentinel.
-    return os.environ.get("OUROBOROS_CONTAINER") == "1" or (
-        IS_LINUX and pathlib.Path("/.dockerenv").exists()
-    )
+    return os.environ.get("OUROBOROS_CONTAINER") == "1" or (IS_LINUX and pathlib.Path("/.dockerenv").exists())
 
 
 def bootstrap_process_path() -> list[str]:
-    """Add existing common user tool directories to this process PATH once."""
-
+    """Add existing common user tool directories to this process PATH once, ahead of its entries."""
     global _PATH_BOOTSTRAPPED
     if _PATH_BOOTSTRAPPED:
         return []
     _PATH_BOOTSTRAPPED = True
+    path = os.environ.get("PATH", "")
+    if added := common_tool_directories(path):
+        os.environ["PATH"] = PATH_SEP.join([*added, *[part for part in path.split(PATH_SEP) if part]])
+    return added
 
+
+def common_tool_directories(search_path: str) -> list[str]:
+    """The existing common user tool directories (package managers, per-user installs) that the PATH value
+    ``search_path`` lacks, in policy order: a GUI launch can inherit a system PATH without them. Changes nothing."""
     candidates: list[pathlib.Path] = []
     home = pathlib.Path.home()
     if IS_MACOS or IS_LINUX:
@@ -130,7 +148,7 @@ def bootstrap_process_path() -> list[str]:
         if user_profile:
             candidates.append(user_profile / ".cargo" / "bin")
 
-    existing = [part for part in os.environ.get("PATH", "").split(PATH_SEP) if part]
+    existing = [part for part in search_path.split(PATH_SEP) if part]
     existing_norm = {str(pathlib.Path(part)).lower() if IS_WINDOWS else str(pathlib.Path(part)) for part in existing}
     added: list[str] = []
     for candidate in candidates:
@@ -145,15 +163,13 @@ def bootstrap_process_path() -> list[str]:
             added.append(text)
         except OSError:
             continue
-    if added:
-        os.environ["PATH"] = PATH_SEP.join([*added, *existing])
     return added
 
 
 def request_native_attention(
     show_window: Optional[Callable[[], None]] = None, *, sound: bool = True,
 ) -> dict[str, object]:
-    """Request one best-effort window/sound cue without claiming a banner."""
+    """Legacy attention bridge. macOS has no separate sound: notifications own it."""
     window_attention = ""
     if show_window is not None:
         try:
@@ -161,21 +177,13 @@ def request_native_attention(
             window_attention = "launcher"
         except Exception as exc:
             log.debug("Native window attention failed: %s", exc)
-    if not sound:
+    if not sound or IS_MACOS:
         if window_attention:
             return {"ok": True, "status": "window_only", "sound_played": False,
                     "window_attention": window_attention}
         return {"ok": False, "status": "unsupported", "reason": "no_window_attention"}
     try:
-        if IS_MACOS:
-            path = "/System/Library/Sounds/Glass.aiff"
-            if not pathlib.Path(path).is_file():
-                raise FileNotFoundError(path)
-            proc = subprocess.run(["/usr/bin/afplay", path], check=False,
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
-            if proc.returncode:
-                raise RuntimeError(f"sound_exit_{proc.returncode}")
-        elif IS_WINDOWS:
+        if IS_WINDOWS:
             import winsound
             winsound.MessageBeep(winsound.MB_ICONASTERISK)
         elif IS_LINUX and (command := shutil.which("canberra-gtk-play")):
@@ -200,11 +208,9 @@ def request_native_attention(
 
 
 def scrub_repo_from_pythonpath(env: dict[str, str], repo_dir: "str | pathlib.Path | None") -> dict[str, str]:
-    """Copy of *env* without ``PYTHONPATH`` entries resolving to the system repo.
-
-    An EXTERNAL-workspace command inheriting that entry resolves its own
-    ``import web``/``server``/``ouroboros`` to OUROBOROS's modules; dropping
-    ONLY the repo entry isolates the target (no-op without one)."""
+    """Copy of *env* without ``PYTHONPATH`` entries resolving to the system repo. An EXTERNAL-workspace command
+    inheriting that entry resolves its own ``import web``/``server``/``ouroboros`` to OUROBOROS's modules;
+    dropping ONLY the repo entry isolates the target (no-op without one)."""
     out = dict(env)
     raw = out.get("PYTHONPATH", "")
     if not raw or not repo_dir:
@@ -248,13 +254,13 @@ _KERNEL_LOCK_TIER: dict = {}  # lock directory -> (kernel locks enforced there, 
 _KERNEL_LOCK_TIER_LOCK = threading.Lock()  # one probe per directory, one verdict for every thread
 
 
-def kernel_file_locks_enforced(lock_path: pathlib.Path) -> bool:
-    """Probe and cache kernel-lock capability per directory, never on a live refusal.
-
-    Unprobeable directories stay enforced and retry later; unsupported/ENOLCK
-    select the recorded name-only tier. See ARCHITECTURE §1 "Platform substrate"."""
+def kernel_file_locks_enforced(lock_path: pathlib.Path, *, known: Optional[tuple] = None) -> bool:
+    """Probe/cache per directory; restore ``known=(tier, errno)`` after mount validation,
+    or ``(None, None)`` to recheck. Unprobeable paths retry; unsupported/ENOLCK use name locking."""
     directory = os.path.realpath(str(pathlib.Path(lock_path).parent))
     with _KERNEL_LOCK_TIER_LOCK:
+        if known is not None:
+            _KERNEL_LOCK_TIER[directory] = known
         tier, refused = _KERNEL_LOCK_TIER.get(directory, (None, None))
         if tier is None:
             probe = os.path.join(directory, f".kernel-lock-probe.{os.getpid()}.{time.time_ns()}")
@@ -276,7 +282,7 @@ def kernel_file_locks_enforced(lock_path: pathlib.Path) -> bool:
                 except OSError:
                     log.debug("Kernel-lock probe %s left behind", probe, exc_info=True)
             if not tier:
-                log.warning("No kernel file locks under %s (errno %s): locks there use the name protocol only", directory, refused)
+                log.warning("Name-only locks under %s (errno %s)", directory, refused)
             _KERNEL_LOCK_TIER[directory] = (tier, refused)
     return tier
 
@@ -290,20 +296,29 @@ def acquire_exclusive_file_lock(
     poll_sec: float = 0.05,
     owner_aware_stale: bool = False,
     refuse_name_tier_errnos: frozenset = frozenset(),
+    outcome: Optional[dict] = None,
 ) -> Optional[int]:
-    """Acquire a descriptor-owned lock whose path still names the held inode.
+    """Acquire a descriptor-owned lock; optional ``outcome`` records failure facts.
 
-    Kernel errors fail closed except contention; owner-aware stale recovery
-    cannot evict a live writer. Name-tier refusal is caller policy. Platform
-    eviction/release ordering and limitations: ARCHITECTURE §1 "Platform substrate"."""
+    Only contention retries; owner-aware recovery cannot evict a live writer.
+    Name-tier refusal is caller policy; missing outcomes are unknown. See ARCHITECTURE §1 "Platform substrate"."""
+    def report(reason, error=None):
+        if outcome is not None:
+            outcome.update(reason=reason, errno=getattr(error, "errno", None))
+    report("unknown")
     lock_path = pathlib.Path(lock_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     enforced = kernel_file_locks_enforced(lock_path)
     if not enforced and _KERNEL_LOCK_TIER.get(os.path.realpath(str(lock_path.parent)), (False, None))[1] in refuse_name_tier_errnos:
+        report("name_tier_refused")
         log.warning("Name-tier lock refused by caller policy at %s: no lock taken", lock_path)
         return None
-    started = time.time()
-    while (time.time() - started) < timeout_sec:
+    started = time.monotonic()
+    first_attempt = True
+    retry_after_stale = False
+    while first_attempt or retry_after_stale or (time.monotonic() - started) < timeout_sec:
+        first_attempt = False
+        retry_after_stale = False
         try:
             fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
             stamp = (metadata or f"pid={os.getpid()} ts={time.time()}\n").encode("utf-8")
@@ -317,37 +332,42 @@ def acquire_exclusive_file_lock(
             except OSError as exc:
                 if exc.errno not in _LOCK_HELD_ERRNOS:
                     release_exclusive_file_lock(lock_path, fd)  # ours, yet never a hold
+                    report("kernel_refused", exc)
                     log.warning("Kernel lock refused at %s (errno %s): no lock taken", lock_path, exc.errno)
                     return None
             else:
                 # Only a readable fd/path identity proves the creator still owns this name.
-                won = _lock_identity(fd)[:2]
-                if won and won == _lock_identity(lock_path)[:2]:
+                won, named = _lock_identity(fd)[:2], _lock_identity(lock_path)[:2]
+                if won and won == named:
+                    report("acquired")
                     return fd
-                if not won:
+                if not won or not named:
                     with contextlib.suppress(OSError):
                         if lock_path.read_bytes() == stamp:
                             os.unlink(str(lock_path))
                     os.close(fd)
+                    report("identity_unreadable")
                     log.warning("Lock identity unreadable at %s: no lock taken", lock_path)
                     return None
             if IS_WINDOWS:  # a lock goes before its handle (see _win32_unlock)
                 file_unlock(fd)
-            os.close(fd)  # the file we created was kernel-locked by a racing
-            time.sleep(poll_sec)  # evictor's probe, or evicted: the name alone is
-            continue  # not ownership — stand down and re-contend
-        except (FileExistsError, PermissionError):
-            stale = refused = None
+            os.close(fd)  # A racing evictor locked or removed our newly created name;
+            report("contention")  # creation alone is not ownership, so re-contend.
+        except (FileExistsError, PermissionError) as creation_error:
+            report("permission" if isinstance(creation_error, PermissionError) else "unknown", creation_error)
+            stale = refused = probe = None
             try:
                 probe = os.open(str(lock_path), os.O_RDONLY)
                 try:
                     judged = _lock_identity(probe)
-                    owner_pid = 0
-                    for field in os.read(probe, 512).decode("utf-8", "replace").split():
-                        if field.startswith("pid=") and field[4:].isdigit():
-                            owner_pid = int(field[4:])
-                    stale = bool(judged) and (time.time() - judged[2] / 1e9) > stale_sec
-                    if judged and owner_aware_stale and owner_pid > 0:
+                    if not judged:
+                        return report("identity_unreadable")
+                    if isinstance(creation_error, FileExistsError):
+                        report("contention")
+                    fields = os.read(probe, 512).decode("utf-8", "replace").split()
+                    owner_pid = ([int(f[4:]) for f in fields if f.startswith("pid=") and f[4:].isdigit()] or [0])[-1]
+                    stale = (time.time() - judged[2] / 1e9) > stale_sec
+                    if owner_aware_stale and owner_pid > 0:
                         stale = not pid_is_alive(owner_pid)  # Proven death needs no age grace.
                     # Judge and evict the same inode under a kernel hold.
                     if stale and enforced:
@@ -360,6 +380,7 @@ def acquire_exclusive_file_lock(
                             if not IS_WINDOWS:  # Windows deletes no open file: it unlinks
                                 if _lock_identity(lock_path) == judged:  # below, after
                                     os.unlink(str(lock_path))  # under the held flock
+                                    retry_after_stale = True  # only our own eviction outlives the deadline
                                 continue
                 finally:
                     if IS_WINDOWS:  # the probe's hold goes before its handle
@@ -367,16 +388,29 @@ def acquire_exclusive_file_lock(
                     os.close(probe)
                 if stale and _lock_identity(lock_path) == judged:
                     lock_path.unlink()
+                    retry_after_stale = True
                     continue
-            except Exception:
-                log.debug("Failed to inspect/remove stale lock %s", lock_path, exc_info=True)
+            except Exception as exc:
+                if probe is None and isinstance(creation_error, FileExistsError) and isinstance(exc, FileNotFoundError):
+                    report("contention", exc)  # Observed holder released its name before our probe.
+                elif probe is None and IS_WINDOWS and isinstance(exc, PermissionError):
+                    # Windows refuses to open a name its holder is deleting (delete pending, or the
+                    # deleter's DELETE handle, which CPython's open does not share): that release is contention.
+                    report("contention", exc)
+                else:
+                    report("permission" if isinstance(exc, PermissionError) else "unknown", exc)
+                    log.debug("Failed to inspect/remove stale lock %s", lock_path, exc_info=True)
             if refused is not None:
+                report("kernel_refused", refused)
                 log.warning("Kernel lock refused on stale %s (%s): no lock taken", lock_path, refused)
                 return None
-            time.sleep(poll_sec)
-        except Exception:
+        except Exception as exc:
+            report("permission" if isinstance(exc, PermissionError) else "unknown", exc)
             log.warning("Failed to acquire lock at %s", lock_path, exc_info=True)
             break
+        remaining = timeout_sec - (time.monotonic() - started)  # contention polls only inside the deadline
+        if remaining > 0:
+            time.sleep(min(poll_sec, remaining))
     return None
 
 
@@ -398,10 +432,8 @@ def refresh_exclusive_file_lock(lock_path: pathlib.Path, lock_fd: Optional[int])
 
 
 def _unlink_lock_path(lock_path: pathlib.Path, held: Optional[tuple]) -> None:
-    """Unlink only the held identity (None means unconditional path-only cleanup).
-
-    Retry transient Windows sharing refusal within the bounded release window;
-    leave a replaced path alone. See ARCHITECTURE §1 "Platform substrate"."""
+    """Unlink only the held identity (None means unconditional path-only cleanup). Retry transient Windows sharing
+    refusal within the bounded release window; leave a replaced path alone. See ARCHITECTURE §1 "Platform substrate"."""
     deadline = time.monotonic() + 2.0
     while True:
         try:
@@ -421,10 +453,8 @@ def _unlink_lock_path(lock_path: pathlib.Path, held: Optional[tuple]) -> None:
 
 
 def release_exclusive_file_lock(lock_path: pathlib.Path, lock_fd: Optional[int]) -> None:
-    """Release only this descriptor's lock path, never a successor's.
-
-    POSIX unlinks under the hold; Windows unlocks/closes before identity-checked
-    unlink. See ARCHITECTURE §1 "Platform substrate" for the sharing gap."""
+    """Release only this descriptor's lock path, never a successor's. POSIX unlinks under the hold; Windows
+    unlocks/closes before identity-checked unlink. See ARCHITECTURE §1 "Platform substrate" for the sharing gap."""
     lock_path = pathlib.Path(lock_path)
     if lock_fd is None:
         return
@@ -456,14 +486,24 @@ def open_path_external(path: pathlib.Path) -> None:
     elif IS_WINDOWS:
         os.startfile(str(target))  # type: ignore[attr-defined]
     else:
-        subprocess.Popen(["xdg-open", str(target)])
+        from ouroboros.desktop_media import host_environment
+
+        subprocess.Popen(["xdg-open", str(target)], env=host_environment())
+
+
+def app_location_labels(path) -> list:
+    """What is measured about where an app copy runs: ``translocated`` (an ``AppTranslocation`` path component),
+    ``read-only mount`` (``statvfs`` sets ``ST_RDONLY``; a path that cannot be measured gets no label)."""
+    labels = ["translocated"] if any("AppTranslocation" in pathlib.Path(p).parts for p in (path, os.path.realpath(path))) else []
+    try:
+        return labels + (["read-only mount"] if os.statvfs(path).f_flag & os.ST_RDONLY else [])
+    except (OSError, AttributeError):  # Windows has no statvfs
+        return labels
 
 
 def is_unstable_macos_app_path(path: pathlib.Path) -> bool:
-    """Return whether a macOS app path is likely a DMG/AppTranslocation mount."""
-    raw = str(path).replace("\\", "/")
-    resolved = str(path.resolve()).replace("\\", "/")
-    return any("AppTranslocation" in p or p.startswith("/Volumes/") for p in (raw, resolved))
+    """Whether an app copy is translocated or on a read-only mount (a disk image); a writable volume is not."""
+    return bool(app_location_labels(path))
 
 
 def ensure_windows_user_path(path: pathlib.Path) -> None:
@@ -493,9 +533,8 @@ def _broadcast_windows_environment_change() -> None:
         import ctypes
 
         result = ctypes.c_ulong()
-        ctypes.windll.user32.SendMessageTimeoutW(  # HWND_BROADCAST, WM_SETTINGCHANGE, SMTO_ABORTIFHUNG
-            0xFFFF, 0x001A, 0, "Environment", 0x0002, 5000, ctypes.byref(result),
-        )
+        # HWND_BROADCAST, WM_SETTINGCHANGE, SMTO_ABORTIFHUNG
+        ctypes.windll.user32.SendMessageTimeoutW(0xFFFF, 0x001A, 0, "Environment", 0x0002, 5000, ctypes.byref(result))
     except Exception:
         pass
 
@@ -512,12 +551,13 @@ _lock_fd: Any = None
 
 
 def pid_lock_acquire(path: str) -> bool:
-    """Acquire an exclusive PID lock, closing the fd on lock failure."""
+    """Exclusive PID lock; a loser closes its fd and never truncates the holder's PID (second-launch signal)."""
     global _lock_fd
     fd_obj = None
     try:
-        fd_obj = open(path, "w")
+        fd_obj = open(path, "a")
         file_lock_exclusive_nb(fd_obj.fileno())
+        fd_obj.truncate(0)
         fd_obj.write(str(os.getpid()))
         fd_obj.flush()
         # Promote to global only after lock and PID write both succeed.
@@ -533,12 +573,13 @@ def pid_lock_acquire(path: str) -> bool:
 def pid_lock_release(path: str) -> None:
     """Release the PID lock."""
     global _lock_fd
-    if _lock_fd is not None:
-        with contextlib.suppress(Exception):
-            file_unlock(_lock_fd.fileno())
-        with contextlib.suppress(Exception):
-            _lock_fd.close()
-        _lock_fd = None
+    if _lock_fd is None:
+        return  # already released, or another launcher owns the new PID file
+    with contextlib.suppress(Exception):
+        file_unlock(_lock_fd.fileno())
+    with contextlib.suppress(Exception):
+        _lock_fd.close()
+    _lock_fd = None
     with contextlib.suppress(Exception):
         os.unlink(path)
 
@@ -547,29 +588,25 @@ def pid_lock_release(path: str) -> None:
 
 def file_lock_exclusive(fd: int) -> None:
     """Acquire an exclusive (write) lock on a file descriptor. Blocks."""
-    if IS_WINDOWS:
-        _win32_lock(fd, exclusive=True, blocking=True)
-    else:
-        import fcntl
-        fcntl.flock(fd, fcntl.LOCK_EX)
+    _file_lock(fd, exclusive=True, blocking=True)
 
 
-def file_lock_shared(fd: int) -> None:
-    """Acquire a shared (read) lock on a file descriptor. Blocks."""
-    if IS_WINDOWS:
-        _win32_lock(fd, exclusive=False, blocking=True)
-    else:
-        import fcntl
-        fcntl.flock(fd, fcntl.LOCK_SH)
+def file_lock_shared(fd: int, *, blocking: bool = True) -> None:
+    """Acquire a shared (read) lock; a non-blocking attempt raises OSError if unavailable."""
+    _file_lock(fd, exclusive=False, blocking=blocking)
 
 
 def file_lock_exclusive_nb(fd: int) -> None:
     """Try to acquire an exclusive lock, non-blocking. Raises OSError on failure."""
+    _file_lock(fd, exclusive=True, blocking=False)
+
+
+def _file_lock(fd: int, *, exclusive: bool, blocking: bool) -> None:
     if IS_WINDOWS:
-        _win32_lock(fd, exclusive=True, blocking=False)
+        _win32_lock(fd, exclusive=exclusive, blocking=blocking)
     else:
         import fcntl
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | (0 if blocking else fcntl.LOCK_NB))
 
 
 def file_unlock(fd: int) -> None:
@@ -582,66 +619,63 @@ def file_unlock(fd: int) -> None:
 
 
 def pid_is_alive(pid: int) -> bool:
-    """Observe process presence; access denial remains alive, not signal authority.
-
-    Windows uses OpenProcess/GetExitCodeProcess, never a signal-zero probe."""
-
+    """Observe process presence; access denial remains alive, not signal authority. Windows probes
+    OpenProcess/GetExitCodeProcess, never os.kill(pid, 0): there signal 0 is CTRL_C_EVENT, delivered to the pid's
+    whole console group. An unexplained Windows open failure reads as dead here, never as provably gone."""
     if pid <= 0:
         return False
     if IS_WINDOWS:
-        # os.kill(pid, 0) is WRONG here: signal 0 is CTRL_C_EVENT, delivered to the pid's
-        # whole console group. Probe with OpenProcess + GetExitCodeProcess, which never signals anything.
-        import ctypes
-        from ctypes import wintypes
+        return _windows_process_state(pid) in {"running", "denied", "unreadable"}
+    return not pid_provably_gone(pid)  # EPERM: it exists and refuses us
 
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
-        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
-        kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
-        kernel32.CloseHandle.restype = wintypes.BOOL
-        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-        _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        _STILL_ACTIVE = 259
-        _ERROR_ACCESS_DENIED = 5
-        handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
-        if not handle:
-            # A live but access-protected process reads as alive; anything else (invalid parameter -> no such pid) reads as dead.
-            return ctypes.get_last_error() == _ERROR_ACCESS_DENIED
-        try:
-            code = wintypes.DWORD()
-            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                return True  # opened but unreadable -> fail SAFE toward alive
-            return int(code.value) == _STILL_ACTIVE
-        finally:
-            kernel32.CloseHandle(handle)
+
+def signal_pid(pid: int, signum: int = 0) -> bool:
+    """POSIX: deliver ``signum`` (0 only probes); False when it cannot. Delivery proves no identity."""
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+        os.kill(pid, signum)
+    except OSError:
         return False
-    except OSError:  # EPERM: it exists and refuses us; anything else undeterminable reads as present
-        pass
     return True
 
 
 def pid_is_signalable(pid: int) -> bool:
-    """Whether this caller can signal a PID: POSIX signal-zero, Windows presence.
+    """Whether this caller can signal a PID (POSIX signal-zero, Windows presence); not identity/ownership."""
+    return pid > 0 and (pid_is_alive(pid) if IS_WINDOWS else signal_pid(pid))
 
-    This is distinct from identity/ownership and from an access-denied live PID."""
-    if pid <= 0:
-        return False
+
+# Typed ``deliver_signal`` outcomes: delivery proves no identity and no exit; only ``absent`` (ESRCH) means gone.
+SIGNAL_SENT, SIGNAL_ABSENT, SIGNAL_DENIED = "sent", "absent", "denied"
+SIGNAL_FAILED, SIGNAL_UNSUPPORTED = "failed", "unsupported"
+
+
+def deliver_signal(pid: int, *, graceful: bool) -> str:
+    """Send TERM (``graceful``) or KILL to ONE POSIX pid, never to a group; the typed outcome is evidence about
+    the SIGNAL alone: ``denied`` (EPERM: it exists and refuses us) and ``failed`` (any other OSError) are unknowns
+    the scope reaper discloses, never counts as ended; it re-measures the pid's birth before calling. Windows:
+    ``unsupported`` — its Job/TerminateProcess paths stay the truth."""
     if IS_WINDOWS:
-        return pid_is_alive(pid)
+        return SIGNAL_UNSUPPORTED
+    if pid <= 1 or pid == os.getpid():
+        return SIGNAL_FAILED
     try:
-        os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError):
-        return False
-    return True
+        os.kill(int(pid), signal.SIGTERM if graceful else signal.SIGKILL)
+    except OSError as exc:
+        return {errno.ESRCH: SIGNAL_ABSENT, errno.EPERM: SIGNAL_DENIED}.get(exc.errno, SIGNAL_FAILED)
+    return SIGNAL_SENT
 
 
 def pid_provably_gone(pid: int) -> bool:
-    """Positive absence from the platform presence reader; denial is not death."""
-    return not pid_is_alive(pid)
+    """Positive absence only (#1554): POSIX ESRCH; Windows no such pid (ERROR_INVALID_PARAMETER) or a readable
+    exit code. Access denial, EPERM and every unexplained error are not death; a zombie is the caller's question."""
+    if pid <= 0:
+        return True
+    if IS_WINDOWS:
+        return _windows_process_state(pid) in {"no_such_pid", "exited"}
+    try:
+        os.kill(pid, 0)
+        return False
+    except OSError as exc:
+        return isinstance(exc, ProcessLookupError)
 
 
 # Windows locking via LockFileEx: unlike msvcrt.locking(), works on empty files.
@@ -652,53 +686,20 @@ _WIN32_LOCK_OFFSET = 0x7FFFFFFF00000000
 _WIN32_LOCK_LENGTH = 1
 
 
-_OVERLAPPED_CLS = None  # cached once per process
-
-
-def _win32_overlapped_class():
-    """Return cached portable OVERLAPPED; ctypes requires one class identity."""
-    global _OVERLAPPED_CLS
-    if _OVERLAPPED_CLS is not None:
-        return _OVERLAPPED_CLS
-
-    import ctypes
-    from ctypes import wintypes
-
-    class OVERLAPPED(ctypes.Structure):
-        _fields_ = [
-            ("Internal", ctypes.c_void_p),
-            ("InternalHigh", ctypes.c_void_p),
-            ("Offset", wintypes.DWORD),
-            ("OffsetHigh", wintypes.DWORD),
-            ("hEvent", wintypes.HANDLE),
-        ]
-
-    _OVERLAPPED_CLS = OVERLAPPED
-    return OVERLAPPED
-
-
 def _win32_lock(fd: int, *, exclusive: bool = True, blocking: bool = True) -> None:
     """Lock the fixed out-of-stamp byte range with LockFileEx (including empty files)."""
     import ctypes
-    from ctypes import wintypes
     import msvcrt as _msvcrt
 
     _LOCKFILE_FAIL_IMMEDIATELY = 0x00000001
     _LOCKFILE_EXCLUSIVE_LOCK = 0x00000002
 
-    OVERLAPPED = _win32_overlapped_class()
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.LockFileEx.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
-                                    wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(OVERLAPPED)]
-    kernel32.LockFileEx.restype = wintypes.BOOL
-
     hfile = _msvcrt.get_osfhandle(fd)
     flags = (_LOCKFILE_EXCLUSIVE_LOCK if exclusive else 0) | (0 if blocking else _LOCKFILE_FAIL_IMMEDIATELY)
 
-    ov = OVERLAPPED()
+    ov = _OVERLAPPED()
     ov.Offset, ov.OffsetHigh = _WIN32_LOCK_OFFSET & 0xFFFFFFFF, _WIN32_LOCK_OFFSET >> 32
-    if not kernel32.LockFileEx(hfile, flags, 0, _WIN32_LOCK_LENGTH, 0, ctypes.byref(ov)):
+    if not _kernel32.LockFileEx(hfile, flags, 0, _WIN32_LOCK_LENGTH, 0, ctypes.byref(ov)):
         raise _win32_lock_error(ctypes.get_last_error())
 
 
@@ -719,80 +720,100 @@ def _win32_unlock(fd: int) -> None:
 
     Rebuild OVERLAPPED; no recycled-fd map. ERROR_NOT_LOCKED needs no recovery."""
     import ctypes
-    from ctypes import wintypes
     import msvcrt as _msvcrt
 
-    OVERLAPPED = _win32_overlapped_class()
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.UnlockFileEx.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
-                                      wintypes.DWORD, ctypes.POINTER(OVERLAPPED)]
-    kernel32.UnlockFileEx.restype = wintypes.BOOL
-
-    ov = OVERLAPPED()
+    ov = _OVERLAPPED()
     ov.Offset, ov.OffsetHigh = _WIN32_LOCK_OFFSET & 0xFFFFFFFF, _WIN32_LOCK_OFFSET >> 32
     with contextlib.suppress(Exception):
-        kernel32.UnlockFileEx(_msvcrt.get_osfhandle(fd), 0, _WIN32_LOCK_LENGTH, 0, ctypes.byref(ov))
+        _kernel32.UnlockFileEx(_msvcrt.get_osfhandle(fd), 0, _WIN32_LOCK_LENGTH, 0, ctypes.byref(ov))
 
 
 # Process management.
 
-def kill_process_tree(proc: subprocess.Popen, *, exclude_pids: "set[int] | None" = None) -> None:
-    """Capture descendants before termination and spare retained branches.
+def request_process_tree_kill(proc, *, job_handle=None) -> dict:
+    """Issue native termination now; never wait, scan descendants or touch disk. Accept a live owner Popen or
+    a previously custody-validated OS target; the receipt proves a request only. A Job/group (a tracked Windows
+    child's own Job too) covers its members; escaped descendants and a process-only Windows request need settlement."""
+    pinned = isinstance(proc, dict)
+    pid = int(proc["pid"] if pinned else proc.pid)
+    result = {"pid": pid, "requested": False, "scope": "process"}
+    try:
+        if pid <= 0 or pid == os.getpid():
+            raise ValueError("refusing current/invalid process")
+        if not pinned and getattr(proc, "_ouroboros_stop_socket", None) is not None:
+            return proc._ouroboros_stop_request()
+        if not pinned and "_ouroboros_group_held" in vars(proc):
+            return {**result, "scope": "group", "requested": retained_child_group(proc, kill=True)}
+        if IS_WINDOWS:
+            if (job_handle := job_handle if pinned or job_handle is not None
+                    else vars(proc).get("_ouroboros_job")) is not None:  # a tracked child's own Job
+                result["scope"] = "job"
+                if not (problem := terminate_job(job_handle)):
+                    return {**result, "requested": True}
+                result.update(scope="process", error=problem)  # still request the known root
+            import _winapi
+            handle = proc["handle"] if pinned else getattr(proc, "_handle", None)
+            _winapi.TerminateProcess(handle if handle is not None else proc._popen._handle, 1)
+        elif pinned:
+            if IS_MACOS:
+                proc["handle"].close()
+                raise RuntimeError("attached Darwin watch is not a signalable identity")
+            signal.pidfd_send_signal(proc["handle"].fileno(), signal.SIGKILL)
+        else:
+            if (proc.poll() if hasattr(proc, "poll") else proc.exitcode) is not None:
+                raise ProcessLookupError("owned child already exited")
+            pgid = os.getpgid(pid)
+            if pgid == pid and pgid != os.getpgrp():
+                os.killpg(pgid, signal.SIGKILL)
+                result["scope"] = "group"
+            else:
+                os.kill(pid, signal.SIGKILL)
+        result["requested"] = True
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    return result
 
-    POSIX kills the group only when it contains no spared PID, then escaped
-    descendants. Windows uses selective PID termination when exclusions exist."""
-    pid = proc.pid
-    if IS_WINDOWS and not exclude_pids:
-        try:
-            _hidden_run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                        capture_output=True, timeout=10)
-        except Exception:
-            pass
+
+def kill_process_tree(proc: subprocess.Popen, *, exclude_pids: "set[int] | None" = None) -> None:
+    """Capture then kill; retain caller-selected branches (selective PIDs on Windows)."""
+    if "_ouroboros_group_held" in vars(proc):
+        if not exclude_pids:
+            retained_child_group(proc, kill=True)
+        return  # an absent/unknown witness never falls back to a numeric PID/group
+    job = vars(proc).get("_ouroboros_job") if IS_WINDOWS and not exclude_pids else None
+    if not exclude_pids and IS_WINDOWS and (job is not None or vars(proc).get("_ouroboros_containment_attempted")):
+        request_process_tree_kill(proc)  # Job failure falls back only to the owned process HANDLE
         return
-    targets, spared = _tree_kill_targets(pid, exclude_pids)
-    if not IS_WINDOWS:
-        pgid = process_group_id(pid)
-        if pgid > 0 and not any(process_group_id(p) == pgid for p in spared):
-            kill_process_group_id(pgid)
-    for dpid in targets:
-        force_kill_pid(dpid)
+    if job is None or terminate_job(job):  # a tracked child's own Job ends its tree whatever the parent chain
+        kill_pid_tree(proc.pid, exclude_pids=exclude_pids, include_process_group=True)
 
 
 def terminate_process_tree(proc: subprocess.Popen) -> None:
-    """Gracefully terminate a subprocess and its process tree."""
-    if IS_WINDOWS:
+    """Gracefully terminate a subprocess and its process tree; a child in the caller's own group gets SIGTERM alone."""
+    if IS_WINDOWS or (pgid := process_group_id(proc.pid)) == current_process_group_id():
         proc.terminate()
-    else:
-        try:
-            pgid = os.getpgid(proc.pid)
-            os.killpg(pgid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
+    elif pgid:
+        terminate_process_group_id(pgid)
 
 
 def terminate_process_group_id(pgid: int, *, exclude_pids: "set[int] | None" = None) -> None:
     """Gracefully terminate a Unix process group by id."""
-    if IS_WINDOWS:
-        return
-    if _group_has_spared_process(pgid, exclude_pids):
-        return
-    try:
-        os.killpg(int(pgid), signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, OSError, ValueError):
-        pass
+    _signal_process_group(pgid, "SIGTERM", exclude_pids)
 
 
-def kill_process_group_id(pgid: int, *, exclude_pids: "set[int] | None" = None) -> None:
-    """Force-kill a Unix process group by id."""
-    if IS_WINDOWS:
-        return
-    if _group_has_spared_process(pgid, exclude_pids):
-        return
+def kill_process_group_id(pgid: int, *, exclude_pids: "set[int] | None" = None) -> bool:
+    """Request a Unix group kill; True confirms the signal request, never exit."""
+    return _signal_process_group(pgid, "SIGKILL", exclude_pids)
+
+
+def _signal_process_group(pgid: int, signal_name: str, exclude_pids: "set[int] | None") -> bool:
+    if IS_WINDOWS or _group_has_spared_process(pgid, exclude_pids):
+        return False
     try:
-        os.killpg(int(pgid), signal.SIGKILL)
+        os.killpg(int(pgid), getattr(signal, signal_name))  # by name: Windows has no SIGKILL
+        return True
     except (ProcessLookupError, PermissionError, OSError, ValueError):
-        pass
+        return False
 
 
 def process_group_id(pid: int) -> int:
@@ -812,12 +833,12 @@ def process_group_is_alive(pgid: int) -> bool:
     try:
         os.killpg(int(pgid), 0)
         return True
-    except ProcessLookupError:
-        return False
     except PermissionError:
         return True
-    except (OSError, ValueError):
+    except (ProcessLookupError, ValueError):
         return False
+    except OSError:
+        return True  # a failed group read is not a measured empty group
 
 
 def current_process_group_id() -> int:
@@ -831,20 +852,16 @@ def current_process_group_id() -> int:
 
 
 def _group_has_spared_process(pgid: int, roots: "set[int] | None") -> bool:
-    for pid in roots or ():
-        if any(process_group_id(p) == pgid for p in [pid, *collect_descendant_pids(pid)]):
-            return True
-    return False
+    return any(process_group_id(p) == pgid for root in roots or ()
+               for p in [root, *collect_descendant_pids(root)])
 
 
 _BOOT_ID = ""  # full hex of the /proc boot id; empty until a successful read, then latched
 
 
 def process_start_time(pid: int) -> str:
-    """Stable birth token: Linux boot-qualified ticks, legacy fallback, or Windows FILETIME.
-
-    Mint order, cross-boot limits and downgrade-compatible ledger fields:
-    ARCHITECTURE §1 "Platform substrate"."""
+    """Stable birth token: Linux boot-qualified ticks, legacy fallback, or Windows FILETIME. Mint order,
+    cross-boot limits and downgrade-compatible ledger fields: ARCHITECTURE §1 "Platform substrate"."""
     global _BOOT_ID
     if pid <= 0:
         return ""
@@ -903,10 +920,7 @@ def process_command(pid: int) -> str:
         except Exception:
             return ""
     try:
-        # -ww: unlimited width. BSD ps truncates to the terminal/128 cols
-        # otherwise, and consumers match exact argv tokens — a packaged
-        # interpreter path is long enough to push the script argument off the
-        # end of a truncated line.
+        # BSD ps needs -ww to retain long packaged interpreter/script argv.
         result = subprocess.run(["ps", "-ww", "-p", str(int(pid)), "-o", "command="],
                                 capture_output=True, text=True, timeout=3)
         return result.stdout.strip()
@@ -917,30 +931,27 @@ def process_command(pid: int) -> str:
 def force_kill_pid(pid: int) -> None:
     """Force-kill a single process by PID."""
     if IS_WINDOWS:
-        try:
+        with contextlib.suppress(Exception):
             _hidden_run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=10)
-        except Exception:
-            pass
     else:
-        try:
+        with contextlib.suppress(OSError):
             os.kill(pid, getattr(signal, "SIGKILL", 9))  # spelled portably: a test may drive this branch on Windows
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
 
 
-def kill_pid_tree(pid: int, exclude_pids: "set[int] | None" = None) -> None:
-    """Kill a captured PID tree, sparing excluded roots and their descendants.
-
-    The caller owns daemon/service retention policy; this helper only signals."""
+def kill_pid_tree(pid: int, exclude_pids: "set[int] | None" = None, *,
+                  include_process_group: bool = False) -> None:
+    """Caller selects retained subtrees; PID callers kill selectively, Popen also uses unspared groups."""
     if IS_WINDOWS and not exclude_pids:
-        try:
-            _hidden_run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                        capture_output=True, timeout=10)
-        except Exception:
-            pass
+        with contextlib.suppress(Exception):
+            _hidden_run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, timeout=10)
         return
 
-    targets, _ = _tree_kill_targets(pid, exclude_pids)
+    targets, spared = _tree_kill_targets(pid, exclude_pids)
+    if include_process_group and not IS_WINDOWS:
+        pgid = process_group_id(pid)
+        # A child left in the caller's own group dies by PID below: a killpg there would kill the caller (#2353).
+        if pgid > 0 and pgid != current_process_group_id() and not any(process_group_id(p) == pgid for p in spared):
+            kill_process_group_id(pgid)
     for dpid in targets:
         force_kill_pid(dpid)
 
@@ -948,34 +959,42 @@ def kill_pid_tree(pid: int, exclude_pids: "set[int] | None" = None) -> None:
 def _tree_kill_targets(pid: int, exclude_pids: "set[int] | None") -> tuple[list[int], set[int]]:
     """Capture before signalling; a spared root keeps its entire branch alive."""
     exclude = {int(p) for p in (exclude_pids or ())}
-    if IS_WINDOWS:
-        children = _windows_process_children()
-        descendants = _snapshot_descendants(pid, children)
-        spared = exclude | {p for root in exclude for p in _snapshot_descendants(root, children)}
-        return [p for p in [*descendants, pid] if p not in spared], spared
-    descendants = collect_descendant_pids(pid)
-    spared: set[int] = set()
-    for ep in exclude:
-        spared.add(ep)
-        spared.update(collect_descendant_pids(ep))
+    children = _process_children()
+    descendants = _snapshot_descendants(pid, children)
+    spared = exclude | {p for root in exclude for p in _snapshot_descendants(root, children)}
     return [p for p in [*descendants, pid] if p not in spared], spared
 
 
-def _windows_process_children() -> dict[int, list[int]]:
-    """One PID/PPID observation for both the target and retained subtrees."""
-    import psutil
-
+def _process_children() -> dict[int, list[int]] | None:
+    """One PID/PPID snapshot per walk; unavailable POSIX snapshots retain pgrep."""
     children: dict[int, list[int]] = {}
-    for process in psutil.process_iter(["pid", "ppid"]):
-        parent = process.info.get("ppid")
-        if parent is not None:
-            children.setdefault(int(parent), []).append(process.pid)
+    if IS_WINDOWS:
+        import psutil
+        for process in psutil.process_iter(["pid", "ppid"]):
+            parent = process.info.get("ppid")
+            if parent is not None:
+                children.setdefault(int(parent), []).append(process.pid)
+    else:
+        try:
+            out = subprocess.run(["ps", "-axo", "pid=,ppid="],
+                                 capture_output=True, text=True, timeout=3, check=True)
+            for line in out.stdout.splitlines():
+                pid, parent = map(int, line.split())
+                if pid <= 0 or parent < 0:
+                    return None
+                children.setdefault(parent, []).append(pid)
+            return children or None
+        except Exception:
+            return None
     return children
 
 
-def _snapshot_descendants(pid: int, children: dict[int, list[int]]) -> list[int]:
+def _snapshot_descendants(pid: int, children: dict[int, list[int]] | None) -> list[int]:
     """Children before parents, excluding the root itself."""
     result: list[int] = []
+    if children is None:
+        _collect_descendants(pid, result)
+        return result
     seen = {pid}
 
     def visit(parent: int) -> None:
@@ -994,12 +1013,9 @@ def _collect_descendants(pid: int, result: list[int]) -> None:
     try:
         out = subprocess.run(["pgrep", "-P", str(pid)],
                              capture_output=True, text=True, timeout=3)
-        for line in out.stdout.strip().splitlines():
-            line = line.strip()
-            if line:
-                child_pid = int(line)
-                _collect_descendants(child_pid, result)
-                result.append(child_pid)
+        for child_pid in map(int, out.stdout.split()):
+            _collect_descendants(child_pid, result)
+            result.append(child_pid)
     except Exception:
         pass
 
@@ -1009,14 +1025,12 @@ def collect_descendant_pids(pid: int, *, exclude_pids: "set[int] | None" = None)
     if exclude_pids:
         targets, _ = _tree_kill_targets(int(pid), exclude_pids)
         return [target for target in targets if target != int(pid)]
-    if IS_WINDOWS:
-        return _snapshot_descendants(int(pid), _windows_process_children())
-    result: List[int] = []
     try:
-        _collect_descendants(int(pid), result)
+        return _snapshot_descendants(int(pid), _process_children())
     except (TypeError, ValueError):
-        pass
-    return result
+        if IS_WINDOWS:
+            raise
+        return []
 
 
 def tcp_keepalive_socket_options() -> List[tuple]:
@@ -1025,21 +1039,14 @@ def tcp_keepalive_socket_options() -> List[tuple]:
     Dead-socket rationale and per-platform fallback: ARCHITECTURE §6 transport."""
     import socket
 
-    from ouroboros.config import (
-        TCP_KEEPALIVE_IDLE_SEC,
-        TCP_KEEPALIVE_INTERVAL_SEC,
-        TCP_KEEPALIVE_PROBE_COUNT,
-    )
+    from ouroboros.config import TCP_KEEPALIVE_IDLE_SEC, TCP_KEEPALIVE_INTERVAL_SEC, TCP_KEEPALIVE_PROBE_COUNT
 
     options: List[tuple] = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
     idle_name = "TCP_KEEPIDLE" if IS_LINUX else ("TCP_KEEPALIVE" if IS_MACOS else "")
     if not idle_name:
         return options
-    for name, value in (
-        (idle_name, TCP_KEEPALIVE_IDLE_SEC),
-        ("TCP_KEEPINTVL", TCP_KEEPALIVE_INTERVAL_SEC),
-        ("TCP_KEEPCNT", TCP_KEEPALIVE_PROBE_COUNT),
-    ):
+    for name, value in ((idle_name, TCP_KEEPALIVE_IDLE_SEC), ("TCP_KEEPINTVL", TCP_KEEPALIVE_INTERVAL_SEC),
+                        ("TCP_KEEPCNT", TCP_KEEPALIVE_PROBE_COUNT)):
         if hasattr(socket, name):
             options.append((socket.IPPROTO_TCP, getattr(socket, name), value))
     return options
@@ -1049,26 +1056,22 @@ def kill_process_on_port(port: int) -> None:
     """Kill any process listening on the given TCP port."""
     try:
         if IS_WINDOWS:
-            res = _hidden_run(["netstat", "-ano"], capture_output=True, text=True, timeout=5)
-            listeners = [
-                line.split()[-1] for line in res.stdout.splitlines()
-                if f":{port}" in line and "LISTENING" in line and line.split()
-            ]
+            # psutil's socket table, not netstat's text, whose state words and code page are localized.
+            import psutil
+
+            listeners = list(dict.fromkeys(  # a dual-stack listener has an IPv4 and an IPv6 row
+                conn.pid for conn in psutil.net_connections(kind="tcp")
+                if conn.status == psutil.CONN_LISTEN and conn.laddr and conn.laddr.port == port and conn.pid
+            ))
         else:
             # -sTCP:LISTEN scopes the sweep to the listener (a bare tcp:PORT
             # selector also matches ESTABLISHED client sockets — on browser
             # installs that would SIGKILL the owner's browser mid-session);
             # -nP skips name resolution so a slow resolver can't eat the 5s.
-            res = subprocess.run(
-                ["lsof", "-nP", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
-                capture_output=True, text=True, timeout=5,
-            )
-            listeners = res.stdout.split()
-        for pid_str in listeners:
-            try:
-                pid = int(pid_str)
-            except ValueError:
-                continue
+            res = subprocess.run(["lsof", "-nP", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
+                                 capture_output=True, text=True, timeout=5)
+            listeners = [int(pid) for pid in res.stdout.split() if pid.isdigit()]
+        for pid in listeners:
             if pid != os.getpid():
                 force_kill_pid(pid)
     except Exception:
@@ -1109,19 +1112,13 @@ def pip_install_target_args(interpreter: str) -> List[str]:
 
 
 def project_venv_python(project_root: pathlib.Path) -> str:
-    """Return the executable for a valid project ``.venv`` on this platform.
-
-    Keep the lexical venv path (rather than resolving its symlink) so Python
-    discovers the adjacent ``pyvenv.cfg`` and activates the environment.
-    """
+    """Return the executable for a valid project ``.venv`` on this platform. Keep the lexical venv path (rather
+    than resolving its symlink) so Python discovers the adjacent ``pyvenv.cfg`` and activates the environment."""
     env_root = pathlib.Path(project_root) / ".venv"
     if not (env_root / "pyvenv.cfg").is_file():
         return ""
-    candidates = (
-        (env_root / "Scripts" / "python.exe",)
-        if IS_WINDOWS
-        else (env_root / "bin" / "python", env_root / "bin" / "python3")
-    )
+    candidates = ((env_root / "Scripts" / "python.exe",) if IS_WINDOWS
+                  else (env_root / "bin" / "python", env_root / "bin" / "python3"))
     for candidate in candidates:
         try:
             if candidate.is_file() and os.access(candidate, os.X_OK):
@@ -1238,27 +1235,23 @@ def get_system_memory() -> str:
     os_name = platform.system()
     try:
         if os_name == "Darwin":
-            mem_bytes = int(subprocess.check_output(
-                ["sysctl", "-n", "hw.memsize"],
-            ).strip())
+            mem_bytes = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"]).strip())
             return f"{mem_bytes / (1024**3):.1f} GB"
         elif os_name == "Linux":
-            out = subprocess.check_output(
-                ["awk", '/MemTotal/ {print $2/1024/1024 " GB"}', "/proc/meminfo"],
-            ).strip().decode()
-            return out
+            return subprocess.check_output(
+                ["awk", '/MemTotal/ {print $2/1024/1024 " GB"}', "/proc/meminfo"]).strip().decode()
         elif os_name == "Windows":
-            out = _hidden_run(
-                ["wmic", "ComputerSystem", "get", "TotalPhysicalMemory", "/value"],
-                capture_output=True, text=True, timeout=10, check=True,
-            ).stdout.strip()
-            for line in out.splitlines():
-                if "=" in line:
-                    mem_bytes = int(line.split("=")[1])
-                    return f"{mem_bytes / (1024**3):.1f} GB"
+            mem_bytes = int(_wmic_value_line("ComputerSystem", "get", "TotalPhysicalMemory").split("=")[1])
+            return f"{mem_bytes / (1024**3):.1f} GB"
     except Exception:
         pass
     return "Unknown"
+
+
+def _wmic_value_line(*query: str) -> str:
+    """First ``key=value`` line of a Windows ``wmic ... /value`` query, or ''."""
+    out = _hidden_run(["wmic", *query, "/value"], capture_output=True, text=True, timeout=10, check=True).stdout
+    return next((line for line in out.strip().splitlines() if "=" in line), "")
 
 
 def get_cpu_info() -> str:
@@ -1266,17 +1259,9 @@ def get_cpu_info() -> str:
     os_name = platform.system()
     try:
         if os_name == "Darwin":
-            return subprocess.check_output(
-                ["sysctl", "-n", "machdep.cpu.brand_string"],
-            ).strip().decode()
-        elif os_name == "Windows":
-            out = _hidden_run(
-                ["wmic", "cpu", "get", "Name", "/value"],
-                capture_output=True, text=True, timeout=10, check=True,
-            ).stdout.strip()
-            for line in out.splitlines():
-                if "=" in line:
-                    return line.split("=", 1)[1].strip()
+            return subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"]).strip().decode()
+        elif os_name == "Windows" and (line := _wmic_value_line("cpu", "get", "Name")):
+            return line.split("=", 1)[1].strip()
     except Exception:
         pass
     return platform.processor()
@@ -1290,25 +1275,41 @@ def create_new_session() -> None:
         os.setsid()
 
 
-def subprocess_new_group_kwargs(*, breakaway_from_job: bool = False, suspended: bool = False) -> dict:
-    """Return subprocess kwargs for killable process-group/session isolation."""
+def subprocess_new_group_kwargs(*, breakaway_from_job: bool = False, suspended: bool = False,
+                                background: bool = False) -> dict:
+    """Return subprocess kwargs for killable process-group/session isolation; ``background`` (Windows) starts
+    the tree in the below-normal priority class (POSIX: ``lower_tree_priority`` once the root exists)."""
     if IS_WINDOWS:
         flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
         if breakaway_from_job:
             flags |= _windows_breakaway_flags()
         if suspended:
-            flags |= getattr(subprocess, "CREATE_SUSPENDED", 0x4)
+            flags |= WINDOWS_CREATE_SUSPENDED
+        if background:
+            flags |= getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x4000)
         return {"creationflags": flags}
     return {"start_new_session": True}
+
+
+def lower_tree_priority(pid: int, pgid: int = 0) -> bool:
+    """POSIX: nice a root that is still starting (its whole group when it leads one) ten steps below the caller,
+    capped at 19, so all it forks inherits it. False on Windows (the creation flag did it) or for a root gone."""
+    if IS_WINDOWS or not hasattr(os, "setpriority"):
+        return False
+    try:
+        os.setpriority(os.PRIO_PGRP if pgid else os.PRIO_PROCESS, pgid or pid,
+                       min(os.getpriority(os.PRIO_PROCESS, 0) + 10, 19))
+    except OSError:
+        return False
+    return True
 
 
 def install_shutdown_signal_handlers(handler) -> None:
     """Install SIGINT and POSIX SIGTERM handlers that only set a flag/event.
 
     The caller's main thread owns teardown, never the signal frame."""
-    signal.signal(signal.SIGINT, handler)
-    if not IS_WINDOWS:
-        signal.signal(signal.SIGTERM, handler)
+    for signum in SHUTDOWN_SIGNALS[:1] if IS_WINDOWS else SHUTDOWN_SIGNALS:
+        signal.signal(signum, handler)
 
 
 def subprocess_hidden_kwargs() -> dict:
@@ -1320,12 +1321,16 @@ def subprocess_hidden_kwargs() -> dict:
 
 def merge_hidden_kwargs(kwargs: dict) -> dict:
     """Merge Windows hidden-window flags without dropping caller flags."""
-    hidden = subprocess_hidden_kwargs()
-    if not hidden:
-        return dict(kwargs)
     result = dict(kwargs)
-    result["creationflags"] = result.get("creationflags", 0) | hidden.get("creationflags", 0)
+    if hidden := subprocess_hidden_kwargs():
+        result["creationflags"] = result.get("creationflags", 0) | hidden.get("creationflags", 0)
     return result
+
+
+def inherited_console_kwargs() -> dict:
+    """A successor keeps this process's console (a terminal run); Windows hides it only when there is none (GUI)."""
+    attached = not IS_WINDOWS or _kernel32.GetConsoleProcessList((ctypes.wintypes.DWORD * 1)(), 1)
+    return {} if attached else subprocess_hidden_kwargs()
 
 
 # Git installation hint.
@@ -1346,98 +1351,107 @@ if IS_WINDOWS:
     import ctypes
     import ctypes.wintypes
 
-    # Snapshot the actual call error; declare full-width HANDLE ABI (ARCHITECTURE §1).
-    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
-
-    _kernel32.CreateJobObjectW.restype = ctypes.wintypes.HANDLE
-    _kernel32.CreateJobObjectW.argtypes = (ctypes.wintypes.LPVOID, ctypes.wintypes.LPCWSTR)
-    _kernel32.SetInformationJobObject.restype = ctypes.wintypes.BOOL
-    _kernel32.SetInformationJobObject.argtypes = (
-        ctypes.wintypes.HANDLE, ctypes.c_int, ctypes.wintypes.LPVOID, ctypes.wintypes.DWORD,
+    from ouroboros.platform_win32_abi import (  # noqa: F401 — preserve native symbol exports
+        _kernel32, _OVERLAPPED, _INVALID_HANDLE_VALUE, _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        _JOB_OBJECT_LIMIT_BREAKAWAY_OK, _JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK, _JOBOBJECTINFOCLASS_EXTENDED,
+        _JOBOBJECTINFOCLASS_PROCESS_ID_LIST, _JOBOBJECT_BASIC_PROCESS_ID_LIST, _PROCESS_SET_QUOTA, _PROCESS_TERMINATE,
+        _PROCESS_SUSPEND_RESUME, _CREATE_SUSPENDED, _JOBOBJECT_BASIC_LIMIT_INFORMATION, _IO_COUNTERS,
+        _ExtendedLimitInfo,
     )
-    _kernel32.OpenProcess.restype = ctypes.wintypes.HANDLE
-    _kernel32.OpenProcess.argtypes = (ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD)
-    _kernel32.GetProcessTimes.restype = ctypes.wintypes.BOOL
-    _kernel32.GetProcessTimes.argtypes = (
-        ctypes.wintypes.HANDLE, *(ctypes.POINTER(ctypes.wintypes.FILETIME),) * 4,
-    )
-    _kernel32.GetCurrentProcess.restype = ctypes.wintypes.HANDLE
-    _kernel32.GetCurrentProcess.argtypes = ()
-    _kernel32.IsProcessInJob.restype = ctypes.wintypes.BOOL
-    _kernel32.IsProcessInJob.argtypes = (
-        ctypes.wintypes.HANDLE, ctypes.wintypes.HANDLE, ctypes.POINTER(ctypes.wintypes.BOOL),
-    )
-    _kernel32.QueryInformationJobObject.restype = ctypes.wintypes.BOOL
-    _kernel32.QueryInformationJobObject.argtypes = (
-        ctypes.wintypes.HANDLE, ctypes.c_int, ctypes.wintypes.LPVOID,
-        ctypes.wintypes.DWORD, ctypes.POINTER(ctypes.wintypes.DWORD),
-    )
-    _kernel32.AssignProcessToJobObject.restype = ctypes.wintypes.BOOL
-    _kernel32.AssignProcessToJobObject.argtypes = (ctypes.wintypes.HANDLE, ctypes.wintypes.HANDLE)
-    _kernel32.TerminateJobObject.restype = ctypes.wintypes.BOOL
-    _kernel32.TerminateJobObject.argtypes = (ctypes.wintypes.HANDLE, ctypes.wintypes.UINT)
-    _kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
-    _kernel32.CloseHandle.argtypes = (ctypes.wintypes.HANDLE,)
 
-    # .value, not the HANDLE instance: with restype=HANDLE the calls return plain
-    # ints (or None for NULL), and an int never equals a ctypes instance.
-    _INVALID_HANDLE_VALUE = ctypes.wintypes.HANDLE(-1).value
-    _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
-    _JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x800
-    _JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK = 0x1000
-    _JOBOBJECTINFOCLASS_EXTENDED = 9
-    _PROCESS_SET_QUOTA = 0x0100
-    _PROCESS_TERMINATE = 0x0001
-    _PROCESS_SUSPEND_RESUME = 0x0800
-    _CREATE_SUSPENDED = 0x4
 
-    class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
-        _fields_ = [
-            ("PerProcessUserTimeLimit", ctypes.c_int64),
-            ("PerJobUserTimeLimit", ctypes.c_int64),
-            ("LimitFlags", ctypes.wintypes.DWORD),
-            ("MinimumWorkingSetSize", ctypes.c_size_t),
-            ("MaximumWorkingSetSize", ctypes.c_size_t),
-            ("ActiveProcessLimit", ctypes.wintypes.DWORD),
-            ("Affinity", ctypes.POINTER(ctypes.c_ulong)),
-            ("PriorityClass", ctypes.wintypes.DWORD),
-            ("SchedulingClass", ctypes.wintypes.DWORD),
-        ]
+def _windows_query(pid: int, read: Callable[[Any], Any]) -> tuple:
+    """``(open_error, read(handle))`` under one limited-query handle; error 0 when opened."""
+    if not (handle := _kernel32.OpenProcess(0x1000, False, int(pid))):  # PROCESS_QUERY_LIMITED_INFORMATION
+        return ctypes.get_last_error() or -1, None
+    try:
+        return 0, read(handle)
+    finally:
+        _kernel32.CloseHandle(handle)
 
-    class _IO_COUNTERS(ctypes.Structure):
-        _fields_ = [
-            ("ReadOperationCount", ctypes.c_uint64),
-            ("WriteOperationCount", ctypes.c_uint64),
-            ("OtherOperationCount", ctypes.c_uint64),
-            ("ReadTransferCount", ctypes.c_uint64),
-            ("WriteTransferCount", ctypes.c_uint64),
-            ("OtherTransferCount", ctypes.c_uint64),
-        ]
 
-    class _ExtendedLimitInfo(ctypes.Structure):
-        _fields_ = [
-            ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
-            ("IoInfo", _IO_COUNTERS),
-            ("ProcessMemoryLimit", ctypes.c_size_t),
-            ("JobMemoryLimit", ctypes.c_size_t),
-            ("PeakProcessMemoryUsed", ctypes.c_size_t),
-            ("PeakJobMemoryUsed", ctypes.c_size_t),
-        ]
+def _windows_handle_birth(handle: Any) -> str:
+    """Creation FILETIME of the process behind an open handle: the runtime's birth token."""
+    times = [ctypes.wintypes.FILETIME() for _ in range(4)]
+    return (f"win-filetime:{(times[0].dwHighDateTime << 32) | times[0].dwLowDateTime}"
+            if _kernel32.GetProcessTimes(handle, *(ctypes.byref(item) for item in times)) else "")
 
 
 def _windows_process_start_time(pid: int) -> str:
-    handle = _kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
-    if not handle:
-        return ""
+    return _windows_query(pid, _windows_handle_birth)[1] or ""
+
+
+def _windows_process_state(pid: int) -> str:
+    """``running``/``exited``/``unreadable`` once opened; else ``denied``, ``no_such_pid`` or ``error``."""
+    def exit_code(handle: Any) -> Optional[int]:
+        code = ctypes.wintypes.DWORD()
+        return int(code.value) if _kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) else None
+    error, code = _windows_query(pid, exit_code)
+    return (("denied" if error == 5 else "no_such_pid" if error == 87 else "error") if error
+            else "unreadable" if code is None else "running" if code == 259 else "exited")
+
+
+@contextlib.contextmanager
+def inheritable_self_handle():
+    """Windows restart handle and exact stdio, owned until Popen has inherited them.
+
+    With all three Popen stream arguments omitted, its STARTUPINFO stays intact.
+    Passing even one fd instead makes Popen replace absent streams with pipes.
+    Duplicate present handles so no shared handle's inheritability is changed.
+    """
+    import _winapi
+    import msvcrt
+
+    with contextlib.ExitStack() as resources:
+        handle = subprocess.Handle(_winapi.OpenProcess(0x101000, True, os.getpid()))  # SYNCHRONIZE | QUERY_LIMITED
+        resources.callback(handle.Close)
+        startupinfo = subprocess.STARTUPINFO(dwFlags=subprocess.STARTF_USESTDHANDLES,
+                                            lpAttributeList={"handle_list": [handle]})
+        current = _winapi.GetCurrentProcess()
+        for name, field in (("stdin", "hStdInput"), ("stdout", "hStdOutput"), ("stderr", "hStdError")):
+            try:
+                raw = msvcrt.get_osfhandle(getattr(sys, f"__{name}__").fileno())
+            except (AttributeError, OSError, ValueError):
+                raw = 0
+            duplicate = 0
+            if raw not in (0, -1, -2):
+                duplicate = subprocess.Handle(_winapi.DuplicateHandle(
+                    current, raw, current, 0, True, _winapi.DUPLICATE_SAME_ACCESS))
+                resources.callback(duplicate.Close)
+                startupinfo.lpAttributeList["handle_list"].append(duplicate)
+            setattr(startupinfo, field, duplicate)
+        yield handle, {"startupinfo": startupinfo, "close_fds": True}
+
+
+def await_restart_binding(handle: int) -> None:
+    """Wait for a cold-bootstrap helper to finish its binding attempt, then close the pipe.
+
+    Only its read end was inherited. EOF also releases us if that helper died;
+    it says nothing about success, which the restart transaction must prove.
+    """
+    import _winapi
+
     try:
-        created, exited, kernel, user = (ctypes.wintypes.FILETIME() for _ in range(4))
-        if not _kernel32.GetProcessTimes(
-            handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user),
-        ):
-            return ""
-        return f"win-filetime:{(created.dwHighDateTime << 32) | created.dwLowDateTime}"
+        try:
+            _winapi.ReadFile(handle, 1)
+        except BrokenPipeError:
+            pass
     finally:
-        _kernel32.CloseHandle(handle)
+        _winapi.CloseHandle(handle)
+
+
+def await_process_handle(handle: int) -> dict:
+    """Windows: block until an inherited process handle signals, then close it; that process's identity and exit."""
+    import _winapi
+    if not (pid := _kernel32.GetProcessId(handle)):  # an older generation passes the number on without the handle
+        raise OSError(f"Restart parent handle {handle} names no process here; it is neither awaited nor closed")
+    try:
+        if (result := _winapi.WaitForSingleObject(handle, _winapi.INFINITE)) != _winapi.WAIT_OBJECT_0:
+            raise OSError(f"Restart parent handle did not signal (wait result {result})")
+        return {"pid": int(pid), "birth": _windows_handle_birth(handle),
+                "exit_code": int(_winapi.GetExitCodeProcess(handle))}
+    finally:
+        _winapi.CloseHandle(handle)
 
 
 def _windows_breakaway_flags() -> int:
@@ -1449,9 +1463,8 @@ def _windows_breakaway_flags() -> int:
         if not in_job.value:
             return 0
         info = _ExtendedLimitInfo()
-        if _kernel32.QueryInformationJobObject(
-            None, _JOBOBJECTINFOCLASS_EXTENDED, ctypes.byref(info), ctypes.sizeof(info), None,
-        ):
+        if _kernel32.QueryInformationJobObject(None, _JOBOBJECTINFOCLASS_EXTENDED, ctypes.byref(info),
+                                               ctypes.sizeof(info), None):
             flags = info.BasicLimitInformation.LimitFlags
             if flags & _JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK:
                 return 0
@@ -1462,8 +1475,8 @@ def _windows_breakaway_flags() -> int:
     return 0
 
 
-def create_kill_on_close_job(*, allow_breakaway: bool = False) -> Optional[Any]:
-    """Create a Windows kill-on-close Job Object, or None."""
+def create_kill_on_close_job(*, allow_breakaway: bool = False, kill_on_close: bool = True) -> Optional[Any]:
+    """Create a Windows Job Object, kill-on-close unless declined, refusing breakaway unless allowed; or None."""
     if not IS_WINDOWS:
         return None
     try:
@@ -1472,13 +1485,10 @@ def create_kill_on_close_job(*, allow_breakaway: bool = False) -> Optional[Any]:
             log.warning("CreateJobObjectW failed")
             return None
         info = _ExtendedLimitInfo()
-        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        if allow_breakaway:
-            info.BasicLimitInformation.LimitFlags |= _JOB_OBJECT_LIMIT_BREAKAWAY_OK
-        ok = _kernel32.SetInformationJobObject(
-            handle, _JOBOBJECTINFOCLASS_EXTENDED, ctypes.byref(info), ctypes.sizeof(info),
-        )
-        if not ok:
+        info.BasicLimitInformation.LimitFlags = ((_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE if kill_on_close else 0)
+                                                 | (_JOB_OBJECT_LIMIT_BREAKAWAY_OK if allow_breakaway else 0))
+        if not _kernel32.SetInformationJobObject(handle, _JOBOBJECTINFOCLASS_EXTENDED, ctypes.byref(info),
+                                                 ctypes.sizeof(info)):
             log.warning("SetInformationJobObject failed")
             _kernel32.CloseHandle(handle)
             return None
@@ -1493,18 +1503,14 @@ def assign_pid_to_job(job_handle: Any, pid: int) -> bool:
     if not IS_WINDOWS or job_handle is None:
         return False
     try:
-        proc_handle = _kernel32.OpenProcess(
-            _PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, pid,
-        )
-        if not proc_handle:
+        if not (proc_handle := _kernel32.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, pid)):
             log.warning("OpenProcess(%d) failed for Job Object assignment", pid)
             return False
         ok = _kernel32.AssignProcessToJobObject(job_handle, proc_handle)
         _kernel32.CloseHandle(proc_handle)
         if not ok:
             log.warning("AssignProcessToJobObject failed for pid %d", pid)
-            return False
-        return True
+        return bool(ok)
     except Exception as exc:
         log.warning("Job Object assign failed: %s", exc)
         return False
@@ -1521,6 +1527,17 @@ def terminate_job(job_handle: Any, exit_code: int = 1) -> str:
     except Exception as exc:
         return f"TerminateJobObject failed ({exc}), so the job's processes are unaccounted for"
     return ""
+
+
+def job_has_running_member(job_handle: Any) -> Optional[bool]:
+    """Whether a process the Job names still runs; None when the Job or a member is unreadable. Each listed
+    member is read by exit code, so an exited one a handle still references (its owner's Popen) never runs."""
+    listed = _JOBOBJECT_BASIC_PROCESS_ID_LIST()
+    if not _kernel32.QueryInformationJobObject(job_handle, _JOBOBJECTINFOCLASS_PROCESS_ID_LIST, ctypes.byref(listed),
+                                               ctypes.sizeof(listed), None):
+        return None
+    states = {_windows_process_state(int(pid)) for pid in listed.ProcessIdList[:listed.NumberOfProcessIdsInList]}
+    return True if "running" in states else None if states - {"exited", "no_such_pid"} else False
 
 
 def close_job(job_handle: Any) -> str:

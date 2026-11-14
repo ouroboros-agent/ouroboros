@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import functools
 import json
+import pathlib
 from contextlib import nullcontext
 from typing import Any
 
 from starlette.responses import JSONResponse
 
+from ouroboros.deployment_policy import served_wait
 from ouroboros.gateway._helpers import json_error
 from ouroboros.model_wait import mutate_wait
 from ouroboros.task_results import validate_task_id
@@ -39,17 +42,18 @@ def history_wait_overlay(messages: list[dict], owner_limit: int) -> tuple[list[d
         for wait_id, row in message["model_waits"].items():
             previous = current["model_waits"].get(wait_id) or {}
             if int(row.get("revision") or 0) > int(previous.get("revision") or 0):
-                current["model_waits"][wait_id] = copy.deepcopy(row)
+                current["model_waits"][wait_id] = served_wait(copy.deepcopy(row))
     ordered = sorted(by_owner.values(), key=lambda row: row["ts"])
     return other, ordered[-owner_limit:] if owner_limit > 0 else [], len(ordered) > owner_limit
 
 
 class WaitDecisionRefused(ValueError):
-    def __init__(self, reason: str, row: dict | None = None, status: int = 409):
+    def __init__(self, reason: str, row: dict | None = None, status: int = 409, text: str = ""):
         super().__init__(reason)
         self.reason = reason
         self.row = row or {}
         self.status = status
+        self.text = text or reason  # the sentence a card shows; ``reason`` stays the typed code
 
 
 def _action(body: dict) -> tuple[str, str, dict]:
@@ -108,8 +112,8 @@ def _live_task(task_id: str) -> dict:
         return task
 
 
-def _decide(root: Any, body: dict) -> JSONResponse:
-    from ouroboros.gateway.owner_settings import CommitBoundary
+def _decide(root: Any, body: dict, request: Any = None) -> JSONResponse:
+    from ouroboros.gateway.owner_settings import CommitBoundary, record_settings_change
     from ouroboros.owner_mailbox import KIND_MODEL_WAIT, write_owner_message
     from supervisor.queue import _task_drive_for_task
 
@@ -121,16 +125,27 @@ def _decide(root: Any, body: dict) -> JSONResponse:
     transformation_completed = False
     mailbox_attempted = False
     owner = None
+    operation_wait = False
+    attempt = 0
 
     def phase_owner():
         from ouroboros.post_task_checkpoint import post_task_model_wait
+        from ouroboros.review_operation import review_operation_controller
 
+        # A paid review operation owns its reviewers' waits, during and after
+        # the author's turn: only its exact live controller may consume them.
+        if operation_wait:
+            return review_operation_controller(root, task_id, wait_id)
         return post_task_model_wait(root, task_id)
 
     def live_task():
         if owner is None:
+            if operation_wait:
+                raise WaitDecisionRefused("task_not_live")  # never the author's mailbox
             return _live_task(task_id)
-        if owner.closed or phase_owner() is not owner:
+        current = phase_owner()
+        if owner.closed or current is None or (current is not owner and (
+                not getattr(owner, "owner_id", "") or getattr(current, "owner_id", "") != owner.owner_id)):
             raise WaitDecisionRefused("task_not_live")
         return owner.task
 
@@ -153,8 +168,45 @@ def _decide(root: Any, body: dict) -> JSONResponse:
             return None
 
         row = mutate(wait_id, discard)
+
+    def receipt(current):
+        """This exact claim applied by its own controller: request, wait owner and attempt."""
+        return bool(action and current.get("applied_request_id") == action["request_id"]
+                    and current.get("task_attempt") == attempt
+                    and str(current.get("model_wait_owner_id") or "") == str(getattr(owner, "owner_id", "") or ""))
+
+    def claim_as_it_is():
+        """After any discard, the claim's current row answers whether its controller applied it."""
+        nonlocal row
+        discard_definitely_unapplied()
+        if claimed:
+            try:
+                row = mutate(wait_id, lambda previous: None)
+            except Exception:
+                pass  # the last observed row stays the answer
+        return claimed and receipt(row)
+
+    def stop_clear():
+        """Whether the owner's separately confirmed Settings save may still land. A reviewer's wait follows
+        its operation's own stop state: Wrap up lets the reviewer finish and keeps this save (owner choice,
+        2026-10-14); Stop now, Panic, a cancelled result or an unreadable state withhold it. Any other wait
+        keeps it only while no Stop intent at all (Wrap up included) is recorded."""
+        from ouroboros.cancel_intents import cancel_pending, resolve_owner_stop_intent
+        from ouroboros.review_operation import operation_stop_state
+
+        try:
+            stopped = operation_stop_state(pathlib.Path(root), task_id)
+            if operation_wait:
+                return not stopped
+            return not (stopped or cancel_pending(root, task_id, strict=True)
+                        or resolve_owner_stop_intent(root, task_id)[1])
+        except Exception:
+            return False
     try:
         task_id, wait_id, action = _action(body)
+        from ouroboros.review_operation import names_review_operation
+
+        operation_wait = names_review_operation(root, task_id, wait_id)
         owner = phase_owner()
         task = live_task()
         attempt = int(task.get("_attempt") or 1)
@@ -177,6 +229,12 @@ def _decide(root: Any, body: dict) -> JSONResponse:
                 return None
             if previous.get("state") != "waiting" or previous.get("revision") != action["revision"]:
                 raise WaitDecisionRefused("stale_model_wait", previous)
+            from ouroboros.deployment_policy import managed_model_roles
+            from ouroboros.gateway.owner_settings import MANAGED_BY_DEPLOYMENT
+
+            if action["action"] == "switch" and previous.get("role") in managed_model_roles():
+                raise WaitDecisionRefused(MANAGED_BY_DEPLOYMENT, previous, 403,  # Retry and auto-continue stay
+                                          "Your organization sets this model; its administrator changes it. Retry or keep waiting.")
             if action.get("persist_role"):
                 from ouroboros.gateway.owner_settings import _owner_read_settings_raw
                 from ouroboros.model_slots import apply_model_role_override
@@ -195,48 +253,87 @@ def _decide(root: Any, body: dict) -> JSONResponse:
         if not applied:
             if action.get("persist_role"):
                 from ouroboros.gateway.owner_settings import _owner_update_settings, settings_document_mutation
-                from ouroboros.model_slots import apply_model_role_override
+                from ouroboros.model_slots import apply_model_role_override, model_role_setting_keys
 
                 if row.get("saved_request_id") != action["request_id"]:
+                    def save_allowed():
+                        nonlocal row
+                        try:
+                            live_task()
+                        except WaitDecisionRefused:
+                            if not getattr(owner, "consumes_pending_action", False):
+                                raise
+                            # A controller consuming the claim itself may apply it while this save
+                            # waits for the lock; its row then stops waiting and it reads closed,
+                            # so its own receipt stands in for liveness.
+                            current = mutate(wait_id, lambda previous: None)
+                            if not receipt(current):
+                                raise WaitDecisionRefused("task_not_live", current) from None
+                            row = current
+                        # One stop rule for a live and an applied claim (``stop_clear``).
+                        return stop_clear()
+
                     def transform(settings):
                         nonlocal transformation_completed
-                        live_task()
+                        if not save_allowed():
+                            return None  # the decision stands; Settings are not written
                         value = apply_model_role_override(
                             settings, role=row["role"], model=action["model"],
                             credential_profile_id=action["credential_profile_id"], use_local=action["use_local"])
                         transformation_completed = True
                         return value
 
-                    with settings_document_mutation():
-                        _owner_update_settings(transform, boundary=boundary)
-                    row = mutate(wait_id,
-                                      lambda previous: {**previous, "saved_request_id": action["request_id"]})
+                    with settings_document_mutation():  # a chosen model is authored, the shown default included
+                        record_settings_change(request, _owner_update_settings(  # the writer's receipt, as Settings
+                            transform, boundary=boundary, authored_keys=model_role_setting_keys(row["role"]),
+                            allow_safety_lowering=True))
+                    if transformation_completed:
+                        row = mutate(wait_id,
+                                     lambda previous: {**previous, "saved_request_id": action["request_id"]})
             # Re-check after the optional settings write. A persistent owner
             # choice may have landed even when cancellation now fences the task.
             with owner.lock if owner is not None else nullcontext():
-                task = live_task()
-                control = {**action, "wait_id": wait_id, "task_attempt": attempt}
-                mailbox_attempted = True
-                if not write_owner_message(owner.drive_root if owner is not None else _task_drive_for_task(task, task_id), json.dumps(control), task_id,
-                                           msg_id=f"model_wait:{wait_id}:{action['request_id']}", kind=KIND_MODEL_WAIT):
-                    raise WaitDecisionRefused("mailbox_write_failed", row, 503)
+                if getattr(owner, "consumes_pending_action", False):
+                    # A review operation consumes the claimed row itself (the author's
+                    # mailbox is not its ingress): its controller already applied it, or
+                    # it is still pending before that exact live controller.
+                    row = mutate(wait_id, lambda previous: None)
+                    applied = receipt(row)
+                    if not applied and (row.get("pending_action") != action or owner.closed):
+                        # A remote controller closes by consuming this very claim
+                        # between the two reads: its durable receipt, read after the
+                        # closed observation, answers; any other closure refuses.
+                        row = mutate(wait_id, lambda previous: None)
+                        applied = receipt(row)
+                        if not applied:
+                            raise WaitDecisionRefused("task_not_live", row)
+                else:
+                    task = live_task()
+                    control = {**action, "wait_id": wait_id, "task_attempt": attempt}
+                    mailbox_attempted = True
+                    if not write_owner_message(owner.drive_root if owner is not None else _task_drive_for_task(task, task_id), json.dumps(control), task_id,
+                                               msg_id=f"model_wait:{wait_id}:{action['request_id']}", kind=KIND_MODEL_WAIT):
+                        raise WaitDecisionRefused("mailbox_write_failed", row, 503)
         return JSONResponse({"ok": True, "decision_id": body["decision_id"], "request_id": action["request_id"],
-                             "state": row["state"], "wait": row, "duplicate": duplicate, "applied": applied,
+                             "state": row["state"], "wait": served_wait(row), "duplicate": duplicate, "applied": applied,
                              "saved": saved()},
                             status_code=200 if duplicate else 202)
     except WaitDecisionRefused as error:
-        discard_definitely_unapplied()
-        return json_error(error.reason, error.status, ok=False, reason_code=error.reason,
-                          state=error.row.get("state", ""), wait=error.row, saved=saved())
+        # Applied, saved and the refusal are separate facts; after a claim its row is read as it now is.
+        applied = claim_as_it_is()
+        current = row if claimed else error.row
+        return json_error(error.text, error.status, ok=False, reason_code=error.reason,
+                          state=current.get("state", ""), wait=served_wait(current), applied=applied, saved=saved())
     except Exception as error:
-        discard_definitely_unapplied()
-        return json_error(str(error), 503, ok=False, reason_code="model_wait_decision_failed", wait=row,
-                          saved=saved())
+        applied = claim_as_it_is()
+        return json_error(str(error), 503, ok=False, reason_code="model_wait_decision_failed", wait=served_wait(row),
+                          applied=applied, saved=saved())
 
 
-async def answer_model_wait_decision(root: Any, body: dict) -> tuple[int, dict]:
-    """Share the existing wait effect and settings-writer receipts across transports."""
-    decide = _decide
+async def answer_model_wait_decision(root: Any, body: dict, *, request: Any = None) -> tuple[int, dict]:
+    """Share the existing wait effect and settings-writer receipts across transports; ``request`` declares a
+    saved choice's origin (``owner_settings.record_settings_change``)."""
+    decide = functools.partial(_decide, request=request)
     if body.get("persist_role") is True:
         from ouroboros.gateway.settings import _run_settings_writer
 

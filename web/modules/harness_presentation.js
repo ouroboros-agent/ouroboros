@@ -8,7 +8,7 @@
 // This module presents identity only. It does not decide route availability,
 // status, requested/effective/executed truth, or review authority.
 
-import { escapeHtmlAttr as escapeHtml } from './utils.js';
+import { escapeHtmlAttr as escapeHtml, escapeHtmlText } from './utils.js';
 
 export const HARNESS_MARKS = Object.freeze({
     codex: Object.freeze({
@@ -38,7 +38,28 @@ export const GENERIC_HARNESS_MARK = Object.freeze({
     path: 'M12 2 22 12 12 22 2 12Z',
 });
 
-const GENERIC_LABELS = Object.freeze({ agy: 'Antigravity' });
+const GENERIC_LABELS = Object.freeze({ agy: 'Antigravity', copilot: 'GitHub Copilot' });
+// Names of the API providers (a task card's route rows, the route editor's fallback when the setup contract
+// does not describe one, e.g. GigaChat). The contract's label wins wherever it exists.
+export const API_PROVIDER_LABELS = Object.freeze({
+    openrouter: 'OpenRouter', openai: 'OpenAI', anthropic: 'Anthropic', deepseek: 'DeepSeek',
+    zai: 'Z.ai (GLM)', minimax: 'MiniMax', cloudru: 'Cloud.ru Foundation Models', gigachat: 'GigaChat',
+    'openai-compatible': 'OpenAI-compatible endpoint',
+});
+
+// The vendors' plan ids as the owner's words; an id not listed here stays itself (honest, never guessed). The raw
+// id is a fact of the account's Resources panel.
+const PLAN_LABELS = Object.freeze({
+    free: 'Free', plus: 'Plus', pro: 'Pro', prolite: 'Pro Lite', promax: 'Pro Max', max: 'Max', team: 'Team',
+    business: 'Business', enterprise: 'Enterprise', claude_pro: 'Pro', claude_max: 'Max', claude_team: 'Team',
+    claude_enterprise: 'Enterprise', self_serve_business_usage_based: 'Business usage-based',
+});
+
+/** The plan's word for a vendor plan id, or the id itself. */
+export function planLabel(plan) {
+    const raw = String(plan ?? '').trim();
+    return PLAN_LABELS[raw.toLowerCase()] || raw;
+}
 const API_IDS = new Set(['api', 'api_chat', 'api_model', 'native']);
 
 /** Return presentation facts only; callers retain status and evidence ownership. */
@@ -91,15 +112,103 @@ export function harnessAccountIdentityMarkup(harnessId, {
     return identity + (profile ? ` (${escapeHtml(profile)})` : '');
 }
 
-/** Card identity consumes projected facts; it does not infer execution from marks. */
-export function executorIdentityMarkup(chip, { agentModel = '' } = {}) {
-    const identity = chip
-        ? `<span class="harness-chip chat-live-executor-chip" title="${escapeHtml(chip.title || '')}">`
-            + harnessIdentityMarkup(chip.harness, { label: chip.label || '', className: 'chat-live-executor-identity' }) + '</span>'
-        : '';
-    const facts = [
-        agentModel ? `${chip ? 'Coordinator' : 'Agent model'}: ${agentModel}` : '',
-        chip?.observedModels?.length ? `Observed: ${chip.observedModels.join(', ')}` : '',
-    ];
-    return identity + facts.filter(Boolean).map(text => `<span class="chat-live-meta-text">${escapeHtml(text)}</span>`).join('');
+// The meta line's separator is TEXT, not a CSS gap: it has to survive a copy
+// out of the page and be read aloud, and a flex gap does neither. One rule for
+// every part boundary, here and in `renderLiveCardMeta`, which joins its own
+// parts with the same string and receives this block as one of them.
+export const META_PART_SEPARATOR = ' \u00b7 ';
+
+export function joinMetaParts(parts) {
+    return parts.filter(Boolean).join(META_PART_SEPARATOR);
+}
+
+/** Normalize coordinator route provenance from a recorded snapshot or frame. */
+export function formatCoordinatorProvenance(source) {
+    if (!source) return '';
+    if (typeof source === 'string') {
+        const trimmed = source.trim();
+        if (!trimmed) return '';
+        const lower = trimmed.toLowerCase();
+        if (lower === 'inherited' || lower === 'parent') return 'inherited';
+        if (lower === 'fallback' || lower === 'parent_fallback' || lower === "parent's fallback") {
+            return "parent's fallback";
+        }
+        if (lower.startsWith('chosen by the delegator')) return trimmed;
+        if (lower.startsWith('delegator:')) {
+            const row = trimmed.slice('delegator:'.length).trim();
+            return row ? `chosen by the delegator (${row})` : 'chosen by the delegator';
+        }
+        return trimmed;
+    }
+    if (typeof source !== 'object') return '';
+    const snap = source.parent_cognitive_route && typeof source.parent_cognitive_route === 'object'
+        ? source.parent_cognitive_route
+        : null;
+    const chosenRow = String(
+        snap?.supervisor_row || snap?.supervisor_subagent_id
+        || snap?.selected_supervisor_snapshot?.handle || snap?.selected_supervisor_snapshot?.selected_subagent_id
+        || snap?.row || source.supervisor_row || source.supervisor_subagent_id
+        || source.selected_supervisor_snapshot?.handle || source.selected_supervisor_snapshot?.selected_subagent_id
+        || '',
+    ).trim();
+    const explicit = String(
+        source.coordinatorProvenance || source.coordinator_provenance
+        || snap?.chosen_by || source.chosen_by || '',
+    ).trim();
+    const lower = explicit.toLowerCase();
+    if (lower === 'delegator') {
+        return chosenRow ? `chosen by the delegator (${chosenRow})` : 'chosen by the delegator';
+    }
+    if (lower === 'fallback' || lower === 'parent_fallback' || lower === "parent's fallback") {
+        return "parent's fallback";
+    }
+    if (lower === 'inherited' || lower === 'parent') {
+        return 'inherited';
+    }
+    return explicit ? formatCoordinatorProvenance(explicit) : '';
+}
+
+/** Describe the supervising child's own cognitive route and billing basis for the pre-evidence chip. */
+export function coordinatorRouteClause(evt) {
+    const snap = evt?.parent_cognitive_route && typeof evt.parent_cognitive_route === 'object'
+        ? evt.parent_cognitive_route
+        : null;
+    const rawModel = String(evt?.coordinator_route || evt?.model || snap?.model || '').trim();
+    const local = Boolean(evt?.use_local_model ?? snap?.use_local_model) || rawModel.endsWith(' (local)');
+    const route = local && rawModel && !rawModel.endsWith(' (local)') ? `${rawModel} (local)` : rawModel;
+    const explicitBilling = String(
+        evt?.coordinator_billing || evt?.nanny_billing || evt?.cost_kind || snap?.billing || snap?.cost_kind || '',
+    ).trim();
+    const billing = explicitBilling || 'unknown';
+    return route
+        ? `this subagent itself runs on ${route} (bills as ${billing})`
+        : `this subagent runs on its coordinator route (bills as ${billing})`;
+}
+
+/** Card identity consumes projected facts; it does not infer execution from marks.
+ *  The chip's detail sentence is card text too, never a hover-only title: the
+ *  `Executor` row of the card's details (chat_activity.renderLiveCardMeta), which
+ *  its one disclosure opens by pointer, keyboard or touch, so the compact line
+ *  never reflows when the card opens. Text-mode escaping keeps the markup equal to
+ *  its serialization, which the meta line's no-op check compares, so a quote never
+ *  forces a rebuild. `model` is the executor's own model fact (executorModelText),
+ *  never the coordinating model: that one is a labelled row of the details. */
+export function executorIdentityMarkup(chip, { model = '' } = {}) {
+    if (!chip) return '';
+    const identity = `<span class="harness-chip chat-live-executor-chip" title="${escapeHtml(chip.title || '')}">`
+        + harnessIdentityMarkup(chip.harness, { label: chip.label || '', className: 'chat-live-executor-identity' }) + '</span>';
+    return joinMetaParts([identity, model ? `<span class="chat-live-meta-text">${escapeHtmlText(model)}</span>` : '']);
+}
+
+/** The model the executor itself ran, as far as its evidence says: settled observed
+ *  models (separate historical facts, listed as such), else the run's own progress
+ *  report with its source. A requested model says so; an unconfirmed one is absent
+ *  (the detail sentence says `model unconfirmed`). `compact` shortens a provider id. */
+export function executorModelText(chip, compact = (model) => model) {
+    if (chip?.observedModels?.length) return chip.observedModels.join(', ');
+    const observation = chip?.observation;
+    const model = compact(String(observation?.model || ''));
+    if (!model) return '';
+    if (observation.model_source === 'observed') return model;
+    return observation.model_source === 'requested' ? `requested ${model}` : '';
 }

@@ -3,9 +3,11 @@
 // `api_chat` + `profile_id`; task actors serialize `api_model` +
 // `credential_profile_id`.
 
-import { accountRows, accountName } from './claudexor_status_store.js';
+import { accountRows, accountName, accountModelUnsupported } from './claudexor_status_store.js';
 import { formatRelativeAge } from './ui_helpers.js';
+import { API_PROVIDER_LABELS, harnessPresentation } from './harness_presentation.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
+import { fmt, tr } from './i18n.js';
 import { modelChooserHtml, updateModelChooserOptions } from './model_chooser.js';
 
 export const ROUTE_KIND_API_MODEL = 'api_model';
@@ -19,6 +21,8 @@ export const EFFORT_CHOICES = ['none', 'minimal', 'low', 'medium', 'high', 'xhig
 export const PROCESSING_PREFERENCE_KEY = 'OUROBOROS_PROCESSING_PREFERENCE';
 export const MODEL_PROCESSING_PREFERENCES_KEY = 'OUROBOROS_MODEL_PROCESSING_PREFERENCES';
 export const PROCESSING_CHOICES = ['standard', 'fast', 'economy'];
+/** Fast and Economy send another processing tier, which its own endpoint prices: a catalog's row is not that call's price. */
+export const tierPriced = (preference) => preference === 'fast' || preference === 'economy';
 
 export function processingLabel(value) {
     return { standard: 'Standard', fast: 'Fast', economy: 'Economy', mixed: 'Mixed', unknown: 'Unknown' }[value] || 'Route default';
@@ -38,7 +42,7 @@ export function processingSelectHtml(attrs, selected, { global = false } = {}) {
 
 /** Intent controls never change model/effort or claim the route served this mode. */
 export function processingDetailsHtml(attrs, selected, inherited = '') {
-    return `<details class="model-role-details" data-processing-details><summary>Processing · <span data-processing-summary>${escapeHtml(processingIntentLabel(selected, inherited))}</span></summary>
+    return `<details class="model-role-details ui-disclosure" data-processing-details><summary><span>Processing · <span data-processing-summary>${escapeHtml(processingIntentLabel(selected, inherited))}</span></span></summary>
         <label class="ui-field">Processing ${processingSelectHtml(attrs, selected)}</label>
         <div class="ui-field-help">Uses the same model and reasoning effort. An explicit native service choice takes precedence.</div></details>`;
 }
@@ -69,8 +73,12 @@ export function parseModelSource(value) {
             model: split < 0 ? '' : target.slice(split + 1) };
     }
     const split = raw.indexOf('::');
-    return split < 0 ? { source: 'openrouter', model: raw }
-        : { source: raw.slice(0, split), model: raw.slice(split + 2) };
+    if (split < 0) return { source: 'openrouter', model: raw };
+    // A source is a provider kind, or `kind@name` for a key added under Accounts; `kind@default`
+    // is the built-in key's long spelling (provider_models.parse_model_route canonicalizes it too).
+    const source = raw.slice(0, split);
+    return { source: source.endsWith('@default') ? source.slice(0, -'@default'.length) : source,
+        model: raw.slice(split + 2) };
 }
 
 export function composeModelSource(source, model) {
@@ -84,51 +92,182 @@ export function composeModelSource(source, model) {
 // Owner-facing order of the direct API providers. OpenRouter first because an
 // unprefixed model id routes through it; the rest follow the settings order.
 export const API_PROVIDER_ORDER = ['openrouter', 'openai', 'anthropic', 'deepseek',
-    'minimax', 'cloudru', 'gigachat', 'openai-compatible'];
+    'zai', 'minimax', 'cloudru', 'gigachat', 'openai-compatible'];
 
-// Fallback names for providers the setup contract does not describe (GigaChat
-// has no profile spec). The contract's label wins whenever it exists.
-const API_PROVIDER_LABELS = {
-    openrouter: 'OpenRouter', openai: 'OpenAI', anthropic: 'Anthropic', deepseek: 'DeepSeek',
-    minimax: 'MiniMax', cloudru: 'Cloud.ru Foundation Models', gigachat: 'GigaChat',
-    'openai-compatible': 'OpenAI-compatible endpoint',
-};
 
 // Credential shapes that make a provider usable, mirroring the runtime's
 // PROVIDER_CREDENTIAL_GROUPS: any ONE group whose every key is present counts.
 // Only the fields the transport cannot start without are listed here; optional
-// region/scope/base-url companions are not evidence of a missing key.
+// region/scope/base-url companions are not evidence of a missing key. The
+// compatible endpoint is `compatible_endpoint_configured`: its own address (key
+// optional), or the legacy address with the OpenAI key it travels with.
 const API_PROVIDER_CREDENTIALS = {
     openrouter: [['OPENROUTER_API_KEY']],
     openai: [['OPENAI_API_KEY']],
     anthropic: [['ANTHROPIC_API_KEY']],
     deepseek: [['DEEPSEEK_API_KEY']],
+    zai: [['ZAI_API_KEY']],
     minimax: [['MINIMAX_API_KEY']],
     cloudru: [['CLOUDRU_FOUNDATION_MODELS_API_KEY']],
     gigachat: [['GIGACHAT_CREDENTIALS'], ['GIGACHAT_USER', 'GIGACHAT_PASSWORD']],
-    'openai-compatible': [['OPENAI_COMPATIBLE_BASE_URL'], ['OPENAI_BASE_URL']],
+    'openai-compatible': [['OPENAI_COMPATIBLE_BASE_URL'], ['OPENAI_BASE_URL', 'OPENAI_API_KEY']],
 };
+
+/**
+ * The built-in compatible connection's one pair, the twin of `provider_models.compatible_endpoint`:
+ * the dedicated address with its own key (blank = no auth), else the legacy `OPENAI_BASE_URL` with
+ * `OPENAI_API_KEY`. Neither pair borrows the other's key. `legacy` says which pair a draft reaches and
+ * `apiKeySetting` the setting its key is read from, which discovery names for a kept (masked) key.
+ * @returns {{baseUrl: string, apiKey: string, apiKeySetting: string, legacy: boolean}}
+ */
+export function compatibleEndpoint(settings = {}) {
+    const value = (key) => String(settings?.[key] ?? '').trim();
+    const legacy = !value('OPENAI_COMPATIBLE_BASE_URL');
+    const [url, key] = legacy ? ['OPENAI_BASE_URL', 'OPENAI_API_KEY'] : ['OPENAI_COMPATIBLE_BASE_URL', 'OPENAI_COMPATIBLE_API_KEY'];
+    return { baseUrl: value(url), apiKey: value(key), apiKeySetting: key, legacy };
+}
 
 /** Every settings key that can make an API provider selectable. */
 export const API_PROVIDER_CREDENTIAL_KEYS = [...new Set(
     API_PROVIDER_ORDER.flatMap((id) => API_PROVIDER_CREDENTIALS[id].flat()),
 )];
 
-export function apiProviderLabel(id, providerProfiles = {}) {
+/** A source id is a provider kind, or `kind@name` for a key added under Accounts. */
+export function connectionParts(id) {
+    const raw = String(id || '');
+    const at = raw.indexOf('@');
+    return at < 0 ? { kind: raw, name: '' } : { kind: raw.slice(0, at), name: raw.slice(at + 1) };
+}
+
+/** A known connection's own label, else the provider's name (and an added key's stored name). */
+export function apiProviderLabel(id, providerProfiles = {}, connections = []) {
     const key = String(id || '');
-    return String(providerProfiles?.[key]?.label || API_PROVIDER_LABELS[key] || key);
+    const listed = (connections || []).find((entry) => entry?.id === key)?.label;
+    if (listed) return String(listed);
+    const { kind, name } = connectionParts(key);
+    const base = String(providerProfiles?.[kind]?.label || API_PROVIDER_LABELS[kind] || kind);
+    return name ? `${base} · ${name}` : base;
 }
 
 /**
- * Providers the owner can actually send to, in owner-facing order.
- * A masked placeholder such as `***set***` is a stored credential; only an
- * absent or blank value withdraws the provider from the list.
+ * Every API connection the settings document names, in owner-facing order: each provider's
+ * built-in key, then the keys added under Accounts (`_meta.connections`; `id` is the source the
+ * editor stores, `display` its label). A draft without that list (the first-run wizard's flat
+ * keys) names the built-in connections from the stored credential fields; a masked placeholder
+ * such as `***set***` is a stored credential, an absent or blank value is not.
+ * @returns {Array<{id:string, kind:string, name:string, label:string, builtin:boolean,
+ *   enabled:boolean, configured:boolean, source:string}>} `source`: where the credential comes from
+ *   (`settings`, `environment`, `none`; '' when the document does not say).
  */
-export function configuredApiProviders(settings = {}, providerProfiles = {}) {
+export function apiConnections(settings = {}, providerProfiles = {}) {
+    const listed = settings?._meta?.connections;
+    if (Array.isArray(listed)) {
+        return listed.filter((entry) => entry && entry.id).map((entry) => {
+            const id = String(entry.id);
+            const name = String(entry.name || '');
+            return { id, kind: String(entry.kind || connectionParts(id).kind), name,
+                builtin: entry.builtin === true || !name, enabled: entry.enabled !== false,
+                configured: entry.configured === true, source: String(entry.source || ''),
+                label: String(entry.display || '') || apiProviderLabel(id, providerProfiles) };
+        });
+    }
     const present = (key) => String(settings?.[key] ?? '').trim() !== '';
-    return API_PROVIDER_ORDER
-        .filter((id) => API_PROVIDER_CREDENTIALS[id].some((group) => group.every(present)))
-        .map((id) => ({ id, label: apiProviderLabel(id, providerProfiles) }));
+    let rows = settings.OUROBOROS_CONNECTIONS || [];
+    if (typeof rows === 'string') {
+        try { rows = JSON.parse(rows); } catch { rows = []; }
+    }
+    rows = Array.isArray(rows) ? rows : [];
+    return API_PROVIDER_ORDER.flatMap((id) => [{ id, kind: id, name: '', builtin: true,
+        enabled: !rows.some((row) => row?.kind === id && row.name === 'default' && row.enabled === false),
+        configured: API_PROVIDER_CREDENTIALS[id].some((group) => group.every(present)), source: '',
+        label: apiProviderLabel(id, providerProfiles) }, ...rows.filter((row) => row?.kind === id && row.name && row.name !== 'default')
+        .map((row) => ({ id: `${id}@${row.name}`, kind: id, name: row.name, builtin: false,
+            enabled: row.enabled !== false, configured: id === 'openai-compatible' ? Boolean(row.base_url?.trim())
+                : id === 'gigachat' ? Boolean(row.credentials?.trim() || (row.user?.trim() && row.password?.trim()))
+                    : Boolean(row.api_key?.trim()), source: '',
+            label: `${apiProviderLabel(id, providerProfiles)} · ${row.label || row.name}` }))]);
+}
+
+/** The sources the owner can send to: one per enabled connection that holds its credential. */
+export function configuredApiProviders(settings = {}, providerProfiles = {}) {
+    return apiConnections(settings, providerProfiles)
+        .filter((connection) => connection.enabled && connection.configured)
+        .map(({ id, label }) => ({ id, label }));
+}
+
+/**
+ * The setup wizard's `profile` defaults (`modelDefaults[profile]`, slot → model) on the key a proposal names in the
+ * draft `settings`, by the server's rule (provider_models.proposal_connection, server_runtime._proposal_connection;
+ * #2969): the built-in key when it serves or no key of that provider does, else the only named one, else the named
+ * key `main` already runs on. Before that choice they keep the shipped spelling, and `choice` lists the keys a Main
+ * still on it waits for (Settings' `main_connection_choice`).
+ */
+export function connectionDefaults(modelDefaults, profile, settings = {}, providerProfiles = {}, main = '') {
+    const keys = configuredApiProviders(settings, providerProfiles).map(({ id }) => id)
+        .filter((id) => connectionParts(id).kind === profile);
+    const names = keys.map((id) => connectionParts(id).name);
+    const own = parseModelSource(main).source;
+    const name = !names.length || names.includes('') ? '' : names.length === 1 ? names[0]
+        : keys.includes(own) ? connectionParts(own).name : null;
+    // Each entry of a list spelled on that key, as provider_models.route_on_connection spells one route.
+    const onKey = (value) => String(value || '').split(',').map((entry) => entry.trim()).filter(Boolean).map((entry) => {
+        const { source, model } = parseModelSource(entry);
+        return name && source === profile ? `${profile}@${name}::${model}` : entry;
+    }).join(', ');
+    const defaults = modelDefaults[profile] || modelDefaults.openrouter || {};
+    return { defaults: Object.fromEntries(Object.entries(defaults).map(([slot, value]) => [slot, onKey(value)])),
+        choice: name === null && own === profile ? keys : [] };
+}
+
+/** Why a saved API source is not offered: its key is turned off, was removed, or holds no credential. */
+export function unavailableConnectionState(id, connections = []) {
+    const known = (connections || []).find((entry) => entry?.id === id);
+    if (known) return known.enabled === false ? 'off' : 'no key';
+    return connectionParts(id).name ? 'removed' : 'no key';
+}
+
+/** What a route whose key cannot send says, on a role's page, the Models list and the home. */
+export const KEY_PROBLEM_WORDS = Object.freeze({ off: 'This key is turned off in Accounts; nothing is sent through it.',
+    removed: 'This key was removed in Accounts; nothing is sent through it.', 'no key': 'This source has no key in Accounts.' });
+
+/** The same fact where the key is not beside it (the Models list): the key named, then why it cannot send. */
+export function keyProblemLine(problem, label) {
+    return { off: `${label} is turned off in Accounts; nothing is sent through it.`,
+        removed: `${label} was removed in Accounts; nothing is sent through it.`, 'no key': `${label} has no key in Accounts.` }[problem] || '';
+}
+
+/** Why a saved route's API key cannot send now (`unavailableConnectionState`), or '' when it can or the route is
+ *  empty or a subscription's. A local route is the caller's to skip. */
+export function routeKeyProblem(value, settings = {}, providerProfiles = {}) {
+    const raw = String(value || '').trim();
+    const { source } = raw ? parseModelSource(raw) : { source: '' };
+    if (!source || source.startsWith('subscription:')) return '';
+    if (configuredApiProviders(settings, providerProfiles).some((provider) => provider.id === source)) return '';
+    return unavailableConnectionState(source, apiConnections(settings, providerProfiles));
+}
+
+const REFERENCE_ROLE_LABELS = Object.freeze({
+    OUROBOROS_MODEL: 'Main', OUROBOROS_MODEL_LIGHT: 'Light', OUROBOROS_MODEL_SAFETY: 'Safety Supervisor',
+    OUROBOROS_MODEL_VISION: 'Vision', OUROBOROS_MODEL_CONSCIOUSNESS: 'Consciousness',
+    OUROBOROS_MODEL_FALLBACKS: 'Fallback', OUROBOROS_MODEL_FALLBACK: 'Fallback', OUROBOROS_WEBSEARCH_MODEL: 'Web search',
+    OUROBOROS_MODEL_DEEP_SELF_REVIEW: 'Deep review', OUROBOROS_SUBAGENTS: 'Agents',
+});
+
+/** The rows a save's answer names as still pointing at a key that cannot send (`connection_references`). */
+export function connectionReferencesText(references, connections = []) {
+    const named = (Array.isArray(references) ? references : []).map((reference) => {
+        if (typeof reference === 'string') return reference.trim();
+        if (!reference || typeof reference !== 'object') return '';
+        const setting = String(reference.setting || '').trim();
+        const role = String(reference.label || REFERENCE_ROLE_LABELS[setting] || setting).trim();
+        const entry = String(reference.entry || '').trim();
+        const where = !entry ? role : setting === 'OUROBOROS_SUBAGENTS' ? `${role} · ${entry}` : `${role} ${entry}`;
+        const route = String(reference.route || '').trim();
+        const { source } = route ? parseModelSource(route) : { source: '' };
+        const id = source && !source.startsWith('subscription:') ? source : String(reference.connection || '').trim();
+        return [where, id ? `(${apiProviderLabel(id, {}, connections)})` : ''].filter(Boolean).join(' ');
+    }).filter(Boolean);
+    return named.length ? `Still naming a key that was removed or turned off, so they cannot send: ${named.join(', ')}` : '';
 }
 
 /** Account binding is supported by agent sessions and subscription model routes. */
@@ -143,12 +282,13 @@ export function routeSupportsAccount(route) {
  * `modelSources` names subscription sources, the options object names API providers.
  * @param {object} route
  * @param {Array<{id:string,label?:string,credentialHarness?:string}>} [modelSources]
- * @param {{providerProfiles?: object}} [options] setup-contract provider profiles, for labels
+ * @param {{providerProfiles?: object, connections?: Array}} [options] setup-contract provider
+ *   profiles and `apiConnections()` output, for labels
  * @returns {{source:string, sourceLabel:string, subscription:boolean, model:string,
  *   harness:string, provider:string, providerLabel:string}} `model` is always the model
  *   part alone: the `openai::`/`claudexor::<source>=` prefix lives in `provider`/`source`.
  */
-export function routeModelFields(route, modelSources = [], { providerProfiles = {} } = {}) {
+export function routeModelFields(route, modelSources = [], { providerProfiles = {}, connections = [] } = {}) {
     if (route?.kind === ROUTE_KIND_AGENT_SESSION) {
         return { ...splitSessionTarget(route.target_id), subscription: false,
             provider: '', providerLabel: '' };
@@ -160,7 +300,7 @@ export function routeModelFields(route, modelSources = [], { providerProfiles = 
     const provider = subscription ? '' : (parsed.source || DEFAULT_API_PROVIDER);
     return { source, sourceLabel: descriptor?.label || source, subscription,
         model: parsed.model,
-        provider, providerLabel: provider ? apiProviderLabel(provider, providerProfiles) : '',
+        provider, providerLabel: provider ? apiProviderLabel(provider, providerProfiles, connections) : '',
         harness: subscription ? String(descriptor?.credentialHarness || '') : '' };
 }
 
@@ -198,21 +338,60 @@ function routeCatalogItems(route, items = []) {
         && (!pin || !item?.credential_profile_id || item.credential_profile_id === pin));
 }
 
+// A dollar figure as the catalog states it, to four decimals and in cents at least: $4, $2.50, $0.075.
+function usd(value) {
+    const [whole, fraction = ''] = String(Math.round(value * 1e4) / 1e4).split('.');
+    return `$${whole}${fraction ? `.${fraction.padEnd(2, '0')}` : ''}`;
+}
+
+/**
+ * A catalog's published price (`ModelCatalogItem.price`) in the owner's words, USD per 1M tokens: `$4 in / $20 out`;
+ * where input length changes it, each figure's range (`$2–4 in / $10–15 out`); `free` when every figure is zero;
+ * '' when the catalog states none, or a figure cannot be read or would print a charge as zero. `unit` names the unit.
+ * The words go through the translation seam. Words only: a price never sorts, filters or admits a model.
+ */
+export function priceWords(price, { unit = false } = {}) {
+    const tiers = Array.isArray(price?.tiers) ? price.tiers : [];
+    const figures = [price?.input, price?.output, ...tiers.flatMap((tier) => [tier?.input, tier?.output])];
+    if (!figures.every((figure) => Number.isFinite(figure) && figure >= 0 && !(figure > 0 && usd(figure) === '$0'))) return '';
+    if (figures.every((figure) => figure === 0)) return tr('model.price.free', 'free');
+    const span = (key) => {
+        const own = [price[key], ...tiers.map((tier) => tier[key])];
+        const [low, high] = [usd(Math.min(...own)), usd(Math.max(...own))];
+        return low === high ? low : `${low}–${high.slice(1)}`;
+    };
+    const params = { input: span('input'), output: span('output') };
+    return unit ? fmt('{input} in / {output} out per 1M tokens', params) : fmt('{input} in / {output} out', params);
+}
+
 /**
  * One suggestion per model: the label names the model and makes no account claim
  * (DESIGN.md §7). Availability, the reading account and its observation time are
- * account facts, so they never travel on a model option.
+ * account facts, so they never travel on a model option. Two row facts do: what an
+ * alias resolves to (`resolved_model`, shown only while every supplying row agrees)
+ * and a row known only from the engine's frozen list (`origin: "hint"` on every
+ * supplying row; absent origin is live). The value stays the row id either way.
+ * The catalog's price travels apart from the label, as `meta`, while every
+ * supplying row states that same price.
  */
 export function catalogModelOptions(items = []) {
     const values = new Map();
     for (const item of items) {
         const value = String(item?.value || item?.id || item);
         const name = String(item?.name || item?.label || '');
+        if (!values.has(value)) values.set(value, { value, label: value, named: false, live: false, resolved: new Set(), prices: new Set() });
         const current = values.get(value);
-        if (!current) values.set(value, { value, label: name || value, named: Boolean(name) });
-        else if (name && !current.named) Object.assign(current, { label: name, named: true });
+        if (name && !current.named) Object.assign(current, { label: name, named: true });
+        if (item?.origin !== 'hint') current.live = true;
+        const resolved = item?.resolved_model;
+        if (typeof resolved === 'string' && resolved && resolved !== value) current.resolved.add(resolved);
+        current.prices.add(priceWords(item?.price));
     }
-    return [...values.values()].map(({ value, label }) => ({ value, label }));
+    return [...values.values()].map(({ value, label, live, resolved, prices }) => {
+        const named = resolved.size === 1 ? `${value} → ${[...resolved][0]}` : label;
+        const meta = prices.size === 1 ? [...prices][0] : '';
+        return { value, label: live ? named : `${named} (shipped list)`, ...(meta ? { meta } : {}) };
+    });
 }
 
 /** Suggestions carry the model alone; the source select already names the provider. */
@@ -222,12 +401,12 @@ export function routeModelSuggestions(route, items = []) {
 }
 
 /** Catalog suggestions, not an entitlement or context claim for the selected account. */
-export function routeModelInputHtml(attrs, route, items, listId, { placeholder = 'Choose a model' } = {}) {
+export function routeModelInputHtml(attrs, route, items, listId, { placeholder = 'Choose a model', programs = [] } = {}) {
     const values = catalogModelOptions(routeCatalogItems(route, items).map((item) => {
         const value = String(item?.value || item?.id || item);
         return { ...(typeof item === 'object' ? item : {}), value: parseModelSource(value).model };
     }));
-    return modelChooserHtml(attrs, routeModelFields(route).model, listId, values, { placeholder });
+    return modelChooserHtml(attrs, routeModelFields(route).model, listId, values, { placeholder, programs });
 }
 
 /** Catalog repaint owns suggestions and native option labels, never a draft node. */
@@ -255,6 +434,46 @@ export function mintStableId(prefix, takenIds) {
     return `${prefix}_${Date.now().toString(36)}`;
 }
 
+// A roster row is NAMED by a projection of its route, never by a stored label
+// (which rots once the owner re-points the row). JS twin of
+// ouroboros/configured_subagents.py — engine_identity / subagent_handle /
+// roster_handles / validate_unique_engines — held together by one parity table,
+// web/tests/fixtures/subagent_handle_parity.json. Facts are EFFECTIVE, exactly
+// what a task snapshot freezes: `inherited` is the global processing preference
+// a row without its own value runs under, and an omitted session access is full.
+function engineIdentity(row, inherited = '') {
+    const route = row?.route || {};
+    return [
+        String(route.kind || ''), String(route.target_id || '').trim(),
+        String(route.credential_profile_id || '').trim(), String(row?.effort || ''),
+        String(row?.processing_preference || inherited || ''),
+        route.kind === ROUTE_KIND_AGENT_SESSION ? String(row?.access || 'full') : '',
+    ];
+}
+
+/** Route target plus THIS row's facets, each omitted at its baseline (full access, standard processing). */
+export function subagentHandle(row, inherited = '') {
+    const [, target, pin, effort, processing, access] = engineIdentity(row, inherited);
+    return [target, effort, access === 'full' ? '' : access, pin ? `@${pin}` : '',
+        processing === 'standard' ? '' : processing].filter(Boolean).join('/');
+}
+
+/** Stored id -> the label the live roster shows; twins are told apart by their stored key. */
+export function rosterHandles(rows, inherited = '') {
+    const base = (rows || []).map((row) => subagentHandle(row, inherited));
+    return new Map((rows || []).map((row, index) => [
+        String(row?.subagent_id || ''),
+        base.indexOf(base[index]) === base.lastIndexOf(base[index])
+            ? base[index] : `${base[index]}~${String(row?.subagent_id || '')}`,
+    ]));
+}
+
+/** Index of the EARLIER row of the same kind sharing this row's handle, else -1 — a save-time rule; reads stay tolerant. */
+export function sameEngineAs(rows, index, inherited = '') {
+    const key = (row) => `${row?.route?.kind || ''}\n${subagentHandle(row, inherited)}`;
+    return (rows || []).findIndex((row, other) => other < index && key(row) === key(rows[index]));
+}
+
 export function composeSessionTarget(harness, model) {
     const h = String(harness || '').trim();
     const m = String(model || '').trim();
@@ -268,9 +487,10 @@ export function splitSessionTarget(target) {
     return { harness: raw.slice(0, eq), model: raw.slice(eq + 1) };
 }
 
-/** Effort already encoded in a Cursor/Agy compound model slug, if any. */
+/** Effort already encoded in a Cursor/Agy compound model slug, if any: a session target
+ *  (`cursor=<slug>`) or the API-wrapped Claudexor model (`claudexor::cursor=<slug>`). */
 export function compoundSessionEffort(target) {
-    const { harness, model } = splitSessionTarget(target);
+    const { harness, model } = splitSessionTarget(String(target || '').replace(/^claudexor::/, ''));
     if (!['cursor', 'agy'].includes(String(harness || '')) || !model) return '';
     const compound = model.toLowerCase().endsWith('-fast') ? model.slice(0, -5) : model;
     const encoded = compound.slice(compound.lastIndexOf('-') + 1).toLowerCase();
@@ -306,14 +526,14 @@ export function decodeRouteChoice(value, { apiKind = ROUTE_KIND_API_MODEL } = {}
 
 /** The chip text for a route's source: who serves it, in the owner's words. */
 export function sourceIdentityLabel(route, {
-    modelSources = [], providerProfiles = {}, harnesses = [],
+    modelSources = [], providerProfiles = {}, harnesses = [], connections = [],
 } = {}) {
     if (route?.kind === ROUTE_KIND_AGENT_SESSION) {
         const { harness } = splitSessionTarget(route?.target_id);
         const descriptor = (harnesses || []).find((entry) => entry?.id === harness);
         return `${descriptor?.display_name || harness} · agent`;
     }
-    const fields = routeModelFields(route, modelSources, { providerProfiles });
+    const fields = routeModelFields(route, modelSources, { providerProfiles, connections });
     return fields.subscription ? `${fields.sourceLabel || fields.source} · model`
         : `API · ${fields.providerLabel}`;
 }
@@ -355,13 +575,14 @@ function undiscoveredLabel(value, known) {
 }
 
 /**
- * The one grouped source select every editor draws: Models, Available subagents
- * and every review lane. Group vocabulary and order are identical everywhere;
+ * The one grouped source select every editor draws: Models and Available subagents
+ * (reviewers included). Group vocabulary and order are identical everywhere;
  * a surface that cannot deliver a group omits it instead of renaming it.
  * @param {object} args
  * @param {Array} [args.harnesses] discovered agent harnesses
  * @param {Array} [args.modelSources] discovered subscription model sources
  * @param {Array<{id:string,label?:string}>} [args.providers] configuredApiProviders() output
+ * @param {Array} [args.connections] apiConnections() output, naming a saved choice that cannot send
  * @param {string} [args.currentChoice] the saved choice, so it survives a read gap
  * @param {boolean} [args.catalogKnown] whether discovery actually answered
  * @param {boolean} [args.accountsKnown] whether the accounts store actually answered
@@ -370,9 +591,9 @@ function undiscoveredLabel(value, known) {
  * @param {object} [args.providerProfiles] setup-contract profiles, for a saved provider's label
  */
 export function routeChoiceGroups({
-    harnesses = [], modelSources = [], providers = [], currentChoice = '',
+    harnesses = [], modelSources = [], providers = [], connections = [], currentChoice = '',
     catalogKnown = true, accountsKnown = true, includeSessions = true,
-    includeSubscriptions = true, providerProfiles = {},
+    includeSubscriptions = true, providerProfiles = {}, hasConfiguredAccounts = false,
 } = {}) {
     const sessionValues = (harnesses || [])
         .filter((harness) => harness && harness.id)
@@ -384,9 +605,10 @@ export function routeChoiceGroups({
     const savedChoice = String(currentChoice || '');
     if (savedChoice.startsWith('session:')
         && !sessionValues.some((option) => option.value === savedChoice)) {
+        // The saved harness keeps its display name (the catalog's own table), with the check's state after it.
         sessionValues.push({
             value: savedChoice,
-            label: undiscoveredLabel(savedChoice.slice('session:'.length), catalogKnown),
+            label: `${harnessPresentation(savedChoice.slice('session:'.length)).label} (agent) · ${catalogKnown ? 'not in discovery' : 'not checked'}`,
         });
     }
     const modelValues = modelSources.map((source) => ({
@@ -394,27 +616,29 @@ export function routeChoiceGroups({
     }));
     if (savedChoice.startsWith('subscription:')
         && !modelValues.some((option) => option.value === savedChoice)) {
-        modelValues.push({ value: savedChoice, label: `${savedChoice.slice(13)} (not checked)` });
+        modelValues.push({ value: savedChoice, label: `${harnessPresentation(savedChoice.slice(13)).label} (model) · not checked` });
     }
-    // Only providers whose credential is stored are offered. A saved choice
-    // whose key is gone stays selectable and says so, so a save cannot silently
-    // rewrite the assignment to the first listed provider.
+    // One entry per enabled connection that holds its key. A saved choice that
+    // cannot send stays selectable and says why, so a save cannot silently
+    // rewrite the assignment to another listed source.
     const apiValues = (providers || []).filter((provider) => provider && provider.id)
         .map((provider) => ({ value: `${API_CHOICE_PREFIX}${provider.id}`,
-            label: provider.label || apiProviderLabel(provider.id, providerProfiles) }));
-    if (savedChoice.length > API_CHOICE_PREFIX.length && savedChoice.startsWith(API_CHOICE_PREFIX)
-        && !apiValues.some((option) => option.value === savedChoice)) {
-        apiValues.push({ value: savedChoice,
-            label: `${apiProviderLabel(savedChoice.slice(API_CHOICE_PREFIX.length), providerProfiles)} (no key)` });
+            label: provider.label || apiProviderLabel(provider.id, providerProfiles, connections) }));
+    const savedApi = savedChoice.startsWith(API_CHOICE_PREFIX) ? savedChoice.slice(API_CHOICE_PREFIX.length) : '';
+    if (savedApi && !apiValues.some((option) => option.value === savedChoice)) {
+        apiValues.push({ value: savedChoice, label: `${apiProviderLabel(savedApi, providerProfiles, connections)}`
+            + ` (${unavailableConnectionState(savedApi, connections)})` });
     }
     apiValues.push({ value: '', disabled: true, label: 'Add a key in Accounts for more' });
     return [
         ...(includeSubscriptions ? [{ label: 'Subscriptions · models', options: modelValues.length
             ? modelValues
             : [{ value: '', disabled: true, label: catalogKnown && accountsKnown
-                ? 'No model sources listed — connect one in Accounts'
+                ? (hasConfiguredAccounts
+                    ? 'No model sources listed: press Read again in Models'
+                    : 'No model sources listed: connect one in Accounts')
                 : catalogKnown ? 'No model sources listed; accounts have not been checked'
-                    : 'Model sources have not been read — use Refresh Model Catalog' }] }] : []),
+                    : 'Model sources not read yet: press Read again in Models' }] }] : []),
         { label: 'API keys', options: apiValues },
         ...(includeSessions ? [sessionValues.length
             ? { label: 'Agents · sessions', options: sessionValues }
@@ -432,8 +656,12 @@ export function routeChoiceGroups({
 // select that pins a route and the Accounts tab that lists the same account
 // call it one name. A second walk over `profiles.profiles` is how the pin
 // option came to say `codex-default` for the row Accounts calls by its email.
+// A refused pre-unified roster offers nothing: the rows beside that refusal are
+// the last unified read, served again, not this engine's accounts. A saved pin
+// still shows as a not-checked option (`profileOptionsFor`).
 export function indexProfilesByHarness(payload) {
     const byHarness = {};
+    if (accountModelUnsupported(payload)) return byHarness;
     for (const row of accountRows(payload)) {
         if (row.kind !== 'profile' || !row.profile_id) continue;
         (byHarness[row.harness] = byHarness[row.harness] || []).push({
@@ -454,7 +682,8 @@ export function profileEntry(entry) {
 /** Native model discovery is per account; an unread account is not an empty catalog. */
 export function accountScopedModelCatalog(harness, pin = '') {
     const envelope = harness?.model_catalog;
-    if (!Array.isArray(envelope?.accounts)) return harness;
+    if (!Array.isArray(envelope?.accounts)) return pin && harness?.models?.some((item) => item.credential_profile_id)
+        ? { ...harness, models: harness.models.filter((item) => !item.credential_profile_id || item.credential_profile_id === pin) } : harness;
     const accounts = envelope.accounts.filter((account) => !pin || account.credentialProfileId === pin);
     const gaps = accounts.filter((account) => !account.catalog);
     const error = gaps.map((account) => account.problem?.message || 'Account model list could not be read').join('; ')
@@ -472,37 +701,68 @@ export function modelsGapNote(harness, catalogKnown = true) {
         ? 'model list could not be read' : '';
 }
 
-export function sessionModelOptions(harness, currentModel, { catalogKnown = true } = {}) {
+/** Catalog evidence, per supplying account. Never rewrites the selected route. */
+export function sessionModelMatches(harness, model, { snapshot = null, pin = '' } = {}) {
+    const selected = String(model || '');
+    const claude = harness?.id === 'claude';
+    // Claude documents only this terminal modifier as case insensitive.
+    const spelling = (value) => claude ? String(value || '').replace(/\[1m\]$/i, '[1m]') : String(value || '');
+    const target = spelling(selected);
+    const base = claude && target.endsWith('[1m]') ? target.slice(0, -4) : '';
+    const usable = snapshot ? accountRows(snapshot).filter((account) => account.harness === harness?.id
+        && account.enabled !== false && account.status?.verification === 'passed').map((account) => account.profile_id) : null;
+    return (harness?.models || []).flatMap((entry) => {
+        const profile = String(entry?.credential_profile_id || '');
+        if (profile && ((pin && profile !== pin) || (usable && !usable.includes(profile)))) return [];
+        const id = spelling(entry?.id || entry?.value || entry);
+        const resolved = spelling(entry?.resolved_model);
+        const basis = id === target ? 'exact' : resolved && resolved === target ? 'resolved'
+            : base && (id === base || resolved === base) ? 'claude_1m_base' : '';
+        return basis ? [{ entry, basis, profile }] : [];
+    });
+}
+
+export const CLAUDE_BASE_QUALIFIER = 'Base model listed; access to the [1m] variant is checked by the engine at session start';
+
+export function sessionModelOptions(harness, currentModel, { catalogKnown = true, snapshot = null, pin = '' } = {}) {
     const models = harness?.models || [];
     const options = [
         { value: '', label: 'Engine default model' },
         ...catalogModelOptions(models),
     ];
-    if (currentModel && !options.some((option) => option.value === currentModel)) {
-        options.push({
-            value: currentModel,
-            label: undiscoveredLabel(currentModel, harnessModelsKnown(harness, catalogKnown)),
+    if (currentModel) {
+        const matches = sessionModelMatches(harness, currentModel, { snapshot, pin });
+        const existing = options.find((option) => option.value === currentModel);
+        const baseOnly = matches.length && matches.every((match) => match.basis === 'claude_1m_base');
+        if (existing && baseOnly && harnessModelsKnown(harness, catalogKnown)) existing.label = `${currentModel} (base model listed; variant checked at start)`;
+        if (!existing) options.push({
+            value: currentModel, custom: !matches.length,
+            label: harnessModelsKnown(harness, catalogKnown) && matches.length
+                ? `${currentModel}${matches.every((match) => match.basis === 'claude_1m_base') ? ' (base model listed; variant checked at start)' : ''}`
+                : undiscoveredLabel(currentModel, harnessModelsKnown(harness, catalogKnown)),
         });
     }
     return options;
 }
 
-export function profileOptionsFor(profiles, savedPin, { accountsKnown = true } = {}) {
+/** `labelled`: the select sits under a visible Account label, so options name the account alone. */
+export function profileOptionsFor(profiles, savedPin, { accountsKnown = true, labelled = false } = {}) {
+    const prefix = labelled ? '' : 'Account: ';
     const options = [
-        { value: '', label: 'Account: automatic rotation' },
+        { value: '', label: labelled ? 'Automatic rotation' : 'Account: automatic rotation' },
         ...(profiles || []).map(profileEntry).filter((profile) => profile.id).map((profile) => ({
             // The VALUE stays the id — it is what the setting stores and what
             // pins the route. Only the label speaks the owner's name for the
             // account, with the stored id appended when they differ.
             value: profile.id,
-            label: `Account: ${profile.name}${profile.name !== profile.id ? ` · ${profile.id}` : ''}`
+            label: `${prefix}${profile.name}${profile.name !== profile.id ? ` · ${profile.id}` : ''}`
                 + ` (pinned)${profile.enabled ? '' : ' (disabled)'}`,
         })),
     ];
     if (savedPin && !options.some((option) => option.value === savedPin)) {
         options.push({
             value: savedPin,
-            label: `Account: ${undiscoveredLabel(savedPin, accountsKnown)}`,
+            label: `${prefix}${undiscoveredLabel(savedPin, accountsKnown)}`,
         });
     }
     return options;
@@ -521,13 +781,13 @@ export function selectHtml(attrs, groups, selected) {
     return `<select class="ui-control" ${attrs}>${options}</select>`;
 }
 
-export function effortSelectHtml(attrs, selected, surfaceDefault = 'route default') {
+export function effortSelectHtml(attrs, selected, surfaceDefault = 'the chat range', defaultLabel = 'Auto (chat range)') {
     const options = [
-        { value: '', label: 'Default effort' },
+        { value: '', label: defaultLabel },
         ...EFFORT_CHOICES.map((effort) => ({ value: effort, label: effort })),
     ];
     return selectHtml(
-        `${attrs} title="Reasoning effort — default: ${escapeHtml(surfaceDefault)}"`,
+        `${attrs} title="Preferred reasoning effort — default: ${escapeHtml(surfaceDefault)}"`,
         [{ label: '', options }],
         selected || '',
     );

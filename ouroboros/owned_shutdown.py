@@ -1,0 +1,997 @@
+"""The installation's ownership set and the one bounded stop of a server generation (ARCHITECTURE §9).
+
+``state/owned_processes.json`` under the canonical data root names every process this
+installation started and has not forgotten. Executor and tracked-command records enter
+through ``workspace_executor._register_process`` and leave through ``_forget_process``;
+ledgered spawns enter through ``process_custody.record_process`` and leave when the ledger
+compaction drops their row or a stop confirms their exit. The per-drive records and the PID
+ledger stay the custody they were (the reaper reads the ledger); the set is the address the
+exit reads instead of walking ``data/state``. One document, atomic replace, written under
+the canonical ledger's append lock. A registration (or a stop's owed identities, ``note_owed``)
+that cannot take that lock is never lost: it lands as one lock-free file in
+``state/owned_processes.pending/``, which every read merges and the next locked update folds in.
+A document that cannot be read is never replaced: what only it names stays owed, entries wait as
+pending files, and strict readers answer unknown until it reads again or an owner removes it.
+
+``begin_owned_stop`` is called first by every shutdown door (owner Restart, the lifespan
+teardown, the emergency exit): it starts the generation's one grace deadline and stamps
+``stop_requested_at`` on every target before any other owner waits, so a launcher kill at the
+grace still leaves every pending stop recorded. Between the two, the generation's first explicit
+door cause replaces ``state/shutdown_entry.json``: one lock-free atomic write, best effort; a
+cause-less or later door keeps it. It records entering shutdown, never an exit, a finished
+cleanup or Resume authority; the ``server_shutdown`` row still follows terminal custody. The next
+start reports that record and claims the file for its own generation, so an older cause never
+explains a death before any door; that death stays uncaused, as does a planned restart's worker
+stop before its teardown (its restart transaction records it).
+
+``stop_owned_work`` is the generation's one stop. The first caller starts it; a later caller
+joins it until completion or the shared deadline and never starts a second one. It stops through
+the existing typed kill helpers, forgets what the existing liveness predicates confirm, stamps the
+rest ``unconfirmed_since`` without waiting for a lock once the deadline passed, and returns: the
+exit owner exits. A target recorded after the stop began (the owner Restart stops before the
+server exits) is born stamped; the begun door also closes tracked-command admission
+(``stop_begun``, read by ``tools/shell_process.tracked_start``) to all but the restart exit's
+own finalization after the stop (the store switch's door owner, ``exit_finalization``), and
+starters stop their late publications. What an in-memory owner leaves unconfirmed (a live handle,
+a start still in flight, an owner unfinished or failed at the deadline) is reported as
+``memory_unconfirmed`` beside the durable ids and keeps the outcome unconfirmed: no record names
+it, so no next start retries it. Debt only the canonical ledger names that no store took into the set
+at the exit, or a selection the exit could not read, is ``ledger_unconfirmed`` and keeps it unconfirmed
+too; the next start's sweep reads that ledger. The next start's ``finish_unconfirmed_stops`` retries every
+stamped record under the same bound before admission and before any extension or replacement
+process starts; what it cannot confirm stays recorded and counted. Records an older release left
+on disk are indexed once by ``start_inherited_import`` on a background thread, so no start waits
+on that walk.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import pathlib
+import threading
+import time
+from typing import Any, Callable, Dict, Iterable, List, Optional
+
+from ouroboros.utils import append_jsonl, atomic_write_json, jsonl_append_lock_path, utc_now_iso
+
+log = logging.getLogger(__name__)
+
+OWNED_PROCESSES_FILENAME = "owned_processes.json"
+PENDING_DIRNAME = "owned_processes.pending"
+SHUTDOWN_ENTRY_FILENAME = "shutdown_entry.json"
+_SCHEMA_VERSION = 1
+_RESTART_CAUSES = frozenset({"restart_requested", "owner_restart"})
+_EXECUTOR_KINDS = ("foreground", "service")
+_POLL_SEC = 0.05  # liveness re-check granularity of process_custody.stop_ledgered_processes
+
+
+class _Stop:
+    """One server generation's stop: started once, then joined until done or its deadline."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.done = threading.Event()
+        self.deadline: Optional[float] = None  # set by the first shutdown door (begin or stop)
+        self.started = False
+        self.outcome: Optional[Dict[str, Any]] = None
+        self.entry_lock = threading.Lock()  # orders the entry file's boot claim and first cause; never the deadline
+        self.entry: Dict[str, Any] = {}  # this generation's shutdown_entry.json record: its claim, then its cause
+        self.previous: Dict[str, Any] = {}  # the record the boot claim replaced: the previous generation's cause
+
+
+_GENERATION_STOP = _Stop()  # one per server process; a test starts a fresh one
+
+
+def _int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def installation_root(drive_root: Any) -> pathlib.Path:
+    """The canonical data root whose set names ``drive_root``'s processes.
+
+    A drive inside the configured data root belongs to it. Outside it (an isolated
+    root), an own child drive maps to its parent by the host layout of
+    ``task_custody.own_child_drives``; any other drive is its own root."""
+    from ouroboros.config import resolve_data_dir
+    from ouroboros.install_identity import require_owned_root
+
+    drive, data = pathlib.Path(drive_root).resolve(strict=False), resolve_data_dir().resolve(strict=False)
+    if drive == data or data in drive.parents:
+        return data  # this install's own set: no identity read, so shutdown doors stay fail-soft
+    drive = require_owned_root(drive)
+    while True:
+        parents = drive.parents
+        if (len(parents) > 3 and drive.name == "data" and parents[1].name == "headless_tasks"
+                and parents[2].name == "state"):
+            drive = parents[3]
+        elif len(parents) > 1 and parents[0].name == "task_drives":
+            drive = parents[1]
+        else:
+            return drive
+
+
+def owned_processes_path(root: Any) -> pathlib.Path:
+    return pathlib.Path(root) / "state" / OWNED_PROCESSES_FILENAME
+
+
+def shutdown_entry_path(root: Any) -> pathlib.Path:
+    return pathlib.Path(root) / "state" / SHUTDOWN_ENTRY_FILENAME
+
+
+def _pending_files(root: Any, *, strict: bool = False, only: Optional[set] = None,
+                   damaged: Optional[set] = None) -> Dict[pathlib.Path, Dict[str, Any]]:
+    """The contended registrations not folded yet (normally none): file -> entry. ``strict`` raises on what it cannot
+    read, a file named for one of the ``only`` record ids when given: another launch's damaged copy says nothing about
+    these. ``damaged`` collects the record ids of every file that cannot be read. A file a concurrent fold just deleted
+    is in the document, read after this."""
+    found: Dict[pathlib.Path, Dict[str, Any]] = {}
+    try:
+        paths = sorted(path for path in (pathlib.Path(root) / "state" / PENDING_DIRNAME).iterdir()
+                       if path.suffix == ".json")
+    except FileNotFoundError:
+        return found
+    except OSError:
+        if strict:
+            raise
+        return found
+    for path in paths:
+        record_id = path.name.split(".", 1)[0]
+        must = strict and (only is None or record_id in only)
+        try:
+            entry = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            entry = None  # a torn write never names a process; its registrant reported the failure
+        if isinstance(entry, dict) and entry.get("record_id"):
+            found[path] = entry
+            continue
+        if must:
+            raise ValueError(f"unreadable pending owned-process record: {path}")
+        if damaged is not None:
+            damaged.add(record_id)
+    return found
+
+
+def _read_document(root: Any, *, pending: Optional[Dict[pathlib.Path, Dict[str, Any]]] = None,
+                   strict: bool = False, only: Optional[set] = None, damaged: Optional[set] = None) -> Dict[str, Any]:
+    """The stored set plus the contended registrations not folded yet. Only a missing file reads as an empty
+    set, without the import mark, so the next start indexes the records on disk again. Unreadable or anything
+    but a set is unknown, never empty: a strict reader raises, a lenient one (the exit's best effort) sees
+    the pending files alone, and no writer replaces it (``_update``)."""
+    from ouroboros.utils import read_text_across_replace
+
+    if pending is None:  # before the document: a concurrent fold-and-delete cannot hide an entry
+        pending = _pending_files(root, strict=strict, only=only, damaged=damaged)
+    path = owned_processes_path(root)
+    missing = False
+    try:
+        document = json.loads(read_text_across_replace(path))
+    except FileNotFoundError:
+        document, missing = None, True
+    except (OSError, ValueError):
+        log.critical("Owned-process set %s is unreadable: kept as it is until it reads again or an owner removes it",
+                     path, exc_info=True)
+        if strict:
+            raise
+        document = None
+    if not isinstance(document, dict) or not isinstance(document.get("records"), dict):
+        if strict and not missing:
+            raise ValueError(f"invalid owned-process set: {path}")
+        document = {"schema_version": _SCHEMA_VERSION, "records": {}}
+    records: Dict[str, Any] = {}
+    aliases = []
+    for record_id, entry in document["records"].items():
+        if _launch_alias(entry):
+            aliases.append(_canonical(entry))
+        else:
+            records[record_id] = entry
+    for entry in aliases:  # after the launch's own record, which keeps its row; the earliest stop stamps stay
+        known = records.get(entry["record_id"])
+        records[entry["record_id"]] = entry if not isinstance(known, dict) else {**known, **{
+            field: min(filter(None, (known.get(field), entry.get(field))), default=None)
+            for field in ("stop_requested_at", "unconfirmed_since")}}
+    document["records"] = records
+    for entry in pending.values():
+        _put(document, _canonical(entry))
+    return document
+
+
+def _canonical(entry: Any) -> Any:
+    """A ledgered launch record under its launch's own id (``process_custody.custody_record_id``)."""
+    if not _launch_alias(entry):
+        return entry
+    from ouroboros.process_custody import custody_record_id
+
+    return {**entry, "record_id": custody_record_id(entry["ledger_entry"])}
+
+
+def _launch_alias(entry: Any) -> bool:
+    """A ledgered launch row stored under another id than its own (an older ``pid-<pid>`` record)."""
+    row = entry.get("ledger_entry") if isinstance(entry, dict) and entry.get("kind") not in _EXECUTOR_KINDS else None
+    if not isinstance(row, dict):
+        return False
+    from ouroboros.process_custody import custody_key, custody_record_id
+
+    try:
+        return custody_key(row)[0] == "launch" and entry.get("record_id") != custody_record_id(row)
+    except (TypeError, ValueError):
+        return False
+
+
+def owned_records(drive_root: Any, *, strict: bool = False, only: Optional[set] = None,
+                  damaged: Optional[set] = None) -> List[Dict[str, Any]]:
+    """Every record the set names; strict consumers distinguish unreadable from empty (``only``, ``damaged``:
+    ``_pending_files``)."""
+    return [dict(entry) for entry in _read_document(installation_root(drive_root), strict=strict, only=only,
+                                                    damaged=damaged)["records"].values()]
+
+
+def _require_owned_entry(root: Any, entry: Dict[str, Any]) -> None:
+    from ouroboros.install_identity import require_owned_root
+
+    require_owned_root(entry.get("drive_root") or root)
+    if entry.get("record_path"):
+        require_owned_root(pathlib.Path(entry["record_path"]).resolve(strict=False).parent)
+
+
+def executor_record_paths(drive_root: Any, kind: str) -> List[pathlib.Path]:
+    from ouroboros.install_identity import StoreForeign
+
+    paths = []
+    for entry in owned_records(drive_root):
+        if entry.get("kind") != kind or not entry.get("record_path"):
+            continue
+        try:
+            _require_owned_entry(drive_root, entry)
+        except StoreForeign as exc:
+            log.warning("Owned-process record retained (%s): %s", exc.reason, exc)
+            continue
+        paths.append(pathlib.Path(entry["record_path"]))
+    return paths
+
+
+def _update(root: Any, change: Callable[[Dict[str, Any]], bool], *, timeout_sec: float = 2.0) -> bool:
+    """Apply ``change(document)`` under the canonical ledger's append lock; write when it changed. False when the
+    document cannot be read: it may hold the only copy of what a stop owes, so it is not rebuilt from nothing."""
+    from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
+    from ouroboros.process_custody import ledger_path
+
+    root = pathlib.Path(root)
+    lock_path = jsonl_append_lock_path(ledger_path(root))
+    lock_fd = acquire_exclusive_file_lock(lock_path, timeout_sec=timeout_sec, stale_sec=10.0, owner_aware_stale=True)
+    if lock_fd is None:
+        log.warning("Owned-process set of %s unchanged: the process-custody lock is unavailable", root)
+        return False
+    try:
+        pending = _pending_files(root)
+        document = _read_document(root, pending=pending, strict=True)
+        if change(document) or pending:
+            document["schema_version"] = _SCHEMA_VERSION
+            atomic_write_json(owned_processes_path(root), document, trailing_newline=True)
+        for path in pending:  # folded into the document just written
+            path.unlink(missing_ok=True)
+        return True
+    except Exception:
+        log.warning("Owned-process set of %s could not be updated", root, exc_info=True)
+        return False
+    finally:
+        release_exclusive_file_lock(lock_path, lock_fd)
+
+
+def stop_begun() -> bool:
+    """This generation entered a shutdown door: its one grace deadline is running (``begin_owned_stop``)."""
+    return _GENERATION_STOP.deadline is not None
+
+
+def stop_deadline() -> Optional[float]:
+    """The monotonic end of that one grace, once a door started it."""
+    return _GENERATION_STOP.deadline
+
+
+def _born_stamped(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """A target recorded after this generation's shutdown began: the next start finishes it."""
+    if stop_begun() and _is_stop_target(entry):
+        return {**entry, "stop_requested_at": entry.get("stop_requested_at") or utc_now_iso()}
+    return entry
+
+
+def _put(document: Dict[str, Any], entry: Dict[str, Any], *, judged: Any = None) -> bool:
+    """Store ``entry``. Over a stored copy of the same launch, a stop's own publication (``judged``: what that stop
+    measured) discharges only that (``process_custody.owed_after``); anything else (a contended copy, a registration
+    landing after a stop) only adds to it (``_fold_launch``)."""
+    records = document.setdefault("records", {})
+    previous = records.get(entry["record_id"])
+    entry = _born_stamped(entry)
+    launch = isinstance(previous, dict) and _ledgered_launch(previous) and _ledgered_launch(entry)
+    if launch or (isinstance(previous, dict) and previous.get("birth") == entry.get("birth")):
+        if launch and judged is None:
+            entry = _fold_launch(previous, entry)
+        else:
+            # The same process recorded again keeps a stop already requested for it.
+            entry = {**entry, "stop_requested_at": previous.get("stop_requested_at") or entry.get("stop_requested_at"),
+                     "unconfirmed_since": previous.get("unconfirmed_since")}
+            if launch:
+                from ouroboros.process_custody import owed_after
+
+                entry["ledger_entry"] = {**entry["ledger_entry"], "known_members": owed_after(
+                    previous["ledger_entry"].get("known_members"), judged, entry["ledger_entry"].get("known_members"))}
+    if previous == entry:
+        return False
+    records[entry["record_id"]] = entry
+    return True
+
+
+def _ledgered_launch(entry: Dict[str, Any]) -> bool:
+    row = entry.get("ledger_entry") if entry.get("kind") not in _EXECUTOR_KINDS else None
+    if not isinstance(row, dict):
+        return False
+    from ouroboros.process_custody import custody_key
+
+    try:
+        return custody_key(row)[0] == "launch"
+    except (TypeError, ValueError):
+        return False
+
+
+def _fold_launch(stored: Dict[str, Any], copy: Dict[str, Any]) -> Dict[str, Any]:
+    """A contended copy of a stored launch record: written while the lock was held, it may be older than what is
+    stored (and a reader may replay it after a newer row of the launch was folded), so it removes nothing
+    (``owed_after`` with nothing judged): every identity either copy still owes stays; one only the copy names, or
+    one either holds, is ``held``. The earliest stop stamps stay."""
+    from ouroboros.process_custody import owed_after
+
+    row = stored["ledger_entry"]
+    known = owed_after(row.get("known_members"), (), copy["ledger_entry"].get("known_members"), stale=True)
+    stamps = {field: min(filter(None, (stored.get(field), copy.get(field))), default=None)
+              for field in ("stop_requested_at", "unconfirmed_since")}
+    return {**stored, **stamps,
+            "ledger_entry": row if known == list(row.get("known_members") or []) else {**row, "known_members": known}}
+
+
+def _forget(root: Any, record_ids: Iterable[str], *, drive_root: str = "", timeout_sec: float = 2.0) -> bool:
+    """``record_ids`` may map each id to the ledger rows its record may still hold to be forgotten."""
+    rows = record_ids if isinstance(record_ids, dict) else None
+    ids = set(record_ids)
+
+    def change(document: Dict[str, Any]) -> bool:
+        records = document.get("records", {})
+        gone = [rid for rid in ids if rid in records
+                and (not drive_root or records[rid].get("drive_root") == drive_root)
+                and (rows is None or records[rid].get("ledger_entry") in rows[rid])]
+        for rid in gone:
+            records.pop(rid)
+        return bool(gone)
+
+    return _update(root, change, timeout_sec=timeout_sec) if ids else True
+
+
+def _executor_entry(path: Any, record: Dict[str, Any]) -> Dict[str, Any]:
+    path = pathlib.Path(path)
+    entry = {
+        "record_id": str(record.get("id") or path.stem),
+        "kind": str(record.get("record_type") or ""),
+        "executor_type": str(record.get("executor_type") or ""),
+        "host_pid": _int(record.get("host_pid")),
+        "birth": str(record.get("created_at") or ""),
+        "task_id": str(record.get("task_id") or ""),
+        "root_task_id": str(record.get("root_task_id") or ""),
+        "drive_root": str(path.parents[2]),
+        "record_path": str(path),
+        "stop_requested_at": None,
+        "unconfirmed_since": None,
+    }
+    # Docker records may carry host_pid=0: the backend identity names the process.
+    entry.update({key: str(record[key]) for key in ("container_name", "backend_pid", "backend_pidfile")
+                  if record.get(key)})
+    return entry
+
+
+def _write_pending(root: Any, entry: Dict[str, Any]) -> bool:
+    """One lock-free pending file: every read merges it, the next locked update folds it."""
+    import uuid
+
+    try:
+        pending_dir = pathlib.Path(root) / "state" / PENDING_DIRNAME
+        pending_dir.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(pending_dir / f"{entry['record_id']}.{uuid.uuid4().hex}.json", entry, trailing_newline=True)
+        return True
+    except Exception:
+        log.warning("Owned process %s is not in the ownership set", entry["record_id"], exc_info=True)
+        return False
+
+
+def _publish(root: Any, entry: Dict[str, Any], *, judged: Any = None, timeout_sec: float = 2.0) -> bool:
+    """Add ``entry`` to the set (``judged``: ``_put``); under contention, as a lock-free pending file instead."""
+    return (_update(root, lambda document: _put(document, entry, judged=judged), timeout_sec=timeout_sec)
+            or _write_pending(root, _born_stamped(entry)))
+
+
+def record_executor_process(path: Any, record: Dict[str, Any]) -> bool:
+    """Add one executor/tracked-command record (``_register_process``); False when not indexed."""
+    entry = _executor_entry(path, record)
+    return _publish(installation_root(entry["drive_root"]), entry)
+
+
+def forget_executor_process(path: Any) -> bool:
+    """Remove the record ``_forget_process`` just deleted."""
+    path = pathlib.Path(path)
+    return _forget(installation_root(path.parents[2]), [path.stem])
+
+
+def record_ledgered_process(drive_root: Any, entry: Dict[str, Any], *, judged: Any = None,
+                            contended: bool = False, timeout_sec: float = 2.0) -> bool:
+    """Add one ledger row ``record_process`` just appended (both spawn funnels), under the row's custody
+    key: ``launch-<hex>`` for a launch, so a later process given its leader's pid is another record.
+    ``judged``: what the stop publishing this row measured (``_put``); ``contended``: that stop could not
+    reconcile under the ledger lock, so its row goes straight to a pending file (no second lock wait)."""
+    from ouroboros.process_custody import custody_record_id, ledger_path
+
+    pid = _int(entry.get("pid"))
+    if pid <= 0:
+        return False
+    row = {key: value for key, value in entry.items() if key != "ts"}
+    fingerprint = row.get("fingerprint") if isinstance(row.get("fingerprint"), dict) else {}
+    purpose = str(row.get("purpose") or "")
+    drive = pathlib.Path(drive_root).resolve(strict=False)
+    record = {
+        "record_id": custody_record_id(row),
+        "kind": "companion" if purpose.startswith("companion:") else "supervised",
+        "host_pid": pid,
+        "birth": str(fingerprint.get("start_time_boot") or fingerprint.get("start_time") or ""),
+        "purpose": purpose,
+        "scope": str(row.get("scope") or ""),
+        "owner_task": str(row.get("owner_task") or ""),
+        "drive_root": str(drive),
+        "record_path": str(ledger_path(drive)),
+        "ledger_entry": row,
+        "stop_requested_at": None,
+        "unconfirmed_since": None,
+    }
+    root = installation_root(drive)
+    return (_write_pending(root, _born_stamped(record)) if contended
+            else _publish(root, record, judged=judged, timeout_sec=timeout_sec))
+
+
+def forget_ledgered_rows(drive_root: Any, rows: Iterable[Dict[str, Any]], *, timeout_sec: float = 2.0) -> bool:
+    """Remove the records of the rows a ledger compaction retired from ``drive_root``'s ledger. A record goes only
+    while it holds one of those exact rows (its copy may lag the ledger); one a later row of the same key replaced
+    after that compaction stays."""
+    from ouroboros.process_custody import custody_record_id
+
+    drive = pathlib.Path(drive_root).resolve(strict=False)
+    observed: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        try:
+            observed.setdefault(custody_record_id(row), []).append({k: v for k, v in row.items() if k != "ts"})
+        except (TypeError, ValueError):
+            continue
+    return _forget(installation_root(drive), observed, drive_root=str(drive),
+                   timeout_sec=timeout_sec) if observed else True
+
+
+def _stamp(root: Any, field: str, select: Callable[[Dict[str, Any]], bool], *,
+           timeout_sec: float = 2.0) -> List[Dict[str, Any]]:
+    """Stamp ``field`` (first time only) on the selected records; return them as stored."""
+    now, selected = utc_now_iso(), []
+
+    def change(document: Dict[str, Any]) -> bool:
+        selected.clear()
+        changed = False
+        for entry in document.get("records", {}).values():
+            if not select(entry):
+                continue
+            if not entry.get(field):
+                entry[field], changed = now, True
+            selected.append(dict(entry))
+        return changed
+
+    if not _update(root, change, timeout_sec=timeout_sec):
+        # Contended: the stop acts on the last readable set, and every stop request lands through
+        # the pending protocol (a stamp seen on a pending registration may exist only in this
+        # read), so a launcher kill leaves it recorded for the next start.
+        selected = []
+        for entry in _read_document(root)["records"].values():
+            if select(entry):
+                entry = {**entry, field: entry.get(field) or now}
+                if field == "stop_requested_at":
+                    _write_pending(root, entry)
+                selected.append(dict(entry))
+    return selected
+
+
+def _is_stop_target(entry: Dict[str, Any]) -> bool:
+    """Executor records and the ledgered processes a task started. Server machinery
+    (workers, event bus, local model, audit), companions and installation daemons keep
+    their lifecycle owners in the teardown."""
+    if entry.get("kind") in _EXECUTOR_KINDS:
+        return True
+    return (entry.get("kind") == "supervised" and bool(entry.get("owner_task"))
+            and entry.get("scope") in ("task", "session"))
+
+
+def _exit_proven(pid: int) -> bool:
+    from ouroboros.platform_layer import pid_provably_gone
+    from ouroboros.process_containment import pid_is_zombie
+
+    # A dead pid only moves toward absence: a corpse its parent reaps between the first two reads is gone by the last.
+    return pid <= 0 or pid_provably_gone(pid) or pid_is_zombie(pid) or pid_provably_gone(pid)
+
+
+def _stop_executor_record(root: Any, entry: Dict[str, Any], deadline: float, retained: set = frozenset(),
+                          shared: Optional[Dict[str, Any]] = None) -> bool:
+    from ouroboros import workspace_executor as executor
+
+    path = pathlib.Path(entry["record_path"])
+    record = executor._load_process_record(path)
+    if record is None:
+        _forget(root, [entry["record_id"]])  # the custody record is gone: nothing left to stop
+        return True
+    if not executor._valid_process_record(path, record, check_identity=False):
+        return False  # never acted on; stays recorded
+    if executor._recorded_launch(record):
+        # It ends everything that identity reaches, leader alive, gone or its pid reused, in its launch's one
+        # pass; what stays alive or unverified keeps this record, and the launch's custody names it for the next start.
+        from ouroboros.process_custody import launch_pass_outcome
+
+        outcome = launch_pass_outcome(root, entry, executor._launch_row(record), deadline, retained, shared)
+        if not outcome or not outcome["exit_confirmed"]:
+            return False
+    elif record.get("executor_type") == "local":
+        pid = _int(record.get("host_pid"))
+        if not _exit_proven(pid):
+            if not executor._host_pid_matches_record(record):
+                expected = str(record.get("host_command_sha256") or "")
+                measured = executor._process_command_sha256(pid)
+                if expected and measured and expected != measured:
+                    from ouroboros.process_custody import record_not_ours
+
+                    if record_not_ours(root, {"pid": pid, "record_id": entry["record_id"]}, {
+                        "recorded": {"cmd_sha256": expected}, "measured": {"cmd_sha256": measured},
+                        "mismatches": ["cmd_sha256"],
+                    }, lock_timeout_sec=max(0.0, min(2.0, deadline - time.monotonic()))):
+                        executor._forget_process(path)
+                        return not path.exists()
+                return False  # alive under an identity the record cannot prove: no right to signal
+            executor._kill_host_pid(pid)
+            while not _exit_proven(pid):
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(_POLL_SEC)
+    elif not executor._stop_record_process(path, record, wait=True):
+        return False  # Docker: the backend receipt is the proof
+    executor._forget_process(path)
+    return True
+
+
+def _stop_ledgered(root: Any, entry: Dict[str, Any], deadline: float, retained: set,
+                   shared: Optional[Dict[str, Any]] = None) -> bool:
+    from ouroboros.platform_layer import kill_pid_tree, kill_process_group_id, pid_is_alive
+    from ouroboros.process_custody import (
+        _fingerprint_matches, _owned_service_row, _service_group_survives_leader, launch_pass_outcome,
+        measured_identity_mismatch, record_not_ours,
+    )
+
+    row = entry.get("ledger_entry") if isinstance(entry.get("ledger_entry"), dict) else {}
+    reconciled: List[Dict[str, Any]] = []  # the row as its launch's pass left it, beside the row this stop read
+
+    def forget() -> bool:  # rows of one shared pass finish together: their turns at the lock share its deadline
+        return _forget(root, {entry["record_id"]: [row, *reconciled]}, timeout_sec=max(2.0, deadline - time.monotonic()))
+
+    def alive() -> bool:
+        return _fingerprint_matches(row) or _service_group_survives_leader(row)
+
+    def retire_mismatch() -> Optional[bool]:
+        evidence = measured_identity_mismatch(row)
+        # A reused non-leader PID does not refute surviving group members.
+        if not evidence or _service_group_survives_leader(row):
+            return None
+        if not record_not_ours(root, {**row, "record_id": entry["record_id"]}, evidence,
+                               lock_timeout_sec=max(0.0, min(2.0, deadline - time.monotonic()))):
+            return False
+        return forget()
+
+    launch = _owned_service_row(row)
+    retired = None if launch else retire_mismatch()  # a launch's marker is read before its pid can retire it
+    if retired is not None:
+        return retired
+    if launch:
+        # It ends by its recorded identity, leader alive, gone or its pid reused, in the one pass this
+        # stop shares with its other service rows (``process_custody.launch_stop_pass``).
+        outcome = launch_pass_outcome(root, entry, row, deadline, retained, shared)
+        if not outcome or not outcome["exit_confirmed"]:
+            return False  # alive, unverified or unfinished: stays recorded for the next start
+        reconciled.append({key: value for key, value in (outcome.get("row") or {}).items() if key != "ts"})
+    elif alive():
+        # Liveness may tolerate an unmeasurable start time (retention); a signal needs the
+        # explicit stop's measured identity, or a recorded group that still has members.
+        # Anything else stays recorded and is never signalled. Installation daemon
+        # subtrees are spared, as by the reaper.
+        pid, pgid = _int(row.get("pid")), _int(row.get("pgid"))
+        measured = _fingerprint_matches(row, require_measured=True)
+        group = pgid > 0 and (measured or _service_group_survives_leader(row))
+        if not (measured or group):
+            return False
+        if group:
+            kill_process_group_id(pgid, **({"exclude_pids": retained} if retained else {}))
+        if measured and (pgid <= 0 or (retained and pid_is_alive(pid))):
+            kill_pid_tree(pid, exclude_pids=retained or None)
+        while alive():
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(_POLL_SEC)
+    retired = retire_mismatch()
+    if retired is not None:
+        return retired
+    if not _exit_proven(_int(row.get("pid"))):
+        return False  # a failed identity read is neither a mismatch nor an exit
+    return forget()
+
+
+def _stop_entry(root: Any, entry: Dict[str, Any], deadline: float, retained: set,
+                skip_paths: frozenset = frozenset(), shared: Optional[Dict[str, Any]] = None) -> bool:
+    """One record's bounded stop: True once its exit is confirmed and it left the set."""
+    _require_owned_entry(root, entry)
+    if entry.get("record_path") in skip_paths:
+        return False  # its in-memory owner holds the Popen/backend handle and settles it
+    if entry.get("kind") in _EXECUTOR_KINDS:
+        return _stop_executor_record(root, entry, deadline, retained, shared)
+    return _stop_ledgered(root, entry, deadline, retained, shared)
+
+
+def _start(name: str, fn: Callable[[], Any], results: Optional[Dict[str, Any]] = None) -> threading.Thread:
+    """Run ``fn`` on a daemon thread; ``results[name]`` receives its value, or ``failed`` when it raised."""
+    def run() -> None:
+        try:
+            value = fn()
+            if results is not None:
+                results[name] = value
+        except Exception:
+            log.warning("Owned-work step %s failed; its records stay", name, exc_info=True)
+            if results is not None:
+                results[name] = {"state": "failed"}
+
+    thread = threading.Thread(target=run, name=name, daemon=True)
+    thread.start()
+    return thread
+
+
+def _stop_records(root: Any, entries: List[Dict[str, Any]], deadline: float, *,
+                  owners: Iterable[tuple] = (), skip_paths: frozenset = frozenset(),
+                  memory: Optional[Dict[str, Any]] = None) -> List[str]:
+    """Run every owner and record stop in parallel until ``deadline``; return the ids still named.
+
+    ``memory`` receives what each in-memory owner left unconfirmed: its own report, ``failed``, or
+    ``unfinished`` when it was still running at the deadline. No record names those handles."""
+    retained: set = set()
+    if any(entry.get("kind") not in _EXECUTOR_KINDS for entry in entries):
+        from ouroboros.process_custody import live_daemon_root_pids
+
+        retained = live_daemon_root_pids(root)
+    results: Dict[str, Any] = {}
+    owner_threads = [(name, _start(f"owned-stop-{name}", fn, results)) for name, fn in owners]
+    threads = [thread for _name, thread in owner_threads]
+    from ouroboros.process_custody import launch_stop_pass
+
+    shared = launch_stop_pass(root, [entry for entry in entries if entry.get("record_path") not in skip_paths], retained)
+    if shared is not None:
+        threads.append(_start("owned-stop-services", shared["run"]))
+    threads += [_start(f"owned-stop-{entry['record_id']}",
+                       lambda entry=entry: _stop_entry(root, entry, deadline, retained, skip_paths, shared))
+                for entry in entries]
+    for thread in threads:
+        thread.join(max(0.0, deadline - time.monotonic()))
+    if memory is not None:
+        for name, thread in owner_threads:
+            report = {"state": "unfinished"} if thread.is_alive() else results.get(thread.name)
+            if report:
+                memory[name] = report
+    named = _read_document(root)["records"]
+    remaining = sorted(entry["record_id"] for entry in entries if entry["record_id"] in named)
+    if remaining:
+        # After the deadline no fresh lock wait: one attempt. Every pending stop already carries
+        # ``stop_requested_at``, which the next start retries whether or not this stamp lands.
+        _stamp(root, "unconfirmed_since", lambda entry: entry.get("record_id") in remaining,
+               timeout_sec=max(0.0, deadline - time.monotonic()))
+    return remaining
+
+
+def _stop_budget_sec() -> float:
+    """The launcher's force-exit grace less Uvicorn's bounded drain (runtime_limits: one budget)."""
+    from ouroboros.runtime_limits import LAUNCHER_STOP_GRACE_SEC, SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_SEC
+
+    return LAUNCHER_STOP_GRACE_SEC - SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_SEC
+
+
+def _memory_owners(root: pathlib.Path, deadline: float) -> List[tuple]:
+    """This process's in-memory owners: Popen handles and service logs no record carries. Each returns
+    what it left unconfirmed, or None."""
+    def commands() -> Optional[Dict[str, Any]]:
+        from ouroboros.tools.shell import kill_all_tracked_subprocesses
+
+        return kill_all_tracked_subprocesses(deadline=deadline)
+
+    def services() -> Optional[Dict[str, Any]]:
+        from ouroboros.tools.services import kill_all_services
+
+        kept = [str(item.get("service_id") or item.get("name") or "unknown")
+                for item in kill_all_services(root, wait=True, durable=False) if item.get("stop_failed")]
+        return {"state": "unconfirmed", "services": kept} if kept else None
+
+    return [("commands", commands), ("services", services)]
+
+
+def _run_stop(root: pathlib.Path, deadline: float) -> Dict[str, Any]:
+    from ouroboros.launch_custody import name_ledger_debt
+
+    started = time.monotonic()
+    wait = max(0.0, min(2.0, deadline - started))
+    # Debt only the canonical ledger names is a target like any other; what this exit cannot count (no store took
+    # its copy, or the selection could not be read) is reported, and every other owner still stops.
+    ledger = name_ledger_debt(root, wait)
+    targets = _stamp(root, "stop_requested_at", _is_stop_target, timeout_sec=wait)  # persisted before any wait
+    from ouroboros.workspace_executor import _services_snapshot
+
+    held = frozenset(str(record.durable_record_path) for record in _services_snapshot()
+                     if record.durable_record_path is not None)
+    memory: Dict[str, Any] = {}
+    remaining = _stop_records(root, targets, deadline, owners=_memory_owners(root, deadline), skip_paths=held,
+                              memory=memory)
+    if remaining or memory or ledger:
+        log.critical("Owned-work stop left %d record(s) unconfirmed at the deadline (the next start retries "
+                     "them), in-memory owners %s unconfirmed (no record names them) and ledger debt %s it could "
+                     "not count (the next start's sweep reads that ledger)", len(remaining), memory, ledger)
+        try:
+            append_jsonl(root / "logs" / "supervisor.jsonl", {
+                "ts": utc_now_iso(), "type": "owned_stop_unconfirmed", "records": remaining, "memory": memory,
+                "ledger": ledger}, lock_timeout_sec=max(0.0, min(2.0, deadline - time.monotonic())))
+        except Exception:
+            log.debug("Failed to record the unconfirmed owned stop", exc_info=True)
+    return {"state": "unconfirmed" if remaining or memory or ledger else "completed", "targets": len(targets),
+            "confirmed": len(targets) - len(remaining), "unconfirmed": remaining, "memory_unconfirmed": memory,
+            "ledger_unconfirmed": ledger, "elapsed_sec": round(time.monotonic() - started, 3)}
+
+
+def _generation_record() -> Dict[str, Any]:
+    """The identity a shutdown entry carries: the process generation the restart transaction uses."""
+    from ouroboros.delegate_recovery import _PROCESS_GENERATION
+
+    return {"schema_version": _SCHEMA_VERSION, "generation": _PROCESS_GENERATION, "supervisor_pid": os.getpid()}
+
+
+def _record_shutdown_entry(root: pathlib.Path, cause: str) -> None:
+    """Write this generation's first explicit shutdown cause once; a failure is logged, never raised."""
+    stop = _GENERATION_STOP
+    if stop.entry.get("cause"):
+        return  # a later door: no wait, the first cause stays
+    with stop.entry_lock:  # held only by this generation's boot claim or a racing door's one write
+        if stop.entry.get("cause"):
+            return
+        try:
+            stop.entry = {**(stop.entry or _generation_record()), "entered_at": utc_now_iso(),
+                          "cause": cause, "restart_exit": cause in _RESTART_CAUSES}
+            atomic_write_json(shutdown_entry_path(root), stop.entry)
+        except Exception:
+            log.warning("Shutdown entry (%s) not written; the shutdown continues", cause, exc_info=True)
+
+
+def claim_shutdown_entry(root: Any) -> Dict[str, Any]:
+    """Report the previous generation's shutdown entry, then claim the file for this generation.
+
+    ``entered``: it entered a shutdown door with ``cause`` (no proof of its exit or cleanup);
+    ``no_entry``: it claimed the file and recorded no cause; ``absent`` or ``unreadable``;
+    ``current``: the file is already this generation's (a door may precede the boot step).
+    Diagnostic only, never raised: the custody retry that follows must run regardless."""
+    stop, path = _GENERATION_STOP, shutdown_entry_path(root)
+    try:
+        with stop.entry_lock:
+            if stop.entry:
+                return {"state": "current"}
+            claim = {**_generation_record(), "started_at": utc_now_iso()}
+            try:
+                previous: Any = json.loads(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                previous = None
+            except (OSError, ValueError):
+                previous = "unreadable"
+            if isinstance(previous, dict) and previous.get("generation") == claim["generation"]:
+                return {"state": "current"}
+            stop.entry, stop.previous = claim, previous if isinstance(previous, dict) else {}
+            try:
+                atomic_write_json(path, claim)
+            except Exception:
+                log.warning("Shutdown entry %s not claimed; the previous record is removed", path, exc_info=True)
+                path.unlink(missing_ok=True)  # an older cause must not outlive the generation that read it
+    except Exception:
+        log.warning("Shutdown entry %s was not read or claimed", path, exc_info=True)
+        return {"state": "failed"}
+    if previous is None:
+        return {"state": "absent"}
+    if not isinstance(previous, dict) or previous.get("schema_version") != _SCHEMA_VERSION \
+            or not previous.get("generation"):
+        log.warning("Previous shutdown entry %s was unreadable", path)
+        return {"state": "unreadable"}
+    if previous.get("cause"):
+        log.info("Previous server generation %s (pid %s) entered its shutdown at %s with cause %s; "
+                 "an entry, not a confirmed exit", previous["generation"], previous.get("supervisor_pid"),
+                 previous.get("entered_at"), previous["cause"])
+        return {"state": "entered", "previous": previous}
+    log.warning("Previous server generation %s (pid %s, started %s) recorded no shutdown entry: it ended "
+                "before an ordinary shutdown door or the entry was not written (Panic and a planned "
+                "restart's worker stop keep their own records)", previous["generation"],
+                previous.get("supervisor_pid"), previous.get("started_at"))
+    return {"state": "no_entry", "previous": previous}
+
+
+def begin_owned_stop(drive_root: Any = None, *, cause: str = "") -> None:
+    """A shutdown door was entered: start the generation's one grace deadline (if no door did
+    yet), record the first explicit ``cause`` without any file lock, and persist
+    ``stop_requested_at`` on every target before any other owner waits."""
+    if drive_root is None:
+        from ouroboros.config import resolve_data_dir
+        drive_root = resolve_data_dir()
+    root = installation_root(drive_root)
+    stop = _GENERATION_STOP
+    with stop.lock:
+        if stop.deadline is None:
+            stop.deadline = time.monotonic() + _stop_budget_sec()
+        deadline = stop.deadline
+    if cause:
+        _record_shutdown_entry(root, cause)
+    try:
+        _stamp(root, "stop_requested_at", _is_stop_target,
+               timeout_sec=max(0.0, min(2.0, deadline - time.monotonic())))
+    except Exception:
+        log.warning("Owned-work stop requests not stamped at shutdown entry; the stop stamps them",
+                    exc_info=True)
+
+
+def stop_owned_work(drive_root: Any = None) -> Dict[str, Any]:
+    """Start/join the one stop; completed evidence includes any subsequently registered targets."""
+    if drive_root is None:
+        from ouroboros.config import resolve_data_dir
+        drive_root = resolve_data_dir()
+    root = installation_root(drive_root)
+    stop = _GENERATION_STOP
+    with stop.lock:
+        starting = not stop.started
+        if starting:
+            stop.started = True
+            if stop.deadline is None:
+                stop.deadline = time.monotonic() + _stop_budget_sec()
+        deadline = stop.deadline
+    if not starting:
+        stop.done.wait(max(0.0, deadline - time.monotonic()))
+        return _current_stop_outcome(root, stop.outcome or {"state": "in_progress", "joined": True})
+    outcome: Dict[str, Any] = {"state": "failed"}
+    try:
+        outcome = _run_stop(root, deadline)
+    except Exception:
+        log.critical("Owned-work stop failed; the set keeps its records for the next start", exc_info=True)
+    finally:
+        stop.outcome = outcome
+        stop.done.set()
+    return _current_stop_outcome(root, outcome)
+
+
+def _current_stop_outcome(root: Any, outcome: Dict[str, Any]) -> Dict[str, Any]:
+    """Late targets keep their next-start recovery and late in-memory children are disclosed (their
+    starters stop them); no second stop or wait is added."""
+    result = dict(outcome)
+    if result.get("state") == "completed":
+        try:
+            remaining = [entry["record_id"] for entry in owned_records(root, strict=True) if _is_stop_target(entry)]
+        except Exception:
+            remaining = ["ownership_set_unreadable"]
+        if remaining:
+            result.update(state="unconfirmed", unconfirmed=remaining)
+    if result.get("state") in ("completed", "unconfirmed"):
+        try:
+            from ouroboros.tools.shell_process import unsettled_tracked_children
+            late = unsettled_tracked_children()
+        except Exception:
+            late = {"state": "unknown"}
+        if late:  # the stop's own report on its commands, when it has one, stays the more specific fact
+            result.update(state="unconfirmed", memory_unconfirmed={"commands": late,
+                                                                   **result.get("memory_unconfirmed", {})})
+    return result
+
+
+def import_inherited_records(drive_root: Any) -> Optional[int]:
+    """Index executor records left on disk before the set existed, once.
+
+    Runs while the set lacks its import mark (a missing file; an unreadable one takes no result), from
+    the boot's background thread only, never on exit: one walk of ``data/state`` and
+    ``data/task_drives`` that matches named directory symlinks without descending through them."""
+    from ouroboros import workspace_executor as executor
+    from ouroboros.install_identity import canonical_root, initialize_install, StoreForeign
+
+    root = installation_root(drive_root)
+    if _read_document(root).get("inherited_import"):
+        return None
+    previous = initialize_install().get("copied_from") if root == canonical_root() else None
+    if previous:
+        # Legacy executor JSON has no install provenance. Its PID/backend may
+        # still name the original install's live process; a copy cannot adopt it.
+        error = StoreForeign(previous[-1], previous[-1])
+
+        def refuse(document: Dict[str, Any]) -> bool:
+            document["inherited_import"] = {"at": utc_now_iso(), "records": 0,
+                                             "reason_code": error.reason, "reason_detail": str(error)}
+            return True
+
+        if _update(root, refuse):
+            log.warning("Inherited process records retained (%s): %s", error.reason, error)
+            return 0
+        return None
+    entries: Dict[str, Dict[str, Any]] = {}
+    for base in (root / "state", root / "task_drives"):
+        for parent, dirs, _files in os.walk(base):
+            if executor._PROCESS_STATE_DIR not in dirs:
+                continue
+            for path in sorted((pathlib.Path(parent) / executor._PROCESS_STATE_DIR).glob("*.json")):
+                record = executor._load_process_record(path)
+                if record is not None and executor._valid_process_record(path, record, check_identity=False):
+                    entry = _executor_entry(path, record)
+                    entries[entry["record_id"]] = entry
+
+    def change(document: Dict[str, Any]) -> bool:
+        records = document.setdefault("records", {})
+        for record_id, entry in entries.items():  # landing after a stop began, a target is born stamped
+            records.setdefault(record_id, _born_stamped(entry))
+        document["inherited_import"] = {"at": utc_now_iso(), "records": len(entries)}
+        return True
+
+    return len(entries) if _update(root, change) else None
+
+
+def finish_unconfirmed_stops(drive_root: Any) -> Dict[str, Any]:
+    """The next start's bounded retry of every stop a previous generation requested.
+
+    First reports the previous generation's shutdown entry (``claim_shutdown_entry``). Retries
+    each record stamped ``stop_requested_at`` or ``unconfirmed_since`` under the
+    stop's own deadline, forgets confirmed exits, keeps the rest stamped and writes one
+    ``owned_stops_finished`` supervisor row when there was work. It never walks the disk."""
+    counts: Dict[str, Any] = {"retried": 0, "confirmed": 0, "unconfirmed": 0}
+    try:
+        root = installation_root(drive_root)
+        claim_shutdown_entry(root)
+        pending = [dict(entry) for entry in _read_document(root)["records"].values()
+                   if entry.get("stop_requested_at") or entry.get("unconfirmed_since")]
+        if pending:
+            remaining = _stop_records(root, pending, time.monotonic() + _stop_budget_sec())
+            counts.update(retried=len(pending), confirmed=len(pending) - len(remaining),
+                          unconfirmed=len(remaining))
+            append_jsonl(root / "logs" / "supervisor.jsonl", {
+                "ts": utc_now_iso(), "type": "owned_stops_finished", **counts})
+    except Exception:
+        log.warning("Finishing unconfirmed owned stops failed; their records stay for the next start",
+                    exc_info=True)
+    return counts
+
+
+def start_inherited_import(drive_root: Any) -> Optional[threading.Thread]:
+    """Index inherited records on a background thread; None when the set already carries the mark.
+
+    The walk can take minutes on a cold disk and no stop at this start waits on an inherited
+    record, so the ready path never waits on it; one that lands after a stop began is stored
+    stamped. An exit before it lands leaves the mark unset: those processes stay running until
+    the next start indexes them and a later exit stops them."""
+    root = installation_root(drive_root)
+    if _read_document(root).get("inherited_import"):
+        return None
+    began = time.monotonic()
+
+    def run() -> None:
+        records = import_inherited_records(root)
+        if records is not None:
+            append_jsonl(root / "logs" / "supervisor.jsonl", {
+                "ts": utc_now_iso(), "type": "owned_records_imported", "records": records,
+                "seconds": round(time.monotonic() - began, 3)})
+
+    return _start("owned-records-import", run)

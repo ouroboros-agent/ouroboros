@@ -8,14 +8,13 @@ rather than leaving a half-admitted row in the queue.
 
 from __future__ import annotations
 
+import copy
 import logging
 import uuid
 from typing import Any, Optional
 from supervisor.state import append_jsonl
 from ouroboros.utils import utc_now_iso
 from supervisor.queue import _queue_lock
-
-
 
 
 log = logging.getLogger(__name__)
@@ -128,6 +127,10 @@ def _canonical_promoted_repair_constraint(value: Any) -> tuple[Optional[dict], s
         return None, "invalid_skill_repair_constraint"
     if not payload_dir.is_dir():
         return None, "skill_repair_payload_missing"
+    from ouroboros.deployment_extensions import change_refusal, payload_write_refusal
+
+    if change_refusal(canonical.skill_name, "repair") or payload_write_refusal(payload_dir, data_root=_pool().DRIVE_ROOT):
+        return None, "managed_by_deployment"  # a required package is its administrator's: no repair task starts
     # X3 (owner 11=B): the repair is admitted against ONE exact payload state.
     # An unreadable payload cannot anchor a hash chain — fail closed here, not
     # after the task has already spent rounds.
@@ -147,8 +150,12 @@ def _canonical_promoted_repair_constraint(value: Any) -> tuple[Optional[dict], s
     }, ""
 
 
-def _promote_duplicate_reason(task_id: str, ctx: Any) -> str:
-    """Fail closed if a promoted id is already live, durable, or uncheckable."""
+def _promote_duplicate_reason(task_id: str, ctx: Any, *, admission_token: str) -> str:
+    """Fail closed if a promoted id is already live, durable, or uncheckable.
+
+    A row that is only THIS admission's emitted stub (#1160) is its own
+    pre-receipt, not a second owner of the id, so it is read around here.
+    """
     pending = getattr(ctx, "PENDING", _pool().PENDING)
     running = getattr(ctx, "RUNNING", _pool().RUNNING)
     with _queue_lock:
@@ -157,12 +164,14 @@ def _promote_duplicate_reason(task_id: str, ctx: Any) -> str:
             for row in list(pending or [])
         ) or task_id in (running or {})
     try:
+        from ouroboros.routing_wait import is_own_admission_stub
         from ouroboros.task_results import load_task_result
 
-        stored_duplicate = bool(
-            load_task_result(
-                getattr(ctx, "DRIVE_ROOT", _pool().DRIVE_ROOT), task_id, strict=True,
-            )
+        stored = load_task_result(
+            getattr(ctx, "DRIVE_ROOT", _pool().DRIVE_ROOT), task_id, strict=True,
+        )
+        stored_duplicate = bool(stored) and not is_own_admission_stub(
+            stored, admission_token,
         )
     except Exception:
         log.warning("promote: duplicate-id lookup failed for %s", task_id, exc_info=True)
@@ -170,39 +179,11 @@ def _promote_duplicate_reason(task_id: str, ctx: Any) -> str:
     return "duplicate_task_id" if live_duplicate or stored_duplicate else ""
 
 
-def _promoted_force_plan_metadata(evt: dict) -> dict:
-    if evt.get("force_plan") is not True:
-        return {}
-    source = str(evt.get("force_plan_source") or "operator").strip() or "operator"
-    return {"metadata": {"force_plan": True, "force_plan_source": source}}
+def _presence_promotion(evt: dict) -> bool:
+    """A promote carrying Presence authority: a speaker's, or a delegated descendant's binding."""
+    from ouroboros.dialogue_provenance import presence_root_carrier
 
-
-def _promote_project_scope(evt: dict) -> str:
-    """The project an admitted promote lands in: the explicit one the event carries,
-    else the project the OWNER MESSAGE it came from already has.
-
-    The tool already inherits that scope when it emits the event, but the emit →
-    admission window is real: a sibling card of the same message can be turned into a
-    Project in between, and the root would then arrive in Main as a second convertible
-    unit for one piece of work. An IMPLICIT event therefore calls this TWICE: once
-    when the handler starts, so the early admission decisions have a scope, and again
-    under the claim lock that also holds the durable bind — only the second answer can
-    still be true when the bind lands. An event whose scope is already settled returns
-    it unchanged, so the second call re-reads nothing. Presence promotion keeps its
-    empty scope — the tool-side override already decided that a public conversation
-    cannot choose a Project. Fail-open: an unreadable store leaves the scope exactly
-    as the event stated it."""
-    explicit = str(evt.get("project_id") or "")
-    if explicit or evt.get("presence") or not isinstance(evt.get("source_ref"), dict):
-        return explicit
-    try:
-        from ouroboros.projects_registry import origin_claim_lock, project_id_for_origin
-
-        with origin_claim_lock():
-            return str(project_id_for_origin(_pool().DRIVE_ROOT, evt.get("source_ref")) or "")
-    except Exception:
-        log.debug("promote: origin project lookup failed", exc_info=True)
-        return ""
+    return bool(presence_root_carrier(evt, task_contract=evt.get("task_contract")))
 
 
 def _admit_project_scope(
@@ -213,20 +194,24 @@ def _admit_project_scope(
     to announce is stored on the task record and ``promote_chat_to_task`` announces
     it only after ``enqueue_task`` succeeds. Returns the caller's rejection dict, or
     ``None`` when the task is admitted (and when there is no project to admit it into).
-
-    Held by the caller under ``origin_claim_lock``: for an implicit promote the
-    origin re-read and this bind are ONE transaction against the UI conversion's
-    claim, so a sibling card cannot bind the owner message in between and leave this
-    root in Main as a second convertible unit for one piece of work."""
+    Shared origin is provenance only; this new work never adopts another root."""
     if not pid:
         return None
+    from ouroboros.workspace_admission import WORKSPACE_NONE
+
+    # Explicit folder/no-folder choices never depend on the room's default,
+    # including the create/bind window before workspace validation below.
+    frozen = (bool(str(evt.get("workspace_root") or "").strip())
+              or str(evt.get("workspace") or "").strip().lower() == WORKSPACE_NONE)
     # Deletion closes admission before cancellation/quiescence begins. Check
     # the durable lifecycle before creating projects or child drives;
     # enqueue_task repeats this check atomically under the queue lock.
     try:
-        from ouroboros.projects_registry import get_reserved_project
+        from ouroboros.projects_registry import project_admission_view, validate_project_admission
 
-        existing_project = get_reserved_project(_pool().DRIVE_ROOT, pid)
+        basis = (validate_project_admission(evt["_project_admission"]) if "_project_admission" in evt
+                 else project_admission_view(_pool().DRIVE_ROOT, pid, allow_unregistered=True, frozen=frozen))
+        existing_project = basis["project"]
         existing_lifecycle = str((existing_project or {}).get("lifecycle") or "active")
         if existing_project is not None and existing_lifecycle != "active":
             return _pool()._reject_promoted_after_attachment_stage({
@@ -248,11 +233,13 @@ def _admit_project_scope(
     # human display name so the project isn't named after its bare id (v6.33.0).
     project_display_name = str(evt.get("project_name") or "").strip()
     try:
-        from ouroboros.projects_registry import bind_task_to_project, create_project, touch_project
+        from ouroboros.projects_registry import bind_task_to_project, create_project, touch_project, project_admission_basis
 
         project = create_project(
             _pool().DRIVE_ROOT, pid, name=project_display_name, origin="promote_chat_to_task",
+            admission_basis=basis,
         )
+        task["_project_admission"] = (basis if "_project_admission" in evt else project_admission_basis(pid, project, frozen=frozen))
         touch_project(_pool().DRIVE_ROOT, pid)
         # Bind the task to its project (durable task->project map). Without this
         # the task is project-scoped only in its own metadata; the frontend (via
@@ -277,6 +264,7 @@ def _admit_project_scope(
                 pid,
                 (project or {}).get("chat_id"),
                 origin=_origin_from_mapping(evt, absent=absent_reason),
+                admission_basis=task["_project_admission"],
             )
         except Exception as exc:
             _report_binding_failure(tid, pid, exc, path="promote_chat_to_task")
@@ -326,68 +314,6 @@ def _admit_project_scope(
     return None
 
 
-def bind_retry_to_origin_project(
-    drive_root: Any, task: dict, task_id: str, retry_task_id: str,
-) -> str:
-    """Carry a timed-out root's Project onto the retry that replaces it.
-
-    A retry is the SAME work under a new physical id, so it belongs to the room
-    the work already has (DEVELOPMENT "the captured reference is the identity of
-    the work"). Before this, the new id copied the origin ref but carried no
-    binding, and the retried work painted a Main card offering "Turn into
-    project" until some later implicit act adopted it. The predecessor's own
-    binding answers first — it is the SSOT for that task's project — and the
-    origin-keyed lookup covers a root that was never bound itself while another
-    task id of the same owner message was. The new row reuses the predecessor's
-    stored origin BY VALUE, so the retry joins that message's one convertible
-    unit instead of starting a second.
-
-    The reaper calls this INSIDE its retry admission transaction, under the same
-    ``origin_claim_lock`` every implicit claim holds, and only once cancellation
-    can no longer win the boundary: ``bind_task_to_project`` is immutable, so a
-    bound-but-never-admitted retry id would answer ``project_id_for_task``
-    forever. Creates no project and never raises — a refused bind (a project that
-    stopped accepting them) or an unreadable store leaves the retry unbound and
-    is disclosed as ``project_binding_failed``. Returns the project the retry was
-    bound to, "" when there was nothing to inherit.
-    """
-    tid = str(retry_task_id or "").strip()
-    origin_id = str(task_id or "").strip()
-    if not tid or not origin_id or tid == origin_id:
-        return ""
-    from ouroboros.projects_registry import (
-        bind_task_to_project,
-        project_binding_for_task,
-        project_id_for_origin,
-    )
-
-    origin = _origin_from_mapping(task, absent="mid_task_no_origin")
-    try:
-        predecessor = project_binding_for_task(drive_root, origin_id) or {}
-        pid = str(predecessor.get("project_id") or "") or str(
-            project_id_for_origin(drive_root, origin.get("ref"), strict=True) or ""
-        )
-    except Exception as exc:
-        _report_binding_failure(tid, "", exc, path="timeout_retry_admission",
-                                reason="project_binding_unreadable", drive_root=drive_root)
-        return ""
-    if not pid:
-        return ""
-    if isinstance(predecessor.get("source_ref"), dict):
-        origin = {"ref": dict(predecessor["source_ref"])}
-        if isinstance(predecessor.get("source_text"), str):
-            origin["text"] = predecessor["source_text"]
-    elif predecessor.get("origin_absent"):
-        origin = {"absent": str(predecessor["origin_absent"])}
-    try:
-        bind_task_to_project(drive_root, tid, pid, origin=origin)
-    except Exception as exc:
-        _report_binding_failure(tid, pid, exc, path="timeout_retry_admission",
-                                drive_root=drive_root)
-        return ""
-    return pid
-
-
 def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
     """Enqueue a first-class pooled owner task from a conversation-lane promote.
     The task carries the originating ``chat_id`` (its live card and replies
@@ -405,7 +331,7 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
         return {"status": "needs_manual_target", "reason": "empty_objective", "task_id": tid}
     # Reject before project/source/workspace side effects. enqueue_task repeats
     # the check atomically for the tiny race before queue insertion.
-    duplicate_reason = _promote_duplicate_reason(tid, ctx)
+    duplicate_reason = _promote_duplicate_reason(tid, ctx, admission_token=admission_token)
     if duplicate_reason:
         return {
             "status": "needs_manual_target",
@@ -415,16 +341,6 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
 
     evt = dict(evt)
     source_note = str(evt.get("_source_note") or "")
-    # IMPLICIT scope: the event named no project, so the answer comes from the owner
-    # message's own Project and can still change before the bind (a sibling card
-    # converting in the emit -> admission window). Remembered HERE, before the
-    # assignment below turns that answer into the event's stated scope.
-    implicit_scope = (
-        not str(evt.get("project_id") or "")
-        and not evt.get("presence")
-        and isinstance(evt.get("source_ref"), dict)
-    )
-    effective_pid = evt["project_id"] = _promote_project_scope(evt)
     repair_constraint, constraint_error = _canonical_promoted_repair_constraint(
         evt.get("task_constraint")
     )
@@ -460,18 +376,27 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
         "title": title,
         "suggested_name": suggested_name,
         "source": "promote_chat_to_task",
+        "context_requires_self_body_docs": evt.get("context_requires_self_body_docs", False),
+        **({"context_requires_development": evt["context_requires_development"]}
+           if isinstance(evt.get("context_requires_development"), bool) else {}),
+        **({"review_answer": True} if evt.get("review_answer") is True else {}),  # task_contract.review_answer
+        **({"reasoning_effort": evt["reasoning_effort"]} if evt.get("reasoning_effort") else {}),  # explicit start only
+        "objective_author": dict(evt.get("objective_author") or {}),
+        "owner_corpus": list(evt.get("owner_corpus") or []),
         "_require_unique_task_id": True,
         "_require_worker_pool": True,
         "_admission_token": admission_token,
         "promotion_admission_token": admission_token,
-        **_promoted_force_plan_metadata(evt),
     }
-    origin = consciousness_origin_metadata(evt)
+    model_metadata = evt.get("metadata") or {}
+    task["metadata"] = {"lead": model_metadata["lead"]} if "lead" in model_metadata else {}
+    origin = consciousness_origin_metadata({"origin_message_ref": evt.get("source_ref"), **evt})
     if origin:
         # A root consciousness started keeps its origin/category/level by value (В9':
         # ordinary Main flow, no presence-style project/workspace/source stripping).
-        task["actor_id"] = "consciousness"
-        task.setdefault("metadata", {}).update(origin)
+        if origin.get("initiator") == "consciousness":
+            task["actor_id"] = "consciousness"
+        task["metadata"].update(origin)
         apply_consciousness_authority(task)
     inherited_attachment_manifest = _pool()._apply_presence_promotion_authority(
         evt, task, objective=objective, expected_output=expected_output,
@@ -480,7 +405,7 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
         evt, task, tid, inherited_manifest=inherited_attachment_manifest,
     )
     if attachment_rejection is not None:
-        return attachment_rejection
+        return _pool()._reject_promoted_after_attachment_stage(attachment_rejection, attachment_manifest)
     if repair_constraint is not None:
         # X3: bind the admission hash to the REAL task id, durably, before the
         # task exists anywhere else — every payload write CAS-checks this chain.
@@ -493,7 +418,11 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
 
             record_repair_admission(
                 _pool().DRIVE_ROOT, str(repair_constraint.get("skill_name") or ""),
-                task_id=tid, base_content_hash=_base_content_hash)
+                task_id=tid, base_content_hash=_base_content_hash,
+                # The owner door's stamp (dialogue_provenance.run_origin): its
+                # revisions become owner edits of the selected skill.
+                owner_request=bool((isinstance(evt.get("source_ref"), dict) and evt.get("source_ref"))
+                                   or evt.get("origin_suppressed") is True))
         except Exception:
             log.warning("Failed to record skill repair admission for %s", tid, exc_info=True)
             return _pool()._reject_promoted_after_attachment_stage({
@@ -510,25 +439,29 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
         task["origin_message_ref"] = dict(evt["source_ref"])
         if isinstance(evt.get("source_text"), str) and evt.get("source_text"):
             task["origin_message_text"] = evt["source_text"]
+    elif evt.get("origin_suppressed") is True:
+        # The door's other stamp (an owner message it never logged) rides the root
+        # in METADATA, where run_origin reads it, the way a ref rides by value.
+        task.setdefault("metadata", {})["origin_suppressed"] = True
+    elif evt.get("origin_message_absent") is True and task["objective_author"].get("kind") == "task":
+        # The producer's third fact: no owner message opened this drafted start (never a stamp).
+        task.setdefault("metadata", {})["origin_message_absent"] = True
+    if task.get("objective_author"):
+        # The start's sources ride METADATA, which the scheduled receipt, the queue snapshot,
+        # the running record and a control seed already persist.
+        task.setdefault("metadata", {}).update(objective_author=dict(task["objective_author"]),
+                                               owner_corpus=[dict(row) for row in task["owner_corpus"]])
     if isinstance(evt.get("predecessor_authority_source"), dict):
         task["predecessor_authority_source"] = dict(evt["predecessor_authority_source"])
     # Owner Surface Fact: the promoting turn's sending-surface fact lands in
     # METADATA (the renderer reads task["metadata"]["client_surface"]), never a
-    # top-level key — and metadata may not exist yet (only force_plan creates it).
+    # top-level key — and metadata may not exist yet.
     if isinstance(evt.get("client_surface"), dict) and evt.get("client_surface"):
         task.setdefault("metadata", {})["client_surface"] = dict(evt["client_surface"])
+    if isinstance(evt.get("ui_control"), dict) and evt.get("ui_control"):
+        task.setdefault("metadata", {})["ui_control"] = dict(evt["ui_control"])  # the press that started it
     pid = str(evt.get("project_id") or "").strip()
-    from ouroboros.projects_registry import origin_claim_lock
-
-    with origin_claim_lock():
-        if implicit_scope:
-            # Re-resolved under the SAME lock that holds the bind below (an RLock, so
-            # the helper's own acquire is free). A sibling card of this owner message
-            # may have created its Project since this handler started; reading the
-            # origin once, a hundred lines before the bind, is what let the promoted
-            # root arrive in Main as a second convertible unit for one message.
-            pid = evt["project_id"] = _promote_project_scope(evt)
-        rejection = _admit_project_scope(evt, task, tid, pid, attachment_manifest)
+    rejection = _admit_project_scope(evt, task, tid, pid, attachment_manifest)
     if rejection is not None:
         return rejection
     # The answer the task was actually admitted with, so the promote's own receipt
@@ -570,6 +503,12 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
             task["task_contract"].update(authority)
     # Popped BEFORE the row is built/queued so the announce fact never rides it.
     announce_project = task.pop("_announce_project", None)
+    # The direct handbook answer is this start's own, on its contract, after any Presence authority: a copied one,
+    # true or false, stays with the work that started this. The row's copy keeps its older meaning in Max.
+    if isinstance(task.get("task_contract"), dict):
+        task["task_contract"].pop("context_requires_development", None)
+    if isinstance(evt.get("context_requires_development"), bool):
+        task.setdefault("task_contract", {})["context_requires_development"] = evt["context_requires_development"]
     attach_task_contract(task)
     admitted = ctx.enqueue_task(task)
     if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
@@ -578,21 +517,19 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
             "reason": str(admitted.get("_admission_blocked") or "admission_fence"),
             "detail": str(admitted.get("_admission_detail") or ""),
             "project_lifecycle": str(admitted.get("_project_lifecycle") or ""),
+            "never_admitted": bool(admitted.get("_admission_never_admitted")),
             "task_id": tid,
         }, attachment_manifest)
     if announce_project is not None:
         _pool()._announce_created_project(announce_project, tid, task=task)
-    # Owner 3=A: the promoter's unmet planning obligation now belongs to this root
-    # (stamped by _promoted_force_plan_metadata above); release it on the promoter's
-    # live row BEFORE the snapshot persist below, so one persist shows both facts.
-    from supervisor.plan_obligation import transfer_promoter_obligation
-
-    obligation_transfer = transfer_promoter_obligation(ctx, evt, tid)
     # A positive promote confirmation is allowed only after the durable queue
-    # projection exists.  The event handler writes the scheduled task result
-    # after the routing receipt; keeping that last step outside this function
-    # makes the result itself the cross-process admission receipt.
-    persist_snapshot = getattr(ctx, "persist_queue_snapshot", None)
+    # projection exists: the BARRIER, never the mark (a mark answers None while the tick
+    # publishes). The event handler writes the scheduled task result after the routing
+    # receipt; keeping that last step outside this function makes the result itself the
+    # cross-process admission receipt.
+    from supervisor.queue_publication import barrier_of
+
+    persist_snapshot = barrier_of(ctx)
     if not callable(persist_snapshot):
         return _pool()._reject_promoted_after_attachment_stage({
             "status": "needs_manual_target",
@@ -601,7 +538,7 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
             "admission_started": True,
         }, attachment_manifest)
     try:
-        persisted = persist_snapshot(reason="promote_chat_to_task") is not False
+        persisted = persist_snapshot(reason="promote_chat_to_task") is True
     except Exception:
         log.warning("promote: queue snapshot persist failed for %s", tid, exc_info=True)
         persisted = False
@@ -619,18 +556,31 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
     # message seam (tests/test_heartbeat_presentation.py). While it is still
     # PENDING the Dashboard Activity row cancels it; the card action appears once
     # it starts.
-    # A project root may execute from a forked child drive.  Its budget-root
+    from ouroboros.route_choice import OWNER_LEAD_SOURCES, lead_snapshot
+
+    chosen = lead_snapshot(model_metadata.get("lead"))
+    if chosen and chosen["source"] in OWNER_LEAD_SOURCES:
+        from ouroboros.gateway.ui_preferences import record_model_recent
+
+        try:
+            record_model_recent(_pool().DRIVE_ROOT, chosen["model"], chosen["use_local"])
+        except Exception:
+            log.warning("Promoted model saved; recent suggestion could not be recorded for %s", tid, exc_info=True)
+    # A project root may execute from a forked child drive. Its budget-root
     # result therefore receives this admitted contract before worker startup.
     outcome = _pool()._promoted_scheduled_outcome(task, admitted, tid)
     outcome["_admitted_suggested_name"] = task["suggested_name"]
+    # The receipt keeps the admitted metadata, so a root interrupted before its first
+    # running write still names its author, owner corpus and origin facts.
+    admitted_metadata = (admitted if isinstance(admitted, dict) else task).get("metadata")
+    if isinstance(admitted_metadata, dict) and admitted_metadata:
+        outcome["_admitted_metadata"] = copy.deepcopy(admitted_metadata)
     if attachment_manifest:
         outcome.update(authority)
     if effective_pid:
         outcome["project_id"] = effective_pid
     if source_note:
         outcome["source_note"] = source_note
-    if obligation_transfer:
-        outcome["force_plan_transfer"] = obligation_transfer
     return outcome
 
 
@@ -656,7 +606,7 @@ def _admit_promoted_workspace(evt: dict, ctx: Any, task: dict, *, pid: str, tid:
         workspace_repair_hint,
     )
 
-    if task.get("_presence_origin"):
+    if _presence_promotion(evt) and "capability_ceiling" in (task.get("task_contract") or {}):
         # Keep the admitted folder from the inherited contract, never a public
         # event's replacement. Presence retains its canonical shared memory.
         workspace = task["task_contract"].get("workspace") or {}
@@ -692,23 +642,17 @@ def _admit_promoted_workspace(evt: dict, ctx: Any, task: dict, *, pid: str, tid:
         and str(evt.get("workspace") or "").strip().lower() != WORKSPACE_NONE
     ):
         provisioned_now = ""
-        try:
-            from ouroboros.projects_registry import get_project as _get_project_entry
-
-            _existing_wd = str((_get_project_entry(_pool().DRIVE_ROOT, pid) or {}).get("working_dir") or "").strip()
-        except Exception:
-            # Registry read failure: do NOT provision (a blind ensure here could
-            # mint a fresh empty repo over a project whose working_dir merely
-            # failed to load). resolve_room_workspace re-reads and decides.
-            _existing_wd = "unreadable"
-            log.warning("promote: project working_dir lookup failed for %s", pid, exc_info=True)
-        if not _existing_wd:
+        basis = task.get("_project_admission") or {}
+        if not str((basis.get("project") or {}).get("working_dir") or "").strip():
             try:
-                from ouroboros.projects_registry import ensure_project_workspace
+                from ouroboros.projects_registry import ensure_project_workspace, project_admission_basis
 
-                provisioned_now = str(ensure_project_workspace(_pool().DRIVE_ROOT, pid, _pool().REPO_DIR) or "")
+                chosen = ensure_project_workspace(_pool().DRIVE_ROOT, pid, _pool().REPO_DIR,
+                                                  return_project=True, admission_basis=basis)
+                provisioned_now = str((chosen or {}).get("working_dir") or "")
+                if chosen:
+                    task["_project_admission"] = project_admission_basis(pid, chosen)
             except Exception:
-                provisioned_now = ""
                 log.warning("promote: workspace auto-provisioning raised for %s", pid, exc_info=True)
             if not provisioned_now:
                 # Bind-or-fail (v6.58.0): falling through to a workspace-less
@@ -731,7 +675,21 @@ def _admit_promoted_workspace(evt: dict, ctx: Any, task: dict, *, pid: str, tid:
         project_id=pid,
         explicit_workspace=str(evt.get("workspace_root") or "").strip(),
         workspace_sentinel=str(evt.get("workspace") or ""),
+        project_admission=task.get("_project_admission"),
     )
+    # The resource CHOICE (#1315), stamped where it is known so a follow-up carries it by
+    # value: the room's default folder, an explicit folder, an explicit "no folder", or
+    # ordinary self-work over the system repository.
+    explicit_root = bool(str(evt.get("workspace_root") or "").strip())
+    opted_out = str(evt.get("workspace") or "").strip().lower() == WORKSPACE_NONE
+    if task.get("_project_admission") and (explicit_root or opted_out):
+        task["_project_admission"]["frozen"] = True
+    stamped = evt.get("resource_intent") if isinstance(evt.get("resource_intent"), dict) else {}
+    task.setdefault("metadata", {})["resource_intent"] = (
+        {"kind": "system_repo"} if stamped.get("kind") == "system_repo" or not (pid or explicit_root)
+        else {"kind": "explicit_resource", "root": resolved_ws} if explicit_root
+        else {"kind": "explicit_none", "project_id": pid} if opted_out
+        else {"kind": "room_default", "project_id": pid})
     if ws_error:
         return {
             "status": "needs_manual_target", "reason": "workspace_unusable", "task_id": tid,
@@ -744,18 +702,40 @@ def _admit_promoted_workspace(evt: dict, ctx: Any, task: dict, *, pid: str, tid:
         task["workspace_root"] = resolved_ws
         task["workspace_mode"] = "external"
         task["memory_mode"] = "forked"
+        if pid and str(evt.get("workspace_root") or "").strip():
+            # An explicit folder for a room that has none yet becomes the room's
+            # folder: the same validated canonical path this task runs in, written
+            # only while `working_dir` is still empty (compare-and-set under the
+            # registry lock), so a set value is never overwritten and the room's
+            # later direct turns are not blind to where the work went.
+            try:
+                from ouroboros.projects_registry import update_project, project_admission_basis
+
+                # Only our confirmed CAS may advance the original identity used
+                # by hold recovery. Frozen resource choice cannot bless a foreign
+                # rebind (including away-and-back) at this preparation write.
+                chosen = update_project(_pool().DRIVE_ROOT, pid, working_dir=resolved_ws,
+                    only_if_empty=("working_dir",), admission_basis={**task["_project_admission"], "frozen": False})
+                if chosen:
+                    task["_project_admission"] = project_admission_basis(pid, chosen, frozen=True)
+            except Exception:
+                log.warning("promote: could not record working_dir for project %s", pid, exc_info=True)
         # The lease lane keys off task["project_id"]: for a project room it is already
         # set; for a bare workspace promote, resolve it (registry-first → derived hash)
         # so one folder is one serialized lane on EVERY entry path (slice 0 invariant).
         if not str(task.get("project_id") or "").strip():
             try:
-                from ouroboros.project_facts import resolve_project_id as _resolve_pid
+                from ouroboros.projects_registry import project_scope_admission
 
-                derived_pid = _resolve_pid({"workspace_root": resolved_ws})
+                task["_project_admission"] = project_scope_admission(
+                    _pool().DRIVE_ROOT, workspace_root=resolved_ws)
+                derived_pid = task["_project_admission"]["project_id"]
                 if derived_pid:
                     task["project_id"] = derived_pid
-            except Exception:
-                log.debug("promote: project_id derivation failed for %s", tid, exc_info=True)
+            except Exception as exc:
+                return {"status": "needs_manual_target", "task_id": tid,
+                        "reason": getattr(exc, "reason", "project_routing_fence_lookup_failed"),
+                        "detail": str(exc), "never_admitted": True}
         # Memory-fork parity with /api/tasks: the room task runs on an ISOLATED child
         # drive (forked seed), with the canonical root kept for budget/status.
         try:
@@ -786,147 +766,34 @@ def _admit_promoted_workspace(evt: dict, ctx: Any, task: dict, *, pid: str, tid:
             )
             + "[END_HEADLESS_WORKSPACE]"
         )
+    if _presence_promotion(evt):
+        # Ordinary admission owns this root's folder, including no folder.
+        # Do not let the promoter's retained workspace override it on attachment.
+        task["task_contract"] = {key: value for key, value in task["task_contract"].items()
+                                 if key not in {"workspace", "workspace_root", "workspace_mode"}}
     return None
 
 
 def ensure_project_scope(evt: dict, ctx: Any) -> dict:
-    """Create/attach the registry project for an in-task ensure_project_scope call
-    and bind the CURRENT (already-running) task to it, then broadcast so the UI moves
-    the card into the project thread. Mirrors the project-registration half of
-    promote_chat_to_task, but for a task that already exists (the worker has already
-    set ctx.project_id locally; this makes it durable + visible). Returns the typed
-    outcome the receipt rail reports: ``delivered`` with the bound project, or
-    ``rejected`` with the reason (bound elsewhere, a refused bind, a registration
-    failure) -- the tool never says "OK" for a bind that did not land."""
-    tid = str(evt.get("task_id") or "").strip()
-    pid = str(evt.get("project_id") or "").strip()
+    """Frozen event adapter for the shared move operation."""
+    from ouroboros.project_placement import move_task_to_project, placement_basis
+
+    tid, pid = (str(evt.get(key) or "").strip() for key in ("task_id", "project_id"))
     if not tid or not pid:
         return {"status": "rejected", "reason": "missing_task_or_project"}
-    name = str(evt.get("project_name") or "").strip()
+    origin = _origin_from_mapping(evt, absent="mid_task_no_origin")
+    if "absent" in origin:
+        row = (getattr(ctx, "RUNNING", {}) or {}).get(tid) or {}
+        origin = _origin_from_mapping(row.get("task"), absent="mid_task_no_origin")
+    if "absent" in origin:
+        origin = _origin_from_task_record(tid) or origin
     try:
-        from ouroboros.projects_registry import (
-            bind_task_to_project,
-            create_project,
-            origin_claim_lock,
-            project_id_for_origin,
-            project_id_for_task,
-            touch_project,
-            update_project,
+        return move_task_to_project(
+            _pool().DRIVE_ROOT, tid, pid, name=str(evt.get("project_name") or ""), origin=origin,
+            basis=evt.get("_project_admission") or placement_basis(_pool().DRIVE_ROOT, tid, pid),
+            running=getattr(ctx, "RUNNING", {}), pending=getattr(ctx, "PENDING", []),
         )
-
-        # The task's ingress-captured origin, resolved BEFORE the authority read (it
-        # answers both questions): event metadata, then the live RUNNING task dict
-        # (queued tasks carry no origin in ctx.task_metadata, and this also covers
-        # forked/workspace roots whose running record lives on a CHILD drive), then
-        # the durable task record on the canonical drive — the mid-run "make this a
-        # project named X" path must keep the start message.
-        origin = _origin_from_mapping(evt, absent="mid_task_no_origin")
-        if "absent" in origin:
-            running = getattr(ctx, "RUNNING", None)
-            running_row = running.get(tid) if isinstance(running, dict) else None
-            task_row = running_row.get("task") if isinstance(running_row, dict) else None
-            candidate = _origin_from_mapping(task_row, absent="mid_task_no_origin")
-            if "ref" in candidate and "text" in candidate:
-                origin = candidate
-        if "absent" in origin:
-            origin = _origin_from_task_record(tid) or origin
-        # The claim lock is the one the UI conversion and the promote handler hold,
-        # so a card of the SAME owner message cannot claim a project between this
-        # read and this bind.
-        with origin_claim_lock():
-            # This task's EXACT binding is the AUTHORITY, read BEFORE any side effect
-            # (owner decision B4=A). create_project runs before bind_task_to_project here,
-            # so a task already bound elsewhere used to mint a second project, mark the
-            # lease, broadcast it and announce it in chat before the immutable bind
-            # refused. An UNREADABLE store is disclosed once and treated as "no binding":
-            # the work continues as it did before this read existed.
-            try:
-                bound = str(project_id_for_task(_pool().DRIVE_ROOT, tid, strict=True) or "")
-                # The project the owner MESSAGE already has answers for a SIBLING task id
-                # of the same message — but only when this act does not name a different
-                # room: an explicit name/id is the model's own choice (P13) and forks.
-                adopted = "" if bound else str(
-                    project_id_for_origin(_pool().DRIVE_ROOT, origin.get("ref"), strict=True) or ""
-                )
-            except Exception:
-                bound, adopted = "", ""
-                log.warning("project_binding_unreadable: ensure_project_scope for task %s continues "
-                            "as unbound", tid, exc_info=True)
-            if bound and bound != pid:
-                # Bound elsewhere: the request is a RENAME of the project this task already
-                # belongs to, never a second project. Nothing else happens - no create, no
-                # lease mark, no broadcast, no announcement.
-                rename = "name_unchanged"
-                if name:
-                    try:
-                        from ouroboros.projects_registry import get_project
-
-                        row = get_project(_pool().DRIVE_ROOT, bound) or {}
-                        if str(row.get("name") or "") != name:
-                            update_project(_pool().DRIVE_ROOT, bound, name=name)
-                            rename = "renamed"
-                    except Exception:
-                        rename = "rename_failed"
-                        log.warning("ensure_project_scope: rename of %s to %r failed", bound, name, exc_info=True)
-                _report_binding_failure(
-                    tid, pid,
-                    ValueError(f"task is already bound to project {bound!r}; it stays there"),
-                    path="ensure_project_scope", reason="project_scope_conflict",
-                )
-                return {"status": "rejected", "reason": "project_scope_conflict",
-                        "project_id": bound, "detail": rename}
-
-            project = create_project(_pool().DRIVE_ROOT, pid, name=name, origin="ensure_project_scope")
-            touch_project(_pool().DRIVE_ROOT, pid)
-            try:
-                proj_chat = int((project or {}).get("chat_id") or 0)
-            except (TypeError, ValueError):
-                proj_chat = 0
-            try:
-                bind_task_to_project(_pool().DRIVE_ROOT, tid, pid, proj_chat or None, origin=origin)
-            except Exception as exc:
-                # A refused bind leaves the task where it was: stop before the lease
-                # mark, the broadcast and the announcement (the promote path already
-                # rejects this way), instead of publishing a project the task is not in.
-                _report_binding_failure(tid, pid, exc, path="ensure_project_scope")
-                return {"status": "rejected", "reason": "project_binding_failed",
-                        "project_id": pid, "detail": f"{type(exc).__name__}: {exc}"}
-        # Make the one-writer-per-project lease recognize THIS already-running task
-        # as a lane occupant: project_lease reads task["project_id"] from the
-        # supervisor RUNNING map, which (unlike the promote path that sets it at
-        # build time) is NOT set for a mid-flight self-scope. Without this, a task
-        # that self-scopes to project X would not hold X's lane and a concurrent
-        # X task could be assigned and write the same project. SSOT helper shared
-        # with the UI api_project_from_task convert path so the two cannot drift.
-        # A task ADOPTING the project its owner message already has owns the binding
-        # it just wrote, so its lane FOLLOWS that truth (authority="binding") even
-        # when the row still carries a derived id from a bare-workspace promote.
-        try:
-            from ouroboros.project_lease import mark_task_project
-
-            running = getattr(ctx, "RUNNING", None)
-            pending = getattr(ctx, "PENDING", None)
-            if isinstance(running, dict):
-                with _queue_lock:
-                    mark_task_project(running, pending, tid, pid,
-                                      authority="binding" if adopted == pid else "")
-        except Exception:
-            log.debug("ensure_project_scope: RUNNING project_id update failed for %s", tid, exc_info=True)
-        if proj_chat:
-            try:
-                from supervisor.message_bus import get_bridge
-
-                get_bridge().broadcast({"type": "projects_changed", "project_id": pid, "chat_id": proj_chat})
-            except Exception:
-                log.debug("ensure_project_scope: projects_changed broadcast failed for %s", pid, exc_info=True)
-        running = getattr(ctx, "RUNNING", None)
-        row = running.get(tid) if isinstance(running, dict) else None
-        _pool()._announce_created_project(
-            project, tid, task=row.get("task") if isinstance(row, dict) else None,
-        )
-        return {"status": "delivered", "project_id": pid, "chat_id": proj_chat,
-                "reason": "created" if (project or {}).get("created") else ("adopted" if adopted == pid else "attached")}
     except Exception as exc:
-        log.warning("ensure_project_scope: project registration failed for %s", pid, exc_info=True)
-        return {"status": "rejected", "reason": "project_registration_failed",
+        _report_binding_failure(tid, pid, exc, path="ensure_project_scope")
+        return {"status": "rejected", "reason": getattr(exc, "reason", "project_binding_failed"),
                 "project_id": pid, "detail": f"{type(exc).__name__}: {exc}"}

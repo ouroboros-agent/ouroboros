@@ -113,7 +113,7 @@ finished "chat-style" left the Ouroboros `loop_outcome.final_answer` empty
 to `not_evaluated`, and several tasks lost reward because the agent answered
 in chat instead of leaving the VM in the evaluator-expected state (e.g.
 `is_expected_active_tab` checks the active URL, `compare_table` checks a saved
-`.xlsx`). Two structural fixes live in `run_step_agent.py`:
+`.xlsx`). Two structural fixes live in `step_agent_policy.py`:
 
 1. **Terminal-message capture.** The per-step JSON schema has a
    `final_answer` field; when the agent emits `done`/`fail` the runner
@@ -172,12 +172,13 @@ stay in the denominator via `result_index.jsonl` (`status=blocked` /
 `adapter_error`).
 
 The task-acceptance panel is a scaffold axis of its own (2026-09-02): it runs the
-configured `OUROBOROS_REVIEWER_SLOTS.triad` rows on their own deliveries (API packet,
-configured-subagent native inspection episode, or agent session) instead of an
-API-only projection. The runs recorded here used three API packet rows, so their
-acceptance axis is unchanged; a run whose triad contains a retrieving row is not
-comparable on that axis — declare the triad rows with the scaffold disclosures and do
-not merge it with API-panel runs under the §7.9 dedup rule.
+configured review-pool rows (the review-eligible rows of `OUROBOROS_SUBAGENTS`; the
+lane-era `OUROBOROS_REVIEWER_SLOTS.triad` before PR-3) on their own deliveries (API
+packet, native inspection episode, or agent session) instead of an API-only
+projection. The runs recorded here used three API packet rows, so their acceptance
+axis is unchanged; a run whose pool contains a retrieving row is not comparable on
+that axis — declare the pool rows with the scaffold disclosures and do not merge it
+with API-panel runs under the §7.9 dedup rule.
 
 **Do NOT score by filtering `result_index.jsonl` rows on `status == "completed"`.**
 `status` is a claim about the RECORD, not about the evaluation:
@@ -256,7 +257,9 @@ leaderboard run without the disclosures below.
    STEP cap; `--max-steps` now declares one and the runtime enforces it (see
    4a-bis). The other three caps still apply, and the one that binds in
    practice is the third:
-   - the bench server's `OUROBOROS_MAX_ROUNDS` (default 200);
+   - the bench server's `OUROBOROS_MAX_ROUNDS` (200 in `settings_base.json`;
+     the runtime default without a settings document is `unlimited`, which a
+     declared `--max-steps` refuses rather than certifies);
    - `--task_timeout_sec` wall clock;
    - **the runtime's per-task USD reservation rail**
      (`OUROBOROS_PER_TASK_COST_USD`, enforced by

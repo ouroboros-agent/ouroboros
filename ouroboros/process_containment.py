@@ -13,6 +13,7 @@ from __future__ import annotations
 import errno
 import logging
 import os
+import signal
 import subprocess
 import time
 import uuid
@@ -28,6 +29,13 @@ log = logging.getLogger(__name__)
 # `ProcessContainer` token prefix. Deliberately NOT in the scrubbed `OUROBOROS_*` namespace: a
 # nested container must keep the OUTER token so an outer reap sees the whole tree; uuids compose.
 CONTAINMENT_ENV_PREFIX = "OURO_PROC_CONTAINER_"
+
+# This is launcher authority, not ordinary task configuration. The launcher
+# starts its managed server through its own direct Popen seam; contained
+# children must never inherit the marker and turn an arbitrary checkout into a
+# destructive-bootstrap target.
+_LAUNCHER_AUTHORITY_ENV = "OUROBOROS_MANAGED_BY_LAUNCHER"
+_LAUNCHER_REPO_AUTHORITY_ENV = "OUROBOROS_MANAGED_REPO_DIR"
 
 
 # Tri-state membership: UNREADABLE is deliberately NOT a "no" — reading a nondumpable member as a
@@ -141,6 +149,8 @@ def process_group_has_live_members(pgid: int) -> bool:
     """
     if not _pl.process_group_is_alive(pgid):
         return False
+    if not _pl.IS_WINDOWS and os.path.isdir("/proc"):
+        return (process_groups_have_live_members({pgid}) or {}).get(pgid) is not False
     try:
         rows = subprocess.run(["ps", "-A", "-o", "pgid=,state="],
                               capture_output=True, text=True, timeout=5)
@@ -155,6 +165,73 @@ def process_group_has_live_members(pgid: int) -> bool:
         return True
     # No visible member is not proof that a still-existing group is empty.
     return _pl.process_group_is_alive(pgid)
+
+
+def _linux_group_members(pgids: "set[int]") -> "tuple[dict[int, dict[str, bytes]], bool]":
+    """One /proc listing; a vanished row makes negative membership incomplete."""
+    members = {pgid: {} for pgid in pgids}
+    live = set()
+    complete = True
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/stat", "rb") as handle:
+                fields = handle.read().rpartition(b")")[2].split()
+        except (FileNotFoundError, ProcessLookupError):
+            complete = False  # it may have forked a member absent from this listing
+            continue
+        if len(fields) < 5:
+            raise ValueError("unreadable /proc stat row")
+        pgid = int(fields[2])
+        if pgid in members:
+            members[pgid][name] = fields[0]
+            if fields[0] != b"Z":
+                live.add(pgid)
+                if live == pgids:
+                    break  # positive witnesses need no further enumeration
+    return members, complete
+
+
+_QUIET_REREADS = 4  # bounded confirming reads; churn past them stays unknown
+
+
+def process_groups_have_live_members(pgids: "set[int]") -> Optional[dict[int, bool]]:
+    """Read Linux groups without spawning; confirm only apparent-quiet groups.
+
+    A single listing can miss a child forked before its parent's stat becomes Z.
+    Quiet requires the same zombie membership in two consecutive reads, the
+    later with no vanished row. A reaped orphan or an unrelated exit gets a few
+    bounded rereads; still unsettled stays unknown and defers retirement to a
+    later spawn, never command admission. No result survives this call.
+    macOS and Windows keep their owner/idle/stop retirement paths.
+    """
+    wanted = {int(pgid) for pgid in pgids if int(pgid) > 0}
+    if not wanted:
+        return {}
+    if _pl.IS_WINDOWS or not os.path.isdir("/proc"):
+        return None
+    try:
+        previous, _ = _linux_group_members(wanted)
+        result = {pgid: True for pgid, rows in previous.items()
+                  if any(state != b"Z" for state in rows.values())}
+        quiet = {pgid for pgid, rows in previous.items() if rows and pgid not in result}
+        for reread in range(_QUIET_REREADS):
+            if not quiet:
+                break
+            if reread:
+                time.sleep(0.002)  # a just-killed tree's orphans are still being reaped
+            current, complete = _linux_group_members(quiet)
+            for pgid, rows in current.items():
+                if any(state != b"Z" for state in rows.values()):
+                    result[pgid] = True
+                elif complete and rows == previous[pgid]:
+                    result[pgid] = False
+            quiet = {pgid for pgid in quiet if pgid not in result}
+            previous = current
+        return result
+    except (OSError, ValueError):
+        return None  # unreadable is never an empty tree; no ps fallback here
 
 
 def _unattributed_candidate(pid: int, since_ticks: int) -> bool:
@@ -226,8 +303,9 @@ def pids_with_env_marker(marker: str, pgid: int = 0, since_ticks: int = 0) -> "O
 
 
 # A member can fork between scans and its child inherits the token, so one quiet scan proves little:
-# `reap` needs `_REAP_QUIET_SCANS` scans in a row with nothing live and nothing undeterminable, and
-# FAILS if that has not happened by `_REAP_DEADLINE_SEC`.
+# `reap` needs `_REAP_QUIET_SCANS` scans in a row with nothing live and nothing undeterminable. A
+# scan past `_REAP_DEADLINE_SEC` that still shows a member FAILS; the clock never fails a quiet tree,
+# whose scans may simply be slow: a quiet scan gets its confirming one however late it ran.
 _REAP_QUIET_SCANS = 2
 _REAP_DEADLINE_SEC = 10.0
 _REAP_SETTLE_SEC = 0.05
@@ -242,10 +320,7 @@ def _containment_leak_reason(alive: List[int], undetermined: List[int]) -> str:
     if undetermined:
         parts.append("liveness could not be determined (the attributed process environment could not be "
                      "read): " + ", ".join(str(pid) for pid in undetermined))
-    detail = "; ".join(parts) or ("no member was visible in the last scan, but two consecutive "
-                                  "quiet scans were never reached, so nothing is proven gone")
-    return (f"the contained tree could not be proven gone within {_REAP_DEADLINE_SEC:.0f}s — "
-            f"{detail}")
+    return f"the contained tree could not be proven gone within {_REAP_DEADLINE_SEC:.0f}s — {'; '.join(parts)}"
 
 
 class ProcessContainer:
@@ -262,11 +337,14 @@ class ProcessContainer:
     teardown — but only when the API confirms it). Prefer ``spawn`` over ``Popen`` + ``adopt``:
     POSIX ``adopt`` can neither plant the token nor vouch for a pid or group."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, lifeline: bool = False, overload: bool = False) -> None:
         self._job = None
         # The pid `spawn` started and the group it leads: known WITHOUT having to be read.
         self._root = 0
         self._pgid = 0
+        # Whether ``spawn`` ever created its root. ``reap`` consumes ``_root``, never this: a caller
+        # whose ``spawn`` raised tells "created, then stopped at launch" from "never created".
+        self.root_created = False
         # The root's start time: nothing the container spawned can predate it.
         self._start_ticks = 0
         self._suspended = False
@@ -274,37 +352,84 @@ class ProcessContainer:
         self._setup_error = ""
         # Unique per instance: a nested preflight and its outer run never claim each other's.
         self._token = f"{CONTAINMENT_ENV_PREFIX}{uuid.uuid4().hex}"
+        # The same name after ``reap`` consumed it: what a record of a kept tree can prove gone later.
+        self.token = self._token
+        self._protect_owner = lifeline
+        self._watch_overload = overload
+        self._lifeline = self._watch = None
+        self._birth = ""
+        self._protection_error = ""
+        # ``reap``'s first answer; ``None`` until it starts.
+        self._teardown: Optional[str] = None
 
     def containment_env(self) -> "dict[str, str]":
         """Environment entries that make a process and its descendants members. ``spawn`` applies
         these; a caller building its own env for ``Popen`` + ``adopt`` must merge them in."""
         return {self._token: "1"}
 
-    def spawn(self, argv: List[str], **popen_kwargs) -> subprocess.Popen:
+    def spawn(self, argv: List[str], *, background: bool = False, **popen_kwargs) -> subprocess.Popen:
         """``Popen`` the process already inside the container, with no gap. The token is merged into
         the caller's ``env`` (defaulting to the inherited one) BEFORE the process exists, so no
         descendant can start outside the membership. On Windows the root is created SUSPENDED too:
-        a descendant preceding the job assignment would survive terminate/close. ``adopt`` resumes."""
+        a descendant preceding the job assignment would survive terminate/close. ``adopt`` resumes.
+        ``background`` puts the root in the host's background priority class, which its whole tree
+        inherits: POSIX nice +10 set on the root's new process group right after it exists (argv stays
+        the caller's, no fork hook runs in a threaded owner), Windows ``BELOW_NORMAL_PRIORITY_CLASS``."""
         kwargs = dict(popen_kwargs)
-        group_kwargs = dict(_pl.subprocess_new_group_kwargs())
+        group_kwargs = dict(_pl.subprocess_new_group_kwargs(background=background))
         flags = int(kwargs.pop("creationflags", 0)) | int(group_kwargs.pop("creationflags", 0))
         kwargs.update(group_kwargs)
         env = kwargs.get("env")
-        kwargs["env"] = {**(os.environ if env is None else env), **self.containment_env()}
+        env = dict(os.environ if env is None else env)
+        # Explicit child environments must not sever an enclosing run's custody.
+        env.update({key: value for key, value in os.environ.items()
+                    if key.startswith(CONTAINMENT_ENV_PREFIX)})
+        env.pop(_LAUNCHER_AUTHORITY_ENV, None)
+        env.pop(_LAUNCHER_REPO_AUTHORITY_ENV, None)
+        kwargs["env"] = {**env, **self.containment_env()}
         if _pl.IS_WINDOWS:
             flags |= getattr(subprocess, "CREATE_SUSPENDED", 0x4)
             self._suspended = True
         if flags:
             kwargs["creationflags"] = flags
-        proc = subprocess.Popen(argv, **kwargs)
+        try:
+            if self._protect_owner and not _pl.IS_WINDOWS:
+                from ouroboros.process_lifeline import ProcessLifeline
+                self._lifeline = ProcessLifeline()
+                self._lifeline.start(self._token)
+            if self._watch_overload:
+                from ouroboros.process_overload import OverloadWatch
+                from ouroboros.test_parallelism import nested_workers
+                self._watch = OverloadWatch(self, nested_workers(kwargs["env"]))
+            proc = subprocess.Popen(argv, **kwargs)
+        except BaseException:
+            self.reap()
+            raise
+        self.root_created = True
         # Knowledge no scan can re-derive: enumeration claims members by READING them, so a root
         # turning nondumpable before the first scan is in no list. `start_new_session` makes it its
         # own group LEADER (pgid == pid); enumerating any OTHER pgid would report bystanders.
         self._root = int(getattr(proc, "pid", 0) or 0)
         pgid = _pl.process_group_id(self._root)
         self._pgid = pgid if pgid and pgid == self._root else 0
+        if background:  # the root is still starting: everything it forks from here inherits the group's priority
+            _pl.lower_tree_priority(self._root, self._pgid)
         self._start_ticks = _pl._proc_start_ticks(self._root)
         self.adopt(proc)
+        try:
+            if self._protect_owner or self._watch_overload:
+                self._birth = _pl.process_start_time(self._root)
+            if self._lifeline is not None:
+                self._lifeline.attach(self._root, self._birth, self._pgid, self._start_ticks)
+            if self._watch is not None:
+                self._watch.start()
+        except BaseException:
+            self.reap()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._teardown = self._teardown or "the root did not exit after its reap"
+            raise
         return proc
 
     def adopt(self, proc: subprocess.Popen) -> None:
@@ -378,7 +503,91 @@ class ProcessContainer:
                 undetermined.append(pid)
         return alive, undetermined, ""
 
+    def stop_tree(self) -> None:
+        """Stop this invocation, keeping attribution alive for the final scan."""
+        if _pl.IS_WINDOWS:
+            if self._job is not None:
+                error = _pl.terminate_job(self._job)
+                if error:
+                    self._protection_error = "; ".join(part for part in (self._protection_error, error) if part)
+        elif self._token:
+            from ouroboros.process_lifeline import kill_attributed_tree
+            kill_attributed_tree(self._token, self._root, self._birth)
+
+    def interrupt_root(self) -> bool:
+        """Let a POSIX command export its KeyboardInterrupt result before tree teardown.
+
+        Only the spawned root is interrupted: signalling its workers too can
+        interrupt their cleanup. Birth AND token must still match; Windows keeps
+        its Job path. A sent signal proves no exit, so the owner still reaps.
+        """
+        if _pl.IS_WINDOWS or not self._birth or not self._token or self._root <= 1:
+            return False
+        if _pl.process_start_time(self._root) != self._birth:
+            return False
+        if pid_marker_state(self._root, self._token) != MARKER_MEMBER:
+            return False
+        return _pl.signal_pid(self._root, signal.SIGINT)
+
+    def terminate_tree(self, grace: float) -> None:
+        """Ask the attributed tree to stop (SIGTERM), waiting up to ``grace`` seconds for it to go.
+
+        A delivered signal is not an exit: ``reap`` still forces and verifies whatever remains.
+        Windows has no tree-wide TERM, so its kill-on-close Job in ``reap`` stays the stop there."""
+        if _pl.IS_WINDOWS or not self._token:
+            return
+        from ouroboros.process_lifeline import kill_attributed_tree
+        try:
+            kill_attributed_tree(self._token, self._root, self._birth, graceful=True)
+        except RuntimeError:
+            return  # An unenumerable table is reap's failure to report, not a reason to wait.
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            members = pids_with_env_marker(self._token, self._pgid, self._start_ticks)
+            if members is not None and all(pid == os.getpid() or pid_is_zombie(pid) for pid in members):
+                return
+            time.sleep(0.1)
+
     def reap(self) -> str:
+        """Stop protection, reap, and only then release the independent guardian.
+
+        The first call is the answer. It consumes the token, root and group a later scan would
+        need, so a later call (the owner's, after ``spawn``'s own) repeats it: an empty rescan of
+        nothing is not evidence. A first call that never finished stays unconfirmed, though an
+        interrupt while the watch stops still reaches the tree and guardian cleanup below."""
+        if self._teardown is not None:
+            return self._teardown
+        self._teardown = "the container's first reap did not finish, so nothing is proven gone"
+        error = ""
+        try:
+            if self._watch is not None:
+                watch, self._watch = self._watch, None
+                try:
+                    self._protection_error = watch.stop() or self._protection_error
+                except Exception as exc:
+                    self._protection_error = f"overload watch stop unconfirmed: {exc}"
+        finally:
+            try:
+                if self._protect_owner or self._watch_overload:
+                    try:
+                        self.stop_tree()
+                    except Exception as exc:
+                        error = f"contained tree stop unconfirmed: {exc}"
+                try:
+                    error = "; ".join(part for part in (error, self._reap()) if part)
+                except Exception as exc:
+                    error = "; ".join(part for part in (error, f"container reap unconfirmed: {exc}") if part)
+            finally:
+                if self._lifeline is not None:
+                    lifeline, self._lifeline = self._lifeline, None
+                    try:
+                        error = lifeline.finish(released=not error) or error
+                    except Exception as exc:
+                        error = "; ".join(part for part in (error, f"lifeline release unconfirmed: {exc}") if part)
+        self._teardown = "; ".join(part for part in (self._protection_error, error) if part)
+        return self._teardown
+
+    def _reap(self) -> str:
         """SCAN the container; return "" only when nothing of it is left, else why not. Detection,
         not guaranteed teardown. ONE bounded best-effort kill sweep runs first; after it nothing is
         ever signalled again, so a member is targeted at most once and the unavoidable
@@ -405,25 +614,21 @@ class ProcessContainer:
         known: "set[int]" = {root} if root > 0 else set()
         deadline = time.monotonic() + _REAP_DEADLINE_SEC
         alive, undetermined, error = self._scan(token, pgid, known, True, since)  # the ONE sweep
-        last, quiet = (alive, undetermined), 0
+        quiet = 0
         while not error:
-            if alive or undetermined:
-                quiet, last = 0, (alive, undetermined)
-            else:
-                quiet += 1
+            quiet = 0 if alive or undetermined else quiet + 1
             if quiet >= _REAP_QUIET_SCANS:
                 return ""
-            if time.monotonic() >= deadline:
-                # The last NON-EMPTY scan, not the current one: a scan coming back empty just as the
-                # deadline passes would name no pid, under a remediation that says to kill them.
-                return _containment_leak_reason(*last)
+            if not quiet and time.monotonic() >= deadline:
+                return _containment_leak_reason(alive, undetermined)
             time.sleep(_REAP_SETTLE_SEC)
             alive, undetermined, error = self._scan(token, pgid, known, False, since)
         return error
 
     def close(self) -> None:
         """Release the container handle. Inert after ``reap``, which closes it itself."""
+        if self._lifeline is not None or self._watch is not None:
+            self.reap()
         if _pl.IS_WINDOWS and self._job is not None:
             _pl.close_job(self._job)
             self._job = None
-

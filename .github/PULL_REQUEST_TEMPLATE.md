@@ -54,7 +54,7 @@ Evidence:
       generated build/review artifacts in the commit; tracked material follows
       DEVELOPMENT.md "Documentation contract" (including plans and optional reports).
 - [ ] I did **not** bump `VERSION` or release-only version carriers; maintainers
-      assign the collision-free release version during final integration.
+      open each development cycle and cut each release.
 
 ## Review evidence
 
@@ -86,9 +86,7 @@ rows for additional FAIL findings on the same item):
 | forgotten_touchpoints | | |
 | cross_surface_consistency | | |
 | regression_surface | | |
-| prompt_doc_sync | | |
 | architecture_fit | | |
-| cross_module_bugs | | |
 | implicit_contracts | | |
 
 <details>

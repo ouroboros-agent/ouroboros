@@ -7,6 +7,7 @@ git, and the preflight inference of binaries from manifests.
 """
 from __future__ import annotations
 
+import os
 import pathlib
 import sys
 
@@ -62,13 +63,22 @@ def test_workspace_context_routes_project_files_and_keeps_system_tools_reachable
     assert (workspace / "README.md").read_text(encoding="utf-8") == "workspace edited"
 
 
-@pytest.mark.serial
-def test_workspace_run_shell_cwd_allows_scratch_and_explicit_system(tmp_path, monkeypatch):
+def test_workspace_run_shell_cwd_allows_scratch_and_explicit_system(tmp_path, tmp_path_factory, monkeypatch):
     """External-workspace tasks may run from host scratch (a sibling checkout, a
     /tmp tree) and explicitly select the system repo; generic runtime data stays
     off-limits and system-repo mutation remains independently governed."""
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_SAFETY_MODE", "off")
+    # The argv below launches the bare `python` from the launch PATH (argv is never
+    # rewritten), which a host shipping only `python3` (stock macOS) lacks. Put the
+    # running interpreter there under that name, outside the repo root.
+    executable = pathlib.Path(sys.executable)
+    python_dir = executable.parent
+    if os.name != "nt" and executable.name != "python":
+        python_dir = tmp_path_factory.mktemp("bare-python")
+        (python_dir / "python").symlink_to(executable)
+    monkeypatch.setenv("PATH", str(python_dir) + os.pathsep + os.environ.get("PATH", ""))
     # Pin $HOME outside tmp_path so the host-scratch cwd allowance holds on Windows
     # CI too (where pytest's tmp dir lives UNDER home and the data-parent-under-home
     # protection would otherwise block the sibling scratch cwd). See the same fixture
@@ -154,7 +164,6 @@ def test_workspace_shell_safe_stdio_redirects_are_not_write_like(tmp_path, monke
     assert not (outside / "out.txt").exists()  # direct argv never executes redirection
 
 
-@pytest.mark.serial
 def test_workspace_direct_argv_keeps_windows_paths_as_literal_data(tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     system_repo = tmp_path / "system"
@@ -175,6 +184,7 @@ def test_workspace_direct_argv_keeps_windows_paths_as_literal_data(tmp_path, mon
 
     registry.override_handler("run_command", handler)
     monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_SAFETY_MODE", "off")
     commands = [["echo", "x", ">", r"C:\ouroboros-outside\out.txt"], ["echo", "x", ">", r"\\server\share\out.txt"]]
     for command in commands:
         assert registry.execute("run_command", {"cmd": command}) == "literal argv"
@@ -182,6 +192,7 @@ def test_workspace_direct_argv_keeps_windows_paths_as_literal_data(tmp_path, mon
 
 
 def test_workspace_shell_keeps_symlinked_workspace_absolute_paths_allowed(tmp_path, monkeypatch):
+    monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_SAFETY_MODE", "off")
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     system_repo = tmp_path / "system"
     real_workspace = tmp_path / "real_workspace"
@@ -204,7 +215,6 @@ def test_workspace_shell_keeps_symlinked_workspace_absolute_paths_allowed(tmp_pa
     assert (real_workspace / "inside.txt").exists()
 
 
-@pytest.mark.serial
 def test_workspace_shell_blocks_nested_symlink_escape_absolute_path(tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     system_repo = tmp_path / "system"
@@ -354,7 +364,8 @@ def test_workspace_shell_git_ls_remote_requires_network_contract(tmp_path):
         assert result and "RESOURCE_CONSTRAINT_BLOCKED" in result, (cmd, result)
 
 
-def test_workspace_run_shell_allows_absolute_cwd_under_workspace_and_child_drive(tmp_path):
+def test_workspace_run_shell_allows_absolute_cwd_under_workspace_and_child_drive(tmp_path, monkeypatch):
+    monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_SAFETY_MODE", "off")
     system_repo = tmp_path / "system"
     workspace = tmp_path / "workspace"
     parent_data = tmp_path / "data"
@@ -403,10 +414,15 @@ def test_workspace_run_shell_allows_absolute_cwd_under_workspace_and_child_drive
         "advanced",
     )
     assert git_escape and "WORKSPACE_GIT_BLOCKED" in git_escape, git_escape
+    # Owner 5A: a bare command word no longer fences a TOP-LEVEL task (a guess is
+    # not write evidence); explicit shell syntax into the runtime drive still is,
+    # and the refusal names every root this task may write.
+    assert _shell_guard_text(registry, {"cmd": ["touch", "../data/state/state.json"]}, "pro") is None
     protected_escape = _shell_guard_text(registry,
-        {"cmd": ["touch", "../data/state/state.json"]}, "pro",
+        {"cmd": ["sh", "-c", "printf x > ../data/state/state.json"]}, "pro",
     )
-    assert "WORKSPACE_SHELL_BLOCKED" in protected_escape
+    assert "WORKSPACE_SHELL_BLOCKED" in protected_escape and "outside every root this task may write" in protected_escape
+    assert f"task_drive={parent_task_dir.parent.resolve()}" in protected_escape, protected_escape
     task_drive_write = registry.execute("run_command", {"cmd": ["touch", "output.txt"], "cwd": str(child_dir)})
     assert "WORKSPACE_SHELL_BLOCKED" not in task_drive_write
     assert (child_dir / "output.txt").is_file()

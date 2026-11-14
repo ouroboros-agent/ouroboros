@@ -9,9 +9,107 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import pathlib
 import re
+from contextlib import contextmanager
 from unittest.mock import MagicMock
+
+
+def answer_projects(route, rows):
+    """``GET /api/projects`` from a page fixture's rows: the list, or the one row ``?id=`` names, as a reference reads
+    its room (CLIENT_CONTRACT §6)."""
+    from urllib.parse import parse_qs, urlparse
+
+    wanted = parse_qs(urlparse(route.request.url).query).get("id")
+    route.fulfill(json={"projects": [row for row in rows if not wanted or row["id"] == wanted[0]]})
+
+
+def producer_evidence_dir(fallback, name, *, env=()):
+    """Where one test producer's published diagnostics (frames, DOM, JSON) go: one destination per invocation.
+
+    A destination the operator exported explicitly for this family wins unchanged. Otherwise
+    the shared channel decides: ``diagnostic_directory`` redirects to the launcher's
+    ``OUROBOROS_TEST_EVIDENCE_ROOT`` (scripts/safe_test.py and the native preflight both
+    publish it) and falls back to ``fallback`` for a bare pytest, where nothing vouches for a
+    directory outside the disposable scratch. A variable private to one test used to fall
+    back straight into ``tmp_path``, so a released scratch took its screenshots, DOM and JSON
+    with it while the migrated destinations survived.
+    """
+    from ouroboros.test_evidence import diagnostic_directory
+
+    for key in ((env,) if isinstance(env, str) else tuple(env)):
+        explicit = os.environ.get(key, "").strip()
+        if explicit:
+            path = pathlib.Path(explicit)
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+    return diagnostic_directory(fallback, name, publish=True)
+
+
+def retire_synthetic_retention(directory, *reasons, release=None) -> bool:
+    """Remove the retention marker THIS test manufactured, only when it says exactly ``reasons``.
+
+    A fixture that fakes an unproven hold or an export fault proves no surviving
+    process, yet its marker would keep the whole enclosing run. Any other line may
+    describe a real one, so it keeps the marker. True when no marker remains.
+    ``release`` frees what that marker held, only once it is proven synthetic; unless
+    it returns True, the marker stays and keeps holding it.
+    """
+    from ouroboros.test_environment import RETENTION_MARKER
+
+    marker = pathlib.Path(directory) / RETENTION_MARKER
+    if marker.is_symlink():
+        return False
+    try:
+        lines = marker.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return True
+    except (OSError, UnicodeError):
+        return False
+    known = {line for reason in reasons for line in reason.rstrip().splitlines()}
+    if not lines or not known.issuperset(lines):
+        return False
+    if release is not None and not release():
+        return False
+    marker.unlink()
+    return True
+
+
+def retire_synthetic_gate_hold(repo, temp_root, reason) -> bool:
+    """Undo a hermetic gate's hold over a lane this test stubbed or faulted, by its exact reason.
+
+    Only a marker saying nothing but that reason (the gate's line and its release owner's)
+    lets the worktree and its registration go, and the marker goes only after they did.
+    Any other line, an unreadable marker or a failed removal keeps all three.
+    """
+    import subprocess
+
+    def remove_worktree() -> bool:
+        return subprocess.run(["git", "worktree", "remove", "--force", str(pathlib.Path(temp_root) / "repo")],
+                              cwd=str(repo), capture_output=True).returncode == 0
+
+    return retire_synthetic_retention(temp_root, reason, "hermetic preflight: " + reason, release=remove_worktree)
+
+
+def retention_left_in(directory) -> str:
+    """Name the retention markers beneath ``directory`` with each one's first reason; "" when none.
+
+    The conftest retention guard's report over release_scratch's own walk: an unreadable
+    subtree, which that walk also counts, is not a marker a test left.
+    """
+    from ouroboros.test_environment import RETENTION_MARKER, retention_markers
+
+    left = []
+    for marker in retention_markers(directory):
+        if marker.name != RETENTION_MARKER:
+            continue
+        try:
+            reason = marker.read_text(encoding="utf-8").splitlines()[0]
+        except (OSError, UnicodeError, IndexError):
+            reason = "unreadable"
+        left.append(f"{marker.parent} ({reason})")
+    return "; ".join(left[:3]) + (f" (+{len(left) - 3} more)" if len(left) > 3 else "")
 
 
 def reap_test_process_group(proc, *, timeout_sec: float = 5.0) -> None:
@@ -32,10 +130,42 @@ def reap_test_process_group(proc, *, timeout_sec: float = 5.0) -> None:
         time.sleep(0.05)
 
 
+def stop_socket_sharer() -> None:
+    """Stop multiprocessing's socket-transfer server once a test's spawned children are gone.
+
+    On Windows a spawn child receives a socket argument (the worker stop channel) through the
+    stdlib ``resource_sharer``, whose process-global ``_serve`` thread starts with the first such
+    spawn and never ends by itself: it belongs to the test that spawned the child. Elsewhere
+    nothing started it and this is a no-op; a later spawn starts a fresh one."""
+    from multiprocessing import resource_sharer
+
+    resource_sharer.stop(timeout=5)
+
+
+def wait_test_child_stop(pid: int, *, timeout_sec: float = 3.0) -> dict:
+    """Retain a fixture child's terminal observation before diagnostic reads.
+
+    A zombie can be reaped between two probes. Check that state first, and keep
+    the observed stop instead of asking again after the wait already succeeded.
+    A still-live or unreadable child exhausts the original bound, never passes.
+    """
+    import time
+    from ouroboros.platform_layer import pid_is_alive
+    from ouroboros.process_containment import pid_is_zombie
+
+    deadline = time.monotonic() + timeout_sec
+    while True:
+        stopped = pid_is_zombie(pid) or not pid_is_alive(pid)
+        verdict = {"child_stopped": stopped, "t_ns": time.monotonic_ns()}
+        if stopped or time.monotonic() >= deadline:
+            return verdict
+        time.sleep(.01)
+
+
 # Every function in the tree that persists a settings document, as (repo-relative POSIX
 # path, function name). Three route through `config.prepare_settings_for_persist`; the
-# context-pair migration and the Colab generator are exempt from it by design and carry
-# their reason in the prologue tripwire's exempt table. Two pins read this one list: the
+# context-pair migration and the Colab generator (for a foreign root) are exempt from it by
+# design and carry their reason in the prologue tripwire's exempt table. Two pins read this one list: the
 # tripwire in tests/test_runtime_mode_elevation.py proves the scanned roots hold exactly
 # these writers (plus its declared non-writer matches), and the byte pin in
 # tests/test_settings_read_seam.py drives every one of them through its real entry point.
@@ -184,3 +314,178 @@ def reconcile_receipt(action=None, reason=None):
     2-tuple silently breaks the caller. Keep fakes going through here.
     """
     return {"action": action, "reason": reason, "process": "", "server_reconcile": ""}
+
+
+def live_worker_pids(data_root):
+    """The ledger's live worker identities, including across pool respawns."""
+    from ouroboros.process_custody import _read_ledger_strict, _fingerprint_matches
+    readable, entries = _read_ledger_strict(data_root)
+    assert readable, "worker custody is unreadable"
+    return {int(row["pid"]) for row in entries
+            if str(row.get("purpose") or "").startswith("worker:") and _fingerprint_matches(row)}
+
+
+def live_worker_slots(data_root):
+    """``{slot id: pid}`` of the ledger's live workers (``purpose="worker:<wid>"``).
+
+    A RUNNING row's ``worker_id`` names its slot, so this maps a task to the one
+    process carrying it; the pool's other live workers (the conversation lane's
+    ready spare among them) stay apart."""
+    from ouroboros.process_custody import _fingerprint_matches, _read_ledger_strict
+
+    readable, entries = _read_ledger_strict(data_root)
+    assert readable, "worker custody is unreadable"
+    slots = {}
+    for row in entries:
+        purpose = str(row.get("purpose") or "")
+        slot = purpose.removeprefix("worker:")
+        if purpose.startswith("worker:") and slot.isdigit() and _fingerprint_matches(row):
+            slots[int(slot)] = int(row["pid"])
+    return slots
+
+
+def write_queue_document(path, payload):
+    """Publish a fixture document and its matching liveness stamp; retain its date."""
+    from ouroboros.utils import atomic_write_json
+    payload = {**payload, "generation": "fixture-generation"}
+    atomic_write_json(path, payload)
+    atomic_write_json(path.parent / "queue.alive", {
+        "generation": payload["generation"], "ts": payload.get("ts"), "heartbeats": {},
+    })
+    return payload
+
+
+# Measuring a reviewer's window (`reviewer_context_window` / `scope_window` ->
+# `capability_evidence.probe`) asks OpenRouter's live `/models` catalog through
+# `LLMClient.openrouter_context_length(allow_fetch=True)`; a retrieving work
+# order, the `## Review` block's cost hint and the retrieving brief all measure.
+# The answer lands in these CLASS caches for the rest of the process, so a later
+# unrelated send already strips a field the catalog lists as unsupported (the
+# `test_llm_no_proxy` parameter-rejection retry then has nothing left to drop).
+_PROVIDER_CATALOG_CLASS_STATE = (
+    "_SUPPORTED_PARAMS_CACHE", "_SUPPORTED_PARAMS_FETCHED",
+    "_CONTEXT_LENGTH_CACHE", "_CONTEXT_LENGTH_OBSERVED_AT", "_CAPABILITIES_FETCH_OK", "_CAPABILITIES_FAILED_AT",
+)
+_PROVIDER_CATALOG_PRISTINE = {
+    "_SUPPORTED_PARAMS_CACHE": {}, "_SUPPORTED_PARAMS_FETCHED": False,
+    "_CONTEXT_LENGTH_CACHE": {}, "_CONTEXT_LENGTH_OBSERVED_AT": "", "_CAPABILITIES_FETCH_OK": False,
+    "_CAPABILITIES_FAILED_AT": "",
+}
+
+
+def _provider_catalog_snapshot(cls):
+    import copy
+    return {name: copy.copy(getattr(cls, name)) for name in _PROVIDER_CATALOG_CLASS_STATE}
+
+
+def _restore_provider_catalog(cls, saved):
+    for name, value in saved.items():
+        current = getattr(cls, name)
+        if isinstance(current, dict) and isinstance(value, dict):
+            current.clear()
+            current.update(value)  # the mixin's dict object itself, not a rebinding
+        else:
+            setattr(cls, name, value)
+
+
+@contextmanager
+def offline_provider_catalog(monkeypatch):
+    """Body of conftest's ``provider_catalog_offline`` fixture, for a process that
+    has no fixture injection. A spawned child must not import ``tests.conftest``:
+    its import-time isolation would rebind the inherited HOME, data, settings,
+    TMPDIR and pycache prefix after config modules already read them.
+    """
+    from ouroboros.llm import LLMClient
+
+    saved = _provider_catalog_snapshot(LLMClient)
+    monkeypatch.setattr(LLMClient, "_fetch_openrouter_capabilities", classmethod(lambda cls: None))
+    try:
+        yield saved
+    finally:
+        _restore_provider_catalog(LLMClient, saved)
+
+
+def saved_settings(monkeypatch, tmp_path, **values):
+    """Point the settings document at the test's own tree and save ``values`` there (merged into a document
+    this helper already wrote at that path).
+
+    Route keys (``route_choice.ROUTE_SETTING_KEYS``: model slots, local flags, accounts, provider keys)
+    read the document as it is now, in a task or not, and an unauthored slot takes its proposal — so
+    "no fallback chain" is a SAVED blank Fallbacks, never an absent environment variable, and a model
+    the test needs is a saved slot (a saved slot beats the environment). ``tmp_path=None`` keeps the
+    path a previous call of this helper bound. Returns the document path."""
+    from ouroboros import config
+
+    path = pathlib.Path(tmp_path) / "settings.json" if tmp_path is not None else pathlib.Path(config.SETTINGS_PATH)
+    if tmp_path is not None:
+        monkeypatch.setattr(config, "SETTINGS_PATH", path)
+    document = {}
+    if path.exists() and getattr(saved_settings, "_wrote", None) == str(path):
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except ValueError:
+            document = {}
+    document = {**(document if isinstance(document, dict) else {}), **values}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(document), encoding="utf-8")
+    saved_settings._wrote = str(path)
+    return path
+
+
+def write_legacy_capability_rows(root, *, effort_ceilings=None, effort_floors=None, rejected_params=None):
+    """Leave model-global rows in ``root``'s capability-evidence store in the shape releases before
+    exact-route request-wire recovery learned them. The store still loads them; nothing reads them."""
+    from ouroboros import capability_evidence as ce
+    from ouroboros.utils import utc_now_iso
+
+    observed_at = utc_now_iso()
+    with ce._store_transaction(root):
+        data = ce._load(root)
+        for key, ceiling in (effort_ceilings or {}).items():
+            data["effort_ceilings"][key] = {"ceiling": ceiling, "observed_at": observed_at,
+                                            "reason": "provider_rejected", "prev": ""}
+        for key, floor in (effort_floors or {}).items():
+            data["effort_floors"][key] = {"floor": floor, "observed_at": observed_at,
+                                          "reason": "provider_required", "prev": ""}
+        for key, params in (rejected_params or {}).items():
+            data["rejected_params"][key] = {"params": sorted(params), "observed_at": observed_at,
+                                            "reason": "provider_rejected"}
+        assert ce._save(root, data)
+
+
+def current_python_env(env_root) -> None:
+    """Leave what ``isolated_deps._ensure_python_env`` leaves for THIS interpreter, without venv or pip:
+    a ``pyvenv.cfg`` naming the running base and an interpreter entry. Fakes of the package installer call
+    it, so the live reader corroborates their record (``isolated_deps.python_env_binding``)."""
+    import sys
+
+    venv = pathlib.Path(env_root) / "python"
+    python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.touch()
+    base = os.path.dirname(os.path.abspath(getattr(sys, "_base_executable", "") or sys.executable))
+    version = ".".join(map(str, sys.version_info[:3]))
+    (venv / "pyvenv.cfg").write_text(f"home = {base}\nversion = {version}\n", encoding="utf-8")
+
+
+def full_disk_at(monkeypatch, part):
+    """ENOSPC exactly where the platform lock creates its ``.lock`` file (``O_CREAT|O_EXCL``) under ``part``."""
+    import errno
+
+    real = os.open
+
+    def create(path, flags, *args, **kwargs):
+        if part in str(path) and str(path).endswith(".lock") and flags & os.O_CREAT and flags & os.O_EXCL:
+            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), str(path))
+        return real(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", create)
+
+
+def run_absent_in(store_id):
+    """Claudexor's run-detail 404 (``run-detail-route.ts``): it names the store it read in ``context.storeId``."""
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    error = ClaudexorUnavailable("http_404", "no such run", status_code=404)
+    error.problem = {"error": "no such run", "context": {"storeId": store_id}}
+    return error

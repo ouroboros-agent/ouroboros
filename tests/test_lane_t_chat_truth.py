@@ -11,7 +11,7 @@ class TestStampRootFinalPhase:
 
         evt = {"type": "send_message"}
         stamp_root_final_phase(evt, {"_is_direct_chat": True}, post_task_open=True, terminal_status="completed")
-        assert evt["progress_meta"] == {"task_phase": "finalizing"}
+        assert evt["progress_meta"] == {"task_phase": "finalizing", "task_terminal_status": "completed"}
 
     def test_settled_direct_bare_final_is_typed_terminal(self):
         from ouroboros.task_finalization import stamp_root_final_phase

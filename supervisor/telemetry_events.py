@@ -1,7 +1,7 @@
 """Durable handlers for rare, typed telemetry-only worker events.
 
 The supervisor drops an event whose type is not in EVENT_HANDLERS (it decays
-into a truncated ``unknown_worker_event`` repr in supervisor.jsonl), so every
+into a content-free ``unknown_worker_event`` row in supervisor.jsonl), so every
 literal-typed emitter needs a registered sink. The types here share one
 type-agnostic durable passthrough — each row is appended verbatim to
 events.jsonl for typed consumers (budget audits, advisory forensics). They
@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict
 
+from ouroboros.owner_mailbox import PEER_RELATION_LABELS
 from ouroboros.utils import append_jsonl, utc_now_iso
 
 log = logging.getLogger(__name__)
@@ -50,19 +51,45 @@ def _handle_task_message_injected(evt: Dict[str, Any], ctx: Any) -> None:
         "task_id": evt.get("task_id", ""),
         "source_task_id": evt.get("source_task_id", ""),
         "provenance": evt.get("provenance", ""),
+        **({"relation": evt["relation"]} if evt.get("relation") in PEER_RELATION_LABELS else {}),
         "relayed_from_task_id": evt.get("relayed_from_task_id", ""),
         "text_preview": str(evt.get("text_preview") or "")[:200],
     }
+    try:
+        # #1578: address BEFORE the durable append, so the row and its live copy
+        # carry the same lineage and audience (read-only over RUNNING).
+        from supervisor.log_addressing import address_ctx_event
+
+        payload = address_ctx_event(ctx, payload)
+    except Exception:
+        log.debug("Failed to address task_message_injected", exc_info=True)
     try:
         ctx.append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", payload)
     except Exception:
         log.warning("Failed to log task_message_injected event", exc_info=True)
     try:
-        from supervisor.log_addressing import address_ctx_event
-
-        ctx.bridge.push_log(address_ctx_event(ctx, dict(payload)))
+        ctx.bridge.push_log(dict(payload))
     except Exception:
         log.debug("Failed to forward task_message_injected to live logs", exc_info=True)
+
+
+def _handle_presence_result(evt: Dict[str, Any], ctx: Any) -> None:
+    """A pooled Presence-bound root's result frame: its fact, never its words.
+
+    The words stay on the task result (a connector reads them by a known reference through
+    ``/presence/work``); this frame neither confirms that write nor sends anything. Inline
+    turns read their own copy in process, so only pooled drains arrive here. Not the shared
+    passthrough above: that would copy the final text into the ledger.
+    """
+    try:
+        ctx.append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", {
+            "ts": evt.get("ts", utc_now_iso()), "type": "presence_result",
+            "task_id": str(evt.get("task_id") or ""), "outcome": str(evt.get("outcome") or ""),
+            "work_ref": str(evt.get("work_ref") or ""), "output_ref": str(evt.get("output_ref") or ""),
+            "text_chars": len(str(evt.get("text") or "")),
+        })
+    except Exception:
+        log.debug("Failed to record presence_result for %s", evt.get("task_id"), exc_info=True)
 
 
 # Merged into supervisor.events.EVENT_HANDLERS (the `**_CEH` pattern). The
@@ -70,16 +97,14 @@ def _handle_task_message_injected(evt: Dict[str, Any], ctx: Any) -> None:
 # fix registered one branch of review_helpers' if/else and missed the other.
 TELEMETRY_EVENT_HANDLERS = {
     "review_density_probe": _handle_typed_telemetry,
-    "review_scope_delivery_migrated": _handle_typed_telemetry,
-    "review_scope_lead_unobserved": _handle_typed_telemetry,
     "review_wave_admission_unavailable": _handle_typed_telemetry,
     "review_wave_budget_insufficient": _handle_typed_telemetry,
+    "review_wave_billing_authority_unavailable": _handle_typed_telemetry,
     "review_wave_budget_partial_unknown": _handle_typed_telemetry,
-    "advisory_suspect_result": _handle_typed_telemetry,
-    "advisory_contract_warning": _handle_typed_telemetry,
     "plan_task_deadline_skip": _handle_typed_telemetry,
     "task_message_injected": _handle_task_message_injected,
     # #Q-2b: the owner's quiz answer landed in a worker round — same
     # duplicate-detection telemetry as its task-message sibling.
     "quiz_answer_injected": _handle_typed_telemetry,
+    "presence_result": _handle_presence_result,
 }

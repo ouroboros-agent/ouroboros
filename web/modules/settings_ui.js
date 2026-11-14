@@ -1,1065 +1,514 @@
-import { renderPageHeader, renderSegmentedField, renderTabStrip, bindTabStrip } from './page_header.js';
-import { PAGE_ICONS } from './page_icons.js';
-import { renderAgentAccountsSection, renderAgentsServiceBanner } from './harness_accounts.js';
-import { renderReviewerSlotsSection } from './reviewer_slots.js';
-import { renderSubagentsSection } from './subagents_settings.js';
-import { modelRolesHost } from './model_roles.js';
+/** The plain pages of Settings (docs/DESIGN.md "Settings"; the shell in settings.js draws each page's title and Back):
+ * Permissions and checks, Your rules, Appearance, Notifications, Voice and calls, This computer with its Advanced and
+ * About. A page is cards of rows. A row is described in settings_rows.js and drawn and written by settings_controls.js,
+ * so it saves itself and says what happened; a row whose control belongs to another module (the theme, the interface
+ * size, the notifier, the host's two switches, the language) is drawn here on the same frame and keeps that module's
+ * hooks. A page reads the settings when it is shown (`ouro:settings-page-shown` for its path) and after one of its
+ * rows saved. */
+import { apiClient, apiFetch } from './api_client.js';
+import { openConfirmDialog } from './confirm_dialog.js';
+import { getContributions } from './contributions.js';
+import { mountDesktopShell } from './desktop_shell.js';
+import { mountInterfaceSize } from './interface_size.js';
+import { getNotifier } from './notifications.js';
+import { bindAutostartControl } from './settings_autostart.js';
+import { CODECS, HIDDEN_WHEN, bindSettingRows, settingsRow } from './settings_controls.js';
+import { readSkills, skillFormTitle, skillForms } from './settings_extension_forms.js';
+import { bindLanguageSettings, languageBlockHtml } from './settings_language.js';
+import { registerSettingsPage } from './settings_pages.js';
+import { applyPolicyToRows } from './settings_policy.js';
+import { rowById, rowsOf } from './settings_rows.js';
+import { mountRulesPage, refreshSafetySkipCounter, safetyFacts } from './settings_safety.js';
+import { bindSecretRows, secretRowHtml } from './settings_secrets.js';
+import { getSpeech } from './speech_providers.js';
+import { showToast } from './toast.js';
+import { copyTextWithToast } from './ui_helpers.js';
+import { setResult } from './ui_primitives.js';
+import { escapeHtmlAttr as escapeHtml, loadVersion } from './utils.js';
 
-// Reads as a sequence: keys → secrets → which API models → who among the agents
-// does what → behavior → technical. "Agents", not "Coding agents" (D-10): the
-// same subscriptions build presentations and run arbitrary tasks, so the
-// narrower word named only one of their uses.
-const SETTINGS_TABS = [
-    { value: 'providers', label: 'Accounts' },
-    { value: 'secrets', label: 'Secrets' },
-    { value: 'models', label: 'Models' },
-    { value: 'agents', label: 'Agents' },
-    { value: 'behavior', label: 'Behavior' },
-    { value: 'appearance', label: 'Appearance' },
-    { value: 'advanced', label: 'Advanced' },
-    { value: 'about', label: 'About' },
-];
-// Guard markers: renderTabStrip emits behavior/advanced tabs at runtime.
+/* ---- A page of rows ------------------------------------------------------------------------------------------------ */
 
-// 6.3: Review and Scope Review efforts moved to per-slot dropdowns in
-// Agents → Review lanes. Behavior keeps the surface-level lanes.
-const EFFORT_FIELDS = [
-    ['s-effort-task', 'Task / Chat', 'medium'],
-    ['s-effort-evolution', 'Evolution', 'high'],
-    ['s-effort-deep-self-review', 'Deep Self-Review', 'high'],
-    ['s-effort-consciousness', 'Consciousness', ''],  // '' = the Task / Chat effort (a wake-up is a Main turn)
-];
+const lead = (text) => `<p class="settings-page-lead">${text}</p>`;
+const note = (attrs, text = '') => `<p class="settings-card-note" ${attrs}>${text}</p>`;
+/** A card: a question as its title, one lead line, its rows, and what stands after them. */
+function card({ title = '', lead: line = '', rows = '', after = '', attrs = '', held = false }) {
+    const head = title ? `<h3 class="settings-card-title">${title}</h3>` : '';
+    return `<section class="ui-card settings-card"${attrs ? ` ${attrs}` : ''}>`
+        + `${held ? `<div class="settings-card-head">${head}<span class="ui-status settings-card-held" data-tone="neutral">Kept for when it is on</span></div>` : head}`
+        + `${line ? `<p class="settings-card-lead">${line}</p>` : ''}<div class="settings-rows">${rows}</div>${after}</section>`;
+}
+/** The page's one fold, at its end: its rare rows, named by what it holds. */
+const foldCard = (holds, rows) => `<section class="ui-card settings-card"><details class="ui-disclosure" data-settings-fold>`
+    + `<summary>More: ${holds}</summary><div class="settings-rows">${rows}</div></details></section>`;
+const rowNode = (container, id) => [...container.querySelectorAll('[data-setting-row]')].find((node) => node.dataset.settingRow === id) || null;
+/** Give a part of a drawn row (`part`: a selector inside it, or '' for the row) the hook another module binds by. */
+function hook(container, id, part, name) {
+    const node = part ? rowNode(container, id)?.querySelector(part) : rowNode(container, id);
+    node?.setAttribute(name, '');
+    return node || null;
+}
+const switchHtml = (row, attrs) => `<label class="ui-switch"><input type="checkbox" role="switch" ${attrs} aria-labelledby="setting-${row.id}-name"`
+    + ` aria-describedby="setting-${row.id}-meta setting-${row.id}-result"><span class="ui-switch-track" aria-hidden="true"><span class="ui-switch-thumb"></span></span></label>`;
+const factHtml = (name) => `<span class="settings-row-value" data-fact="${name}"></span>`;
+const setFact = (container, name, text) => {
+    const node = container.querySelector(`[data-fact="${name}"]`);
+    if (node && node.textContent !== text) node.textContent = text;
+};
 
-// Runtime mode is one axis of the owner policy contract. Keep the Settings
-// presentation in the same vocabulary as the onboarding setup contract; the
-// saved value is still handled by settings.js and the owner endpoint.
-const RUNTIME_MODE_OPTIONS = [
-    { value: 'light', label: 'Light' },
-    { value: 'advanced', label: 'Advanced' },
-    { value: 'pro', label: 'Pro' },
-    { value: 'cyber_pro', label: 'Cyber Pro' },
-];
+// What the drawn rows cannot repaint: which rows, their kind, and the options offered (a `choices` row draws each
+// option's line too). A read that changes it draws the page again; any other fact is painted in place.
+const shapeOf = (rows) => JSON.stringify(rows.map((row) => [row.id, row.control.kind,
+    (row.control.options || []).map((option) => [option.value, option.label, row.control.kind === 'choices' ? option.note : ''])]));
 
-function providerCard({ id, title, icon, hint, body, open = false }) {
-    return `
-        <details class="settings-provider-card" data-provider-card="${id}" ${open ? 'open' : ''}>
-            <summary>
-                <div class="settings-provider-title">
-                    ${icon ? `<img src="${icon}" alt="" class="settings-provider-icon">` : ''}
-                    <span>${title}</span>
-                </div>
-                <span class="settings-provider-hint">${hint || ''}</span>
-            </summary>
-            <div class="settings-provider-body">
-                ${body}
-            </div>
-        </details>
-    `;
+/**
+ * Mount a page of rows. `ids` are its rows; `draw(row, ctx)` answers the page's HTML (`row(id)` is the page's own copy
+ * of a descriptor, changed in place by `tune(rows, settings, row)` for what a read shows); `bind(container, ctx)` wires
+ * what is not a row and answers its disposer; `paint(container, settings)` writes the facts beside the rows;
+ * `shown(container, again)` runs whenever the page is shown (`again()` paints once more, for a fact it read itself).
+ * Remembers the last read, so a page opened again is drawn right.
+ */
+function rowsPage(path, { ids, draw, tune = null, bind = null, paint = null, shown = null }) {
+    let known = null;
+    return (container, { ctx }) => {
+        const rows = ids().map((id) => structuredClone(rowById(id)));
+        const row = (id) => rows.find((each) => each.id === id);
+        let handle = null;
+        let unbind = null;
+        let shape = '';
+        let gone = false;
+        const render = () => {
+            handle?.dispose();
+            unbind?.();
+            container.innerHTML = draw(row, ctx);
+            unbind = bind?.(container, ctx) || null;
+            handle = bindSettingRows(container, { rows, ask: ctx.ask, openDoor: (door) => ctx.openSettings?.(door.control.to) });
+            shape = shapeOf(rows);
+        };
+        const apply = (settings) => {
+            known = settings;
+            tune?.(rows, settings, row);
+            if (shapeOf(rows) !== shape) render(); else handle.paint();
+            paint?.(container, settings, row);
+        };
+        const read = async () => {
+            let settings;
+            try { settings = await ctx.readSettings(); } catch { return; }  // the rows keep what they show
+            if (!gone) apply(settings);
+        };
+        const onShown = (event) => {
+            if (event.detail?.path !== path) return;
+            shown?.(container, () => { if (known && !gone) apply(known); });
+            void read();
+        };
+        // One of this page's rows saved: what the server derives from it (the level in force, what waits for a restart)
+        // is read again. A result the owner saw ends when Settings is left.
+        const onSaved = (event) => { if (event.detail?.source === 'settings-row' && event.detail.page === path) void read(); };
+        const onPage = (event) => { if (event.detail?.page !== 'settings') handle?.leave(); };
+        const win = globalThis.window;
+        tune?.(rows, known, row);
+        render();
+        if (known) paint?.(container, known, row);
+        win?.addEventListener?.('ouro:settings-page-shown', onShown);
+        win?.addEventListener?.('ouro:settings-updated', onSaved);
+        win?.addEventListener?.('ouro:page-shown', onPage);
+        return { unmount() {
+            gone = true;
+            handle?.dispose();
+            unbind?.();
+            win?.removeEventListener?.('ouro:settings-page-shown', onShown);
+            win?.removeEventListener?.('ouro:settings-updated', onSaved);
+            win?.removeEventListener?.('ouro:page-shown', onPage);
+        } };
+    };
 }
 
-function secretField({ id, settingKey, label, placeholder }) {
-    return `
-        <div class="form-field ui-field">
-            <label for="${id}">${label}</label>
-            <div class="secret-input-row">
-                <input id="${id}" name="${settingKey}" data-secret-setting="${settingKey}" class="secret-input ui-control" type="password" placeholder="${placeholder}">
-                <button type="button" class="btn btn-default secret-toggle" data-target="${id}">Show</button>
-                <button type="button" class="btn btn-default secret-clear" data-target="${id}">Clear</button>
-            </div>
-        </div>
-    `;
+/* ---- Permissions and checks ---------------------------------------------------------------------------------------- */
+
+/** The rows as this installation's policy and Safety facts leave them (pure; `rows` are the page's copies). */
+export function tunePermissionRows(rows, settings, row = (id) => rows.find((each) => each.id === id)) {
+    applyPolicyToRows(rows, settings, rowById);
+    const facts = safetyFacts(settings || {});
+    const supervisor = row('permissions:supervisor');
+    const second = row('permissions:second-check');
+    supervisor.meta = settings ? facts.supervisor : '';
+    second.meta = settings ? `${facts.secondCheck}${facts.unmeasured ? ' · not measured yet: no replay of real checks exists' : ''}` : '';
+    // An organization's Supervisor is said, never offered for change: its two rows lead nowhere.
+    for (const each of [supervisor, second]) each.control = facts.fixed ? { kind: 'custom' } : structuredClone(rowById(each.id).control);
+    return rows;
 }
 
-function plainField({ id, label, placeholder }) {
-    return `<div class="form-field ui-field"><label for="${id}">${label}</label><input id="${id}" name="${id}" type="text" class="ui-control" placeholder="${placeholder}"></div>`;
+const mountPermissions = rowsPage('permissions', {
+    ids: () => rowsOf('permissions').map((row) => row.id),
+    tune: tunePermissionRows,
+    draw: (row) => {
+        const rows = (...ids) => ids.map((id) => settingsRow(row(id))).join('');
+        return lead('What Ouroboros may change, and who looks before and after.')
+            + card({ title: 'What it may change', rows: rows('OUROBOROS_RUNTIME_MODE') })
+            + card({ title: 'Who watches its actions', lead: 'The Safety Supervisor is a second model that reads a step before it runs.',
+                rows: rows('OUROBOROS_SAFETY_MODE', 'OUROBOROS_CONSCIOUSNESS_SAFETY_MODE', 'permissions:rules', 'permissions:supervisor', 'permissions:second-check'),
+                after: note('data-safety-skips role="status"') + note('data-safety-spares role="status" hidden') + note('data-safety-exits hidden')
+                    + note('data-safety-organization-rules hidden', 'Your organization’s rules apply too; its administrator sets them.') })
+            + card({ title: 'Who checks its results', lead: 'Reviewers are other models that read finished work.',
+                rows: rows('OUROBOROS_TASK_REVIEW_MODE', 'permissions:reviewers') })
+            + card({ title: 'Trust it without asking', rows: rows('OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS') })
+            + foldCard('review rounds', rows('OUROBOROS_REVIEW_MAX_CYCLES'));
+    },
+    paint: (container, settings) => {
+        const facts = safetyFacts(settings || {});
+        const exits = container.querySelector('[data-safety-exits]');
+        exits.textContent = facts.exits;
+        exits.hidden = !facts.exits;
+        // An organization's checker records a walk whenever a route of its own lacks a credential, its own answer included.
+        container.querySelector('[data-safety-spares]').hidden = facts.fixed;
+        container.querySelector('[data-safety-organization-rules]').hidden = !facts.organizationRules;
+    },
+    shown: (container) => { void refreshSafetySkipCounter(container); },
+});
+
+/* ---- Appearance ---------------------------------------------------------------------------------------------------- */
+
+// Theme and size are this device's and their own modules write them (theme.js paints and takes the strip's presses,
+// interface_size.js the slider); the language is the install's (settings_language.js). Nothing here is a settings row
+// the helper writes, so the page binds none. The theme's options stand in theme.js's own order, the one its arrows,
+// Home and End walk.
+function mountAppearance(container) {
+    const custom = (row) => (row.id === 'appearance:theme'
+        ? `<div class="ui-segment-group" role="radiogroup" data-theme-control aria-labelledby="setting-${row.id}-name">${[['light', 'Light'], ['dark', 'Dark'], ['system', 'System']]
+            .map(([value, label]) => `<button type="button" class="ui-segment" role="radio" data-theme-choice="${value}">${label}</button>`).join('')}</div>`
+        : `<span class="settings-slider" data-interface-size-row hidden><input type="range" id="interface-size" min="50" max="200" step="5" value="100"
+            data-interface-size-input aria-labelledby="setting-${row.id}-name"><output for="interface-size" data-interface-size-value data-i18n-skip>100%</output>
+            <button type="button" class="btn btn-default btn-sm" data-interface-size-reset>Reset</button></span>`);
+    container.innerHTML = card({ title: 'On this device', attrs: 'data-interface-size',
+        rows: ['appearance:theme', 'appearance:size'].map((id) => settingsRow(rowById(id), { custom })).join(''),
+        after: note('data-interface-size-note role="status" aria-live="polite"') + note('class="settings-card-note theme-status" data-theme-status role="status" aria-live="polite"')
+            + note('data-shell-storage-status role="status" aria-live="polite"') })
+        + languageBlockHtml();
+    globalThis.ouroTheme?.mount();
+    // The desktop app says where it keeps this device's choices (a fact of the app, which is not updated with the core).
+    const disposers = [mountInterfaceSize(container), bindLanguageSettings(container), mountDesktopShell(container)];
+    return { unmount() { disposers.forEach((dispose) => dispose()); } };
 }
 
-const PROVIDER_CARDS = [
-    {
-        id: 'openrouter', title: 'OpenRouter', icon: '/static/providers/openrouter.ico', hint: 'Default multi-model router', open: true,
-        fields: [{ id: 's-openrouter', settingKey: 'OPENROUTER_API_KEY', label: 'OpenRouter API Key', placeholder: 'sk-or-...' }],
-        // testInputs must cover BOTH the secret and the plain fields of the card:
-        // the probe runs against what is typed, before anything is saved.
-        testProvider: 'openrouter', testInputs: { 's-openrouter': 'OPENROUTER_API_KEY' },
-    },
-    {
-        id: 'openai', title: 'OpenAI', icon: '/static/providers/openai.svg', hint: 'Official OpenAI API',
-        fields: [{ id: 's-openai', settingKey: 'OPENAI_API_KEY', label: 'OpenAI API Key', placeholder: 'sk-...' }],
-        testProvider: 'openai', testInputs: { 's-openai': 'OPENAI_API_KEY' },
-        note: 'Pick OpenAI as the source in Models or Agents to route a role through this key. If OpenRouter is absent and the shipped defaults are still untouched, Ouroboros auto-remaps them to official OpenAI defaults.',
-    },
-    {
-        id: 'compatible', title: 'OpenAI Compatible', icon: '/static/providers/openai-compatible.svg', hint: 'Custom OpenAI-style endpoint',
-        fields: [
-            { id: 's-openai-compatible-key', settingKey: 'OPENAI_COMPATIBLE_API_KEY', label: 'API Key', placeholder: 'Compatible provider key' },
-            { id: 's-openai-compatible-base-url', label: 'Base URL', placeholder: 'https://provider.example/v1' },
-        ],
-        testProvider: 'openai-compatible',
-        testInputs: {
-            's-openai-compatible-key': 'OPENAI_COMPATIBLE_API_KEY',
-            's-openai-compatible-base-url': 'OPENAI_COMPATIBLE_BASE_URL',
-        },
-        note: 'Use this card for custom base URLs. Built-in web search only works with the official OpenAI Responses API, so keep <code>OPENAI_BASE_URL</code> empty when you want <code>web_search</code>.',
-    },
-    {
-        // advanced: rendered inside the collapsed "More providers" section.
-        // Inputs stay mounted either way — settings.js applyInputValue has no
-        // null guard, so every input id must always exist in the DOM.
-        id: 'cloudru', title: 'Cloud.ru Foundation Models', icon: '/static/providers/cloudru.svg', hint: 'Cloud.ru OpenAI-compatible runtime', advanced: true,
-        fields: [
-            { id: 's-cloudru-key', settingKey: 'CLOUDRU_FOUNDATION_MODELS_API_KEY', label: 'API Key', placeholder: 'Cloud.ru Foundation Models API key' },
-            { id: 's-cloudru-base-url', label: 'Base URL', placeholder: 'https://foundation-models.api.cloud.ru/v1' },
-        ],
-        testProvider: 'cloudru',
-        testInputs: {
-            's-cloudru-key': 'CLOUDRU_FOUNDATION_MODELS_API_KEY',
-            's-cloudru-base-url': 'CLOUDRU_FOUNDATION_MODELS_BASE_URL',
-        },
-    },
-    {
-        id: 'minimax', title: 'MiniMax', icon: '', hint: 'Direct regional OpenAI-compatible runtime', advanced: true,
-        fields: [
-            { id: 's-minimax-key', settingKey: 'MINIMAX_API_KEY', label: 'API Key', placeholder: 'MiniMax API key' },
-            { id: 's-minimax-region', label: 'Region', placeholder: 'global_en or cn_zh' },
-        ],
-        testProvider: 'minimax',
-        testInputs: { 's-minimax-key': 'MINIMAX_API_KEY', 's-minimax-region': 'MINIMAX_REGION' },
-        note: 'Pick MiniMax as the source in Models or Agents, then choose MiniMax-M3 or MiniMax-M2.7. Leave Region empty for <code>global_en</code>; use <code>cn_zh</code> for the China endpoint.',
-    },
-    {
-        id: 'deepseek', title: 'DeepSeek', icon: '', hint: 'Direct OpenAI-compatible runtime (v4 family)', advanced: true,
-        fields: [
-            { id: 's-deepseek-key', settingKey: 'DEEPSEEK_API_KEY', label: 'API Key', placeholder: 'sk-...' },
-        ],
-        testProvider: 'deepseek',
-        testInputs: { 's-deepseek-key': 'DEEPSEEK_API_KEY' },
-        note: 'Pick DeepSeek as the source in Models or Agents, then choose deepseek-v4-pro or deepseek-v4-flash.',
-    },
-    {
-        id: 'gigachat', title: 'GigaChat', icon: '/static/providers/gigachat.svg', hint: 'Sber GigaChat via the gigachat library', advanced: true,
-        fields: [
-            { id: 's-gigachat-credentials', settingKey: 'GIGACHAT_CREDENTIALS', label: 'Authorization Key', placeholder: 'Base64 client_id:secret (OAuth)' },
-            { id: 's-gigachat-scope', label: 'Scope', placeholder: 'GIGACHAT_API_PERS' },
-            { id: 's-gigachat-user', label: 'User (basic auth, optional)', placeholder: 'username' },
-            { id: 's-gigachat-password', settingKey: 'GIGACHAT_PASSWORD', label: 'Password (basic auth, optional)', placeholder: 'password' },
-            { id: 's-gigachat-base-url', label: 'Base URL', placeholder: 'https://api.giga.chat/v1' },
-            { id: 's-gigachat-verify-ssl', label: 'Verify SSL Certs', placeholder: 'true / false' },
-        ],
-        testProvider: 'gigachat',
-        testInputs: {
-            's-gigachat-credentials': 'GIGACHAT_CREDENTIALS',
-            's-gigachat-scope': 'GIGACHAT_SCOPE',
-            's-gigachat-user': 'GIGACHAT_USER',
-            's-gigachat-password': 'GIGACHAT_PASSWORD',
-            's-gigachat-base-url': 'GIGACHAT_BASE_URL',
-            's-gigachat-verify-ssl': 'GIGACHAT_VERIFY_SSL_CERTS',
-        },
-        note: 'Pick GigaChat as the source in Models or Agents to route a role through this account. Authenticate with either an Authorization Key (OAuth, scope <code>GIGACHAT_API_PERS</code>, <code>GIGACHAT_API_B2B</code>, or <code>GIGACHAT_API_CORP</code>) or User + Password.',
-    },
-    {
-        id: 'anthropic', title: 'Anthropic', icon: '/static/providers/anthropic.png', hint: 'Direct Anthropic API access',
-        fields: [{ id: 's-anthropic', settingKey: 'ANTHROPIC_API_KEY', label: 'Anthropic API Key', placeholder: 'sk-ant-...' }],
-        testProvider: 'anthropic', testInputs: { 's-anthropic': 'ANTHROPIC_API_KEY' },
-        note: 'Pick Anthropic as the source in Models or Agents to route a role directly through this key.',
-    },
-];
+/* ---- Notifications ------------------------------------------------------------------------------------------------- */
 
-// {backend provider id: {DOM input id: settings key}} — settings.js reads the
-// live input values through this map to build the unsaved-credential overrides.
-export const PROVIDER_TEST_INPUTS = Object.fromEntries(
-    PROVIDER_CARDS.filter((card) => card.testProvider).map((card) => [card.testProvider, card.testInputs]),
-);
+// This device's choices: notifications.js keeps them, takes every press by its own hooks and paints them
+// (`mountSettings`); a switch acts at once. The first row's one line is the notifier's sentence about this system.
+function mountNotifications(container, { ctx }) {
+    const custom = (row) => (row.control.pref ? switchHtml(row, `data-notify-pref="${row.control.pref}"`)
+        : row.id === 'notify:tone_volume'
+            ? `<span class="settings-slider"><input type="range" id="notify-tone-volume" min="0" max="100" step="1" value="40" data-notify-volume
+                aria-labelledby="setting-${row.id}-name" aria-describedby="setting-${row.id}-meta"><output for="notify-tone-volume" data-notify-volume-value data-i18n-skip>40%</output>
+                <button type="button" class="btn btn-default btn-sm" data-notify-preview>Preview tone</button></span>`
+            : '<button type="button" class="btn btn-default btn-sm" data-notify-test>Send a test</button>');
+    const rows = (...ids) => ids.map((id) => settingsRow(rowById(id), { custom })).join('');
+    container.innerHTML = lead('When Ouroboros calls you back to this device.')
+        + `<div class="settings-stack">${card({ rows: rows('notify:enabled') })
+            + card({ title: 'Notify me about', held: true, rows: rows('notify:needs_answer', 'notify:task_done', 'notify:important', 'notify:main_reply') })
+            + card({ title: 'How', held: true, rows: rows('notify:sound', 'notify:tone_volume', 'notify:show_text', 'notify:test') })}</div>`
+        + `<div data-notify-doors>${card({ rows: rows('notify:places') })}</div>`;
+    hook(container, 'notify:enabled', '[data-setting-meta]', 'data-notify-status');
+    hook(container, 'notify:test', '[data-setting-meta]', 'data-notify-attention-status');
+    getNotifier().mountSettings(container);
+    // While the first switch is off the other choices are kept, not used: their cards say so.
+    const master = container.querySelector('[data-notify-pref="enabled"]');
+    const held = () => container.querySelectorAll('.settings-card-held').forEach((node) => { node.hidden = Boolean(master?.checked); });
+    held();
+    container.addEventListener('change', held);
+    const doors = bindSettingRows(container.querySelector('[data-notify-doors]'), { openDoor: (door) => ctx.openSettings?.(door.control.to) });
+    return { unmount() { container.removeEventListener('change', held); doors.dispose(); } };
+}
 
-function providerSettingsCard(spec) {
-    const fields = (spec.fields || [])
-        .map((field) => {
-            const named = { ...field, label: field.label === "API Key" || field.label === "Base URL"
-                ? `${spec.title} ${field.label}` : field.label };
-            return field.settingKey ? secretField(named) : plainField(named);
-        })
-        .join('');
-    const test = spec.testProvider ? `
-            <div class="settings-action-row">
-                <span class="settings-inline-status" data-provider-test-status="${spec.testProvider}" role="status" aria-live="polite" aria-atomic="true"></span>
-                <button type="button" class="btn btn-default" data-provider-test="${spec.testProvider}" title="Sends one short model request. Provider charges may apply.">Test</button>
-            </div>
-        ` : '';
-    return providerCard({
-        id: spec.id,
-        title: spec.title,
-        icon: spec.icon,
-        hint: spec.hint,
-        open: spec.open,
-        body: `<div class="form-row">${fields}</div>${test}${spec.note ? `<div class="settings-inline-note">${spec.note}</div>` : ''}`,
+/* ---- Voice and calls ----------------------------------------------------------------------------------------------- */
+
+const skillFormPath = (skill) => `skill/${encodeURIComponent(skill)}`;
+
+/** The saved dictation engine and read-aloud voice in words, and the skills that registered a live conversation and a
+ *  settings form, each named by its form's own title (`store`: the contributions store; `speech`: the speech hub;
+ *  `forms`: the skill forms the last read of the skills knows). Pure over the three. */
+export function voiceFacts({ speech = getSpeech(), store = getContributions(), forms = skillForms(),
+    title = (skill) => skillFormTitle(skillFormPath(skill)) } = {}) {
+    const engine = speech.selected('stt');
+    const reader = speech.readAloud();
+    let voices = [];
+    try { voices = reader?.available ? reader.impl?.voices?.() || [] : []; } catch { voices = []; }
+    const voice = speech.voiceId();
+    const formed = new Set(forms.map((form) => form.skill));
+    const talking = new Set(store.providers('conversation').map((item) => item.skill).filter((skill) => skill && formed.has(skill)));
+    return {
+        dictation: !engine.key ? 'Not chosen' : engine.label ? `${engine.label}${engine.available ? '' : ' · not ready here'}` : 'Chosen engine is not here',
+        dictationNote: engine.key && !engine.available ? engine.reason || '' : '',
+        readAloud: !reader ? 'No voice on this device' : !reader.available ? `${reader.label || 'Chosen engine'} · not ready here`
+            : `${voices.find((each) => each.id === voice)?.label || 'Automatic'}${reader.label ? ` · ${reader.label}` : ''}`,
+        readAloudNote: reader && !reader.available ? reader.reason || '' : '',
+        calls: [...talking].map((skill) => ({ skill, name: title(skill) })),
+    };
+}
+
+// No setting lives here: each row says a saved choice and where it is made. A skill's own form is one press away: the
+// skills are read when the page is shown (a passive read), which is how the page knows who has a form and its title.
+function mountVoice(container, { ctx }) {
+    const speech = getSpeech();
+    const store = getContributions();
+    const base = { 'voice:dictation': rowById('voice:dictation'), 'voice:read-aloud': rowById('voice:read-aloud') };
+    let handle = null;
+    let drawn = '';
+    const render = () => {
+        const facts = voiceFacts({ speech, store });
+        const doors = facts.calls.map((call) => ({ id: `voice:skill:${call.skill}`, keys: [], page: 'voice', fold: false, name: call.name,
+            meta: 'Its own settings, on its own page.', more: '', control: { kind: 'door', to: skillFormPath(call.skill) } }));
+        const rows = [{ ...base['voice:dictation'], meta: facts.dictationNote || base['voice:dictation'].meta },
+            { ...base['voice:read-aloud'], meta: facts.readAloudNote || base['voice:read-aloud'].meta }, ...doors];
+        const shape = JSON.stringify([rows.map((row) => [row.id, row.name, row.meta]), facts.dictation, facts.readAloud]);
+        if (shape === drawn) return;
+        drawn = shape;
+        handle?.dispose();
+        const doorValue = (row) => factHtml(row.id);
+        container.innerHTML = card({ rows: rows.slice(0, 2).map((row) => settingsRow(row, { doorValue })).join('') })
+            + (doors.length ? card({ title: 'Calls', lead: 'Talk to Ouroboros by voice from the message field.', rows: doors.map((row) => settingsRow(row)).join('') }) : '');
+        setFact(container, 'voice:dictation', facts.dictation);
+        setFact(container, 'voice:read-aloud', facts.readAloud);
+        handle = bindSettingRows(container, { rows, openDoor: (door) => ctx.openSettings?.(door.control.to) });
+    };
+    render();
+    let gone = false;
+    const read = () => readSkills().then(() => { if (!gone) render(); }, () => {});  // a failed read keeps what is drawn
+    const onShown = (event) => { if (event.detail?.path === 'voice') void read(); };
+    globalThis.window?.addEventListener?.('ouro:settings-page-shown', onShown);
+    const offs = [speech.onChange(render), store.onChange(() => { render(); void read(); })];
+    return { unmount() {
+        gone = true;
+        globalThis.window?.removeEventListener?.('ouro:settings-page-shown', onShown);
+        offs.forEach((off) => off?.());
+        handle?.dispose();
+    } };
+}
+
+/* ---- This computer ------------------------------------------------------------------------------------------------- */
+
+const HOST_KEY = 'OUROBOROS_SERVER_HOST';
+const PASSWORD_KEY = 'OUROBOROS_NETWORK_PASSWORD';
+// The Settings writer takes a loopback or a wildcard address only (gateway/settings.py); any other is set outside.
+const hostChoice = (host) => {
+    const text = String(host ?? '').trim().toLowerCase();
+    return /^(|localhost|127(\.\d+){3}|::1|\[::1\])$/.test(text) ? '127.0.0.1' : /^(0\.0\.0\.0|::|\[::\])$/.test(text) ? '0.0.0.0' : text;
+};
+let typedPassword = '';  // the password typed on this visit of the page, until an opening write carried it
+CODECS.network = {
+    read: (settings) => (settings ? hostChoice(settings[HOST_KEY]) : undefined),
+    // Opening to the network carries the password typed beside it in the same write: the server wants one with it.
+    // (The Password row also saves itself when its field is left; the same value twice changes nothing.)
+    body: (value) => {
+        const password = value === '0.0.0.0' ? typedPassword : '';
+        typedPassword = '';
+        return { [HOST_KEY]: value, ...(password ? { [PASSWORD_KEY]: password } : {}) };
+    },
+    running: (settings) => {
+        // The address in force while the saved one waits for a restart, as one of the two choices.
+        const applied = settings?._meta?.restart_state?.running?.[HOST_KEY];
+        return applied === undefined ? undefined : hostChoice(applied);
+    },
+};
+/** The address other devices type, from a settings read's `_meta`: `{ url, copy, note, warning }` (the row's one line,
+ *  and the server's warning about it), or null while only this computer reaches it. */
+export function lanAddress(meta) {
+    const found = meta?.reachability === 'lan_reachable';
+    if (!found && meta?.reachability !== 'host_ip_unknown') return null;
+    return { url: String(meta.recommended_url || ''), copy: found && Boolean(meta.recommended_url), warning: String(meta.warning || ''),
+        note: found ? 'Type it in a browser on the same network.'
+            : 'This computer’s address on your network could not be found. Put its address in place of your-host-ip.' };
+}
+HIDDEN_WHEN.noLanAddress = (settings) => !lanAddress(settings?._meta);
+
+/** The network rows as a read leaves them (pure): the password row says what an unset one means (a set one says Saved
+ *  in its place, settings_secrets.js), and a listener the way Ouroboros was started decides is said in place of what
+ *  each choice would mean. */
+export function tuneComputerRows(rows, settings, row = (id) => rows.find((each) => each.id === id)) {
+    const host = row(HOST_KEY);
+    const password = row(PASSWORD_KEY);
+    const base = rowById(HOST_KEY);
+    const meta = settings?._meta || {};
+    const saved = hostChoice(settings?.[HOST_KEY]);
+    const listens = hostChoice(meta.bind_host);
+    const pending = CODECS.network.running(settings) !== undefined;
+    const outside = Boolean(settings) && Boolean(meta.bind_host) && listens !== saved && !pending;
+    host.control = { ...base.control, options: base.control.options.map((option) => (outside
+        ? { ...option, note: `It listens on ${meta.bind_host} now: the way Ouroboros was started sets that, not this choice.` } : { ...option })) };
+    host.meta = settings && !base.control.options.some((option) => option.value === saved) ? `Listens on ${saved}: set outside Settings.` : '';
+    password.meta = !settings || settings[PASSWORD_KEY] ? rowById(PASSWORD_KEY).meta
+        : 'Not set. Other devices are asked for it: set it before you open to your network.';
+    const address = lanAddress(meta);
+    row('computer:address').meta = address?.note || rowById('computer:address').meta;
+    // The version the sidebar already shows (one health read, utils.js loadVersion).
+    const version = globalThis.document?.getElementById?.('nav-version')?.textContent || '';
+    row('computer:about').meta = version ? `Ouroboros ${version}` : '';
+    return rows;
+}
+
+// One listener for as long as the page stands: a press copies the address the last read drew on its button.
+export function bindNetworkHintCopy(host, { copy = copyTextWithToast } = {}) {
+    const onClick = (event) => {
+        const url = event.target?.closest?.('[data-copy-lan-url]')?.dataset.copyLanUrl;
+        if (url) void copy(url, { okMessage: 'LAN URL copied.' });
+    };
+    host?.addEventListener('click', onClick);
+    return () => host?.removeEventListener('click', onClick);
+}
+
+/** Paint the address row's control from a read's `_meta`: the address as a link, and Copy link carrying that address. */
+export function paintNetworkHint(host, meta) {
+    const address = lanAddress(meta);
+    if (!host || !address) { if (host) host.innerHTML = ''; return; }
+    const url = escapeHtml(address.url);
+    host.innerHTML = (address.copy ? `<a class="settings-row-value settings-row-link" href="${url}" target="_blank" rel="noopener">${url}</a>`
+        + `<button type="button" class="btn btn-default btn-sm ui-hit-area" data-copy-lan-url="${url}">Copy link</button>`
+        : `<span class="settings-row-value">${url}</span>`);
+}
+
+// The password is a stored key's row (settings_secrets.js): Replace, Show, and Remove that asks first.
+const passwordRows = new WeakMap();  // the page's container -> its bound password row
+const mountComputer = rowsPage('computer', {
+    ids: () => rowsOf('computer').map((row) => row.id),
+    tune: tuneComputerRows,
+    draw: (row) => {
+        const custom = (each) => (each.id === 'computer:address' ? '<span class="settings-row-end" data-lan-address></span>'
+            : switchHtml(each, each.id === 'computer:autostart' ? 'data-autostart-toggle' : 'data-background-toggle'));
+        const rows = (...ids) => ids.map((id) => (id === PASSWORD_KEY ? secretRowHtml(row(id)) : settingsRow(row(id), { custom }))).join('');
+        return lead('The computer Ouroboros runs on.')
+            + card({ title: 'Start and background', attrs: 'data-autostart-settings hidden', rows: rows('computer:autostart', 'OUROBOROS_DESKTOP_KEEP_RUNNING'),
+                after: note('id="settings-autostart-note" data-autostart-shared-note role="status" aria-live="polite" hidden') })
+            + card({ title: 'Who can reach it', rows: rows(HOST_KEY, PASSWORD_KEY, 'computer:address') })
+            + card({ rows: rows('computer:advanced', 'computer:about') });
+    },
+    bind: (container, ctx) => {
+        // The host's two switches are settings_autostart.js's: it reads the host, paints and writes them. Each says
+        // its state in its own row's line; a host that offers neither says why once, under both.
+        hook(container, 'computer:autostart', '[data-setting-result]', 'data-autostart-status');
+        hook(container, 'OUROBOROS_DESKTOP_KEEP_RUNNING', '[data-setting-result]', 'data-background-status');
+        const background = hook(container, 'OUROBOROS_DESKTOP_KEEP_RUNNING', '', 'data-background-row');
+        if (background) background.hidden = true;
+        // Heard before the row helper takes the change and empties the field it saved.
+        const onTyped = (event) => { if (event.target?.id === `setting-${PASSWORD_KEY}` && event.target.value) typedPassword = event.target.value; };
+        container.addEventListener('change', onTyped, true);
+        // A password write that landed puts its field away (Remove writes '' through the row's own queue).
+        const password = bindSecretRows(container, { rowOf: rowById, ask: ctx.ask });
+        passwordRows.set(container, password);
+        const onSaved = (event) => { if (event.detail?.row === PASSWORD_KEY) password.close(PASSWORD_KEY); };
+        globalThis.window?.addEventListener?.('ouro:settings-updated', onSaved);
+        const disposers = [bindAutostartControl(container), bindNetworkHintCopy(container)];
+        return () => {
+            typedPassword = '';
+            container.removeEventListener('change', onTyped, true);
+            globalThis.window?.removeEventListener?.('ouro:settings-updated', onSaved);
+            password.dispose();
+            disposers.forEach((dispose) => dispose());
+        };
+    },
+    paint: (container, settings) => {
+        passwordRows.get(container)?.paint(settings);
+        paintNetworkHint(container.querySelector('[data-lan-address]'), settings?._meta);
+        // The server's warning about the open address (no password, for one) stands in that row's line, as a warning.
+        const warning = lanAddress(settings?._meta)?.warning || '';
+        setResult(rowNode(container, 'computer:address')?.querySelector('[data-setting-result]'), warning ? { text: warning, tone: 'warn' } : {});
+    },
+});
+
+/* This computer › Advanced: what an installation rarely changes. */
+
+// What the core serves at its own address right now (`served_ui` on /api/state),
+// beside the saved choice that applies at the next restart; a refused choice
+// carries the core's own sentence naming it and why. A core older than the choice
+// reports nothing, and nothing is shown.
+export function servedUiStatus(servedUi) {
+    const label = { builtin: 'the built-in interface', directory: 'the interface directory', none: 'no main page' }[servedUi?.source];
+    if (!label) return null;
+    return servedUi.error
+        ? { text: `Serving now: ${label}. ${servedUi.error}`, tone: 'warn' }
+        : { text: `Serving now: ${label}.`, tone: 'muted' };
+}
+
+// The cap on acting tasks is optional: the server keeps "no cap" as a blank, which the row shows and sends as No limit.
+CODECS.ownerCap = {
+    read: (settings, row) => (!settings ? undefined : String(settings[row.keys[0]] ?? '').trim() === '' ? 'unlimited' : settings[row.keys[0]]),
+    body: (value, row) => ({ [row.keys[0]]: String(value ?? '').trim().toLowerCase() === 'unlimited' ? '' : value }),
+};
+
+let servedUi = null;  // the last answer of /api/state about what is served
+const mountAdvanced = rowsPage('computer/advanced', {
+    ids: () => rowsOf('computer/advanced').map((row) => row.id),
+    draw: (row) => lead('Most installations never change these.')
+        + card({ rows: rowsOf('computer/advanced').map((each) => settingsRow(row(each.id))).join('') }),
+    // What is served now stands in the Interface folder row, after its one line: a fact of the running core, in the
+    // warning's tone when it refused the saved folder.
+    bind: (container) => {
+        const fact = globalThis.document.createElement('span');
+        fact.className = 'ui-result settings-row-result';
+        fact.setAttribute('data-served-ui', '');
+        fact.setAttribute('role', 'status');
+        rowNode(container, 'OUROBOROS_UI_DIR')?.querySelector('.ui-row-meta')?.append(fact);
+        return null;
+    },
+    paint: (container) => setResult(container.querySelector('[data-served-ui]'), servedUiStatus(servedUi) || {}),
+    shown: (container, again) => { apiClient.state().then((state) => { servedUi = state?.served_ui || null; again(); }, () => {}); },
+});
+
+/* This computer › About: the version and what Ouroboros is; Reset all data in its fold. */
+function mountAbout(container) {
+    const custom = () => '<button type="button" class="btn btn-danger btn-sm" data-reset-all>Reset all data…</button>';
+    container.innerHTML = `<section class="ui-card settings-card"><div class="about-body">
+            <img src="/static/logo.jpg" class="about-logo" alt="">
+            <div><p class="about-title">Ouroboros</p><p id="about-version" class="about-version"></p></div>
+            <p class="about-desc">A self-creating AI agent. Not a tool, but a becoming digital personality with its own constitution,
+                persistent identity, and background consciousness. Born February 16, 2026.</p>
+            <div class="about-credits"><span>Created by <strong>Anton Razzhigaev</strong> &amp; <strong>Andrew Kaznacheev</strong></span>
+                <div class="about-links"><a href="https://t.me/abstractDL" target="_blank" rel="noopener noreferrer">@abstractDL</a>
+                    <a href="https://github.com/razzant/ouroboros" target="_blank" rel="noopener noreferrer">GitHub</a></div></div>
+        </div></section>${foldCard('reset all data', settingsRow(rowById('computer:reset'), { custom }))}`;
+    void loadVersion();  // utils.js fills `#about-version` from one health read
+    const button = container.querySelector('[data-reset-all]');
+    const onReset = () => { void resetAllData(); };
+    button.addEventListener('click', onReset);
+    return { unmount() { button.removeEventListener('click', onReset); } };
+}
+
+registerSettingsPage('permissions', { title: 'Permissions and checks', mount: mountPermissions });
+registerSettingsPage('rules', { title: 'Your rules', mount: mountRulesPage });
+registerSettingsPage('appearance', { title: 'Appearance', mount: mountAppearance });
+registerSettingsPage('notifications', { title: 'Notifications', mount: mountNotifications });
+registerSettingsPage('voice', { title: 'Voice and calls', mount: mountVoice });
+registerSettingsPage('computer', { title: 'This computer', mount: mountComputer });
+registerSettingsPage('computer/advanced', { title: 'Advanced', mount: mountAdvanced });
+registerSettingsPage('computer/about', { title: 'About', mount: mountAbout });
+
+// The desktop app's own facts (its system notifications, where it keeps this device's choices) reach the notifier when
+// the app starts, not when a page is opened: where an alert goes depends on them long before anyone opens Settings.
+if (globalThis.document) mountDesktopShell(null, (shell) => getNotifier().configure({ shell }));
+
+// Reset All Data (the Danger Zone's button): asks first, then deletes the runtime data and restarts.
+export async function resetAllData() {
+    const confirmedReset = await openConfirmDialog({
+        title: 'Reset runtime data',
+        body: 'This will delete all runtime data (state, memory, logs, settings) and restart.\nThe repo (agent code) will be preserved.\nYou will need to re-enter your provider settings.\n\nContinue?',
+        confirmLabel: 'Delete and restart',
+        danger: true,
     });
-}
-
-// The owner-facing subset of ouroboros/config.py EFFORT_SCALE: `minimal` is a
-// valid runtime tier (bench adapters / agent-side switch_model use it) but is
-// deliberately NOT offered as an owner slot default — sub-`low` thinking is a
-// per-call tactical choice, not a standing configuration. xhigh/max/ultra adapt
-// down to each route's real ceiling (exact-route request-wire recovery on API
-// routes, per-model resolution on delegated ones); the adaptation is disclosed
-// in usage, and a cold route whose provider rejects without naming supported
-// tiers remains the PR-disclosed limit of the two-send recovery rail.
-const EFFORT_OPTIONS = [
-    { value: 'none', label: 'None' }, { value: 'low', label: 'Low' },
-    { value: 'medium', label: 'Medium' }, { value: 'high', label: 'High' },
-    { value: 'xhigh', label: 'X-High' }, { value: 'max', label: 'Max' }, { value: 'ultra', label: 'Ultra' },
-];
-
-function effortField({ id, label, defaultValue }) {
-    // Consciousness may inherit the Task / Chat effort ('' — a wake-up is a Main turn).
-    const options = id === 's-effort-consciousness' ? [{ value: '', label: 'Same as Task / Chat' }, ...EFFORT_OPTIONS] : EFFORT_OPTIONS;
-    return `
-        <div class="settings-effort-card">
-            <label for="${id}">${label}</label>
-            <input id="${id}" type="hidden" value="${defaultValue}">
-            ${renderSegmentedField({ target: id, options })}
-        </div>
-    `;
-}
-
-export const SECRET_KEYS = [
-    ['OPENROUTER_API_KEY', 'OpenRouter API Key', 'sk-or-...'],
-    ['OPENAI_API_KEY', 'OpenAI API Key', 'sk-...'],
-    ['OPENAI_COMPATIBLE_API_KEY', 'OpenAI-compatible API Key', 'Compatible provider key'],
-    ['CLOUDRU_FOUNDATION_MODELS_API_KEY', 'Cloud.ru Foundation Models API Key', 'Cloud.ru key'],
-    ['GIGACHAT_CREDENTIALS', 'GigaChat Authorization Key', 'Base64 client_id:secret'],
-    ['GIGACHAT_PASSWORD', 'GigaChat Password (basic auth)', 'password'],
-    ['ANTHROPIC_API_KEY', 'Anthropic API Key', 'sk-ant-...'],
-    ['MINIMAX_API_KEY', 'MiniMax API Key', 'MiniMax key'],
-    ['DEEPSEEK_API_KEY', 'DeepSeek API Key', 'sk-...'],
-    ['GITHUB_TOKEN', 'GitHub Token', 'ghp_...'],
-    ['OUROBOROS_NETWORK_PASSWORD', 'Network Password', 'Required for LAN/Docker binds'],
-];
-
-function secretSettingsSection() {
-    return `
-        <section class="settings-card">
-            <h3>Stored Secrets</h3>
-            <div class="settings-section-copy">
-                Central place for API keys, bridge tokens, passwords, and future skill-requested secrets.
-                Skills only receive grant-only keys after explicit human approval.
-            </div>
-            <div class="form-grid two">
-                ${SECRET_KEYS.map(([key, label, placeholder]) => secretField({
-                    id: `s-secret-${key.toLowerCase().replace(/_/g, '-')}`,
-                    settingKey: key,
-                    label,
-                    placeholder,
-                })).join('')}
-            </div>
-        </section>
-        <section class="settings-card">
-            <h3>Requested By Skills</h3>
-            <div class="settings-section-copy">
-                Secrets requested by installed skills appear here only when a skill asks for them.
-            </div>
-            <div id="skill-requested-secrets" class="settings-secret-list">
-                <div class="muted">No skill-requested secrets.</div>
-            </div>
-        </section>
-        <section class="settings-card">
-            <div class="settings-card-head">
-                <div>
-                    <h3>Custom Keys</h3>
-                    <div class="settings-section-copy">
-                        Optional key/value storage for future skills. Use uppercase names such as <code>SLACK_WEBHOOK_URL</code>.
-                    </div>
-                </div>
-                <button type="button" class="btn btn-default btn-sm" id="btn-add-custom-secret">Add custom key</button>
-            </div>
-            <div id="custom-secrets-list" class="settings-secret-list settings-custom-secret-list"></div>
-        </section>
-    `;
-}
-
-export function renderSettingsPage() {
-    return `
-        ${renderPageHeader({
-            title: 'Settings',
-            icon: PAGE_ICONS.settings,
-            description: 'Configure providers, secrets, models, behavior, source control, and runtime controls.',
-            tabsHtml: `
-                <div class="settings-tabs-bar">
-                    <button type="button" class="settings-mobile-back" data-settings-back hidden>Settings</button>
-                    ${renderTabStrip({
-                        items: SETTINGS_TABS.map((item) => ({ ...item,
-                            tabId: `settings-tab-${item.value}`, panelId: `settings-panel-${item.value}` })),
-                        active: 'providers',
-                        dataAttr: 'data-settings-tab',
-                        ariaLabel: 'Settings sections',
-                        stripClass: 'settings-tabs',
-                        tabClass: 'settings-tab',
-                    })}
-                </div>
-            `,
-        })}
-        <div class="settings-shell">
-            <div class="settings-scroll scroll-fade-y">
-                <section class="settings-panel active" data-settings-panel="providers">
-                    <div class="settings-section-copy">
-                        Connect subscriptions and API keys here, then choose their roles in Models and Agents.
-                        Adding an account keeps your existing assignments.
-                    </div>
-                    ${renderAgentsServiceBanner()}
-                    ${renderAgentAccountsSection()}
-                    <h3>API keys</h3>
-                    ${PROVIDER_CARDS.filter((card) => !card.advanced).map(providerSettingsCard).join('')}
-                    <details class="settings-more-providers" id="settings-more-providers">
-                        <summary>
-                            <span class="settings-provider-title"><span>More providers</span></span>
-                            <span class="settings-provider-hint">Cloud.ru Foundation Models, MiniMax, DeepSeek, and GigaChat</span>
-                        </summary>
-                        <div class="settings-more-providers-body">
-                            ${PROVIDER_CARDS.filter((card) => card.advanced).map(providerSettingsCard).join('')}
-                        </div>
-                    </details>
-                    <div class="form-section compact">
-                        <h3>Legacy Compatibility</h3>
-                        <div class="form-row">
-                            <div class="form-field ui-field">
-                                <label for="s-openai-base-url">Legacy OpenAI Base URL</label>
-                                <input id="s-openai-base-url" placeholder="https://api.openai.com/v1 or compatible endpoint" class="ui-control" name="s-openai-base-url" type="text">
-                            </div>
-                        </div>
-                        <div class="settings-inline-note">Backward-compatibility escape hatch for older installs. For new custom providers, use the dedicated <code>OpenAI Compatible</code> card instead.</div>
-                    </div>
-                    <div class="form-section compact">
-                        <h3>Network Gate</h3>
-                        <div class="form-row">${secretField({
-                            id: 's-network-password',
-                            settingKey: 'OUROBOROS_NETWORK_PASSWORD',
-                            label: 'Network Password (optional)',
-                            placeholder: 'Leave blank to keep the network surface open',
-                        })}</div>
-                        <div class="form-row">
-                            <div class="form-field ui-field">
-                                <label for="s-server-host">Server Bind Host</label>
-                                <input id="s-server-host" placeholder="127.0.0.1 or 0.0.0.0" class="ui-control" name="s-server-host" type="text" aria-describedby="s-server-host-help">
-                                <div class="settings-inline-note ui-field-help" id="s-server-host-help">Use <code>127.0.0.1</code> for this machine only. Use <code>0.0.0.0</code> for LAN/Docker access with a Network Password in the same save. Specific LAN IP binds are manual/env-only.</div>
-                            </div>
-                        </div>
-                        <div class="settings-inline-note">Adds a password wall only for non-localhost app and API access. If you expose Ouroboros on LAN or Docker, set a password before sharing the URL.</div>
-                        <div id="settings-lan-hint" class="settings-lan-hint" hidden></div>
-                    </div>
-                </section>
-
-                <section class="settings-panel" data-settings-panel="secrets">
-                    ${secretSettingsSection()}
-                </section>
-
-                <section class="settings-panel" data-settings-panel="models">
-                    <div class="form-section">
-                        <h3>Model Routing</h3>
-                        <div class="settings-section-copy">
-                            Choose a source, model, and subscription account for each role. Auto rotates
-                            compatible accounts. Local uses the runtime configured in Advanced.
-                        </div>
-                        <div class="settings-action-row">
-                            <span id="settings-model-catalog-status" class="settings-inline-status" role="status" aria-live="polite" aria-atomic="true">Model catalog is optional and failure-tolerant.</span>
-                            <button type="button" class="btn btn-default" id="btn-refresh-model-catalog">Refresh Model Catalog</button>
-                        </div>
-                        ${modelRolesHost('settings-model-roles')}
-                    </div>
-
-                    <!-- Review lanes and Delegation moved to the Agents tab
-                         (D-10): they answer "who does the work", not "which API
-                         model id". One capability, one section — no control here
-                         duplicates one there. The deep self-review reviewer is a
-                         Review lanes row too (R7); its former model field's key,
-                         OUROBOROS_MODEL_DEEP_SELF_REVIEW, survives only as the
-                         backend's invisible migration source for that row. -->
-
-                    <div class="form-section">
-                        <h3>Other Model Slots</h3>
-                        <div class="form-grid two">
-                            <div class="form-field ui-field">
-                                <label for="s-websearch-model">Web Search Model</label>
-                                <input id="s-websearch-model" placeholder="gpt-5.2" class="ui-control" name="s-websearch-model" type="text" aria-describedby="s-websearch-model-help">
-                                <div class="settings-inline-note ui-field-help" id="s-websearch-model-help">OpenAI model for <code>web_search</code>. Requires <code>OPENAI_API_KEY</code> and an empty Legacy Base URL.</div>
-                            </div>
-                        </div>
-                    </div>
-                </section>
-
-                <section class="settings-panel" data-settings-panel="agents">
-                    <div class="settings-section-copy">
-                        Configure the subagents and reviewers Ouroboros works with. Subscriptions and
-                        API keys are in Accounts; global model roles are in Models.
-                    </div>
-                    <!-- ONE service banner for the whole tab: the single place a
-                         daemon or runtime problem is explained, instead of the
-                         scattering of "(not in discovery)" the owner reported. -->
-                    ${renderSubagentsSection()}
-                    ${renderReviewerSlotsSection()}
-                </section>
-
-                <section class="settings-panel" data-settings-panel="behavior">
-                    <div class="form-section">
-                        <h3>Reasoning Effort</h3>
-                        <div class="settings-section-copy">Controls how deeply the model thinks per task type. Higher effort = slower but more thorough.</div>
-                        <div class="settings-effort-grid">
-                            ${EFFORT_FIELDS.map(([id, label, defaultValue]) => effortField({ id, label, defaultValue })).join('')}
-                        </div>
-                    </div>
-
-                    <div class="form-section">
-                        <h3>Review Enforcement</h3>
-                        <div class="settings-section-copy"><code>Advisory</code> keeps review visible but non-blocking. <code>Blocking</code> stops commits and reviewed-skill activation when critical findings remain unresolved.</div>
-                        <div class="settings-effort-card">
-                            <label>Enforcement Mode</label>
-                            <input id="s-review-enforcement" type="hidden" value="advisory">
-                            ${renderSegmentedField({
-                                target: 's-review-enforcement',
-                                modifier: 'data-enforcement-group',
-                                options: [
-                                    { value: 'advisory', label: 'Advisory' },
-                                    { value: 'blocking', label: 'Blocking' },
-                                ],
-                            })}
-                            <div class="settings-inline-note" data-policy-state="review" role="status" aria-live="polite"></div>
-                        </div>
-                    </div>
-
-                    <div class="form-section">
-                        <h3>Task Result Review</h3>
-                        <div class="settings-section-copy">Auto and Required run the root-owned review panel for queued/headless work and substantive direct results. Pure conversation and routing controls are skipped. Once review applies, both follow the selected Advisory or Blocking policy.</div>
-                        <div class="settings-effort-card">
-                            <label>Task Result Review</label>
-                            <input id="s-task-review-mode" type="hidden" value="auto">
-                            ${renderSegmentedField({
-                                target: 's-task-review-mode',
-                                modifier: 'data-task-review-group',
-                                options: [
-                                    { value: 'off', label: 'Off' },
-                                    { value: 'auto', label: 'Auto' },
-                                    { value: 'required', label: 'Required' },
-                                ],
-                            })}
-                        </div>
-                    </div>
-
-                    <div class="form-section">
-                        <h3>Max Review Cycles</h3>
-                        <div class="settings-section-copy">Limits paid review waves, including dispatched technical failures: plan and task review per task, commit triad+scope per root task, and skill review per root task or manual snapshot. The last review still permits author corrections within ordinary task limits; explicit task-local author limits remain separate. Collection and exact replay are free. Advisory allows an explicit decision after receiving feedback or a disclosed unavailable result; Blocking still requires reviewer approval. <code>&infin;</code> removes the count cap, while deadlines, budgets and lifecycle limits still apply.</div>
-                        <div class="settings-effort-card">
-                            <label>Max Review Cycles</label>
-                            <input id="s-review-max-cycles" type="hidden" value="2">
-                            ${renderSegmentedField({
-                                target: 's-review-max-cycles',
-                                modifier: 'data-review-cycles-group',
-                                options: [
-                                    { value: '1', label: '1' },
-                                    { value: '2', label: '2' },
-                                    { value: '3', label: '3' },
-                                    { value: '5', label: '5' },
-                                    { value: 'unlimited', label: '\u221E' },
-                                ],
-                            })}
-                        </div>
-                    </div>
-
-                    <div class="form-section">
-                        <h3>Image Input</h3>
-                        <div class="settings-section-copy">Auto sends images inline to vision-capable models and captions them for blind models. Caption always uses text captions; Inline refuses caption fallback; Off emits placeholders.</div>
-                        <div class="settings-effort-card">
-                            <label>Image Input Mode</label>
-                            <input id="s-image-input-mode" type="hidden" value="auto">
-                            ${renderSegmentedField({
-                                target: 's-image-input-mode',
-                                modifier: 'data-image-input-group',
-                                options: [
-                                    { value: 'auto', label: 'Auto' },
-                                    { value: 'caption', label: 'Caption' },
-                                    { value: 'inline', label: 'Inline' },
-                                    { value: 'off', label: 'Off' },
-                                ],
-                            })}
-                        </div>
-                    </div>
-
-                    <div class="form-section">
-                        <h3>Skills</h3>
-                        <div class="settings-section-copy">
-                            Closed-loop skill development can auto-grant the keys and host permissions a skill declares after a fresh executable review for the current content hash.
-                            Leave this off when every skill permission should require a separate human approval.
-                        </div>
-                        <label class="local-toggle ui-field ui-field-inline" title="Applies only after a fresh executable skill review and only to manifest-declared grants for that exact content hash.">
-                            <input type="checkbox" id="s-auto-grant-reviewed-skills" class="ui-checkbox" name="s-auto-grant-reviewed-skills">
-                            Auto-grant reviewed skills' keys and permissions
-                        </label>
-                    </div>
-
-                    <div class="form-section">
-                        <h3>Context Mode</h3>
-                        <div class="settings-section-copy">
-                            Working-context size profile (separate axis from Runtime Mode and Review Enforcement).
-                            <code>Max</code> inlines ARCHITECTURE and DEVELOPMENT in full &mdash; for ~1M-context models (today's behavior).
-                            <code>Nano</code> is the compact owner window. <code>Low</code> fits ~200K / local models: ARCHITECTURE becomes a navigation map (read full sections on demand), DEVELOPMENT stays full for normal runnable tasks unless a structured non-development caller opts out, and memory compacts sooner. It governs Ouroboros's own working window: it never changes the model or reasoning effort, and scope review runs in every mode.
-                            <br><strong>Human controlled:</strong> saved via the owner endpoint; saves immediately (no restart), and lowering requires Ouroboros to be idle.
-                        </div>
-                        <div class="settings-effort-card">
-                            <label>Context Mode</label>
-                            <input id="s-context-mode" type="hidden" value="max">
-                            ${renderSegmentedField({
-                                target: 's-context-mode',
-                                title: 'Saves immediately; no restart required. Lowering requires Ouroboros to be idle.',
-                                options: [
-                                    { value: 'nano', label: 'Nano' },
-                                    { value: 'low', label: 'Low' },
-                                    { value: 'max', label: 'Max' },
-                                ],
-                            })}
-                        </div>
-                    </div>
-
-                    <div class="form-section">
-                        <h3>Prompt Cache TTL</h3>
-                        <div class="settings-section-copy">
-                            How long provider prompt caches keep this agent's stable context warm (Anthropic-family routes; other providers manage caching implicitly).
-                            <code>1h</code> keeps the large stable prefix cached across long waits and review cycles &mdash; cache writes bill at 2&times; base input instead of 1.25&times;, but one wait longer than 5 minutes already pays that back on big contexts.
-                            <code>5m</code> is the provider default tier as an explicit value; <code>Default</code> sends bare markers (provider default, callers may still declare their own TTL).
-                            One honest global: it applies to every lane, including review and safety prompts.
-                        </div>
-                        <div class="settings-effort-card">
-                            <label>Prompt Cache TTL</label>
-                            <input id="s-prompt-cache-ttl" type="hidden" value="1h">
-                            ${renderSegmentedField({
-                                target: 's-prompt-cache-ttl',
-                                options: [
-                                    { value: 'default', label: 'Default' },
-                                    { value: '5m', label: '5m' },
-                                    { value: '1h', label: '1h' },
-                                ],
-                            })}
-                        </div>
-                    </div>
-
-                    <div class="form-section">
-                        <h3>Safety Supervisor</h3>
-                        <div class="settings-section-copy">
-                            Coverage of the LLM safety-supervisor layer (a separate axis from Runtime Mode).
-                            <code>Full</code> &mdash; every guarded tool call gets the LLM safety check.
-                            <code>Light</code> keeps the LLM check only for integration-policy tools; conditional shell/verify fall to the deterministic guards. Light is the default for new DESKTOP setups (authored by the first-run wizard); existing installs, web and Docker keep Full.
-                            <code>Off</code> makes no LLM safety calls. In every mode the deterministic registry sandbox, protected-path policy, and light-mode guards STAY ON &mdash; the LLM supervisor is a layer, not the floor. Lowering coverage emits a durable audit event per waved-through call.
-                            <br><strong>Configuration authority:</strong> outside Cyber Pro, the agent cannot lower its own supervision. Cyber Pro also lets the agent configure Supervisor coverage. Changes apply on the next task.
-                        </div>
-                        <div class="settings-effort-card">
-                            <label>Safety Supervisor</label>
-                            <input id="s-safety-mode" type="hidden" value="full">
-                            ${renderSegmentedField({
-                                target: 's-safety-mode',
-                                title: 'Lowering coverage here prompts for confirmation.',
-                                options: [
-                                    { value: 'full', label: 'Full' },
-                                    { value: 'light', label: 'Light' },
-                                    { value: 'off', label: 'Off' },
-                                ],
-                            })}
-                            <div class="settings-inline-note" data-policy-state="supervisor" role="status" aria-live="polite"></div>
-                            <div id="s-safety-skip-counter" class="settings-section-copy"></div>
-                        </div>
-                    </div>
-
-                    <div class="form-section">
-                        <h3>Update Channel</h3>
-                        <div class="settings-section-copy">
-                            Chooses which official branch Update checks. Your local work branch stays <code>ouroboros</code>.
-                            <code>Stable</code> follows released code on <code>main</code> (default),
-                            <code>QA</code> follows <code>ouroboros-stable</code>, and
-                            <code>Development</code> follows <code>ouroboros</code>.
-                        </div>
-                        <div class="settings-effort-card">
-                            <label>Official Update Source</label>
-                            <input id="s-update-channel" type="hidden" value="stable">
-                            ${renderSegmentedField({
-                                target: 's-update-channel',
-                                modifier: 'data-update-channel-group',
-                                title: 'Applies immediately; no restart required.',
-                                options: [
-                                    { value: 'stable', label: 'Stable' },
-                                    { value: 'qa', label: 'QA' },
-                                    { value: 'development', label: 'Development' },
-                                ],
-                            })}
-                        </div>
-                    </div>
-
-                    <div class="form-section">
-                        <h3>Access</h3>
-                        <div class="settings-section-copy">
-                            Separate axis from Review Enforcement. Controls how far Ouroboros is allowed to self-modify.
-                            <code>Light</code> blocks repo self-modification but allows reviewed + enabled skills to run.
-                            <code>Advanced</code> is the default &mdash; self-modify the evolutionary layer; protected core/contract/release files stay guarded by the shared runtime-mode policy.
-                            <code>Pro</code> can edit protected core/contract/release surfaces, but commits still go through the normal triad + scope review gate; Advanced remains limited to the evolutionary layer.
-                            <code>Cyber Pro</code> grants the full host and configuration authority, including credentials, models, Supervisor configuration and protected rewrites. Review scope and enforcement stay owner-controlled. Review Enforcement remains independent, so <code>Blocking</code> stays available in Cyber Pro.
-                            <br><strong>Human controlled:</strong> desktop builds ask the launcher for native confirmation before saving a mode change.
-                            Web/Docker sessions save mode changes through the owner endpoint; the new mode takes effect after restart.
-                        </div>
-                        <div class="settings-effort-card">
-                            <label>Access level</label>
-                            <input id="s-runtime-mode" type="hidden" value="advanced">
-                            ${renderSegmentedField({
-                                target: 's-runtime-mode',
-                                modifier: 'data-runtime-mode-group',
-                                title: 'Access changes take effect after restart.',
-                                options: RUNTIME_MODE_OPTIONS,
-                            })}
-                            <div class="settings-inline-note" data-policy-state="access" role="status" aria-live="polite"></div>
-                        </div>
-                    </div>
-
-                    <!-- Allow Mutative Subagents moved to Agents → Delegation: one
-                         subagent story in one place, and two controls over one
-                         setting would have carried two drafts. -->
-
-                    <div class="form-section">
-                        <h3>Post-Task Self-Evolution</h3>
-                        <div class="settings-section-copy">
-                            After an eligible task, Ouroboros can optionally run one reviewed self-improvement cycle: the worker asks a light model whether to promote a backlog item, writes a durable request, and the supervisor starts a one-shot campaign later on an idle tick if all gates pass.
-                            <br><strong>Configuration authority:</strong> outside Cyber Pro, only the owner can enable this. Cyber Pro also lets the agent configure it; selecting Cyber Pro does not enable evolution automatically. Changes apply on the next task.
-                        </div>
-                        <div class="settings-effort-card">
-                            <label>Self-Improvement Trigger</label>
-                            <input id="s-post-task-evolution-mode" type="hidden" value="off">
-                            ${renderSegmentedField({
-                                target: 's-post-task-evolution-mode',
-                                options: [
-                                    { value: 'off', label: 'Off' },
-                                    { value: 'llm', label: 'After Each Task (LLM decides)' },
-                                    { value: 'every_n', label: 'Every N Tasks' },
-                                ],
-                            })}
-                            <div class="settings-inline-note"><strong>Counts every eligible task, including trivial chats.</strong> <code>Every N=1</code> means Ouroboros considers self-improvement after every task, then runs the actual cycle later on an idle supervisor tick.</div>
-                        </div>
-                        <div class="form-row">
-                            <div class="form-field ui-field">
-                                <div data-evo-every-n-row>
-                                <label for="s-evo-cadence-n">Every N Tasks</label>
-                                <input id="s-evo-cadence-n" type="number" min="1" step="1" placeholder="3" class="ui-control" name="s-evo-cadence-n" aria-describedby="s-evo-cadence-n-help">
-                                <div class="settings-inline-note ui-field-help" id="s-evo-cadence-n-help">Visible only when Self-Improvement Trigger = Every N Tasks.</div>
-                                </div>
-                            </div>
-                            <div class="form-field ui-field">
-                                <label for="s-evo-budget">Per-Cycle Budget Reserve (USD)</label>
-                                <input id="s-evo-budget" placeholder="0" class="ui-control" name="s-evo-budget" type="text" aria-describedby="s-evo-budget-help">
-                                <div class="settings-inline-note ui-field-help" id="s-evo-budget-help">Minimum remaining global budget required to start a post-task cycle. <code>0</code> = rely on the normal gates. Running cycles still inherit the global per-task hard cost cap and the supervisor's reserved-budget floor.</div>
-                            </div>
-                        </div>
-                        <div class="form-field ui-field">
-                            <label for="s-evo-objective">Standing Objective (optional)</label>
-                            <input id="s-evo-objective" placeholder="(none) — e.g. prioritize test coverage and latency" class="ui-control" name="s-evo-objective" type="text" aria-describedby="s-evo-objective-help">
-                            <div class="settings-inline-note ui-field-help" id="s-evo-objective-help">Optional steer appended to every evolution cycle objective. It never overrides the LLM-first promotion; leave empty for pure LLM choice.</div>
-                        </div>
-                    </div>
-
-                    <div class="form-section">
-                        <h3>Background Cognition</h3>
-                        <div class="settings-section-copy">When Ouroboros wakes up on its own, what a wake-up is allowed to do, and what it may spend doing it.</div>
-                        <div class="settings-effort-card">
-                            <label>Consciousness Autonomy</label>
-                            <input id="s-consciousness-autonomy" type="hidden" value="act">
-                            ${renderSegmentedField({ target: 's-consciousness-autonomy', options: [{ value: 'observe', label: 'Observe' }, { value: 'act', label: 'Act' }, { value: 'full', label: 'Full' }] })}
-                            <div class="settings-inline-note"><strong>Observe:</strong> think, keep memory and knowledge, write to you &mdash; start nothing. <strong>Act (default):</strong> everything the runtime mode allows except editing Ouroboros's own code and prompts, evolution, restart and settings. <strong>Full:</strong> everything the runtime mode allows, evolution included.</div>
-                        </div>
-                        <div class="form-row">
-                            <div class="form-field ui-field">
-                                <label for="s-consciousness-daily-usd">Daily Allowance (USD)</label>
-                                <input id="s-consciousness-daily-usd" placeholder="20" class="ui-control" name="s-consciousness-daily-usd" type="text" aria-describedby="s-consciousness-daily-usd-help">
-                                <div class="settings-inline-note ui-field-help" id="s-consciousness-daily-usd-help">Spending cap for consciousness over a rolling 24-hour window: the wake-ups plus the tasks they start. When it is exhausted, no new wake-up or task starts until spend leaves the window. <code>0</code> = consciousness may not spend.</div>
-                            </div>
-                            <div class="form-field ui-field">
-                                <label for="s-consciousness-max-tasks">Max Concurrent Tasks</label>
-                                <input id="s-consciousness-max-tasks" type="number" min="0" step="1" placeholder="2" class="ui-control" name="s-consciousness-max-tasks" aria-describedby="s-consciousness-max-tasks-help">
-                                <div class="settings-inline-note ui-field-help" id="s-consciousness-max-tasks-help">How many tasks started by consciousness may run at once. <code>0</code> = it never starts tasks.</div>
-                            </div>
-                            <div class="form-field ui-field">
-                                <label for="s-bg-wakeup-min">Wake-Up Interval Min (sec)</label>
-                                <input id="s-bg-wakeup-min" type="number" min="60" step="1" placeholder="900" class="ui-control" name="s-bg-wakeup-min">
-                            </div>
-                            <div class="form-field ui-field">
-                                <label for="s-bg-wakeup-max">Wake-Up Interval Max (sec)</label>
-                                <input id="s-bg-wakeup-max" type="number" min="60" step="1" placeholder="14400" class="ui-control" name="s-bg-wakeup-max">
-                            </div>
-                        </div>
-                        <div class="settings-inline-note">Ouroboros chooses the interval between its own wake-ups; the two values above are the lower and upper bound it must stay within. All four settings apply without a restart: the alarm clock reads them at each decision.</div>
-                    </div>
-
-                    <div class="form-section">
-                        <h3>External Skills Repo</h3>
-                        <div class="settings-section-copy">
-                            Optional EXTRA discovery path on top of the in-data-plane
-                            <code>data/skills/{native,clawhub,external}/</code> tree.
-                            Ouroboros scans this for additional skill packages without
-                            cloning or pulling them. Leave empty to use only the data plane.
-                        </div>
-                        <div class="form-row">
-                            <div class="form-field ui-field">
-                                <label for="s-skills-repo-path">Skills Repo Path</label>
-                                <input id="s-skills-repo-path" placeholder="~/Ouroboros/skills or /absolute/path/to/skills" class="ui-control" name="s-skills-repo-path" type="text" aria-describedby="s-skills-repo-path-help">
-                                <div class="settings-inline-note ui-field-help" id="s-skills-repo-path-help">Absolute or <code>~</code>-prefixed path. Ouroboros never clones/pulls this directory — you manage it yourself.</div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="form-section">
-                        <h3>ClawHub Marketplace</h3>
-                        <div class="settings-section-copy">
-                            Always-on surface for installing community skills from
-                            <a href="https://clawhub.ai" target="_blank" rel="noopener">clawhub.ai</a>.
-                            The Skills page exposes a Marketplace tab; every install is
-                            staged, OpenClaw frontmatter is translated into the
-                            Ouroboros manifest shape, and the standard tri-model review runs
-                            automatically before the skill becomes executable. Plugins (Node)
-                            are filtered out — only skill packages are installable.
-                        </div>
-                        <div class="form-row">
-                            <div class="form-field ui-field">
-                                <label for="s-clawhub-registry-url">Registry URL</label>
-                                <input id="s-clawhub-registry-url" placeholder="https://clawhub.ai/api/v1" class="ui-control" name="s-clawhub-registry-url" type="text" aria-describedby="s-clawhub-registry-url-help">
-                                <div class="settings-inline-note ui-field-help" id="s-clawhub-registry-url-help">Override only for self-hosted mirrors. Hostname must be <code>clawhub.ai</code> or localhost.</div>
-                            </div>
-                        </div>
-                    </div>
-                </section>
-
-                <section class="settings-panel" data-settings-panel="appearance">
-                    <div class="form-section">
-                        <h3>Theme</h3>
-                        <div class="settings-section-copy">
-                            <code>System</code> follows this device's OS appearance and is the default for a new client.
-                            <code>Light</code> and <code>Dark</code> pin the palette regardless of the OS.
-                            <br><strong>Per device, not per account:</strong> the choice is stored by this client alone
-                            (the desktop window and each browser keep their own), never sent to the server and never
-                            shared with other devices. Clearing this client's site data returns it to System.
-                        </div>
-                        <div class="settings-effort-card">
-                            <label class="theme-choice-label" id="s-appearance-theme-label">Theme</label>
-                            <div data-theme-control aria-labelledby="s-appearance-theme-label"></div>
-                            <div class="settings-inline-note theme-status" data-theme-status role="status" aria-live="polite"></div>
-                        </div>
-                    </div>
-
-                    <div class="form-section" data-notify-settings>
-                        <h3>Notifications</h3>
-                        <div class="settings-section-copy">
-                            While this client is running, Ouroboros can pull you back to a question or a
-                            finished task. Notifications arrive whether or not this window has focus, and
-                            clicking one opens its source.
-                            <br><strong>Per device, not per account:</strong> like the theme above, these choices
-                            are stored by this client alone and never sent to the server.
-                            Where this system exposes no notifications, or permission is denied, alerts appear
-                            inside the app instead. Do Not Disturb and OS permissions still decide what you see.
-                        </div>
-                        <div class="settings-effort-card">
-                            <label class="local-toggle ui-field ui-field-inline">
-                                <input type="checkbox" class="ui-checkbox" data-notify-pref="enabled">
-                                Enable notifications
-                            </label>
-                            <label class="local-toggle ui-field ui-field-inline">
-                                <input type="checkbox" class="ui-checkbox" data-notify-pref="needs_answer">
-                                A question or decision is waiting for you
-                            </label>
-                            <label class="local-toggle ui-field ui-field-inline">
-                                <input type="checkbox" class="ui-checkbox" data-notify-pref="task_done">
-                                A task finished or stopped
-                            </label>
-                            <label class="local-toggle ui-field ui-field-inline">
-                                <input type="checkbox" class="ui-checkbox" data-notify-pref="important">
-                                Messages Ouroboros sends you while it works
-                            </label>
-                            <label class="local-toggle ui-field ui-field-inline">
-                                <input type="checkbox" class="ui-checkbox" data-notify-pref="main_reply">
-                                Ordinary replies in Main
-                            </label>
-                            <label class="local-toggle ui-field ui-field-inline">
-                                <input type="checkbox" class="ui-checkbox" data-notify-pref="sound">
-                                Sound
-                            </label>
-                            <label class="local-toggle ui-field ui-field-inline">
-                                <input type="checkbox" class="ui-checkbox" data-notify-pref="show_text">
-                                Show the message text (otherwise only the kind of event)
-                            </label>
-                            <div class="settings-toolbar">
-                                <button type="button" class="btn btn-default btn-sm" data-notify-test>Send a test notification</button>
-                            </div>
-                            <div class="settings-inline-note" data-notify-status role="status" aria-live="polite"></div>
-                            <div class="settings-inline-note" data-notify-attention-status role="status" aria-live="polite"></div>
-                        </div>
-                    </div>
-                </section>
-
-                <section class="settings-panel" data-settings-panel="advanced">
-                    <div class="form-section">
-                        <div class="settings-card-head">
-                            <div>
-                                <h3>MCP Servers</h3>
-                                <div class="settings-section-copy">
-                                    External Model Context Protocol tool servers. MCP is a base-runtime client:
-                                    it borrows tools from trusted HTTP/SSE servers or local stdio processes and exposes them as non-core
-                                    <code>mcp_&lt;server&gt;__&lt;tool&gt;</code> tools after refresh. Changes are hot-reloadable.
-                                    Treat server descriptions and results as untrusted third-party data.
-                                </div>
-                            </div>
-                            <div class="settings-toolbar">
-                                <button type="button" class="btn btn-default btn-sm" id="btn-mcp-add-server">Add server</button>
-                                <button type="button" class="btn btn-default btn-sm" id="btn-mcp-refresh-all">Refresh all</button>
-                            </div>
-                        </div>
-                        <div class="form-grid two">
-                            <label class="local-toggle ui-field ui-field-inline">
-                                <input type="checkbox" id="s-mcp-enabled" class="ui-checkbox" name="s-mcp-enabled">
-                                Enable MCP client
-                            </label>
-                            <div class="form-field ui-field">
-                                <label for="s-mcp-tool-timeout">Per-tool timeout (s)</label>
-                                <input id="s-mcp-tool-timeout" type="number" min="1" value="60" class="ui-control" name="s-mcp-tool-timeout">
-                            </div>
-                        </div>
-                        <div id="mcp-global-status" class="settings-inline-status">Checking MCP status…</div>
-                        <div id="mcp-servers-list" class="mcp-servers-list"></div>
-                    </div>
-
-                    <div class="form-section">
-                        <h3>Source Control</h3>
-                        <div class="settings-section-copy">Repository metadata for GitHub integration. Tokens live in Secrets; this is not secret.</div>
-                        <div class="form-row">
-                            <div class="form-field ui-field">
-                                <label for="s-gh-repo">GitHub Repo</label>
-                                <input id="s-gh-repo" placeholder="owner/repo-name" class="ui-control" name="s-gh-repo" type="text">
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="form-section">
-                        <h3>Local Model Runtime</h3>
-                        <div class="settings-section-copy">Only fill this in when you want Ouroboros to start and route to a GGUF model on this machine.</div>
-                        <div class="form-grid two">
-                            <div class="form-field ui-field">
-                                <label for="s-local-source">Model Source</label>
-                                <input id="s-local-source" placeholder="bartowski/Llama-3.3-70B-Instruct-GGUF or /path/to/model.gguf" class="ui-control" name="s-local-source" type="text">
-                            </div>
-                            <div class="form-field ui-field">
-                                <label for="s-local-filename">GGUF Filename (for HF repos)</label>
-                                <input id="s-local-filename" placeholder="Llama-3.3-70B-Instruct-Q4_K_M.gguf" class="ui-control" name="s-local-filename" type="text">
-                            </div>
-                        </div>
-                        <div class="form-grid four">
-                            <div class="form-field ui-field">
-                                <label for="s-local-port">Port</label>
-                                <input id="s-local-port" type="number" value="8766" class="ui-control" name="s-local-port">
-                            </div>
-                            <div class="form-field ui-field">
-                                <label for="s-local-gpu-layers">GPU Layers (-1 = all)</label>
-                                <input id="s-local-gpu-layers" type="number" value="-1" class="ui-control" name="s-local-gpu-layers">
-                            </div>
-                            <div class="form-field ui-field">
-                                <label for="s-local-ctx">Context Length</label>
-                                <input id="s-local-ctx" type="number" value="16384" class="ui-control" name="s-local-ctx">
-                            </div>
-                            <div class="form-field ui-field">
-                                <label for="s-local-chat-format">Chat Format</label>
-                                <input id="s-local-chat-format" placeholder="auto-detect" class="ui-control" name="s-local-chat-format" type="text">
-                            </div>
-                        </div>
-                        <div class="settings-toolbar">
-                            <button class="btn btn-primary" id="btn-local-start">Start</button>
-                            <button class="btn btn-primary" id="btn-local-stop">Stop</button>
-                            <button class="btn btn-primary" id="btn-local-test">Test Tool Calling</button>
-                        </div>
-                        <div id="local-model-status" class="settings-inline-status" role="status" aria-live="polite">Status: Offline</div>
-                        <div id="local-model-action-status" class="settings-inline-status" role="status" aria-live="polite" aria-atomic="true"></div>
-                        <div id="local-model-progress-wrap" class="local-model-progress-wrap local-model-hidden" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
-                            <div id="local-model-progress-bar" class="local-model-progress-bar"></div>
-                        </div>
-                        <button class="btn btn-secondary local-model-install-btn local-model-hidden" id="btn-local-install-runtime">Install Local Runtime</button>
-                        <div id="local-model-test-result" class="settings-test-result"></div>
-                    </div>
-
-                    <div class="form-section">
-                        <h3>Runtime Limits</h3>
-                        <!-- Active Subagents / Root and Subagent Depth moved to
-                             Agents → Delegation (D-10): they bound the agents,
-                             not the process pool. Max Workers stays: it is
-                             runtime worker processes, not an agent setting. -->
-                        <div class="settings-section-copy">Workers control parallel task capacity. Task liveness is governed automatically by progress, deadlines, the absolute ceiling, and the reaper. Budget limits control runtime cost thresholds. How many subagents a task may run, and how deep they may nest, live in <code>Agents</code>.</div>
-                        <div class="form-grid two">
-                            <div class="form-field ui-field">
-                                <label for="s-workers">Max Workers</label>
-                                <input id="s-workers" type="number" min="1" max="50" value="10" class="ui-control" name="s-workers">
-                            </div>
-                            <div class="form-field ui-field">
-                                <label for="s-presence-max-active">Concurrent Presence Conversations</label>
-                                <input id="s-presence-max-active" type="number" min="1" max="20" value="2" class="ui-control" name="s-presence-max-active">
-                            </div>
-                            <div class="form-field ui-field">
-                                <label for="s-tool-timeout">Tool Timeout (s)</label>
-                                <input id="s-tool-timeout" type="number" value="600" class="ui-control" name="s-tool-timeout">
-                            </div>
-                            <div class="form-field ui-field">
-                                <label for="s-total-budget">Total Budget (USD)</label>
-                                <input id="s-total-budget" type="number" min="0.01" step="any" value="200.0" class="ui-control" name="s-total-budget">
-                            </div>
-                            <div class="form-field ui-field">
-                                <label for="s-settings-per-task-cost">Per-Task Cost Cap (USD)</label>
-                                <input id="s-settings-per-task-cost" type="number" min="0.01" step="any" value="50.0" class="ui-control" name="s-settings-per-task-cost">
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="form-section">
-                        <h3>Cleanup</h3>
-                        <!-- The two subagent path roots moved to Agents →
-                             Delegation → Advanced (D-10). GC Retention stays: it
-                             governs every disposable runtime artifact, not just
-                             subagent worktrees. -->
-                        <div class="settings-section-copy">
-                            <strong>GC Retention</strong> is the single age knob (days) for all disposable runtime artifacts the startup garbage collector removes: acting-subagent worktrees, terminal task drives, and leftover service logs (hard max 365). Genesis projects are durable and never auto-removed. Where subagents check out that work is set in <code>Agents</code>.
-                        </div>
-                        <div class="form-grid two">
-                            <div class="form-field ui-field">
-                                <label for="s-gc-retention-days">GC Retention (days)</label>
-                                <input id="s-gc-retention-days" type="number" min="1" max="365" value="7" class="ui-control" name="s-gc-retention-days">
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="form-section">
-                        <h3>Extension Settings</h3>
-                        <div class="settings-section-copy">
-                            Live extensions can register reviewed, host-rendered settings sections.
-                            Sections appear here after the owning skill is reviewed, enabled, and loaded.
-                        </div>
-                        <div id="extension-settings-sections" class="settings-extension-sections">
-                            <div class="muted">No extension settings registered.</div>
-                        </div>
-                    </div>
-
-                    <div class="form-section danger">
-                        <h3>Danger Zone</h3>
-                        <div class="settings-inline-note">Reset still uses the current restart-based flow. This clears runtime data but keeps the repo.</div>
-                        <button class="btn btn-danger" id="btn-reset">Reset All Data</button>
-                    </div>
-                </section>
-
-                <section class="settings-panel" data-settings-panel="about">
-                    <div class="about-body">
-                        <img src="/static/logo.jpg" class="about-logo" alt="Ouroboros">
-                        <div>
-                            <h1 class="about-title">Ouroboros</h1>
-                            <p id="about-version" class="about-version"></p>
-                        </div>
-                        <p class="about-desc">
-                            A self-creating AI agent. Not a tool, but a becoming digital personality
-                            with its own constitution, persistent identity, and background consciousness.
-                            Born February 16, 2026.
-                        </p>
-                        <div class="about-credits">
-                            <span>Created by <strong>Anton Razzhigaev</strong> &amp; <strong>Andrew Kaznacheev</strong></span>
-                            <div class="about-links">
-                                <a href="https://t.me/abstractDL" target="_blank" rel="noopener noreferrer">@abstractDL</a>
-                                <a href="https://github.com/razzant/ouroboros" target="_blank" rel="noopener noreferrer">GitHub</a>
-                            </div>
-                        </div>
-                    </div>
-                </section>
-            </div>
-
-            <div class="settings-footer">
-                <div class="settings-footer-actions">
-                    <button type="button" class="btn btn-secondary" id="btn-reload-settings">Reload Settings</button>
-                    <button class="btn btn-save" id="btn-save-settings">Save Settings</button>
-                    <button type="button" class="btn btn-secondary" id="btn-restart-now" hidden
-                        title="Restart the agent process">Restart now</button>
-                </div>
-                <div class="settings-footer-status">
-                    <span id="settings-unsaved-indicator" class="settings-inline-status settings-unsaved-indicator" aria-hidden="true">Unsaved changes</span>
-                    <div id="settings-restart-status" class="settings-inline-status" role="status" aria-live="polite" hidden></div>
-                    <div id="settings-status" class="settings-inline-status" role="status" aria-live="polite" aria-atomic="true"></div>
-                </div>
-            </div>
-        </div>
-    `;
-}
-
-export function bindSettingsTabs(root, options = {}) {
-    const panels = Array.from(root.querySelectorAll('.settings-panel'));
-    const scrollRoot = root.querySelector('.settings-scroll');
-    const state = options.state || null;
-    const onActivate = typeof options.onActivate === 'function' ? options.onActivate : null;
-
-    const tabs = bindTabStrip(root.querySelector('.settings-tabs'), {
-        dataAttr: 'data-settings-tab', onChange: (value) => activate(value),
-    });
-    panels.forEach((panel) => {
-        panel.id = `settings-panel-${panel.dataset.settingsPanel}`;
-        panel.setAttribute('role', 'tabpanel');
-        panel.setAttribute('aria-labelledby', `settings-tab-${panel.dataset.settingsPanel}`);
-    });
-
-    function activate(tabName, notify = true) {
-        if (!tabs.select(tabName)) return;
-        const changed = root.dataset.activeSettingsTab !== tabName;
-        root.dataset.activeSettingsTab = tabName;
-        panels.forEach((panel) => {
-            panel.classList.toggle('active', panel.dataset.settingsPanel === tabName);
-            panel.hidden = panel.dataset.settingsPanel !== tabName;
-        });
-        if (scrollRoot && changed && notify) scrollRoot.scrollTop = 0;
-        if (state) state.settingsActiveSubtab = tabName;
-        if (notify && changed) {
-            if (onActivate) onActivate(tabName);
-            window.dispatchEvent(new CustomEvent('ouro:settings-subtab-shown', { detail: { tab: tabName } }));
+    if (!confirmedReset) return;
+    try {
+        const res = await apiFetch('/api/reset', { method: 'POST' });
+        const data = await res.json();
+        if (data.status === 'ok') {
+            await openConfirmDialog({
+                title: 'Reset complete',
+                body: 'Deleted: ' + (data.deleted.join(', ') || 'nothing') + '\nRestarting...',
+                alert: true,
+            });
+        } else {
+            await openConfirmDialog({
+                title: 'Reset failed',
+                body: 'Error: ' + (data.error || 'unknown'),
+                alert: true,
+            });
         }
+    } catch (e) {
+        showToast('Reset failed: ' + e.message, 'error');
     }
-
-    root.activateSettingsTab = activate;
-    activate(state?.settingsActiveSubtab || 'providers', false);
-    return () => { tabs.destroy(); delete root.activateSettingsTab; };
-}
-
-export function bindSecretInputs(root) {
-    root.querySelectorAll('.secret-toggle, .secret-clear').forEach((button) => {
-        const input = root.querySelector(`#${button.dataset.target}`);
-        if (!input) return;
-        button.setAttribute('aria-controls', input.id);
-        const label = input.labels?.[0];
-        if (label) {
-            label.id ||= `${input.id}-label`;
-            button.setAttribute('aria-describedby', label.id);
-        }
-    });
-    root.querySelectorAll('.secret-input').forEach((input) => {
-        input.addEventListener('input', () => {
-            if (input.value.trim()) delete input.dataset.forceClear;
-        });
-    });
-
-    root.querySelectorAll('.secret-toggle').forEach((button) => {
-        button.addEventListener('click', () => {
-            const target = root.querySelector(`#${button.dataset.target}`);
-            if (!target) return;
-            const nextType = target.type === 'password' ? 'text' : 'password';
-            target.type = nextType;
-            button.textContent = nextType === 'password' ? 'Show' : 'Hide';
-        });
-    });
-
-    root.querySelectorAll('.secret-clear').forEach((button) => {
-        button.addEventListener('click', () => {
-            const target = root.querySelector(`#${button.dataset.target}`);
-            if (!target) return;
-            target.value = '';
-            target.type = 'password';
-            target.dataset.forceClear = '1';
-            const toggle = root.querySelector(`.secret-toggle[data-target="${button.dataset.target}"]`);
-            if (toggle) toggle.textContent = 'Show';
-            // Programmatic value changes fire no 'input' event, but a Clear is
-            // an edit like any other: the provider-test verdict-expiry listener
-            // must see it, or a stale OK keeps vouching for a cleared key.
-            target.dispatchEvent(new Event('input', { bubbles: true }));
-        });
-    });
 }

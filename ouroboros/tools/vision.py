@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import pathlib
 from typing import Any, Dict, List, Optional, Tuple
@@ -13,7 +14,7 @@ from ouroboros.config import (
 )
 from ouroboros.deadline_utils import owner_deadline_exhausted, transport_timeout_with_deadline
 from ouroboros.tools.registry import ToolContext, ToolEntry
-from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, completed_local_read
 from ouroboros.model_wait import current_model_wait, model_waitable
 from ouroboros.utils import emit_cognitive_operation_event
 from ouroboros.observability import new_call_id
@@ -99,9 +100,10 @@ def _analyze_screenshot(ctx: ToolContext, prompt: str = "Describe what you see i
 
     try:
         client = _get_llm_client()
-        vlm_model = _resolve_vlm_model(client, model, ctx=ctx)
+        shot = [{"base64": b64, "mime": "image/png"}]  # the screenshot as the transcript holds it
+        vlm_model = _resolve_vlm_model(client, model, ctx=ctx, images=shot)
         if not vlm_model:
-            return _VLM_NO_VISION_MODEL_MSG
+            return _no_image_route(ctx, client, model, shot)
         operation_id = new_call_id("vlm_analysis")
         emit_cognitive_operation_event(
             getattr(ctx, "event_queue", None),
@@ -111,10 +113,11 @@ def _analyze_screenshot(ctx: ToolContext, prompt: str = "Describe what you see i
             kind="vlm",
             task_attempt=getattr(ctx, "task_attempt", None),
         )
+        images = [_image_payload_from_base64(b64, "image/png")]
         text, usage = _vision_query_with_timeout(
             client,
             prompt=prompt,
-            images=[_image_payload_from_base64(b64, "image/png")],
+            images=images,
             model=vlm_model,
             reasoning_effort=resolve_effort("task"),
             timeout=_vision_timeout_for_context(ctx),
@@ -131,7 +134,7 @@ def _analyze_screenshot(ctx: ToolContext, prompt: str = "Describe what you see i
 
         _emit_usage(ctx, usage, vlm_model)
 
-        return text or "(no response from VLM)"
+        return _vlm_response(text, usage)
     except Exception as e:
         from ouroboros.llm_claudexor import propagate_model_error
         if "operation_id" in locals():
@@ -145,19 +148,19 @@ def _analyze_screenshot(ctx: ToolContext, prompt: str = "Describe what you see i
             )
         propagate_model_error(e)
         log.warning("analyze_screenshot failed: %s", e, exc_info=True)
-        return f"⚠️ VLM_ANALYSIS_FAILED: {e}"
+        return _vlm_failure(ctx, "VLM_ANALYSIS_FAILED", e, locals().get("vlm_model") or model,
+                            [*locals().get("shot", ()), *locals().get("images", ())])
 
 
-_IMAGE_MAGIC: List[tuple] = [
-    (b'\x89PNG\r\n\x1a\n', "image/png"),
-    (b'\xff\xd8\xff', "image/jpeg"),
-    (b'GIF87a', "image/gif"),
-    (b'GIF89a', "image/gif"),
-]
-_IMAGE_WEBP_MAGIC = (b'RIFF', b'WEBP')
 _VLM_MAX_FILE_BYTES = 20 * 1024 * 1024
+# Existing host request budget, not a claim about every provider.
 _VLM_MAX_PROVIDER_BYTES = 6 * 1024 * 1024
-_VLM_MAX_IMAGE_SIDE = 1600
+
+
+def _vlm_response(text: str, usage: dict) -> str:
+    """Keep the host's disclosure even when the model omits it from its answer."""
+    note = (usage.get("_vision_query_receipt") or {}).get("note")
+    return "\n\n".join(part for part in (note, text or "(no response from VLM)") if part)
 
 
 @model_waitable(client_parameter="client")
@@ -165,35 +168,41 @@ def _vision_query_with_timeout(client: Any, *, model_role: str = "vision",
                                processing_preference: Optional[str] = None, **kwargs: Any) -> tuple[str, dict]:
     """Wait around one image call while keeping inference in a tracked child."""
     from ouroboros.provider_models import provider_for_model
-    from ouroboros.deadline_utils import dispatch_window_remaining_sec
+    from ouroboros.deadline_utils import dispatch_window_end_ts, dispatch_window_remaining_sec
     from ouroboros.tools.vision_process import run_vision_child
 
     subscription = not kwargs.get("use_local") and provider_for_model(kwargs.get("model", "")) == "claudexor"
     provider_timeout = float(kwargs.get("timeout") or get_vision_caption_timeout_sec())
-    remaining = dispatch_window_remaining_sec(deadline_at=kwargs.pop("_deadline_at", None),
-                                              deadline_ts=kwargs.pop("_deadline_ts", None),
-                                              reserve_sec=2 * NESTED_SETTLEMENT_MARGIN_SEC + float(kwargs.pop("_finalization_reserve", 0) or 0))
+    # The deadline less both margins and the reserve, as an instant: the parent's remaining time and the child's
+    # send window both come from it, so time spent here cannot extend the window (#572).
+    reserve = 2 * NESTED_SETTLEMENT_MARGIN_SEC + float(kwargs.pop("_finalization_reserve", 0) or 0)
+    end = dispatch_window_end_ts(deadline_at=kwargs.pop("_deadline_at", None),
+                                 deadline_ts=kwargs.pop("_deadline_ts", None), reserve_sec=reserve)
+    remaining = None if end is None else dispatch_window_remaining_sec(deadline_ts=end)
+    # A subscription call waits on its task's clocks only; ``None`` = none exists, and the
+    # child then has no timeout (its control watcher still ends it on Stop).
     operation_timeout = _vision_execution_window() if subscription else provider_timeout
     if remaining is not None:
-        operation_timeout = min(operation_timeout, remaining)
-    if operation_timeout <= 0:
+        operation_timeout = remaining if operation_timeout is None else min(operation_timeout, remaining)
+    if operation_timeout is not None and operation_timeout <= 0:
         raise TimeoutError("VLM task execution window exhausted before child dispatch")
-    child_timeout = operation_timeout + NESTED_SETTLEMENT_MARGIN_SEC
+    if end is not None:
+        # ``vision_query``'s send window: the child's sends re-check it after its start-up, image preparation and
+        # recording, reserve already taken.
+        kwargs["caller_dispatch_deadline_ts"] = end
+    child_timeout = None if operation_timeout is None else operation_timeout + NESTED_SETTLEMENT_MARGIN_SEC
     return run_vision_child(child_timeout=child_timeout, subscription=subscription,
                             model_role=model_role, processing_preference=processing_preference, **kwargs)
 
 
-def _vision_execution_window() -> float:
-    from ouroboros.config import get_task_abs_ceiling_sec
+def _vision_execution_window() -> Optional[float]:
+    from ouroboros.deadline_utils import task_execution_window_sec
 
-    context = current_model_wait()
-    remaining = context.execution_window_remaining() if context else None
-    # An owner without an absolute clock still bounds this individual image.
-    return float(get_task_abs_ceiling_sec()) if remaining is None else remaining
+    return task_execution_window_sec()
 
 
-def _vision_tool_timeout(ctx: Any, tool_args: dict | None) -> float:
-    """Only a subscription image call adopts the task's existing execution cap."""
+def _vision_tool_timeout(ctx: Any, tool_args: dict | None) -> Optional[float]:
+    """Only a subscription image call adopts the task's existing execution cap (``None`` = none)."""
     from ouroboros.provider_models import provider_for_model
 
     context = current_model_wait()
@@ -205,7 +214,8 @@ def _vision_tool_timeout(ctx: Any, tool_args: dict | None) -> float:
     )
     if provider_for_model(model) != "claudexor":
         return 0.0
-    return _vision_execution_window() + (2 * NESTED_SETTLEMENT_MARGIN_SEC)
+    window = _vision_execution_window()
+    return None if window is None else window + (2 * NESTED_SETTLEMENT_MARGIN_SEC)
 
 
 def _path_is_under(path: "pathlib.Path", root: "pathlib.Path") -> bool:
@@ -217,104 +227,23 @@ def _path_is_under(path: "pathlib.Path", root: "pathlib.Path") -> bool:
         return False
 
 
-def _detect_image_mime_for_vlm(raw: bytes) -> str:
-    """Return MIME type string or empty string if not a recognised image."""
-    for magic, mime in _IMAGE_MAGIC:
-        if raw[:len(magic)] == magic:
-            return mime
-    if raw[:4] == _IMAGE_WEBP_MAGIC[0] and raw[8:12] == _IMAGE_WEBP_MAGIC[1]:
-        return "image/webp"
-    return ""
-
-
 def _downscale_image_for_vlm(raw: bytes, mime: str) -> Tuple[bytes, str]:
-    """Cap very large image payloads before sending them to the VLM provider.
-
-    Raises ``ValueError`` on an image PIL cannot fully decode: a truncated
-    PNG keeps a parseable header, and forwarding its bytes turns into a
-    non-retryable provider 400 ("Could not process image") that kills the
-    task rounds later. Fail here, where the caller still maps errors to a
-    tool-visible ⚠️ message. Without PIL the check is skipped (permissive).
-    """
-    if len(raw) <= _VLM_MAX_PROVIDER_BYTES:
-        try:
-            from PIL import Image
-            import io
-        except Exception:
-            return raw, mime
-        try:
-            with Image.open(io.BytesIO(raw)) as img:
-                img.load()
-                if max(img.size) <= _VLM_MAX_IMAGE_SIDE:
-                    return raw, mime
-        except Image.DecompressionBombError:
-            # A VALID but very large image. Not corruption — forward it; the
-            # size rails below/above are what bound it.
-            return raw, mime
-        except Exception as exc:
-            # A truncated-but-renderable file (a partially downloaded JPEG) still
-            # yields a usable frame under Pillow's tolerant mode; only refuse what
-            # cannot be rendered at all, which is the zero-padded-PNG class that
-            # used to reach the provider and come back as a non-retryable 400.
-            try:
-                from PIL import ImageFile
-
-                previous = ImageFile.LOAD_TRUNCATED_IMAGES
-                ImageFile.LOAD_TRUNCATED_IMAGES = True
-                try:
-                    with Image.open(io.BytesIO(raw)) as img:
-                        img.load()
-                        if max(img.size) <= _VLM_MAX_IMAGE_SIDE:
-                            return raw, mime
-                finally:
-                    ImageFile.LOAD_TRUNCATED_IMAGES = previous
-            except Exception:  # noqa: BLE001 - genuinely undecodable, fall through
-                pass
-            else:
-                return raw, mime
-            raise ValueError(
-                f"⚠️ IMAGE_UNDECODABLE: {type(exc).__name__}: {exc} — the image cannot "
-                "be rendered at all (truncated or corrupt beyond recovery); re-capture "
-                "it instead of retrying the attach."
-            ) from exc
-
-    try:
-        from PIL import Image
-        import io
-
-        with Image.open(io.BytesIO(raw)) as img:
-            img.load()
-            if img.mode != "RGB":
-                background = Image.new("RGB", img.size, (255, 255, 255))
-                alpha = img.getchannel("A") if img.mode in {"RGBA", "LA"} else None
-                background.paste(img.convert("RGB"), mask=alpha)
-                img = background
-            else:
-                img = img.copy()
-            max_side = min(_VLM_MAX_IMAGE_SIDE, max(img.size))
-            for quality in (85, 75, 65, 55):
-                candidate = img.copy()
-                candidate.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
-                out = io.BytesIO()
-                candidate.save(out, format="JPEG", quality=quality, optimize=True)
-                data = out.getvalue()
-                if len(data) <= _VLM_MAX_PROVIDER_BYTES:
-                    return data, "image/jpeg"
-                max_side = max(64, int(max_side * 0.75))
-    except Exception:
-        log.debug("Failed to downscale VLM image payload", exc_info=True)
-    if len(raw) <= _VLM_MAX_PROVIDER_BYTES:
-        return raw, mime
-    raise _ProviderCapExceeded(
-        f"⚠️ VLM_IMAGE_TOO_LARGE: image payload exceeds {int(_VLM_MAX_PROVIDER_BYTES / 1024 / 1024)}MB provider cap"
-    )
+    """Compatibility wrapper for the shared, detail-preserving byte preparer."""
+    payload = _image_payload_from_bytes(raw, mime)
+    import base64
+    return base64.b64decode(payload["base64"]), payload["mime"]
 
 
 def _image_payload_from_bytes(raw: bytes, mime: str) -> Dict[str, str]:
     import base64
+    from ouroboros.image_preparation import ImagePayloadTooLarge, prepare_image_bytes
 
-    capped_raw, capped_mime = _downscale_image_for_vlm(raw, mime)
-    return {"base64": base64.b64encode(capped_raw).decode(), "mime": capped_mime}
+    try:
+        prepared = prepare_image_bytes(raw, max_bytes=_VLM_MAX_PROVIDER_BYTES)
+    except ImagePayloadTooLarge as exc:
+        raise _ProviderCapExceeded(str(exc)) from exc
+    return {"base64": base64.b64encode(prepared.data).decode(), "mime": prepared.mime,
+            "note": prepared.note}
 
 
 def _image_payload_from_base64(image_base64: str, mime: str) -> Dict[str, str]:
@@ -322,44 +251,96 @@ def _image_payload_from_base64(image_base64: str, mime: str) -> Dict[str, str]:
 
     try:
         raw = base64.b64decode(image_base64, validate=True)
-    except Exception:
-        return {"base64": image_base64, "mime": mime}
+    except Exception as exc:
+        raise ValueError("IMAGE_UNDECODABLE: invalid base64 image") from exc
     return _image_payload_from_bytes(raw, mime)
 
 
-_VLM_NO_VISION_MODEL_MSG = (
-    "⚠️ VLM_NO_VISION_MODEL: image analysis is unavailable — neither the active "
-    "model nor any configured vision slot (vision/light/main/fallback) accepts image "
-    "input. Do NOT retry the image. Instead inspect the page as TEXT/DOM "
-    "(browse_page output='html' or 'text') and the console/network for errors, or "
-    "switch_model to a vision-capable model, or ask the owner to configure one."
-)
+def _no_image_route(ctx: Any, client: Any, requested_model: str = "", images: Any = ()) -> str:
+    """Typed refusal when no route can take the image, naming why each was passed over.
+
+    ``VLM_NO_VISION_MODEL`` means every candidate is confirmed unable (its own
+    metadata says no, our own lane cannot carry images, or its route refused this
+    image earlier in the task), with the source; an unknown route is never refused
+    here because it is called."""
+    from ouroboros.vision_routing import describe_passed_over
+
+    _model, passed_over = _vlm_route(client, requested_model, ctx=ctx, images=images)
+    if not passed_over:
+        text = ("⚠️ VLM_NO_MODEL: no model is configured that could analyze the image. Name one with "
+                "vlm_query(model=...), or ask the owner to configure a vision, light or main model.")
+    else:
+        text = ("⚠️ VLM_NO_VISION_MODEL: no configured route can take this image: "
+                f"{describe_passed_over(passed_over)}. Inspect the page as TEXT/DOM (browse_page "
+                "output='html' or 'text'), name a model that accepts images with vlm_query(model=...), "
+                "or ask the owner to configure a vision model.")
+    return _refuse(ctx, text, code="VLM_ERROR")
+
+
+def _vlm_failure(ctx: Any, label: str, error: BaseException, model: str, images: Any = ()) -> str:
+    """Typed VLM failure with the provider's own status and code from the call's capture.
+
+    A refusal by the chosen route is the route's answer, shown as is and never
+    retried here; a completed one (400/422, 404/415) is remembered for this task, so
+    neither a VLM call nor a Main send gives these images to that route again."""
+    from ouroboros.vision_routing import query_image_digests, record_image_refusal
+    from ouroboros.vision_image_limits import prepare_query_images, refusal_identity
+
+    def prepared_digests(route: str) -> list:
+        try:
+            return query_image_digests(prepare_query_images(images, route))
+        except (OSError, ValueError):  # a refusal record never replaces the typed failure
+            return query_image_digests(images)
+
+    capture = getattr(error, "physical_attempt_capture", None)
+    model, refusal, digests = refusal_identity(error, model, prepared_digests)
+    if refusal is not None:
+        record_image_refusal(getattr(ctx, "_accumulated_usage", None), model, digests,
+                             {**refusal, "via": "vlm", "model": str(model or "")})
+    status = getattr(capture, "provider_status_code", None) or getattr(error, "status_code", None)
+    meta = {
+        "model": str(model or ""),
+        "provider_status_code": status if isinstance(status, int) and not isinstance(status, bool) else None,
+        "provider_code": str(getattr(capture, "provider_code", "") or ""),
+        "provider_error": str(getattr(capture, "provider_error", "") or "")[:500],
+    }
+    # The typed error's own sanitized projection (provider_code, parameter) when it has one.
+    display = getattr(error, "display_message", None)
+    return _publish_tool_result(ctx, ToolResult(
+        status="error", code="VLM_ERROR",
+        text=f"⚠️ {label}: {display if isinstance(display, str) and display else error}",
+        meta={key: value for key, value in meta.items() if value not in (None, "")},
+    ))
 
 
 def _vision_capable_slot_candidates(client: Any, ctx: Any = None) -> List[str]:
     """Configured models that may serve a VLM sub-call, most-local/cheapest first
     (active task model -> vision -> light -> main -> fallback chain). Reviewer/scope slots
     are deliberately NOT poached. De-duplicated, order-preserving, empties dropped."""
-    out: List[str] = [
-        str(getattr(ctx, "active_model", "") or getattr(ctx, "task_model_override", "") or "").strip(),
-    ]
+    from ouroboros.model_slots import local_lane_label, slot_lane_label
+
+    # Each candidate as it routes: a slot on our local lane (its USE_LOCAL_* flag, or the
+    # task's active local route) is named so, and the image policy passes it over.
+    out: List[str] = [local_lane_label(
+        getattr(ctx, "active_model", "") or getattr(ctx, "task_model_override", ""),
+        bool(getattr(ctx, "active_use_local", False)))]
     try:
         from ouroboros.config import get_light_model, get_vision_model
-        out.append(str(get_vision_model() or "").strip())
-        out.append(str(get_light_model() or "").strip())
+        out.append(slot_lane_label("vision", get_vision_model()))
+        out.append(slot_lane_label("light", get_light_model()))
     except Exception:
         pass
     try:
-        out.append(str(client.default_model() or "").strip())
+        out.append(slot_lane_label("main", client.default_model()))
     except Exception:
         pass
-    out.append(str(runtime_setting("OUROBOROS_MODEL", "") or "").strip())
+    out.append(slot_lane_label("main", runtime_setting("OUROBOROS_MODEL", "")))
     # Fallbacks is a comma chain -> add each link as its own candidate (via the shared
     # SSOT parser, which also honors the legacy singular env), not the raw comma-string
     # (which would never match a vision-capable model id).
     try:
         from ouroboros.config import parse_fallback_chain
-        out.extend(parse_fallback_chain())
+        out.extend(slot_lane_label("fallback", model) for model in parse_fallback_chain())
     except Exception:
         pass
     seen: set = set()
@@ -371,27 +352,44 @@ def _vision_capable_slot_candidates(client: Any, ctx: Any = None) -> List[str]:
     return uniq
 
 
-def _resolve_vlm_model(client: Any, requested_model: str = "", *, ctx: Any = None) -> str:
-    """Resolve a VISION-CAPABLE model for an image sub-call, or "" when none is
-    available. A known text-only model returns a typed capability gap. Missing
-    subscription metadata remains unknown: the actual call can start its engine
-    or surface the provider's typed refusal, without losing the image. Otherwise
-    route to the first vision-capable
-    configured slot (active -> vision -> light -> main -> fallback) — a gemini light/main
-    is vision-capable, so this usually succeeds without any new model slot."""
-    from ouroboros.provider_models import supports_vision
+def _vlm_route(client: Any, requested_model: str = "", *, ctx: Any = None,
+               images: Any = ()) -> Tuple[str, List[Tuple[str, str]]]:
+    """``(model, passed_over)`` for an image sub-call (``vision_routing.choose_image_model``).
+
+    An owner-switched vision route, an explicit ``model=`` and the configured
+    vision slot are called even when their metadata says no: the route answers,
+    and its refusal comes back typed. Otherwise the configured slots are
+    candidates (active -> vision -> light -> main -> fallback): a confirmed yes
+    first, then an unknown; a confirmed no and our own lanes that cannot carry
+    images are passed over. A route that refused one of ``images`` earlier in
+    this task is passed over too, even when it was named explicitly."""
+    from ouroboros.vision_routing import choose_image_model, query_image_digests, refusal_check
+
+    from ouroboros.vision_image_limits import prepare_query_images
+
+    def refused(model):
+        try:
+            prepared = prepare_query_images(images, model)
+        except (OSError, ValueError) as exc:  # this route's known limits cannot carry the image
+            return f"this image could not be prepared for the route's known limits: {exc}"
+        check = refusal_check(getattr(ctx, "_accumulated_usage", None), query_image_digests(prepared))
+        return check(model) if check else ""
     wait = current_model_wait()
     override = wait.overrides.get("vision") if wait is not None else None
     if override:
-        return ("" if override.get("use_local") or supports_vision(
-            override["model"], model_role="vision") is False else override["model"])
+        if override.get("use_local"):
+            return "", [(str(override["model"]), "our local llama.cpp transport lane cannot carry images")]
+        return choose_image_model([override["model"]], (), refused=refused)
     requested = str(requested_model or "").strip()
     if requested:
-        return requested if supports_vision(requested, model_role="vision") is not False else ""
-    for candidate in _vision_capable_slot_candidates(client, ctx):
-        if supports_vision(candidate, model_role="vision") is not False:
-            return candidate
-    return ""
+        return choose_image_model([requested], (), refused=refused)
+    explicit = str(runtime_setting("OUROBOROS_MODEL_VISION", "") or "").strip()
+    return choose_image_model([explicit], _vision_capable_slot_candidates(client, ctx), refused=refused)
+
+
+def _resolve_vlm_model(client: Any, requested_model: str = "", *, ctx: Any = None, images: Any = ()) -> str:
+    """The model an image sub-call uses, or "" when no route can take the image."""
+    return _vlm_route(client, requested_model, ctx=ctx, images=images)[0]
 
 
 def _allowed_file_roots(ctx: Any = None, *, include_user_files: bool = True) -> List["pathlib.Path"]:
@@ -476,8 +474,7 @@ def _read_file_parity_block(ctx: Any, fp: "pathlib.Path") -> str:
     (SC-6). Deriving admission roots from ``profile_readable_root_paths``
     admitted the user_files home, the WHOLE runtime-data drive, and system_repo
     — roots where read_file enforces per-path rules BEYOND root membership: the
-    user_files secret/runtime confinement, the restricted-subagent
-    secret/owner-control denials, and the project-store guard. Root admission
+    user_files runtime confinement, skill owner state and the project-store guard. Root admission
     alone would let an image/PDF/video path in where read_file refuses it. ONE
     helper shared by vision (view_image / vlm_query) and media (ocr_pdf /
     extract_video_frames) so the two consumers cannot drift. Empty = no
@@ -488,82 +485,48 @@ def _read_file_parity_block(ctx: Any, fp: "pathlib.Path") -> str:
         return block
     if ctx is None:
         return ""
-    import pathlib as _pl
-    restricted = False
+    from ouroboros.tools.core_file_tools import _runtime_data_read_block
+
+    return _runtime_data_read_block(ctx, fp)
+
+
+def _canonical_task_source(ctx: Any, fp: "pathlib.Path", raw: bytes) -> bool:
+    """Whether ``fp`` is a digest-named source in a task's canonical store: write-once, it outlives
+    execution drives and the age sweep of ``uploads/views``, so it stays its own lasting address."""
+    from ouroboros.tool_access import canonical_data_root
+
     try:
-        from ouroboros.tools.core import is_restricted_subagent_profile
-        restricted = bool(is_restricted_subagent_profile(ctx))
-    except Exception:
-        restricted = False
-    # Read admission and every restricted file/shell consumer share the same
-    # child/canonical/configured roots; a fork cannot hide parent owner state.
-    from ouroboros.tools.core_secret_paths import restricted_data_roots
-
-    fp_resolved = _pl.Path(fp).resolve(strict=False)
-    data_roots = restricted_data_roots(ctx)
-
-    for data_root in data_roots:
-        try:
-            rel = fp_resolved.relative_to(data_root).as_posix()
-        except Exception:
-            rel = ""
-        if not rel:
-            continue
-        try:
-            from ouroboros.project_facts import project_store_access_block
-            reason = project_store_access_block(rel)
-            if reason:
-                return str(reason)
-        except Exception:
-            pass
-        if restricted:
-            try:
-                from ouroboros.tools.core import (
-                    _is_skill_owner_state_target,
-                    _is_subagent_secret_data_path,
-                    is_skill_owner_state_alias,
-                )
-                if (
-                    _is_subagent_secret_data_path(rel)
-                    or _is_skill_owner_state_target(fp, data_root)
-                    or is_skill_owner_state_alias(fp, data_root)
-                ):
-                    return "⚠️ PATH_BLOCKED: this subagent cannot access secret or owner-control data files."
-            except Exception:
-                pass
-    if restricted:
-        try:
-            from ouroboros.tools.core import _is_subagent_secret_repo_target
-            from ouroboros.tools.registry import active_repo_dir_for
-            repo_roots = []
-            try:
-                repo_roots.append(_pl.Path(active_repo_dir_for(ctx)).expanduser().resolve(strict=False))
-            except Exception:
-                pass
-            try:
-                from ouroboros.tool_access import resource_root_path
-                repo_roots.append(_pl.Path(resource_root_path(ctx, "system_repo")).expanduser().resolve(strict=False))
-            except Exception:
-                pass
-            for repo_root in repo_roots:
-                if _path_is_under(fp, repo_root) and _is_subagent_secret_repo_target(fp, repo_root, ctx=ctx):
-                    return "⚠️ PATH_BLOCKED: this subagent cannot access repo secret or control paths."
-        except Exception:
-            pass
-    return ""
+        parts = fp.relative_to(canonical_data_root(ctx) / "task_results" / "artifacts").parts
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return (len(parts) == 4 and parts[1] == "source_handles"
+            and f"-{hashlib.sha256(raw).hexdigest()}." in parts[3])
 
 
-def _load_local_image_payload(ctx: ToolContext, file_path: str) -> Tuple[Optional[Dict[str, str]], str]:
+def _load_local_image_payload(ctx: ToolContext, file_path: str, *, retain_original: bool = False) -> Tuple[Optional[Dict[str, str]], str]:
     """Validate a LOCAL image path against the SAME trust boundary the agent already
     holds via read_file/run_command (allowed roots + protected-artifact read_bytes
-    policy + size cap + fail-closed MIME sniff), then return a downscaled provider
+    policy + size cap), then return a validated, detail-preserving image
     payload ``{"base64", "mime"}``. On any rejection returns ``(None, message)``.
     LOCAL FILES ONLY — no URL, no base64 (no new exfiltration surface). Shared by
-    vlm_query(file_path=...) and view_image so both enforce identical checks."""
+    vlm_query(file_path=...) and view_image so both enforce identical checks.
+    A relative path means the caller's active workspace (read_file's default root), never the
+    process working directory: that is the serving checkout, whose same-named file
+    would answer for the task's. A workspace that cannot be named refuses. An absent
+    path inside the admitted roots is a discovery miss (typed warning, no image),
+    reported only after every admission guard; size/read/MIME failures stay errors."""
     import pathlib
-    fp = pathlib.Path(file_path).expanduser().resolve()
-    if not fp.exists():
-        return None, _refuse(ctx, f"⚠️ File not found: {file_path}")
+    fp = pathlib.Path(file_path).expanduser()
+    if not fp.is_absolute():
+        try:
+            from ouroboros.tools.registry import active_repo_dir_for
+            fp = pathlib.Path(active_repo_dir_for(ctx)).expanduser() / fp
+        except Exception as e:
+            return None, _refuse(ctx, (
+                f"⚠️ Relative image path {file_path!r} has no active workspace to resolve against: {e}. "
+                "Name the image by its absolute path."
+            ))
+    fp = fp.resolve()
     allowed = _allowed_file_roots(ctx)
     if not any(_path_is_under(fp, root) for root in allowed):
         return None, _refuse(ctx, (
@@ -585,6 +548,9 @@ def _load_local_image_payload(ctx: ToolContext, file_path: str) -> Tuple[Optiona
         _artifact_block = ""
     if _artifact_block:
         return None, _artifact_block
+    if not fp.exists():
+        return None, _publish_tool_result(ctx, ToolResult(status="ok", code="LEGACY_WARNING", text=(
+            f"⚠️ FILE_NOT_FOUND: image file not found: {file_path} (resolved: {fp}).")))
     if fp.stat().st_size > _VLM_MAX_FILE_BYTES:
         return None, _refuse(
             ctx, f"⚠️ File too large ({fp.stat().st_size} bytes). Max {_VLM_MAX_FILE_BYTES} bytes."
@@ -593,19 +559,26 @@ def _load_local_image_payload(ctx: ToolContext, file_path: str) -> Tuple[Optiona
         raw = fp.read_bytes()
     except Exception as e:
         return None, _refuse(ctx, f"⚠️ Failed to read image file: {e}")
-    # Fail closed: only recognized image bytes may be used.
-    mime = _detect_image_mime_for_vlm(raw)
-    if not mime:
-        return None, _refuse(ctx, (
-            "⚠️ File does not appear to be a supported image (PNG/JPEG/GIF/WEBP). "
-            "Only image files are accepted."
-        ))
+    source_path = str(fp)
+    if retain_original and not _canonical_task_source(ctx, fp, raw):
+        # Retain the admitted bytes BEFORE decoding/conversion, even on refusal.
+        from ouroboros.image_preparation import retain_original as retain
+        from ouroboros.tool_access import canonical_data_root
+        try:
+            source_path = str(retain(canonical_data_root(ctx) / "uploads" / "views", raw, fp.name))
+        except OSError:
+            log.warning("Could not retain image original; source stays at %s", fp, exc_info=True)
+    from ouroboros.image_preparation import image_mime
     try:
-        return _image_payload_from_bytes(raw, mime), ""
+        payload = _image_payload_from_bytes(raw, image_mime(raw))
+        if retain_original:
+            payload["source_path"] = source_path
+            payload["source_sha256"] = hashlib.sha256(raw).hexdigest()
+        return payload, ""
     except _ProviderCapExceeded as e:
-        return None, _refuse(ctx, str(e), code="VLM_ERROR")
+        return None, _refuse(ctx, f"{e}. Original: {source_path}", code="VLM_ERROR")
     except ValueError as e:
-        return None, _refuse(ctx, str(e))
+        return None, _refuse(ctx, f"⚠️ Not a supported image representation: {e}. Original: {source_path}")
 
 
 def _vlm_query(ctx: ToolContext, prompt: str, image_url: str = "", image_base64: str = "", image_mime: str = "image/png", file_path: str = "", model: str = "") -> str:
@@ -626,9 +599,9 @@ def _vlm_query(ctx: ToolContext, prompt: str, image_url: str = "", image_base64:
             images.append(_image_payload_from_base64(image_base64, image_mime))
 
         client = _get_llm_client()
-        vlm_model = _resolve_vlm_model(client, model, ctx=ctx)
+        vlm_model = _resolve_vlm_model(client, model, ctx=ctx, images=images)
         if not vlm_model:
-            return _VLM_NO_VISION_MODEL_MSG
+            return _no_image_route(ctx, client, model, images)
         operation_id = new_call_id("vlm_query")
         emit_cognitive_operation_event(
             getattr(ctx, "event_queue", None),
@@ -658,7 +631,7 @@ def _vlm_query(ctx: ToolContext, prompt: str, image_url: str = "", image_base64:
 
         _emit_usage(ctx, usage, vlm_model)
 
-        return text or "(no response from VLM)"
+        return _vlm_response(text, usage)
     except Exception as e:
         from ouroboros.llm_claudexor import propagate_model_error
         if "operation_id" in locals():
@@ -672,7 +645,7 @@ def _vlm_query(ctx: ToolContext, prompt: str, image_url: str = "", image_base64:
             )
         propagate_model_error(e)
         log.warning("vlm_query failed: %s", e, exc_info=True)
-        return f"⚠️ VLM_QUERY_FAILED: {e}"
+        return _vlm_failure(ctx, "VLM_QUERY_FAILED", e, locals().get("vlm_model") or model, images)
 
 
 def _emit_usage(ctx: ToolContext, usage: Dict[str, Any], model: str) -> None:
@@ -680,12 +653,14 @@ def _emit_usage(ctx: ToolContext, usage: Dict[str, Any], model: str) -> None:
     if ctx.event_queue is None:
         return
     try:
+        from ouroboros.event_usage import event_token_counts
+
         event = {
             "type": "llm_usage",
             "model": (usage.get("model_role_route") or {}).get("model") or model,
-            "prompt_tokens": usage.get("prompt_tokens", 0),
-            "completion_tokens": usage.get("completion_tokens", 0),
-            "cached_tokens": usage.get("cached_tokens", 0),
+            **event_token_counts(usage),  # #1578: unreported stays null, a reported 0 stays 0
+            "usage": usage,
+            **({"provider": str(usage["provider"])} if usage.get("provider") else {}),
             "cost": usage.get("cost"),
             "task_id": ctx.task_id,
             "task_type": ctx.current_task_type or "task",
@@ -695,7 +670,8 @@ def _emit_usage(ctx: ToolContext, usage: Dict[str, Any], model: str) -> None:
         log.debug("Failed to emit VLM usage event", exc_info=True)
 
 
-def attach_local_image_to_context(ctx: ToolContext, path: str) -> Tuple[bool, str]:
+def attach_local_image_to_context(ctx: ToolContext, path: str, *, stamp: Any = None,
+                                  observation: Optional[dict] = None, capture_source: str = "") -> Tuple[bool, str]:
     """Attach a LOCAL image file to the active conversation as a native image block.
 
     The single implementation behind BOTH the agent-called ``view_image`` tool and
@@ -708,34 +684,21 @@ def attach_local_image_to_context(ctx: ToolContext, path: str) -> Tuple[bool, st
     captions/omits image blocks for routes that cannot see them."""
     if not path:
         return False, _refuse(ctx, "⚠️ Provide a local image file path.")
-    payload, err = _load_local_image_payload(ctx, path)
+    messages = getattr(ctx, "messages", None)
+    if not isinstance(messages, list):
+        return False, "⚠️ VIEW_IMAGE_UNAVAILABLE: no active conversation to attach the image to."
+    payload, err = _load_local_image_payload(ctx, path, retain_original=True)
     if err:
         return False, err
     b64, mime = payload["base64"], payload["mime"]
 
-    messages = getattr(ctx, "messages", None)
-    if not isinstance(messages, list):
-        return False, "⚠️ VIEW_IMAGE_UNAVAILABLE: no active conversation to attach the image to."
-
     import pathlib
-    import base64 as _b64
-    from ouroboros.utils import utc_now_iso
 
     src_name = pathlib.Path(path).name
-    ts = utc_now_iso().replace(":", "").replace("-", "")[:15]
-    ext = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp"}.get(mime, "img")
-    view_dir = pathlib.Path(ctx.drive_root) / "uploads" / "views"
-    try:
-        view_dir.mkdir(parents=True, exist_ok=True)
-        # Use the stem + the ACTUAL (possibly downscaled, e.g. PNG->JPEG) mime extension —
-        # src_name already carries an extension, so f"{src_name}.{ext}" would double it.
-        view_path = view_dir / f"{ts}_{pathlib.Path(path).stem}.{ext}"
-        view_path.write_bytes(_b64.b64decode(b64))
-        source_path = str(view_path)
-    except Exception:
-        source_path = str(pathlib.Path(path).expanduser().resolve())
-
-    caption = f"[image: {src_name}]"
+    source_path = payload["source_path"]
+    if observation is not None:
+        observation.update(source_path=source_path, source_sha256=payload["source_sha256"])
+    caption = f"[image: {src_name}; original: {source_path}" + (f"; {payload['note']}]" if payload.get("note") else "]")
     from ouroboros.loop import _append_or_merge_user_content
 
     _append_or_merge_user_content(messages, [
@@ -745,15 +708,19 @@ def attach_local_image_to_context(ctx: ToolContext, path: str) -> Tuple[bool, st
             "image_url": {"url": f"data:{mime};base64,{b64}"},
             "_caption": caption,
             "_source_path": source_path,
+            "_source_sha256": payload["source_sha256"],
+            **({"_capture_source": capture_source} if capture_source else {}),
         },
-    ])
+    ], stamp=stamp or ctx)  # a batch eviction of sent images names its origin on the live slot
     return True, (
         f"'{src_name}' is now attached as a local image block. Vision-capable remote routes can "
         f"inspect it inline; blind/local routes may receive a caption or placeholder at send time. "
+        f"Original: {source_path}. {payload.get('note', '')} "
         f"It was read from local disk; this is NOT a web tool."
     )
 
 
+@completed_local_read
 def _view_image(ctx: ToolContext, path: str = "") -> str:
     """Bring a LOCAL image file into the active model's context NATIVELY.
 
@@ -765,7 +732,11 @@ def _view_image(ctx: ToolContext, path: str = "") -> str:
     (no URL / no base64), same trust boundary as read_file. Prefer this over
     vlm_query when you need to reason about the image yourself (charts, renders,
     screenshots, photos, scanned/printed text)."""
-    _ok, message = attach_local_image_to_context(ctx, path)
+    observation = {}
+    ok, message = attach_local_image_to_context(ctx, path, observation=observation)
+    if ok:
+        return _publish_tool_result(ctx, ToolResult(status="ok", code="OK", text=message,
+                                    meta={"image_attachment": {"status": "attached", **observation}}))
     return message
 
 
@@ -776,7 +747,7 @@ def get_tools() -> List[ToolEntry]:
             schema={
                 "name": "analyze_screenshot",
                 "description": (
-                    "Analyze the last browser screenshot using a Vision LLM. "
+                    "Ask a vision model, in a separate call, about this task's last browser screenshot. "
                     "Must call browse_page(output='screenshot') or browser_action(action='screenshot') first. "
                     "Returns a text description and analysis of the screenshot. "
                     "Use this to verify UI, check for visual errors, or understand page layout. "
@@ -809,7 +780,7 @@ def get_tools() -> List[ToolEntry]:
             schema={
                 "name": "vlm_query",
                 "description": (
-                    "Analyze any image using a Vision LLM. "
+                    "Ask a vision model, in a separate call, to analyze one image (not your own native view; see view_image). "
                     "Provide one of: file_path (local file, preferred — avoids large base64 in arguments), "
                     "image_url (public URL), or image_base64 (base64-encoded PNG/JPEG). "
                     "Use file_path for files already on disk (e.g. data/uploads/ attachments). "
@@ -827,7 +798,7 @@ def get_tools() -> List[ToolEntry]:
                         },
                         "file_path": {
                             "type": "string",
-                            "description": "Local file path to image (preferred — reads from disk, avoids base64 in arguments). Must be inside the uploads directory (data/uploads/), the skill-state tree (data/state/skills, e.g. a computer-use screenshot), the active task workspace, or the task's artifact_store/task_drive (e.g. artifact_store/video_frames frames, artifact_store/attachments staged files).",
+                            "description": "Local image path (preferred — avoids base64 in arguments): relative to the active workspace, or absolute inside the workspace, the uploads directory (data/uploads/), the skill-state tree (data/state/skills, e.g. a computer-use screenshot) or the task's artifact_store/task_drive (e.g. artifact_store/video_frames frames, artifact_store/attachments staged files).",
                         },
                         "image_url": {
                             "type": "string",
@@ -875,7 +846,7 @@ def get_tools() -> List[ToolEntry]:
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "Local image file path inside the task workspace, uploads dir, the skill-state tree (data/state/skills), or the task's artifact_store/task_drive (e.g. /app/chart.png after list_files finds it, or artifact_store/video_frames/frame_001.png from extract_video_frames).",
+                            "description": "Local image path: relative to the active workspace (list_files' default root), or absolute inside the workspace, uploads dir, the skill-state tree (data/state/skills) or the task's artifact_store/task_drive (e.g. a frame path extract_video_frames returned).",
                         },
                     },
                     "required": ["path"],

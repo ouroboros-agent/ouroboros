@@ -1,277 +1,109 @@
-"""Secret-byte egress masking (#447 X1/В23) and observability G11 contracts.
-
-Egress contract: root may read owner-home files in full; bytes in a recognized
-credential format or a PEM private-key block leave as ``***``, and secrets in
-unrecognized formats are not detected (owner answer 5=A). G11
-contract: key-name redaction preserves non-secret meta as a fingerprint
-(type/len/sha256_8) instead of destroying it, and credential-metadata keys
-(counts, budgets, ids) are structurally non-secret without a per-name allowlist.
-"""
-
+"""Admitted file content stays exact; diagnostic projections still redact."""
 from __future__ import annotations
 
+import hashlib
 import json
-import pathlib
 import re
 
 import pytest
 
 from ouroboros.observability import redact_projection
-from ouroboros.secret_masking import mask_secret_bytes
-from ouroboros.tools.core import _read_file
-from ouroboros.tools.registry import ToolContext
+from ouroboros.contracts.task_constraint import TaskConstraint
+from ouroboros.tools.registry import ToolRegistry
 
 
-OPENROUTER_KEY = "sk-or-" + "abcd1234" * 4
-GITHUB_TOKEN = "ghp_" + "abcdefghijklmnopqrstuvwxyz123456"
-PEM_BLOCK = (
-    "-----BEGIN OPENSSH PRIVATE KEY-----\n"
-    "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gt\n"
-    "-----END OPENSSH PRIVATE KEY-----"
-)
-
+TOKEN = "ghp_" + "syntheticfixture0123456789" * 2
+PEM = "-----BEGIN PRIVATE KEY-----\nsynthetic-key-material\n-----END PRIVATE KEY-----\n"
 _FINGERPRINT_RE = re.compile(r"^\*\*\*REDACTED\[\w+:len=\d+:sha256_8=[0-9a-f]{8}\]\*\*\*$")
 
 
-def test_mask_secret_bytes_masks_entropy_formats():
-    text = f"config a\nkey={OPENROUTER_KEY}\nAuthorization: Bearer {GITHUB_TOKEN}\nplain tail"
-    masked, count = mask_secret_bytes(text)
-    assert OPENROUTER_KEY not in masked
-    assert GITHUB_TOKEN not in masked
-    assert count >= 2
-    assert "***" in masked
-    # Non-secret content survives byte-for-byte.
-    assert "config a" in masked and "plain tail" in masked
+@pytest.fixture()
+def reader(tmp_path, monkeypatch):
+    repo, data, home = (tmp_path / name for name in ("repo", "data", "home"))
+    for path in (repo, data, home):
+        path.mkdir()
+    monkeypatch.setenv("OUROBOROS_USER_FILES_ROOT", str(home))
+    monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_SAFETY_MODE", "off")
+    return ToolRegistry(repo, data), repo, home
 
 
-def test_mask_secret_bytes_masks_pem_block():
-    masked, count = mask_secret_bytes(f"prefix\n{PEM_BLOCK}\nsuffix")
-    assert "PRIVATE KEY" not in masked
-    assert "b3BlbnNzaC1rZXktdjE" not in masked
-    assert count == 1
-    assert masked.startswith("prefix\n") and masked.endswith("\nsuffix")
+def _actor(registry, monkeypatch, mode, actor):
+    from ouroboros.config import reset_runtime_mode_baseline_for_tests
+    reset_runtime_mode_baseline_for_tests()
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", mode)
+    if actor != "parent":
+        registry._ctx.task_constraint = TaskConstraint(
+            mode=actor, surface="external_workspace", write_root=str(registry._ctx.repo_dir))
 
 
-def test_mask_secret_bytes_masks_unterminated_pem_to_end():
-    # A read slice can cut the file before the END marker; the tail is still
-    # key material and must not survive.
-    head, _, _ = PEM_BLOCK.partition("-----END")
-    masked, count = mask_secret_bytes(f"prefix\n{head}")
-    assert count == 1
-    assert "b3BlbnNzaC1rZXktdjE" not in masked
-    assert masked == "prefix\n***"
+@pytest.mark.parametrize("mode", ["light", "advanced", "pro", "cyber_pro"])
+@pytest.mark.parametrize("actor", ["parent", "local_readonly_subagent", "acting_subagent"])
+def test_file_reads_preserve_source_and_exact_receipt(reader, monkeypatch, mode, actor):
+    registry, repo, _home = reader
+    _actor(registry, monkeypatch, mode, actor)
+    source = "prefix\n" + TOKEN + "\n" + PEM + "x" * 4000 + "\n"
+    raw = source.replace("\n", "\r\n").encode("utf-8")
+    (repo / "source.txt").write_bytes(raw)
+    result = registry.execute("read_file", {"path": "source.txt"})
+    assert "SECRET_BYTES_MASKED" not in result
+    view = registry._ctx.last_read_view
+    from ouroboros.tools.core_file_tools import delivered_source_prefix
+    assert delivered_source_prefix(view, result, len(result)) == source
+    assert view["source_masked"] is False
+    assert view["source_revision"] == hashlib.sha256(raw).hexdigest()
+    assert view["complete_sha256"] == hashlib.sha256(source.encode()).hexdigest()
+    assert view["source_end_char"] == len(source)
+    fragment = registry.execute("read_file", {"path": "source.txt", "start_line": 4, "max_lines": 1, "start_char": 3})
+    assert "thetic-key-material\n" in fragment
+    assert registry._ctx.last_read_view["source_masked"] is False
 
 
-@pytest.mark.parametrize("separator", ["\n", "\r\n", "\u2028"])
-def test_mask_before_file_window_preserves_source_positions(separator):
-    prefix = 'public line' + separator
-    tail = separator + 'next source line' + separator
-    text = prefix + PEM_BLOCK.replace('\n', separator) + tail
-    masked, count = mask_secret_bytes(text, preserve_layout=True)
-    assert count == 1 and len(masked) == len(text)
-    assert [i for i, char in enumerate(masked) if char == '\n'] == [i for i, char in enumerate(text) if char == '\n']
-    assert len(masked.splitlines()) == len(text.splitlines())
-    assert masked[:len(prefix)] == prefix and masked[-len(tail):] == tail
-    key_start = text.index('b3BlbnNzaC1rZXktdjE')
-    assert set(masked[key_start:key_start + 20]) == {'*'}
-
-
-def test_mask_secret_bytes_leaves_plain_text_untouched():
-    text = "ordinary notes\nmodel: anthropic/claude-fable-5\npath: ~/.config/app/settings.toml\n"
-    masked, count = mask_secret_bytes(text)
-    assert masked == text
-    assert count == 0
-
-
-def test_key_material_without_a_known_format_now_reaches_the_reader():
-    """Owner answer 5=A removed the 40-character opaque-run rule. What that rule
-    alone used to cover is now delivered raw, on search and on read alike: a PEM
-    body line without its markers, and an AWS secret access key (which no
-    SECRET_TOKEN_PATTERN matches — the aws pattern is the AKIA key ID). This is
-    a stated relaxation, pinned so it cannot happen again unnoticed."""
-    body_line = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMw" + "x" * 10
-    assert mask_secret_bytes(f"match: {body_line}\n") == (f"match: {body_line}\n", 0)
-    aws_secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-    assert mask_secret_bytes(f"aws_secret_access_key = {aws_secret}\n") == (
-        f"aws_secret_access_key = {aws_secret}\n", 0
-    )
-    # The former accepted false positive is gone with it: hashes, data URIs and
-    # minified bodies in the owner's own files arrive intact.
-    assert mask_secret_bytes("sha256: " + "a" * 64 + "\n") == ("sha256: " + "a" * 64 + "\n", 0)
-
-
-def test_search_and_read_deliver_the_same_bytes_for_long_source():
-    """One masker, one answer: long source, hashes and identifiers survive in
-    every scope, and only known formats and PEM blocks are replaced."""
-    source = "x" * 4000 + "\nsha256: " + "ab12cd34" * 8 + "\n"
-    assert mask_secret_bytes(source) == (source, 0)
-    assert mask_secret_bytes(f"{source}key={OPENROUTER_KEY}\n")[1] == 1
-
-
-@pytest.mark.parametrize("profile", ["local_readonly_subagent", "acting_subagent"])
-def test_restricted_repo_read_delivers_full_source_and_masks_known_credentials(tmp_path, profile):
-    from ouroboros.contracts.task_constraint import TaskConstraint
-    from ouroboros.tools.registry import ToolRegistry
-
-    repo, data = tmp_path / "repo", tmp_path / "data"
-    repo.mkdir()
-    data.mkdir()
-    body = "x" * 4000 + "\nsha256: " + "ab12cd34" * 8 + "\n"
-    (repo / "source.txt").write_text(body + GITHUB_TOKEN + "\n" + PEM_BLOCK, encoding="utf-8")
-    registry = ToolRegistry(repo, data)
-    registry._ctx.task_constraint = TaskConstraint(mode=profile, write_root=str(repo), surface="external_workspace")
-    out = registry.execute("read_file", {"path": "source.txt"})
-    assert body in out
-    assert GITHUB_TOKEN not in out and "b3BlbnNzaC1rZXktdjE" not in out
-    assert "SECRET_BYTES_MASKED" in out
-    assert registry._ctx.last_read_view["end_line"] == registry._ctx.last_read_view["total_lines"]
-    assert registry._ctx.last_read_view["opened_path"] == "source.txt"
-    chunk = registry.execute("read_file", {"path": "source.txt", "start_char": 2000, "max_lines": 1})
-    assert "x" * 2000 in chunk and "SECRET_BYTES_MASKED" not in chunk
-
-
+@pytest.mark.parametrize("mode", ["light", "advanced", "pro", "cyber_pro"])
+@pytest.mark.parametrize("actor", ["parent", "local_readonly_subagent", "acting_subagent"])
 @pytest.mark.parametrize("fallback", [False, True])
-def test_restricted_repo_search_preserves_source_identifiers(tmp_path, monkeypatch, fallback):
-    from ouroboros.contracts.task_constraint import TaskConstraint
-    from ouroboros.tools.registry import ToolRegistry
-
-    repo, data = tmp_path / "repo", tmp_path / "data"
-    repo.mkdir()
-    data.mkdir()
-    identifier = "ordinary_source_identifier_" + "x" * 50
-    source = f"def {identifier}(value='{GITHUB_TOKEN}'):\n    return value\ndef {GITHUB_TOKEN}():\n    pass\n"
+def test_search_and_query_preserve_source_identifiers(reader, monkeypatch, mode, actor, fallback):
+    registry, repo, _home = reader
+    _actor(registry, monkeypatch, mode, actor)
+    source = f"def {TOKEN}():\n    return 'synthetic-key-material'\n"
     (repo / "source.py").write_text(source, encoding="utf-8")
-    registry = ToolRegistry(repo, data)
-    registry._ctx.task_constraint = TaskConstraint(mode="local_readonly_subagent")
     if fallback:
         monkeypatch.setattr("ouroboros.code_search_rg._rg_binary", lambda: "")
     else:
         from tests.test_code_search_rg import _install_fake_rg
-
-        _install_fake_rg(tmp_path, monkeypatch)
-    out = registry.execute("search_code", {"query": "ordinary_source_identifier"})
-    assert identifier in out and "SECRET_BYTES_MASKED" in out
-    assert GITHUB_TOKEN not in out
-    assert ("files searched" if fallback else "ripgrep") in out
-    query = registry.execute("query_code", {"op": "definition", "query": identifier})
-    assert identifier in query and "source.py:1" in query
-    assert GITHUB_TOKEN not in query and "SECRET_BYTES_MASKED" not in query
-    credential = registry.execute("query_code", {"op": "symbols", "path": "source.py"})
-    assert GITHUB_TOKEN not in credential and "SECRET_BYTES_MASKED" in credential
+        _install_fake_rg(repo.parent, monkeypatch)
+    result = registry.execute("search_code", {"query": "def "})
+    assert TOKEN in result and "SECRET_BYTES_MASKED" not in result
+    assert ("files searched" if fallback else "ripgrep") in result
+    for query in ({"op": "symbols"}, {"op": "digest"}):
+        result = registry.execute("query_code", query)
+        assert TOKEN in result and "SECRET_BYTES_MASKED" not in result
+    if actor == "local_readonly_subagent" or (actor == "acting_subagent" and mode != "cyber_pro"):
+        assert not list((registry._ctx.drive_root / "state" / "code_intel").glob("*/inventory.json"))
 
 
-def test_project_settings_source_is_readable_by_verify_guard(tmp_path):
-    from ouroboros.contracts.task_constraint import TaskConstraint
-    from ouroboros.tools.registry import ToolRegistry
-    from ouroboros.tools.shell_guards import process_shell_guard_args
-    from tests._typed_guard_shared import _shell_guard_text
-
-    repo, data = tmp_path / "repo", tmp_path / "runtime"
-    (repo / "data").mkdir(parents=True)
-    data.mkdir()
-    (repo / "data" / "settings.json").write_text('{"ordinary": "project fixture"}', encoding="utf-8")
-    registry = ToolRegistry(repo, data)
-    registry._ctx.task_constraint = TaskConstraint(mode="acting_subagent", surface="external_workspace", write_root=str(repo))
-    mapped = process_shell_guard_args("verify_and_record", {"check": "cat data/settings.json", "cwd": str(repo)})
-    result = _shell_guard_text(registry, mapped, "advanced")
-    assert result is None, result
-    assert "project fixture" in registry.execute("read_file", {"path": "data/settings.json"})
-
-
-@pytest.mark.parametrize("profile", ["local_readonly_subagent", "acting_subagent"])
-@pytest.mark.parametrize("forked", [False, True])
-def test_runtime_data_inside_repo_keeps_its_read_protection(tmp_path, monkeypatch, profile, forked):
-    from ouroboros.contracts.task_constraint import TaskConstraint
-    from ouroboros.tools.registry import ToolRegistry
-
-    repo = tmp_path / "repo"
-    data = repo / "data"
-    (data / "auth").mkdir(parents=True)
-    (repo / "auth").mkdir()
-    (repo / "auth" / "secret.py").write_text("def public_source():\n    pass\n", encoding="utf-8")
-    (data / "auth" / "secret.py").write_text("def runtime_private():\n    pass\n", encoding="utf-8")
-    (data / "settings.json").write_text('{"fixture": "runtime_private"}', encoding="utf-8")
-    child = data / 'state' / 'headless_tasks' / 'child-1' / 'data' if forked else data
-    child.mkdir(parents=True, exist_ok=True)
-    registry = ToolRegistry(repo, child)
-    registry._ctx.task_metadata['budget_drive_root'] = str(data)
-    registry._ctx.task_constraint = TaskConstraint(mode=profile, write_root=str(repo), surface="external_workspace")
-    for path in ("data/auth/secret.py", str(data / "auth" / "secret.py"), "data/settings.json"):
-        result = registry.execute("read_file", {"path": path})
-        assert "BLOCKED" in result and "runtime_private" not in result
-    assert "auth/" not in registry.execute("list_files", {"path": "data"})
-    assert "secret.py" in registry.execute("list_files", {"path": "auth"})
-    assert "public_source" in registry.execute("read_file", {"path": "auth/secret.py"})
-    query = registry.execute("query_code", {"op": "symbols"})
-    assert "public_source" in query and "runtime_private" not in query
-    monkeypatch.setattr("ouroboros.code_search_rg._rg_binary", lambda: "")
-    search = registry.execute("search_code", {"query": "def "})
-    assert "public_source" in search and "runtime_private" not in search
-    assert "files searched" in search
-    # The image/media admission path uses this same set of physical data roots.
-    from ouroboros.tools.vision import _read_file_parity_block
-
-    assert 'BLOCKED' in _read_file_parity_block(registry._ctx, data / 'settings.json')
-
-
-@pytest.fixture()
-def user_files_ctx(tmp_path, monkeypatch):
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("OUROBOROS_USER_FILES_ROOT", str(home))
-    system = tmp_path / "system"
-    workspace = tmp_path / "workspace"
-    data = tmp_path / "data"
-    for p in (system, workspace, data):
-        p.mkdir()
-    ctx = ToolContext(repo_dir=system, drive_root=data, workspace_root=workspace, task_id="t-egress")
-    return ctx, home
-
-
-def test_read_file_user_files_masks_secret_bytes_with_disclosure(user_files_ctx):
-    ctx, home = user_files_ctx
-    (home / "notes.txt").write_text(
-        f"remember: openrouter {OPENROUTER_KEY}\n{PEM_BLOCK}\nplain line\n",
-        encoding="utf-8",
-    )
-    out = _read_file(ctx, "notes.txt", root="user_files")
-    assert OPENROUTER_KEY not in out
-    assert "b3BlbnNzaC1rZXktdjE" not in out
-    assert "plain line" in out
-    assert "SECRET_BYTES_MASKED" in out  # disclosure note, not a refusal
-    assert not out.startswith("⚠️")  # the read itself succeeds
-
-
-def test_cyber_owner_mode_can_read_literal_owner_file_bytes(user_files_ctx, monkeypatch):
-    """The explicit high-power owner mode may use a supplied key literally."""
-    from ouroboros.tools import core_file_tools
-
-    ctx, home = user_files_ctx
-    (home / "keys.txt").write_text(f"OPENROUTER_API_KEY={OPENROUTER_KEY}\n", encoding="utf-8")
-    monkeypatch.setattr(core_file_tools, "_raw_owner_secret_access_allowed", lambda _ctx: True)
-    out = _read_file(ctx, "keys.txt", root="user_files")
-    assert OPENROUTER_KEY in out
-    assert "SECRET_BYTES_MASKED" not in out
-
-
-def test_read_file_user_files_plain_file_has_no_masking_note(user_files_ctx):
-    ctx, home = user_files_ctx
-    (home / "notes.txt").write_text("just prose, nothing secret\n", encoding="utf-8")
-    out = _read_file(ctx, "notes.txt", root="user_files")
-    assert "just prose, nothing secret" in out
-    assert "SECRET_BYTES_MASKED" not in out
-
-
-def test_read_file_non_user_files_roots_are_not_masked(user_files_ctx, tmp_path):
-    # Scope pin: the egress seam is the user_files read path only. A task's own
-    # drive legitimately carries tokens the task itself staged (e.g. for a
-    # service it runs); masking there was not ratified (#447 В23 covers X1).
-    ctx, _home = user_files_ctx
-    drive_file = pathlib.Path(ctx.drive_root) / "task_drives" / ctx.task_id / "staged.txt"
-    drive_file.parent.mkdir(parents=True)
-    drive_file.write_text(f"token {GITHUB_TOKEN}\n", encoding="utf-8")
-    out = _read_file(ctx, "staged.txt", root="task_drive")
-    assert GITHUB_TOKEN in out
+@pytest.mark.parametrize("mode", ["light", "advanced", "pro", "cyber_pro"])
+def test_owner_home_read_search_query_and_pdf_preserve_content(reader, monkeypatch, mode):
+    from ouroboros.tools import media
+    from tests.test_media_tools import _patch_pypdf, _FakePage
+    registry, _repo, home = reader
+    _actor(registry, monkeypatch, mode, "parent")
+    source = f"def {TOKEN}():\n    pass\n"
+    (home / "source.py").write_text(source, encoding="utf-8")
+    for name, args in (
+        ("read_file", {"path": "source.py"}),
+        ("search_code", {"query": "def "}),
+        ("query_code", {"op": "symbols", "path": str(home)}),
+        ("query_code", {"op": "digest", "path": str(home)}),
+    ):
+        result = registry.execute(name, {"root": "user_files", **args})
+        assert TOKEN in result and "SECRET_BYTES_MASKED" not in result
+    pdf = home / "source.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+    _patch_pypdf(monkeypatch, [_FakePage(TOKEN + "\n" + PEM)])
+    result = media._ocr_pdf(registry._ctx, str(pdf))
+    assert TOKEN in result and PEM.strip() in result
+    assert "SECRET_BYTES_MASKED" not in result
 
 
 def test_redaction_preserves_credential_metadata_keys_without_allowlist():
@@ -314,59 +146,3 @@ def test_secret_key_redaction_fingerprints_instead_of_destroying():
     # Deterministic: equality/rotation stays auditable without the raw bytes.
     assert first == second
     assert first != other
-
-
-def test_search_user_files_masks_secret_bytes_on_both_egresses(user_files_ctx, monkeypatch):
-    """#447 В23 seam a×b: search over the owner's home surfaces file CONTENT in
-    match lines — the raw key must be masked on the rg path AND the Python
-    fallback, with the same disclosure note as the read seam."""
-    from ouroboros.tools.core import _code_search as _search_code
-
-    ctx, home = user_files_ctx
-    (home / "creds.txt").write_text(
-        f"api entry openrouter {OPENROUTER_KEY} end\n", encoding="utf-8",
-    )
-
-    out_rg = _search_code(ctx, "openrouter", root="user_files")
-    assert OPENROUTER_KEY not in out_rg, out_rg[:300]
-    # The fixture guarantees a match: an empty result here means the rg binary
-    # is genuinely unavailable AND the fallback was not reached — fail loudly
-    # rather than skip the masking assert silently.
-    assert "No matches" not in out_rg, out_rg[:300]
-    assert "SECRET_BYTES_MASKED" in out_rg
-
-    # Force the Python fallback by making rg unavailable.
-    import ouroboros.code_search_rg as rg_mod
-
-    def _raise(*a, **k):
-        raise FileNotFoundError("rg unavailable (forced)")
-
-    monkeypatch.setattr(rg_mod, "search_with_rg", _raise)
-    out_fb = _search_code(ctx, "openrouter", root="user_files")
-    assert OPENROUTER_KEY not in out_fb, out_fb[:300]
-    assert "creds.txt" in out_fb  # the match itself is still reported
-    assert "SECRET_BYTES_MASKED" in out_fb
-
-
-def test_cyber_owner_mode_can_search_literal_owner_file_bytes(user_files_ctx, monkeypatch):
-    from ouroboros.tools import core as core_tools
-    from ouroboros.tools import core_file_tools
-
-    ctx, home = user_files_ctx
-    (home / "keys.txt").write_text(f"OPENROUTER_API_KEY={OPENROUTER_KEY}\n", encoding="utf-8")
-    monkeypatch.setattr(core_file_tools, "_raw_owner_secret_access_allowed", lambda _ctx: True)
-    monkeypatch.setattr(core_tools, "_raw_owner_secret_access_allowed", lambda _ctx: True)
-    out = core_tools._code_search(ctx, "OPENROUTER", root="user_files")
-    assert OPENROUTER_KEY in out
-    assert "SECRET_BYTES_MASKED" not in out
-
-
-def test_search_non_user_files_root_is_not_masked(user_files_ctx):
-    from ouroboros.tools.core import _code_search as _search_code
-
-    ctx, _home = user_files_ctx
-    (ctx.repo_dir / "sample.txt").write_text(
-        "fixture openrouter sk-or-aaaaaaaabbbbbbbbccccccccdddddddd here\n", encoding="utf-8",
-    )
-    out = _search_code(ctx, "openrouter", root="system_repo")
-    assert "SECRET_BYTES_MASKED" not in out

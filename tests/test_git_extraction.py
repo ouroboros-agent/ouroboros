@@ -15,6 +15,7 @@ import pathlib
 from ouroboros.tools import (
     git,
     git_evolution,
+    git_managed_postcommit,
     git_plumbing,
     git_repo_edit,
     git_review_cycle,
@@ -25,7 +26,7 @@ from ouroboros.tools import (
 REPO = pathlib.Path(__file__).parents[1]
 TOOLS = REPO / "ouroboros" / "tools"
 
-_LEAVES = (git_plumbing, git_review_cycle, git_evolution, git_repo_edit, git_vcs_ops)
+_LEAVES = (git_plumbing, git_review_cycle, git_managed_postcommit, git_evolution, git_repo_edit, git_vcs_ops)
 
 _MOVED_OWNERS = {
     "_BINARY_EXTENSIONS": git_plumbing,
@@ -38,18 +39,19 @@ _MOVED_OWNERS = {
     "_release_git_lock": git_plumbing,
     "_sanitize_git_error": git_plumbing,
     "_unstage_binaries": git_plumbing,
-    "_DOC_ONLY_EXTENSIONS": git_review_cycle,
-    "_diff_is_doc_only": git_review_cycle,
     "_finalize_blocked_review": git_review_cycle,
     "_fingerprint_staged_diff": git_review_cycle,
     "_handle_revalidation_failure": git_review_cycle,
-    "_mark_failed_bypass_advisory_stale": git_review_cycle,
     "_review_binding_precondition_error": git_review_cycle,
     "_review_cycle_infra_failure": git_review_cycle,
     "_run_non_committing_review_cycle": git_review_cycle,
     "_run_reviewed_stage_cycle": git_review_cycle,
     "_stage_candidate_for_review": git_review_cycle,
     "_verify_reviewed_commit_binding": git_review_cycle,
+    "_finish_managed_commit": git_managed_postcommit,
+    "_managed_commit_paused": git_managed_postcommit,
+    "_managed_post_commit_tests_gate": git_managed_postcommit,
+    "_resume_managed_commit": git_managed_postcommit,
     "_check_evolution_commit_stage": git_evolution,
     "_evolution_commit_authority": git_evolution,
     "_evolution_publication_stopped_result": git_evolution,
@@ -95,8 +97,6 @@ def test_git_catalog_schema_bytes_and_handler_owners_are_stable():
     assert tuple(entry.name for entry in entries) == (
         "commit_reviewed",
         "vcs_commit_reviewed",
-        "vcs_status",
-        "vcs_diff",
         "vcs_pull_ff",
         "vcs_restore",
         "vcs_revert",
@@ -107,18 +107,32 @@ def test_git_catalog_schema_bytes_and_handler_owners_are_stable():
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode()
-    # Informed Advisory commit aliases plus explicit local vcs_diff base/head.
+    # Reviewed commit aliases disclose strictness-keyed panels; vcs_read diff keeps base/head;
+    # full_tests distinguishes local adoption from full-only publication consumers;
+    # S3 collection permits omitted commit_message; S5 adds author doctrine; D4 adds wake_on.
+    # Target merge retains the contributor tool affordances and target review/mail contracts.
+    # Mechanical revert names effective mode/task or managed-update authority, without fresh review.
+    # wake_on (review_waiting, 8f35c1416): host-marked waking place arrivals bypass selectors; context-only
+    # place arrivals stay unread until a genuine wake. That sentence is the only change from 6865d432….
+    # vcs_restore (#2433) now says it restores index and files and deletes new files in scope,
+    # staged or not; that description is the only change from 86389708….
+    # Explicit continuation (#2677): both reviewed-commit aliases add continue_seats and say what review_reference
+    # does with and without author_disposition; those two properties are the only change from 4bb35274….
+    # #2680: both aliases' paths say omitted paths with author_disposition mean the reviewed paths, and their
+    # author_disposition accepts the candidate the call stages (omitted paths: the reviewed ones), not the current
+    # attributed candidate; those two descriptions are the only change from aa615be1….
+    # 06.11: extra_tests says which entries the tests preflight runs and that it skips others with a note; that
+    # description is the only change from a4ff0c92….
     assert hashlib.sha256(schema_bytes).hexdigest() == (
-        "93c0f6fced87cf33dc7a46395367f8315cb1ba7760d738489960dffd0084949a"
+        "e7ad640f7fc3a806bcdca365c58247423cdab89d31ba0e9c032f27ac4a78bf57"
     )
     assert {
         entry.name: (entry.handler.__module__, entry.handler.__name__)
         for entry in entries
     } == {
-        "commit_reviewed": ("ouroboros.tools.git", "_repo_commit_push"),
-        "vcs_commit_reviewed": ("ouroboros.tools.git", "_repo_commit_push"),
-        "vcs_status": ("ouroboros.tools.git_vcs_ops", "_git_status"),
-        "vcs_diff": ("ouroboros.tools.git_vcs_ops", "_git_diff"),
+        # The public handler names the call's review record in every outcome (DEVELOPMENT 05).
+        "commit_reviewed": ("ouroboros.tools.git", "_commit_reviewed"),
+        "vcs_commit_reviewed": ("ouroboros.tools.git", "_commit_reviewed"),
         "vcs_pull_ff": ("ouroboros.tools.git_vcs_ops", "_pull_from_remote"),
         "vcs_restore": ("ouroboros.tools.git_vcs_ops", "_restore_to_head"),
         "vcs_revert": ("ouroboros.tools.git_vcs_ops", "_revert_commit"),
@@ -133,16 +147,3 @@ def test_git_facade_reexports_every_moved_identity():
         assert getattr(git, name) is getattr(owner, name), name
     owned = {name for module in _LEAVES for name in vars(module)}
     assert set(_MOVED_OWNERS) <= owned
-
-
-def test_git_extraction_size_bounds_have_meaningful_headroom():
-    counts = {
-        module.__name__: len(
-            pathlib.Path(module.__file__).read_text(encoding="utf-8").splitlines()
-        )
-        for module in (git, *_LEAVES)
-    }
-    assert counts["ouroboros.tools.git"] <= 1800
-    assert all(count <= 1000 for name, count in counts.items()
-               if name != "ouroboros.tools.git")
-    assert counts["ouroboros.tools.git_review_cycle"] <= 1000

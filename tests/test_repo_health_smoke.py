@@ -11,9 +11,10 @@ from types import SimpleNamespace
 import pytest
 
 from ouroboros.review import (
+    BAND_MODULE_MAX_LINES,
+    MAX_FUNCTION_LINES,
     MAX_MODULE_BYTES,
     MAX_MODULE_LINES,
-    MAX_TOTAL_FUNCTIONS,
     TARGET_MODULE_LINES,
     SizeRatchetManifest,
     candidate_repo_paths,
@@ -32,6 +33,7 @@ from ouroboros.review import (
     validate_size_ratchet_transition_against_base,
 )
 from ouroboros.tools.health import _codebase_health
+from ouroboros.tools.review_helpers import check_worktree_readiness
 from scripts import regenerate_size_ratchet as regenerate
 
 
@@ -73,7 +75,7 @@ def _bootstrap_repo(repo: Path, *, files: dict[str, str] | None = None) -> str:
     for rel, text in (files or {"small.py": "x = 1\n"}).items():
         path = repo / rel
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
+        path.write_bytes(text.encode("utf-8"))
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "base")
     return _git(repo, "rev-parse", "HEAD")
@@ -97,9 +99,9 @@ def test_module_hard_boundary_is_1600_then_1601(tmp_path: Path) -> None:
     assert inventory.giant_paths == frozenset({"over_limit.py"})
 
 
-def test_module_scope_includes_tests_devtools_and_web_tests(tmp_path: Path) -> None:
+def test_module_scope_includes_devtools_and_leaves_test_modules_out(tmp_path: Path) -> None:
     _write_lines(tmp_path / "tests" / "foo.py", MAX_MODULE_LINES + 1)
-    _write_lines(tmp_path / "devtools" / "helper.py", 2)
+    _write_lines(tmp_path / "devtools" / "helper.py", MAX_MODULE_LINES + 1)
     _write_lines(tmp_path / "web" / "tests" / "ui.test.js", 2)
     _write_lines(tmp_path / "web" / "modules" / "live.js", 2)
     _write_lines(tmp_path / "web" / "vendor" / "bundle.min.js", 2)
@@ -110,12 +112,12 @@ def test_module_scope_includes_tests_devtools_and_web_tests(tmp_path: Path) -> N
 
     paths = {item.path for item in iter_gated_modules(tmp_path)}
 
-    assert "tests/foo.py" in paths
+    assert "tests/foo.py" not in paths
     assert "devtools/helper.py" in paths
-    assert "web/tests/ui.test.js" in paths
+    assert "web/tests/ui.test.js" not in paths
     assert "web/modules/live.js" in paths
     assert "web/vendor/bundle.min.js" not in paths
-    assert collect_size_ratchet_inventory(tmp_path).giant_paths == frozenset({"tests/foo.py"})
+    assert collect_size_ratchet_inventory(tmp_path).giant_paths == frozenset({"devtools/helper.py"})
 
 
 def test_default_inventory_sees_untracked_but_injected_inventory_does_not(tmp_path: Path) -> None:
@@ -344,6 +346,62 @@ def test_tree_validation_rejects_stale_and_new_exact_debt(tmp_path: Path) -> Non
     assert "GIANT_PATHS contains stale entry: 'stale.py'" in errors
 
 
+def _band_repo(tmp_path: Path, lines: dict[str, int], manifest: SizeRatchetManifest) -> Path:
+    """A repository whose committed manifest is ``manifest`` over modules of ``lines`` lines."""
+    files = {path: "x\n" * count for path, count in lines.items()}
+    files["ouroboros/size_ratchet_manifest.py"] = regenerate._render(manifest)
+    _bootstrap_repo(tmp_path / "repo", files=files)
+    return tmp_path / "repo"
+
+
+def test_band_entry_stays_only_while_its_module_sits_above_the_band(tmp_path: Path) -> None:
+    """A module drifting to 1501-1600 lines keeps its band entry (live and staged); below
+    the band, above the hard gate or deleted, the entry is stale, and a band module without
+    one is still missing."""
+    kept = _manifest(band_paths={"mod.py": "extraction seam"})
+    repo = _band_repo(tmp_path, {"mod.py": 1450}, kept)
+    stale = "BAND_PATHS contains stale entry: 'mod.py'"
+
+    _write_lines(repo / "mod.py", 1504)
+    _git(repo, "add", "mod.py")
+    assert validate_size_ratchet(repo) == []
+    _write_lines(repo / "mod.py", 1600)  # the top edge of the gap still keeps it
+    _git(repo, "add", "mod.py")
+    assert validate_size_ratchet(repo) == []
+    _write_lines(repo / "new.py", 1100)
+    assert validate_size_ratchet(repo) == ["BAND_PATHS missing live entry: 'new.py'"]
+    (repo / "new.py").unlink()
+
+    _write_lines(repo / "mod.py", 1000)  # the bottom edge of the band is already below it
+    assert validate_size_ratchet(repo) == [stale]
+    _write_lines(repo / "mod.py", 1700)
+    _write_manifest(repo, _manifest(giant_paths=frozenset({"mod.py"}), band_paths={"mod.py": "extraction seam"}))
+    assert validate_size_ratchet(repo) == [stale, "new module debt above 1600 lines: mod.py"]
+    _write_manifest(repo, kept)
+    (repo / "mod.py").unlink()
+    assert validate_size_ratchet(repo) == [stale]
+    # Only a band entry is kept: a giant entry for a module that shrank into the gap is still stale.
+    _write_lines(repo / "big.py", 1550)
+    _write_manifest(repo, _manifest(giant_paths=frozenset({"big.py"})))
+    assert "GIANT_PATHS contains stale entry: 'big.py'" in validate_size_ratchet(repo)
+
+
+def test_band_entry_kept_above_the_band_returns_with_its_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """1504 -> 1450 lines needs no new reason: the entry never left. The adjacent rule that a
+    surviving reason is immutable is unchanged."""
+    repo = _band_repo(tmp_path, {"mod.py": 1504}, _manifest(band_paths={"mod.py": "extraction seam"}))
+    assert collect_size_ratchet_inventory_at_ref(repo, "HEAD").above_band_paths == frozenset({"mod.py"})
+    _write_lines(repo / "mod.py", 1450)
+    monkeypatch.setattr(regenerate, "REPO_ROOT", repo)
+
+    assert validate_size_ratchet(repo) == []
+    assert regenerate._next_manifest({}).band_paths == {"mod.py": "extraction seam"}
+    _write_manifest(repo, _manifest(band_paths={"mod.py": "a new reason"}))
+    assert validate_size_ratchet(repo) == ["surviving band rationale is immutable: mod.py"]
+
+
 def test_tree_validation_reads_staged_bytes_not_unstaged_worktree_bytes(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     baseline = _bootstrap_repo(repo)
@@ -369,40 +427,85 @@ def test_tree_validation_reads_staged_bytes_not_unstaged_worktree_bytes(tmp_path
     assert not any(error.startswith("staged:") for error in errors)
 
 
-def test_total_function_cap_checks_staged_and_live_projections(tmp_path: Path) -> None:
+@pytest.mark.parametrize("projection", ["staged", "live"])
+def test_function_totals_are_descriptive_in_staged_and_live_trees(tmp_path: Path, projection: str) -> None:
     repo = tmp_path / "repo"
     baseline = _bootstrap_repo(repo)
     _write_manifest(repo, _manifest(sha=baseline))
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "bootstrap ratchet")
-    functions_per_path = MAX_MODULE_LINES
-    paths = [
-        f"batch_{index}.py"
-        for index in range((MAX_TOTAL_FUNCTIONS // functions_per_path) + 1)
-    ]
-    source = "".join(
-        f"def f{index}(): pass\n" for index in range(functions_per_path)
-    )
-    total = len(paths) * functions_per_path
-    assert total > MAX_TOTAL_FUNCTIONS
-
+    # Exceed the retired aggregate ceilings without per-unit size debt.
+    paths = [f"batch_{index}.py" for index in range(13)]
+    source = "".join(f"def f{index}(): pass\n" for index in range(1000))
     for rel in paths:
         (repo / rel).write_text(source, encoding="utf-8")
-    _git(repo, "add", *paths)
-    for rel in paths:
-        (repo / rel).unlink()
+    if projection == "staged":
+        _git(repo, "add", *paths)
+        for rel in paths:
+            (repo / rel).unlink()
+        inventory = collect_size_ratchet_inventory_at_ref(repo, _git(repo, "write-tree"))
+    else:
+        inventory = collect_size_ratchet_inventory(repo)
+
+    assert len(inventory.functions) == 13000
+    assert validate_size_ratchet(repo) == []
+    information: list[str] = []
+    # Scope the diff readout; readiness still validates the whole inventory.
+    assert check_worktree_readiness(repo, paths=[paths[0]], information=information) == []
+    live_total = 0 if projection == "staged" else 13000
+    assert compute_repo_complexity_metrics(repo)["total_functions"] == live_total
+    count_line = f"Runtime functions: {live_total} (descriptive)."
+    assert information[0] == count_line
+    report = _codebase_health(SimpleNamespace(repo_dir=repo))
+    assert f"**Functions:** {live_total}" in report
+    assert count_line in report.splitlines()
+    assert "No hard P7 limit violations detected" in report
+    assert "manifest matches the live tree" in report
+    assert "Complexity Status" not in report
+    assert "Size-Ratchet Findings" not in report
+    assert "total function count" not in report
+    assert "Hard-limit total functions" not in report
+
+
+@pytest.mark.parametrize(("source", "finding"), [
+    ("x\n" * (MAX_MODULE_LINES + 1), "GIANT_PATHS missing live entry: 'oversized.py'"),
+    ("def large():\n" + "    pass\n" * MAX_FUNCTION_LINES,
+     "FUNCTION_DEBT missing live entry: ('oversized.py', 'large')"),
+    ("#" + "é" * (MAX_MODULE_BYTES // 2) + "\n", "BYTE_DEBT differs from live exact counts:"),
+], ids=["module-lines", "function-lines", "module-utf8-bytes"])
+def test_public_validator_keeps_per_unit_limits(tmp_path: Path, source: str, finding: str) -> None:
+    repo = tmp_path / "repo"
+    baseline = _bootstrap_repo(repo)
+    _write_manifest(repo, _manifest(sha=baseline))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "bootstrap ratchet")
+    (repo / "oversized.py").write_text(source, encoding="utf-8")
+    _git(repo, "add", "oversized.py")
 
     errors = validate_size_ratchet(repo)
-    expected = f"total function count exceeds {MAX_TOTAL_FUNCTIONS}: {total}"
-    assert f"staged: {expected}" in errors
-    assert expected not in {error for error in errors if not error.startswith("staged:")}
 
-    _git(repo, "reset", "-q", "HEAD", "--", *paths)
-    for rel in paths:
-        (repo / rel).write_text(source, encoding="utf-8")
+    assert any(error.startswith(finding) for error in errors)
+    assert any(error.startswith(f"staged: {finding}") for error in errors)
+
+
+def test_public_validator_keeps_byte_debt_shrink_only(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    source = "#" + "x" * MAX_MODULE_BYTES + "\n"
+    baseline = _bootstrap_repo(repo, files={"large.py": source})
+    byte_baseline = {"large.py": len(source.encode("utf-8"))}
+    _write_manifest(repo, _manifest(sha=baseline, byte_baseline_debt=byte_baseline, byte_debt=byte_baseline))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "bootstrap ratchet")
+    (repo / "large.py").write_text(source + "#\n", encoding="utf-8")
+    _write_manifest(repo, _manifest(sha=baseline, byte_baseline_debt=byte_baseline,
+                                    byte_debt={"large.py": byte_baseline["large.py"] + 2}))
+    _git(repo, "add", ".")
+
     errors = validate_size_ratchet(repo)
-    assert expected in errors
-    assert not any(error.startswith("staged:") for error in errors)
+
+    expected = f"byte debt grew: large.py {byte_baseline['large.py']} -> {byte_baseline['large.py'] + 2}"
+    assert errors == [expected, f"staged: {expected}"]
+
 
 
 def test_staged_manifest_cannot_self_authorize_staged_new_debt(tmp_path: Path) -> None:
@@ -661,6 +764,77 @@ def test_pairwise_degraded_parent_base_must_match_its_own_tree(tmp_path: Path) -
     assert "fabricated base" in error or "does not match the parent's own tree" in error
 
 
+def test_pairwise_degraded_red_parent_does_not_condemn_its_fix_forward(tmp_path: Path) -> None:
+    """Two merges that each fit can push a band module past 1600 lines: that parent's tree holds debt its
+    manifest omits, which is red, not fabricated. Against it, the tip that shrinks the module passes in the
+    degraded mode (dispatch and tags carry no base); a tip that keeps the debt still fails its live check."""
+    repo = tmp_path / "repo"
+    baseline = _bootstrap_repo(repo)
+    _write_lines(repo / "edge.py", MAX_MODULE_LINES)
+    _write_manifest(repo, _manifest(band_paths={"edge.py": "sits at the module limit"}, sha=baseline))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "a band module at the limit")
+    _write_lines(repo / "edge.py", MAX_MODULE_LINES + 5)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "two merges together cross the limit")
+    assert validate_size_ratchet(repo), "the red parent fails its own live check"
+    _write_lines(repo / "edge.py", MAX_MODULE_LINES - 1)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "fix forward")
+
+    assert validate_size_ratchet_transition_against_base(repo, "deadbeef" * 5) == []
+    assert validate_size_ratchet(repo) == []
+
+
+def _degraded_history(repo: Path, steps: list) -> list[str]:
+    """Commit each (files, manifest) step in order and return the degraded-mode transition at the tip."""
+    baseline = _bootstrap_repo(repo)
+    for index, (files, manifest) in enumerate(steps):
+        for name, (count, line) in files.items():
+            _write_lines(repo / name, count, line)
+        _write_manifest(repo, manifest(baseline))
+        _git(repo, "add", ".")
+        _git(repo, "commit", "-q", "--allow-empty", "-m", f"step {index}")
+    return validate_size_ratchet_transition_against_base(repo, "0" * 40)
+
+
+def test_pairwise_degraded_red_parent_lends_the_tip_no_debt(tmp_path: Path) -> None:
+    """Against an under-declaring parent, a tip that keeps the debt still fails its live check, and a tip
+    that writes the debt into its manifest is new debt; a parent that pre-claims a small existing file, a
+    byte count above its tree, or a band entry for a module that left the band downward stays fabricated."""
+    band = lambda sha: _manifest(band_paths={"edge.py": "sits at the limit"}, sha=sha)  # noqa: E731
+    edge = {"edge.py": (MAX_MODULE_LINES + 5, "x")}
+
+    kept = _degraded_history(tmp_path / "kept", [({"edge.py": (MAX_MODULE_LINES, "x")}, band), (edge, band), (edge, band)])
+    assert kept == [] and validate_size_ratchet(tmp_path / "kept"), "the transition alone is not the gate"
+    claimed = _degraded_history(tmp_path / "claimed", [
+        ({"edge.py": (MAX_MODULE_LINES, "x")}, band), (edge, band),
+        (edge, lambda sha: _manifest(giant_paths=frozenset({"edge.py"}), sha=sha))])
+    assert claimed == ["new module debt above 1600 lines: edge.py"]
+
+    preclaim = _degraded_history(tmp_path / "preclaim", [
+        ({}, lambda sha: _manifest(giant_paths=frozenset({"small.py"}), sha=sha)),
+        ({"small.py": (MAX_MODULE_LINES + 1, "x")}, lambda sha: _manifest(giant_paths=frozenset({"small.py"}), sha=sha))])
+    assert len(preclaim) == 1 and "does not match the parent's own tree" in preclaim[0]
+
+    wide = "x" * 249  # 250 bytes a line: 1000 lines are 250 000 bytes, above MAX_MODULE_BYTES
+    debt = lambda value: (lambda sha: _manifest(byte_debt={"big.py": value}, sha=sha))  # noqa: E731
+    low = {"big.py": (920, wide)}
+    assert _degraded_history(tmp_path / "bytes_fixed", [({"big.py": (1000, wide)}, debt(1000 * 250)),
+                                                         ({"big.py": (1000, wide)}, debt(920 * 250)),
+                                                         (low, debt(920 * 250))]) == []
+    grew = _degraded_history(tmp_path / "bytes_grew", [({"big.py": (1000, wide)}, debt(1000 * 250)),
+                                                       (low, debt(1000 * 250)), (low, debt(1001 * 250))])
+    assert len(grew) == 1 and "does not match the parent's own tree" in grew[0]
+    assert MAX_MODULE_BYTES < 920 * 250
+
+    gone = _degraded_history(tmp_path / "band_down", [
+        ({"low.py": (BAND_MODULE_MAX_LINES - 100, "x")}, lambda sha: _manifest(band_paths={"low.py": "in band"}, sha=sha)),
+        ({"low.py": (900, "x")}, lambda sha: _manifest(band_paths={"low.py": "in band"}, sha=sha)),
+        ({"low.py": (900, "x")}, lambda sha: _manifest(band_paths={"low.py": "in band"}, sha=sha))])
+    assert len(gone) == 1 and "does not match the parent's own tree" in gone[0]
+
+
 def test_interval_rationale_form_allows_legal_reentry_and_blocks_drops(tmp_path: Path) -> None:
     """Across an interval a band path may legally retire and re-enter with a
     fresh rationale (every adjacent step green): the pairwise interval form
@@ -761,6 +935,39 @@ def test_ref_inventory_reads_unsubstituted_git_blob_bytes(tmp_path: Path) -> Non
 
     module = next(item for item in inventory.modules if item.path == "formatted.py")
     assert module._source_text == source
+
+
+@pytest.mark.parametrize("count", [0, 1024])
+def test_git_source_snapshot_uses_file_input_and_preserves_all_blobs(tmp_path, monkeypatch, count):
+    import stat
+    from ouroboros import review
+
+    repo = tmp_path / "repo"
+    source = "value = '$Format:%H$'\n"
+    files = {f"mod_{i:04d}.py": source for i in range(count)}
+    head = _bootstrap_repo(repo, files={"seed.py": source} if count else {"README.md": "No gated sources.\n"})
+    if count:
+        oid = _git(repo, "rev-parse", "HEAD:seed.py")
+        entries = b"".join(f"100644 blob {oid}\t{path}\0".encode() for path in files)
+        head = subprocess.check_output(["git", "mktree", "-z"], cwd=repo, input=entries).decode().strip()
+    real_run = subprocess.run
+    observed = []
+
+    def run(args, **kwargs):
+        if args[:3] == ["git", "cat-file", "--batch"]:
+            stream = kwargs.get("stdin")
+            assert stream is not None and stat.S_ISREG(os.fstat(stream.fileno()).st_mode)
+            assert "input" not in kwargs and kwargs["capture_output"] and kwargs["check"]
+            assert stream.tell() == 0
+            observed.append(stream)
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(review.subprocess, "run", run)
+    with review._git_source_snapshot(repo, head) as (snapshot, paths):
+        assert set(paths) == set(files)
+        for path, expected in files.items():
+            assert (snapshot / path).read_bytes() == expected.encode()
+    assert len(observed) == 1 and observed[0].closed
 
 
 def test_bootstrap_accepts_the_current_tree_as_its_own_authority(tmp_path: Path) -> None:
@@ -979,6 +1186,23 @@ def test_generator_candidate_allows_tracked_source_deletion(tmp_path: Path, monk
     assert generated.giant_paths == frozenset()
 
 
+def test_generator_keeps_a_band_entry_only_while_its_module_sits_above_the_band(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    committed = _manifest(band_paths={"down.py": "paid down", "up.py": "kept reason"})
+    repo = _band_repo(tmp_path, {"down.py": 1450, "up.py": 1450}, committed)
+    _write_lines(repo / "up.py", 1504)
+    _write_lines(repo / "down.py", 900)
+    monkeypatch.setattr(regenerate, "REPO_ROOT", repo)
+
+    generated = regenerate._next_manifest({})
+
+    assert generated.band_paths == {"up.py": "kept reason"}
+    assert regenerate.main(["--check"]) == 1  # the 900-line module's entry is stale
+    _write_manifest(repo, generated)
+    assert regenerate.main(["--check"]) == 0
+
+
 def test_manifest_render_is_deterministic() -> None:
     manifest_a = _manifest(
         giant_paths=frozenset({"z.py", "a.py"}),
@@ -1062,8 +1286,8 @@ def test_generator_writes_a_validated_candidate(tmp_path: Path, monkeypatch: pyt
 
 def test_health_metrics_use_the_same_inventory(tmp_path: Path) -> None:
     (tmp_path / "runtime.py").write_text("def f():\n    return 1\nvalue = f()\n", encoding="utf-8")
-    _write_lines(tmp_path / "tests" / "large.py", 4)
-    _write_lines(tmp_path / "web" / "tests" / "view.test.js", 5)
+    _write_lines(tmp_path / "devtools" / "large.py", 4)
+    _write_lines(tmp_path / "web" / "modules" / "view.js", 5)
 
     inventory = collect_size_ratchet_inventory(tmp_path)
     metrics = compute_repo_complexity_metrics(tmp_path)
@@ -1095,7 +1319,7 @@ def test_health_report_renders_size_ratchet_findings_section(
     monkeypatch.setattr(review_module, "validate_size_ratchet", lambda *_a, **_k: [])
     report = _codebase_health(SimpleNamespace(repo_dir=tmp_path))
     assert "Size-Ratchet Findings" not in report
-    assert "Size-ratchet manifest is exact and shrink-only against the committed authority" in report
+    assert "Size-ratchet manifest matches the live tree and is shrink-only against the committed authority" in report
 
 
 def test_staged_tree_is_read_without_taking_the_live_index_lock(tmp_path: Path) -> None:

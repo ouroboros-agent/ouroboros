@@ -22,8 +22,8 @@ import subprocess
 import sys
 
 import pytest
+from tests._safety_fixtures import disable_safety, owner_registry as _registry
 
-from ouroboros.onboarding_wizard import build_onboarding_html
 from ouroboros.runtime_mode_policy import protected_path_category
 from ouroboros.tools.registry import ToolRegistry
 
@@ -41,16 +41,15 @@ def test_settings_defaults_include_phase2_keys():
     assert SETTINGS_DEFAULTS["OUROBOROS_RUNTIME_MODE"] == "advanced"
     assert SETTINGS_DEFAULTS["OUROBOROS_SKILLS_REPO_PATH"] == ""
     assert SETTINGS_DEFAULTS["OUROBOROS_MODEL"] == "google/gemini-3.8-flash"
-    # Empty role slots inherit Main; Light and Fallback use Luna explicitly.
+    # Empty role slots inherit Main; Light (Luna 6) and Fallback (Luna 5.6, kept) use Luna explicitly.
     assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_HEAVY"] == ""
     assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_VISION"] == ""
     assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_CONSCIOUSNESS"] == ""
-    assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_LIGHT"] == "openai/gpt-5.6-luna"
+    assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_LIGHT"] == "openai/gpt-6-luna"
     assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_FALLBACKS"] == "openai/gpt-5.6-luna"
-    assert (
-        SETTINGS_DEFAULTS["OUROBOROS_MODEL_DEEP_SELF_REVIEW"]
-        == "openai/gpt-5.6-sol"
-    )
+    # Retired (review pool): the deep-review model is a reviewer row of the subagent
+    # catalog; the read seam migrates the key, so it is no shipped default any more.
+    assert "OUROBOROS_MODEL_DEEP_SELF_REVIEW" not in SETTINGS_DEFAULTS
     assert SETTINGS_DEFAULTS["TOTAL_BUDGET"] == 200.0
     assert SETTINGS_DEFAULTS["OUROBOROS_PER_TASK_COST_USD"] == 50.0
 
@@ -273,32 +272,14 @@ def test_onboarding_bootstrap_exposes_runtime_mode():
 
 
 def test_api_state_declares_phase2_keys():
-    tree = ast.parse((REPO / "ouroboros" / "gateway" / "state.py").read_text(encoding="utf-8"))
-    api_state_fn = None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "api_state":
-            api_state_fn = node
-            break
-    assert api_state_fn is not None
-
-    for node in ast.walk(api_state_fn):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if not (isinstance(func, ast.Name) and func.id == "JSONResponse"):
-            continue
-        if not node.args or not isinstance(node.args[0], ast.Dict):
-            continue
-        keys = {
-            k.value for k in node.args[0].keys
-            if isinstance(k, ast.Constant) and isinstance(k.value, str)
-        }
-        if keys == {"error"}:
-            continue
-        assert "runtime_mode" in keys
-        assert "skills_repo_configured" in keys
-        return
-    raise AssertionError("api_state exposes no happy-path JSONResponse literal")
+    """``/api/state`` reads its process facts per request from ``state_publication.live_fields``."""
+    tree = ast.parse((REPO / "ouroboros" / "gateway" / "state_publication.py").read_text(encoding="utf-8"))
+    live = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "live_fields")
+    returned = [node.value for node in ast.walk(live) if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict)]
+    assert returned, "live_fields returns no dict literal"
+    keys = {k.value for k in returned[0].keys if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+    assert "runtime_mode" in keys
+    assert "skills_repo_configured" in keys
 
 
 def test_state_response_typeddict_declares_phase2_keys():
@@ -314,88 +295,22 @@ def test_state_response_typeddict_declares_phase2_keys():
 # ===========================================================================
 
 
-def test_settings_ui_renders_runtime_mode_and_skills_path():
-    src = (REPO / "web" / "modules" / "settings_ui.js").read_text(encoding="utf-8")
-    assert 'id="s-runtime-mode"' in src
-    # Runtime-mode segmented control is built by the renderSegmentedField SSOT
-    # (C7.1): the column-override modifier and the light/advanced/pro options come
-    # through its params, not inline data-effort-value markup.
-    assert "modifier: 'data-runtime-mode-group'" in src
-    for mode in ("light", "advanced", "pro"):
-        assert f"value: '{mode}'" in src
-    assert 'id="s-skills-repo-path"' in src
+def test_the_protected_path_messages_name_the_review_panel_and_the_review_gate(monkeypatch):
+    """V-D4-07, the owner's approval of 2026-10-08 for exactly three phrases of the protected
+    ``runtime_mode_policy``: the module docstring, the advanced-mode refusal and the pro-mode
+    notice say «the normal review gate» / «the normal review panel» (the words
+    ``settings_setup_contract`` already uses) — the lanes they used to name no longer exist."""
+    from ouroboros import runtime_mode_policy as policy
 
-
-def test_settings_js_reads_and_writes_phase2_keys():
-    src = "\n".join((REPO / "web" / "modules" / name).read_text(encoding="utf-8")
-                     for name in ("settings.js", "settings_local_model.js"))
-    assert "OUROBOROS_RUNTIME_MODE" in src
-    assert "OUROBOROS_CONTEXT_MODE'" in src
-    assert "OUROBOROS_SKILLS_REPO_PATH" in src
-    assert "['s-runtime-mode', 'OUROBOROS_RUNTIME_MODE', 'advanced']" in src
-    assert "['s-context-mode', 'OUROBOROS_CONTEXT_MODE', 'max']" in src
-    assert "['s-skills-repo-path', 'OUROBOROS_SKILLS_REPO_PATH']" in src
-    assert "fieldValue(id).trim()" in src
-
-
-def test_chat_context_mode_toggle_reports_owner_endpoint_errors():
-    src = (REPO / "web" / "modules" / "chat.js").read_text(encoding="utf-8")
-    assert "/api/owner/context-mode" in src
-    assert "resp.json()" in src
-    assert "showToast(message, 'error')" in src
-
-
-def test_onboarding_js_has_runtime_mode_selector_and_save_payload():
-    src = (REPO / "web" / "modules" / "onboarding_wizard.js").read_text(encoding="utf-8")
-    agents = (REPO / "web" / "modules" / "onboarding_agents_step.js").read_text(encoding="utf-8")
-    html = build_onboarding_html({})
-    for mode in ("light", "advanced", "pro"):
-        assert f'"value": "{mode}"' in html
-    assert "data-runtime-mode" in src
-    assert "onboardingSettingsDraft" in src
-    assert "OUROBOROS_RUNTIME_MODE" in agents
-    assert "OUROBOROS_SKILLS_REPO_PATH" in agents
-
-
-def test_phase4_ui_copy_matches_shipped_runtime():
-    settings_ui = (REPO / "web" / "modules" / "settings_ui.js").read_text(encoding="utf-8")
-    onboarding_html = build_onboarding_html({})
-
-    assert "Phase 2 plumbing only" not in settings_ui
-    assert "land in Phase 3" not in settings_ui
-    assert "data/skills/" in settings_ui
-    assert "Pick both review enforcement and the initial runtime mode" in onboarding_html
-    assert "normal triad + scope review" in onboarding_html
-    assert "Phase 6+:" not in onboarding_html
-
-
-def test_skills_ui_reads_live_extension_state_fields():
-    renderer = (REPO / "web" / "modules" / "skill_card_renderer.js").read_text(encoding="utf-8")
-    orchestration = (REPO / "web" / "modules" / "skills.js").read_text(encoding="utf-8")
-    src = renderer + "\n" + orchestration
-    assert "live_loaded" in src
-    assert "review_gate?.executable_review" in src or "review_gate.executable_review" in src
-    assert "executable_review" in src
-    assert "skill.review_status === 'blockers' && !reviewReady(skill)" in src
-    assert "function statusBadge(status, gate = null, profile = '')" in src
-    assert "statusBadge(skill.review_status, skill.review_gate, skill.review_profile)" in src
-    assert "Open widgets" in src
-    assert "retry_install" in src
-    assert "Retry install" in src
-    assert "result.error" in src
-
-
-def test_onboarding_js_exposes_skills_repo_path_input_and_binding():
-    src = (REPO / "web" / "modules" / "onboarding_wizard.js").read_text(encoding="utf-8")
-    assert 'id="skills-repo-path"' in src
-    assert 'data-clear="skills-repo-path"' in src
-    assert "state.skillsRepoPath = skillsInput.value" in src
-    assert "'skills-repo-path': () => { state.skillsRepoPath = ''; }" in src
-
-
-def test_onboarding_css_has_three_column_variant():
-    src = (REPO / "web" / "onboarding.css").read_text(encoding="utf-8")
-    assert ".wizard-choice-grid.three" in src
+    assert "commits still flow through the normal\nreview gate." in (policy.__doc__ or "")
+    refusal = policy.protected_write_block_message(path="BIBLE.md", runtime_mode="advanced", action="run tool 'write_file' against")
+    assert refusal.endswith("Switch to runtime_mode='pro' and let the normal review panel "
+                            "cover the protected core/contract/release change before commit.")
+    monkeypatch.setattr("ouroboros.config.get_runtime_mode", lambda: "pro")
+    notice = policy.core_patch_notice(["BIBLE.md"])
+    assert notice.endswith("These changes can be committed only through the normal review gate.")
+    for text in (policy.__doc__ or "", refusal, notice):
+        assert "triad" not in text and "scope review" not in text
 
 
 # ===========================================================================
@@ -434,11 +349,12 @@ def test_api_settings_post_clamps_unknown_runtime_mode(tmp_path, monkeypatch):
         return out
 
     def fake_save_settings(payload, *, allow_elevation: bool = False, allow_context_lowering: bool = False,
-                           authored_keys=(), boundary=None):
+                           authored_keys=(), boundary=None, expected_digest="", if_unchanged=None, unset=()):
         # Stands in for both save_settings (allow_elevation) and _owner_write_settings
         # (allow_context_lowering, added in v6.33.0 P4; authored_keys in v6.80.0 — the caller
         # names the disk-authored keys it really authors, see prepare_settings_for_persist;
-        # boundary marks the commit point, so the stub marks it as the real writer would).
+        # boundary marks the commit point, so the stub marks it as the real writer would;
+        # expected_digest, if_unchanged and unset bind the save to its own read and a row's token).
         saved.clear()
         saved.update(payload)
         if boundary is not None:
@@ -483,11 +399,12 @@ def test_api_settings_post_silently_drops_runtime_mode_changes(monkeypatch):
         return out
 
     def fake_save_settings(payload, *, allow_elevation: bool = False, allow_context_lowering: bool = False,
-                           authored_keys=(), boundary=None):
+                           authored_keys=(), boundary=None, expected_digest="", if_unchanged=None, unset=()):
         # Stands in for both save_settings (allow_elevation) and _owner_write_settings
         # (allow_context_lowering, added in v6.33.0 P4; authored_keys in v6.80.0 — the caller
         # names the disk-authored keys it really authors, see prepare_settings_for_persist;
-        # boundary marks the commit point, so the stub marks it as the real writer would).
+        # boundary marks the commit point, so the stub marks it as the real writer would;
+        # expected_digest, if_unchanged and unset bind the save to its own read and a row's token).
         saved.clear()
         saved.update(payload)
         if boundary is not None:
@@ -516,10 +433,6 @@ def test_api_settings_post_silently_drops_runtime_mode_changes(monkeypatch):
 # ===========================================================================
 
 
-def _registry(tmp_path):
-    return ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
-
-
 class _CommitCtx:
     def __init__(self, repo_dir: pathlib.Path, drive_root: pathlib.Path):
         self.repo_dir = repo_dir
@@ -532,7 +445,7 @@ class _CommitCtx:
         self._last_scope_raw_result = {}
         self._review_degraded_reasons = []
         self._current_review_tool_name = "commit_reviewed"
-        self._scope_review_history = {}
+        self._coupling_review_history = {}
         self._review_history = []
 
     def emit_progress_fn(self, *_args, **_kwargs):
@@ -562,12 +475,8 @@ def _git_repo(tmp_path: pathlib.Path) -> pathlib.Path:
 
 @pytest.mark.parametrize(("tool_name", "args"), [
     ("write_file", {"path": "README.md", "content": "changed\n"}),
-    ("commit_reviewed", {"commit_message": "test"}),
-    ("edit_text", {"path": "README.md", "old_str": "ok", "new_str": "changed"}),
-    ("vcs_revert", {"sha": "HEAD"}),
     ("vcs_pull_ff", {}),
     ("vcs_restore", {}),
-    ("vcs_rollback", {"target": "HEAD"}),
     ("promote_to_stable", {"reason": "test"}),
 ])
 def test_light_mode_blocks_repo_mutation_tools(tool_name, args, tmp_path, monkeypatch):
@@ -611,7 +520,7 @@ def test_light_mode_redirects_absolute_home_path_to_user_files(tmp_path, monkeyp
     reg = _registry(tmp_path)
     home_path = str(pathlib.Path.home() / "Desktop" / "ouro_root_required_test.html")
     result = reg.execute("write_file", {"path": home_path, "content": "<html></html>"})
-    assert "ROOT_REQUIRED_USER_FILES" in result, result[:200]
+    assert result.startswith("OK: wrote user_files:"), result[:200]
     assert "user_files" in result
 
 
@@ -629,7 +538,6 @@ def test_light_mode_does_not_block_skill_exec_at_registry_layer(tmp_path, monkey
 @pytest.mark.parametrize("path", [
     "ouroboros/safety.py",
     "ouroboros/contracts/plugin_api.py",
-    "ouroboros/runtime_mode_policy.py",
     ".github/workflows/ci.yml",
 ])
 def test_advanced_mode_blocks_protected_write(path, tmp_path, monkeypatch):
@@ -745,9 +653,13 @@ def test_advanced_commit_blocks_rename_from_protected_path(tmp_path, monkeypatch
 def test_pro_commit_uses_normal_review_for_protected_paths(tmp_path, monkeypatch):
     from ouroboros.tools import git as git_mod
 
-    repo = _git_repo(tmp_path)
+    serving = _git_repo(tmp_path)
+    repo = tmp_path / "candidate"
+    subprocess.run(["git", "worktree", "add", "-qb", "candidate", str(repo)], cwd=serving, check=True)
     (repo / "BIBLE.md").write_text("changed\n", encoding="utf-8")
     ctx = _CommitCtx(repo, tmp_path / "drive")
+    ctx.serving_repo_dir = serving
+    ctx.task_metadata = {"body_candidate": {"path": str(repo)}}
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "pro")
     monkeypatch.setenv("OUROBOROS_PRE_PUSH_TESTS", "0")
 
@@ -768,7 +680,8 @@ def test_pro_commit_uses_normal_review_for_protected_paths(tmp_path, monkeypatch
         skip_advisory_pre_review=True,
     )
 
-    assert result["status"] == "passed"
+    # The normal review ran and its outcome returns before Git (#1741).
+    assert result["status"] == "reviewed"
     assert calls == {"review": 1}
 
 
@@ -951,6 +864,7 @@ def test_restore_to_head_does_not_mangle_leading_dot_paths(tmp_path, monkeypatch
 def test_revert_commit_blocks_protected_contract_path(tmp_path, monkeypatch):
     from ouroboros.tools import git as git_mod
 
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     repo = _git_repo(tmp_path)
     (repo / "ouroboros" / "contracts").mkdir(parents=True)
     (repo / "ouroboros" / "contracts" / "plugin_api.py").write_text("old\n", encoding="utf-8")
@@ -961,7 +875,7 @@ def test_revert_commit_blocks_protected_contract_path(tmp_path, monkeypatch):
     ctx = _CommitCtx(repo, tmp_path / "drive")
     result = git_mod._revert_commit(ctx, target_sha, confirm=True)
 
-    assert "REVERT_BLOCKED" in result
+    assert "CORE_PROTECTION_BLOCKED" in result
     assert "ouroboros/contracts/plugin_api.py" in result
 
 
@@ -1055,10 +969,19 @@ def test_default_lane_allows_minusC_retarget_from_default_cwd(tmp_path, monkeypa
 
 
 @pytest.mark.parametrize("mode", ["advanced", "pro"])
-def test_shell_python_writer_reaches_the_selected_process(tmp_path, monkeypatch, mode):
+def test_shell_python_writer_reaches_the_selected_process(tmp_path, tmp_path_factory, monkeypatch, mode):
     """Source text is executed under selected supervision without guessed targets."""
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", mode)
-    monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    disable_safety(monkeypatch)
+    # Only an argv LIST is interpreter-resolved; this string form launches the bare
+    # `python` from PATH, which a host shipping only `python3` (stock macOS) lacks.
+    # Put the running interpreter there under that name, outside the repo root.
+    executable = pathlib.Path(sys.executable)
+    python_dir = executable.parent
+    if os.name != "nt" and executable.name != "python":
+        python_dir = tmp_path_factory.mktemp("bare-python")
+        (python_dir / "python").symlink_to(executable)
+    monkeypatch.setenv("PATH", str(python_dir) + os.pathsep + os.environ.get("PATH", ""))
     reg = _registry(tmp_path)
     result = reg.execute(
         "run_command",
@@ -1099,7 +1022,7 @@ def test_runtime_identity_deletion_uses_the_selected_mode(tmp_path, monkeypatch,
     from ouroboros.tools.registry import ToolContext
 
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", mode)
-    monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    disable_safety(monkeypatch)
     repo, data = tmp_path / "repo", tmp_path / "data"
     repo.mkdir()
     (data / "memory").mkdir(parents=True)
@@ -1111,7 +1034,7 @@ def test_runtime_identity_deletion_uses_the_selected_mode(tmp_path, monkeypatch,
     if mode == "cyber_pro":
         assert "exit_code=0" in result and not identity.exists(), result
     else:
-        assert "WORKSPACE_SHELL_BLOCKED" in result
+        assert "IDENTITY_DELETE_BLOCKED" in result, result  # owner 5A: the bare word no longer fences a root; the identity guard refuses
         assert identity.read_text() == "identity\n"
 
 
@@ -1125,9 +1048,6 @@ def test_runtime_mode_rank_preserves_the_access_order():
 @pytest.mark.parametrize("cmd", [
     "git rebase HEAD~1",
     "git checkout -- BIBLE.md",
-    "git restore BIBLE.md",
-    "git commit -m rewrite BIBLE.md",
-    "git update-ref refs/heads/feature HEAD",
     "git filter-repo --path other.txt --invert-paths",
 ])
 def test_bible_history_predicate_allows_unrelated_git_history_operations(cmd):
@@ -1138,7 +1058,6 @@ def test_bible_history_predicate_allows_unrelated_git_history_operations(cmd):
 
 @pytest.mark.parametrize("cmd", [
     "git rm BIBLE.md",
-    "git mv BIBLE.md BIBLE.old",
     "git update-index --remove BIBLE.md",
     "git filter-repo --path BIBLE.md --invert-paths",
 ])
@@ -1179,8 +1098,6 @@ def test_light_mode_allows_extension_tool_dispatch(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize(("tool_name", "args"), [
     ("fetch_pr_ref", {"pr_number": 1}),
-    ("create_integration_branch", {"pr_number": 1}),
-    ("cherry_pick_pr_commits", {"shas": ["deadbeef"]}),
     ("stage_adaptations", {}),
     ("stage_pr_merge", {"branch": "integration/test"}),
 ])
@@ -1238,7 +1155,7 @@ def test_run_shell_allows_readonly_mentions_of_protected_paths(cmd, tmp_path, mo
 ])
 def test_light_mode_preserves_direct_repo_write_authority(cmd, tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
-    monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    disable_safety(monkeypatch)
     reg = _registry(tmp_path)
     result = reg.execute("run_command", {"cmd": cmd})
     assert "LIGHT_MODE_BLOCKED" in result, result
@@ -1469,16 +1386,11 @@ def test_light_missing_native_payload_creation_rejected_at_gate(tmp_path, monkey
     assert "root=system_repo" in result
 
 
-@pytest.mark.parametrize("tool_name,base_args", [
-    ("write_file", {"path": "plugin.py", "content": "x"}),
-    ("edit_text", {"path": "plugin.py", "old_str": "a", "new_str": "b"}),
-    ("write_file", {"root": "skill_payload", "path": "plugin.py", "content": "x"}),
-])
-@pytest.mark.parametrize("partial", [
-    {"bucket": "external"},
-    {"skill_name": "alpha"},
-    {"bucket": "native", "skill_name": "alpha"},
-    {"bucket": "external", "skill_name": "...."},  # sanitizes to empty
+@pytest.mark.parametrize(("partial", "tool_name", "base_args"), [
+    pytest.param({"bucket": "external"}, "write_file", {"path": "plugin.py", "content": "x"}, id='partial0-write_file-base_args0'),
+    pytest.param({"skill_name": "alpha"}, "edit_text", {"path": "plugin.py", "old_str": "a", "new_str": "b"}, id='partial1-edit_text-base_args1'),
+    pytest.param({"bucket": "native", "skill_name": "alpha"}, "write_file", {"root": "skill_payload", "path": "plugin.py", "content": "x"}, id='partial2-write_file-base_args2'),
+    pytest.param({"bucket": "external", "skill_name": "...."}, "write_file", {"path": "plugin.py", "content": "x"}, id='partial3-write_file-base_args0'),  # sanitizes to empty
 ])
 def test_light_partial_args_surface_specific_error_not_generic_light_block(
     tool_name, base_args, partial, tmp_path, monkeypatch

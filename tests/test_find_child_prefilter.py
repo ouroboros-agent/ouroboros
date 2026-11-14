@@ -18,14 +18,10 @@ from ouroboros.task_status import find_child_tasks, wait_for_effective_tasks
 
 
 def _write_result(drive_root: pathlib.Path, row: dict) -> None:
-    from ouroboros.contracts.schema_versions import SCHEMA_VERSION_KEY
-    from ouroboros.task_result_schema import TASK_RESULT_SCHEMA_VERSION
+    """The row as stored (stamped by the seed): a read never imports, so the fixture seeds the store."""
+    from tests._store_shared import seed_result
 
-    d = drive_root / "task_results"
-    d.mkdir(parents=True, exist_ok=True)
-    # Campaign ABI 7.0: readers QUARANTINE an unstamped row.
-    row = {SCHEMA_VERSION_KEY: TASK_RESULT_SCHEMA_VERSION, **row}
-    (d / f"{row['task_id']}.json").write_text(json.dumps(row))
+    seed_result(drive_root, row["task_id"], row)
 
 
 def test_non_matching_rows_never_reach_the_projection(tmp_path, monkeypatch):
@@ -134,3 +130,84 @@ def test_wait_polls_without_materializing_and_finishes_with_one_full_read(tmp_pa
     assert calls, "no reads recorded"
     assert calls[-1] is True
     assert all(flag is False for flag in calls[:-1])
+
+
+def test_child_lookup_reads_only_selected_bodies_and_sees_a_changed_lineage(tmp_path, monkeypatch):
+    """The lineage WHERE selects by typed columns: 240 foreign bodies are never decoded, a row
+    whose lineage changes joins the next lookup, and a deleted row leaves it."""
+    from ouroboros import task_store
+    from ouroboros.task_results import write_task_result
+    from ouroboros.task_store import delete_document
+
+    for number in range(240):
+        _write_result(tmp_path, {"task_id": f"foreign-{number}", "status": "completed",
+            "delegation_role": "subagent", "parent_task_id": "other", "root_task_id": "other",
+            "result": "unrelated full answer " * 1000})
+    _write_result(tmp_path, {"task_id": "child", "status": "completed", "delegation_role": "subagent",
+                            "parent_task_id": "owner", "root_task_id": "owner", "result": "selected answer"})
+    decoded = []
+    real = task_store._decode
+
+    def counted(*fetched):
+        rows = real(*fetched)
+        decoded.extend(str(row.get("task_id")) for row in rows)
+        return rows
+
+    monkeypatch.setattr(task_store, "_decode", counted)
+    rows = find_child_tasks(tmp_path, parent_task_id="owner", scope="direct")
+    assert [row["task_id"] for row in rows] == ["child"] and rows[0]["result"] == "selected answer"
+    assert decoded == ["child"]
+    decoded.clear()
+    write_task_result(tmp_path, "foreign-0", "completed", delegation_role="subagent",
+                      parent_task_id="owner", root_task_id="owner")
+    assert {row["task_id"] for row in find_child_tasks(tmp_path, parent_task_id="owner", scope="direct")} == {"child", "foreign-0"}
+    assert set(decoded) == {"child", "foreign-0"}
+    delete_document(tmp_path, "foreign-0")
+    assert [row["task_id"] for row in find_child_tasks(tmp_path, parent_task_id="owner", scope="direct")] == ["child"]
+
+
+def test_child_selection_preserves_whole_scan_quarantine_for_unrelated_bad_rows(tmp_path, monkeypatch):
+    """The boot import is the door: unrelated inadmissible files are quarantined with one
+    batched event, exactly as the complete reader did, before the lineage query answers."""
+    from ouroboros import store_import
+
+    directory = tmp_path / "task_results"
+    directory.mkdir(parents=True)
+    (directory / "old.json").write_text(json.dumps({"task_id": "old", "status": "completed"}), encoding="utf-8")
+    (directory / "torn.json").write_text("{broken", encoding="utf-8")
+    events = []
+    monkeypatch.setattr(store_import, "emit_quarantine_event", lambda _root, rows: events.append(rows) if rows else None)
+    store_import.ensure_current_store(tmp_path)
+    _write_result(tmp_path, {"task_id": "child", "status": "completed", "delegation_role": "subagent", "parent_task_id": "owner"})
+    assert [row["task_id"] for row in find_child_tasks(tmp_path, parent_task_id="owner", scope="direct")] == ["child"]
+    assert len(events) == 1 and {row["task_id"] for row in events[0]} == {"old", "torn"}
+    assert not (directory / "old.json").exists() and not (directory / "torn.json").exists()
+
+
+def test_compact_child_selection_matches_complete_reader_with_retry_and_subtree(tmp_path, monkeypatch):
+    from ouroboros.task_results import list_task_results
+
+    records = [
+        {"task_id": "direct", "parent_task_id": "owner", "root_task_id": "owner"},
+        {"task_id": "deep", "parent_task_id": "direct", "root_task_id": "owner"},
+        {"task_id": "foreign", "parent_task_id": "elsewhere", "root_task_id": "elsewhere"},
+        {"task_id": "old", "parent_task_id": "elsewhere", "root_task_id": "elsewhere", "retry_task_id": "direct"},
+    ]
+    for row in records:
+        _write_result(tmp_path, {"status": "completed", "delegation_role": "subagent", "result": row["task_id"], **row})
+    for scope in ("direct", "subtree"):
+        expected = find_child_tasks(tmp_path, parent_task_id="owner", root_task_id="owner", scope=scope, materialize_artifacts=False)
+        def complete_reader(root, parent, root_id, *, direct_only=False, queue_members=()):
+            def may_match(item):
+                if str(item.get("superseded_by") or item.get("retry_task_id") or "").strip():
+                    return True
+                if str(item.get("delegation_role") or "") != "subagent":
+                    return False
+                if parent and str(item.get("parent_task_id") or "") == parent:
+                    return True
+                return bool(not direct_only and root_id and str(item.get("root_task_id") or "") == root_id)
+            return sorted((row for row in list_task_results(root) if may_match(row)), key=lambda row: row["task_id"])
+
+        with monkeypatch.context() as complete:
+            complete.setattr(task_status, "select_lineage", complete_reader)
+            assert find_child_tasks(tmp_path, parent_task_id="owner", root_task_id="owner", scope=scope, materialize_artifacts=False) == expected

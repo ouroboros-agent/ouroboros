@@ -13,8 +13,6 @@ FINALIZATION_GRACE_DEFAULT_SEC = 120
 # Owner finalization outer cap starts at the stop request; grace starts at control delivery
 # (the loop's mailbox drain). No summary by this cap -> honest custody cancel.
 OWNER_STOP_OUTER_CAP_SEC = 600
-# Cadence for intrinsic self-pacing checkpoints when a task has NO deadline_at (headless benchmark runs). Advisory only — surfaces elapsed/rounds/cost for self-pacing; 0 disables.
-PACING_INTERVAL_DEFAULT_SEC = 600
 # Supervisor-loop liveness deadline (WS3, v6.34.0): a watchdog thread flags the main supervisor loop STALLED if it has not ticked within this many seconds (healthy tick ~0.5s, real wedges only). 0 disables.
 SUPERVISOR_LIVENESS_DEADLINE_DEFAULT_SEC = 90
 
@@ -31,7 +29,7 @@ CLAUDEXOR_ADMISSION_POLL_SEC = 0.15
 OPENROUTER_DEFAULTS = {
     "main": "google/gemini-3.8-flash",
     "heavy": "",
-    "light": "openai/gpt-5.6-luna",
+    "light": "openai/gpt-6-luna",
     "vision": "",
     "consciousness": "",
     "fallback": "openai/gpt-5.6-luna",
@@ -45,12 +43,12 @@ OPENROUTER_DEFAULTS = {
 OPENROUTER_REVIEW_DEFAULTS = {
     "triad": (
         "google/gemini-3.8-flash",
-        "openai/gpt-5.6-terra",
-        "anthropic/claude-opus-5",
+        "openai/gpt-6.1-sol",
+        "anthropic/claude-opus-5.5",
     ),
+    # Scope and advisory are the retired lanes' values as they shipped, read only by the
+    # retired-key tolerance; the factory pool is the triad (``factory_review_rows``).
     "scope": ("openai/gpt-5.6-terra",),
-    # Routed catalog id (the retired Claude-SDK spelling migrated same-model);
-    # without provider credentials the advisory gate records an audited bypass.
     "advisory": "anthropic/claude-sonnet-5",
 }
 
@@ -71,13 +69,22 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "GIGACHAT_BASE_URL": "https://api.giga.chat/v1",
     "GIGACHAT_VERIFY_SSL_CERTS": "true",
     "GIGACHAT_PROFANITY_CHECK": "",
+    # PEM file with CA certificates ADDED to the default trust bundle for every
+    # first-party provider call (net_transport.extra_ca_bundle); "" = defaults only.
+    "OUROBOROS_EXTRA_CA_BUNDLE": "",
     "ANTHROPIC_API_KEY": "",
     "MINIMAX_API_KEY": "",
     "MINIMAX_REGION": "",
     "DEEPSEEK_API_KEY": "",
+    "ZAI_API_KEY": "",
+    "ZAI_PLAN": "",
+    "OUROBOROS_CONNECTIONS": [],  # extra keys/endpoints per kind, one row each (provider_connections)
     "OUROBOROS_NETWORK_PASSWORD": "",
     "OUROBOROS_SERVER_HOST": "127.0.0.1",
     "OUROBOROS_HOST_SERVICE_PORT": 8767,
+    # Main interface at / and /static: "" builtin, "none", or a trusted directory (server_web.select_ui).
+    "OUROBOROS_UI_DIR": "",
+    "OUROBOROS_DESKTOP_KEEP_RUNNING": "false",  # desktop window close keeps running (launcher_background.py)
     "OUROBOROS_MODEL": OPENROUTER_DEFAULTS["main"],
     # Role-owned choices; empty account and zero window mean Auto, not healthy/known.
     "OUROBOROS_MODEL_ACCOUNTS": "{}",
@@ -92,12 +99,12 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_IMAGE_INPUT_MODE": "auto",
     # Background consciousness is a high-horizon loop, not a cheap helper lane.
     "OUROBOROS_MODEL_CONSCIOUSNESS": OPENROUTER_DEFAULTS["consciousness"],
-    # Cross-model resilience CHAIN (comma-separated, ordered). A single model is a
-    # 1-element chain; empty disables cross-model fallback. Resilience slot — keeps a
-    # real default, unlike the worker lanes. (Renamed from the singular MODEL_FALLBACK.)
+    # Cross-model resilience CHAIN (comma-separated, ordered). A single model is a 1-element
+    # chain; empty disables cross-model fallback. Resilience slot — keeps a real default,
+    # unlike the worker lanes. (Renamed from the singular MODEL_FALLBACK.)
     "OUROBOROS_MODEL_FALLBACKS": OPENROUTER_DEFAULTS["fallback"],
-    "OUROBOROS_MODEL_DEEP_SELF_REVIEW": OPENROUTER_DEFAULTS["deep_self_review"],
-    "OUROBOROS_MAX_WORKERS": 10, "OUROBOROS_PRESENCE_MAX_ACTIVE": 2,
+    "OUROBOROS_SERVED_MODEL_REDOS": 2,  # redos of a round another model answered (`llm_substitution.py`)
+    "OUROBOROS_MAX_WORKERS": "", "OUROBOROS_PRESENCE_MAX_ACTIVE": 2,  # "": no cap, memory admits (settings_scales)
     "OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT": 6,
     "OUROBOROS_MAX_SUBAGENT_DEPTH": 3,
     # Mutative ("acting") subagents master toggle. Empty = follow runtime mode
@@ -121,21 +128,27 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_RUB_USD_RATE": "",
     # Live-pricing (OpenRouter + cloud.ru catalog) refetch interval; prices/FX drift.
     "OUROBOROS_PRICING_TTL_SEC": 21600,
-    # Main-loop round ceiling (was an inline literal in loop.py — hot-reloadable now).
-    "OUROBOROS_MAX_ROUNDS": 200,
+    # Optional main-loop round limit: a positive int or "unlimited" (legacy: settings_scales).
+    "OUROBOROS_MAX_ROUNDS": "unlimited",
     # Same-model attempt budget for TRANSIENT provider failure classes
     # (finish_reason=null, 429/5xx/overloaded); floored at the caller's base
     # retry budget. Permanent classes fail fast regardless.
     "OUROBOROS_TRANSIENT_RETRY_MAX": 6,
     # #4 self-DoS guard: max concurrent provider calls per (model, use_local) route; excess
     # worker threads wait (deadline-bounded) instead of storming one model's rate limit. <=0
-    # disables. Default-on, fail-soft (see ouroboros/model_concurrency.py).
+    # disables. Default-on (see ouroboros/model_concurrency.py).
     "OUROBOROS_MODEL_MAX_CONCURRENCY": 3,
     # Hard ceiling (seconds) a provider call waits for a concurrency slot when the task has
-    # NO deadline; past it the call proceeds WITHOUT a slot (never blocks forever). SSOT here.
+    # NO deadline; past it the call is refused before dispatch ($0), never sent without a slot. SSOT here.
     "OUROBOROS_MODEL_SLOT_MAX_WAIT_SEC": 180,
-    # LIGHT one-shot ceilings (naming, its gateway wait, the update letter): SSOT here, never consumer magic numbers.
-    "OUROBOROS_UPDATE_LETTER_TIMEOUT_SEC": 120,
+    # The owner's interface language for this install: a BCP-47 tag ("ru", "pt-BR", "art-x-<slug>"
+    # for an invented language); "" = not chosen, the English source renders. Written by
+    # POST /api/ui/i18n/language, read live by the SPA and the Telegram skill, by the mind at its
+    # next attempt (ouroboros/ui_language.py, ouroboros/i18n_memory.py). Never an enumeration.
+    "OUROBOROS_UI_LANGUAGE": "",
+    # LIGHT one-shot ceilings (naming, its gateway wait): SSOT here, never consumer magic numbers.
+    # One translation-generator batch call (ui_translation.py): slot wait and provider call together.
+    "OUROBOROS_UI_TRANSLATION_TIMEOUT_SEC": 120,
     "OUROBOROS_PROJECT_NAMING_TIMEOUT_SEC": 60,
     "OUROBOROS_PROJECT_NAMING_ASYNC_TIMEOUT_SEC": 8,
     # Skill lifecycle lane deadline (wedged-job loud-failure bound).
@@ -154,15 +167,14 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # next round boundary after the owner's stop control was written; the
     # same custody pass runs on the supervisor sweep, so this stays short.
     "OUROBOROS_DIRECT_TURN_STOP_WAIT_SEC": 2,
-    # Activity-based liveness (the flat wall-clock pair it replaced is RETIRED below):
-    # idle window = no real progress AND no progressing subtree; abs ceiling = the
-    # unconditional per-task backstop (budget/cost stays a separate hard axis).
+    # Activity observation (the flat wall-clock pair it replaced is RETIRED below): the
+    # idle window dates silence (no real progress AND no progressing subtree) for attention,
+    # never a stop (#1376); abs ceiling = the optional per-task lifetime, "unlimited" or
+    # seconds (budget/cost stays a separate hard axis).
     "OUROBOROS_TASK_IDLE_TIMEOUT_SEC": 900,
-    "OUROBOROS_TASK_ABS_CEILING_SEC": 21600,
-    "OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC": 1800,
+    "OUROBOROS_TASK_ABS_CEILING_SEC": "unlimited",
     "OUROBOROS_FINALIZATION_GRACE_SEC": FINALIZATION_GRACE_DEFAULT_SEC,
     "OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC": SUPERVISOR_LIVENESS_DEADLINE_DEFAULT_SEC,
-    "OUROBOROS_PACING_INTERVAL_SEC": PACING_INTERVAL_DEFAULT_SEC,
     "OUROBOROS_TOOL_TIMEOUT_SEC": 600,
     "OUROBOROS_VISION_CAPTION_TIMEOUT_SEC": 90,
     # Consciousness: MIN/MAX bound the wake-up interval the MODEL picks (set_next_wakeup); autonomy is what a
@@ -182,7 +194,7 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # Optional owner steer appended to each evolution cycle's objective (never
     # overrides the LLM-first promotion). Empty = pure LLM choice.
     "OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE": "",
-    "OUROBOROS_WEBSEARCH_MODEL": "gpt-5.2",
+    "OUROBOROS_WEBSEARCH_MODEL": "",
     # web_search backend pin: auto (default OpenAI-first cascade) | ddgs (pure
     # retrieval, no second LLM — for fixed-model runs) | openai | openrouter | anthropic.
     "OUROBOROS_WEBSEARCH_BACKEND": "auto",
@@ -199,37 +211,25 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # NOTE: OUROBOROS_OBSERVABILITY_KEEP_RAW (writes UNREDACTED secret-bearing payloads to
     # disk) is intentionally NOT a settings/UI carrier — it is an env-only operator debug
     # override so a self-change or non-owner save can never enable secret logging.
-    # Generative context-window probe machinery: when enabled AND a caller passes
-    # allow_generative=True, confirms a route's >=1M window from a FREE over-window
-    # reject; *_CHARS sizes the padding. Since the settings-time Max gate retirement
-    # no production surface passes allow_generative=True (dormant; kept for tests
-    # and future explicit owner probes).
-    "OUROBOROS_GENERATIVE_PROBE": "1",
-    "OUROBOROS_GENERATIVE_PROBE_CHARS": "5000000",
-    # ABI 7.0 (ABI-10, owner 5.4=A): the structured slot value is the ONE
-    # reviewer configuration surface; "" = the shipped default panel. The
-    # legacy comma-list settings keys are RETIRED (see RETIRED_SETTING_KEYS);
-    # their env spellings survive only as the derived runtime projection.
-    "OUROBOROS_REVIEWER_SLOTS": "",
-    "OUROBOROS_SUBAGENTS": "",  # configured task-actor SSOT; "" = bounded legacy/undecided read
+    # Configured task-actor SSOT and, since the review pool, the ONE reviewer
+    # configuration surface too (rows marked review_eligible); "" = bounded
+    # legacy/undecided read. The former review-lane keys are RETIRED (see
+    # REVIEW_POOL_MIGRATED_SETTING_KEYS) and migrate into this catalog on read.
+    "OUROBOROS_SUBAGENTS": "",
+    "OUROBOROS_SUBAGENTS_MODE": "auto",
     # INSTALL-TIME facts: the agent-preset generation this install received, and WHEN onboarding last completed
-    # (recorded on EVERY completion). Endpoint-authored and disk-only — see ENDPOINT_AUTHORED_SETTINGS.
+    # and by which client attempt (recorded on EVERY completion). Endpoint-authored and disk-only — see
+    # ENDPOINT_AUTHORED_SETTINGS.
     "OUROBOROS_SUBSCRIPTION_PRESET_VERSION": "",
     "OUROBOROS_SUBAGENT_PRESET_RECEIPT": "",
     "OUROBOROS_ONBOARDING_COMPLETED_AT": "",
-    # Pre-commit review enforcement: advisory | blocking
-    "OUROBOROS_REVIEW_ENFORCEMENT": "advisory",
-    # Native tool-round reviewer episode transcript CEILING (chars); the effective
-    # bound is derived from the reviewer window (review_native_episode.py); a
-    # surface's declared mandatory reading may lift it up to the window. No round cap.
-    "OUROBOROS_REVIEW_NATIVE_MAX_TRANSCRIPT_CHARS": "900000",
+    "OUROBOROS_ONBOARDING_ATTEMPT_ID": "",
     # Auto-grant reviewed-skill requests by default; grants stay bound to the
     # reviewed content hash and editing a skill still invalidates them.
     "OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS": "true",
-    # Launcher-seeded native skills carry a hash-pinned native-trust review
-    # verdict (the payload bytes shipped through the repo commit gate); the
-    # zero-grant ones also auto-enable. Editing the payload still goes stale.
-    # Owner opt-out: set to false to keep manual review for native seeds.
+    # Trust of the built-in source while no source list is saved (its derived row): true installs the bundled
+    # skills with basis trusted (exact bytes only; any edit leaves the release), false reviews them like a
+    # review-each source. A saved list's built-in row decides instead (skill_builtin.builtin_trust).
     "OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS": "true",
     # Agent-requested restarts drain running tasks first: while any RUNNING
     # task still heartbeats, the restart waits up to this many seconds before
@@ -237,10 +237,10 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_RESTART_DRAIN_MAX_SEC": 120,
     # Runtime mode: light | advanced | pro; pro still requires review gates.
     "OUROBOROS_RUNTIME_MODE": "advanced",
-    # Context mode: nano | low | max. Owner-only working-context size profile. max = full always-on docs +
-    # current memory granularity; low = ARCHITECTURE as a navigation map + deeper memory consolidation,
-    # sized for ~200k / local models. Cognitive-horizon knob (BIBLE P1): the agent cannot lower it
-    # (owner-only), and it never changes model / reasoning-effort / output-token budgets.
+    # Context mode: nano | low | max, the owner-only working-context size (BIBLE P1: the agent cannot lower it).
+    # max: full docs and memory; low: book maps, memory held under the 250k target; nano: the same under 85k with a
+    # tool selection. It never changes the model or reasoning effort; the reply follows the route window
+    # (context_budget.reply_allowance_tokens: Nano floor 8,192, its target stands in for an unknown window).
     "OUROBOROS_CONTEXT_MODE": "max",
     # One-window compatibility tombstone for the retired persistent auto-Low mechanism.
     # It never sizes or routes context and no runtime writer may set it true.  An explicit
@@ -250,6 +250,14 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_SKILLS_REPO_PATH": "",
     "OUROBOROS_CLAWHUB_REGISTRY_URL": "https://clawhub.ai/api/v1",
     "OUROBOROS_HUB_CATALOG_URL": "https://raw.githubusercontent.com/razzant/OuroborosHub/main/catalog.json",
+    # JSON source rows: {id, name, kind, url|path, ref|commit, part, trust, confirmed}; builds may add managed: true.
+    # Blank: skill_sources.derived_sources uses the three keys above and OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS.
+    "OUROBOROS_SKILL_SOURCES": "",
+    "OUROBOROS_SKILL_SOURCE_SUGGESTIONS": "",  # a build's Add source offers: [{name, url, ref|commit, path, about}]
+    # Starter catalog ids install once; absent/"" uses recommended built-in/Official (skill_starter.default_starter_ids).
+    # An explicit [] means none; the first-enable choice never overrides an owner's Off.
+    "OUROBOROS_STARTER_SKILLS": "",
+    "OUROBOROS_STARTER_SKILLS_TURN_ON": "true",
     "MCP_ENABLED": False,
     "MCP_SERVERS": [],
     "MCP_TOOL_TIMEOUT_SEC": 60,
@@ -262,6 +270,9 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     #   off   — no LLM safety calls at all; the deterministic registry sandbox, protected-path
     #           policy and light-mode guards STAY ON. Every non-full mode audits durably.
     "OUROBOROS_SAFETY_MODE": "full",
+    "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE": "full",
+    "OUROBOROS_MODEL_SAFETY": "",
+    "OUROBOROS_SAFETY_OWNER_RULES": "",
     # Safety-supervisor LLM call shaping (v6.54.3 parse-bug fix): a tight output
     # budget + no reasoning keeps the light model from spending its whole budget on
     # hidden reasoning and returning a 1-token/empty body that fails JSON parse and
@@ -274,31 +285,21 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # pinning a worker on a dead socket.
     "OUROBOROS_WEBSEARCH_TIMEOUT_SEC": 480,
     "OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC": 2700,
-    # v6.54.3 (1.5): plan_task deadline scaling. With a task deadline the planning swarm's
-    # wait ceiling is min(configured ceiling, remaining/4); below this floor plan_task SKIPS
-    # with a typed reason + telemetry rather than eat the tail of the budget.
-    "OUROBOROS_PLAN_TASK_DEADLINE_MIN_SEC": 300,
-    # Acceptance-review budget layer (task_pacing SSOT): the configurable
-    # acceptance admission floor, clamped to >=200 s by task_pacing.
-    "OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC": 200,
     # Shared paid-review-cycle cap (SSOT + per-gate meaning: ouroboros/review_cycles.py):
-    # STRING "N"|"unlimited": paid plan/acceptance/commit/skill waves; final feedback still permits author response. Explicit task-local author limits and free identical-material replay remain separate.
+    # STRING "N"|"unlimited": paid result/commit/skill waves (plan asks stand outside it); final feedback still permits author response. Explicit task-local author limits and free identical-material replay remain separate.
     "OUROBOROS_REVIEW_MAX_CYCLES": "2",
-    "OUROBOROS_ACCEPTANCE_RESERVE_PCT": 5,
     # Prompt-cache TTL, one honest GLOBAL override (owner decision 2026-08-08, batch #2 Q2=A): applied to
-    # EVERY cache_control breakpoint on the Anthropic-normalizing family — main loop, review lanes, safety
-    # supervisor alike — at the ONE send-time finalizer (llm._normalize_payload_cache_ttl). 'default' = bare
-    # markers (provider default 5m tier); '5m'/'1h' = the explicit Anthropic ephemeral tiers ('1h' bills cache
-    # writes at the documented 2x-vs-1.25x ratio). Non-Anthropic wire formats are a NO-OP by construction
-    # (Gemini documents no ttl field — the v5.30.0 outage class).
+    # EVERY cache_control breakpoint on the Anthropic-normalizing family (direct, OpenRouter anthropic/, the
+    # generic compatible lane) — main loop, review lanes, safety supervisor alike — at the ONE send-time
+    # finalizer (llm._normalize_payload_cache_ttl). 'default' = bare markers (provider default 5m tier); '5m'/'1h'
+    # = the explicit Anthropic ephemeral tiers ('1h' bills writes at the documented 2x-vs-1.25x ratio). Other
+    # wire formats are a NO-OP (Gemini documents no ttl field — the v5.30.0 outage class).
     "OUROBOROS_PROMPT_CACHE_TTL": "1h",
-    # Reasoning effort per task type: any EFFORT_SCALE tier (the ordered SSOT in settings_scales)
+    # Main's primary TASK is independent of the helper corridor MIN <= MAX.
+    # Projects copy these once; explicit reviewer-row pins retain their precedence.
+    "OUROBOROS_EFFORT_MIN": "low",
     "OUROBOROS_EFFORT_TASK": "medium",
-    "OUROBOROS_EFFORT_EVOLUTION": "high",
-    "OUROBOROS_EFFORT_REVIEW": "high",
-    "OUROBOROS_EFFORT_SCOPE_REVIEW": "high",
-    "OUROBOROS_EFFORT_DEEP_SELF_REVIEW": "high",
-    "OUROBOROS_EFFORT_CONSCIOUSNESS": "",  # empty = the Task / Chat effort (a wake-up is an ordinary Main turn)
+    "OUROBOROS_EFFORT_MAX": "high",
     "OUROBOROS_RETURN_REASONING": True,
     "OUROBOROS_REASONING_SUMMARY": "auto",
     "GITHUB_TOKEN": "",
@@ -308,7 +309,7 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "LOCAL_MODEL_FILENAME": "",
     "LOCAL_MODEL_PORT": 8766,
     "LOCAL_MODEL_N_GPU_LAYERS": 0,
-    "LOCAL_MODEL_CONTEXT_LENGTH": 16384,
+    "LOCAL_MODEL_CONTEXT_LENGTH": 65536,
     "LOCAL_MODEL_CHAT_FORMAT": "",
     "USE_LOCAL_MAIN": False,
     "USE_LOCAL_HEAVY": False,
@@ -324,13 +325,11 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # Delegated subagents. NARROW key, read ONLY by the subagent scheduler; deliberately absent from
     # provider_models.MODEL_SETTING_KEYS (see ARCHITECTURE "Delegated subagents"). Empty = delegation off AND
     # undecided (Settings' Subagents section offers the connected-subscription default); the literal `off` =
-    # delegation off because the owner said so. Wait keys bound the nanny's QUIET wait only.
+    # delegation off because the owner said so.
     "OUROBOROS_SUBAGENT_HARNESS": "",
     # Optional Delegation account pin (D-U5): a credential-profile id sent as `credentialProfileId`; empty = engine
     # rotation pool (D28; presets never author it). Read ONLY by get_subagent_harness -> DelegationRoute.profile_id.
     "OUROBOROS_SUBAGENT_PROFILE": "",
-    "OUROBOROS_DELEGATE_WAIT_SEC": 120,
-    "OUROBOROS_DELEGATE_WAIT_MAX_SEC": 1800,
 }
 
 
@@ -338,10 +337,15 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
 # an owner customization — which would otherwise leave a removed key living in data/settings.json
 # forever, still served by GET /api/settings. Retiring a key is a decision; its ghost is not.
 RETIRED_SETTING_KEYS: tuple[str, ...] = (
+    "OUROBOROS_GENERATIVE_PROBE",
+    "OUROBOROS_GENERATIVE_PROBE_CHARS",
     # v6.87.7: the depth cap conflated how DEEP delegation nests with how STRONG a descendant is.
     "OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT",
-    # knobs are retired (the review-cycle cap OUROBOROS_REVIEW_MAX_CYCLES bounds plan review).
+    # The acceptance improvement-pass and plan-swarm knobs are retired (the cap bounds result/commit/skill waves).
     "OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES",
+    # Blocking left the product: consumed before the purge (config.normalize_settings_raw), so the generic notice never
+    # names it; an install that had Blocking hears it once in its own words (upgrade_notices.review_enforcement_notice).
+    "OUROBOROS_REVIEW_ENFORCEMENT",
     "OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC",
     "OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC",
     "OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC",
@@ -352,7 +356,7 @@ RETIRED_SETTING_KEYS: tuple[str, ...] = (
     "OUROBOROS_SCOPE_REVIEW_FLOOR",
     # ABI 7.0 (ABI-10, owner 5.4=A): the reviewer comma-lists and the phase-5
     # per-row/advisory route envs are retired as SETTINGS keys — the structured
-    # OUROBOROS_REVIEWER_SLOTS is the one configuration surface. An install
+    # OUROBOROS_REVIEWER_SLOTS became the one configuration surface (retired below, PR-3). An install
     # that carried only comma keys gets the shipped default panel (the RC
     # auditor names this migration explicitly). The ENV spellings of the two
     # comma model lists live on as the derived runtime projection for the
@@ -368,16 +372,45 @@ RETIRED_SETTING_KEYS: tuple[str, ...] = (
     # misleading operator surface. Manifests/blobs stay preserved
     # indefinitely BY CONTRACT; the knob is gone, not honored.
     "OUROBOROS_OBSERVABILITY_RETENTION_DAYS",
-    # ABI 7.0 (D04, owner 1B): the flat wall-clock pair. Their kill was replaced by
-    # the activity model (OUROBOROS_TASK_IDLE_TIMEOUT_SEC + OUROBOROS_TASK_ABS_CEILING_SEC)
-    # long ago, after which they were kept as typed no-ops that a settings save reported
+    # ABI 7.0 (D04, owner 1B): the flat wall-clock pair. The activity model replaced
+    # them long ago: OUROBOROS_TASK_ABS_CEILING_SEC is the optional lifetime stop, and
+    # OUROBOROS_TASK_IDLE_TIMEOUT_SEC now only dates silence for attention (#1376). They
+    # were then kept as typed no-ops that a settings save reported
     # as "retired" and a non-default value merely logged. A knob the UI accepts, the
     # status line renders and nothing obeys is the misleading-surface class; the 7.0 ABI
     # window deletes it rather than carrying the ghost another minor.
     "OUROBOROS_SOFT_TIMEOUT_SEC",
     "OUROBOROS_HARD_TIMEOUT_SEC",
-    "OUROBOROS_REVIEW_NATIVE_MAX_ROUNDS",  # a ceiling on rounds; bounds are transcript/deadline/ledger
-    "OUROBOROS_BG_MAX_ROUNDS",  # a wake is an ordinary Main turn: OUROBOROS_MAX_ROUNDS + the per-task cost cap bound it
+    "OUROBOROS_REVIEW_NATIVE_MAX_ROUNDS",  # execution retains deadline and ledger limits
+    # Serialized characters are diagnostic, never a native-review admission limit.
+    # Retire every stored value without inferring whether it was owner-selected.
+    "OUROBOROS_REVIEW_NATIVE_MAX_TRANSCRIPT_CHARS",
+    "OUROBOROS_BG_MAX_ROUNDS",  # a wake is an ordinary Main turn: the per-task cost cap (+ any OUROBOROS_MAX_ROUNDS) bounds it
+    # #1748 (owner 11 Oct: facts, no advice): the periodic [PACING] note it timed is gone; elapsed time,
+    # rounds and cost ride every round's facts line, so no cadence is left to set.
+    "OUROBOROS_PACING_INTERVAL_SEC",
+    # The effort range: evolution tasks and consciousness wakes start at its top (EFFORT_RANGE_RETIRED_SETTING_KEYS).
+    "OUROBOROS_EFFORT_EVOLUTION", "OUROBOROS_EFFORT_CONSCIOUSNESS",
+    # Review pool (PR-3): the review lanes and their surface keys. MIGRATED, not dropped:
+    # ``review_pool_migration`` runs at the read seam BEFORE this purge and turns what the
+    # lanes executed into reviewer rows of OUROBOROS_SUBAGENTS; only a document the migration
+    # could not finish, or a stray effort key without lanes, reaches the retired-key notice.
+    "OUROBOROS_REVIEWER_SLOTS",
+    "OUROBOROS_EFFORT_REVIEW",
+    "OUROBOROS_EFFORT_SCOPE_REVIEW",
+    "OUROBOROS_EFFORT_DEEP_SELF_REVIEW",
+    "OUROBOROS_MODEL_DEEP_SELF_REVIEW",
+    # Task acceptance folded into review_change(subject="result"): its launch floor and default reserve are gone (a
+    # budget profile's reserve_finalization_pct still applies; a review is bounded by the deadline less the grace).
+    "OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC",
+    "OUROBOROS_ACCEPTANCE_RESERVE_PCT",
+    "OUROBOROS_UPDATE_LETTER_TIMEOUT_SEC",  # #2389: the description is ordinary Main work; no host one-shot to bound
+    # Its remaining/4 floor outlived the quarter-window planning wait it scaled: a plan ask is refused
+    # only by a spent deadline (less the finalization reserve), budget or Stop.
+    "OUROBOROS_PLAN_TASK_DEADLINE_MIN_SEC",
+    "OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC",  # owner 3A; 30 Oct: await waits its ask, silence its window
+    # pool-capacity WP5: delegate_wait is a sleep on runs (the body observes them); no window holds a slot.
+    "OUROBOROS_DELEGATE_WAIT_SEC", "OUROBOROS_DELEGATE_WAIT_MAX_SEC",
 )
 
 
@@ -398,61 +431,72 @@ RETIRED_COMMA_LIST_SETTING_KEYS: tuple[str, ...] = (
 )
 
 
-# The second classification INSIDE RETIRED_SETTING_KEYS: retired keys whose
-# SUCCESSOR SETTING this retirement table states, so the first-boot notice can
-# name it instead of telling the owner there is none. Membership is a decision
-# recorded HERE, next to the retirement it explains — a retired key is absent
-# from this map when the table names no successor for it (the knob's effect
-# became fixed behavior, or the replacement is a surface rather than a setting),
-# and the notice then stays neutral instead of claiming either. The pair below
-# is stated twice over: by the comment above the keys in the tuple, and by the
-# ABI-5/D04 rows in docs/ARCHITECTURE.md.
-#
-# A key whose value the read seam MIGRATES does not belong here even though its
-# successor is named: `OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES` is consumed
-# into `OUROBOROS_REVIEW_MAX_CYCLES` before the purge computes the dropped set,
-# so it never reaches the notice — there is no loss to report, and an entry for
-# it would promise a line nothing emits.
+# The third classification INSIDE RETIRED_SETTING_KEYS (review pool, PR-3): the former
+# review-lane keys. Their migration is AUTOMATIC — the read seam
+# (``review_pool_migration.migrate_review_lanes``) turns what the lanes executed into
+# reviewer rows of OUROBOROS_SUBAGENTS before the purge — so the RC auditor reports them as
+# a note ("migrated on load; no action required"), never as an incompatibility; membership
+# in RETIRED_SETTING_KEYS is pinned fail-closed by the auditor and its fixture suite.
+REVIEW_POOL_MIGRATED_SETTING_KEYS: tuple[str, ...] = (
+    "OUROBOROS_REVIEWER_SLOTS",
+    "OUROBOROS_EFFORT_REVIEW",
+    "OUROBOROS_EFFORT_SCOPE_REVIEW",
+    "OUROBOROS_EFFORT_DEEP_SELF_REVIEW",
+    "OUROBOROS_MODEL_DEEP_SELF_REVIEW",
+)
+# The fourth classification: the role effort keys the owner's effort range replaced. No value is carried
+# (evolution and consciousness start at OUROBOROS_EFFORT_MAX): the RC auditor reports a stored one as a note.
+EFFORT_RANGE_RETIRED_SETTING_KEYS: tuple[str, ...] = ("OUROBOROS_EFFORT_EVOLUTION", "OUROBOROS_EFFORT_CONSCIOUSNESS")
+# The one sentence every surface uses for that class (the RC auditor's check text
+# and the settings read seam share it, so the two never describe the migration differently).
+REVIEW_POOL_MIGRATION_CLASS_LINE = (
+    "the review lanes are migrated on load into the review pool — reviewer rows of the "
+    "subagent catalog (OUROBOROS_SUBAGENTS, Settings → Agents); no action required"
+)
+
+
+# The second classification INSIDE RETIRED_SETTING_KEYS: retired keys whose SUCCESSOR SETTING
+# this retirement table states, so the first-boot notice can name it instead of telling the
+# owner there is none. Membership is a decision recorded HERE, next to the retirement it
+# explains — a retired key is absent from this map when the table names no successor for it
+# (the knob's effect became fixed behavior, or the replacement is a surface rather than a
+# setting), and the notice then stays neutral instead of claiming either. The pair below is
+# stated twice over: by the comment above the keys in the tuple, and by the ABI-5/D04 rows in
+# docs/ARCHITECTURE.md. A key whose value the read seam CONSUMES before the purge normally never
+# reaches the notice (`OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES` -> `OUROBOROS_REVIEW_MAX_CYCLES`:
+# no loss to report, so no entry). The review-lane keys are the exception that DOES belong
+# here: their migration can finish later (an error outcome keeps them until the owner's catalog
+# save) and a stray effort key can survive without lanes, so the notice must name their successor.
 RETIRED_SETTING_SUCCESSORS: dict[str, tuple[str, ...]] = {
     # The flat wall-clock pair was superseded by the activity model.
-    "OUROBOROS_SOFT_TIMEOUT_SEC": (
-        "OUROBOROS_TASK_IDLE_TIMEOUT_SEC", "OUROBOROS_TASK_ABS_CEILING_SEC"),
-    "OUROBOROS_HARD_TIMEOUT_SEC": (
-        "OUROBOROS_TASK_IDLE_TIMEOUT_SEC", "OUROBOROS_TASK_ABS_CEILING_SEC"),
+    **{key: ("OUROBOROS_TASK_IDLE_TIMEOUT_SEC", "OUROBOROS_TASK_ABS_CEILING_SEC")
+       for key in ("OUROBOROS_SOFT_TIMEOUT_SEC", "OUROBOROS_HARD_TIMEOUT_SEC")},
+    # The review lanes and their surface keys became rows of the subagent catalog.
+    **{key: ("OUROBOROS_SUBAGENTS",) for key in REVIEW_POOL_MIGRATED_SETTING_KEYS},
+    # Evolution tasks and consciousness wakes start at the top of the owner's effort range.
+    **{key: ("OUROBOROS_EFFORT_MAX",) for key in EFFORT_RANGE_RETIRED_SETTING_KEYS},
+    "OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC": ("OUROBOROS_TOOL_TIMEOUT_SEC", "OUROBOROS_TASK_IDLE_TIMEOUT_SEC"),
 }
 
 
-def retired_setting_keys_notice(dropped: tuple[str, ...], *, reviewer_slots: tuple[str, str]) -> str:
+def retired_setting_keys_notice(dropped: tuple[str, ...]) -> str:
     """THE sentence every surface says about retired keys found in the owner's document.
 
     Read by the settings read seam (``config.normalize_settings_raw``, the once-per-process
     log line) and by the boot-time owner chat notice (``server_maintenance``), so the log
     and the chat never describe the same loss differently. It names every dropped key,
-    says they are NOT honored, and states what replaced them from the two tables above;
-    for the reviewer comma-lists it names what runs NOW from ``reviewer_slots`` — the
-    ``(state, parse_error)`` pair ``reviewer_slot_config.authored_reviewer_slots_state``
-    derives from the document's ``OUROBOROS_REVIEWER_SLOTS``: the panel authored there,
-    the shipped default panel while it is absent, or — malformed — NO panel, because the
-    loader rejects it and every review surface refuses with that parse error until the
-    owner repairs the setting. "Which reviewers run" is the fact the owner has to see, and
-    a default panel that is not serving must never be announced.
+    says they are NOT honored, and states what replaced them from the tables above: the
+    reviewer comma-lists by the review pool (reviewer rows of the subagent catalog — the
+    migration notice says which rows run), the successor map by its named settings, and
+    the rest as removed without a successor.
     """
     comma = [k for k in dropped if k in RETIRED_COMMA_LIST_SETTING_KEYS]
     clauses = []
     if comma:
-        state, parse_error = reviewer_slots
-        if state == "authored":
-            panel = "the reviewer panel authored in that setting"
-        elif state == "invalid":
-            panel = (
-                "NO reviewer panel: that setting is malformed, so reviews are refused "
-                "(Blocking prevents committing; Advisory returns the failure for an explicit "
-                "author decision) until it is repaired on the Settings page — %s" % parse_error)
-        else:
-            panel = "the SHIPPED default reviewer panel until that setting is authored (Settings page)"
         clauses.append(
-            "the reviewer comma-lists (%s) are replaced by the structured "
-            "OUROBOROS_REVIEWER_SLOTS, so this install now runs %s" % (", ".join(comma), panel))
+            "the reviewer comma-lists (%s) are replaced by the review pool — the rows of the "
+            "subagent catalog marked Reviewer (OUROBOROS_SUBAGENTS, Settings → Agents); an install "
+            "that carried only the comma keys runs the shipped default reviewer rows" % ", ".join(comma))
     if named := [k for k in dropped if k in RETIRED_SETTING_SUCCESSORS]:
         clauses.append("the retirement table names a successor setting: %s" % "; ".join(
             "%s -> %s" % (k, ", ".join(RETIRED_SETTING_SUCCESSORS[k])) for k in named))
@@ -468,12 +512,20 @@ def retired_setting_keys_notice(dropped: tuple[str, ...], *, reviewer_slots: tup
 # The same keys from the other side: load_settings overlays env onto disk-ABSENT keys, so without this an
 # ordinary load->save round-trip in a process whose env says low/off would launder that value onto disk
 # unauthorised — or, once the guard reads disk, raise a PermissionError nobody authored. Owner endpoints
-# write BOTH disk and env, so the owner path is unaffected.
-_DISK_AUTHORED_SETTINGS = ("OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUTO_LOW", "OUROBOROS_SAFETY_MODE")
+# write BOTH disk and env, so the owner path is unaffected. Keep-running is consent: absent means not asked yet.
+_DISK_AUTHORED_SETTINGS = ("OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUTO_LOW", "OUROBOROS_SAFETY_MODE",
+                          "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE", "OUROBOROS_SAFETY_OWNER_RULES",
+                          "OUROBOROS_MODEL_SAFETY", "OUROBOROS_DESKTOP_KEEP_RUNNING")
 
 # ENDPOINT-AUTHORED, DISK-ONLY: install-time facts POST /api/onboarding/complete alone writes. The ratchets above are
 # disk-authored yet DO project once the file carries them; these never leave disk in EITHER direction — an env timestamp alone closed the onboarding window on a fresh install, and an env marker was then persisted by a save.
-ENDPOINT_AUTHORED_SETTINGS = frozenset({"OUROBOROS_SUBSCRIPTION_PRESET_VERSION", "OUROBOROS_SUBAGENT_PRESET_RECEIPT", "OUROBOROS_ONBOARDING_COMPLETED_AT"})
+ENDPOINT_AUTHORED_SETTINGS = frozenset({"OUROBOROS_SUBSCRIPTION_PRESET_VERSION", "OUROBOROS_SUBAGENT_PRESET_RECEIPT",
+                                        "OUROBOROS_ONBOARDING_COMPLETED_AT", "OUROBOROS_ONBOARDING_ATTEMPT_ID"})
+# ENDPOINT-WRITTEN, PROJECTED: one endpoint owns the write (the generic save skips the key and names the writer in
+# `ignored_keys`, so a language change always creates the memory header, fires the hooks and broadcasts), yet the value
+# projects to the environment like any setting: a restart, the worker and the Telegram bridge read it (the disk-only set above lost it).
+ENDPOINT_WRITTEN_SETTINGS = frozenset({"OUROBOROS_UI_LANGUAGE"})
+ENDPOINT_WRITERS = {"OUROBOROS_UI_LANGUAGE": "POST /api/ui/i18n/language"}
 
 
 # Settings keys deliberately NOT projected into the environment. Everything else in SETTINGS_DEFAULTS IS
@@ -485,13 +537,32 @@ SETTINGS_KEYS_NOT_EXPORTED_TO_ENV = frozenset({
     # Structured list value: `str(value)` is a Python repr no reader parses back, and every consumer already reads
     # it from the settings dict (mcp_client.parse_servers, gateway.mcp), never from the environment.
     "MCP_SERVERS",
+    # The same for the API connection rows, whose keys would otherwise ride every child's environment.
+    "OUROBOROS_CONNECTIONS",
     # ENV IS THE AUTHORITY for the bind host, not settings. `ouroboros server --host 0.0.0.0` puts the choice in
     # the environment, and both consumers (server.main, server_control.restart_current_process) deliberately read
     # env BEFORE settings. Exporting this key stamped the settings value — usually the shipped 127.0.0.1 default,
     # which no owner authored — back over that environment, so the operator's LAN-reachable server silently became
     # loopback at the first self-restart. A default standing in for an absent key is not a decision.
     "OUROBOROS_SERVER_HOST",
+    # Read once per server generation (server_web.ServedUI.apply). An exported copy outlives the choice it
+    # copied: the desktop launcher keeps its environment across Restart, so clearing a saved directory or
+    # `none` would come back from that stale copy. The environment stays an operator's input for an ABSENT key.
+    "OUROBOROS_UI_DIR",
 }) | ENDPOINT_AUTHORED_SETTINGS  # disk-only in BOTH directions (never read from env, never exported to it)
+
+# A SAVED value of these keys, blank included, is the owner's choice and wins over the environment; an
+# ABSENT key leaves the choice to the environment (a deployment's OUROBOROS_UI_DIR=none). A merged write
+# carries every key the read produced, so it must not author an absent key with the value the environment
+# or the default gave it: one unrelated Settings save would otherwise freeze the operator's choice on disk.
+SAVED_CHOICE_SETTINGS = frozenset({"OUROBOROS_UI_DIR", "OUROBOROS_MAX_WORKERS"})
+
+
+def unauthored_saved_choices(prepared, stored, authored=()) -> frozenset:
+    """Only the writer's explicit authorship can create a saved choice. Merged reads may contain defaults
+    or environment values; equality with either is not evidence of intent. Existing saved values survive."""
+    stored = stored if isinstance(stored, dict) else {}
+    return frozenset(key for key in SAVED_CHOICE_SETTINGS - set(authored) if key in prepared and key not in stored)
 
 
 def settings_env_keys() -> list:

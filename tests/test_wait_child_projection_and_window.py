@@ -1,0 +1,390 @@
+"""Truthful waiting D + E: the unsettled wait_task body and the one wait window.
+
+D. A wait_task that returns BEFORE its child settled (timeout, mailbox interrupt,
+beacon) carries the compact per-child projection wait_tasks already owns, plus the
+child's own open delegated runs: what the host's one observer of runs (the body) last
+recorded of each (``delegate_feed.read_observation``) and the child's own wake cursor
+(its supervision record), each read once. A settled child, or a caller whose known
+hash no longer matches, still gets the full single-child handoff.
+
+E. wait_task, wait_tasks and await_messages share ``_wait_window``: under a deadline or
+an explicit execution budget the window stops a margin inside the executor's emit window
+(the finalization reserve subtracted once), and each entry timeout stays at least
+ceiling + margin, so a full window ends inside its kill timer instead of in TOOL_TIMEOUT.
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+import json
+import pathlib
+import time
+from types import SimpleNamespace
+
+import pytest
+
+import ouroboros.delegate_custody as dc
+import ouroboros.task_pacing as pacing
+from ouroboros import delegate_feed
+from ouroboros.deadline_utils import utc_now
+from ouroboros.task_results import STATUS_COMPLETED, STATUS_RUNNING, write_task_result
+from ouroboros.tools import control_task_results as mod
+from tests._cases import case_folders
+
+REPO = pathlib.Path(__file__).resolve().parents[1]
+CHILD = "nannychild"
+
+
+def _iso(seconds_ago: float) -> str:
+    return (utc_now() - _dt.timedelta(seconds=seconds_ago)).isoformat()
+
+
+def _seed_child(drive, *, status=STATUS_RUNNING, record=None, runs=("run-a",)):
+    dc._CUSTODY.clear()
+    write_task_result(drive, CHILD, status, result="partial answer",
+                      trace_summary="step " * 50, parent_task_id="parent")
+    for run_id in runs:
+        dc.record_started(drive, dc.RunCustody(
+            run_id=run_id, task_id=CHILD, invocation_id="inv-" + run_id, route_id="codex", ledger_root=str(drive)),
+            shape={"max_seconds": 1800})
+    # A review panel's run on the same task is its panel's, never this child's leaf.
+    dc.record_started(drive, dc.RunCustody(
+        run_id="run-review", task_id=CHILD, route_id="codex", source="review_substrate",
+        category="task_acceptance_review", ledger_root=str(drive)))
+    if record is not None:
+        path = drive / "state" / "delegate_supervision" / f"{CHILD}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(record if isinstance(record, str) else json.dumps(record), encoding="utf-8")
+
+
+def _cursor_record(**extra):
+    return {"schema": 1, "run_id": "run-a", "journal_cursor": 7, "status": "wake_pending", **extra}
+
+
+def _observed(drive, run_id="run-a", *, state="running", error=None):
+    """What the body's own writer records of one read of ``run_id`` (``delegate_feed.Feed.record``)."""
+    entry = SimpleNamespace(run_id=run_id, task_id=CHILD, invocation_id="inv-" + run_id)
+    delegate_feed.Feed(drive).record(entry, {"run_state": state, "waiting_on_user": False,
+                                             "answered": error is None}, error)
+
+
+def _projection(text: str) -> dict:
+    assert "[CHILD_PROJECTION]" in text, text
+    return json.loads(text.split("[CHILD_PROJECTION]\n", 1)[1].split("\n[/CHILD_PROJECTION]", 1)[0])
+
+
+def _ctx(drive, **extra):
+    return SimpleNamespace(drive_root=drive, task_id="parent", **extra)
+
+
+# ---------------------------------------------------------------- D: the body
+
+
+@pytest.mark.parametrize("early", [
+    None,
+    {"reason": "owner_mailbox_pending", "delivery": "pending_loop_drain"},
+    {"reason": "child_attention_beacon", "beacons": [], "beacons_remaining": 0},
+])
+def test_an_unsettled_return_is_compact_with_dated_leaf_rows(tmp_path, monkeypatch, early):
+    _seed_child(tmp_path, record=_cursor_record())
+    _observed(tmp_path)
+    real_wait = mod.wait_for_effective_tasks
+
+    def _wait(root, ids, **kw):
+        out = real_wait(root, ids, **{**kw, "on_poll": None})
+        if early is not None:
+            out["early_return"] = early
+        return out
+
+    monkeypatch.setattr(mod, "wait_for_effective_tasks", _wait)
+
+    text = mod._wait_for_task(_ctx(tmp_path), CHILD, timeout_sec=0)
+
+    assert f"Task {CHILD} [running]" in text, "the header line of the full read is kept"
+    assert "[SUBTASK_OUTCOME]" not in text and "[SUBTASK_TRACE]" not in text
+    projection = _projection(text)
+    assert projection["status"] == "running" and projection["result"] == "partial answer"
+    rows = projection["delegated_runs"]
+    assert [row["run_id"] for row in rows] == ["run-a"], "review-owned runs are the panel's"
+    assert rows[0]["max_seconds"] == 1800 and rows[0]["started_at"] != "unknown"
+    observation = rows[0]["observation"]
+    assert observation["observed_run_state"] == "running" and observation["observation_failure"] == ""
+    assert observation["observed_since"] == observation["last_answered_observation_at"] != "unknown"
+    assert observation["observed_waiting_on_user"] is False and 0 <= observation["observation_age_sec"] < 60
+    assert rows[0]["supervision"] == {"journal_cursor": 7}
+    # Dated facts only: no written-at stamp and no liveness verdict of any spelling.
+    flat = json.dumps(projection)
+    for word in ("state_written_at", "alive", "liveness", "stale", "updated_at", "hold_entered_at"):
+        assert word not in flat
+
+
+@pytest.mark.parametrize("record, reason", [
+    (None, "no_supervision_record"),
+    ("{not json", "unreadable"),
+    (json.dumps(["a", "list"]), "unreadable"),
+])
+def test_a_missing_or_unreadable_record_is_the_fact_unknown(tmp_path, record, reason):
+    _seed_child(tmp_path, record=record)
+
+    [row] = _projection(mod._wait_for_task(_ctx(tmp_path), CHILD, timeout_sec=0))["delegated_runs"]
+
+    assert row["supervision"] == {"state": "unknown", "reason": reason}
+    assert row["observation"] == {"state": "unknown", "reason": "no_observation_record"}, \
+        "a run the body never recorded is unknown, never fresh"
+    path = delegate_feed.observation_path(tmp_path, "run-a")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(record or "[]", encoding="utf-8")
+    [row] = _projection(mod._wait_for_task(_ctx(tmp_path), CHILD, timeout_sec=0))["delegated_runs"]
+    assert row["observation"] == {"state": "unknown", "reason": "unreadable"}
+
+
+def test_record_facts_attach_only_to_the_run_and_invocation_they_name(tmp_path):
+    _seed_child(tmp_path, record=_cursor_record(), runs=("run-a", "run-b"))
+    _observed(tmp_path, "run-a")
+    other = delegate_feed.observation_path(tmp_path, "run-b")
+    other.write_text(json.dumps({"run_id": "run-b", "invocation_id": "an-earlier-start", "run_state": "running",
+                                 "answered": True, "since": _iso(5)}), encoding="utf-8")
+
+    rows = _projection(mod._wait_for_task(_ctx(tmp_path), CHILD, timeout_sec=0))["delegated_runs"]
+
+    by_run = {row["run_id"]: row for row in rows}
+    assert by_run["run-b"]["supervision"] == {"state": "unknown", "reason": "record_names_another_run"}
+    assert by_run["run-b"]["observation"] == {"state": "unknown", "reason": "record_names_another_invocation"}
+    assert by_run["run-a"]["observation"]["observed_run_state"] == "running"
+
+
+def test_an_unreachable_engine_is_named_and_the_last_answer_keeps_its_date(tmp_path, monkeypatch):
+    """The body's record while the engine stopped answering keeps the last state it read and the time of that read;
+    ``observed_since`` is when the engine stopped answering."""
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    clock = [time.time() - 900]
+    monkeypatch.setattr(delegate_feed, "time", SimpleNamespace(
+        time=lambda: clock[0], strftime=time.strftime, gmtime=time.gmtime, monotonic=time.monotonic))
+    _seed_child(tmp_path, record=_cursor_record())
+    feed = delegate_feed.Feed(tmp_path)
+    entry = SimpleNamespace(run_id="run-a", task_id=CHILD, invocation_id="inv-run-a")
+    feed.record(entry, {"run_state": "running", "waiting_on_user": False, "answered": True})
+    clock[0] += 300
+    feed.record(entry, {"run_state": "", "waiting_on_user": False, "answered": False}, ClaudexorUnavailable(
+        "daemon_unreachable", "nothing answered", observation_timeout=True, observation_reason="daemon_unreachable"))
+
+    observation = _projection(mod._wait_for_task(_ctx(tmp_path), CHILD, timeout_sec=0))[
+        "delegated_runs"][0]["observation"]
+
+    assert observation["observation_failure"] == "daemon_unreachable"
+    assert observation["observed_run_state"] == "running", "the last state the engine answered"
+    assert observation["last_answered_observation_at"] < observation["observed_since"]
+    assert observation["observation_age_sec"] >= 899
+
+
+def test_the_records_are_read_once_after_the_wait_without_retrying(tmp_path, monkeypatch):
+    """Windows: a racing os.replace makes a read fail; that is a fact, not a
+    loop, and no handle is open while the wait sleeps."""
+    _seed_child(tmp_path, record=_cursor_record())
+    _observed(tmp_path)
+    order = []
+    real_wait, real_read = mod.wait_for_effective_tasks, pathlib.Path.read_text
+
+    def _wait(*args, **kw):
+        order.append("wait")
+        return real_wait(*args, **kw)
+
+    def _read(self, *args, **kw):
+        if self.parent.name in ("delegate_supervision", "delegate_observation"):
+            order.append(self.parent.name)
+            raise PermissionError("sharing violation")
+        return real_read(self, *args, **kw)
+
+    monkeypatch.setattr(mod, "wait_for_effective_tasks", _wait)
+    monkeypatch.setattr(pathlib.Path, "read_text", _read)
+
+    rows = _projection(mod._wait_for_task(_ctx(tmp_path), CHILD, timeout_sec=0))["delegated_runs"]
+
+    assert order == ["wait", "delegate_supervision", "delegate_observation"]
+    assert rows[0]["supervision"] == {"state": "unknown", "reason": "unreadable"}
+    assert rows[0]["observation"] == {"state": "unknown", "reason": "unreadable"}
+
+
+def test_a_settled_child_keeps_the_full_handoff(tmp_path):
+    _seed_child(tmp_path, status=STATUS_COMPLETED, record=_cursor_record())
+
+    text = mod._wait_for_task(_ctx(tmp_path), CHILD, timeout_sec=0)
+
+    assert "[CHILD_PROJECTION]" not in text
+    assert "[SUBTASK_OUTCOME]" in text and "[BEGIN_SUBTASK_OUTPUT]\npartial answer" in text
+
+
+def test_a_changed_known_hash_returns_the_full_body_and_a_match_stays_compact(tmp_path):
+    _seed_child(tmp_path, record=_cursor_record())
+    ctx = _ctx(tmp_path)
+    sha = mod._wait_for_task(ctx, CHILD, timeout_sec=0).split("child_result_sha256=", 1)[1].split("\n", 1)[0]
+
+    changed = mod._wait_for_task(ctx, CHILD, timeout_sec=0, known_result_sha256="0" * 64)
+    assert "[CHILD_PROJECTION]" not in changed
+    assert "[SUBTASK_OUTCOME]" in changed and "partial answer" in changed
+
+    same = _projection(mod._wait_for_task(ctx, CHILD, timeout_sec=0, known_result_sha256=sha))
+    assert same["result_unchanged"] is True and "result" not in same and "trace_summary" not in same
+
+
+def test_the_batch_and_the_single_wait_share_one_projection(tmp_path, monkeypatch):
+    _seed_child(tmp_path, record=_cursor_record())
+    calls = []
+    real = mod._compact_child_projection
+    monkeypatch.setattr(mod, "_compact_child_projection",
+                        lambda tid, data, known: calls.append(tid) or real(tid, data, known))
+
+    batch = json.loads(mod._wait_for_tasks(_ctx(tmp_path), [CHILD], timeout_sec=0))["tasks"][CHILD]
+    single = _projection(mod._wait_for_task(_ctx(tmp_path), CHILD, timeout_sec=0))
+
+    assert calls == [CHILD, CHILD]
+    single.pop("delegated_runs")
+    assert single == batch
+
+
+# ---------------------------------------------------------------- E: the window
+
+
+def _deadline_ctx(drive, remaining_sec):
+    return _ctx(drive, task_metadata={
+        "deadline_at": (utc_now() + _dt.timedelta(seconds=remaining_sec)).isoformat()})
+
+
+def _budget_ctx(drive, budget_sec, used_sec=0.0):
+    """An explicit execution budget (#939) with ``used_sec`` of it already spent."""
+    return _ctx(drive, task_metadata={"execution_timeout_sec": budget_sec}, task_started_at=time.time() - used_sec)
+
+
+@pytest.mark.parametrize("requested, clamp, minimum, margin, remaining, expected", [
+    (180, 3600, 0, 30, None, (180, "requested")),
+    (0, 3600, 0, 30, None, (0, "requested")),       # the zero-second peek survives
+    (10_000, None, 1, 1, None, (10_000, "requested")),  # ... and the time it asked for (owner 30 Oct, B)
+])
+def test_the_one_window_ladder(tmp_path, monkeypatch, requested, clamp, minimum, margin, remaining, expected):
+    monkeypatch.setattr(pacing, "effective_finalization_reserve_sec", lambda ctx: 60.0)
+    ctx = _ctx(tmp_path) if remaining is None else _deadline_ctx(tmp_path, remaining)
+
+    assert mod._wait_window(ctx, requested, clamp=clamp, minimum=minimum, margin=margin) == expected
+
+
+@pytest.mark.parametrize("requested, clamp, minimum, margin, budget, used, expected", [
+    (3600, 3600, 0, 30, 1000.5, 0, (910, "deadline")),  # emit window 940, less the margin once
+    (600, None, 1, 1, 400.5, 0, (339, "deadline")),     # await_messages: its one-second margin
+    (600, None, 1, 1, 60, 120, (0, "deadline")),
+])
+def test_an_execution_budget_narrows_the_window_as_a_deadline_does(tmp_path, monkeypatch, requested, clamp,
+                                                                   minimum, margin, budget, used, expected):
+    """The executor's kill timer counts the explicit execution budget beside the deadline
+    (``deadline_clamped_timeout_sec``), so the window ends inside it the same way."""
+    monkeypatch.setenv("OUROBOROS_TASK_ABS_CEILING_SEC", "unlimited")
+    monkeypatch.setattr(pacing, "effective_finalization_reserve_sec", lambda ctx: 60.0)
+
+    assert mod._wait_window(_budget_ctx(tmp_path, budget, used), requested, clamp=clamp, minimum=minimum,
+                            margin=margin) == expected
+
+
+_WINDOWED = {
+    "wait_task": (mod._WAIT_TASK_CLAMP_SEC, 0, 30),
+    "wait_tasks": (mod._WAIT_TASKS_CLAMP_SEC, 0, 30),
+    "await_messages": (None, 1, 1),
+}
+
+
+def _executor_margins(tmp_path, monkeypatch, name, get_timeout, settings_timeout, bound="deadline"):
+    import ouroboros.loop_tool_execution as lte
+
+    monkeypatch.setenv("OUROBOROS_TASK_ABS_CEILING_SEC", "unlimited")
+    monkeypatch.setattr(lte, "load_settings", lambda: {"OUROBOROS_TOOL_TIMEOUT_SEC": settings_timeout})
+    monkeypatch.setattr(pacing, "effective_finalization_reserve_sec", lambda ctx: 60.0)
+    clamp, minimum, margin = _WINDOWED[name]
+    bounded = _deadline_ctx if bound == "deadline" else _budget_ctx
+    margins = []
+    for remaining in (None, 95.5, 400.5, 3000.5, 3650.5, 7000.5, 7300.5, 20_000.5):
+        ctx = _ctx(tmp_path) if remaining is None else bounded(tmp_path, remaining)
+        executor = lte._get_tool_timeout(SimpleNamespace(_ctx=ctx, get_timeout=get_timeout), name, {})
+        window, _bound = mod._wait_window(ctx, 10**6, clamp=clamp, minimum=minimum, margin=margin)
+        if window > 0:  # no kill timer at all (await_messages without a deadline): its window is the bound
+            margins.append(float("inf") if executor is None else executor - window)
+    return margins, margin
+
+
+def test_the_executor_kill_timer_outlives_every_window_by_the_margin(subtests, tmp_path, monkeypatch):
+    """Exactly one reserve subtraction on both sides of the executor seam: without a bound, under a
+    deadline or an explicit execution budget, and whatever OUROBOROS_TOOL_TIMEOUT_SEC says."""
+    case_paths = case_folders(tmp_path)
+    for name in sorted(_WINDOWED):
+        for settings_timeout in [0, 60, 99_999]:
+            for bound in ["deadline", "execution budget"]:
+                tmp_path = next(case_paths)
+                with subtests.test(name=name, settings_timeout=settings_timeout, bound=bound), monkeypatch.context() as monkeypatch:
+                    from ouroboros.tools.registry import ToolRegistry
+
+                    registry = ToolRegistry(repo_dir=REPO, drive_root=tmp_path)
+                    margins, margin = _executor_margins(tmp_path, monkeypatch, name, registry.get_timeout, settings_timeout, bound)
+
+                    assert margins and min(margins) >= margin, margins
+
+
+def test_the_old_equal_window_and_kill_timeout_fails_the_ordering(tmp_path, monkeypatch):
+    """The guard's other direction: a 7200 s entry around a 7200 s window leaves the
+    full window to end in TOOL_TIMEOUT with an abandoned thread."""
+    margins, margin = _executor_margins(tmp_path, monkeypatch, "wait_tasks", lambda name: 7200, 0)
+
+    assert min(margins) < margin
+
+
+def test_a_narrowed_window_is_named_in_both_results(tmp_path, monkeypatch):
+    monkeypatch.setattr(pacing, "effective_finalization_reserve_sec", lambda ctx: 60.0)
+    write_task_result(tmp_path, "livechild", STATUS_RUNNING, result="")
+    ctx = _deadline_ctx(tmp_path, 90.5)
+
+    single = mod._wait_for_task(ctx, "livechild", timeout_sec=600)
+    batch = json.loads(mod._wait_for_tasks(ctx, ["livechild"], timeout_sec=600))
+
+    assert '[WAIT_WINDOW] {"requested_sec": 600, "window_sec": 0, "window_bound": "deadline"}' in single
+    assert (batch["window_sec"], batch["window_bound"], batch["timeout_sec"]) == (0.0, "deadline", 0.0)
+    assert batch["wait_expired_with_live_children"]["requested_timeout_sec"] == 600.0
+
+    plain = _ctx(tmp_path)
+    assert "[WAIT_WINDOW]" not in mod._wait_for_task(plain, "livechild", timeout_sec=0)
+    assert "window_bound" not in json.loads(mod._wait_for_tasks(plain, ["livechild"], timeout_sec=0))
+
+
+def test_the_poll_sleep_never_overshoots_the_window(tmp_path):
+    from ouroboros.task_status import wait_for_effective_tasks
+
+    write_task_result(tmp_path, "livechild", STATUS_RUNNING, result="")
+    start = time.monotonic()
+
+    out = wait_for_effective_tasks(tmp_path, ["livechild"], timeout_sec=1.0, poll_interval_sec=2.0)
+
+    assert out["timed_out"] is True and time.monotonic() - start < 1.5
+
+
+def test_a_slow_final_read_still_ends_inside_the_kill_timer(tmp_path, monkeypatch):
+    """The materializing read after the loop is not bounded by the window; the
+    settlement margin is what leaves it room before the executor's kill timer."""
+    import ouroboros.loop_tool_execution as lte
+    import ouroboros.task_status as task_status
+
+    monkeypatch.setattr(pacing, "effective_finalization_reserve_sec", lambda ctx: 60.0)
+    monkeypatch.setattr(lte, "load_settings", lambda: {})
+    write_task_result(tmp_path, "livechild", STATUS_RUNNING, result="")
+    real = task_status.load_effective_task_result
+
+    def _slow(root, tid, *args, **kw):
+        if kw.get("materialize_artifacts", True):
+            time.sleep(0.5)
+        return real(root, tid, *args, **kw)
+
+    monkeypatch.setattr(task_status, "load_effective_task_result", _slow)
+    ctx = _deadline_ctx(tmp_path, 91.9)
+    executor = lte._deadline_clamped_timeout(SimpleNamespace(_ctx=ctx), "wait_tasks", 7230)
+    start = time.monotonic()
+
+    out = json.loads(mod._wait_for_tasks(ctx, ["livechild"], timeout_sec=600))
+
+    took = time.monotonic() - start
+    assert out["window_bound"] == "deadline" and 0 < out["window_sec"] <= 1
+    assert took < out["window_sec"] + 1.5 and executor - took >= 28

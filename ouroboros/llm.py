@@ -60,7 +60,6 @@ from ouroboros.llm_attempt import (
 )
 from ouroboros.llm_capability_policy import (
     _CapabilityPolicyMixin,  # noqa: F401
-    _MANDATORY_VALUE_MARKERS,  # noqa: F401
     _OPTIONAL_DROPPABLE_PARAMS,  # noqa: F401
     _OPTIONAL_SAMPLING_PARAMS,  # noqa: F401
     normalize_reasoning_effort,  # noqa: F401
@@ -71,14 +70,11 @@ from ouroboros.llm_fallback import (
 from ouroboros.llm_gigachat import (
     _GigaChatLaneMixin,  # noqa: F401
 )
+from ouroboros.context_budget import estimate_message_chars as _estimate_message_chars  # noqa: F401 -- the historical private name
 from ouroboros.llm_local import (
-    _compact_local_text,  # noqa: F401
-    _compact_markdown_sections,  # noqa: F401
-    _estimate_message_chars,  # noqa: F401
-    _LOCAL_COMPACTION_MODES,  # noqa: F401
     _LocalLaneMixin,  # noqa: F401
-    _split_markdown_sections,  # noqa: F401
     LocalContextTooLargeError,  # noqa: F401
+    _split_leading_reasoning,
 )
 from ouroboros.llm_messages import (
     _MessageShapingMixin,  # noqa: F401
@@ -92,7 +88,6 @@ from ouroboros.llm_openai_compatible import (
     _RESPONSE_METADATA_LABEL_MAX_CHARS,  # noqa: F401
 )
 from ouroboros.llm_pricing import (
-    _GenerationCostMixin,  # noqa: F401
     add_usage,  # noqa: F401
     fetch_cloudru_pricing,  # noqa: F401
     fetch_openrouter_pricing,  # noqa: F401
@@ -120,6 +115,7 @@ from ouroboros.request_wire_recovery import (
     prepare_wire_payload_for_send,  # noqa: F401
     request_wire_scoped,
 )
+from ouroboros.request_wire_recovery import resolve_temperature_hint
 from ouroboros.transport_custody import is_loopback_base_url  # noqa: F401
 from ouroboros.openrouter_attribution import OPENROUTER_APP_HEADERS  # noqa: F401 -- historical public import surface
 from ouroboros.usage_accounting import (
@@ -138,12 +134,104 @@ from ouroboros.usage_accounting import (
     last_physical_attempt_capture,  # noqa: F401
     usage_scope,  # noqa: F401 -- historical public import surface
     )
-from ouroboros.utils import in_worker_process, sanitize_tool_result_for_log  # noqa: F401
+from ouroboros.utils import sanitize_tool_result_for_log, transport_no_proxy  # noqa: F401
 from ouroboros.config import runtime_setting
 
 log = logging.getLogger(__name__)
 
 DEFAULT_LIGHT_MODEL = OPENROUTER_DEFAULTS["light"]
+
+
+def _declared_types(schema: Any) -> Set[str]:
+    """The JSON types a parameter schema allows, through ``anyOf``/``oneOf`` branches too."""
+    if not isinstance(schema, dict):
+        return set()
+    kinds = schema.get("type")
+    found = {kinds} if isinstance(kinds, str) else {
+        kind for kind in (kinds if isinstance(kinds, (list, tuple)) else ()) if isinstance(kind, str)}
+    for key in ("anyOf", "oneOf"):
+        branches = schema.get(key)
+        for branch in branches if isinstance(branches, (list, tuple)) else ():
+            found |= _declared_types(branch)
+    return found
+
+
+def _xml_tool_argument(value: str, schema: Any) -> Any:
+    """One ``<parameter>`` value typed as the tool declares it: the template writes strings raw, other values as
+    JSON. A value a string may hold stays text; an undeclared one stays text unless it is a JSON object or array."""
+    kinds = _declared_types(schema)
+    if "string" in kinds:
+        return value
+    if "boolean" in kinds and value.strip() in ("True", "False"):
+        return value.strip() == "True"
+    try:
+        parsed = json.loads(value)
+    except ValueError:
+        return value
+    if not kinds and not isinstance(parsed, (dict, list)):
+        return value
+    return parsed
+
+
+def _tool_call_bodies(text: str) -> Optional[List[str]]:
+    """The bodies of a reply that is nothing but ``<tool_call>`` blocks, else None. A JSON body is read by the JSON
+    decoder, so a string argument may itself contain ``</tool_call>``."""
+    decoder, bodies, i, n = json.JSONDecoder(), [], 0, len(text)
+    while True:
+        while i < n and text[i].isspace():
+            i += 1
+        if i == n:
+            return bodies or None
+        if not text.startswith("<tool_call>", i):
+            return None
+        i += len("<tool_call>")
+        while i < n and text[i].isspace():
+            i += 1
+        end = None
+        if text.startswith("{", i):
+            try:
+                end = decoder.raw_decode(text, i)[1]
+            except ValueError:
+                end = None  # a double-brace or malformed object: its own reader decides below
+        if end is None:
+            end = text.find("</tool_call>", i)
+            if end < 0:
+                return None
+        body, j = text[i:end], end
+        while j < n and text[j].isspace():
+            j += 1
+        if not text.startswith("</tool_call>", j):
+            return None
+        bodies.append(body.strip())
+        i = j + len("</tool_call>")
+
+
+def _parse_tool_call_block(body: str, tool_schemas: Optional[Dict[str, Any]]) -> Tuple[str, Dict[str, Any]]:
+    """``(name, arguments)`` of one ``<tool_call>`` body: a JSON object (Qwen3 and earlier) or a
+    ``<function=NAME><parameter=KEY>VALUE</parameter>…</function>`` block (Qwen3.5 and later)."""
+    if body.startswith("{"):
+        try:
+            obj = json.loads(body)
+        except json.JSONDecodeError:
+            if body.startswith("{{") and body.endswith("}}"):
+                obj = json.loads(body[1:-1])
+            else:
+                raise
+        if not isinstance(obj, dict):
+            raise ValueError("tool_call payload must be an object")
+        return str(obj.get("name", "")).strip(), obj.get("arguments", {})
+    function = re.fullmatch(r"<function=([^>\s]+)>(.*?)</function>", body, re.DOTALL)
+    if not function:
+        raise ValueError("tool_call is neither a JSON object nor a <function=...> block")
+    parameter = re.compile(r"<parameter=([^>\s]+)>\n?(.*?)\n?</parameter>", re.DOTALL)
+    if parameter.sub("", function.group(2)).strip():
+        raise ValueError("text outside <parameter> blocks")
+    name = function.group(1).strip()
+    schema = (tool_schemas or {}).get(name) if isinstance(tool_schemas, dict) else None
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    properties = properties if isinstance(properties, dict) else {}
+    return name, {key: _xml_tool_argument(value, properties.get(key))
+                  for key, value in parameter.findall(function.group(2))}
 
 
 class LLMClient(
@@ -156,7 +244,6 @@ class LLMClient(
     _GigaChatLaneMixin,
     _LocalLaneMixin,
     _OpenAICompatibleLaneMixin,
-    _GenerationCostMixin,
 ):
     """LLM API wrapper. Routes calls to OpenRouter or a local llama-cpp-python server."""
 
@@ -166,7 +253,8 @@ class LLMClient(
         base_url: str = "https://openrouter.ai/api/v1",
     ):
         self._api_key_override = api_key
-        self._api_key = api_key or runtime_setting("OPENROUTER_API_KEY", "")
+        # Route resolution owns credentials at dispatch. Constructing an ordinary
+        # actor for preparation must not fetch an unused provider key.
         self._base_url = base_url
         self._client = None
         self._client_api_key: Optional[str] = None
@@ -207,7 +295,7 @@ class LLMClient(
         caller_execution_deadline: Optional[float] = None,
         wait_for_resources: bool = True,
         processing_preference: str | None = None,
-        context_mode: str | None = None,
+        caller_dispatch_deadline_ts: Optional[float] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Single LLM call returning (message, usage); no_proxy avoids macOS fork proxy crashes.
 
@@ -219,12 +307,16 @@ class LLMClient(
         ``default_temperature`` is a host hint, unlike explicit ``temperature``.
         Resolve it on this invocation's effective route after any model wait:
         raw model operations defer to provider defaults; explicit values win.
+        Its origin stays on the route: a bounded value refusal may withdraw a hint
+        and no explicit value (``request_wire_recovery``).
 
         ``model_turn_state`` is the caller's optional active-turn transport slot
         (``llm_claudexor.ModelTurnState``); this seam is where a dispatch that
         leaves that transport ends the turn. ``wait_for_resources=False`` returns
         a confirmed quota/auth refusal to this caller without entering resource
-        waiting; task overrides, controls and dispatched-operation custody remain."""
+        waiting; task overrides, controls and dispatched-operation custody remain.
+        ``caller_dispatch_deadline_ts`` is a helper's send window, never a wait's end
+        (``deadline_utils.caller_deadline_scoped``)."""
         from ouroboros.llm_claudexor import turn_state_for_route
 
         messages = self._normalize_system_message_placement(messages)
@@ -232,22 +324,19 @@ class LLMClient(
             if use_local:
                 turn_state_for_route(model_turn_state, "local")
                 local_kwargs = {"timeout": timeout}
-                if processing_preference:
+                if reasoning_effort is not None:
+                    local_kwargs["reasoning_effort"] = reasoning_effort
+                if processing_preference is not None:
                     local_kwargs["processing_preference"] = processing_preference
-                if context_mode:
-                    local_kwargs["context_mode"] = context_mode
                 message, usage = self._chat_local(
                     messages, tools, max_tokens, tool_choice, **local_kwargs,
                 )
             else:
-                # Central worker policy: remote calls from worker processes avoid
-                # system proxy lookup without every caller remembering a flag.
-                no_proxy = no_proxy or in_worker_process()
-                target = {**self._resolve_remote_target(model),
-                          "processing_preference": processing_preference,
-                          "context_mode": context_mode}
-                if temperature is None and target.get("provider") != "claudexor":
-                    temperature = default_temperature
+                # The spawner's transport policy (``utils.transport_no_proxy``): a forked child
+                # avoids OS proxy lookup; a spawned carrier keeps the server's policy.
+                no_proxy = no_proxy or transport_no_proxy()
+                target = {**self._resolve_remote_target(model), "processing_preference": processing_preference}
+                temperature = resolve_temperature_hint(target, temperature, default_temperature)
                 message, usage = self._chat_remote(
                     target, messages, tools, reasoning_effort, max_tokens, tool_choice, temperature,
                     no_proxy=no_proxy,
@@ -294,7 +383,7 @@ class LLMClient(
         caller_execution_deadline: Optional[float] = None,
         wait_for_resources: bool = True,
         processing_preference: str | None = None,
-        context_mode: str | None = None,
+        caller_dispatch_deadline_ts: Optional[float] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Async remote chat; no_proxy keeps forked macOS workers off OS proxy APIs.
 
@@ -303,7 +392,7 @@ class LLMClient(
         from ouroboros.llm_claudexor import turn_state_for_route
 
         messages = self._normalize_system_message_placement(messages)
-        no_proxy = no_proxy or in_worker_process()
+        no_proxy = no_proxy or transport_no_proxy()
         if use_local:
             turn_state_for_route(model_turn_state, "local")
             from ouroboros.usage_accounting import adopt_physical_attempt_capture, last_physical_attempt_capture
@@ -311,10 +400,10 @@ class LLMClient(
             def local_call():
                 adopt_physical_attempt_capture(None)
                 local_kwargs = {"timeout": timeout}
-                if processing_preference:
+                if reasoning_effort is not None:
+                    local_kwargs["reasoning_effort"] = reasoning_effort
+                if processing_preference is not None:
                     local_kwargs["processing_preference"] = processing_preference
-                if context_mode:
-                    local_kwargs["context_mode"] = context_mode
                 result = self._chat_local(messages, tools, max_tokens, tool_choice, **local_kwargs)
                 return result, last_physical_attempt_capture()
 
@@ -327,11 +416,8 @@ class LLMClient(
                 adopt_physical_attempt_capture(capture)
             result[1]["ledger_attempt_ids"] = list(attempt_ids)
             return result
-        target = {**self._resolve_remote_target(model),
-                  "processing_preference": processing_preference,
-                  "context_mode": context_mode}
-        if temperature is None and target.get("provider") != "claudexor":
-            temperature = default_temperature
+        target = {**self._resolve_remote_target(model), "processing_preference": processing_preference}
+        temperature = resolve_temperature_hint(target, temperature, default_temperature)
         carried_turn_state = turn_state_for_route(model_turn_state, target.get("provider"))
         if target.get("provider") == "claudexor":
             from ouroboros.llm_claudexor import chat_claudexor_async
@@ -366,7 +452,7 @@ class LLMClient(
             with capture_attempt_ids() as attempt_ids:
                 result = await asyncio.to_thread(
                     self._chat_gigachat, target, messages, tools, reasoning_effort,
-                    max_tokens, tool_choice, temperature, no_proxy,
+                    max_tokens, tool_choice, temperature, no_proxy, timeout,
                 )
             result[1]["ledger_attempt_ids"] = list(attempt_ids)
             return result
@@ -397,7 +483,8 @@ class LLMClient(
                 return result
             finally:
                 try:
-                    await _http_client.aclose()
+                    from ouroboros._usage_wait import aclose_after_model_send
+                    await aclose_after_model_send(_http_client)
                 except Exception:
                     pass
         client = self._get_async_remote_client(target)
@@ -429,6 +516,12 @@ class LLMClient(
     @staticmethod
     def _strip_reasoning_wrappers(text: str):
         """Strip leading think/reasoning wrappers before the first <tool_call> only."""
+        reasoning_parts: list = []
+        # The same leading split the plain-answer path uses (``llm_local``): reasoning the template opened in the
+        # prompt arrives only closed (Qwen3.5 and later), and may itself mention a <tool_call>.
+        text, leading = _split_leading_reasoning(text)
+        if leading:
+            reasoning_parts.append(leading)
         # Split at first <tool_call> so we never touch JSON inside tool payloads.
         tool_call_start = re.search(r"<tool_call\b", text, re.IGNORECASE)
         if tool_call_start:
@@ -437,8 +530,6 @@ class LLMClient(
         else:
             prefix = text
             suffix = ""
-
-        reasoning_parts: list = []
 
         def _extract(tag: str, s: str) -> str:
             pattern = re.compile(
@@ -459,8 +550,11 @@ class LLMClient(
     def _parse_tool_calls_from_content(
         msg: Dict[str, Any],
         allowed_tool_names: Optional[Set[str]] = None,
+        tool_schemas: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Parse local <tool_call> XML output after a strict full-match guard."""
+        """Parse local <tool_call> output after a strict full-match guard.
+
+        ``tool_schemas`` (tool name -> its JSON parameters schema) types the values of the XML form."""
         content = str(msg.get("content", "") or "")
         stripped_raw = content.strip()
         if not stripped_raw:
@@ -472,14 +566,7 @@ class LLMClient(
             return msg
 
         # Upgrade only pure tool-call output; mixed prose stays plain text.
-        full_pattern = re.compile(
-            r"^(?:\s*<tool_call>\s*\{.*?\}\s*</tool_call>\s*)+$",
-            re.DOTALL,
-        )
-        if not full_pattern.fullmatch(stripped):
-            return msg
-
-        matches = re.findall(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", stripped, re.DOTALL)
+        matches = _tool_call_bodies(stripped)
         if not matches:
             return msg
 
@@ -487,18 +574,7 @@ class LLMClient(
         tool_calls = []
         for i, raw in enumerate(matches):
             try:
-                raw_stripped = raw.strip()
-                try:
-                    obj = json.loads(raw_stripped)
-                except json.JSONDecodeError:
-                    if raw_stripped.startswith("{{") and raw_stripped.endswith("}}"):
-                        obj = json.loads(raw_stripped[1:-1])
-                    else:
-                        raise
-                if not isinstance(obj, dict):
-                    raise ValueError("tool_call payload must be an object")
-                name = str(obj.get("name", "")).strip()
-                args = obj.get("arguments", {})
+                name, args = _parse_tool_call_block(raw, tool_schemas)
                 if not name:
                     raise ValueError("tool_call missing function name")
                 if allowed and name not in allowed:
@@ -513,7 +589,7 @@ class LLMClient(
                         "arguments": json.dumps(args),
                     },
                 })
-            except (json.JSONDecodeError, ValueError) as exc:
+            except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as exc:
                 log.warning("Rejected local <tool_call> block: %s (%s)", raw[:200], exc)
                 return msg
 
@@ -642,27 +718,40 @@ class LLMClient(
         model_operation_observer: Any = None,
         model_account_override: str | None = None,
         processing_preference: str | None = None,
+        purpose: str = "vlm",
+        caller_dispatch_deadline_ts: Optional[float] = None,
     ) -> Tuple[str, Dict[str, Any]]:
-        """Run a lightweight vision query; image dicts use url or base64+mime."""
-        content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
-        for img in images:
-            if "url" in img:
-                content.append({
-                    "type": "image_url",
-                    "image_url": {"url": img["url"]},
-                })
-            elif "base64" in img:
-                mime = img.get("mime", "image/png")
-                content.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{mime};base64,{img['base64']}"},
-                })
-            else:
-                log.warning("vision_query: skipping image with unknown format: %s", list(img.keys()))
+        """Run a lightweight vision query; image dicts use url or base64+mime.
 
-        messages = [{"role": "user", "content": content}]
-        response_msg, usage = self.chat(
-            messages=messages,
+        ``model`` is named explicitly, so the one image policy sends its pixels
+        (``purpose`` "vlm" for a VLM tool, "caption" for a send-time caption);
+        it never captions here, so a caption cannot recurse into another.
+        ``caller_dispatch_deadline_ts`` is ``chat``'s send window, reserve already subtracted."""
+        from ouroboros.vision_routing import VisionRoutingContext, prepare_messages_for_send
+        from ouroboros.vision_image_limits import query_image_messages
+        from ouroboros.model_wait import current_model_wait
+        from contextlib import nullcontext
+
+        canonical = query_image_messages(prompt, images)
+        sent = {}
+
+        def prepare(values):
+            from ouroboros.vision_routing import _has_image, _image_digest, _is_image
+
+            messages = prepare_messages_for_send(canonical, routing=VisionRoutingContext(
+                values["model"], self, {}, use_local=values.get("use_local", False),
+                model_role=values.get("model_role", model_role),
+                model_account_override=values.get("model_account_override")), purpose=purpose)
+            parts = [part for message in messages for part in message.get("content", [])]
+            sent.update(model=values["model"], digests=[_image_digest(part) for part in parts if _is_image(part)],
+                        note=" ".join(part["text"] for part in parts[1:] if part.get("type") == "text"))
+            if _has_image(canonical) and not sent["digests"]:
+                error = ValueError(f"VLM_NO_IMAGE_PIXELS: {values['model']}: {sent['note']}")
+                error.vision_query_receipt = dict(sent)
+                raise error
+            return {**values, "messages": messages}
+
+        values = prepare(dict(
             model=model,
             tools=None,
             reasoning_effort=reasoning_effort,
@@ -675,7 +764,17 @@ class LLMClient(
             model_operation_observer=model_operation_observer,
             model_account_override=model_account_override,
             processing_preference=processing_preference,
-        )
+            **({"caller_dispatch_deadline_ts": caller_dispatch_deadline_ts}
+               if caller_dispatch_deadline_ts is not None else {}),
+        ))
+        waiter = current_model_wait()
+        with waiter.register_reprepare(model_role, prepare) if waiter else nullcontext():
+            try:
+                response_msg, usage = self.chat(**values)
+            except Exception as exc:
+                exc.vision_query_receipt = dict(sent)
+                raise
+        usage = {**usage, "_vision_query_receipt": dict(sent)}
         text = response_msg.get("content") or ""
         return text, usage
 
@@ -693,13 +792,16 @@ class LLMClient(
         return models
 
 
+@caller_deadline_scoped
 def openrouter_web_search_server_tool(
 
     *, api_key: str, model: str, query: str, search_context_size: str,
     accounting_scope: Optional[UsageScope] = None, timeout: Optional[float] = None,
-    processing_preference: str | None = None,
+    processing_preference: str | None = None, caller_dispatch_deadline_ts: Optional[float] = None,
 ) -> Any:
-    """Keep native search tools on the shared physical-send recovery driver."""
+    """Keep native search tools on the shared physical-send recovery driver.
+
+    ``caller_dispatch_deadline_ts`` is the leg's send window as in ``chat``, reserve already subtracted."""
     return _openrouter_web_search_server_tool(
         api_key=api_key, model=model, query=query, search_context_size=search_context_size,
         accounting_scope=accounting_scope, timeout=timeout, processing_preference=processing_preference,
@@ -707,12 +809,15 @@ def openrouter_web_search_server_tool(
     )
 
 
+@caller_deadline_scoped
 def anthropic_web_search_server_tool(
     *, api_key: str, model: str, query: str,
     accounting_scope: Optional[UsageScope] = None, timeout: Optional[float] = None,
-    processing_preference: str | None = None,
+    processing_preference: str | None = None, caller_dispatch_deadline_ts: Optional[float] = None,
 ) -> Any:
-    """Compose native Messages search without converting its provider-owned tool."""
+    """Compose native Messages search without converting its provider-owned tool.
+
+    ``caller_dispatch_deadline_ts`` is the leg's send window as in ``chat``, reserve already subtracted."""
     return _anthropic_web_search_server_tool(
         api_key=api_key, model=model, query=query, accounting_scope=accounting_scope,
         timeout=timeout, processing_preference=processing_preference,

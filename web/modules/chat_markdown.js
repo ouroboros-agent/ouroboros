@@ -1,6 +1,8 @@
-/** Rich, sanitized markdown rendering for assistant and system chat messages. */
+/** Rich, sanitized markdown rendering for assistant and system chat messages; linked plain text for the owner's. */
 
-import { safeExternalUrl } from './utils.js';
+import { safeExternalHrefAttr, safeExternalUrl } from './utils.js';
+import { copyTextToClipboard } from './ui_helpers.js';
+import { tr } from './i18n.js';
 import { applyChartTheme, onThemeChange } from './theme_palette.js';
 
 const CHART_TYPES = new Set([
@@ -11,11 +13,14 @@ const MAX_CHART_POINTS = 500;
 const MAX_RICH_BLOCK_SOURCE_LENGTH = 32768;
 const MERMAID_SCRIPT_ID = 'chat-mermaid-library';
 const ROOT_STATE = new WeakMap();
+const TABLE_BINDINGS = new WeakMap();
 const CHART_AUTHORED = new WeakMap();
 const CHART_THEMED = new WeakMap();
 const writeDirectly = (mutate) => mutate();
 
-let markdownParser = null;
+// One parser per line-break reading: chat keeps every newline (`breaks: true`),
+// a delivered document reads a single newline as a soft break.
+const markdownParsers = new Map();
 let mermaidLoadPromise = null;
 let mermaidInitialized = false;
 
@@ -26,38 +31,154 @@ function escapeText(value) {
         .replace(/>/g, '&gt;');
 }
 
-function decodeHtmlEntities(value) {
-    const raw = String(value ?? '');
-    if (!/&[#A-Za-z]/.test(raw)) return raw;
-    if (typeof document !== 'undefined') {
-        const textarea = document.createElement('textarea');
-        textarea.innerHTML = raw;
-        return textarea.value;
-    }
-    return raw
-        .replace(/&lt;/gi, '<')
-        .replace(/&gt;/gi, '>')
-        .replace(/&quot;/gi, '"')
-        .replace(/&#0*39;/g, "'")
-        .replace(/&#x0*27;/gi, "'")
-        .replace(/&amp;/gi, '&');
-}
-
-/** Decode one stored entity layer, then escape it so raw HTML stays literal. */
+/**
+ * Parser input whose raw HTML stays literal. `<` is the only character that
+ * opens HTML in marked's grammar, so it becomes `lessThan`: a decimal reference
+ * the message does not already contain. Prose therefore still reads `<`, and
+ * code maps each one back to the author's byte. `&` stays the author's: marked
+ * decodes one entity layer in prose (the legacy stored-entity reading) and keeps
+ * fenced and inline code literal. An entity never creates Markdown structure.
+ * The one `<` kept opens an autolink to an address a link may carry
+ * (`<https://…>`, `<mailto:…>`): it opens no HTML, and without it marked's bare
+ * URL rule would take the closing `>` into the destination.
+ * An escaped `\<` (backslashes paired left to right, as marked pairs them)
+ * becomes `escapedLessThan`, a second unused reference that takes the backslash
+ * too: a `\` left before a reference escapes its `&`, and prose would show the
+ * reference. Prose reads `<` there, as marked reads `\<`; code maps it back.
+ */
 export function prepareMarkdownSource(text) {
-    return escapeText(decodeHtmlEntities(String(text ?? '')));
+    const raw = String(text ?? '');
+    const unused = (reference) => {
+        while (raw.includes(reference)) reference = reference.replace('&#', '&#0');
+        return reference;
+    };
+    const lessThan = unused('&#60;');
+    const escapedLessThan = unused(lessThan.replace('&#', '&#0'));
+    const source = raw.replace(/(\\?<)(?!(?:https?|mailto):[^\s<>]*>)|\\[\s\S]/gi, (match, opener) => (
+        opener === '<' ? lessThan : opener ? escapedLessThan : match));
+    return { source, lessThan, escapedLessThan };
 }
 
-function getMarkdownParser() {
-    if (markdownParser) return markdownParser;
+// Attribute text in marked's own manner: an entity (including `lessThan`) stays
+// an entity for the browser to read, everything else that could end the value is
+// escaped.
+function attributeText(value) {
+    return String(value ?? '').replace(/&(?!#?\w+;)/g, '&amp;').replace(/"/g, '&quot;').replace(/>/g, '&gt;');
+}
+
+// A forbidden image keeps its words and its address (#1368). Nothing loads: the
+// renderer writes an inert placeholder (a link would nest inside a linked image
+// and break it), and the link pass decides what it becomes. The address is
+// encoded exactly as marked encodes a link's.
+function renderImageReference({ href, title, tokens, text }) {
+    const alt = tokens ? this.parser.parseInline(tokens) : attributeText(text);
+    let address = '';
+    try { address = encodeURI(String(href ?? '')).replace(/%25/g, '%'); } catch { address = ''; }
+    const titleAttr = title ? ` title="${attributeText(title)}"` : '';
+    return `<span class="md-image-ref" data-md-image-href="${attributeText(address)}"${titleAttr}>`
+        + `Image${alt ? `: ${alt}` : ''}</span>`;
+}
+
+function getMarkdownParser(breaks = true) {
+    if (markdownParsers.has(breaks)) return markdownParsers.get(breaks);
     const Marked = globalThis.marked?.Marked;
     if (typeof Marked !== 'function') return null;
-    markdownParser = new Marked({ gfm: true, breaks: true });
-    return markdownParser;
+    const parser = new Marked({ gfm: true, breaks, renderer: { image: renderImageReference } });
+    markdownParsers.set(breaks, parser);
+    return parser;
 }
 
-function protectLatexDelimiters(source) {
-    const rawSource = String(source);
+// Inside a block marked did not read as code, its one code construct: marked's own
+// code span, from a whole run of backticks (its first not escaped) to the next run
+// of the same length, across lines. The caller cuts the text where a span must end.
+const INLINE_CODE = /(?<!(?<!\\)(?:\\\\)*[\\`])(`+)(?!`)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)/g;
+// A line whose ``` could still open a fence: the run leads it, after only a quote's or
+// list item's marks (marked reads a task box's text as inline), and no backtick follows.
+const FENCE_LEAD = /^(?:[ \t]*(?:>|(?:[-+*]|\d{1,9}[.)])[ \t]))*[ \t]*`{3,}[^`]*$/;
+// The code elements marked writes; their text holds no raw `<`.
+const RENDERED_CODE = /(<code\b[^>]*>[\s\S]*?<\/code>)/;
+const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+
+// Code marked read inside a quote or list item, as [first line, its lines] of the
+// top-level block's raw; every other block in it, and each table row, as [first
+// line], since a code span never leaves one. marked strips a container's marks
+// line by line and lexes what is left, so the children spell that text and its
+// line N is raw line N. false when a child cannot be placed so: the caller then
+// keeps the whole block literal.
+// A task item's text has lost its `[ ] ` box, which marked keeps as the first child
+// (a loose item's first paragraph starts with it): the children spell box + text.
+function nestedCode(token, line, found) {
+    const children = token.type === 'list' ? token.items
+        : token.type === 'blockquote' || token.type === 'list_item' ? token.tokens : [];
+    const box = token.type === 'list_item' && token.task
+        ? [children?.[0], children?.[0]?.tokens?.[0]].find((child) => child?.type === 'checkbox') : null;
+    const text = String(box?.raw ?? '') + String((token.type === 'list' ? token.raw : token.text) ?? '');
+    if (token.type === 'table') token.raw.split('\n').forEach((_, row) => found.push([line + row]));
+    let offset = 0;
+    for (const child of children || []) {
+        if (typeof child?.raw !== 'string' || !text.startsWith(child.raw, offset)) return false;
+        if (child.type === 'code') {
+            found.push([line, child.raw.replace(/\n+$/, '').split('\n')]);
+        } else {
+            found.push([line]);
+            if (!nestedCode(child, line, found)) return false;
+        }
+        offset += child.raw.length;
+        line += child.raw.split('\n').length - 1;
+    }
+    return true;
+}
+
+// The author's text split into [text, isCode] runs: every code block (fenced or
+// indented, top-level or nested in a quote or list item) as marked's own lexer
+// reads it, then the code spans inside the rest, each within its own block. Adjacent
+// prose runs join, so math may still span them, but never across a code block.
+function splitAuthorCode(source, parser) {
+    const blocks = typeof parser?.lexer === 'function' ? parser.lexer(source) : [{ raw: source }];
+    const runs = [];
+    const push = (text, code) => {
+        if (!code && runs.length && !runs.at(-1)[1]) runs.at(-1)[0] += text;
+        else runs.push([text, code]);
+    };
+    const pushProse = (text) => {
+        let last = 0;
+        for (const match of text.matchAll(INLINE_CODE)) {
+            push(text.slice(last, match.index), false);
+            push(match[0], true);
+            last = match.index + match[0].length;
+        }
+        push(text.slice(last), false);
+    };
+    for (const block of blocks) {
+        if (block.type === 'code') { push(block.raw, true); continue; }
+        const found = [];
+        const lines = block.raw.split('\n');
+        // Each nested code line must end its raw line (after the container's marks).
+        if (!nestedCode(block, 0, found)
+            || found.some(([at, code = []]) => code.some((text, k) => !lines[at + k]?.endsWith(text)))) {
+            push(block.raw, true);
+            continue;
+        }
+        const starts = [0];
+        for (const text of lines) starts.push(starts.at(-1) + text.length + 1);
+        let last = 0;
+        for (const [at, code = []] of found) {
+            if (starts[at] < last) continue; // it opens on the last line of the code before it
+            pushProse(block.raw.slice(last, starts[at]));
+            last = code.length ? starts[at + code.length] - 1 : starts[at];
+            if (code.length) push(block.raw.slice(starts[at], last), true);
+        }
+        pushProse(block.raw.slice(last));
+    }
+    return runs;
+}
+
+// Math is parked only outside the author's code, and each block comes back as
+// marked would write that same text where it landed: code encodes every `&`,
+// prose keeps an entity an entity (the one layer it reads). No `<` returns raw.
+// Parked math skips marked's escapes, so `authorText` gives it back its `\<`.
+function protectLatexDelimiters(source, parser, authorText = (text) => text) {
+    const rawSource = String(source).replace(/\r\n?/g, '\n'); // marked's own first step
     let tokenStem = 'OUROBOROSLATEX';
     while (rawSource.includes(tokenStem)) tokenStem += 'X';
     const replacements = [
@@ -67,14 +188,31 @@ function protectLatexDelimiters(source) {
         ['\\]', `${tokenStem}CLOSEBLOCK`],
     ];
     const displayBlocks = [];
-    const protectedSource = rawSource.split(/(```[\s\S]*?```|`[^`\n]*`)/g)
-        .map((part, index) => {
-            if (index % 2 === 1) return part;
-            const withProtectedBlocks = part.replace(/\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]/g, (block) => {
+    // Without a math delimiter there is nothing to park and no second lex to pay.
+    const runs = /\$\$|\\[()[\]]/.test(rawSource) ? splitAuthorCode(rawSource, parser) : [[rawSource, true]];
+    // What marked will read of the line being written: the code before it and the
+    // math already parked on it count, since a code span or math may cross lines.
+    let line = '';
+    const write = (text) => {
+        const end = text.lastIndexOf('\n');
+        line = end < 0 ? line + text : text.slice(end + 1);
+        return text;
+    };
+    const protectedSource = runs
+        .map(([part, code]) => {
+            if (code) return write(part);
+            let last = 0;
+            const withProtectedBlocks = part.replace(/\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]/g, (block, at) => {
+                write(part.slice(last, at));
+                last = at + block.length;
+                // After a ``` that could open a fence, math keeps that line's backticks in view:
+                // marked read the line as text for one of them, and parking it would open a fence.
+                if (/^[^\n]*`/.test(block) && FENCE_LEAD.test(line)) return write(block);
                 const token = `${tokenStem}DISPLAY${displayBlocks.length}`;
-                displayBlocks.push([token, block]);
-                return token;
+                displayBlocks.push([token, authorText(block)]);
+                return write(token);
             });
+            write(part.slice(last));
             return replacements.reduce(
                 (value, [delimiter, token]) => value.split(delimiter).join(token),
                 withProtectedBlocks,
@@ -83,13 +221,13 @@ function protectLatexDelimiters(source) {
         .join('');
     return {
         protectedSource,
-        restore: (html) => displayBlocks.reduceRight(
-            (value, [token, block]) => value.split(token).join(block),
-            replacements.reduce(
-                (value, [delimiter, token]) => String(value).split(token).join(delimiter),
-                html,
-            ),
-        ),
+        restore: (html) => String(html).split(RENDERED_CODE).map((part, index) => {
+            const escape = index % 2 === 1 ? /[&<>"']/g : /[<>"']|&(?!#?\w+;)/g;
+            return displayBlocks.reduceRight(
+                (value, [token, block]) => value.split(token).join(block.replace(escape, (char) => HTML_ESCAPES[char])),
+                replacements.reduce((value, [delimiter, token]) => value.split(token).join(delimiter), part),
+            );
+        }).join(''),
     };
 }
 
@@ -121,6 +259,48 @@ export function chatMarkdownUrl(value) {
     }
     const safe = safeExternalUrl(text);
     return safe === '#' ? '' : safe;
+}
+
+// An explicit http(s) address in plain text: it follows no letter, digit or underscore and runs to a
+// blank, quote, angle bracket, backtick, backslash or an invisible control or format character.
+const PLAIN_TEXT_ADDRESS = /(?<![\p{L}\p{N}_])https?:\/\/(?![/\\])[^\s<>"`\\\p{Cc}\p{Cf}]+/giu;
+// Punctuation that ends a sentence or closes a quotation is not part of the address before it; a
+// closing bracket is, while it closes one opened inside the address (`wiki/Foo_(bar)`).
+const ADDRESS_TRAIL = new Set([...'.,:;!?…\'’”»›。、，；：！？']);
+const ADDRESS_CLOSERS = { ')': '(', ']': '[', '}': '{' };
+
+function addressEnd(candidate) {
+    const count = { '(': 0, '[': 0, '{': 0, ')': 0, ']': 0, '}': 0 };
+    for (const char of candidate) if (char in count) count[char] += 1;
+    let end = candidate.length;
+    while (end) {
+        const char = candidate[end - 1];
+        const opener = ADDRESS_CLOSERS[char];
+        if (opener && count[char] > count[opener]) count[char] -= 1;
+        else if (!ADDRESS_TRAIL.has(char)) break;
+        end -= 1;
+    }
+    return end;
+}
+
+/**
+ * The owner's words exactly as written, every character literal (Markdown, HTML and code marks
+ * included), with each explicit http(s) address a chat link to its parsed destination. Nothing
+ * else is read as structure, and the shown text is never rewritten: only the href is normalized.
+ */
+export function linkify(text) {
+    const source = String(text ?? '');
+    let html = '';
+    let from = 0;
+    for (const match of source.matchAll(PLAIN_TEXT_ADDRESS)) {
+        const address = match[0].slice(0, addressEnd(match[0]));
+        const href = safeExternalHrefAttr(address);
+        if (!href) continue;
+        html += `${escapeText(source.slice(from, match.index))}<a class="md-link" href="${href}"`
+            + ` target="_blank" rel="noopener noreferrer">${escapeText(address)}</a>`;
+        from = match.index + address.length;
+    }
+    return html + escapeText(source.slice(from));
 }
 
 /** Parse and bound an untrusted JSON chart configuration. */
@@ -186,11 +366,11 @@ function createCodeBlock(source, language = '') {
     label.textContent = language || 'text';
     const copy = document.createElement('button');
     copy.type = 'button';
-    copy.className = 'md-code-copy';
+    copy.className = 'btn btn-ghost btn-sm md-code-copy';
     copy.dataset.codeCopy = '';
-    copy.setAttribute('aria-label', 'Copy code');
-    copy.title = 'Copy code';
-    copy.textContent = 'Copy';
+    copy.setAttribute('aria-label', tr('code.copy_code', 'Copy code'));
+    copy.title = tr('code.copy_code', 'Copy code');
+    copy.textContent = tr('code.copy', 'Copy');
     const pre = document.createElement('pre');
     const code = document.createElement('code');
     code.className = `language-${language || 'plain'}`;
@@ -200,13 +380,27 @@ function createCodeBlock(source, language = '') {
     return block;
 }
 
-function transformRenderedMarkdown(fragment) {
-    // Levels 4+ have no size of their own (DESIGN.md §1): they read as the
-    // smallest heading label, exactly as the legacy renderMarkdown demotes them.
+function transformRenderedMarkdown(fragment, literal) {
+    // Levels 4+ carry the smallest label class, as the compact renderMarkdown
+    // demotes them; chat bubbles still size h4-h6 by element (DESIGN.md §5).
     fragment.querySelectorAll('h1, h2, h3, h4, h5, h6').forEach((heading) => {
         heading.classList.add(`md-h${Math.min(Number(heading.tagName.slice(1)), 3)}`);
     });
     fragment.querySelectorAll('blockquote').forEach((quote) => quote.classList.add('md-quote'));
+    fragment.querySelectorAll('.md-image-ref').forEach((reference) => {
+        const address = chatMarkdownUrl(reference.getAttribute('data-md-image-href') || '');
+        reference.removeAttribute('data-md-image-href');
+        // A refused address stays plain text, never a link-styled anchor without
+        // a destination. Inside an authored link, or around one in its own words,
+        // that link is already the destination: anchors never nest.
+        if (!address || reference.closest('a') || reference.querySelector('a')) return;
+        const link = document.createElement('a');
+        link.className = 'md-image-ref';
+        link.setAttribute('href', address);
+        if (reference.title) link.title = reference.title;
+        link.append(...reference.childNodes);
+        reference.replaceWith(link);
+    });
     fragment.querySelectorAll('a').forEach((link) => {
         const safe = chatMarkdownUrl(link.getAttribute('href') || '');
         if (safe) link.setAttribute('href', safe); else link.removeAttribute('href');
@@ -215,7 +409,7 @@ function transformRenderedMarkdown(fragment) {
         link.rel = 'noopener noreferrer';
     });
     fragment.querySelectorAll('code:not(pre code)').forEach((code) => {
-        code.textContent = decodeHtmlEntities(code.textContent);
+        code.textContent = literal(code.textContent);
         code.classList.add('inline-code');
     });
     fragment.querySelectorAll('input[type="checkbox"]').forEach((input) => {
@@ -237,7 +431,7 @@ function transformRenderedMarkdown(fragment) {
     });
     fragment.querySelectorAll('pre > code').forEach((code) => {
         const language = codeLanguage(code);
-        const source = decodeHtmlEntities(code.textContent || '');
+        const source = literal(code.textContent || '');
         if (language === 'mermaid' || language === 'chart') {
             const richBlock = document.createElement('div');
             richBlock.className = `md-${language}`;
@@ -249,38 +443,49 @@ function transformRenderedMarkdown(fragment) {
     });
 }
 
-/** Return sanitized, presentation-ready HTML for a chat message. */
-export function renderChatMarkdown(text) {
-    const source = prepareMarkdownSource(text).replace(
-        /^((?:[ \t]*&gt;)+)/gm,
-        (markers) => markers.replaceAll('&gt;', '>'),
-    );
-    const parser = getMarkdownParser();
-    if (!parser || !globalThis.DOMPurify || typeof document === 'undefined') {
-        return source.replace(/\n/g, '<br>');
-    }
+/** Return sanitized, presentation-ready HTML for a chat message, or with
+ * `softBreaks` for a delivered document (DESIGN "Document reading"). */
+export function renderChatMarkdown(text, { softBreaks = false } = {}) {
+    // Without the parser the message reads as the author's exact text.
+    const plain = () => escapeText(text).replace(/\n/g, '<br>');
+    const parser = getMarkdownParser(!softBreaks);
+    if (!parser || !globalThis.DOMPurify || typeof document === 'undefined') return plain();
     try {
-        const latex = protectLatexDelimiters(source);
+        const { source, lessThan, escapedLessThan } = prepareMarkdownSource(text);
+        const authorText = (value) => String(value).split(escapedLessThan).join(`\\${lessThan}`);
+        const latex = protectLatexDelimiters(source, parser, authorText);
         const parsed = latex.restore(parser.parse(latex.protectedSource, { async: false }));
         const safe = globalThis.DOMPurify.sanitize(parsed, {
             USE_PROFILES: { html: true },
-            // 'input' stays sanitizable so the task-list post-pass can swap checkboxes for inert glyphs; raw HTML is already escaped upstream.
+            // 'input' stays sanitizable so the task-list post-pass can swap checkboxes for inert glyphs; raw HTML cannot open upstream (no author `<` reaches the parser).
             FORBID_TAGS: ['script', 'iframe', 'object', 'embed', 'form', 'img', 'video', 'audio', 'source'],
             FORBID_ATTR: ['style', 'src', 'srcset', 'srcdoc', 'onerror', 'onload'],
         });
         const template = document.createElement('template');
         template.innerHTML = safe;
-        transformRenderedMarkdown(template.content);
+        // Code text still holds `lessThan` where the author wrote `<` and
+        // `escapedLessThan` where they wrote `\<`, and only there.
+        transformRenderedMarkdown(template.content, (value) => authorText(value).split(lessThan).join('<'));
         return template.innerHTML;
     } catch (error) {
         console.warn('renderChatMarkdown: markdown render failed', error);
-        return source.replace(/\n/g, '<br>');
+        return plain();
     }
+}
+
+/** Mount blocks with their CSS contract. Enhancement stays with the owning
+ * bubble/card so replacing content does not create another resource owner. */
+export function mountChatMarkdown(host, text, options = {}) {
+    host.classList.add('ui-rich-content');
+    host.innerHTML = renderChatMarkdown(text, options);
 }
 
 function highlightCodeIn(root) {
     root.querySelectorAll?.('.md-code-block pre > code').forEach((code) => {
         const source = code.textContent || '';
+        // A block past the rich-block bound stays plain text: highlighting it would
+        // hold the main thread; it still reads and copies exactly.
+        if (source.length > MAX_RICH_BLOCK_SOURCE_LENGTH) return;
         const language = codeLanguage(code);
         const api = globalThis.hljs;
         if (!api) return;
@@ -375,13 +580,13 @@ function initializeMermaid(api) {
         theme: 'base',
         themeVariables: {
             fontFamily: diagramToken('--diagram-font', 'Inter, system-ui, sans-serif'),
-            background: diagramToken('--diagram-bg', '#151318'),
-            primaryColor: diagramToken('--diagram-primary', '#25222c'),
-            primaryTextColor: diagramToken('--diagram-primary-text', '#f4eef7'),
-            primaryBorderColor: diagramToken('--diagram-border', '#6f6678'),
-            lineColor: diagramToken('--diagram-line', '#9b90a6'),
-            secondaryColor: diagramToken('--diagram-secondary', '#302b39'),
-            tertiaryColor: diagramToken('--diagram-tertiary', '#19171d'),
+            background: diagramToken('--diagram-bg', '#131415'),
+            primaryColor: diagramToken('--diagram-primary', '#212223'),
+            primaryTextColor: diagramToken('--diagram-primary-text', '#efeff2'),
+            primaryBorderColor: diagramToken('--diagram-border', '#717171'),
+            lineColor: diagramToken('--diagram-line', '#989898'),
+            secondaryColor: diagramToken('--diagram-secondary', '#28292a'),
+            tertiaryColor: diagramToken('--diagram-tertiary', '#151617'),
         },
     });
     mermaidInitialized = theme;
@@ -541,24 +746,112 @@ function renderChartNodes(root, state, onDomWrite) {
     }
 }
 
-async function copyCode(code) {
-    const text = code?.textContent || '';
-    if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(text);
-        return;
+/* A table scrolls sideways only when its columns cannot fit even wrapped. Its
+   edges follow the actually hidden columns, as `scroll_fade.js` does for the
+   vertical scroll bodies, and only while it scrolls is its wrapper a named
+   region the keyboard can focus and scroll. */
+function measureTableOverflow(wrap) {
+    if (!wrap || wrap.isConnected === false) return null;
+    return { wrap, hidden: wrap.scrollWidth - wrap.clientWidth, scrolled: Math.abs(wrap.scrollLeft) };
+}
+function markTableOverflow(wrap) {
+    const seen = measureTableOverflow(wrap);
+    if (seen) applyTableOverflow(seen);
+}
+// Measured apart from the marks: a batch measures every table, then marks every one, so a write never makes the next
+// table's read lay the page out again.
+function applyTableOverflow({ wrap, hidden, scrolled }) {
+    const scrolls = hidden > 1;
+    wrap.toggleAttribute('data-scroll-start', scrolls && scrolled > 1);
+    wrap.toggleAttribute('data-scroll-end', scrolls && hidden - scrolled > 1);
+    // A late resize/Markdown write must not make clipped Main text a keyboard stop.
+    // Keep the region semantics and selection; its Project reference opens the full table.
+    const tabIndex = wrap.closest('.project-answer.is-folded') ? -1 : 0;
+    if (scrolls && wrap.hasAttribute('tabindex') && wrap.tabIndex === tabIndex) return;
+    if (scrolls) {
+        wrap.setAttribute('role', 'region');
+        wrap.setAttribute('aria-label', tr('code.scrollable_table', 'Scrollable table'));
+        wrap.tabIndex = tabIndex;
+    } else {
+        wrap.removeAttribute('role');
+        wrap.removeAttribute('aria-label');
+        wrap.removeAttribute('tabindex');
     }
-    const textarea = document.createElement('textarea');
-    textarea.value = text;
-    textarea.setAttribute('readonly', '');
-    let copied = false;
-    try {
-        document.body.appendChild(textarea);
-        textarea.select();
-        copied = typeof document.execCommand === 'function' && document.execCommand('copy') === true;
-    } finally {
-        textarea.remove();
-    }
-    if (!copied) throw new Error('copy command failed');
+}
+
+// The wrapper attributes `markTableOverflow` decides by. A keyed patch (a task
+// timeline row) keeps the wrapper but copies attributes from fresh markup, which
+// drops them while nothing resizes: their change re-marks the wrapper.
+const TABLE_STATE = ['tabindex', 'data-scroll-start', 'data-scroll-end'];
+
+// The table wrappers at or under a node: a mutation may add the wrapper itself.
+function tableWraps(node) {
+    if (node?.nodeType !== 1) return [];
+    const nested = Array.from(node.querySelectorAll?.('.md-table-wrap') || []);
+    return node.matches?.('.md-table-wrap') ? [node, ...nested] : nested;
+}
+
+/**
+ * Keep every Markdown table under `rootEl`, from either renderer and including
+ * tables written into it later, a keyboard region with fading edges exactly
+ * while it scrolls. Table-only: nothing else in the root is enhanced, so a
+ * compact surface's literal code stays as rendered. Returns the disposer;
+ * `destroyChatMarkdown` on the root or an ancestor releases it too, and binding
+ * a bound root again returns its disposer.
+ */
+export function bindMarkdownTables(rootEl) {
+    if (!rootEl || typeof ResizeObserver !== 'function') return () => {};
+    const bound = TABLE_BINDINGS.get(rootEl);
+    if (bound) return bound;
+    // The wrapper resizes with its column; the table with its own content.
+    const sizes = new ResizeObserver((entries) => {
+        const wraps = new Set(entries.map((entry) => entry.target.closest('.md-table-wrap')).filter(Boolean));
+        [...wraps].map(measureTableOverflow).filter(Boolean).forEach(applyTableOverflow);
+    });
+    const observe = (wrap) => {
+        sizes.observe(wrap);
+        if (wrap.firstElementChild) sizes.observe(wrap.firstElementChild);
+    };
+    const release = (wrap) => {
+        sizes.unobserve(wrap);
+        if (wrap.firstElementChild) sizes.unobserve(wrap.firstElementChild);
+    };
+    for (const wrap of rootEl.querySelectorAll?.('.md-table-wrap') || []) observe(wrap);
+    // A surface that writes its Markdown later (a timeline row, a fetched review)
+    // is followed: a new table is observed, a removed one released. The DOM as it
+    // stands when the records arrive decides, so a moved table stays observed.
+    const writes = typeof MutationObserver === 'function' ? new MutationObserver((records) => {
+        for (const record of records) {
+            if (record.type === 'attributes') {
+                if (record.target.classList?.contains('md-table-wrap')) markTableOverflow(record.target);
+                continue;
+            }
+            for (const node of record.removedNodes) {
+                for (const wrap of tableWraps(node)) if (!rootEl.contains(wrap)) release(wrap);
+            }
+            for (const node of record.addedNodes) {
+                for (const wrap of tableWraps(node)) if (rootEl.contains(wrap)) observe(wrap);
+            }
+        }
+    }) : null;
+    writes?.observe(rootEl, { childList: true, subtree: true, attributeFilter: TABLE_STATE });
+    // Scroll events do not bubble; one capturing listener follows every wrapper.
+    const onScroll = (event) => {
+        if (event?.target?.classList?.contains('md-table-wrap')) markTableOverflow(event.target);
+    };
+    rootEl.addEventListener?.('scroll', onScroll, true);
+    const dispose = () => {
+        if (TABLE_BINDINGS.get(rootEl) !== dispose) return;
+        TABLE_BINDINGS.delete(rootEl);
+        sizes.disconnect();
+        writes?.disconnect();
+        rootEl.removeEventListener?.('scroll', onScroll, true);
+        rootEl.removeAttribute?.('data-md-tables');
+    };
+    TABLE_BINDINGS.set(rootEl, dispose);
+    // The marker lets `destroyChatMarkdown` find the binding from an ancestor.
+    rootEl.setAttribute?.('data-md-tables', '');
+    return dispose;
 }
 
 function cleanupState(root, state) {
@@ -566,6 +859,8 @@ function cleanupState(root, state) {
     state.destroyed = true;
     state.unsubscribeTheme?.();
     state.unsubscribeTheme = null;
+    state.disposeTables?.();
+    state.disposeTables = null;
     root.removeEventListener('click', state.clickHandler);
     for (const chart of state.charts) {
         try { chart.destroy(); } catch {}
@@ -587,7 +882,7 @@ export function enhanceChatMarkdown(rootEl, { onDomWrite = writeDirectly, onThem
         charts: new Set(), timers: new Set(), clickHandler: null, frame: null, destroyed: false,
         // Bumped by every repaint so a diagram render still awaiting mermaid from
         // the previous palette discards its result instead of racing this one in.
-        epoch: 0, unsubscribeTheme: null,
+        epoch: 0, unsubscribeTheme: null, disposeTables: null,
     };
     state.clickHandler = async (event) => {
         const button = event.target?.closest?.('[data-code-copy]');
@@ -595,19 +890,20 @@ export function enhanceChatMarkdown(rootEl, { onDomWrite = writeDirectly, onThem
         const code = button.closest('.md-code-block')?.querySelector('pre > code');
         if (!code) return;
         try {
-            await copyCode(code);
+            // The code block is the anchor: inside the document reader's modal it names the dialog that owns the selection.
+            await copyTextToClipboard(code.textContent || '', { anchor: code });
             if (state.destroyed) return;
             button.classList.add('is-copied');
-            button.textContent = 'Copied';
+            button.textContent = tr('code.copied', 'Copied');
             const timer = setTimeout(() => {
                 state.timers.delete(timer);
                 if (state.destroyed || button.isConnected === false) return;
                 button.classList.remove('is-copied');
-                button.textContent = 'Copy';
+                button.textContent = tr('code.copy', 'Copy');
             }, 1200);
             state.timers.add(timer);
         } catch {
-            if (!state.destroyed) button.textContent = 'Copy failed';
+            if (!state.destroyed) button.textContent = tr('code.copy_failed', 'Copy failed');
         }
     };
     ROOT_STATE.set(rootEl, state);
@@ -634,6 +930,7 @@ export function enhanceChatMarkdown(rootEl, { onDomWrite = writeDirectly, onThem
             return true;
         });
         void renderMermaidNodes(rootEl, state, onDomWrite);
+        if (rootEl.querySelector?.('.md-table-wrap')) state.disposeTables = bindMarkdownTables(rootEl);
         const mountCharts = () => {
             state.frame = null;
             if (!state.destroyed && rootEl.isConnected !== false) {
@@ -657,6 +954,10 @@ export function destroyChatMarkdown(rootEl) {
     if (ROOT_STATE.has(rootEl)) roots.push(rootEl);
     roots.push(...(rootEl.querySelectorAll?.('[data-chat-markdown-enhanced]') || []));
     for (const root of new Set(roots)) cleanupState(root, ROOT_STATE.get(root));
+    // A table-only binding (a compact surface) goes with the same node.
+    for (const root of [rootEl, ...(rootEl.querySelectorAll?.('[data-md-tables]') || [])]) {
+        TABLE_BINDINGS.get(root)?.();
+    }
 }
 
 // Any future bubble-removal path in chat.js MUST call destroyChatMarkdown() or Chart

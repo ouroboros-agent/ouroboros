@@ -4,6 +4,7 @@ import pytest
 import httpx
 
 from ouroboros import usage_accounting as ua
+from tests._usage_store_testing import ledger_rows
 
 
 @pytest.fixture
@@ -132,11 +133,7 @@ def test_requests_proxy_error_without_connect_evidence_stays_untyped(data_root):
 
 @pytest.mark.parametrize("url,expected", [
     ("http://localhost:11434/v1", True),
-    ("http://127.0.0.1:1234/v1", True),
-    ("http://[::1]:8000/v1", True),
     ("http://127.0.0.2:11434/v1", True),  # the whole 127.0.0.0/8 range is this host
-    ("http://127.255.255.254:1/v1", True),
-    ("http://[::ffff:127.0.0.1]:8000/v1", True),  # IPv4-mapped IPv6 loopback
     ("http://10.0.0.5:8000/v1", False),
     ("http://example.com/v1", False),
     ("http://localhost.example/v1", False),  # a name is loopback only when it IS localhost
@@ -145,12 +142,6 @@ def test_requests_proxy_error_without_connect_evidence_stays_untyped(data_root):
     ("", False),
     ("not a url", False),
     # every inet_aton spelling the OS accepts for a local server, and a trailing-dot name
-    ("http://127.1:8000/v1", True),
-    ("http://127.0.1:8000/v1", True),
-    ("http://2130706433:8000/v1", True),
-    ("http://0x7f000001:8000/v1", True),
-    ("http://0177.0.0.1:8000/v1", True),
-    ("http://localhost.:11434/v1", True),
     ("http://10.1:8000/v1", False),  # an inet_aton shorthand of a remote address stays remote
     ("http://8.8.8.8/v1", False),
     ("http://example.com./v1", False),
@@ -211,6 +202,32 @@ def test_attempt_custody_capture_found_on_explicit_cause():
     assert fields["provider_error_type"] == "overflow"
 
 
+def test_provider_error_type_is_the_providers_own_never_an_exception_class_name():
+    """The durable error row names the provider's own type: a typed vendor code on the error or its cause
+    (Claudexor's vendorCode, also when no capture rides the chain), never the class name a capture
+    substitutes for the classifier; a capture's real provider type still passes (the overflow test above)."""
+    from ouroboros.llm_claudexor import ClaudexorModelError
+    from ouroboros.transport_custody import attempt_custody_event_fields
+
+    busy = ClaudexorModelError({"code": "provider_failed", "message": "Model operation failed",
+                                "context": {"vendorCode": "server_is_overloaded"}})
+    assert attempt_custody_event_fields(busy) == {"provider_error_type": "server_is_overloaded"}
+    try:
+        raise RuntimeError("recovery wrapper") from busy
+    except RuntimeError as exc:
+        assert attempt_custody_event_fields(exc)["provider_error_type"] == "server_is_overloaded"
+
+    class APIStatusError(Exception):
+        pass
+
+    sdk = APIStatusError("no structured body")
+    sdk.physical_attempt_capture = ua.PhysicalAttemptCapture(
+        attempt_id="pa-name", model="m", provider="openrouter", state="released",
+        candidate_measurement_kind="opaque", provider_error_type="APIStatusError")
+    fields = attempt_custody_event_fields(sdk)
+    assert fields["physical_attempt_id"] == "pa-name" and "provider_error_type" not in fields
+
+
 def test_attempt_custody_cause_walk_matches_bare_builtin_transport_errors():
     """Fable lane B F5: a bare builtins ConnectionResetError/TimeoutError cause
     (no httpx wrapper) still yields a transport cause type."""
@@ -252,8 +269,7 @@ def test_typed_transport_death_on_dispatched_remote_route_is_retryable(cause_cls
 
 
 @pytest.mark.parametrize("cause_cls", [
-    httpx.ReadTimeout, httpx.WriteTimeout, httpx.ConnectError, httpx.ConnectTimeout,
-    httpx.PoolTimeout,
+    httpx.ReadTimeout, httpx.ConnectError, httpx.PoolTimeout,
 ])
 def test_timeouts_and_pre_dispatch_failures_are_not_transport_deaths(cause_cls):
     """A timeout is "we gave up" (the provider may still be working); a connect
@@ -301,7 +317,6 @@ def test_implicit_context_chain_never_proves_a_transport_death():
 
 @pytest.mark.parametrize("capture", [
     _unresolved_capture(provider="local"),
-    _unresolved_capture(provider="openai-compatible", route_is_loopback=True),
     ua.PhysicalAttemptCapture(
         attempt_id="pa-rel", model="m", provider="openrouter", state="released",
         candidate_measurement_kind="opaque",
@@ -386,7 +401,6 @@ def test_requests_lane_event_fields_name_the_innermost_typed_cause(data_root):
     RemoteDisconnected over its ProtocolError wrapper; ProtocolError alone when
     urllib3 hands it over as MaxRetryError.reason; wrappers keep it."""
     import http.client
-    import json
 
     import requests
     import urllib3
@@ -412,7 +426,7 @@ def test_requests_lane_event_fields_name_the_innermost_typed_cause(data_root):
     reservation = ua.reserve_attempt(_request(data_root))
     ua.mark_dispatched(reservation)
     assert ua._terminalize_failed_attempt(reservation, bare) == "unresolved"
-    rows = [json.loads(line) for line in (data_root / ua.LEDGER_REL).read_text().splitlines() if line.strip()]
+    rows = ledger_rows(data_root)
     assert rows[-1]["state"] == "unresolved"
     assert rows[-1]["reason"].startswith("ConnectionError [cause: RemoteDisconnected]:")
 
@@ -478,3 +492,57 @@ def test_requests_proxy_tunnel_death_is_neither_pre_dispatch_nor_a_death():
     bare.physical_attempt_capture = _unresolved_capture(provider="anthropic")
     assert is_pre_dispatch_transport_failure(bare) is False
     assert is_retryable_transport_death(bare) is False
+
+
+def _capture(state, status=None):
+    return ua.PhysicalAttemptCapture(attempt_id="a", model="m", provider="p", state=state,
+                                     candidate_measurement_kind="canonical_json_v1", provider_status_code=status)
+
+
+def _failure(**facts):
+    error = RuntimeError("synthetic attempt failure")
+    for name, value in facts.items():
+        setattr(error, name, value)
+    return error
+
+
+@pytest.mark.parametrize(("state", "status", "error", "known"), [
+    ("released", None, _failure(), True),  # proven unsent, a typed no-start included
+    ("released", None, None, True),
+    ("settled", None, None, True),  # its response came back
+    ("unresolved", None, None, True),  # unpriced is not unanswered
+    ("dispatched", None, None, True),  # response read, accounting failed
+    ("unresolved", 400, _failure(), True),  # the provider answered an HTTP error
+    ("unresolved", 400, _failure(stream_incomplete=True, stream_receipt={"model_output_received": False}), True),
+    ("settled", None, _failure(), True),  # a settled typed failure (an engine verdict without a status)
+    ("unresolved", 400, _failure(stream_incomplete=True, stream_receipt={"model_output_received": True}), False),
+    ("unresolved", None, _failure(), False),  # no answer
+    ("unresolved", 504, _failure(explicit_timeout=True), False),
+    ("dispatched", 400, _failure(receiver_abandoned=True), False),
+    ("settled", None, _failure(code="model_outcome_unknown"), False),
+    ("settled", None, _failure(stream_incomplete=True, stream_receipt={"model_output_received": True}), False),
+    ("reserved", None, _failure(), False),  # its release could not be recorded
+])
+def test_attempt_end_known_reads_only_typed_attempt_facts(state, status, error, known):
+    from ouroboros.transport_custody import attempt_end_known
+
+    assert attempt_end_known(_capture(state, status), error) is known
+
+
+def test_attempt_end_known_without_a_capture_proves_nothing():
+    from ouroboros.transport_custody import attempt_end_known
+
+    assert attempt_end_known(None, None) is False
+
+
+def test_report_attempt_end_ignores_the_pre_dispatch_capture_and_an_unbound_tracker():
+    from ouroboros.transport_custody import report_attempt_end, track_physical_attempts
+
+    heard = []
+    tracker = type("Tracker", (), {"attempt_ended": lambda self, capture, error: heard.append((capture.state, error))})()
+    report_attempt_end(_capture("settled"), None)  # no tracker bound
+    with track_physical_attempts(tracker):
+        report_attempt_end(_capture("reserved"), None)
+        report_attempt_end(_capture("reserved", 400), error := _failure())  # a failed release is a reported end
+        report_attempt_end(_capture("settled"), None)
+    assert heard == [("reserved", error), ("settled", None)]

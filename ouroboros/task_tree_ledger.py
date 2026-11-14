@@ -16,6 +16,8 @@ from __future__ import annotations
 import json
 import logging
 import pathlib
+import threading
+from collections import OrderedDict
 from hashlib import sha256
 from typing import Any, Dict, List
 
@@ -60,6 +62,8 @@ _MAX_TEXT_CHARS = 4000
 # Bound runaway growth — this is a coordination ledger, not a bulk-data store.
 _MAX_LEDGER_BYTES = 2 * 1024 * 1024
 _MAX_EVIDENCE_REF_CHARS = 1000
+_ROWS_CACHE: OrderedDict = OrderedDict()
+_ROWS_LOCK = threading.Lock()
 
 
 def normalize_review_request_payload(payload: Any) -> Dict[str, str] | None:
@@ -291,6 +295,9 @@ def tree_ledger_append(
         row["payload"] = payload_out
     try:
         written = append_jsonl(path, row)
+        if written:
+            from ouroboros.maintenance_retirement import artifact_changed
+            artifact_changed(path.parent.parent.parent)
     except Exception:
         log.warning("Failed to append task-tree ledger row for %s", rid, exc_info=True)
         written = False
@@ -361,7 +368,11 @@ def record_subscription_window_exhausted(
     try:
         path = tree_ledger_path(rid, data_root=data_root)
         path.parent.mkdir(parents=True, exist_ok=True)
-        return bool(append_jsonl(path, row))
+        written = bool(append_jsonl(path, row))
+        if written:
+            from ouroboros.maintenance_retirement import artifact_changed
+            artifact_changed(path.parent.parent.parent)
+        return written
     except Exception:
         log.debug("Failed to append subscription-window-exhausted beacon for %s", rid, exc_info=True)
         return False
@@ -372,13 +383,29 @@ def tree_ledger_rows(
     *,
     data_root: pathlib.Path | None = None,
 ) -> List[Dict[str, Any]]:
+    """Read-only rows cached by (path, st_size, st_mtime_ns): an unchanged file costs one stat.
+
+    Physical cache bounds: 32 ledgers and 8 MiB of source bytes in total.
+    Larger ledgers are still read whole, but not retained. An append invalidates the cached generation.
+    """
     try:
         path = tree_ledger_path(root_id, data_root=data_root)  # raises on malformed root_id
-    except ValueError:
+        stat = path.stat()
+    except (ValueError, OSError):
         return []  # reads are fail-soft: a bad/unknown scope simply has no rows
-    if not path.is_file():
-        return []
-    return [r for r in iter_jsonl_objects(path) if isinstance(r, dict)]
+    identity = (stat.st_size, stat.st_mtime_ns)
+    with _ROWS_LOCK:
+        cached = _ROWS_CACHE.get(path)
+        if cached is not None and cached[0] == identity:
+            _ROWS_CACHE.move_to_end(path)
+            return cached[1]
+        rows = [r for r in iter_jsonl_objects(path) if isinstance(r, dict)]
+        _ROWS_CACHE.pop(path, None)
+        if stat.st_size <= 8 * 1024 * 1024:
+            _ROWS_CACHE[path] = (identity, rows)
+            while len(_ROWS_CACHE) > 32 or sum(value[0][0] for value in _ROWS_CACHE.values()) > 8 * 1024 * 1024:
+                _ROWS_CACHE.popitem(last=False)
+        return rows
 
 
 def tree_ledger_row_id(row: Dict[str, Any]) -> str:
@@ -489,7 +516,8 @@ def _tree_ledger_snapshot_rows(
 
 def _format_tree_ledger_row(row: Dict[str, Any]) -> str:
     flag = " ⚠needs_parent_attention" if row.get("needs_parent_attention") else ""
-    who = str(row.get("role") or "") or str(row.get("task_id") or "")[:8]
+    # Role AND the full task id: a row is addressable with forward_to_worker/peek_task.
+    who = " ".join(part for part in (str(row.get("role") or ""), str(row.get("task_id") or "")) if part)
     payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
     payload_note = ""
     if str(row.get("kind") or "") == DELEGATION_CONSTRAINT_KIND and payload:

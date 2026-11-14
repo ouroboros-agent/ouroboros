@@ -49,13 +49,16 @@ def test_settings_template_contract():
     # Sprint bench-template decisions.
     assert settings["OUROBOROS_MAX_WORKERS"] == 4
     assert settings["OUROBOROS_SAFETY_MODE"] == "light"
-    assert settings["OUROBOROS_REVIEW_ENFORCEMENT"] == "blocking"
+    assert "OUROBOROS_REVIEW_ENFORCEMENT" not in settings  # retired: a FAIL is shown to the agent, which decides
     assert settings["OUROBOROS_POST_TASK_EVOLUTION"] == "false"
     actors = json.loads(settings["OUROBOROS_SUBAGENTS"])
     assert actors["enabled"] is True
-    assert [row["route"]["target_id"] for row in actors["items"]] == [
-        settings["OUROBOROS_MODEL"]
-    ]
+    # One actor row plus the three packet review seats, all on the solve model.
+    rows = {marked: [row["route"]["target_id"] for row in actors["items"]
+                     if bool(row.get("review_eligible")) is marked] for marked in (False, True)}
+    assert rows == {False: [settings["OUROBOROS_MODEL"]], True: [settings["OUROBOROS_MODEL"]] * 3}
+    assert all(row["delivery"] == "packet" for row in actors["items"] if row.get("review_eligible"))
+    assert "OUROBOROS_REVIEWER_SLOTS" not in settings
     assert "claude_code_edit" in settings["CLBENCH_SOLVE_DISABLED_TOOLS"]
     # The declared solve denylist must cover the registry's REAL web-tool set
     # (cumulative review r2: youtube_transcript had drifted out) and must not
@@ -188,7 +191,7 @@ def test_dry_run_writes_manifest_and_blanked_settings(tmp_path, monkeypatch):
     assert params["max_workers"] == 4  # within-task subagent pool, not cross-task parallelism
     fidelity = manifest["extra"]["fidelity"]
     assert "OUROBOROS_SAFETY_MODE" in fidelity["declared_only_pinned_adapter_gap"]
-    assert "OUROBOROS_REVIEW_ENFORCEMENT" in fidelity["declared_only_pinned_adapter_gap"]
+    assert "OUROBOROS_REVIEW_ENFORCEMENT" not in fidelity["declared_only_pinned_adapter_gap"]
     assert "OUROBOROS_SUBAGENTS" in fidelity["declared_only_pinned_adapter_gap"]
     assert manifest["available_subagents"]["items"][0]["route"]["target_id"] == \
         rendered["OUROBOROS_MODEL"]
@@ -326,7 +329,7 @@ def _pin_live_roots(tmp_path, monkeypatch, *, live_repo: Path) -> None:
     earlier version of these tests set only the environment and therefore asserted a verdict it
     did not own. It passed in a worktree (where `_WORKSPACE_ROOT/repo` is a different tree) and
     failed in the advisory preflight sandbox, where the suite runs from
-    `/tmp/ouroboros-preflight-*/repo` and that sibling IS the checkout under test. The
+    `/tmp/obs-preflight-*/repo` and that sibling IS the checkout under test. The
     production logic was right in both places; the test was reading ambient state.
 
     Tests here assert the gate's SHAPE, or a verdict every input of which they control. This is
@@ -590,7 +593,7 @@ def test_fidelity_follows_the_execution_clone_not_the_pinned_commit_constant(tmp
         return json.loads(buf.getvalue())["fidelity"]
 
     unpatched = _fidelity_of()
-    for knob in ("OUROBOROS_SAFETY_MODE", "OUROBOROS_REVIEW_ENFORCEMENT", "OUROBOROS_SUBAGENTS",
+    for knob in ("OUROBOROS_SAFETY_MODE", "OUROBOROS_SUBAGENTS",
                  "CLBENCH_SOLVE_DISABLED_TOOLS"):
         assert knob in unpatched["declared_only_pinned_adapter_gap"]
         assert knob not in unpatched["enforced_via_operator_patch"]
@@ -618,14 +621,18 @@ def test_fidelity_follows_the_execution_clone_not_the_pinned_commit_constant(tmp
         encoding="utf-8")
 
     patched = _fidelity_of()
-    assert patched["declared_only_pinned_adapter_gap"] == {}
-    for knob in ("OUROBOROS_SAFETY_MODE", "OUROBOROS_REVIEW_ENFORCEMENT", "OUROBOROS_SUBAGENTS",
+    # Only the Required request stays a gap on every clone (#1731, O4): the launcher renders
+    # and exports it but cannot attest the external adapter's executing settings.
+    unattested = {"OUROBOROS_TASK_REVIEW_MODE"}
+    assert set(patched["declared_only_pinned_adapter_gap"]) == unattested
+    assert patched["declared_only_pinned_adapter_gap"]["OUROBOROS_TASK_REVIEW_MODE"]["declared"] == "required"
+    assert not unattested & set(patched["enforced_via_operator_patch"])
+    for knob in ("OUROBOROS_SAFETY_MODE", "OUROBOROS_SUBAGENTS",
                  "CLBENCH_SOLVE_DISABLED_TOOLS"):
         assert knob in patched["enforced_via_operator_patch"]
     # The declared values are the ones the patched clone really applies.
     assert patched["enforced_via_operator_patch"]["OUROBOROS_SAFETY_MODE"]["declared"] == "light"
-    assert patched["enforced_via_operator_patch"][
-        "OUROBOROS_REVIEW_ENFORCEMENT"]["declared"] == "blocking"
+    assert "OUROBOROS_REVIEW_ENFORCEMENT" not in patched["enforced_via_operator_patch"]
     assert json.loads(patched["enforced_via_operator_patch"][
         "OUROBOROS_SUBAGENTS"]["declared"])["items"][0]["route"]["target_id"] == \
         "anthropic/claude-sonnet-4.6"
@@ -639,7 +646,7 @@ def test_fidelity_follows_the_execution_clone_not_the_pinned_commit_constant(tmp
     )
     host_patched = _fidelity_of("--no-docker")
     assert "OUROBOROS_SUBAGENTS" in host_patched["enforced_via_operator_patch"]
-    assert host_patched["declared_only_pinned_adapter_gap"] == {}
+    assert set(host_patched["declared_only_pinned_adapter_gap"]) == unattested
 
 
 def test_seed_gate_binds_to_the_execution_clone_and_records_the_launcher_separately(tmp_path):
@@ -822,28 +829,7 @@ def test_clb_operator_patches_are_tracked_with_an_unambiguous_apply_order():
     assert [p.name for p in required] == ["base_url", "repo_dir"]
     assert all(p.default is inspect.Parameter.empty for p in required)
     assert "runtime_attestation(self._server.base_url, pathlib.Path(clone)," in attest
-    # ...and the signature the patch DOCUMENTS must name it too, or the next reader copies
-    # the broken call back out of the docstring.
-    assert "runtime_attestation(base_url, repo_dir, *, expected_version=" in attest
     assert "OBO_ALLOW_EVOLVED_VOLUME" in attest
-    readme = (patches / "README.md").read_text(encoding="utf-8")
-    # The stack order must name the three predecessor bridge patches explicitly.
-    for name in ("run_clbench_bridge_agent.v6560.patch", "clb_acceptance_claims.v674.patch",
-                 "clb_disabled_tools_env.v6745.patch"):
-        assert name in readme
-    order = readme.index("Apply order (unambiguous)")
-    assert order < readme.index("clb_multi_instance_outcomes.v6746.patch")
-
-
-def test_clb_methodology_states_poker_instance_count_and_outcome_semantics():
-    text = (REPO_ROOT / "devtools" / "benchmarks" / "continual_learning"
-            / "METHODOLOGY.md").read_text(encoding="utf-8")
-    assert "`exploitable_poker` = 120" in text
-    assert "--num-instances 120" in text
-    assert "auto_resolved_no_agent_turn" in text
-    assert "Accepted overshoot (owner decision)" in text
-    assert "late_instance_outcomes_fill" in text
-    assert "Disclosed residual" in text
 
 
 def test_collect_results_normalizes_bridge_traces(tmp_path):

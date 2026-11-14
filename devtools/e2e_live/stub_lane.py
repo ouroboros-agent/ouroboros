@@ -14,6 +14,9 @@ import json
 STUB_MODEL_SLUG = "openai-compatible::mock-model"   # == harness.MOCK_SLUG (asserted in stub_settings)
 STUB_CHILD_SLUG = "openai-compatible::mock-child"
 STUB_MODEL_SLOTS = {"OUROBOROS_MODEL": STUB_MODEL_SLUG, "OUROBOROS_MODEL_LIGHT": STUB_MODEL_SLUG}
+# Carried by every stub attempt row and printed with its verdicts: a pass here says the path ran, never that anyone judged it.
+MACHINERY_ONLY = ("keyless stub: the critics' answers are canned and the author's steps scripted, so this verifies the "
+                  "machinery of the path, not independent semantic review or design quality")
 
 
 def routed_stub_model(script: dict):
@@ -66,7 +69,7 @@ def routed_stub_model(script: dict):
 
 def stub_settings(stub, template: dict) -> dict:
     """The keyless lane settings: every slot the tree declares pinned (the loop slots to the
-    loopback stub, the rest empty), the review panel and the advisory row on the stub, then the
+    loopback stub, the rest empty), every reviewer of the review pool on the stub, then the
     run template's knobs (budget, workers, evolution) on top. Refuses a template that would
     smuggle a paid slot or a credential."""
     from tests.system_e2e import harness
@@ -75,7 +78,6 @@ def stub_settings(stub, template: dict) -> dict:
         raise RuntimeError("stub slug drifted from the harness MOCK_SLUG")
     cfg = harness.keyless_settings(
         stub,
-        OUROBOROS_REVIEWER_SLOTS=harness.keyless_reviewer_slots(advisory=True),
         OUROBOROS_RUNTIME_MODE="advanced",
         # The tree's default context mode, declared explicitly: the suite's keyless Low would
         # either be normalized to Max at boot (a persist the strict snapshot pin refuses) or,

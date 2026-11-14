@@ -1,10 +1,14 @@
+from tests._shared import write_queue_document
 import json
 import pathlib
 import threading
 import time
 from types import SimpleNamespace
 
+from tests.worker_pool_support import affirm_ready
+
 import pytest
+from tests._store_shared import read_result, result_exists
 
 _TEST_SUBAGENTS = '{"enabled":true,"items":[{"subagent_id":"api-scout","name":"API scout","recommended_use":"Tests","route":{"kind":"api_model","target_id":"openai/gpt-5.6-sol"},"effort":"high"}]}'
 
@@ -23,8 +27,7 @@ class _FakeEventQueue:
         if self.fail:
             raise RuntimeError("queue unavailable")
         if self.status_root is not None:
-            path = pathlib.Path(self.status_root) / "task_results" / f"{evt['task_id']}.json"
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = read_result(self.status_root, evt["task_id"])
             assert data["status"] == "requested"
         self.events.append(dict(evt))
 
@@ -35,7 +38,10 @@ def test_schedule_task_live_emits_strict_contract_and_requested_status(tmp_path,
 
     _configure_test_subagent(monkeypatch)
     event_queue = _FakeEventQueue(status_root=tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
     ctx = SimpleNamespace(
+        repo_dir=repo,
         task_depth=0,
         pending_events=[],
         event_queue=event_queue,
@@ -57,9 +63,14 @@ def test_schedule_task_live_emits_strict_contract_and_requested_status(tmp_path,
     )
 
     assert "Subagent request queued" in result
+    # The result names the engine by its handle; the stored key stays in the
+    # durable snapshot and never reaches the model.
+    assert "(subagent_id=openai/gpt-5.6-sol/high, route=api_model" in result
+    assert "api-scout" not in result
     assert ctx.pending_events == []
     assert len(event_queue.events) == 1
     evt = event_queue.events[0]
+    assert evt["configured_subagent"]["selected_subagent_id"] == "api-scout"
     task_id = evt["task_id"]
     assert evt["description"] == "Do the thing"
     assert evt["expected_output"] == "A concise handoff"
@@ -74,8 +85,7 @@ def test_schedule_task_live_emits_strict_contract_and_requested_status(tmp_path,
     assert evt["child_drive_root"] == evt["drive_root"]
     assert evt["budget_drive_root"] == str(tmp_path)
     assert evt["task_constraint"]["mode"] == "local_readonly_subagent"
-    path = tmp_path / "task_results" / f"{task_id}.json"
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = read_result(tmp_path, task_id)
     assert data["status"] == STATUS_REQUESTED
     assert data["description"] == "Do the thing"
     assert data["expected_output"] == "A concise handoff"
@@ -91,7 +101,10 @@ def test_schedule_task_falls_back_to_pending_events_when_live_queue_unavailable(
     from ouroboros.tools.control import _schedule_task
 
     _configure_test_subagent(monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
     ctx = SimpleNamespace(
+        repo_dir=repo,
         task_depth=0,
         pending_events=[],
         event_queue=_FakeEventQueue(fail=True),
@@ -151,7 +164,7 @@ def test_cancel_task_writes_durable_intent_and_emits_live(tmp_path):
     assert any(e.get("type") == "cancel_task" and e.get("task_id") == "child42" for e in event_queue.events)
     # Idempotent: a second request reuses the intent instead of re-minting.
     again = _cancel_task(ctx, "child42")
-    assert "idempotent" in again
+    assert "existing cancellation custody retained" in again
     assert active_intent(tmp_path, "child42")["request_id"] == intent["request_id"]
 
 
@@ -201,12 +214,9 @@ def test_natural_completion_wins_a_late_cancel(tmp_path, monkeypatch):
         is_workspace_mode=lambda: False,
     )
 
-    from ouroboros.utils import atomic_write_json, utc_now_iso
+    from ouroboros.utils import utc_now_iso
 
-    atomic_write_json(
-        tmp_path / "state" / "queue_snapshot.json",
-        {"ts": utc_now_iso(), "running": [], "pending": []},
-    )
+    write_queue_document(tmp_path / "state" / "queue_snapshot.json", {"ts": utc_now_iso(), "running": [], "pending": []})
     assert "Nothing to cancel" in _cancel_task(ctx, "fast-child")
     assert active_intent(tmp_path, "fast-child") is None
     monkeypatch.setattr(queue_module, "DRIVE_ROOT", tmp_path)
@@ -216,7 +226,9 @@ def test_natural_completion_wins_a_late_cancel(tmp_path, monkeypatch):
     monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": None)
     monkeypatch.setattr(queue_module, "_emit_cancel_task_done", lambda *_args, **_kwargs: None)
 
-    assert queue_module.cancel_task_by_id("fast-child") is True
+    # No intent was ever minted (the tool saw a settled child), so custody is the
+    # typed no-op already_settled (A2): nothing captured, nothing written.
+    assert task_lifecycle.cancel_task_custody("fast-child") == task_lifecycle.CANCEL_ALREADY_SETTLED
     stored = load_task_result(tmp_path, "fast-child")
     assert stored["status"] == STATUS_COMPLETED
     assert stored["accounted_upper_bound_usd"] == 0.75
@@ -226,12 +238,9 @@ def test_natural_completion_wins_a_late_cancel(tmp_path, monkeypatch):
     # Completion wins WITHOUT a parent_decision stamp: discarding a kept result
     # stays a separate explicit action (discard_child_result).
     assert "parent_decision" not in stored
-    # The durable intent settled (already_settled) — nothing left pending.
     assert active_intent(tmp_path, "fast-child") is None
     public = public_task_result(stored)
     assert public["outcome_axes"]["execution"]["status"] == "ok"
-    # The typed custody outcome (not the boolean facade) reports already_settled.
-    assert task_lifecycle.cancel_task_custody("fast-child") == task_lifecycle.CANCEL_ALREADY_SETTLED
 
 
 def test_cancel_workspace_task_records_terminal_artifact_state(tmp_path, monkeypatch):
@@ -269,7 +278,10 @@ def test_cancel_workspace_task_records_terminal_artifact_state(tmp_path, monkeyp
         result="queued",
     )
 
-    assert queue_module.cancel_task_by_id("workspacecancel") is True
+    from ouroboros.cancel_intents import request_cancel
+
+    request_cancel(tmp_path, "workspacecancel")
+    assert queue_module.drive_cancel_intent_scope("workspacecancel") == queue_module.CANCEL_CANCELLED
 
     stored = load_task_result(tmp_path, "workspacecancel")
     assert stored["status"] == STATUS_CANCELLED
@@ -318,7 +330,10 @@ def test_schedule_task_memory_modes_prepare_declared_drive_shape(tmp_path, monke
     (parent_memory / "knowledge" / "pattern.md").write_text("stable pattern", encoding="utf-8")
 
     event_queue = _FakeEventQueue()
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
     ctx = SimpleNamespace(
+        repo_dir=repo,
         task_depth=0,
         pending_events=[],
         event_queue=event_queue,
@@ -377,7 +392,10 @@ def test_configured_session_child_materializes_initial_and_steered_attachments(t
         attachment_manifest=steered_manifest,
     )
     event_queue = _FakeEventQueue()
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
     ctx = SimpleNamespace(
+        repo_dir=repo,
         task_depth=0, pending_events=[], event_queue=event_queue,
         drive_root=tmp_path, task_id="parent-attachments",
         task_contract={"attachment_manifest": [dict(row) for row in parent_manifest]},
@@ -417,7 +435,10 @@ def test_schedule_task_rejects_legacy_description_schema(tmp_path, monkeypatch):
     from ouroboros.tools.control import _schedule_task
 
     _configure_test_subagent(monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
     ctx = SimpleNamespace(
+        repo_dir=repo,
         task_depth=0,
         pending_events=[],
         event_queue=None,
@@ -496,8 +517,8 @@ def test_schedule_task_workspace_mode_inherits_context_and_enqueues(tmp_path, mo
     assert evt["workspace_root"] == str(tmp_path / "workspace")
     assert evt["budget_drive_root"] == str(budget_root)
     assert str(evt["child_drive_root"]).startswith(str(budget_root))
-    assert not (tmp_path / "task_results" / f"{task_id}.json").exists()
-    data = json.loads((budget_root / "task_results" / f"{task_id}.json").read_text(encoding="utf-8"))
+    assert not result_exists(tmp_path, task_id)
+    data = read_result(budget_root, task_id)
     assert data["budget_drive_root"] == str(budget_root)
     assert data["child_drive_root"] == evt["child_drive_root"]
 
@@ -675,9 +696,9 @@ def test_child_finalization_publishes_receipts_to_canonical_root(tmp_path):
 
     # Durability: the receipts survive child-drive pruning (retention GC / the
     # cancel path delete the drive; the canonical copy is the durable record).
-    import shutil as _shutil
+    from tests._store_shared import remove_store_tree
 
-    _shutil.rmtree(child_drive)
+    remove_store_tree(child_drive)
     rows = _receipt_rows_of(_get_task_result(SimpleNamespace(drive_root=tmp_path), tid))
     assert rows is not None and len(rows) == 3
     assert rows[0]["criterion_id"] == "claim_red"
@@ -775,13 +796,14 @@ def test_materializing_child_read_cannot_overwrite_canonical_zero_run_receipt(tm
         "ts": "2026-01-01T00:00:02+00:00",
     })
 
-    # Repeated polling must preserve the canonical-only row.  Final copy-back
-    # then unions the ordinary child check into that same authority file.
+    # Repeated polling must preserve the canonical-only row, and a read writes no
+    # receipt (TZ-1 A: reads are pure). Final copy-back then unions the ordinary
+    # child check into that same authority file.
     effective_task_result(tmp_path, load_task_result(tmp_path, tid) or {})
     assert [
         row.get("contract_kind")
         for row in read_verification_receipts(tmp_path, tid)
-    ] == [None, "delegation_zero_run"]
+    ] == ["delegation_zero_run"]
 
     copied = copy_child_task_result(
         tmp_path, {"id": tid, "drive_root": str(child_drive)},
@@ -1324,7 +1346,6 @@ def test_wait_surfaces_preentry_beacon_before_terminal_fast_path(tmp_path, monke
 
 
 def test_wait_for_tasks_flags_unknown_ids_and_attaches_children_roster(tmp_path):
-    import json as _json
 
     from ouroboros.task_results import STATUS_COMPLETED, write_task_result
     from ouroboros.tools.control import _wait_for_tasks
@@ -1334,9 +1355,7 @@ def test_wait_for_tasks_flags_unknown_ids_and_attaches_children_roster(tmp_path)
     # unreadable surface), so the unknown verdict needs all surfaces present.
     state_dir = tmp_path / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
-    (state_dir / "queue_snapshot.json").write_text(
-        _json.dumps({"pending": [], "running": []}), encoding="utf-8"
-    )
+    write_queue_document(state_dir / "queue_snapshot.json", {"pending": [], "running": []})
     write_task_result(
         tmp_path,
         "realchild1",
@@ -1366,12 +1385,12 @@ def test_wait_for_tasks_flags_unknown_ids_and_attaches_children_roster(tmp_path)
     assert real["status"] == STATUS_COMPLETED
     assert "unknown_task_id" not in real
 
-    # The repair surface: the ACTUAL direct children, compact v6.71.2 field set
-    # only — no result/trace envelope fields, absent accounting projects null.
+    # Actual children stay compact, with execution evidence and honest accounting.
     roster = payload["children_roster"]
     assert [row["task_id"] for row in roster] == ["realchild1"]
     assert set(roster[0]) == {"task_id", "status", "accounted_upper_bound_usd",
-                              "child_result_sha256", "outcome_axes"}
+                              "child_result_sha256", "outcome_axes", "execution_observation"}
+    assert roster[0]["execution_observation"]["state"] == "terminal"
     assert roster[0]["accounted_upper_bound_usd"] == 0.55
     # Nothing was capped away, and the projection SAYS so (BIBLE P1).
     assert payload["children_roster_omitted"] == 0
@@ -1408,15 +1427,14 @@ def test_children_roster_projection_discloses_the_capped_tail(tmp_path):
     assert projected["children_roster_omitted"] == total - 30  # …and is disclosed
     assert all(
         set(row) == {"task_id", "status", "accounted_upper_bound_usd",
-                     "child_result_sha256", "outcome_axes"}
-        for row in roster
+                     "child_result_sha256", "outcome_axes", "execution_observation"}
+        and row["execution_observation"]["state"] == "terminal" for row in roster
     )
 
 
 def test_wait_for_tasks_phantom_only_set_short_circuits_the_window(tmp_path, monkeypatch):
     """A wait set in which NOTHING was ever minted ends after the registration
     grace instead of blocking the whole requested window — and says so."""
-    import json as _json
 
     from ouroboros.tools import control
     # The wait internals live in the extracted owner leaf (v7 D07 split):
@@ -1426,9 +1444,7 @@ def test_wait_for_tasks_phantom_only_set_short_circuits_the_window(tmp_path, mon
 
     state_dir = tmp_path / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
-    (state_dir / "queue_snapshot.json").write_text(
-        _json.dumps({"pending": [], "running": []}), encoding="utf-8"
-    )
+    write_queue_document(state_dir / "queue_snapshot.json", {"pending": [], "running": []})
     monkeypatch.setattr(control_task_results, "_UNMINTED_WAIT_GRACE_SEC", 0.1)
 
     ctx = SimpleNamespace(drive_root=tmp_path, task_id="waitparent3", task_metadata={})
@@ -1449,7 +1465,6 @@ def test_wait_for_tasks_phantom_only_set_short_circuits_the_window(tmp_path, mon
 def test_wait_for_tasks_id_minted_during_grace_keeps_waiting(tmp_path, monkeypatch):
     """The grace is for the registration race: an id that becomes real during it
     is a genuine child, so the wait resumes with the remaining window."""
-    import json as _json
 
     from ouroboros.task_results import STATUS_COMPLETED, write_task_result
     from ouroboros.tools import control
@@ -1460,9 +1475,7 @@ def test_wait_for_tasks_id_minted_during_grace_keeps_waiting(tmp_path, monkeypat
 
     state_dir = tmp_path / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
-    (state_dir / "queue_snapshot.json").write_text(
-        _json.dumps({"pending": [], "running": []}), encoding="utf-8"
-    )
+    write_queue_document(state_dir / "queue_snapshot.json", {"pending": [], "running": []})
     monkeypatch.setattr(control_task_results, "_UNMINTED_WAIT_GRACE_SEC", 0.1)
 
     real_calls = {"n": 0}
@@ -1492,14 +1505,13 @@ def test_wait_for_tasks_queue_scheduled_id_is_not_unknown(tmp_path):
     """An id with a queue-snapshot row but no task result yet is a REAL child
     (just-scheduled), never a phantom — and without unknowns the roster is not
     attached (the compact batch stays compact, v6.71.2)."""
-    import json as _json
 
     from ouroboros.tools.control import _wait_for_tasks
 
     snapshot = {"pending": [{"id": "queuedonly1", "task": {}}], "running": []}
     state_dir = tmp_path / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
-    (state_dir / "queue_snapshot.json").write_text(_json.dumps(snapshot), encoding="utf-8")
+    write_queue_document(state_dir / "queue_snapshot.json", snapshot)
 
     ctx = SimpleNamespace(drive_root=tmp_path, task_id="waitparent2", task_metadata={})
     payload = json.loads(_wait_for_tasks(ctx, ["queuedonly1"], timeout_sec=0))
@@ -1612,10 +1624,7 @@ def test_effective_status_repairs_stale_running_infra_failure_when_queue_empty(t
         },
     )
     (tmp_path / "state").mkdir(exist_ok=True)
-    (tmp_path / "state" / "queue_snapshot.json").write_text(
-        '{"ts": "2027-01-15T08:00:00+00:00", "pending": [], "running": []}',
-        encoding="utf-8",
-    )
+    write_queue_document(tmp_path / "state" / "queue_snapshot.json", {'ts': '2027-01-15T08:00:00+00:00', 'pending': [], 'running': []})
 
     effective = load_effective_task_result(tmp_path, "providerfail")
 
@@ -1668,10 +1677,7 @@ def test_effective_status_repairs_orphan_running_after_worker_restart(tmp_path, 
         },
     )
     (tmp_path / "state").mkdir(exist_ok=True)
-    (tmp_path / "state" / "queue_snapshot.json").write_text(
-        '{"ts": "2027-01-15T08:00:00+00:00", "pending": [], "running": []}',
-        encoding="utf-8",
-    )
+    write_queue_document(tmp_path / "state" / "queue_snapshot.json", {'ts': '2027-01-15T08:00:00+00:00', 'pending': [], 'running': []})
     events = tmp_path / "logs" / "events.jsonl"
     append_jsonl(events, {"ts": "2026-05-28T00:00:01+00:00", "type": "llm_round", "task_id": "cc4db6fa"})
     append_jsonl(events, {"ts": "2026-05-28T00:00:02+00:00", "type": "worker_boot"})
@@ -1707,10 +1713,7 @@ def test_reconcile_durably_finalizes_orphaned_running_task(tmp_path, monkeypatch
         result="Task is running.", ts="2026-05-28T00:00:00+00:00",
     )
     (tmp_path / "state").mkdir(exist_ok=True)
-    (tmp_path / "state" / "queue_snapshot.json").write_text(
-        '{"ts": "2027-01-15T08:00:00+00:00", "pending": [], "running": []}',
-        encoding="utf-8",
-    )
+    write_queue_document(tmp_path / "state" / "queue_snapshot.json", {'ts': '2027-01-15T08:00:00+00:00', 'pending': [], 'running': []})
     events = tmp_path / "logs" / "events.jsonl"
     append_jsonl(events, {"ts": "2026-05-28T00:00:01+00:00", "type": "llm_round", "task_id": "orphan1"})
     append_jsonl(events, {"ts": "2026-05-28T00:00:02+00:00", "type": "worker_boot"})
@@ -1738,7 +1741,7 @@ def test_best_effort_outcome_is_not_a_terminal_failure(tmp_path):
         },
     )
     (tmp_path / "state").mkdir(exist_ok=True)
-    (tmp_path / "state" / "queue_snapshot.json").write_text('{"pending": [], "running": []}', encoding="utf-8")
+    write_queue_document(tmp_path / "state" / "queue_snapshot.json", {'pending': [], 'running': []})
 
     effective = load_effective_task_result(tmp_path, "besteffort1")
 
@@ -1789,8 +1792,8 @@ def test_find_child_tasks_does_not_regress_terminal_or_running_from_stale_queue_
         ],
         "running": [],
     }
-    (tmp_path / "state").mkdir()
-    (tmp_path / "state" / "queue_snapshot.json").write_text(json.dumps(snapshot), encoding="utf-8")
+    (tmp_path / "state").mkdir(exist_ok=True)
+    write_queue_document(tmp_path / "state" / "queue_snapshot.json", snapshot)
 
     effective_done = load_effective_task_result(tmp_path, "childdone")
     effective_running = load_effective_task_result(tmp_path, "childrun")
@@ -1842,7 +1845,7 @@ def test_effective_status_preserves_parent_retry_status_over_stale_child_running
         ],
         "running": [],
     }
-    (tmp_path / "state" / "queue_snapshot.json").write_text(json.dumps(snapshot), encoding="utf-8")
+    write_queue_document(tmp_path / "state" / "queue_snapshot.json", snapshot)
 
     effective = load_effective_task_result(tmp_path, "childretry")
 
@@ -2008,9 +2011,8 @@ def test_handle_schedule_task_admits_identical_siblings_without_semantic_veto(tm
 
     assert [task["id"] for task in enqueued] == ["sib1", "sib2", "sib3", "sib4"]
     for tid in ("sib1", "sib2", "sib3", "sib4"):
-        path = tmp_path / "task_results" / f"{tid}.json"
-        assert path.exists(), f"{tid} was not admitted"
-        data = json.loads(path.read_text(encoding="utf-8"))
+        assert result_exists(tmp_path, tid), f"{tid} was not admitted"
+        data = read_result(tmp_path, tid)
         assert data["status"] == STATUS_SCHEDULED
         assert "duplicate_of" not in data
     assert not [text for _chat, text, _kw in sent if "semantically similar" in text]
@@ -2039,7 +2041,8 @@ def test_handle_schedule_task_accepts_unique_subagent_with_lineage_and_constrain
             sent.append((chat_id, text, kwargs))
 
         def enqueue_task(self, task):
-            enqueued.append(task)
+            enqueued.append(dict(task))
+            return enqueued[-1]
 
         def persist_queue_snapshot(self, reason=""):
             self.snapshot_reason = reason
@@ -2082,7 +2085,7 @@ def test_handle_schedule_task_accepts_unique_subagent_with_lineage_and_constrain
     assert task["task_constraint"]["allow_review"] is False
     assert "[EXPECTED_OUTPUT]" in task["text"]
     assert "[BEGIN_PARENT_CONTEXT" in task["text"]
-    data = json.loads((tmp_path / "task_results" / "child123.json").read_text(encoding="utf-8"))
+    data = read_result(tmp_path, "child123")
     assert data["status"] == STATUS_SCHEDULED
     assert data["expected_output"] == "Findings table"
     assert data["child_drive_root"] == task["drive_root"]
@@ -2126,7 +2129,7 @@ def test_handle_schedule_task_rejects_internal_subagent_without_child_drive_cont
         FakeCtx(),
     )
 
-    data = json.loads((tmp_path / "task_results" / "badchild.json").read_text(encoding="utf-8"))
+    data = read_result(tmp_path, "badchild")
     assert data["status"] == STATUS_FAILED
     assert "memory_mode=forked or empty" in data["result"]
     assert sent and sent[0][2]["progress_meta"]["subagent_event"] == "rejected"
@@ -2155,7 +2158,8 @@ def test_handle_schedule_task_uses_event_chat_id_without_owner(tmp_path, monkeyp
             sent.append((chat_id, text, kwargs))
 
         def enqueue_task(self, task):
-            enqueued.append(task)
+            enqueued.append(dict(task))
+            return enqueued[-1]
 
         def persist_queue_snapshot(self, reason=""):
             self.snapshot_reason = reason
@@ -2178,7 +2182,7 @@ def test_handle_schedule_task_uses_event_chat_id_without_owner(tmp_path, monkeyp
 
     assert len(enqueued) == 1
     assert enqueued[0]["chat_id"] == 44
-    scheduled = json.loads((tmp_path / "task_results" / "headless1.json").read_text(encoding="utf-8"))
+    scheduled = read_result(tmp_path, "headless1")
     assert scheduled["status"] == STATUS_SCHEDULED
     assert scheduled["chat_id"] == 44
     assert sent and sent[0][0] == 44
@@ -2206,7 +2210,7 @@ def test_handle_schedule_task_uses_event_chat_id_without_owner(tmp_path, monkeyp
     # headless run's progress log is read back as its benchmark trajectory.
     assert len(enqueued) == 2
     assert enqueued[1]["id"] == "headless2"
-    scheduled2 = json.loads((tmp_path / "task_results" / "headless2.json").read_text(encoding="utf-8"))
+    scheduled2 = read_result(tmp_path, "headless2")
     assert scheduled2["status"] == STATUS_SCHEDULED
     assert scheduled2["chat_id"] == 0
     assert len(sent) == 1
@@ -2249,10 +2253,12 @@ def test_handle_schedule_task_depth_rejection_writes_failed_status(tmp_path, mon
         FakeCtx(),
     )
 
-    data = json.loads((tmp_path / "task_results" / "deep1.json").read_text(encoding="utf-8"))
+    data = read_result(tmp_path, "deep1")
     assert data["status"] == STATUS_FAILED
     assert "depth limit" in data["result"]
     assert sent and "depth limit" in sent[0][1]
+    # The owner's sentence, complete on its own (a later addendum appends after its period).
+    assert sent[0][1].startswith("⚠️ Task rejected: subtask depth limit (") and sent[0][1].endswith(") exceeded.")
     assert sent[0][2]["is_progress"] is True
     assert sent[0][2]["progress_meta"]["delegation_role"] == "subagent"
     assert sent[0][2]["progress_meta"]["status"] == STATUS_FAILED
@@ -2279,9 +2285,7 @@ def test_configured_zero_subagent_depth_truly_disables_delegation(tmp_path, monk
     assert "depth limit (0) exceeded" in out
     assert "subtask_depth_limit" in out
     refused_id = out.split("task_id=", 1)[1].split(";", 1)[0]
-    refused = json.loads(
-        (tmp_path / "task_results" / f"{refused_id}.json").read_text(encoding="utf-8")
-    )
+    refused = read_result(tmp_path, refused_id)
     assert refused["status"] == STATUS_FAILED
     assert refused["delegation_admission"]["reason_code"] == "subtask_depth_limit"
     assert refused["depth_provenance"] == {
@@ -2306,7 +2310,8 @@ def test_configured_zero_subagent_depth_truly_disables_delegation(tmp_path, monk
             pass
 
         def enqueue_task(self, task):
-            enqueued.append(task)
+            enqueued.append(dict(task))
+            return enqueued[-1]
 
         def persist_queue_snapshot(self, reason=""):
             pass
@@ -2326,12 +2331,12 @@ def test_configured_zero_subagent_depth_truly_disables_delegation(tmp_path, monk
         }
 
     ev_module._handle_schedule_task(_event("child-at-1", 1), FakeCtx())
-    child = json.loads((tmp_path / "task_results" / "child-at-1.json").read_text(encoding="utf-8"))
+    child = read_result(tmp_path, "child-at-1")
     assert child["status"] == STATUS_FAILED and "depth limit (0)" in child["result"]
     assert not enqueued
 
     ev_module._handle_schedule_task(_event("root-at-0", 0), FakeCtx())
-    root = json.loads((tmp_path / "task_results" / "root-at-0.json").read_text(encoding="utf-8"))
+    root = read_result(tmp_path, "root-at-0")
     assert root["status"] != STATUS_FAILED
     assert enqueued and enqueued[0]["id"] == "root-at-0"
 
@@ -2344,28 +2349,6 @@ def test_other_bounded_int_settings_keep_their_min_of_one(monkeypatch):
     assert get_max_active_subagents_per_root() == int(
         SETTINGS_DEFAULTS["OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT"]
     )
-
-
-def test_settings_ui_carries_a_configured_zero_subagent_depth():
-    """The runtime honouring 0 is worthless if the Settings page silently reverts it: 0 is FALSY
-    in JS, so a stored 0 read through the plain `if (value)` branch displayed the fallback 3, and
-    the next Save (which posts every number field unconditionally) wrote 3 back — re-enabling three
-    levels of delegation through the UI. All three carriers of the owner's 0 are pinned: the input
-    can reach it, the depth entry is falsy-tolerant, and the load path still honours that flag
-    (without which the flag is inert)."""
-    root = pathlib.Path(__file__).resolve().parents[1]
-    settings_js = (root / "web" / "modules" / "settings.js").read_text(encoding="utf-8")
-    # The input moved from Advanced -> Runtime Limits to Agents -> Delegation
-    # (D-10): the counts bound the agents, not the process pool. Same invariant,
-    # new address.
-    settings_ui = (root / "web" / "modules" / "subagents_settings.js").read_text(encoding="utf-8")
-    assert 'id="s-subagent-depth" type="number" min="0"' in settings_ui
-    # The 4th tuple element is the falsy-tolerant flag consumed by the load path below.
-    assert "['s-subagent-depth', 'OUROBOROS_MAX_SUBAGENT_DEPTH', 3, true]" in settings_js
-    assert (
-        "if (allowFalsy ? value !== null && value !== undefined : value) byId(id).value = value;"
-        in settings_js
-    ), "the load path no longer honours the falsy-tolerant flag, so the entry is inert"
 
 
 def test_handle_schedule_task_rejects_legacy_subagent_event_schema(tmp_path, monkeypatch):
@@ -2406,7 +2389,7 @@ def test_handle_schedule_task_rejects_legacy_subagent_event_schema(tmp_path, mon
     )
 
     assert enqueued == []
-    data = json.loads((tmp_path / "task_results" / "legacy123.json").read_text(encoding="utf-8"))
+    data = read_result(tmp_path, "legacy123")
     assert data["status"] == STATUS_FAILED
     assert "objective and expected_output" in data["result"]
     assert sent and "objective and expected_output" in sent[0][1]
@@ -2414,6 +2397,64 @@ def test_handle_schedule_task_rejects_legacy_subagent_event_schema(tmp_path, mon
     assert sent[0][2]["progress_meta"]["delegation_role"] == "subagent"
     assert sent[0][2]["progress_meta"]["parent_task_id"] == "parent123"
     assert sent[0][2]["progress_meta"]["status"] == STATUS_FAILED
+
+
+@pytest.mark.parametrize("count, wait, pending, blocked, rejected", [
+    (6, "acting", 0, True, False),
+    (6, "warm", 0, False, False),
+    (6, "in_slot", 0, False, False),
+    (6, "slot_flag", 0, False, False),
+    (6, "expired", 0, True, False),
+    (6, "warm", 6, True, False),
+    (0, "cold", 6, False, False),
+    (0, "cold", 499, False, False),
+    (0, "cold", 500, True, True),
+    (499, "warm", 0, False, False),
+    (500, "warm", 0, True, True),
+])
+def test_scheduling_soft_cap_counts_acting_children_but_hard_cap_counts_all(
+        tmp_path, monkeypatch, count, wait, pending, blocked, rejected):
+    from supervisor import events, workers
+
+    monkeypatch.setenv("OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT", "6")
+    running, slots, enqueued, sent = {}, {-1: SimpleNamespace(busy_task_id=None)}, [], []
+    for wid in range(count):
+        tid = f"running-{wid}"
+        running[tid] = {"task": {"id": tid, "root_task_id": "root", "delegation_role": "subagent"}, "worker_id": wid}
+        slots[wid] = SimpleNamespace(busy_task_id=tid, active_capacity=wait != "slot_flag")
+        if wait == "warm":
+            running[tid]["owner_wait"] = {"state": "waiting"}
+        elif wait in {"in_slot", "expired"}:
+            running[tid]["active_operation_leases"] = {"wait": {
+                "kind": "in_slot_wait", "until_ts": time.time() + (600 if wait == "in_slot" else -1)}}
+    monkeypatch.setattr(workers, "WORKERS", slots)
+    ctx = SimpleNamespace(
+        DRIVE_ROOT=tmp_path, RUNNING=running, WORKERS=slots,
+        PENDING=[{"id": f"pending-{i}", "root_task_id": "root", "delegation_role": "subagent"}
+                 for i in range(pending)],
+        load_state=lambda: {"owner_chat_id": 1},
+        send_with_budget=lambda chat, text, **kw: sent.append((text, kw)),
+        enqueue_task=lambda task: enqueued.append(dict(task)) or task,
+        persist_queue_snapshot=lambda reason="": None,
+    )
+    if wait == "cold":
+        for task in ctx.PENDING:
+            task["_budget_pause"] = {"reason": "sleep", "sleep": {}}
+    drive = str(tmp_path / "state" / "headless_tasks" / "next" / "data")
+    events._handle_schedule_task({
+        "type": "schedule_subagent", "task_id": "next", "objective": "Inspect", "expected_output": "Findings",
+        "depth": 1, "root_task_id": "root", "parent_task_id": "root", "delegation_role": "subagent",
+        "memory_mode": "forked", "drive_root": drive, "child_drive_root": drive,
+    }, ctx)
+    result = read_result(tmp_path, "next")
+    assert result["status"] == ("failed" if rejected else "scheduled")
+    assert bool(enqueued) is not rejected
+    assert sent
+    if rejected:
+        assert "hard active child limit (500)" in sent[0][0]
+    else:
+        assert ("queued behind active subagent cap" in sent[0][0]) is blocked
+        assert bool(sent[0][1]["progress_meta"].get("queued_behind_active_cap")) is blocked
 
 
 def test_handle_schedule_task_queues_when_active_subagent_cap_is_full(tmp_path, monkeypatch):
@@ -2437,7 +2478,8 @@ def test_handle_schedule_task_queues_when_active_subagent_cap_is_full(tmp_path, 
             sent.append((chat_id, text, kwargs))
 
         def enqueue_task(self, task):
-            enqueued.append(task)
+            enqueued.append(dict(task))
+            return enqueued[-1]
 
         def persist_queue_snapshot(self, reason=""):
             pass
@@ -2458,7 +2500,7 @@ def test_handle_schedule_task_queues_when_active_subagent_cap_is_full(tmp_path, 
         FakeCtx(),
     )
 
-    data = json.loads((tmp_path / "task_results" / "child999.json").read_text(encoding="utf-8"))
+    data = read_result(tmp_path, "child999")
     assert data["status"] == STATUS_SCHEDULED
     assert enqueued and enqueued[0]["id"] == "child999"
     assert sent and "queued behind active subagent cap" in sent[0][1]
@@ -2481,7 +2523,7 @@ def test_handle_schedule_task_queues_when_active_subagent_cap_is_full(tmp_path, 
         },
         FakeCtx(),
     )
-    data2 = json.loads((tmp_path / "task_results" / "child1000.json").read_text(encoding="utf-8"))
+    data2 = read_result(tmp_path, "child1000")
     assert data2["status"] == STATUS_SCHEDULED
     assert any(task["id"] == "child1000" for task in enqueued)
 
@@ -2629,9 +2671,34 @@ def test_handle_schedule_task_fails_fast_when_worker_pool_unavailable(tmp_path, 
         FakeCtx(),
     )
 
-    data = json.loads((tmp_path / "task_results" / "ghost1.json").read_text(encoding="utf-8"))
+    data = read_result(tmp_path, "ghost1")
     assert data["status"] == STATUS_FAILED
     assert data.get("reason_code") == "workers_unavailable"
+    # Two readers, two texts (#1403): the parent model's stored result keeps its full
+    # instruction; the owner's card row (text and the error the web card body reads)
+    # carries the producer's owner sentence, with one warning mark.
+    assert "do the work inline yourself, or retry after /restart" in data["result"]
+    assert len(sent) == 1
+    _chat, text, kwargs = sent[0]
+    assert text == "⚠️ Task ghost1 not scheduled: worker pool unavailable."
+    meta = kwargs["progress_meta"]
+    assert meta["error"] == "Task ghost1 not scheduled: worker pool unavailable."
+    assert meta["subagent_event"] == "rejected" and meta["subagent_task_id"] == "ghost1"
+    assert kwargs["system_type"] == "subagent_admission_notice"
+
+
+def test_subagent_rejection_without_owner_sentence_keeps_its_factual_detail(tmp_path):
+    """No producer sentence: the factual detail is shown as written, never filtered."""
+    from supervisor.events_schedule_task import _reject_schedule_task
+
+    sent = []
+    ctx = SimpleNamespace(DRIVE_ROOT=tmp_path, send_with_budget=lambda *a, **k: sent.append((a, k)))
+    detail = "Subagent rejected: schedule_subagent requires objective and expected_output."
+    _reject_schedule_task(ctx, tid="kid1", chat_id=1, delegation_role="subagent", parent_id="root1",
+                          root_task_id="root1", role="", result_fields={}, detail=detail)
+    (_chat, text), kwargs = sent[0]
+    assert text == "⚠️ " + detail and kwargs["progress_meta"]["error"] == detail
+    assert read_result(tmp_path, "kid1")["result"] == detail
 
 
 def test_handle_task_done_skips_workspace_readonly_subagent_artifacts(tmp_path, monkeypatch):
@@ -2766,7 +2833,9 @@ def test_queue_snapshot_preserves_subagent_contract_fields(tmp_path, monkeypatch
         SimpleNamespace(drive_root=tmp_path, budget_drive_root=tmp_path), restored,
     ) == {}
     assert restored["predecessor_authority"]["source"] == restored["predecessor_authority_source"]
-    assert restored["predecessor_authority"]["result"] == "Previous exact result"
+    assert "result" not in restored["predecessor_authority"]
+    assert restored["predecessor_authority"]["omitted_fields"]["result"] == len("Previous exact result")
+    assert read_result(tmp_path, "previous")["result"] == "Previous exact result"
 
 
 def test_assign_tasks_mirrors_running_subagent_status_to_parent_drive(tmp_path, monkeypatch):
@@ -2806,10 +2875,10 @@ def test_assign_tasks_mirrors_running_subagent_status_to_parent_drive(tmp_path, 
     monkeypatch.setattr(workers_module, "DRIVE_ROOT", tmp_path)
     monkeypatch.setattr(workers_module, "PENDING", [task])
     monkeypatch.setattr(workers_module, "RUNNING", {})
-    monkeypatch.setattr(workers_module, "WORKERS", {1: SimpleNamespace(wid=1, busy_task_id=None, in_q=FakeWorkerQueue())})
+    monkeypatch.setattr(workers_module, "WORKERS", {1: affirm_ready(SimpleNamespace(wid=1, busy_task_id=None, in_q=FakeWorkerQueue()))})
     monkeypatch.setattr(workers_module, "load_state", lambda: {})
     monkeypatch.setattr(state_module, "budget_remaining", lambda _state, **_kwargs: 100.0)
-    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": True)
 
     workers_module.assign_tasks()
 
@@ -2853,7 +2922,7 @@ def test_assign_tasks_leaves_subagent_pending_when_running_cap_full(tmp_path, mo
     monkeypatch.setattr(workers_module, "DRIVE_ROOT", tmp_path)
     monkeypatch.setattr(workers_module, "PENDING", pending)
     monkeypatch.setattr(workers_module, "RUNNING", running)
-    monkeypatch.setattr(workers_module, "WORKERS", {1: SimpleNamespace(wid=1, busy_task_id=None, in_q=FakeWorkerQueue())})
+    monkeypatch.setattr(workers_module, "WORKERS", {1: affirm_ready(SimpleNamespace(wid=1, busy_task_id=None, in_q=FakeWorkerQueue()))})
     monkeypatch.setattr(workers_module, "load_state", lambda: {})
     monkeypatch.setattr(state_module, "budget_remaining", lambda _state, **_kwargs: 100.0)
     monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": None)
@@ -2898,10 +2967,10 @@ def test_assign_tasks_honors_depth_reservation_for_first_grandchild(tmp_path, mo
     monkeypatch.setattr(workers_module, "DRIVE_ROOT", tmp_path)
     monkeypatch.setattr(workers_module, "PENDING", pending)
     monkeypatch.setattr(workers_module, "RUNNING", running)
-    monkeypatch.setattr(workers_module, "WORKERS", {1: SimpleNamespace(wid=1, busy_task_id=None, in_q=FakeWorkerQueue())})
+    monkeypatch.setattr(workers_module, "WORKERS", {1: affirm_ready(SimpleNamespace(wid=1, busy_task_id=None, in_q=FakeWorkerQueue()))})
     monkeypatch.setattr(workers_module, "load_state", lambda: {})
     monkeypatch.setattr(state_module, "budget_remaining", lambda _state, **_kwargs: 100.0)
-    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": True)
 
     workers_module.assign_tasks()
 
@@ -2915,11 +2984,7 @@ def test_assignment_depth_fact_reaches_worker_and_survives_child_copyback(tmp_pa
     from supervisor import state as state_module
     from ouroboros.contracts.task_contract import build_task_contract
     from ouroboros.headless import copy_child_task_result
-    from ouroboros.task_results import (
-        STATUS_COMPLETED,
-        load_task_result,
-        write_task_result,
-    )
+    from ouroboros.task_results import STATUS_COMPLETED, load_task_result, write_task_result
 
     delivered = []
 
@@ -2961,11 +3026,11 @@ def test_assignment_depth_fact_reaches_worker_and_survives_child_copyback(tmp_pa
     monkeypatch.setattr(
         workers_module,
         "WORKERS",
-        {1: SimpleNamespace(wid=1, busy_task_id=None, in_q=FakeWorkerQueue())},
+        {1: affirm_ready(SimpleNamespace(wid=1, busy_task_id=None, in_q=FakeWorkerQueue()))},
     )
     monkeypatch.setattr(workers_module, "load_state", lambda: {})
     monkeypatch.setattr(state_module, "budget_remaining", lambda _state, **_kwargs: 100.0)
-    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": True)
 
     workers_module.assign_tasks()
 
@@ -3021,19 +3086,18 @@ def test_override_delegation_constraint_requires_parent_lineage(tmp_path, monkey
     assert ledger.open_delegation_constraints("root1") == []
 
 
-def test_subagent_hard_timeout_retry_preserves_task_id(tmp_path, monkeypatch):
+def test_subagent_silence_preserves_live_custody_and_service_logs(tmp_path, monkeypatch):
     from supervisor import queue as queue_module
     from supervisor import workers as workers_module
-    from ouroboros.task_results import STATUS_INTERRUPTED, load_task_result
 
     class FakeProc:
         pid = 12345
 
         def is_alive(self):
-            return False
+            return True
 
         def terminate(self):
-            raise AssertionError("already dead")
+            raise AssertionError("Silence cannot authorize process termination")
 
         def join(self, timeout=None):
             return None
@@ -3047,13 +3111,10 @@ def test_subagent_hard_timeout_retry_preserves_task_id(tmp_path, monkeypatch):
     monkeypatch.setattr(queue_module, "load_state", lambda: {})
     monkeypatch.setattr(queue_module, "append_jsonl", lambda *args, **kwargs: None)
     monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": None)
-    # Activity model: a "timed out" task is one with no real progress for the idle
-    # window AND no progressing subtree (heartbeat alone is not progress). Variant A:
-    # run the heavy teardown reaper synchronously (no daemon) for a deterministic test.
+    # Heartbeats alone request attention; the live process and service logs stay owned.
     monkeypatch.setattr(queue_module, "_ensure_reaper_started", lambda: None)
     monkeypatch.setattr(queue_module, "_reap_queue", queue_module._stdqueue.Queue())
     monkeypatch.setattr(queue_module, "get_task_idle_timeout_sec", lambda: 1)
-    monkeypatch.setattr(queue_module, "get_per_call_timeout_ceiling_sec", lambda: 1)
     worker = SimpleNamespace(busy_task_id="childtimeout", proc=FakeProc(), reaping=False)
     monkeypatch.setattr(workers_module, "WORKERS", {9: worker})
     monkeypatch.setattr(workers_module, "respawn_worker", lambda worker_id: None)
@@ -3073,7 +3134,7 @@ def test_subagent_hard_timeout_retry_preserves_task_id(tmp_path, monkeypatch):
             "_attempt": 1,
         },
         # idle for ~1000s, far beyond the monkeypatched idle window max(1, 1+120)=121s,
-        # with no progressing subtree -> activity-based stop.
+        # with no progressing subtree -> factual attention only.
         "started_at": time.time() - 1000,
         "last_heartbeat_at": time.time() - 1000,
         "worker_id": 9,
@@ -3081,18 +3142,10 @@ def test_subagent_hard_timeout_retry_preserves_task_id(tmp_path, monkeypatch):
     }
 
     queue_module.enforce_task_timeouts()
-    # Drain the off-loop reaper synchronously (kill/archive/respawn).
-    while not queue_module._reap_queue.empty():
-        queue_module._reap_timed_out_task(queue_module._reap_queue.get_nowait())
-
-    assert queue_module.PENDING
-    retried = queue_module.PENDING[0]
-    assert retried["id"] == "childtimeout"
-    assert retried["_attempt"] == 2
-    assert retried["timeout_retry_from"] == "childtimeout"
-    assert load_task_result(tmp_path, "childtimeout")["status"] == STATUS_INTERRUPTED
-    assert "childtimeout" not in queue_module.RUNNING
-    assert not service_dir.exists()
+    assert queue_module._reap_queue.empty() and queue_module.PENDING == []
+    assert queue_module.RUNNING["childtimeout"]["silence_attention"]["state"] == "pending_attention"
+    assert worker.busy_task_id == "childtimeout" and not worker.reaping
+    assert service_dir.exists()
 
 
 def test_absolute_deadline_does_not_retry_expired_task(tmp_path, monkeypatch):
@@ -3124,7 +3177,6 @@ def test_absolute_deadline_does_not_retry_expired_task(tmp_path, monkeypatch):
     monkeypatch.setattr(queue_module, "_ensure_reaper_started", lambda: None)
     monkeypatch.setattr(queue_module, "_reap_queue", queue_module._stdqueue.Queue())
     monkeypatch.setattr(queue_module, "get_task_idle_timeout_sec", lambda: 1)
-    monkeypatch.setattr(queue_module, "get_per_call_timeout_ceiling_sec", lambda: 1)
     worker = SimpleNamespace(busy_task_id="deadline1", proc=FakeProc(), reaping=False)
     monkeypatch.setattr(workers_module, "WORKERS", {9: worker})
     monkeypatch.setattr(workers_module, "respawn_worker", lambda worker_id: None)
@@ -3178,9 +3230,7 @@ def _orphan_shaped_running_task(tmp_path, task_id, *, snapshot_ts):
         result="Task is running.", ts="2026-05-28T00:00:00+00:00",
     )
     (tmp_path / "state").mkdir(exist_ok=True)
-    (tmp_path / "state" / "queue_snapshot.json").write_text(
-        json.dumps({"ts": snapshot_ts, "pending": [], "running": []}), encoding="utf-8",
-    )
+    write_queue_document(tmp_path / "state" / "queue_snapshot.json", {"ts": snapshot_ts, "pending": [], "running": []})
     events = tmp_path / "logs" / "events.jsonl"
     append_jsonl(events, {"ts": "2026-05-28T00:00:01+00:00", "type": "llm_round", "task_id": task_id})
     append_jsonl(events, {"ts": "2026-05-28T00:00:02+00:00", "type": "worker_boot"})
@@ -3206,7 +3256,8 @@ def test_orphan_reconcile_never_terminalizes_a_live_direct_activity(tmp_path, mo
     _orphan_shaped_running_task(tmp_path, "direct-live", snapshot_ts="2027-01-15T08:00:00+00:00")
 
     registry = get_direct_activity_registry()
-    registry.register("direct-live", chat_id=1)
+    from types import SimpleNamespace
+    registry.register("direct-live", chat_id=1, actor=SimpleNamespace(env=SimpleNamespace(drive_root=tmp_path)))
     assert reconcile_orphaned_running_tasks(tmp_path) == 0
     assert load_effective_task_result(tmp_path, "direct-live")["status"] == STATUS_RUNNING
     assert load_task_result(tmp_path, "direct-live")["status"] == STATUS_RUNNING
@@ -3231,10 +3282,7 @@ def test_orphan_reconcile_does_not_use_a_stale_snapshot_as_death_proof(tmp_path,
     assert reconcile_orphaned_running_tasks(tmp_path) == 0
     assert load_task_result(tmp_path, "pooled-live")["status"] == STATUS_RUNNING
 
-    (tmp_path / "state" / "queue_snapshot.json").write_text(
-        json.dumps({"ts": "2027-01-15T08:00:00+00:00", "pending": [], "running": []}),
-        encoding="utf-8",
-    )
+    write_queue_document(tmp_path / "state" / "queue_snapshot.json", {"ts": "2027-01-15T08:00:00+00:00", "pending": [], "running": []})
     assert reconcile_orphaned_running_tasks(tmp_path) == 1
     assert load_task_result(tmp_path, "pooled-live")["reason_code"] == (
         "orphaned_running_after_worker_restart"
@@ -3244,6 +3292,7 @@ def test_orphan_reconcile_does_not_use_a_stale_snapshot_as_death_proof(tmp_path,
 def test_request_restart_latches_reason_until_task_end(tmp_path, monkeypatch):
     from ouroboros.tools import control as control_module
     from ouroboros.tools import control_runtime
+    from tests.body_candidate_support import host_restart_ack
 
     from supervisor import evolution_lifecycle
 
@@ -3264,14 +3313,21 @@ def test_request_restart_latches_reason_until_task_end(tmp_path, monkeypatch):
         pending_restart_reason = None
         repo_dir = tmp_path
         drive_root = tmp_path
+        task_id = "restart-requester"  # one request per requester attempt
+        task_attempt = 1
 
         def drive_path(self, rel):
             return tmp_path / rel
 
     ctx = _Ctx()
+    sent = host_restart_ack(ctx, tmp_path)
     result = control_module._request_restart(ctx, "reload runtime")
 
     assert "Restart requested" in result
+    # Only the intent goes out now; the restart itself waits for this task's end.
+    [intent] = sent
+    assert (intent["type"], intent["phase"], intent["task_id"], intent["task_attempt"], intent["reason"]) == (
+        "restart_request", "intent", "restart-requester", 1, "reload runtime")
     assert ctx.pending_events == []
     assert ctx.pending_restart_reason == "reload runtime"
     assert written
@@ -3338,18 +3394,17 @@ def test_expired_batch_wait_reports_the_asked_for_window_not_the_clamp(tmp_path,
     assert payload["timeout_sec"] == 7200.0, "the clamp still bounds the real wait"
 
 
-def test_wait_clamp_constants_match_the_scraped_literals():
-    """The schema text's number and the clamp arithmetic are one fact (A10)."""
-    import inspect
-    import re
-
+def test_wait_clamp_constants_are_the_windows_the_waits_use(tmp_path, monkeypatch):
+    """The schema text's number and the real wait window are one fact (A10)."""
     from ouroboros.tools import control_task_results as mod
 
-    def _scraped(fn):
-        return int(re.findall(r"min\(int\(timeout_sec\),\s*(\d+)\)", inspect.getsource(fn))[0])
-
-    assert _scraped(mod._wait_for_task) == mod._WAIT_TASK_CLAMP_SEC
-    assert _scraped(mod._wait_for_tasks) == mod._WAIT_TASKS_CLAMP_SEC
+    seen = []
+    monkeypatch.setattr(mod, "wait_for_effective_tasks", lambda root, ids, **kw: seen.append(
+        kw["timeout_sec"]) or {"all_terminal": True, "elapsed_sec": 0.0, "tasks": {}})
+    ctx = SimpleNamespace(drive_root=tmp_path)
+    mod._wait_for_task(ctx, "anychild", timeout_sec=10**6)
+    mod._wait_for_tasks(ctx, ["anychild"], timeout_sec=10**6)
+    assert seen == [mod._WAIT_TASK_CLAMP_SEC, mod._WAIT_TASKS_CLAMP_SEC]
 
 
 def test_wait_schemas_name_the_real_clamp(tmp_path):

@@ -18,13 +18,16 @@ any automated claim.
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 
 import pytest
+from tests.settings_browser_helpers import open_settings
 from tests.test_subscription_setup_browser import capture, subscription_ui as _subscription_ui
 
 subscription_ui = _subscription_ui  # re-exported pytest fixture (requested by name below)
 
-pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
+pytestmark = [pytest.mark.ui_browser]
 
 # Records notifications, and replaces the socket transport with one this test
 # can push frames into. `ws.js` keeps its own dispatch, reconnect and queue.
@@ -71,16 +74,32 @@ MAIN = 1
 PROJECT = 4242
 
 
+NOTIFICATIONS = '[data-settings-page="notifications"]'
+
+
 def open_notifications(page):
-    page.locator('[data-nav-page="settings"]').click()
-    page.wait_for_selector('#page-settings.active')
-    page.locator('[data-settings-tab="appearance"]').click()
-    page.wait_for_selector('[data-settings-panel="appearance"].active')
-    return page.locator('[data-settings-panel="appearance"] [data-notify-settings]')
+    """Settings › Notifications, opened by its path; the page's own level is what a block capture shows."""
+    level = open_settings(page, 'notifications')
+    level.locator('[data-notify-pref="enabled"]').wait_for(state='attached')
+    return level
 
 
 def pref(page, key):
-    return page.locator(f'[data-settings-panel="appearance"] [data-notify-pref="{key}"]')
+    return page.locator(f'{NOTIFICATIONS} [data-notify-pref="{key}"]')
+
+
+def set_pref(page, key, on):
+    """Turn a switch on or off the way a hand does: by its track (the input itself lies under it)."""
+    box = pref(page, key)
+    if box.is_checked() != on:
+        box.locator('xpath=..').click()
+    page.wait_for_function('([key, on]) => document.querySelector(`[data-settings-page="notifications"] [data-notify-pref="${key}"]`).checked === on',
+                           arg=[key, on])
+
+
+def set_theme(page, theme):
+    """The theme is chosen on Appearance; these tests only need the page painted in it."""
+    page.evaluate('theme => window.ouroTheme.set(theme)', theme)
 
 
 def boot(page, ui):
@@ -117,7 +136,7 @@ def titles(page):
 
 def enable(page):
     open_notifications(page)
-    pref(page, 'enabled').check()
+    set_pref(page, 'enabled', True)
     page.wait_for_function(CATEGORY_ENABLED)
 
 
@@ -133,7 +152,7 @@ def test_notifications_are_off_until_asked_and_then_ring_once(subscription_ui):
     assert pref(page, 'main_reply').is_checked() is False, 'ordinary Main replies start off'
     assert pref(page, 'show_text').is_checked() is False, 'message text starts hidden'
     assert pref(page, 'task_done').is_disabled() is True
-    status = page.locator('[data-settings-panel="appearance"] [data-notify-status]')
+    status = page.locator('[data-settings-page="notifications"] [data-notify-status]')
     assert 'off' in status.inner_text().lower()
     capture(page, 'notifications-default-off')
 
@@ -142,14 +161,14 @@ def test_notifications_are_off_until_asked_and_then_ring_once(subscription_ui):
                    'data': {'type': 'task_done', 'task_id': 't-off', 'status': 'completed'}})
     assert recorded(page) == []
 
-    pref(page, 'enabled').check()
+    set_pref(page, 'enabled', True)
     page.wait_for_function(CATEGORY_ENABLED)
     assert 'enabled' in status.inner_text().lower()
     capture(page, 'notifications-enabled')
 
     # The test button is the owner's only honest way to see what this system
     # does with a notification, so it must become usable and actually deliver.
-    test_button = page.locator('[data-settings-panel="appearance"] [data-notify-test]')
+    test_button = page.locator('[data-settings-page="notifications"] [data-notify-test]')
     assert test_button.is_enabled() is True
     test_button.click()
     assert titles(page) == ['Ouroboros notifications are working']
@@ -272,9 +291,10 @@ def test_choices_survive_reload_and_reload_itself_never_notifies(subscription_ui
         ], 'progress': []})))
     boot(page, ui)
     enable(page)
-    pref(page, 'show_text').check()
+    set_pref(page, 'show_text', True)
     page.wait_for_function(SHOW_TEXT_SAVED)
 
+    ui['errors'].watch(page)  # the reload may cut off the page's own reads (tests/ui_console_errors.py)
     page.reload()
     page.wait_for_selector('#chat-input')
     page.wait_for_function(SOCKET_READY)
@@ -285,10 +305,366 @@ def test_choices_survive_reload_and_reload_itself_never_notifies(subscription_ui
     assert pref(page, 'enabled').is_checked() is True, 'the choice is client-local and persisted'
     assert pref(page, 'show_text').is_checked() is True
 
-    # With text shown, the body carries the message.
-    deliver(page, {'type': 'chat', 'role': 'system', 'system_type': 'task_summary',
-                   'task_id': 't-after-reload', 'chat_id': MAIN, 'content': 'The report is ready.'})
+    # With text shown, a finished task's body is its work's name, outcome word and the cause its record
+    # holds (DESIGN §9), said from the facts of the live event the server pushes, never a task id.
+    deliver(page, {'type': 'log', 'chat_id': MAIN,
+                   'data': {'type': 'task_done', 'task_id': 't-after-reload', 'chat_id': MAIN, 'status': 'failed',
+                            'target_label': 'Alpha', 'reason_code': 'worker_crash_signal'}})
     notes = recorded(page)
     assert len(notes) == 1
-    assert notes[0]['options']['body'] == 'The report is ready.'
+    assert notes[0]['options']['body'] == 'Alpha · Failed: The worker process running the task crashed'
     capture(page, 'notifications-after-reload')
+
+
+# The desktop app's bridge as `launcher_background.DesktopApi` answers it, recording each call: the
+# real SPA decides from these answers exactly as inside the packaged window. `window.__nextNative`
+# scripts the next `show_native_notification` answers; nothing here reaches an operating system.
+DESKTOP_BRIDGE = """
+window.__native = [];
+window.__asks = 0;
+window.__nextNative = [];
+window.__systemPermission = 'not_determined';
+window.pywebview = { api: {
+    shell_info: async () => ({ shell_version: '7.7.0', persistent_storage: true,
+        native_notifications: { available: true, status: window.__systemPermission, platform: 'macos', reason: '' } }),
+    request_native_notifications: async () => {
+        window.__asks += 1;
+        // A granted request changes what the next fresh system read observes.
+        window.__systemPermission = 'authorized';
+        return { available: true, status: window.__systemPermission, platform: 'macos', reason: '' };
+    },
+    show_native_notification: async (...args) => {
+        window.__native.push(args);
+        return window.__nextNative.shift() || { ok: true, status: 'submitted', platform: 'macos', sound: 'os' };
+    },
+    request_attention: async () => ({ ok: true, status: 'native_sound', sound_played: true }),
+    notify_owner: async () => ({ ok: true, status: 'native_sound', sound_played: true }),
+} };
+"""
+TOASTS = "() => [...document.querySelectorAll('#toast-stack .toast')].map((node) => node.textContent)"
+
+
+def test_the_desktop_app_keeps_permission_and_the_last_hand_off_apart(subscription_ui):
+    """Through the shipped Settings: switching on is the gesture that asks; an unconfirmed hand-off shows
+    no second alert and says so; a failed one falls back and says so without withdrawing the permission."""
+    ui = subscription_ui
+    page = ui['page']
+    page.add_init_script(DESKTOP_BRIDGE)
+    boot(page, ui)
+    enable(page)
+    status = page.locator('[data-settings-page="notifications"] [data-notify-status]')
+    page.wait_for_function("() => window.__asks === 1")
+    page.wait_for_function("() => /System notifications are on/.test("
+                           "document.querySelector('[data-settings-page=\"notifications\"] [data-notify-status]').textContent)")
+    assert 'shows each alert' not in status.inner_text()
+    capture(page, 'notifications-desktop-on')
+
+    page.evaluate("window.__nextNative.push({ ok: null, status: 'unknown', platform: 'macos', reason: 'no_completion' })")
+    deliver(page, {'type': 'log', 'chat_id': MAIN,
+                   'data': {'type': 'task_done', 'task_id': 't-unknown', 'status': 'completed'}})
+    page.wait_for_function("() => window.__native.length === 1")
+    page.wait_for_timeout(120)
+    assert page.evaluate(TOASTS) == [], 'it may still appear: no copy in the app'
+    assert recorded(page) == [], 'and no browser banner'
+    assert 'did not confirm the last alert' in status.inner_text()
+    capture(page, 'notifications-desktop-unconfirmed')
+
+    page.evaluate("window.__nextNative.push({ ok: false, status: 'failed', platform: 'macos', reason: 'no_center' })")
+    deliver(page, {'type': 'log', 'chat_id': MAIN,
+                   'data': {'type': 'task_done', 'task_id': 't-failed', 'status': 'completed'}})
+    page.wait_for_function("() => window.__native.length === 2")
+    page.wait_for_function("() => window.__notifications.length === 1")
+    assert titles(page) == ['Task finished'], 'never reached the system: the browser banner this client allows'
+    assert page.evaluate(TOASTS) == []
+    assert 'could not be handed to the system (no_center)' in status.inner_text()
+    assert 'so it fell back to a browser banner or the app' in status.inner_text(), 'never claimed as the app'
+    assert page.evaluate("window.__asks") == 1, 'a live alert never asks for permission'
+    capture(page, 'notifications-desktop-fell-back')
+
+
+# The bridge of a desktop app before system notifications, as 7.6.0's `launcher.py` exposed it: no
+# `shell_info` or `show_native_notification`, and `notify_owner` IS `request_attention`, which, with the
+# window hidden in background mode, shows a Windows balloon with Windows' sound whatever `sound` says.
+OLD_DESKTOP_BRIDGE = """
+window.__attention = [];
+const attention = async (...args) => {
+    window.__attention.push(args);
+    return { ok: true, status: 'background', banner: true, sound_played: false };
+};
+window.pywebview = { api: { request_attention: attention, notify_owner: attention } };
+"""
+
+
+def test_an_older_desktop_app_is_never_called_sound_on_or_off(subscription_ui):
+    """That app's hidden-window balloon would sound, and an older launcher may ignore `sound=false`: its alerts
+    are a browser banner under the Sound choice, and Settings never calls the banner fallback the app."""
+    ui = subscription_ui
+    page = ui['page']
+    page.add_init_script(OLD_DESKTOP_BRIDGE)
+    boot(page, ui)
+    enable(page)
+    set_pref(page, 'sound', False)
+    page.wait_for_function("() => JSON.parse(localStorage.getItem('ouroboros.notifications') || '{}').sound === false")
+    deliver(page, {'type': 'log', 'chat_id': MAIN,
+                   'data': {'type': 'task_done', 'task_id': 't-old-silent', 'status': 'completed'}})
+    page.wait_for_function("() => window.__notifications.length === 1")
+    assert recorded(page)[0]['options']['silent'] is True
+    status = page.locator('[data-settings-page="notifications"] [data-notify-status]')
+    said = status.inner_text()
+    # Settings names the one observed fact, the missing system-notification method, and where alerts go instead; it
+    # never infers the app's age or an update remedy (docs/DESIGN.md §9, owner decision 3A: Dashboard > Updates owns those).
+    assert 'has no system-notification method here, so alerts fall back to a browser banner or the app' in said, said
+    assert not [word for word in ('predate', 'older', 'outdated', 'update', 'upgrade') if word in said.lower()], said
+    capture_block(page.locator(NOTIFICATIONS), 'notifications-old-app-status-block')
+
+    set_pref(page, 'sound', True)
+    deliver(page, {'type': 'log', 'chat_id': MAIN,
+                   'data': {'type': 'task_done', 'task_id': 't-old-sound-on', 'status': 'completed'}})
+    page.wait_for_function("() => window.__notifications.length === 2")
+    assert recorded(page)[1]['options']['silent'] is False, 'the banner\'s sound is the system\'s'
+    assert page.evaluate("window.__attention") == [], 'never asked, Sound on or off'
+    capture(page, 'notifications-old-app-never-called')
+
+
+# A recording Web Audio double: nothing reaches a speaker. Each started oscillator is kept with its frequency
+# and the peak its gain ramps to, so the test reads what WOULD sound.
+AUDIO_STUB = """
+window.__audio = { contexts: 0, tones: [] };
+class RecordingAudioContext {
+    constructor() { this.currentTime = 0; this.state = 'running'; this.destination = {}; window.__audio.contexts += 1; }
+    resume() { return Promise.resolve(); }
+    close() { this.state = 'closed'; return Promise.resolve(); }
+    createOscillator() {
+        return {
+            type: '', frequency: { value: 0 },
+            connect(node) { this.output = node; return node; },
+            start(at) { window.__audio.tones.push({ hz: this.frequency.value, type: this.type, at, peak: this.output && this.output.peak }); },
+            stop(at) { this.stoppedAt = at; },
+        };
+    }
+    createGain() {
+        const node = { connect(next) { return next; } };
+        node.gain = {
+            value: 1,
+            setValueAtTime() {},
+            linearRampToValueAtTime(value) { node.peak = value; },
+            exponentialRampToValueAtTime() {},
+        };
+        return node;
+    }
+}
+window.AudioContext = RecordingAudioContext;
+window.webkitAudioContext = RecordingAudioContext;
+"""
+TONES = "() => window.__audio.tones"
+
+
+def volume(page):
+    return page.locator('[data-settings-page="notifications"] [data-notify-volume]')
+
+
+def capture_block(locator, name):
+    """The Notifications block alone, as rendered, beside the full-page captures."""
+    root = os.environ.get("OUROBOROS_UI_EVIDENCE_DIR")
+    if root:
+        target = Path(root)
+        target.mkdir(parents=True, exist_ok=True)
+        locator.screenshot(path=str(target / f"{name}.png"), animations="disabled")
+
+
+def test_app_tone_volume_previews_only_on_press_and_survives_reload(subscription_ui):
+    """The approved row under Sound: a level stored by this client, a slider that plays nothing, and the
+    existing small capsule button that plays the soft tone once. Light, dark and narrow, as rendered."""
+    ui = subscription_ui
+    page = ui['page']
+    page.add_init_script(AUDIO_STUB)
+    boot(page, ui)
+    block = open_notifications(page)
+    row = block.locator('[data-setting-row="notify:tone_volume"]')
+    assert row.count() == 1
+    # Directly under Sound, in the same card as the other switches of "How".
+    assert page.evaluate("""() => {
+        const sound = document.querySelector('[data-settings-page="notifications"] [data-setting-row="notify:sound"]');
+        return sound.nextElementSibling === document.querySelector('[data-settings-page="notifications"] [data-setting-row="notify:tone_volume"]');
+    }""")
+    assert row.locator('.ui-row-title').inner_text() == 'App tone volume'
+    preview = row.locator('[data-notify-preview]')
+    assert preview.get_attribute('class') == 'btn btn-default btn-sm'
+    assert preview.inner_text() == 'Preview tone'
+    assert row.locator('[data-setting-meta]').inner_text() == \
+        'Only the soft tone the app plays itself. The system sets the volume of its own alerts.'
+    value = row.locator('[data-notify-volume-value]')
+    assert value.inner_text() == '40%'
+    assert volume(page).is_disabled() and preview.is_disabled(), 'inert while notifications are off'
+
+    enable(page)
+    assert volume(page).is_enabled() and preview.is_enabled()
+    for level in ('70', '0', '25'):
+        volume(page).fill(level)
+    page.wait_for_function("() => JSON.parse(localStorage.getItem('ouroboros.notifications') || '{}').tone_volume === 25")
+    assert value.inner_text() == '25%'
+    page.wait_for_timeout(150)
+    assert page.evaluate("window.__audio.contexts") == 0, 'moving the slider opens no audio device'
+    assert page.evaluate(TONES) == []
+
+    set_theme(page, 'light')
+    row.scroll_into_view_if_needed()
+    capture(page, 'notifications-tone-light')
+    capture_block(block, 'notifications-tone-light-block')
+    set_theme(page, 'dark')
+    assert page.locator('html').get_attribute('data-theme') == 'dark'
+    row.scroll_into_view_if_needed()
+    capture(page, 'notifications-tone-dark')
+    capture_block(block, 'notifications-tone-dark-block')
+
+    preview.click()
+    page.wait_for_function("() => window.__audio.tones.length === 1")
+    (tone,) = page.evaluate(TONES)
+    assert tone['hz'] == 523.25 and tone['type'] == 'sine'
+    assert abs(tone['peak'] - 0.05 * 0.25 ** 2) < 1e-12, tone
+
+    set_pref(page, 'sound', False)
+    assert volume(page).is_disabled() and preview.is_disabled(), 'inert while Sound is off'
+    row.scroll_into_view_if_needed()
+    capture_block(block, 'notifications-tone-sound-off-block')
+    set_pref(page, 'sound', True)
+
+    ui['errors'].watch(page)  # the reload may cut off the page's own reads (tests/ui_console_errors.py)
+    page.reload()
+    page.wait_for_selector('#chat-input')
+    block = open_notifications(page)
+    assert volume(page).input_value() == '25', 'the level is client-local and persisted'
+    assert block.locator('[data-notify-volume-value]').inner_text() == '25%'
+    assert page.evaluate(TONES) == [], 'a reload plays nothing'
+
+    page.set_viewport_size({'width': 390, 'height': 844})
+    set_theme(page, 'light')
+    block.locator('[data-setting-row="notify:tone_volume"]').scroll_into_view_if_needed()
+    width = page.evaluate("""() => {
+        const row = document.querySelector('[data-settings-page="notifications"] [data-setting-row="notify:tone_volume"]');
+        const card = row.closest('.settings-card');
+        return { row: row.scrollWidth, card: card.clientWidth };
+    }""")
+    assert width['row'] <= width['card'], width
+    capture(page, 'notifications-tone-narrow')
+    capture_block(block, 'notifications-tone-narrow-block')
+
+
+# A current desktop app whose `show_native_notification` answer the test holds, so the owner's choices can
+# change while it is pending (research c7845ef5). Nothing reaches an operating system.
+PENDING_DESKTOP_BRIDGE = """
+window.__toasts = [];
+new MutationObserver((records) => {
+    for (const record of records) {
+        for (const node of record.addedNodes) {
+            if (node.nodeType === 1 && node.classList.contains('toast')) window.__toasts.push(node.textContent);
+        }
+    }
+}).observe(document, { childList: true, subtree: true });
+window.__native = [];
+window.__attention = [];
+window.__release = [];
+window.pywebview = { api: {
+    // The preparation read, plus a fresh read after a definite failure;
+    // this fixture deliberately withholds a positive sound setting.
+    shell_info: async () => ({ shell_version: '7.7.0', persistent_storage: true,
+        native_notifications: window.__systemRead || { available: true, status: 'authorized', platform: 'macos', reason: '' } }),
+    request_native_notifications: async () => ({ available: true, status: 'authorized', platform: 'macos', reason: '' }),
+    show_native_notification: (...args) => {
+        window.__native.push(args);
+        return new Promise((resolve) => window.__release.push(resolve));
+    },
+    // Model a sound-capable Windows/legacy bridge; the page must request it silently.
+    notify_owner: async (sound = true, title = '', body = '', cueWhenVisible = true) => {
+        window.__attention.push([sound, title, body]);
+        if (!cueWhenVisible) return { ok: false, status: 'visible' };
+        return sound ? { ok: true, status: 'native_sound', sound_played: true } : { ok: true, status: 'window_only', sound_played: false };
+    },
+    request_attention: async (sound = true) => (sound ? { ok: true, status: 'native_sound', sound_played: true }
+        : { ok: true, status: 'window_only', sound_played: false }),
+} };
+"""
+REFUSAL = {'ok': False, 'status': 'failed', 'platform': 'macos', 'reason': 'no_center'}
+APP_BUNDLE_REFUSAL = {'ok': False, 'status': 'unavailable', 'platform': 'macos', 'reason': 'not_an_app_bundle'}
+DENIED_REFUSAL = {'ok': False, 'status': 'denied', 'platform': 'macos', 'reason': ''}
+STORED = "() => JSON.parse(localStorage.getItem('ouroboros.notifications') || '{}')"
+
+
+def release(page, answer):
+    page.evaluate("answer => window.__release.shift()(answer)", answer)
+    page.wait_for_timeout(120)
+
+
+def finish(page, task_id, count):
+    deliver(page, {'type': 'log', 'chat_id': MAIN, 'data': {'type': 'task_done', 'task_id': task_id, 'status': 'completed'}})
+    page.wait_for_function("n => window.__native.length === n", arg=count)
+
+
+def test_a_choice_changed_while_the_system_answer_is_pending_holds(subscription_ui):
+    """Through the shipped Settings: Sound off or notifications off while the desktop app's answer is pending
+    holds for the fallback that had not started; the launcher is only ever asked silently; the page plays no
+    tone without a positive read taken after a definite failure; a client without native permission/sound
+    evidence stays quiet, and an explicit denial is never read past."""
+    ui = subscription_ui
+    page = ui['page']
+    page.add_init_script(CLIENT_STUB)
+    page.add_init_script(AUDIO_STUB)
+    page.add_init_script(PENDING_DESKTOP_BRIDGE)
+    page.goto(ui['url'])
+    page.wait_for_selector('#chat-input')
+    page.wait_for_function(SOCKET_READY)
+    enable(page)
+
+    # Control: unchanged choices. The refusal falls back to the browser banner, which keeps the system's sound.
+    finish(page, 't-control', 1)
+    assert page.evaluate("window.__native[0][2]") is True, 'the system is asked for its own sound'
+    release(page, REFUSAL)
+    page.wait_for_function("() => window.__notifications.length === 1")
+    assert recorded(page)[0]['options']['silent'] is False
+    assert page.evaluate("window.__attention") == [[False, 'Task finished', '']], 'never the launcher\'s own sound'
+
+    # Sound off while pending: the same fallback, silent.
+    finish(page, 't-muted', 2)
+    set_pref(page, 'sound', False)
+    page.wait_for_function(STORED + ".sound === false")
+    release(page, REFUSAL)
+    page.wait_for_function("() => window.__notifications.length === 2")
+    assert recorded(page)[1]['options']['silent'] is True
+    set_pref(page, 'sound', True)
+    page.wait_for_function(STORED + ".sound === true")
+
+    # Notifications off while pending: nothing at all.
+    finish(page, 't-off', 3)
+    asked = len(page.evaluate("window.__attention"))
+    set_pref(page, 'enabled', False)
+    page.wait_for_function(STORED + ".enabled === false")
+    release(page, REFUSAL)
+    assert len(recorded(page)) == 2, 'no browser banner'
+    assert len(page.evaluate("window.__attention")) == asked, 'no attention cue'
+    assert page.evaluate("window.__toasts") == [], 'no in-app alert'
+
+    # Today's launcher outside an app bundle, and a page without banner permission: the in-app alert, the
+    # attention cue asked silently, and no page sound (the permission was never read: unknown is not a grant).
+    set_pref(page, 'enabled', True)
+    page.wait_for_function(CATEGORY_ENABLED)
+    page.evaluate("window.Notification.permission = 'default'")
+    finish(page, 't-bundle', 4)
+    release(page, APP_BUNDLE_REFUSAL)
+    page.wait_for_function("() => window.__toasts.length === 1")
+    assert page.evaluate("window.__attention.at(-1)") == [False, 'Task finished', '']
+    assert page.evaluate("window.__audio.contexts") == 0, 'the page opened no audio device for any alert'
+
+    # The app now reads authorized with its sound on (the launcher seam): an explicit denial at the hand-off
+    # stays quiet, and only a definite failure, read again after it, plays the one soft tone.
+    page.evaluate("window.__systemRead = { available: true, status: 'authorized', platform: 'macos', reason: '',"
+                  " sound_setting: 'enabled' }")
+    finish(page, 't-denied', 5)
+    release(page, DENIED_REFUSAL)
+    page.wait_for_function("() => window.__toasts.length === 2")
+    assert page.evaluate(TONES) == [], 'an explicit denial is never read past'
+    finish(page, 't-failed', 6)
+    release(page, REFUSAL)
+    page.wait_for_function("() => window.__audio.tones.length === 1")
+    assert page.evaluate("window.__audio.tones[0].hz") == 523.25
+    assert page.evaluate("window.__toasts.length") == 3
+    capture(page, 'notifications-desktop-late-mute')

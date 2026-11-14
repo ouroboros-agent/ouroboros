@@ -1,12 +1,12 @@
-"""Scope-reviewer WINDOW sizing: evidence-typed resolution + honest wording (RS5).
+"""Retrieving-seat WINDOW sizing: evidence-typed resolution + honest wording (RS5).
 
 Window size is not a condition of authority (owner decision 2026-09-17, BIBLE
-P3): a scope verdict rests on the reviewer's independence, the declared
+P3): a coupling verdict rests on the reviewer's independence, the declared
 required-source manifest and its recorded coverage. What this module answers is
-the one remaining sizing question — how large an output reserve the row's
-request may ask for — plus the provenance wording every diagnostic quotes.
-``scope_review`` re-imports these names under their private aliases, so its
-tests and callers keep exactly one patch point.
+the one remaining sizing question — how large an output reserve the seat's
+request may ask for, and the first-send bound its two-part brief must land
+under (``review_brief_coupling.first_send_bound``) — plus the provenance wording
+every diagnostic quotes.
 """
 
 from __future__ import annotations
@@ -20,8 +20,8 @@ from ouroboros.reviewer_window import (
 )
 
 # The conservative sizing fallback for a route with no Capability Evidence:
-# SIZING only, never an authority floor. `scope_review` imports it back rather
-# than defining a second copy.
+# SIZING only, never an authority floor. `review_brief_coupling` imports it
+# rather than defining a second copy.
 SCOPE_SIZING_FALLBACK_WINDOW = 200_000
 SCOPE_MODEL_DEFAULT = "openai/gpt-5.6-terra"
 
@@ -32,14 +32,10 @@ WINDOW_STALE = "stale_unverifiable"
 WINDOW_UNKNOWN = "unknown_conservative"
 WINDOW_SENTINEL = "designated_default_sentinel"
 
-# The metadata probe lives with the shared window resolver (`reviewer_window`) and is
-# rate-limited by the TTL on the evidence record, keyed by the full ROUTE fingerprint
-# rather than the model name: capability is a property of provider+base_url+model, and
-# a hot base-URL change must get its own probe rather than silently reusing the old
-# verdict. EVERY scope route gets that probe, the shipped default included, so the
-# sizing number is a measurement wherever one is reachable; rate-limiting it per
-# PROCESS instead of per TTL left an install that outlived the TTL unable to
-# RE-source it (v6.87.45).
+# The shared resolver (`reviewer_window`) keys remote metadata by full route
+# fingerprint and evidence TTL, not process lifetime or model name alone. Local
+# capacity is live serving-instance evidence on each resolution, never that cache.
+# Both a remote route change and a local restart must reach their own current facts.
 
 
 def is_designated_default_reviewer(model: str) -> bool:
@@ -52,11 +48,9 @@ def is_designated_default_reviewer(model: str) -> bool:
     nor a model name — grants or removes it."""
     def _normalized(m: str) -> str:
         text = str(m or "").strip()
-        if text.startswith("openrouter::"):
-            text = text[len("openrouter::"):]
         try:
             from ouroboros.provider_models import normalize_model_identity
-            return normalize_model_identity(text)
+            return normalize_model_identity(text)  # folds ``openrouter[@name]::`` like every route spelling
         except Exception:
             return text
     return bool(model) and _normalized(model) == _normalized(SCOPE_MODEL_DEFAULT)
@@ -79,13 +73,10 @@ def scope_window(model: str, *, session: bool = False, model_role: str = "",
     alone cannot say where it came from, and the caller that needs to know then
     guesses.
 
-    Every route gets one lazy metadata-only fetch per evidence-TTL period (never
-    generative, never a paid call), concurrent resolutions of the same route
-    serialized by the per-route lock; inside the TTL the cache answers and the path
-    stays hot-path safe. How often the network is re-asked is owned by
-    ``capability_evidence.probe``'s record TTL, deliberately NOT by the process
-    lifetime (v6.87.45: a per-process memo outlived the 24h record and wedged
-    every commit once an install stayed up past the TTL)."""
+    Remote metadata uses the evidence TTL (never generation or a paid call),
+    with concurrent resolutions serialized by the per-route lock. Local routes
+    read live serving evidence each time. ``capability_evidence.probe`` owns this
+    distinction; process-lifetime memoization would outlive either kind of fact."""
     model = str(model or "")
     try:
         # Probe the scope slot, not the active main route (which honors USE_LOCAL_MAIN).

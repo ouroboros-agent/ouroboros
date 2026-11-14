@@ -24,7 +24,12 @@ from ouroboros.platform_layer import pid_is_alive
 _POSIX = pytest.mark.skipif(os.name == "nt", reason="POSIX process groups; Windows Job Objects")
 
 _DAEMON = """
-import http.server, json
+import http.server, json, socketserver
+class LoopbackHTTPServer(http.server.HTTPServer):
+    def server_bind(self):
+        # Numeric loopback fixture: no hostname semantics, skip HTTPServer's reverse DNS.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_args): pass
     def do_GET(self):
@@ -36,7 +41,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(200); self.end_headers()
         self.wfile.write(json.dumps({'compatible': True, 'protocolMajor': 3,
             'engine': {'version': '3.9.8', 'sha': 'a' * 40}}).encode())
-server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+server = LoopbackHTTPServer(('127.0.0.1', 0), Handler)
 print(server.server_port, flush=True)
 server.serve_forever()
 """
@@ -77,6 +82,25 @@ def _supervisor_rows(root: pathlib.Path, kind: str) -> list:
     return [row for row in rows if row.get("type") == kind]
 
 
+def test_daemon_fixture_serves_without_reverse_dns():
+    """The fixture daemon binds a numeric loopback address, so it must start and answer
+    while ``socket.getfqdn`` raises: that lookup costs about 35 s per bind on macOS CI."""
+    refuse = ("import socket\n"
+              "def _refuse(*_a): raise RuntimeError('fixture performed reverse DNS')\n"
+              "socket.getfqdn = _refuse\n")
+    proc = subprocess.Popen([sys.executable, "-u", "-c", refuse + _DAEMON],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        line = proc.stdout.readline()
+        assert line.strip().isdigit(), proc.communicate(timeout=5)
+        assert _echoes(int(line))
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
+        proc.stdout.close()
+        proc.stderr.close()
+
+
 @pytest.fixture
 def worker_with_daemon(tmp_path, monkeypatch):
     """A real dummy worker that spawned a real echo daemon into ``tmp_path``'s ledger.
@@ -115,7 +139,6 @@ def worker_with_daemon(tmp_path, monkeypatch):
 
 
 @_POSIX
-@pytest.mark.serial
 def test_worker_tree_kill_spares_the_daemon_and_a_new_manager_stops_it(tmp_path, monkeypatch, worker_with_daemon):
     from supervisor.worker_pool_lifecycle import kill_worker_tree
 
@@ -145,7 +168,6 @@ def test_worker_tree_kill_spares_the_daemon_and_a_new_manager_stops_it(tmp_path,
 
 
 @_POSIX
-@pytest.mark.serial
 def test_cancel_and_timeout_kill_spares_the_daemon_beside_kept_services(tmp_path, monkeypatch, worker_with_daemon):
     from supervisor.worker_pool_lifecycle import kill_worker_tree
 
@@ -156,7 +178,6 @@ def test_cancel_and_timeout_kill_spares_the_daemon_beside_kept_services(tmp_path
 
 
 @_POSIX
-@pytest.mark.serial
 def test_stop_and_sparing_refuse_a_row_whose_live_identity_does_not_match(tmp_path, monkeypatch):
     """A live pid under a daemon row is not a daemon: the recorded command hash must match."""
     import ouroboros.config as config_mod
@@ -185,7 +206,6 @@ def test_stop_and_sparing_refuse_a_row_whose_live_identity_does_not_match(tmp_pa
 
 
 @_POSIX
-@pytest.mark.serial
 def test_stop_needs_measured_identity_and_an_owned_home(tmp_path, monkeypatch):
     """The reaper's permissive keep is never stop authority, and a foreign home stops nothing."""
     import ouroboros.config as config_mod
@@ -262,12 +282,12 @@ def test_every_supervisor_worker_tree_kill_is_the_shared_one():
     }
     assert direct == {"worker_pool_lifecycle.py"}
     for module, name, keep in (
-        ("workers", "kill_workers", False),
+        ("workers", "_tear_down_slots", False),  # kill_workers' teardown of the doomed slots
         ("worker_pool_lifecycle", "_kill_survivors", False),
         ("worker_pool_lifecycle", "kill_workers_for_update", False),
         ("worker_pool_lifecycle", "_replace_unready_slot", False),
         ("worker_pool_lifecycle", "_spawn_worker_slot", False),
-        ("worker_owner_wait", "_retire_idle", True),
+        ("worker_pool_lifecycle", "reap_idle_worker", True),  # quiescent idle retirement
         ("task_reaper", "_kill_and_confirm_worker_dead", True),
         ("task_lifecycle", "_finish_captured_running", True),
     ):
@@ -275,7 +295,7 @@ def test_every_supervisor_worker_tree_kill_is_the_shared_one():
         assert "kill_worker_tree(" in source, name
         assert ("keep_services=True" in source) is keep, name
     respawn = _function_source(root / "supervisor" / "worker_pool_lifecycle.py", "respawn_worker")
-    assert "return _spawn_worker_slot(wid, old, ready_attempt=ready_attempt)" in respawn
+    assert 'return _spawn_worker_slot(wid, old, ready_attempt=ready_attempt, lane=getattr(old, "lane", LANE_PROJECT))' in respawn
 
 
 def test_retained_purpose_never_rescues_a_stale_identity(tmp_path, monkeypatch):
@@ -294,11 +314,16 @@ def test_retained_purpose_never_rescues_a_stale_identity(tmp_path, monkeypatch):
 def test_both_server_sweeps_preserve_legacy_daemon_records(tmp_path, monkeypatch, surface):
     from ouroboros import server_maintenance
 
-    calls = []
+    import threading
+    from types import SimpleNamespace
+
+    calls, threads = [], []
     monkeypatch.setattr(server_maintenance, "DATA_DIR", tmp_path)
     monkeypatch.setattr(server_maintenance, "_installed_skill_names", lambda: None)
-    monkeypatch.setattr(server_maintenance, "_reconcile_delegated_runs", lambda _: None)
-    monkeypatch.setattr(server_maintenance, "_cursor_refresh_settled_terminals", lambda: None)
+    # Not this fixture's duty: the real child's own thread would outlive the test (it has its own tests).
+    monkeypatch.setattr(server_maintenance, "_tick_maintenance_child", lambda: None)
+    monkeypatch.setattr(server_maintenance, "_reconcile_delegated_runs", lambda *a, **kw: None)
+    monkeypatch.setattr(server_maintenance, "_cursor_refresh_settled_terminals", lambda *a, **kw: None)
     monkeypatch.setattr(server_maintenance, "_LAST_CANCEL_INTENT_SWEEP", [time.time()])
     monkeypatch.setattr(process_custody, "reap_orphaned_processes", lambda root, **kw: calls.append((root, kw)) or [])
     monkeypatch.setattr("ouroboros.delegate_terminal.backfill_terminal_reconciliations", lambda _: [])
@@ -308,14 +333,22 @@ def test_both_server_sweeps_preserve_legacy_daemon_records(tmp_path, monkeypatch
     if surface == "startup":
         server_maintenance._startup_custody_sweep()
     else:
+        # The 600 s block rides its own daemon thread now (INV-B); join it.
+        def tracked(**kwargs):
+            thread = threading.Thread(**kwargs)
+            threads.append(thread)
+            return thread
+
+        monkeypatch.setattr(server_maintenance, "threading", SimpleNamespace(Thread=tracked))
         server_maintenance._periodic_supervisor_maintenance([0], [time.time()])
+        for thread in threads:
+            thread.join(5)
     assert len(calls) == 1
     assert calls[0][0] == tmp_path
     assert calls[0][1]["retained_purposes"] == {claudexor_daemon.CUSTODY_PURPOSE}
 
 
 @_POSIX
-@pytest.mark.serial
 @pytest.mark.parametrize("evidence", ["missing_marker", "malformed_marker", "foreign_token"])
 def test_attached_stop_requires_marker_and_authenticated_endpoint(worker_with_daemon, evidence):
     worker, child = worker_with_daemon
@@ -334,7 +367,6 @@ def test_attached_stop_requires_marker_and_authenticated_endpoint(worker_with_da
 
 
 @_POSIX
-@pytest.mark.serial
 def test_worker_teardown_retains_a_legacy_session_daemon(tmp_path, worker_with_daemon):
     from supervisor.worker_pool_lifecycle import kill_worker_tree
     worker, child = worker_with_daemon

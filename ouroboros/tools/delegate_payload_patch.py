@@ -80,7 +80,8 @@ def _finalize_payload_apply(
 
         invalidate_advisory_after_mutation(
             pathlib.Path(getattr(ctx, "drive_root", ".")), mutation_root=target,
-            changed_paths=ordered, source_tool="integrate_delegated_patch")
+            changed_paths=ordered, source_tool="integrate_delegated_patch",
+            mutating_task_id=str(getattr(ctx, "task_id", "") or ""))
     except Exception:
         pass
     reconcile_err = ""
@@ -173,9 +174,10 @@ def _write_payload_patch_artifacts(
     reported as ``blocked_reserved_paths`` and refused whole at apply, with the
     candidate always preserved for the parent's decision.
     """
-    import hashlib
     import subprocess
 
+    from ouroboros.artifact_storage import compress_in_place
+    from ouroboros.artifacts import stream_artifact_file
     from ouroboros.headless import (
         ARTIFACT_STATUS_FAILED,
         ARTIFACT_STATUS_READY_NO_CHANGES,
@@ -230,8 +232,8 @@ def _write_payload_patch_artifacts(
                               "baseline commit; refusing to capture over an ambiguous "
                               "baseline")
     resolved_root = exec_root.resolve()
-    # Final loader-visible inventory; raises SkillPayloadUnreadable on
-    # credential-shaped files (the existing refusal — caller discloses it typed).
+    # Final loader-visible inventory; a credential-like name (a child-created
+    # `.env`) rides like any file. Reserved paths are reported below, refused at apply.
     final_rel = sorted(
         path.relative_to(resolved_root).as_posix()
         for path in _iter_payload_files(resolved_root)
@@ -345,7 +347,9 @@ def _write_payload_patch_artifacts(
             detail = (diff.stderr or diff.stdout or b"").decode("utf-8", errors="replace")
             return _manifest(ARTIFACT_STATUS_FAILED, note=f"patch emit failed: {detail.strip()[:300]}")
         patch_bytes = diff.stdout or b""
-        (cap_dir / "workspace.patch").write_bytes(patch_bytes)
+        patch_path = cap_dir / "workspace.patch"
+        patch_path.write_bytes(patch_bytes)
+        compress_in_place(patch_path)
         baseline_hash = str((entry.resource_ref or {}).get("payload_hash") or "")
         if baseline_hash and result_hash == baseline_hash:
             # Non-empty patch, result hash EQUAL to baseline: the change is
@@ -361,10 +365,11 @@ def _write_payload_patch_artifacts(
                      "e.g. symlink topology or file metadata). The snapshot and "
                      "the candidate patch are preserved for inspection.")
         stat = _git("diff", *diff_isolation, "--cached", "--shortstat", baseline)
+        measured = stream_artifact_file(patch_path)
         return _manifest(
             ARTIFACT_STATUS_READY_WITH_CHANGES,
-            sha256=hashlib.sha256(patch_bytes).hexdigest(),
-            patch_size=len(patch_bytes),
+            sha256=measured["sha256"],
+            patch_size=measured["size"],
             diffstat=(stat.stdout or b"").decode("utf-8", errors="replace").strip(),
             tracked_changed=changed,
             untracked_included=[],
@@ -470,7 +475,42 @@ def _candidate_symlink_escapes(
     return sorted(set(escapes)), ""
 
 
-def integrate_payload_patch(
+def integrate_payload_patch(ctx: ToolContext, **params: Any) -> str:
+    """Serialize the live target's CAS, mutation and disposition publication across captures."""
+    from hashlib import sha256
+    from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
+
+    if params.get("decision") != "apply":
+        return _integrate_payload_patch(ctx, **params)
+    target = pathlib.Path(params["entry"].target_root).resolve()
+    key = sha256(str(target).encode("utf-8")).hexdigest()
+    path = pathlib.Path(params["drive"]) / "state" / "delegate_payload_mutations" / f"{key}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = acquire_exclusive_file_lock(path, timeout_sec=20.0, owner_aware_stale=True)
+    if fd is None:
+        return "⚠️ INTEGRATE_DELEGATED_TARGET_BUSY: payload mutation lock unavailable; capture retained."
+    try:
+        return _integrate_payload_patch(ctx, **params)
+    finally:
+        release_exclusive_file_lock(path, fd)
+
+
+def _payload_apply_target(ctx: ToolContext, entry: _RunCustody, rid: str):
+    """Fresh payload authority, then the administrator's write rule, at the actual apply door.
+
+    Private drafting/capture is not installation. No-change and rejection need no write authority.
+    """
+    from ouroboros.deployment_extensions import payload_write_refusal
+
+    target, binding, refusal = _di()._rebind_payload_reference(
+        ctx, entry.resource_ref, entry.target_root, tool="integrate_delegated_patch", context=f"run_id={rid}")
+    if refusal:
+        return target, binding, refusal.text  # the family native result projected into integration's string ABI
+    managed = payload_write_refusal(target, data_root=binding.state_drive_root)
+    return target, binding, f"⚠️ MANAGED_BY_DEPLOYMENT: {managed}" if managed else ""
+
+
+def _integrate_payload_patch(
     ctx: ToolContext, *, drive: pathlib.Path, entry: _RunCustody, rid: str,
     decision: str, reason: str, cap_dir: pathlib.Path,
     manifest: Dict[str, Any], patch_path: pathlib.Path,
@@ -489,7 +529,6 @@ def integrate_payload_patch(
     post-apply hash mismatch — QUEUES the existing extension reconcile request
     (receipt says queued, never reconciled).
     """
-    import subprocess
 
     from ouroboros.headless import (
         ARTIFACT_STATUS_READY_NO_CHANGES,
@@ -566,14 +605,9 @@ def integrate_payload_patch(
         return (f"⚠️ INTEGRATE_PATCH_CORRUPT: sha256 mismatch for run {rid}; "
                 "refusing to apply.")
 
-    target, binding, rebind_refusal = _di()._rebind_payload_reference(
-        ctx, entry.resource_ref, entry.target_root,
-        tool="integrate_delegated_patch", context=f"run_id={rid}")
+    target, binding, rebind_refusal = _payload_apply_target(ctx, entry, rid)
     if rebind_refusal:
-        # The family boundary: this rebind helper is shared with the
-        # external-executor verbs, which speak the native result; the patch
-        # integration tool keeps its own string ABI, so the refusal projects here.
-        return rebind_refusal.text
+        return rebind_refusal
     from ouroboros.subagent_worktrees import isolated_git_env
 
     # NO-REPOSITORY mode for BOTH git invocations below (the touched-path reader
@@ -629,6 +663,10 @@ def integrate_payload_patch(
         return (f"⚠️ INTEGRATE_DELEGATED_BASELINE_UNVERIFIABLE: the live payload "
                 f"could not be hashed ({type(exc).__name__}: {exc}). Nothing was "
                 "changed; the snapshot and the patch are preserved.")
+    from ouroboros.tools.subagent_integration_delegated import _current_disposition_refusal
+
+    if refusal := _current_disposition_refusal(ctx, rid):
+        return refusal
     if live_hash != baseline_hash:
         if result_hash and live_hash == result_hash:
             # Already applied (a crashed prior attempt landed the patch before its
@@ -655,11 +693,15 @@ def integrate_payload_patch(
         return (f"⚠️ INTEGRATE_INTENT_UNWRITTEN: the durable apply-intent row for run "
                 f"{rid} could not be written. Refusing to mutate; fix the drive/event "
                 "log and retry. Nothing was changed.")
+    if refusal := _current_disposition_refusal(ctx, rid):
+        custody.record_patch_apply_resolved(drive, entry, reason="authority_changed")
+        return refusal
     # Index-free apply with cwd = the LIVE payload (R1 item 3, probed): no .git,
     # no index, no staging is created in the live payload. Atomic on failure.
     # Config-isolated and repository-free (see the git_env comment above).
-    proc = subprocess.run(["git", "apply", str(patch_path)], cwd=str(target),
-                          capture_output=True, text=True, env=git_env)
+    from ouroboros.tools.patch_staging import git_apply  # a payload in a work checkout applies as the work domain
+
+    proc = git_apply(target, patch_path, [], text=True, env=git_env)
     if proc.returncode != 0:
         custody.record_patch_apply_resolved(drive, entry, reason="apply_failed")
         stderr = (proc.stderr or proc.stdout or "").strip()
@@ -702,7 +744,7 @@ def integrate_payload_patch(
             "integrate_delegated_patch(decision='reject') to release the snapshot "
             "while keeping the patch artifact. Finalizing your task while this run is "
             "neither applied nor rejected leaves your custody audit unreconciled (Done "
-            "with warnings, reason delegated_custody_unreconciled). "
+            "with warnings, the run listed in delegated_runs_unreconciled beside your own reason). "
             f"Verdict: {verdict_path or '(unwritten)'}.")
     if result_hash and live_after != result_hash:
         try:
@@ -711,7 +753,8 @@ def integrate_payload_patch(
             invalidate_advisory_after_mutation(
                 pathlib.Path(str(getattr(ctx, "drive_root", "") or ".")),
                 mutation_root=target, changed_paths=ordered,
-                source_tool="integrate_delegated_patch")
+                source_tool="integrate_delegated_patch",
+                mutating_task_id=str(getattr(ctx, "task_id", "") or ""))
         except Exception:
             pass
         reconcile_err = ""
@@ -753,8 +796,8 @@ def integrate_payload_patch(
             "to release the snapshot while keeping the patch artifact). The snapshot "
             "and the patch are preserved as forensic material. Finalizing your task "
             "while this run is neither applied nor rejected leaves your custody audit "
-            "unreconciled (the task completes as Done with warnings, reason "
-            f"delegated_custody_unreconciled). Verdict: {verdict_path or '(unwritten)'}.")
+            "unreconciled (the task completes as Done with warnings, the run listed in "
+            f"delegated_runs_unreconciled beside your own reason). Verdict: {verdict_path or '(unwritten)'}.")
     return _finalize_payload_apply(
         ctx, rid=rid, reason=reason, target=target, touched=touched,
         ordered=ordered, manifest=manifest, state_root=state_root,

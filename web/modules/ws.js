@@ -1,10 +1,23 @@
-import { apiFetch } from './api_client.js';
-/** WebSocket manager; connect after modules register listeners. */
+import { isPanicFrame, panicWithoutSocket } from './panic.js';
+import { openSignIn, readState } from './api_client.js';
+/** WebSocket manager; connect after modules register listeners.
+ *
+ * Outbound messages sent while the socket is down are queued in memory (at most
+ * 100; the oldest is dropped and announced as `outbound_dropped`) and flushed on
+ * the next open; `send(..., {queue: false})` skips the queue. A watchdog checks
+ * every 10 s and closes a socket that has delivered no inbound message for 45 s,
+ * which enters the normal reconnect path.
+ * Panic returns `intercepted`: an emergency control, never a sent chat or queued submission.
+ */
 
 // Consecutive healthy /api/state probes tolerated while the socket stays down
 // before recovery forces a reload (at most one per disconnect episode) — the
-// fuse for a browser runtime whose WebSocket stack froze.
+// fuse for a browser runtime whose WebSocket stack froze. A page whose socket
+// never opened has no frozen connection to heal: reloading it would only repeat
+// itself every few minutes (its own reload starts unconnected too).
 export const RECOVERY_HEALTHY_PROBE_LIMIT = 4;
+// The event that says serverAnswersWhileDown() changed.
+export const SERVER_ANSWERS_EVENT = 'server_answers';
 
 // Pause before the post-open state read is repeated after a non-answer; it grows
 // 1.5x per attempt up to the cap, the same curve the recovery probe uses.
@@ -13,7 +26,7 @@ const POST_OPEN_RETRY_MAX_MS = 30000;
 
 /**
  * SSOT for the served-SHA reload decision, shared by the post-open state
- * refresh and the socket-down recovery probe.
+ * refresh and the socket-down recovery probe through decideServedPage below.
  *
  * A client that never connected has nothing to reconcile: keep the page.
  * After a connection existed, an equal SHA keeps the page; a different SHA
@@ -41,6 +54,43 @@ export function decide(prevSha, servedSha, previouslyConnected) {
     return prev === served ? 'keep' : 'reload_changed';
 }
 
+// The core marks only the built-in page it serves itself, per response: never
+// in the shipped bytes, never on a custom directory's or another host's page.
+const PAGE_OWNER_META = 'ouroboros-ui-owner';
+
+export function pageOwnedByCore(doc = globalThis.document) {
+    return doc?.querySelector?.(`meta[name="${PAGE_OWNER_META}"]`)?.getAttribute('content') === 'core';
+}
+
+/**
+ * Who refreshes this page when the core behind it changes. `served_ui` on
+ * /api/state is the interface the core actually serves (an unusable directory
+ * reports builtin with its error), fixed until the core restarts.
+ *
+ * - No `served_ui` — a core older than the interface choice: decide(), exactly.
+ * - The core's own built-in page while it still serves built-in: decide().
+ * - The core's own page after a restart applied a directory or none: reload once,
+ *   even on an unchanged SHA. A fresh page never reloads before its first
+ *   connection, so a marked page cannot loop.
+ * - Any unmarked page under such a core: its directory or host owns its refresh;
+ *   a core change only reconnects and resynchronizes it.
+ *
+ * @param {*} prevSha last remembered served SHA
+ * @param {*} state parsed /api/state body (may be absent/malformed)
+ * @param {boolean} previouslyConnected whether this client ever had an open socket
+ * @param {boolean} coreOwnedPage whether this page carries the core's marker
+ * @returns {'keep'|'reload_changed'|'reload_unknown'|'reload_source'}
+ */
+export function decideServedPage(prevSha, state, previouslyConnected, coreOwnedPage) {
+    const servedUi = state?.served_ui;
+    if (servedUi === undefined) return decide(prevSha, state?.sha, previouslyConnected);
+    if (!coreOwnedPage) return 'keep';
+    if (servedUi?.source === 'builtin') return decide(prevSha, state.sha, previouslyConnected);
+    return previouslyConnected ? 'reload_source' : 'keep';
+}
+
+const RELOAD_REASONS = { reload_changed: 'sha-change', reload_unknown: 'sha-unknown', reload_source: 'ui-source' };
+
 export class WS {
     constructor(url) {
         this.url = url;
@@ -62,8 +112,33 @@ export class WS {
         this._watchdogTimer = null;
         this._recoveryHealthyProbes = 0;
         this._recoveryReloadFired = false;
+        // Socket attempts started; how many had started when the core first answered in the current
+        // streak of healthy probes (null: none); whether a later attempt failed too.
+        this._attempts = 0;
+        this._answeredAtAttempt = null;
+        this._serverAnswers = false;
         this._pendingMessages = [];
         this._nextClientMessageId = 1;
+    }
+
+    /** While the socket is down: the core answered its state read, and a socket attempt started after that
+     *  answer still did not open. An observation for the room's status, never a cause: a handshake refused
+     *  before accept (4403, 4401), a proxy or network that drops the upgrade and a frozen runtime all reach
+     *  the page as the same 1006. It ends at an open, an unanswered probe, sign-in or a reload. */
+    serverAnswersWhileDown() {
+        return this._serverAnswers && !this.isConnected();
+    }
+
+    _serverAnswered(atAttempt) {
+        // Keep the first answer: a slow handshake may span more healthy probes before it fails.
+        if (atAttempt === null || this._answeredAtAttempt === null) this._answeredAtAttempt = atAttempt;
+        if (atAttempt === null) this._setServerAnswers(false);
+    }
+
+    _setServerAnswers(value) {
+        if (this._serverAnswers === value) return;
+        this._serverAnswers = value;
+        this.emit(SERVER_ANSWERS_EVENT, { serverAnswers: value });
     }
 
     _getUrl() {
@@ -109,8 +184,9 @@ export class WS {
         window.location.replace(this._freshWindowUrl(reason));
     }
 
-    _applyShaDecision(servedSha, previouslyConnected, storeServedSha) {
-        const decision = decide(this._lastSha, servedSha, previouslyConnected);
+    _applyServedDecision(state, previouslyConnected, storeServedSha) {
+        const decision = decideServedPage(this._lastSha, state, previouslyConnected, pageOwnedByCore());
+        const servedSha = state?.sha;
         // Only the post-open refresh remembers the served SHA. A pre-connect
         // recovery probe must never adopt a restarted server's SHA: doing so
         // would make the eventual post-open compare a self-fulfilling "keep"
@@ -122,10 +198,11 @@ export class WS {
         return decision;
     }
 
-    _reloadForShaDecision(decision) {
+    _reloadForDecision(decision) {
         // Reload on SHA change so PyWebView picks up new JS/CSS after restart;
-        // an unproveable SHA after a reconnect is treated the same way.
-        this._refreshWindow(decision === 'reload_changed' ? 'sha-change' : 'sha-unknown');
+        // an unproveable SHA after a reconnect is treated the same way, and so
+        // is the core's own page once the core serves another interface.
+        this._refreshWindow(RELOAD_REASONS[decision]);
     }
 
     _scheduleUiRecovery(reason, delay = 15000) {
@@ -147,22 +224,24 @@ export class WS {
             let rearm = false;
             try {
                 let healthy = false;
-                let servedSha;
+                let signedOut = false;
+                let served;
                 try {
-                    const resp = await apiFetch('/api/state', { cache: 'no-store' });
-                    if (resp.ok) {
-                        // Healthy requires an OK status AND a parseable object
-                        // body: a captive portal / interposed proxy answering
-                        // 200 HTML must count as a FAILED probe, or a
-                        // remembered SHA would reload straight into the portal
-                        // and destroy queued outbound messages.
-                        try {
-                            const body = await resp.json();
-                            if (body && typeof body === 'object') {
-                                healthy = true;
-                                servedSha = body.sha;
-                            }
-                        } catch {}
+                    // One bounded read: a request or body that never answers ends
+                    // as a failed probe within its lifetime and the chain re-arms.
+                    const { response: resp, state: body } = await readState();
+                    // The gate refuses an unauthenticated socket before accepting
+                    // it, which reaches this page as an ordinary close (1006,
+                    // never 4401): the state read is where the refusal is legible.
+                    signedOut = resp.status === 401;
+                    // Healthy requires an OK status AND a parseable object
+                    // body: a captive portal / interposed proxy answering
+                    // 200 HTML must count as a FAILED probe, or a
+                    // remembered SHA would reload straight into the portal
+                    // and destroy queued outbound messages.
+                    if (resp.ok && body && typeof body === 'object') {
+                        healthy = true;
+                        served = body;
                     }
                 } catch {}
                 if (this._recoveryEpisode !== episode) {
@@ -175,15 +254,22 @@ export class WS {
                     // the post-open refresh owns the SHA decision now.
                     return;
                 }
+                if (signedOut) {
+                    this._serverAnswered(null);
+                    openSignIn();
+                    return;
+                }
                 if (healthy) {
-                    const decision = this._applyShaDecision(servedSha, this._wasConnected, false);
+                    const decision = this._applyServedDecision(served, this._wasConnected, false);
                     if (decision !== 'keep') {
-                        this._reloadForShaDecision(decision);
+                        this._serverAnswered(null);
+                        this._reloadForDecision(decision);
                         return;
                     }
+                    this._serverAnswered(this._attempts);
                     this._recoveryHealthyProbes += 1;
                     if (this._recoveryHealthyProbes >= RECOVERY_HEALTHY_PROBE_LIMIT
-                            && !this._recoveryReloadFired) {
+                            && !this._recoveryReloadFired && this._wasConnected) {
                         // The server is reachable and serves the same page, yet the
                         // socket never reopens: force one reload per disconnect
                         // episode instead of reconnecting in place forever.
@@ -193,6 +279,7 @@ export class WS {
                     }
                 } else {
                     this._recoveryHealthyProbes = 0;
+                    this._serverAnswered(null);
                 }
                 rearm = true;
             } finally {
@@ -223,7 +310,6 @@ export class WS {
 
     _scheduleReconnect() {
         if (this._reconnectTimer) return;
-        document.getElementById('reconnect-overlay')?.classList.add('visible');
         this._scheduleUiRecovery('socket-disconnect', 15000);
         const delay = this.reconnectDelay;
         this._reconnectTimer = setTimeout(() => {
@@ -254,16 +340,14 @@ export class WS {
                     Math.min(Math.round(delay * 1.5), POST_OPEN_RETRY_MAX_MS));
             }, delay);
         };
-        apiFetch('/api/state', { cache: 'no-store' }).then(async (resp) => {
+        // One bounded read. A body that does not parse is still an answer (decided
+        // as unknown below); a request or body that outlives the read's lifetime
+        // is a non-answer and repeats like a failed request.
+        readState().then(({ response: resp, state: served }) => {
             if (this.ws !== socket) return;
             if (!resp.ok) { retry(); return; }
-            let servedSha;
-            try {
-                servedSha = (await resp.json())?.sha;
-            } catch {}
-            if (this.ws !== socket) return;
-            const decision = this._applyShaDecision(servedSha, previouslyConnected, true);
-            if (decision !== 'keep') this._reloadForShaDecision(decision);
+            const decision = this._applyServedDecision(served, previouslyConnected, true);
+            if (decision !== 'keep') this._reloadForDecision(decision);
         }, retry).catch(() => {});
     }
 
@@ -274,6 +358,7 @@ export class WS {
         const queued = [...this._pendingMessages];
         this._pendingMessages = [];
         for (const msg of queued) {
+            if (isPanicFrame(msg)) continue;
             try {
                 this.ws.send(JSON.stringify(msg));
                 this.emit('outbound_sent', {
@@ -296,6 +381,7 @@ export class WS {
         const socket = new WebSocket(this._getUrl());
         this.ws = socket;
         const previouslyConnected = this._wasConnected;
+        const attempt = ++this._attempts;
         let disconnected = false;
 
         const handleDisconnect = () => {
@@ -304,12 +390,17 @@ export class WS {
             // A newer socket owns its own retry; an older socket's late close leaves it alone.
             if (this.ws === socket) { this.ws = null; this._clearPostOpenRetryTimer(); }
             this._clearWatchdogTimer();
+            // Only an attempt begun after the core's answer counts (an open clears the answer).
+            if (this._answeredAtAttempt !== null && attempt > this._answeredAtAttempt) this._setServerAnswers(true);
             this.emit('close');
             this._scheduleReconnect();
         };
 
         socket.onopen = () => {
             if (this.ws !== socket) return;
+            // Ends with the episode; the open event below re-derives every status, so nothing else is told.
+            this._answeredAtAttempt = null;
+            this._serverAnswers = false;
             this._wasConnected = true;
             this._lastMessageAt = Date.now();
             this._clearReconnectTimer();
@@ -328,7 +419,6 @@ export class WS {
             // per-instance "seen an open before" flag as false on the next real
             // reconnect and skip the full rebuild; previouslyConnected cannot.
             this.emit('open', { previouslyConnected });
-            document.getElementById('reconnect-overlay')?.classList.remove('visible');
             this._refreshStateAfterOpen(previouslyConnected);
             this._flushPendingMessages();
         };
@@ -356,6 +446,12 @@ export class WS {
 
     send(msg, options = {}) {
         const payload = { ...msg };
+        if (isPanicFrame(payload)) {
+            void panicWithoutSocket({ ...payload.client_surface, input: payload.type === 'chat' ? 'typed_chat' : 'command' },
+                this.ws, options.onPanicAccepted);
+            return { status: 'intercepted', clientMessageId: '' };
+        }
+
         if (!payload.client_message_id && payload.type === 'chat') {
             payload.client_message_id = `msg-${Date.now()}-${this._nextClientMessageId++}`;
         }

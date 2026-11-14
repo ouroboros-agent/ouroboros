@@ -16,23 +16,14 @@
 // (url-only `oauth_url`/`chatgpt` vs `oauth_url_input`; 3.3.7 final
 // contract) — no harness-name branches, no boolean sidecar.
 //
-// This machinery used to be welded into the Providers-tab section
-// (`harness_accounts.js`). It is extracted so the onboarding wizard mounts the
-// SAME flow instead of reimplementing device codes, backoff and the
-// verify-race — and so both surfaces inherit every fix once.
+// Shared by the Providers tab and the onboarding wizard, so both inherit every fix.
+// Start, Retry and Close run through one ordered queue; a new login begins only
+// once release of the previous job is proven (`loginReleaseProven`) — a 2xx cancel
+// alone is not proof.
 //
-// TWO render modes:
-//   * `full`    — exactly what Settings renders today: link/device code,
-//                 the optional paste-code entry, the live state line, the
-//                 verdict + the engine's own sentence, the collapsed Advanced
-//                 terminal fallback (or an explicit external continuation),
-//                 and Close.
-//   * `compact` — Connect + progress + verified state + retry, for a wizard
-//                 step. The optional paste-code entry and the delayed Advanced
-//                 fallback stay full-only. Any available attach command is
-//                 rendered directly in compact, while an explicitly selected
-//                 external-terminal continuation is direct in BOTH modes, so
-//                 neither mode strands the completion path.
+// Full mode adds paste-code input and the delayed Advanced fallback. Compact
+// mode exposes any available attach command directly; an explicit external
+// terminal continuation is direct in both. Both report authentication only.
 //
 // Pure helpers up top are node-tested without a DOM.
 
@@ -54,6 +45,7 @@ export const JOB_POLL_GIVE_UP_FAILURES = 10;
 
 export const LOGIN_CARD_FULL = 'full';
 export const LOGIN_CARD_COMPACT = 'compact';
+export const SIGN_IN_SCOPE_NOTE = 'Sign-in does not verify main-chat support or agent execution.';
 
 export const TERMINAL_TRANSPORT_ERROR_CODES = Object.freeze([
     'terminal_transport_unavailable',
@@ -351,14 +343,12 @@ export async function confirmLoginLive(harness, profileId, {
 
 export function resolvedJobProfileId(envelope) {
     // The profile a login job REALLY targets, read off the job's own record.
-    // On a legacy engine a default login carries `profileId: null` — the
-    // empty-string address the native pseudo-row answers to. On a unified
-    // engine (plan §K.4) the engine resolves a default login onto its
-    // bootstrap registry row and the job record names it, so the verify-race
-    // must ask about THAT row: no row with the empty id exists there, and an
-    // unresolved '' address would report every successful default login as
-    // unconfirmed. A named login's job names the same profile the card
-    // started with, so adopting the job's answer is safe on both engines.
+    // The engine resolves an empty family's login onto its bootstrap registry
+    // row (plan §K.4) — `claude-default`, or another id such as
+    // `claude-default-2` when that one is taken — and the job record names it,
+    // so the verify-race asks about THAT row and no sibling. A job naming no
+    // profile leaves '', which no row answers to: never a confirmation. A
+    // named login's job names the same profile the card started with.
     const raw = envelope?.job?.profileId;
     return typeof raw === 'string' ? raw : '';
 }
@@ -491,6 +481,9 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
         `<h4>Connect ${harnessAccountIdentityMarkup(active.harness, { label: active.familyLabel, profile: active.profile })}</h4>`];
     if (face === 'error') {
         bits.push(`<div class="settings-inline-note" data-tone="error">${escapeHtml(active.error)}</div>`);
+        for (const action of active.maintenanceProblem ? active.requiredActions || [] : []) {
+            bits.push(`<div class="settings-inline-note" data-login-required-action>${escapeHtml(action)}</div>`);
+        }
         if (loginRetryAvailable(active)) {
             bits.push('<button type="button" class="btn btn-primary" data-login-retry>Try again</button>');
         }
@@ -548,7 +541,7 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
     // ALSO silences it explicitly: once a verdict (or its re-check) owns the
     // card, a snapshot that still reads pending — a poll response captured
     // before the job settled — must not print "Waiting for the sign-in link…"
-    // underneath "Connected.".
+    // underneath "Signed in.".
     if (face !== 'error' && face !== 'name' && !active.verdict && !active.confirming) {
         const line = active.preparingRuntime
             ? claudexorPreparationLine(statusPayload)
@@ -601,7 +594,8 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
     } else if (face === 'unavailable') {
         bits.push('<div class="settings-inline-status" data-tone="muted" data-login-verdict>This sign-in job is no longer available. Refresh the account status before trying again.</div>');
     } else if (active.verdict?.kind === 'success') {
-        bits.push('<div class="settings-inline-status" data-tone="ok" data-login-verdict>Connected.</div>');
+        bits.push(`<div class="settings-inline-status" data-tone="ok" data-login-verdict>Signed in.</div>
+            <div class="settings-inline-note" data-login-scope>${SIGN_IN_SCOPE_NOTE}</div>`);
     } else if (active.verdict?.kind === 'failure') {
         bits.push(`<div class="settings-inline-status" data-tone="error" data-login-verdict>${escapeHtml(failureText(active.verdict.reason))}</div>`);
     } else if (active.verdict?.kind === 'unconfirmed') {
@@ -621,7 +615,7 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
     // other an honest "unknown"), so without this line a settled login says
     // nothing about WHY — the daemon's sentence lived in the snapshot and was
     // rendered nowhere. Only for a settled non-success verdict: beside
-    // "Connected." a stale message would contradict the outcome, and while the
+    // "Signed in." a stale message would contradict the outcome, and while the
     // job is pending the live status line already owns the card.
     if (!compact && (active.verdict?.kind === 'failure' || active.verdict?.kind === 'unconfirmed')) {
         // #125: a verdict minted client-side (the poll give-up) carries its own
@@ -1319,6 +1313,7 @@ export function createLoginCardController({
                 const problemCode = typeof data?.code === 'string' ? data.code : '';
                 active.problemCode = problemCode;
                 active.requiredActions = actions;
+                active.maintenanceProblem = Boolean(data?.context?.operationId);
                 if (problemCode) {
                     // A typed daemon refusal before a durable job was returned
                     // proves this client owns no setup custody. Generic
@@ -1518,11 +1513,9 @@ export function createLoginCardController({
         active.confirming = true;
         render();
         // The row address: the profile the card started with, upgraded to the
-        // job's OWN resolved profile when the engine names one — a unified
-        // engine resolves a default login onto its bootstrap registry row, and
-        // only that row can confirm it (resolvedJobProfileId). On a legacy
-        // engine the job carries null for a default login and the address
-        // stays the empty string, byte-identical to today.
+        // job's OWN resolved profile when the engine names one — the engine
+        // resolves an empty family's login onto its bootstrap registry row, and
+        // only that row can confirm it (resolvedJobProfileId).
         const rowAddress = active.profile
             || resolvedJobProfileId(active.envelope || {}) || '';
         const check = await confirmLoginLive(active.harness, rowAddress, {

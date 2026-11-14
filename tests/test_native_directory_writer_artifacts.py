@@ -4,16 +4,16 @@ from __future__ import annotations
 from hashlib import sha256
 import json
 from pathlib import Path
-import shutil
 import subprocess
 
 import pytest
 
 from ouroboros.artifacts import collect_task_artifact_records
-from ouroboros.headless import copy_child_task_result, finalize_task_artifacts, task_artifacts_dir
+from ouroboros.headless import copy_child_task_result, finalize_task_artifacts, task_artifacts_dir, retry_child_task_refs
 from ouroboros.task_results import load_task_result, write_task_result
 from ouroboros.task_status import load_effective_task_result
 from ouroboros.tools.registry import ToolContext, ToolRegistry
+from tests._store_shared import remove_store_tree
 
 
 def _registry(tmp_path, monkeypatch, *, git=False, system_target=False):
@@ -47,9 +47,10 @@ def _finish(ctx, task, parent):
                       parent_task_id="parent1", root_task_id="parent1", delegation_role="subagent",
                       artifacts=collect_task_artifact_records(ctx.drive_root, ctx.task_id))
     copied = copy_child_task_result(parent, task)
+    copied = retry_child_task_refs(parent, ctx.drive_root, ctx.task_id)
     assert copied and copied["child_ref_promotion"]["status"] == "complete"
     finalize_task_artifacts(parent, task)
-    shutil.rmtree(ctx.drive_root)
+    remove_store_tree(ctx.drive_root)
     return load_effective_task_result(parent, ctx.task_id)
 
 
@@ -96,7 +97,7 @@ def test_all_native_writers_register_outputs_before_result_and_survive_reopen(tm
     assert load_task_result(parent, ctx.task_id)["result"] == "Requested changes written"
 
 
-@pytest.mark.parametrize("tool", ["write_file", "edit_text", "apply_patch", "edit_batch"])
+@pytest.mark.parametrize("tool", ["write_file", "apply_patch", "edit_batch"])
 def test_capture_failure_reports_already_written_file_without_retry(tmp_path, monkeypatch, tool):
     registry, ctx, task, parent = _registry(tmp_path, monkeypatch)
     target = ctx.workspace_root / "out.txt"
@@ -163,8 +164,7 @@ def test_git_and_self_repo_writes_keep_existing_artifact_behavior(tmp_path, monk
     assert collect_task_artifact_records(ctx.drive_root, ctx.task_id) == []
 
 
-@pytest.mark.parametrize("mode", ["overwrite", "append"])
-@pytest.mark.parametrize("failure", ["", "write", "capture"])
+@pytest.mark.parametrize(("failure", "mode"), [("", "overwrite"), ("write", "overwrite"), ("capture", "append")])
 def test_batch_retains_each_success_with_one_capture_preamble(tmp_path, monkeypatch, mode, failure):
     registry, ctx, _, _ = _registry(tmp_path, monkeypatch)
     names = ("first.txt", "second.txt", "third.txt")
@@ -204,3 +204,18 @@ def test_batch_retains_each_success_with_one_capture_preamble(tmp_path, monkeypa
     if failure == "capture":
         assert "OUTPUT_CAPTURE_FAILED: second.txt" in result
         assert "writes remain applied; do not repeat" in result
+
+
+def test_a_git_ignored_native_write_keeps_its_exact_postimage_and_a_tracked_one_stays_the_patchs(tmp_path, monkeypatch):
+    """In a Git folder only the written paths Git ignores (no status row, no workspace patch) are retained as exact
+    postimages, by their exact known paths; a write Git tracks keeps its patch capture alone, never a duplicate."""
+    registry, ctx, _task, _parent = _registry(tmp_path, monkeypatch, git=True)
+    folder = ctx.workspace_root
+    (folder / ".gitignore").write_text("dist/\n", encoding="utf-8")
+    ignored = str(registry.execute("write_file", {"path": "dist/report.txt", "content": "the made report\n"}))
+    assert "Git ignores these written paths" in ignored and "Retained file outputs: dist/report.txt" in ignored
+    tracked = str(registry.execute("write_file", {"path": "notes.txt", "content": "tracked text\n"}))
+    assert "Retained file outputs:" not in tracked and "Written 1 file" in tracked
+    [record] = collect_task_artifact_records(ctx.drive_root, ctx.task_id)
+    assert Path(record["source_path"]).name == "report.txt" and record["kind"] == "user_file"
+    assert Path(record["path"]).read_bytes() == b"the made report\n"

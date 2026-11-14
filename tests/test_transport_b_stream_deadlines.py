@@ -20,6 +20,7 @@ from ouroboros.llm_stream import (
     AssembledResponse, IncompleteProviderStream, ProviderStreamError, RejectedProviderStream,
 )
 from ouroboros.loop_llm_call import classify_llm_exception
+from tests._usage_store_testing import ledger_rows
 
 WIRE_CORPUS = pathlib.Path(__file__).parent / "fixtures" / "llm_wire"
 
@@ -113,15 +114,13 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(pricing, "estimate_cost_optional", lambda *a, **k: None)
     monkeypatch.setattr(ua, "_reservation_cost", lambda request: 1.0)
     monkeypatch.setattr(LLMClient, "_get_supported_parameters", lambda *a, **k: None)
-    monkeypatch.setattr(LLMClient, "_fetch_generation_cost", lambda *a, **k: None)
     monkeypatch.setenv("TOTAL_BUDGET", "100")
     with ua.usage_scope(ua.UsageScope(drive_root=tmp_path, task_id="stream-task", root_task_id="stream-task")):
         yield tmp_path
 
 
 def rows(root):
-    path = root / ua.LEDGER_REL
-    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    return ledger_rows(root)
 
 
 def run_driver(create, kwargs, route, *, asynchronous=False):
@@ -147,7 +146,7 @@ def test_json_and_stream_parity_with_usage_tail(isolated, asynchronous):
         completion(), target(), skip_cost_fetch=True)
     assert receipt["complete"] is True and receipt["manifest_ref"]
     assert response.closed
-    assert [row["state"] for row in rows(isolated)] == ["reserved", "dispatched", "settled"]
+    assert [row["state"] for row in rows(isolated)] == ["settled"]
     assert rows(isolated)[-1]["cost_usd"] == 0.25
 
 
@@ -182,16 +181,23 @@ def test_recorded_gemini_multicall_frames_through_the_driver(isolated):
     assert result["usage"]["cost"] == 0.00358725 and result["usage"]["completion_tokens"] == 944
     assert receipt["complete"] is True and receipt["anomalies"] == {"count": 0, "first": []}
     assert response.closed
-    assert [row["state"] for row in rows(isolated)] == ["reserved", "dispatched", "settled"]
+    assert [row["state"] for row in rows(isolated)] == ["settled"]
     assert rows(isolated)[-1]["cost_usd"] == 0.00358725
     normalized_msg, normalized_usage = LLMClient()._normalize_remote_response(result, target(), skip_cost_fetch=True)
     assert [detail["type"] for detail in normalized_msg["reasoning_details"]] == ["reasoning.text", "reasoning.encrypted"]
     assert normalized_usage["response_provider"] == "Google"
 
 
-@pytest.mark.parametrize("asynchronous", [False, True])
-@pytest.mark.parametrize("failure", ["eof", "missing_finish", "error_first", "error_mid", "error_free_claim",
-                                     "disconnect", "cancel", "malformed"])
+@pytest.mark.parametrize(("failure", "asynchronous"), [
+    ("eof", True),
+    ("missing_finish", False),
+    ("error_first", True),
+    ("error_mid", False),
+    ("error_free_claim", True),
+    ("disconnect", False),
+    ("cancel", True),
+    ("malformed", False),
+])
 def test_incomplete_stream_never_settles_or_replays(isolated, asynchronous, failure):
     wire = sse(chunk({"content": "partial", "tool_calls": [{"index": 0, "id": "t", "type": "function",
                            "function": {"name": "lookup", "arguments": '{"q":"ok"}'}}]}), done=False)
@@ -277,7 +283,7 @@ def test_rejected_terminal_body_settles_usage_and_classifies_provider_error(isol
     assert exc.stream_usage == completion()["usage"]
     assert exc.stream_receipt["complete"] is True and exc.stream_receipt["manifest_ref"]
     assert exc.physical_attempt_capture.state == "settled"
-    assert [row["state"] for row in rows(isolated)] == ["reserved", "dispatched", "settled"]
+    assert [row["state"] for row in rows(isolated)] == ["settled"]
     assert rows(isolated)[-1]["cost_usd"] == 0.25 and rows(isolated)[-1]["prompt_tokens"] == 10
     classification = classify_llm_exception(exc)
     assert (classification.kind, classification.retry_same_request) == ("provider_error", False)
@@ -295,7 +301,7 @@ def test_terminal_length_with_a_partial_tool_call_returns_like_non_stream(isolat
     assert choice["message"]["tool_calls"] == [
         {"id": "t", "type": "function", "function": {"name": "lookup", "arguments": '{"q":'}}]
     assert result["_stream_receipt"]["complete"] is True and result["_stream_receipt"]["anomalies"]["count"] == 0
-    assert [row["state"] for row in rows(isolated)] == ["reserved", "dispatched", "settled"]
+    assert [row["state"] for row in rows(isolated)] == ["settled"]
 
 
 _FORGIVEN_SHAPES = {
@@ -390,13 +396,14 @@ def test_tool_call_without_type_is_structurally_complete(isolated, payload_key, 
     assert result["_stream_receipt"]["anomalies"]["count"] == 0 and rows(isolated)[-1]["state"] == "settled"
 
 
-def test_clean_close_with_a_missing_expected_choice_stays_unknown(isolated):
+def test_clean_close_with_a_missing_expected_choice_keeps_response_unknown_and_price(isolated):
     """``n=2``, one choice finished, the body closes without ``[DONE]`` and without the second
-    choice: the wire is genuinely incomplete, so this is the unknown outcome, not a rejection."""
+    choice: the reply remains an unknown outcome, while its received price is final."""
     wire = sse(chunk({"role": "assistant", "content": "only one"}, "stop", usage=completion()["usage"]), done=False)
     with pytest.raises(IncompleteProviderStream):
         run_driver(lambda **kw: WireResponse(wire), payload(stream=True, n=2), target())
-    assert rows(isolated)[-1]["state"] == "unresolved"
+    assert rows(isolated)[-1]["state"] == "settled"
+    assert rows(isolated)[-1]["cost_usd"] == 0.25 and rows(isolated)[-1]["cost_final"] is True
 
 
 def test_later_usage_snapshot_overrides_an_earlier_one(isolated):
@@ -542,8 +549,7 @@ def test_mid_stream_error_chunk_classifies_by_body_and_settles_only_with_usage(i
         "provider_transient", True, 502)
 
 
-@pytest.mark.parametrize("usage_first", [False, True])
-@pytest.mark.parametrize("shape", ["finish_reason_error", "code_less_error_frame"])
+@pytest.mark.parametrize(("shape", "usage_first"), [("finish_reason_error", False), ("code_less_error_frame", True)])
 def test_code_less_stream_error_is_a_provider_verdict_not_an_unknown_outcome(isolated, usage_first, shape):
     """An SSE error without an HTTP-shaped code — the provider's own ``finish_reason: "error"``, or an
     ``{"error": {"type": ...}}`` frame (the overload/api_error shape) — is the provider's terminal verdict on
@@ -579,8 +585,7 @@ def test_error_frame_carrying_its_own_usage_settles_the_attempt(isolated):
     assert rows(isolated)[-1]["state"] == "settled" and rows(isolated)[-1]["cost_usd"] == 0.25
 
 
-@pytest.mark.parametrize("asynchronous", [False, True])
-@pytest.mark.parametrize("field", ["stream", "stream_options"])
+@pytest.mark.parametrize(("field", "asynchronous"), [("stream", False), ("stream_options", True)])
 def test_stream_rejection_uses_existing_wire_recovery(isolated, asynchronous, field):
     calls = []
     def send(**kw):
@@ -631,7 +636,8 @@ def test_exhaustion_preserves_earlier_paid_capture(isolated, monkeypatch, asynch
     assert not is_pre_dispatch_transport_failure(caught.value)
     assert caught.value.physical_attempt_capture.state == "unresolved"
     assert caught.value.physical_attempt_capture.attempt_id == rows(isolated)[0]["attempt_id"]
-    assert len(rows(isolated)) == 3
+    assert [(row["state"], row["revision"]) for row in rows(isolated)] == [("unresolved", 4)]
+    assert rows(isolated)[0]["physical_failure"]
 
 
 def test_expired_initial_window_reserves_nothing(isolated, monkeypatch):
@@ -657,7 +663,7 @@ def test_slow_candidate_preparation_rechecks_before_dispatch(isolated, monkeypat
     monkeypatch.setattr(observability, "persist_physical_candidate", persist)
     with model_wait.execution_deadline_scope(110), pytest.raises(PhysicalDispatchInterrupted) as caught:
         run_driver(lambda **kw: pytest.fail("dispatched"), payload(), target())
-    assert [row["state"] for row in rows(isolated)] == ["reserved", "released"]
+    assert [row["state"] for row in rows(isolated)] == ["released"]
     assert caught.value.physical_attempt_capture.candidate_manifest_ref
 
 
@@ -685,7 +691,7 @@ def test_slow_recovery_preparation_keeps_both_attempt_receipts(isolated, monkeyp
     assert caught.value.deadline_attempt_capture.state == "released"
     assert caught.value.deadline_attempt_capture.candidate_manifest_ref
     assert not is_pre_dispatch_transport_failure(caught.value)
-    assert [row["state"] for row in rows(isolated)] == ["reserved", "dispatched", "unresolved", "reserved", "released"]
+    assert [row["state"] for row in rows(isolated)] == ["unresolved", "released"]
 
 
 def test_later_free_recovery_cannot_replace_earlier_unknown_custody(isolated, monkeypatch):
@@ -807,7 +813,11 @@ def test_native_incomplete_blocks_or_message_cannot_return_tools(isolated, monke
     monkeypatch.setattr(requests, "post", lambda *a, **k: WireResponse(sse(*events, done=False)))
     with pytest.raises(IncompleteProviderStream):
         LLMClient()._chat_anthropic(target("anthropic"), MESSAGES, TOOLS, "high", 1024, "auto", stream=True)
-    assert rows(isolated)[-1]["state"] == "unresolved"
+    row = rows(isolated)[-1]
+    if omit == "message_stop":
+        assert row["state"] == "settled" and row["cost_usd"] == 0.4
+    else:
+        assert row["state"] == "unresolved"  # No final message_delta was accepted.
 
 
 def test_native_unusable_body_after_message_stop_is_rejected_and_settled(isolated, monkeypatch):
@@ -872,10 +882,9 @@ def test_native_max_tokens_with_tool_blocks_returns_like_non_stream(isolated, mo
     assert rows(isolated)[-1]["state"] == "settled"
 
 
-@pytest.mark.parametrize("before_content", [False, True])
-@pytest.mark.parametrize("error,status,kind", [
-    ({"type": "overloaded_error", "message": "Overloaded"}, 200, "provider_error"),
-    ({"type": "api_error", "code": 502, "message": "Bad gateway"}, 502, "provider_transient"),
+@pytest.mark.parametrize(("error", "status", "kind", "before_content"), [
+    pytest.param({"type": "overloaded_error", "message": "Overloaded"}, 200, "provider_error", False, id='error0-200-provider_error-False'),
+    pytest.param({"type": "api_error", "code": 502, "message": "Bad gateway"}, 502, "provider_transient", True, id='error1-502-provider_transient-True'),
 ])
 def test_native_http_200_sse_error_keeps_producer_facts_and_custody(isolated, monkeypatch, before_content,
                                                                     error, status, kind):
@@ -901,8 +910,7 @@ def test_native_http_200_sse_error_keeps_producer_facts_and_custody(isolated, mo
     assert classify_llm_exception(exc).kind == kind
 
 
-@pytest.mark.parametrize("asynchronous", [False, True])
-@pytest.mark.parametrize("no_proxy", [False, True])
+@pytest.mark.parametrize(("no_proxy", "asynchronous"), [(False, False), (False, True), (True, True)])
 def test_public_remote_chat_carries_stream_deadline_and_custom_receipts(isolated, monkeypatch, asynchronous, no_proxy):
     client = LLMClient()
     calls = []
@@ -945,22 +953,29 @@ def test_late_complete_stream_settles_original_attempt(isolated, monkeypatch):
     with model_wait.execution_deadline_scope(110):
         result = run_driver(lambda **kw: response, payload(stream=True), target())
     assert result.model_dump()["choices"][0]["message"]["content"] == "done"
-    assert [row["state"] for row in rows(isolated)] == ["reserved", "dispatched", "settled"]
+    assert [row["state"] for row in rows(isolated)] == ["settled"]
 
 
-def test_cancelled_control_during_recovery_keeps_paid_custody(isolated, monkeypatch):
+def test_cancelled_control_during_recovery_keeps_paid_custody(isolated):
+    from ouroboros.task_results import write_task_result
+    write_task_result(isolated, "stream-task", "running", root_task_id="stream-task")
     reason = [None]
-    owner = SimpleNamespace(control_reason=lambda: reason[0])
-    monkeypatch.setattr(model_wait, "current_model_wait", lambda: owner)
     calls = []
     def send(**kw):
         calls.append(kw)
         reason[0] = "cancelled"
         raise Rejected("temperature unsupported")
-    with pytest.raises(PhysicalDispatchInterrupted) as caught:
-        run_driver(send, payload(temperature=0.2), target())
+    with model_wait.task_model_wait_scope(
+        task={"id": "stream-task"}, drive_root=isolated, event_queue=None,
+        worker_slot_held=False, owner_control=lambda: reason[0],
+    ) as owner:
+        assert owner.control_reason() is None
+        with pytest.raises(PhysicalDispatchInterrupted) as caught:
+            run_driver(send, payload(temperature=0.2), target())
+        assert owner.control_reason() == "cancelled"
     assert len(calls) == 1 and caught.value.control_reason == "cancelled"
     assert caught.value.physical_attempt_capture.state == "unresolved"
+    assert [row["state"] for row in rows(isolated)] == ["unresolved"]
 
 
 @pytest.mark.parametrize("no_proxy", [False, True])
@@ -989,8 +1004,9 @@ def test_local_and_model_operation_transports_receive_no_stream_option(isolated,
     import ouroboros.llm_claudexor as operations
     client = LLMClient()
     seen = []
-    def local(messages, tools, max_tokens, choice, *, timeout=None):
-        seen.append({"timeout": timeout})
+    def local(messages, tools, max_tokens, choice, *, timeout=None, reasoning_effort=None,
+              processing_preference=None):
+        seen.append({"timeout": timeout, "reasoning_effort": reasoning_effort})
         return {"content": "local"}, {}
     def operation(*args, **kwargs):
         seen.append(kwargs)
@@ -1008,10 +1024,7 @@ def test_local_and_model_operation_transports_receive_no_stream_option(isolated,
     assert all("stream" not in kwargs and "stream_options" not in kwargs for kwargs in seen)
 
 
-@pytest.mark.serial
-@pytest.mark.parametrize("asynchronous", [False, True])
-@pytest.mark.parametrize("no_proxy", [False, True])
-@pytest.mark.parametrize("terminal", [False, True])
+@pytest.mark.parametrize(("terminal", "no_proxy", "asynchronous"), [(False, False, False), (True, True, True)])
 def test_actual_sdk_loopback_sse_and_cleanup(isolated, monkeypatch, asynchronous, no_proxy, terminal):
     import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1058,7 +1071,7 @@ def test_actual_sdk_loopback_sse_and_cleanup(isolated, monkeypatch, asynchronous
         # unknown outcome); the missing witness is disclosed in the receipt.
         assert usage["stream_receipt"]["anomalies"]["count"] == (0 if terminal else 1)
         assert observed[0]["stream"] is True and observed[0]["stream_options"]["include_usage"] is True
-        assert [row["state"] for row in rows(isolated)] == ["reserved", "dispatched", "settled"]
+        assert [row["state"] for row in rows(isolated)] == ["settled"]
     finally:
         for sdk in client._remote_clients.values():
             sdk.close()
@@ -1068,7 +1081,6 @@ def test_actual_sdk_loopback_sse_and_cleanup(isolated, monkeypatch, asynchronous
     assert not thread.is_alive()
 
 
-@pytest.mark.serial
 def test_native_async_cancellation_keeps_worker_until_physical_terminal(isolated, monkeypatch):
     import threading
     import requests

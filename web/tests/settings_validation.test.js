@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { collectCustomSecretDraft, paintSettingsFieldErrors, settingsWriteFailure } from '../modules/settings_controls.js';
+import { collectCustomSecretDraft, settingsWriteFailure, webSearchPreviewWords } from '../modules/settings_controls.js';
 
 const draft = (overrides = {}) => ({
     key: '', value: '', appliedValue: '', originalKey: '', clear: false, removed: false,
@@ -54,28 +54,6 @@ test('duplicate and built-in names cannot silently overwrite another field', () 
     assert.equal(result.values.OUROBOROS_PRIVATE, undefined);
 });
 
-test('field validation clears the old error and keeps its accessible association', () => {
-    const attributes = new Map([['aria-describedby', 'custom-key-help']]);
-    const hint = { id: 'custom-key-error', hidden: true, textContent: '' };
-    const input = { id: 'custom-key', dataset: {},
-        getAttribute: (name) => attributes.get(name),
-        setAttribute: (name, value) => attributes.set(name, value),
-        removeAttribute: (name) => attributes.delete(name) };
-    const root = {
-        querySelectorAll: () => input.dataset.settingsValidation ? [input] : [],
-        querySelector: () => hint,
-    };
-    paintSettingsFieldErrors(root, [{ input, message: 'Invalid key' }]);
-    assert.equal(attributes.get('aria-invalid'), 'true');
-    assert.equal(attributes.get('aria-describedby'), 'custom-key-help custom-key-error');
-    assert.equal(hint.hidden, false);
-    paintSettingsFieldErrors(root, []);
-    assert.equal(attributes.has('aria-invalid'), false);
-    assert.equal(hint.hidden, true);
-    assert.equal(hint.textContent, '');
-    assert.equal(attributes.get('aria-describedby'), 'custom-key-help custom-key-error');
-});
-
 test('settings write errors preserve saved, unsaved and unknown receipts', () => {
     const error = new Error('stage refused');
     error.body = { saved: true };
@@ -91,3 +69,24 @@ test('settings write errors preserve saved, unsaved and unknown receipts', () =>
         assert.match(result.text, /outcome is unknown/);
     }
 });
+
+test('the web search preview names the sources once in order; models, gaps and credentials are Details', () => {
+    const names = { openai: 'OpenAI', openrouter: 'OpenRouter', anthropic: 'Anthropic', ddgs: 'DuckDuckGo' };
+    const name = (id) => names[id] || id;
+    const words = webSearchPreviewWords({
+        legs: [{ source: 'openai', model: 'gpt-5.2' }, { source: 'openrouter', model: 'openai/gpt-5.2', model_source: 'provider_default' },
+            { source: 'ddgs' }],
+        unavailable: [{ source: 'anthropic', unavailable_reason: 'package_missing' }],
+    }, name);
+    assert.equal(words.main, 'Uses OpenAI, then OpenRouter, then DuckDuckGo.');
+    assert.equal(words.details, 'OpenAI · gpt-5.2; OpenRouter · openai/gpt-5.2 (recommended). '
+        + 'Not available now: Anthropic (package not installed). Uses saved account credentials.');
+    // No id, arrow or model in the main line; the gap that changes nothing stays out of it.
+    assert.doesNotMatch(words.main, /openai|ddgs|→|gpt|Anthropic/);
+    // A saved model a source ignores changes what the owner does next, so it stays in the main line.
+    assert.match(webSearchPreviewWords({ legs: [{ source: 'ddgs' }], unapplied_model: 'x-1' }, name).main,
+        /^Uses DuckDuckGo\. No built-in search serves the saved model x-1/);
+    assert.deepEqual(webSearchPreviewWords({ legs: [] }, name), { main: 'No search source is ready.', details: 'Uses saved account credentials.' });
+    assert.deepEqual(webSearchPreviewWords({ error: 'Search routes are not ready' }), { main: 'Search routes are not ready', details: '' });
+});
+

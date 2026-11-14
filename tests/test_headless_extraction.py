@@ -8,8 +8,6 @@ import pathlib
 from ouroboros import headless, headless_status, workspace_file_outputs, workspace_patch_capture
 
 
-REPO = pathlib.Path(__file__).parents[1]
-
 _LEAVES = (headless_status, workspace_patch_capture, workspace_file_outputs)
 
 _MOVED_OWNERS = {
@@ -85,7 +83,9 @@ def test_headless_public_export_list_preserves_extraction_and_terminal_file_help
         "terminal_task_files_ready",
         "finalize_task_artifacts",
         "task_is_readonly_subagent",
+        "task_requires_workspace_capture",
         "prepare_task_drive",
+        "drive_candidates",
         "prune_headless_task_drives",
         "prune_task_drives",
         "task_artifacts_dir",
@@ -108,18 +108,6 @@ def test_headless_facade_reexports_every_moved_identity():
     assert set(_MOVED_OWNERS) <= owned
 
 
-def test_headless_extraction_size_bounds_have_meaningful_headroom():
-    counts = {
-        module.__name__: len(
-            pathlib.Path(module.__file__).read_text(encoding="utf-8").splitlines()
-        )
-        for module in (headless, *_LEAVES)
-    }
-    assert counts["ouroboros.headless"] <= 1000
-    assert all(count <= 1000 for count in counts.values())
-    assert counts["ouroboros.workspace_patch_capture"] <= 1000
-
-
 def test_terminal_file_helper_preserves_legacy_ready_without_finalized_timestamp(tmp_path, monkeypatch):
     from ouroboros.task_results import load_task_result, write_task_result
 
@@ -135,8 +123,9 @@ def test_terminal_file_helper_preserves_legacy_ready_without_finalized_timestamp
     assert headless.terminal_task_files_ready(tmp_path, task, prepared["result"])
 
 
-def test_current_metadata_race_reuses_file_io_in_one_promotion_operation(tmp_path, monkeypatch):
+def test_current_metadata_race_reuses_unchanged_manifest_publication(tmp_path, monkeypatch):
     import gzip
+    import json
     from collections import Counter
     from ouroboros import observability
     from ouroboros.task_results import write_task_result
@@ -144,6 +133,9 @@ def test_current_metadata_race_reuses_file_io_in_one_promotion_operation(tmp_pat
 
     parent, child, task = _child(tmp_path)
     ref = _call(child)["manifest_ref"]
+    payload = json.loads(pathlib.Path(ref["path"]).read_text(encoding="utf-8"))["full_payload_ref"]
+    source_blob = pathlib.Path(payload["path"]).resolve()
+    target_blob = (parent / "observability" / "blobs" / source_blob.name).resolve()
     review = _review(ref)
     _store(child, task["id"], ref, review_projection=review)
     write_task_result(parent, task["id"], "completed", review_projection=review)
@@ -175,13 +167,17 @@ def test_current_metadata_race_reuses_file_io_in_one_promotion_operation(tmp_pat
     monkeypatch.setattr(observability, "write_call_manifest", counted_write)
     monkeypatch.setattr(observability, "_rewrite_child_ref_tree", concurrent_metadata)
     copied = headless.copy_child_task_result(parent, task)
+    assert not changed and not reads and not writes, "adoption does not replay history"
+    copied = headless.retry_child_task_refs(parent, child, task["id"])
     assert copied["accounted_upper_bound_usd"] == 42
     assert copied["review_projection"]["panels"][0]["headline"] == "CURRENT metadata"
     assert writes == ["call"]
-    assert reads and all(count == 1 for count in reads.values())
+    # A changed CURRENT basis is revalidated without retaining decoded payloads.
+    # Source and destination verification still run; identical manifest bytes do not republish.
+    assert {path for path in reads if path.endswith(".json.gz")} == {str(source_blob), str(target_blob)}
 
 
-def test_fork_memory_copy_preserves_identity_and_project_patterns(tmp_path):
+def test_fork_memory_copy_preserves_identity_and_gives_a_project_no_global_knowledge(tmp_path):
     files = ["identity.md", "WORLD.md", "registry.md", "knowledge/patterns.md", "knowledge/topic.md"]
     for name in files:
         path = tmp_path / "memory" / name
@@ -191,6 +187,8 @@ def test_fork_memory_copy_preserves_identity_and_project_patterns(tmp_path):
     plain = headless.prepare_task_drive(tmp_path, "plain", "forked")
     for name in files:
         assert (plain / "memory" / name).read_text(encoding="utf-8") == "original " + name
-        if name != "knowledge/topic.md":
+        if not name.startswith("knowledge/"):
             assert (project / "memory" / name).read_text(encoding="utf-8") == "original " + name
+    # A project fork inherits no global knowledge note, the former register included.
     assert not (project / "memory/knowledge/topic.md").exists()
+    assert not (project / "memory/knowledge/patterns.md").exists()

@@ -26,7 +26,9 @@ def test_near_limit_module_is_not_hidden_by_registered_giants(monkeypatch):
 
 
 def test_headroom_uses_live_limits_and_retains_zero_and_negative(monkeypatch):
-    monkeypatch.setattr(review, "MAX_TOTAL_FUNCTIONS", 1)
+    monkeypatch.setattr(review, "MAX_MODULE_LINES", 500)
+    monkeypatch.setattr(review, "MAX_MODULE_BYTES", 100_000)
+    monkeypatch.setattr(review, "MAX_FUNCTION_LINES", 200)
     module = review.GatedModule("sample.py", review.MAX_MODULE_LINES, review.MAX_MODULE_BYTES + 1)
     functions = (review.GatedFunction("sample.py", "a", 1, review.MAX_FUNCTION_LINES),
                  review.GatedFunction("sample.py", "b", 2, review.MAX_FUNCTION_LINES + 1))
@@ -34,7 +36,7 @@ def test_headroom_uses_live_limits_and_retains_zero_and_negative(monkeypatch):
 
     lines = review.size_headroom_lines(inventory)
 
-    assert "2/1; -1 remaining" in lines[0]
+    assert lines[0] == "Runtime functions: 2 (descriptive)."
     assert "lines (0 remaining)" in lines[1]
     assert "UTF-8 bytes (-1 remaining)" in lines[1]
     assert "b:" in lines[2] and "-1 remaining" in lines[2]
@@ -95,4 +97,4 @@ def test_real_readiness_keeps_information_out_of_warning_and_reuses_inventory(tm
     assert len(calls) == 1
     assert "Size Headroom (information; official CI enforces the limits)" in result
     assert "lines (1 remaining)" in result
-    assert "manifest is exact" in result
+    assert "manifest matches the live tree" in result

@@ -1,6 +1,4 @@
 import { renderPageHeader } from './page_header.js';
-import { PAGE_ICONS } from './page_icons.js';
-import { applyMasonry } from './masonry.js';
 import {
     classifyWidgetJobStatus,
     isRetryableWidgetError,
@@ -8,41 +6,50 @@ import {
     boundedNumber,
     withWidgetRequestTimeout,
 } from './widget_job.js';
-import { chartConfig, formatNumber, getPath, renderChartDataTable, renderTableCell } from './widget_chart.js';
+import { getPath } from './widget_chart.js';
 import { applyChartTheme, onThemeChange } from './theme_palette.js';
-import { mountModuleWidget, mountRouteIframeWidget } from './widget_module.js';
-import { planWidgetListPatch, widgetKey, widgetTabsSignature } from './widget_list.js';
+import { boardFrameGeometry, mountModuleWidget, mountRouteIframeWidget, setFrameHeight } from './widget_module.js';
+import { SHELL_ICONS } from './page_icons.js';
+import {
+    planWidgetListPatch, requestWidgetCards, requestWidgetListPayload, widgetKey,
+    widgetListRequests, widgetTabsSignature,
+} from './widget_list.js';
 import {
     bindWidgetCardMenus,
     effectiveStartMode,
+    fitWidgetCardBody,
     isFramedWidget,
     isRetainedWidget,
-    renderWidgetCardControls,
+    renderWidgetCardParts,
+    renderWidgetContributionGroup,
     renderWidgetFacade,
+    setWidgetCardNote,
     syncWidgetCardControls,
+    syncWidgetCardMore,
     WIDGET_START_MODES,
     withWidgetStartMode,
 } from './widget_card.js';
-import { bindWidgetCardReorder, normalizeWidgetOrder, sortTabsByWidgetOrder } from './widget_reorder.js';
+import {
+    bindWidgetCardReorder, cancelWidgetCardCarry, createWidgetWidths, mergeWidgetOrder, moveWidgetKey, normalizeWidgetOrder,
+    sortTabsByWidgetOrder, widgetMoveIndex, widgetPlaceWords,
+} from './widget_reorder.js';
 import {
     apiClient,
     apiFetch,
-    cleanExtensionRoute,
     extensionRoutePath,
     extensionRoutePrefix,
 } from './api_client.js';
+import { escapeHtmlAttr as escapeHtml } from './utils.js';
+import { collectSafeFieldValues, downloadViaHostBridge } from './ui_helpers.js';
+import { getContributions } from './contributions.js';
+import { mountPinnedCard, setCardPinned } from './card_components.js';
+import { getHolds, HELD_LINES, settleAfterFrameLoad } from './holds.js';
 import {
-    escapeHtmlAttr as escapeHtml,
-    renderMarkdownSafe,
-} from './utils.js';
-import {
-    collectSafeFieldValues,
-    downloadViaHostBridge,
-    normalizeTone,
-    renderSafeField,
-} from './ui_helpers.js';
+    filenameFromWidgetUrl, indexComponentTree, patchWidgetChildren, renderComponent, syncWidgetCharts,
+} from './widget_render.js';
 
 export {
+    WIDGET_BOARD_FRAME_BORDER_RESERVE,
     WIDGET_FRAME_BORDER_RESERVE,
     WIDGET_FRAME_DEFAULT_HEIGHT,
     WIDGET_FRAME_MAX_HEIGHT,
@@ -52,388 +59,67 @@ function pageTemplate() {
     return `
         <section class="page app-page-glass" id="page-widgets">
             ${renderPageHeader({
-                title: 'Widgets',
-                icon: PAGE_ICONS.widgets,
-                description: 'Reviewed extension UI surfaces live here, separate from the skill catalogue.',
+                page: 'widgets',
             })}
-            <div class="widgets-scroll scroll-fade-y">
+            <div class="widgets-scroll">
                 <div id="widgets-list-error" class="skills-load-error" hidden><span data-widget-list-error></span> <button type="button" class="btn btn-default btn-sm" data-widget-list-retry>Retry</button></div>
                 <div id="widgets-list" class="widgets-list"></div>
+                <div class="widgets-arrange-status ui-status" data-tone="neutral" data-widget-arrange-status role="status" aria-live="polite"></div>
             </div>
         </section>
     `;
 }
 
-function renderCardHtml(tab) {
-    // Avoid leaking internal "skill:tab_id"; show skill only as needed.
+// One card: its head (title; a framed card's status and Start; the menu and the move grip), its body (the frame or
+// the host-drawn components), the line that shows what an owner height keeps out of view (Show all / Back), the foot
+// a finger adjusts it from (Done; shown on the one card being adjusted), and its right edge (width), bottom edge
+// (height; the foot's grip) and corner (both).
+function renderCardHtml(tab, contributionVisibility = null) {
+    // The card's own title names it; the skill's id is no owner word, so only a card kept from the chat says where from.
     const title = tab.title || tab.tab_id || tab.skill;
-    const subtitle = tab.skill && tab.skill !== title
-        ? `<span class="widgets-card-source">from ${escapeHtml(tab.skill)}</span>`
-        : '';
+    const subtitle = tab.pinned_card ? '<span class="widgets-card-source">kept from the chat</span>' : '';
     const span = Number(tab.span || tab.grid_span || 1);
     const spanClass = span >= 2 ? ' widgets-card-span-2' : '';
+    const framed = isFramedWidget(tab) && !tab.pinned_card ? ' data-widget-framed' : '';
+    const { run, menu } = renderWidgetCardParts(tab, { contributionVisibility: contributionVisibility?.(tab.skill) || [] });
     return `
-        <article class="widgets-card${spanClass}" data-widget-key="${escapeHtml(widgetKey(tab))}">
+        <article class="ui-card widgets-card${spanClass}" data-widget-key="${escapeHtml(widgetKey(tab))}"${framed}>
             <div class="widgets-card-head">
                 <div class="widgets-card-title">
                     <strong>${escapeHtml(title)}</strong>
                     ${subtitle}
                 </div>
                 <div class="widgets-card-controls">
-                    ${renderWidgetCardControls(tab)}
-                    <button class="widgets-card-drag" type="button" data-widget-reorder-handle title="Move widget: drag or use arrow keys" aria-label="Move widget: drag or use arrow keys">↕</button>
+                    ${run ? `<div class="widgets-card-run">${run}</div>` : ''}
+                    <div class="widgets-card-tools">
+                        ${menu}
+                        <button class="btn btn-ghost btn-sm widgets-card-drag" type="button" data-widget-reorder-handle title="Move widget: drag or use arrow keys" aria-label="Move widget: drag or use arrow keys">${SHELL_ICONS.grip}</button>
+                    </div>
                 </div>
             </div>
             <div class="widgets-card-body" data-widget-mount></div>
+            <div class="widgets-card-more" data-widget-more hidden><button type="button" class="btn btn-default btn-sm" data-widget-expand aria-expanded="false"></button></div>
+            <div class="widgets-card-adjust"><button type="button" class="btn btn-default btn-sm" data-widget-adjust-done>Done</button></div>
+            <button class="widgets-card-resize" type="button" data-widget-resize-handle title="Resize width: drag or use arrow keys" aria-label="Resize width: drag or use arrow keys"></button>
+            <button class="widgets-card-edge" type="button" data-widget-height-handle title="Resize widget: drag; arrow keys change height" aria-label="Resize widget: drag; arrow keys change height"></button>
+            <span class="widgets-card-corner" data-widget-corner-handle aria-hidden="true" title="Resize width and height: drag"></span>
         </article>
         `;
 }
 
 // Full paint — only for a list that has no cards yet.
-function renderShell(host, tabs) {
+function renderShell(host, tabs, contributionVisibility = null) {
     if (!tabs.length) {
         host.innerHTML = '<div class="muted">No live widgets yet. Review and enable an extension that registers a UI tab.</div>';
         return;
     }
-    host.innerHTML = tabs.map(renderCardHtml).join('');
+    host.innerHTML = tabs.map((tab) => renderCardHtml(tab, contributionVisibility)).join('');
 }
 
-function createCardElement(tab) {
+function createCardElement(tab, contributionVisibility = null) {
     const template = document.createElement('template');
-    template.innerHTML = renderCardHtml(tab).trim();
+    template.innerHTML = renderCardHtml(tab, contributionVisibility).trim();
     return template.content.firstElementChild;
-}
-
-function safeMediaSrc(tab, spec, state, effectiveTarget = '') {
-    const route = spec.route || spec.api_route || '';
-    if (route) {
-        const params = new URLSearchParams();
-        for (const [key, value] of Object.entries(spec.query || {})) {
-            params.set(key, String(value ?? ''));
-        }
-        return extensionRoutePath(tab.skill, route, params);
-    }
-    const value = getPath(state[effectiveTarget || spec.target || 'result'], spec.path || '', spec.src || '');
-    const text = String(value || '').trim();
-    if (/^data:(image\/(?:png|jpeg|jpg|gif|webp)|audio\/(?:mpeg|wav|ogg)|video\/(?:mp4|webm|ogg));base64,[A-Za-z0-9+/=]+$/i.test(text)) {
-        return text;
-    }
-    if (text.startsWith('/api/extensions/')) {
-        try {
-            const parsed = new URL(text, window.location.origin);
-            const expectedPrefix = extensionRoutePrefix(tab.skill);
-            if (parsed.origin === window.location.origin && parsed.pathname.startsWith(expectedPrefix)) {
-                return parsed.pathname + parsed.search;
-            }
-        } catch {
-            return '';
-        }
-    }
-    return '';
-}
-
-function routePrefixToMediaSpec(routePrefix, value, itemType = 'image') {
-    const text = String(value || '').trim();
-    const prefix = String(routePrefix || '').trim();
-    if (!prefix || !text) return { type: itemType, src: text };
-    const [route, queryKey = 'path'] = prefix.split('?', 2);
-    const key = queryKey.endsWith('=') ? queryKey.slice(0, -1) : queryKey;
-    return {
-        type: itemType,
-        route,
-        query: { [key || 'path']: text },
-    };
-}
-
-function filenameFromWidgetUrl(url, fallback = 'download') {
-    try {
-        const parsed = new URL(url, window.location.origin);
-        for (const key of ['filename', 'image_id', 'clip_id']) {
-            const value = parsed.searchParams.get(key);
-            if (value) return value.split('/').pop() || fallback;
-        }
-        const base = parsed.pathname.split('/').filter(Boolean).pop();
-        return base || fallback;
-    } catch {
-        return fallback;
-    }
-}
-
-function componentIdentity(component, treePath) {
-    const explicitId = String(component?.id || '').trim();
-    return explicitId ? `id:${explicitId}` : `path:${treePath}`;
-}
-
-function indexComponentTree(components) {
-    const entries = [];
-    const byKey = new Map();
-    const visit = (component, path) => {
-        if (!component || typeof component !== 'object') return;
-        const key = componentIdentity(component, path);
-        if (byKey.has(key)) throw new Error(`duplicate declarative widget component identity: ${key}`);
-        const entry = { component, key, path };
-        byKey.set(key, entry);
-        entries.push(entry);
-        if (String(component.type || '') === 'group') {
-            (Array.isArray(component.components) ? component.components : []).forEach((child, idx) => {
-                visit(child, `${path}.components.${idx}`);
-            });
-        }
-        if (String(component.type || '') === 'tabs') {
-            (Array.isArray(component.tabs) ? component.tabs : []).forEach((item, tabIdx) => {
-                (Array.isArray(item?.components) ? item.components : []).forEach((child, idx) => {
-                    visit(child, `${path}.tabs.${tabIdx}.components.${idx}`);
-                });
-            });
-        }
-        if (String(component.type || '') === 'subscription') {
-            (Array.isArray(component.render) ? component.render : []).forEach((child, idx) => {
-                visit(child, `${path}.render.${idx}`);
-            });
-        }
-    };
-    (Array.isArray(components) ? components : []).forEach((component, idx) => visit(component, `components.${idx}`));
-    return { entries, byKey };
-}
-
-function renderComponent(tab, component, view, treePath, inheritedTarget = '') {
-    const markup = renderComponentBody(tab, component, view, treePath, inheritedTarget);
-    // The renderer owns these tags; carry its existing identity onto each root
-    // without adding a wrapper that would change group/grid composition.
-    return markup.replace(/^(\s*)<([a-z][a-z0-9-]*)/, `$1<$2 data-widget-component="${escapeHtml(componentIdentity(component, treePath))}"`);
-}
-
-function renderActionFeedback(componentState, key) {
-    const feedback = componentState[`feedback:${key}`];
-    if (!feedback) return '';
-    return `<div class="widget-status ui-status" data-widget-feedback="${escapeHtml(key)}" data-state="${escapeHtml(feedback.status)}" data-tone="${normalizeTone(feedback.status)}" role="status" aria-live="polite">${escapeHtml(feedback.message)}</div>`;
-}
-
-function renderComponentBody(tab, component, view, treePath, inheritedTarget = '') {
-    const { state, status, componentState, formValues, pendingActions, visibleKeys } = view;
-    const type = String(component.type || '');
-    const target = component.target || inheritedTarget || 'result';
-    const data = state[target] ?? {};
-    const key = componentIdentity(component, treePath);
-    if (component.condition_key && !getPath(data, component.condition_key, false)) {
-        return '';
-    }
-    visibleKeys.add(key);
-    if (type === 'form') {
-        const busy = pendingActions.has(key) || Boolean(componentState[`job:${key}`]);
-        const disabled = Boolean(component.disabled) || busy;
-        const columns = Math.max(1, Math.min(4, Number(component.columns) || 1));
-        const fields = (Array.isArray(component.fields) ? component.fields : []).map((field) => renderSafeField(
-            field,
-            formValues[key] || {},
-            { disabled, maxSpan: columns, spanClassPrefix: 'widget-field-span-' },
-        )).join('');
-        const label = busy ? (component.busy_label || 'Working…') : (component.submit_label || 'Submit');
-        const heading = component.title || component.label || '';
-        return `<form class="widget-form" data-widget-form="${escapeHtml(key)}" aria-busy="${busy ? 'true' : 'false'}"${heading ? ` aria-label="${escapeHtml(heading)}"` : ''}>${heading ? `<h4>${escapeHtml(heading)}</h4>` : ''}<div class="widget-form-fields widget-grid-cols-${columns}">${fields}</div><button class="btn btn-primary" type="submit"${disabled ? ' disabled' : ''}>${escapeHtml(label)}</button>${renderActionFeedback(componentState, key)}</form>`;
-    }
-    if (type === 'action') {
-        const busy = pendingActions.has(key) || Boolean(componentState[`job:${key}`]);
-        const label = busy ? (component.busy_label || 'Working…') : (component.label || 'Run');
-        return `<div class="widget-action"><button type="button" class="btn btn-default" data-widget-action="${escapeHtml(key)}"${component.disabled || busy ? ' disabled' : ''}>${escapeHtml(label)}</button>${renderActionFeedback(componentState, key)}</div>`;
-    }
-    if (type === 'poll') {
-        const busy = status[target] === 'loading';
-        return `<button type="button" class="btn btn-default" data-widget-poll="${escapeHtml(key)}"${busy ? ' disabled' : ''}>${escapeHtml(busy ? (component.busy_label || 'Polling…') : (component.label || 'Start polling'))}</button>`;
-    }
-    if (type === 'group') {
-        const layout = ['stack', 'grid', 'cluster'].includes(component.layout) ? component.layout : 'stack';
-        const columns = Math.max(1, Math.min(4, Number(component.columns) || 2));
-        const passiveTarget = inheritedTarget ? target : '';
-        const children = (Array.isArray(component.components) ? component.components : []).map((child, idx) => (
-            renderComponent(tab, child, view, `${treePath}.components.${idx}`, passiveTarget)
-        )).join('');
-        const heading = component.title ? `<h4>${escapeHtml(component.title)}</h4>` : '';
-        const description = component.description ? `<p>${escapeHtml(component.description)}</p>` : '';
-        const columnClass = layout === 'grid' ? ` widget-grid-cols-${columns}` : '';
-        return `<section class="widget-group widget-group-${layout}${columnClass}">${heading}${description}<div class="widget-group-components">${children}</div></section>`;
-    }
-    if (type === 'metric') {
-        const raw = Object.prototype.hasOwnProperty.call(component, 'value')
-            ? component.value
-            : getPath(data, component.path || '', undefined);
-        const text = typeof raw === 'string' ? raw.trim() : '';
-        const numericValue = text ? Number(text) : Number.NaN;
-        const numericText = Number.isFinite(numericValue);
-        const nonFiniteText = Boolean(text) && (
-            (!Number.isNaN(numericValue) && !Number.isFinite(numericValue))
-            || ['nan', 'inf', '+inf', '-inf'].includes(text.toLowerCase())
-        );
-        const structured = raw !== null && typeof raw === 'object';
-        const missing = raw === undefined
-            || raw === null
-            || (typeof raw === 'string' && !text)
-            || (typeof raw === 'number' && !Number.isFinite(raw))
-            || nonFiniteText
-            || structured;
-        const rendered = missing
-            ? '—'
-            : (typeof raw === 'number' || numericText ? formatNumber(raw, component.precision) : String(raw));
-        const tone = normalizeTone(component.tone);
-        return `<div class="widget-metric" data-tone="${escapeHtml(tone)}"><span>${escapeHtml(component.label || '')}</span><strong>${escapeHtml(rendered)}${!missing && component.unit ? ` <small>${escapeHtml(component.unit)}</small>` : ''}</strong></div>`;
-    }
-    if (type === 'callout') {
-        const value = Object.prototype.hasOwnProperty.call(component, 'text')
-            ? component.text
-            : getPath(data, component.path || '', '');
-        return `<div class="widget-callout" data-tone="${escapeHtml(normalizeTone(component.tone, 'info'))}">${escapeHtml(value ?? '')}</div>`;
-    }
-    if (type === 'status') {
-        const current = status[target] || 'idle';
-        const label = component[current]
-            || (current === 'refreshing' ? component.loading : '')
-            || current;
-        return `<div class="widget-status" data-state="${escapeHtml(current)}">${escapeHtml(label)}</div>`;
-    }
-    if (type === 'kv') {
-        const fields = component.fields || [];
-        const rows = fields.map((field) => {
-            const label = escapeHtml(field.label || field.path || '');
-            const value = getPath(data, field.path, '—');
-            return `<div class="widget-kv-row"><span>${label}</span><strong>${escapeHtml(value)}</strong></div>`;
-        }).join('');
-        return `<div class="widget-kv">${rows || '<div class="muted">No data.</div>'}</div>`;
-    }
-    if (type === 'key_value') {
-        const rows = getPath(data, component.items_key || component.path || '', []);
-        if (!Array.isArray(rows) || !rows.length) return '';
-        return `<div class="widget-kv">${rows.map((row) => `<div class="widget-kv-row"><span>${escapeHtml(row?.key || row?.label || '')}</span><strong>${escapeHtml(row?.value ?? '')}</strong></div>`).join('')}</div>`;
-    }
-    if (type === 'table') {
-        const rows = getPath(data, component.path || '', []);
-        const cols = component.columns || [];
-        if (!Array.isArray(rows)) return '<div class="muted">No rows.</div>';
-        return `<div class="widget-table-wrap"><table class="widget-table"><thead><tr>${cols.map((c) => `<th>${escapeHtml(c.label || c.path || '')}</th>`).join('')}</tr></thead><tbody>${rows.map((row) => `<tr>${cols.map((c) => `<td data-label="${escapeHtml(c.label || c.path || '')}">${renderTableCell(row, c)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
-    }
-    if (type === 'markdown') {
-        const value = component.text ?? getPath(data, component.path || '', '');
-        return `<div class="widget-markdown ui-rich-content">${renderMarkdownSafe(value)}</div>`;
-    }
-    if (type === 'json') {
-        const value = component.path ? getPath(data, component.path, {}) : data;
-        return `<details class="widget-json"><summary>${escapeHtml(component.label || 'JSON')}</summary><pre>${escapeHtml(JSON.stringify(value, null, 2))}</pre></details>`;
-    }
-    if (type === 'code') {
-        const value = component.text ?? getPath(data, component.path || '', '');
-        const label = component.label ? `<div class="widget-code-label">${escapeHtml(component.label)}</div>` : '';
-        return `<div class="widget-code">${label}<pre><code>${escapeHtml(value)}</code></pre></div>`;
-    }
-    if (type === 'chart') {
-        const config = chartConfig(component, component.path ? getPath(data, component.path, {}) : data);
-        const label = String(component.aria_label || component.label || component.title || 'Chart');
-        const chartAvailable = typeof Chart !== 'undefined';
-        const canvas = chartAvailable ? `<div class="widget-chart-canvas"><canvas role="img" aria-label="${escapeHtml(label)}" data-widget-chart-key="${escapeHtml(key)}" data-widget-chart-config="${escapeHtml(JSON.stringify(config))}"></canvas></div>` : '';
-        return `<div class="widget-chart${chartAvailable ? '' : ' widget-chart-fallback'}">${canvas}${renderChartDataTable(config, label, !chartAvailable)}</div>`;
-    }
-    if (type === 'tabs') {
-        const tabs = Array.isArray(component.tabs) ? component.tabs : [];
-        const stateKey = `tab:${key}`;
-        const active = Math.max(0, Math.min(Number(componentState[stateKey] || 0), Math.max(tabs.length - 1, 0)));
-        const buttons = tabs.map((item, idx) => (
-            `<button type="button" class="widget-tab-btn ${idx === active ? 'active' : ''}" data-widget-tab-key="${escapeHtml(stateKey)}" data-widget-tab-idx="${idx}" aria-selected="${idx === active ? 'true' : 'false'}">${escapeHtml(item.label || `Tab ${idx + 1}`)}</button>`
-        )).join('');
-        const activeTab = tabs[active] || {};
-        const passiveTarget = inheritedTarget ? target : '';
-        const body = (activeTab.components || [])
-            .map((child, idx) => renderComponent(tab, child, view, `${treePath}.tabs.${active}.components.${idx}`, passiveTarget))
-            .join('');
-        return `<div class="widget-tabs"><div class="widget-tab-list">${buttons}</div><div class="widget-tab-body">${body || '<div class="muted">No content.</div>'}</div></div>`;
-    }
-    if (type === 'stream') {
-        const current = status[target] || 'idle';
-        return `<div class="widget-stream" data-state="${escapeHtml(current)}">${escapeHtml(component[current] || component.label || current)}</div>`;
-    }
-    if (['image', 'audio', 'video', 'file'].includes(type)) {
-        const src = safeMediaSrc(tab, component, state, target);
-        const label = escapeHtml(component.label || component.alt || type);
-        if (!src) return `<div class="muted">${label}: no safe media source.</div>`;
-        if (type === 'image') return `<figure class="widget-media"><img src="${escapeHtml(src)}" alt="${escapeHtml(component.alt || label)}"><figcaption>${label}</figcaption></figure>`;
-        if (type === 'audio') return `<div class="widget-media"><div>${label}</div><audio controls src="${escapeHtml(src)}"></audio></div>`;
-        if (type === 'video') return `<div class="widget-media"><div>${label}</div><video controls src="${escapeHtml(src)}"></video></div>`;
-        const filename = escapeHtml(component.filename || filenameFromWidgetUrl(src, label || 'download'));
-        return `<div class="widget-file"><button class="btn btn-default widget-download" type="button" data-widget-download-url="${escapeHtml(src)}" data-widget-download-filename="${filename}"${pendingActions.has(`download:${key}`) ? ' disabled' : ''}>${label}</button>${renderActionFeedback(componentState, key)}</div>`;
-    }
-    if (type === 'gallery') {
-        let items = component.items || getPath(data, component.path || component.items_key || '', []);
-        if (!Array.isArray(items)) return '<div class="muted">No media items.</div>';
-        if (component.items_key && component.route_prefix) {
-            items = items.map((item) => routePrefixToMediaSpec(
-                component.route_prefix,
-                typeof item === 'object' ? (item.path || item.src || item.url || '') : item,
-                component.item_type || 'image',
-            ));
-        }
-        const passiveTarget = inheritedTarget ? target : '';
-        return `<div class="widget-gallery">${items.map((item, idx) => renderComponent(tab, { ...item, type: item.type || 'image' }, view, `${treePath}.gallery.${idx}`, passiveTarget)).join('')}</div>`;
-    }
-    if (type === 'progress') {
-        const value = Number(getPath(data, component.path || component.value_key || 'progress', 0));
-        const bounded = Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0;
-        const label = component.label_key ? getPath(data, component.label_key, '') : '';
-        return `<div class="widget-progress"><progress max="100" value="${bounded}"></progress><span>${bounded}%${label ? ` · ${escapeHtml(label)}` : ''}</span></div>`;
-    }
-    // Host-owned map renderer; no skill-supplied JS reaches the SPA origin.
-    if (type === 'map') {
-        const markers = Array.isArray(component.markers) ? component.markers : [];
-        const list = markers.length
-            ? `<ul class="widget-map-list">${markers.map((m) => `<li><strong>${escapeHtml(m.label || `${m.lat}, ${m.lon}`)}</strong>${m.popup ? ` — ${escapeHtml(m.popup)}` : ''}</li>`).join('')}</ul>`
-            : '<div class="muted">No map markers.</div>';
-        return `<div class="widget-map" data-widget-map-config="${escapeHtml(JSON.stringify({ tiles_url: component.tiles_url, markers }))}">${list}</div>`;
-    }
-    if (type === 'calendar') {
-        const items = Array.isArray(component.items) ? component.items : (Array.isArray(getPath(data, component.path || '', [])) ? getPath(data, component.path || '', []) : []);
-        if (!items.length) return '<div class="muted">No calendar entries.</div>';
-        const rows = items.map((item) => `<li class="widget-calendar-row"><strong>${escapeHtml(item.label || '—')}</strong>${item.start ? ` <span class="muted">${escapeHtml(item.start)}${item.end ? ' → ' + escapeHtml(item.end) : ''}</span>` : ''}${item.row ? ` <em>${escapeHtml(item.row)}</em>` : ''}</li>`).join('');
-        return `<div class="widget-calendar"><ul class="widget-calendar-list">${rows}</ul></div>`;
-    }
-    if (type === 'kanban') {
-        const columns = Array.isArray(component.columns) ? component.columns : [];
-        if (!columns.length) return '<div class="muted">Kanban has no columns.</div>';
-        const rawMoveRoute = component.on_move?.route || '';
-        const moveRoute = cleanExtensionRoute(rawMoveRoute) ? rawMoveRoute : '';
-        const cardsByCol = new Map();
-        for (const col of columns) cardsByCol.set(col.id || col.label, []);
-        const cardsList = Array.isArray(component.cards) ? component.cards : (Array.isArray(getPath(data, component.path || '', [])) ? getPath(data, component.path || '', []) : []);
-        for (const card of cardsList) {
-            const colKey = card.column || card.col || columns[0]?.id || columns[0]?.label;
-            if (!cardsByCol.has(colKey)) cardsByCol.set(colKey, []);
-            cardsByCol.get(colKey).push(card);
-        }
-        const colHtml = columns.map((col) => {
-            const colKey = col.id || col.label;
-            const cards = cardsByCol.get(colKey) || [];
-            const busy = pendingActions.has(`kanban:${key}`);
-            const empty = cards.length
-                ? ''
-                : '<div class="widget-kanban-empty">No cards</div>';
-            return `<div class="widget-kanban-col${cards.length ? '' : ' is-empty'}" data-widget-kanban-col="${escapeHtml(colKey)}">
-                <div class="widget-kanban-col-head"><strong>${escapeHtml(col.label || colKey)}</strong></div>
-                ${cards.map((c, idx) => {
-                    const cardId = c.id || `${colKey}-${idx}`;
-                    const move = moveRoute ? `<label class="widget-kanban-move"><span>Move to</span><select class="ui-control" aria-label="${escapeHtml(`Move to column for ${c.label || c.title || cardId}`)}" data-widget-kanban-move data-widget-kanban-card-id="${escapeHtml(cardId)}"${busy ? ' disabled' : ''}>${columns.map((option) => {
-                        const optionKey = option.id || option.label;
-                        return `<option value="${escapeHtml(optionKey)}"${String(optionKey) === String(colKey) ? ' selected' : ''}>${escapeHtml(option.label || optionKey)}</option>`;
-                    }).join('')}</select></label>` : '';
-                    return `<div class="widget-kanban-card" draggable="${busy ? 'false' : 'true'}" data-widget-kanban-card="${escapeHtml(cardId)}"><span>${escapeHtml(c.label || c.title || '—')}</span>${move}</div>`;
-                }).join('')}${empty}
-            </div>`;
-        }).join('');
-        return `<div class="widget-kanban" data-widget-kanban-key="${escapeHtml(key)}" data-widget-kanban-route="${escapeHtml(moveRoute || '')}" aria-busy="${pendingActions.has(`kanban:${key}`) ? 'true' : 'false'}">${colHtml}${renderActionFeedback(componentState, key)}</div>`;
-    }
-    if (type === 'subscription') {
-        const children = Array.isArray(component.render) ? component.render : [];
-        if (!children.length) return '';
-        return `<div class="widget-subscription-render">${children.map((child, idx) => {
-            if (!child || typeof child !== 'object') return '';
-            return renderComponent(tab, child, view, `${treePath}.render.${idx}`, target);
-        }).join('')}</div>`;
-    }
-    return '';
 }
 
 const widgetDisposers = new Map();
@@ -446,12 +132,27 @@ const widgetMounting = new Map();
 const widgetMountControllers = new Set();
 const widgetMessageHandlers = new Set();
 const widgetSessionState = new Map();
-// Owner pressed Stop on this card in this page session: re-entering Widgets
-// shows its facade instead of auto-starting it again. Start and a launch-policy
-// change to Auto / Keep running clear it. Never persisted, so a window reload
-// forgets it.
-const stoppedByOwner = new Set();
+// The start ledger (holds.js) keeps two facts for a framed card on this device:
+// the owner's Stop (`board:<key>`, until Start or a launch-policy change to Auto /
+// Keep running) and a start of its code the page did not outlive
+// (`widget:<skill>:<tab_id>` at its revision). Either shows the facade instead
+// of starting the card by itself.
+const holds = getHolds();
+const stopHoldKey = (tab) => `board:${widgetKey(tab)}`;
+const codeHoldKey = (tab) => `widget:${tab.skill}:${tab.tab_id}`;
 let widgetsWsBridgeBound = false;
+// What the page knows of each framed card's geometry in this page session: the content height its frame last
+// reported (`natural`, at the card's revision; forgotten when the card leaves the list), so a remount — returning to
+// Widgets, Start again — stands at it at once, with `held` (the extra its reporter found it keeps asking for there:
+// widget_frame.js) so its next document stops at the same place instead of growing again, and `at`, the frame's height
+// when that report came (see `heightInfo`); and the refit of the frame mounted now, which re-applies the card's
+// geometry when the owner changes its height or Show all. The frame's own memory is not kept: a remount is a new
+// document.
+const frameNatural = new Map();
+const frameRefits = new Map();
+// The frame policy of one framed card for its mount (`board` of widget_module.js), set by initWidgets; `starting`
+// is the ledger write the mount calls as its frame gets its document.
+let boardFrameOf = () => null;
 
 async function callWidgetRoute(tab, spec, values, signal) {
     const method = String(spec.method || 'GET').toUpperCase();
@@ -489,88 +190,26 @@ async function callWidgetRoute(tab, spec, values, signal) {
     }
 }
 
-// Data updates patch the mounted declaration, never detach a retained control
-// or its ancestors. Component ids/tree paths already own identity; field and
-// kanban keys distinguish editable siblings inside those component roots.
-function widgetNodeKey(node) {
-    const data = node.dataset || {};
-    if (data.widgetComponent) return `component:${data.widgetComponent}`;
-    if (data.widgetFeedback) return `feedback:${data.widgetFeedback}`;
-    if (data.widgetTabKey) return `tab:${data.widgetTabKey}:${data.widgetTabIdx}`;
-    if (data.widgetKanbanCard) return `card:${data.widgetKanbanCard}`;
-    if (data.widgetKanbanCol) return `column:${data.widgetKanbanCol}`;
-    return node.name ? `field:${node.name}` : '';
-}
-
-function patchWidgetChildren(current, desired) {
-    const available = Array.from(current.childNodes);
-    const used = new Set();
-    const pools = new Map();
-    const matchKey = (node) => `${node.nodeType}:${node.nodeName}:${widgetNodeKey(node)}`;
-    for (const node of available) {
-        const key = matchKey(node);
-        if (!pools.has(key)) pools.set(key, { nodes: [], next: 0 });
-        pools.get(key).nodes.push(node);
-    }
-    const pairs = Array.from(desired.childNodes).map((next) => {
-        const pool = pools.get(matchKey(next));
-        const live = pool?.nodes[pool.next++];
-        if (live) used.add(live);
-        return [live, next];
-    });
-    available.filter((node) => !used.has(node)).forEach((node) => node.remove());
-    let anchor = current.firstChild;
-    for (const [live, next] of pairs) {
-        const node = live || next.cloneNode(true);
-        if (node !== anchor) current.insertBefore(node, anchor);
-        if (live) patchWidgetNode(live, next);
-        anchor = node.nextSibling;
-    }
-}
-
-function patchWidgetNode(current, desired) {
-    if (current.nodeType !== 1) {
-        if (current.nodeValue !== desired.nodeValue) current.nodeValue = desired.nodeValue;
-        return;
-    }
-    if (current.classList.contains('widget-chart-canvas')) {
-        // Chart.js owns its canvas and responsive parent. Only the declaration
-        // attributes change here; renderAll updates the existing chart below.
-        const canvas = current.querySelector('canvas');
-        const next = desired.querySelector('canvas');
-        if (canvas && next) {
-            canvas.dataset.widgetChartConfig = next.dataset.widgetChartConfig;
-            canvas.setAttribute('aria-label', next.getAttribute('aria-label') || '');
-            return;
-        }
-    }
-    const field = current.matches('input, textarea, select') && current.closest('[data-widget-form]');
-    const preserve = (name) => (field && ['value', 'checked', 'selected'].includes(name))
-        || (current.tagName === 'DETAILS' && name === 'open');
-    for (const attr of Array.from(current.attributes)) {
-        if (!preserve(attr.name) && !desired.hasAttribute(attr.name)) current.removeAttribute(attr.name);
-    }
-    for (const attr of Array.from(desired.attributes)) {
-        if (!preserve(attr.name) && current.getAttribute(attr.name) !== attr.value) current.setAttribute(attr.name, attr.value);
-    }
-    // The declaration is fixed for this mount. Do not rewrite editable values,
-    // textarea children or select options during a composition/native popup.
-    // Passwords remain only in their live control, outside saved formValues.
-    if (!field) patchWidgetChildren(current, desired);
-}
-
-async function mountDeclarativeWidget(mount, tab, render) {
+// `input` (a living card showing this widget in a message: `show_card(widget={..., input})`) gives the
+// widget's form fields of the same names their first values; what the owner typed in this page session wins.
+export async function mountDeclarativeWidget(mount, tab, render, { input = null } = {}) {
     // A new mount is a real lifecycle boundary, including password lifetime.
     // In-place reconciliation applies only while this mounted owner is alive.
     mount.replaceChildren();
     const components = Array.isArray(render.components) ? render.components : [];
     const { entries: componentEntries, byKey: componentByKey } = indexComponentTree(components);
     const componentSpec = (key) => componentByKey.get(key)?.component || null;
+    // Where the declaration renders (widget_render.js): this card's own skill routes.
+    const renderContext = { routePath: (route, params) => extensionRoutePath(tab.skill, route, params),
+        routePrefix: extensionRoutePrefix(tab.skill) };
     const persistenceKey = tab.key || `${tab.skill}:${tab.tab_id}`;
     const saved = widgetSessionState.get(persistenceKey) || {};
     const state = { ...(saved.state || {}) };
     const status = { ...(saved.status || {}) };
-    const formValues = { ...(saved.formValues || {}) };
+    const seeded = input && typeof input === 'object' ? componentEntries.filter(({ component }) => component.type === 'form')
+        .map(({ component, key }) => [key, Object.fromEntries((component.fields || [])
+            .filter((field) => Object.hasOwn(input, field?.name || '')).map((field) => [field.name, input[field.name]]))]) : [];
+    const formValues = { ...Object.fromEntries(seeded), ...(saved.formValues || {}) };
     const componentState = { ...(saved.componentState || {}) };
     const timers = new Set();
     const controllers = new Set();
@@ -925,41 +564,9 @@ async function mountDeclarativeWidget(mount, tab, render) {
         const visibleKeys = new Set();
         const view = { state, status, componentState, formValues, pendingActions, visibleKeys };
         const desired = document.createElement('template');
-        desired.innerHTML = components.map((component, idx) => renderComponent(tab, component, view, `components.${idx}`)).join('');
+        desired.innerHTML = components.map((component, idx) => renderComponent(renderContext, component, view, `components.${idx}`)).join('');
         patchWidgetChildren(mount, desired.content);
-        const mountedChartKeys = new Set();
-        mount.querySelectorAll('[data-widget-chart-config]').forEach((canvas) => {
-            if (typeof Chart === 'undefined') return;
-            const chartKey = canvas.dataset.widgetChartKey || '';
-            mountedChartKeys.add(chartKey);
-            try {
-                const config = JSON.parse(canvas.dataset.widgetChartConfig || '{}');
-                const existing = chartInstances.get(chartKey);
-                const shape = JSON.stringify({ type: config.type, options: config.options || {} });
-                if (existing && existing.canvas === canvas && chartShapes.get(chartKey) === shape) {
-                    existing.data = config.data;
-                    existing.update();
-                    return;
-                }
-                if (existing) existing.destroy();
-                const chart = new Chart(canvas, config);
-                // widget_chart.js is DOM-free by contract, so its serialized
-                // config carries neutral chrome; the live theme is layered on
-                // here, where the document is actually readable.
-                applyChartTheme(chart);
-                chartInstances.set(chartKey, chart);
-                chartShapes.set(chartKey, shape);
-            } catch (err) {
-                console.warn('widgets: chart render failed', err);
-            }
-        });
-        chartInstances.forEach((chart, chartKey) => {
-            if (!mountedChartKeys.has(chartKey)) {
-                chart.destroy();
-                chartInstances.delete(chartKey);
-                chartShapes.delete(chartKey);
-            }
-        });
+        syncWidgetCharts(mount, chartInstances, chartShapes);
         visibleKeys.forEach((key) => {
             const component = componentSpec(key);
             if (!component) return;
@@ -1103,18 +710,20 @@ async function mountDeclarativeWidget(mount, tab, render) {
     return dispose;
 }
 
-async function mountTab(card, tab, mountSignal = null) {
+async function mountTab(card, tab, mountSignal = null, board = null) {
     const mount = card.querySelector('[data-widget-mount]');
     const render = tab.render || {};
     if (!mount) return;
     if (render.kind === 'iframe' && render.route) {
-        return mountRouteIframeWidget(mount, tab, render);
+        return mountRouteIframeWidget(mount, tab, render, mountSignal, null, widgetMessageHandlers, board);
     }
+    // A kept living card is Ouroboros's, not a skill's: no route, its presses go to the card's decisions.
+    if (tab.pinned_card) return mountPinnedCard(mount, tab);
     if (render.kind === 'declarative') {
         return mountDeclarativeWidget(mount, tab, render);
     }
     if (render.kind === 'module' && render.entry) {
-        return mountModuleWidget(mount, tab, render, mountSignal, widgetMessageHandlers);
+        return mountModuleWidget(mount, tab, render, mountSignal, widgetMessageHandlers, null, board);
     }
     mount.innerHTML = `<div class="muted">Widget render kind <code>${escapeHtml(render.kind || 'unknown')}</code> is not supported yet.</div>`;
     return null;
@@ -1134,7 +743,8 @@ function trackSettling(key, result) {
 }
 
 // Returns the settle promise of an ordered stop, or null when nothing is left to
-// wait for (declarative and route-iframe disposers finish synchronously).
+// wait for (declarative disposers, and route pages that never joined the bridge,
+// finish synchronously).
 function disposeWidgetByKey(key) {
     const dispose = widgetDisposers.get(key);
     if (!dispose) return widgetDisposing.get(key) || null;
@@ -1185,13 +795,13 @@ function retireCard(card, settling) {
 // on the same settle promise) — new cards are appended, every other card keeps
 // its DOM node. No node ever moves: the visible order is the masonry key order,
 // and a moved <iframe> would reload. The list's masonry relayouts on the mutation.
-function patchWidgetCards(list, previousTabs, nextTabs) {
+function patchWidgetCards(list, previousTabs, nextTabs, contributionVisibility = null) {
     const plan = planWidgetListPatch(previousTabs, nextTabs);
     for (const key of plan.removed) {
         const card = liveCardFor(list, key);
         const settling = disposeWidgetByKey(key);
         widgetSessionState.delete(key);
-        stoppedByOwner.delete(key);
+        frameNatural.delete(key);
         if (!card) continue;
         if (settling) retireCard(card, settling);
         else card.remove();
@@ -1201,7 +811,7 @@ function patchWidgetCards(list, previousTabs, nextTabs) {
         const card = liveCardFor(list, key);
         if (card && !plan.changed.includes(key)) continue;
         const settling = disposeWidgetByKey(key);
-        const fresh = createCardElement(tab);
+        const fresh = createCardElement(tab, contributionVisibility);
         if (!card) list.append(fresh);
         else if (!settling) card.replaceWith(fresh);
         else {
@@ -1239,21 +849,34 @@ async function mountTabOnce(card, tab, key, isCurrent) {
     if (!isCurrent() || !card.isConnected) return;
     const mountController = new AbortController();
     widgetMountControllers.add(mountController);
+    // A frame's start goes into the ledger before its first byte runs — as the frame gets its document, never
+    // during the downloads before it, which run no code (a neighbour's crash meanwhile is not this card's); its
+    // load and one host second clear it.
+    let settle = () => {};
+    const framed = isFramedWidget(tab) && !tab.pinned_card;
+    const starting = () => { settle = holds.starting(codeHoldKey(tab), tab.revision); };
+    const board = framed ? boardFrameOf(tab, starting) : null;
+    if (framed && !board) starting();
     try {
-        const dispose = await mountTab(card, tab, mountController.signal);
-        if (typeof dispose === 'function') {
-            // Stale (page left, list rebuilt, card replaced meanwhile): stop it in
-            // order instead of registering a frame nobody can reach.
-            if (!isCurrent() || !card.isConnected) {
-                trackSettling(key, dispose());
-                return;
-            }
-            widgetDisposers.set(key, dispose);
+        const mounted = await mountTab(card, tab, mountController.signal, board);
+        if (typeof mounted !== 'function') { settle(); return; }
+        const cancelSettle = settleAfterFrameLoad(card.querySelector('[data-widget-mount]'), settle);
+        const dispose = () => { cancelSettle(); settle(); return mounted(); };
+        // Stale (page left, list rebuilt, card replaced meanwhile): stop it in
+        // order instead of registering a frame nobody can reach.
+        if (!isCurrent() || !card.isConnected) {
+            trackSettling(key, dispose());
+            return;
         }
+        widgetDisposers.set(key, dispose);
+    } catch (err) {
+        settle();
+        throw err;
     } finally {
         widgetMountControllers.delete(mountController);
     }
 }
+
 
 export function initWidgets(ctx = {}) {
     const page = document.createElement('div');
@@ -1262,6 +885,9 @@ export function initWidgets(ctx = {}) {
     const list = document.getElementById('widgets-list');
     const listError = document.getElementById('widgets-list-error');
     const retryButton = listError.querySelector('[data-widget-list-retry]');
+    const listRequests = widgetListRequests();
+    const contributions = getContributions();
+    const contributionVisibility = (skill) => contributions?.visibilityForSkill?.(skill) || [];
     let renderGeneration = 0;
     let widgetsVisible = false;
     let widgetsMounted = false;
@@ -1273,7 +899,7 @@ export function initWidgets(ctx = {}) {
     // mid-sync marks the list dirty and the running sync loops once more.
     let activeSync = 0;
     let listDirty = false;
-    let uiPreferences = { widget_order: [], widget_start_mode: {}, nested_subagents_expanded: false };
+    let uiPreferences = { widget_order: [], widget_size: {}, widget_start_mode: {}, nested_subagents_expanded: false };
     if (ctx.ws && !widgetsWsBridgeBound) {
         widgetsWsBridgeBound = true;
         ctx.ws.on('message', (msg) => {
@@ -1293,15 +919,121 @@ export function initWidgets(ctx = {}) {
     // its frame while Widgets is hidden; every other mounted card is stopped.
     const retainsWhileHidden = (key) => isRetainedWidget(tabByKey(key), uiPreferences);
     const keptRunning = () => Array.from(widgetDisposers.keys()).filter(retainsWhileHidden);
-    // The complete visible key order (`lastTabs` already carries `widget_order`):
-    // masonry packs the cards in it; no DOM node is ever moved for it.
+    // The complete visible key order (`lastTabs` already carries `widget_order`) and the
+    // owner's widths: masonry packs the cards by them; no DOM node is ever moved for it.
     const currentWidgetOrder = () => (lastTabs || []).map(widgetKey);
-    const relayout = () => applyMasonry(list, { order: currentWidgetOrder() });
+    const widths = createWidgetWidths(list, {
+        tabs: () => lastTabs || [], prefs: () => uiPreferences, save: (payload) => apiClient.saveUiPreferences(payload),
+        adopt(widgetSize) { uiPreferences = { ...uiPreferences, widget_size: widgetSize }; },
+        resized: (key, picked) => fitCard(key, picked),
+        heightInfo: (key) => heightInfo(key),
+    });
+    const relayout = widths.relayout;
+
+    // A framed card's geometry now (boardFrameGeometry): the owner's height, Show all, and the content height its
+    // frame last reported at this revision.
+    const isBoardFrame = (tab) => isFramedWidget(tab) && !tab.pinned_card;
+    const fitOf = (tab) => {
+        const known = frameNatural.get(widgetKey(tab));
+        return known && known.revision === String(tab.revision ?? '') ? known : null;
+    };
+    const naturalOf = (tab) => fitOf(tab)?.natural || 0;
+    const geometryOf = (tab, natural = naturalOf(tab)) => {
+        const key = widgetKey(tab);
+        return boardFrameGeometry(tab.render, { h: widths.heightOf(key), expanded: widths.isExpanded(key), natural });
+    };
+    // A stopped card's facade is as tall as its frame will be: a card that starts again when Widgets is shown
+    // keeps its last height, so the board does not move while it comes back; one waiting for Start stands at the
+    // loading height (an owner height is both).
+    const facadeHeight = (tab) => geometryOf(tab, startsOnShow(tab) ? naturalOf(tab) : 0).height;
+    // The bottom edge's starting point and catch: the content height on screen and the height its content takes, when
+    // that is known apart from the height it is shown at (0 otherwise: no catch rather than a guess). A fixed frame has
+    // none (a taller one is a bigger working area); nor has a bounded body taller than what it holds (its scroll height
+    // is then its own height). A frame's report is the content's own only once it has outlived a change of that frame:
+    // a document that follows its window (one that fills it, or asks for margins beyond it) reports anew at every
+    // height, and one report at one height, or the height it stopped at, says nothing about any other.
+    function heightInfo(key) {
+        const tab = tabByKey(key);
+        const card = liveCardFor(list, key);
+        if (!tab || !card) return null;
+        if (isBoardFrame(tab)) {
+            // A stopped card stands at its facade: an edge starts there, with no catch (no frame measures it now).
+            if (!frameRefits.has(key)) return { content: facadeHeight(tab), natural: 0 };
+            const geometry = geometryOf(tab);
+            const fit = fitOf(tab);
+            const own = fit && !fit.held && Math.abs(geometry.height - fit.at) > 1;
+            const whole = own ? boardFrameGeometry(tab.render, { natural: fit.natural }).height : 0;
+            return { content: geometry.height, natural: geometry.auto ? whole : 0 };
+        }
+        const body = card.querySelector('[data-widget-mount]');
+        if (!body) return null;
+        const echo = body.hasAttribute('data-widget-bounded') && body.scrollHeight <= body.clientHeight + 1;
+        return { content: body.clientHeight, natural: echo ? 0 : body.scrollHeight };
+    }
+    // Fit one card to its size now: a running frame takes its geometry (its refit), a stopped one's facade
+    // its height, a host-drawn body its bound. The line under a frame shows while it runs, and while it waits to
+    // start again on show, so the card keeps its whole height until its frame is back. Natural height or Reset size
+    // (`picked`) on a card that had an owner height, or whose reporter stopped, starts its fit over from the loading
+    // height: a document that fills or follows its window has no height of its own to return to.
+    function fitCard(key, picked = null) {
+        const card = liveCardFor(list, key);
+        const tab = tabByKey(key);
+        if (!card || !tab) return;
+        if (!isBoardFrame(tab)) {
+            fitWidgetCardBody(card, widths.heightOf(key), widths.isExpanded(key));
+            return;
+        }
+        const fresh = Boolean(picked && (picked.hadHeight || fitOf(tab)?.held));
+        if (fresh) frameNatural.delete(key);
+        const refit = frameRefits.get(key);
+        if (refit) refit({ fresh });
+        const facade = card.querySelector('[data-widget-mount] > [data-widget-facade]');
+        if (facade) setFrameHeight(facade, facadeHeight(tab));
+        const h = widths.heightOf(key);
+        syncWidgetCardMore(card, refit || startsOnShow(tab)
+            ? { ...geometryOf(tab), expanded: widths.isExpanded(key) && h > 0, h } : { h: 0 });
+    }
+    // A host-drawn body's content changes under its bound (a poll, a stream, an image or video that learns its size
+    // after it is drawn, or fails, a disclosure such as a JSON value opened): its line is counted again, once a frame.
+    // Media loading and a disclosure's toggle change no node or text, so they are heard on the list in the capture phase.
+    let bodiesFrame = 0;
+    const fitBodies = () => {
+        bodiesFrame = 0;
+        for (const tab of lastTabs || []) {
+            const key = widgetKey(tab);
+            if (!isBoardFrame(tab) && widths.heightOf(key)) fitCard(key);
+        }
+    };
+    const refitBodies = () => {
+        if (!bodiesFrame) bodiesFrame = requestAnimationFrame(fitBodies);
+    };
+    const bodiesObserver = new MutationObserver(refitBodies);
+    bodiesObserver.observe(list, { childList: true, subtree: true, characterData: true });
+    const BODY_SIZED = ['load', 'loadedmetadata', 'error', 'toggle'];
+    BODY_SIZED.forEach((type) => list.addEventListener(type, refitBodies, true));
+    boardFrameOf = (tab, starting) => {
+        const key = widgetKey(tab);
+        return {
+            starting,
+            geometry: () => geometryOf(tab),
+            held: () => fitOf(tab)?.held || 0,
+            measured(natural, held = 0, at = 0) {
+                frameNatural.set(key, { natural, held, at, revision: String(tab.revision ?? '') });
+                const card = liveCardFor(list, key);
+                if (card) syncWidgetCardMore(card, { ...geometryOf(tab), expanded: widths.isExpanded(key) && widths.heightOf(key) > 0, h: widths.heightOf(key) });
+            },
+            attach(refit) {
+                frameRefits.set(key, refit);
+                return () => { if (frameRefits.get(key) === refit) frameRefits.delete(key); };
+            },
+        };
+    };
 
     function paintShell(tabs) {
-        renderShell(list, tabs);
-        bindWidgetCardReorder(list, currentWidgetOrder, persistWidgetOrder);
+        renderShell(list, tabs, contributionVisibility);
+        bindWidgetCardReorder(list, currentWidgetOrder, persistWidgetOrder, widths);
         relayout();
+        tabs.forEach((tab) => fitCard(widgetKey(tab)));
     }
 
     // Page entry: the shell is on screen before the first await. Leaving
@@ -1344,7 +1076,7 @@ export function initWidgets(ctx = {}) {
         if (!kept.length) return;
         let data;
         try {
-            data = await apiClient.widgets();
+            data = await listRequests.run((controller) => requestWidgetCards(apiClient, controller));
         } catch {
             return;
         }
@@ -1353,9 +1085,8 @@ export function initWidgets(ctx = {}) {
         kept.filter((key) => !live.has(key)).forEach(disposeWidgetByKey);
     }
 
-    // One list sync: GET /api/widgets (+ preferences), compare signatures, patch
-    // cards by key, then mount every card without a live mount. Repeats while a
-    // trigger marked the list dirty mid-flight.
+    // One list sync: GET /api/widgets (+ preferences), signature compare, keyed
+    // patch, then mount. Repeats while a trigger marked the list dirty.
     async function syncWidgets(generation) {
         const isCurrent = isCurrentFor(generation);
         activeSync = generation;
@@ -1364,15 +1095,15 @@ export function initWidgets(ctx = {}) {
         try {
             do {
                 listDirty = false;
-                const [data, prefs] = await Promise.all([
-                    apiClient.widgets(),
-                    apiClient.uiPreferences().catch(() => null),
-                ]);
+                const readSizes = widths.beginRead();
+                const [data, prefs] = await listRequests.run(
+                    (controller) => requestWidgetListPayload(apiClient, controller));
                 if (!isCurrent()) return;
                 listError.hidden = true;
                 if (prefs) {
                     uiPreferences = {
                         widget_order: normalizeWidgetOrder(prefs.widget_order),
+                        widget_size: readSizes(prefs.widget_size),
                         widget_start_mode: prefs.widget_start_mode && typeof prefs.widget_start_mode === 'object'
                             ? prefs.widget_start_mode
                             : {},
@@ -1381,7 +1112,7 @@ export function initWidgets(ctx = {}) {
                 }
                 const tabs = sortTabsByWidgetOrder(
                     Array.isArray(data.ui_tabs) ? data.ui_tabs : [],
-                    uiPreferences.widget_order,
+                    uiPreferences.widget_order, currentWidgetOrder(),
                 );
                 const signature = widgetTabsSignature(tabs);
                 if (hasCards() && tabs.length) {
@@ -1389,7 +1120,7 @@ export function initWidgets(ctx = {}) {
                     // moved (the sync still reconciles controls and layout below).
                     if (signature !== lastSignature) {
                         cardMenus.close();
-                        patchWidgetCards(list, lastTabs, tabs);
+                        patchWidgetCards(list, lastTabs, tabs, contributionVisibility);
                     }
                 } else {
                     cardMenus.close();
@@ -1400,41 +1131,46 @@ export function initWidgets(ctx = {}) {
                     // Same eviction the keyed patch performs for a vanished card,
                     // for the transition the patch never sees (the last card
                     // leaving, or the first list arriving): a key that is gone must
-                    // not leave its declarative session state or the owner's
-                    // page-session Stop behind, or re-enabling the skill would
-                    // restore values the owner never re-entered and keep a card
-                    // suppressed. It runs after disposal, because a declarative
-                    // disposer writes that snapshot on its way out.
+                    // not leave its declarative session state behind, or re-enabling
+                    // the skill would restore values the owner never re-entered (the
+                    // owner's Stop stays: it holds until Start). It runs after
+                    // disposal, because a declarative disposer writes that snapshot
+                    // on its way out.
                     const live = new Set(tabs.map(widgetKey));
                     for (const key of (lastTabs || []).map(widgetKey)) {
-                        if (live.has(key)) continue;
-                        widgetSessionState.delete(key);
-                        stoppedByOwner.delete(key);
+                        if (!live.has(key)) widgetSessionState.delete(key);
                     }
-                    renderShell(list, tabs);
+                    renderShell(list, tabs, contributionVisibility);
                 }
                 lastTabs = tabs;
                 lastSignature = signature;
-                bindWidgetCardReorder(list, currentWidgetOrder, persistWidgetOrder);
+                bindWidgetCardReorder(list, currentWidgetOrder, persistWidgetOrder, widths);
                 relayout();
                 widgetsMounted = true;
+                // Every card starts on its own and says it is ready (or failed) as its own mount ends: a slow
+                // source or lease holds back only its card. The sync — and a reconcile that marked the list dirty
+                // meanwhile — waits for all of them before it reads the list again.
+                const mounting = [];
                 for (const tab of tabs) {
-                    if (!isCurrent()) return;
+                    if (!isCurrent()) break;
                     const key = widgetKey(tab);
                     const card = liveCardFor(list, key);
                     if (!card) continue;
+                    fitCard(key);
                     if (widgetDisposers.has(key)) {
                         if (isFramedWidget(tab)) syncWidgetCardControls(card, 'running', effectiveStartMode(tab, uiPreferences));
                         continue;
                     }
-                    if (isFramedWidget(tab) && !startsOnShow(tab)) await settleStopped(card, tab);
-                    else await startWidget(card, tab, isCurrent);
-                    relayout();
+                    mounting.push(isFramedWidget(tab) && !startsOnShow(tab) ? settleStopped(card, tab) : startWidget(card, tab, isCurrent));
                 }
-                relayout();
+                await Promise.allSettled(mounting);
+                if (!isCurrent()) return;
             } while (listDirty && isCurrent());
         } catch (err) {
             if (!isCurrent()) return;
+            // A deliberate abort (page hide, disposal) is not a list failure;
+            // the deadline reports itself as its own typed timeout error.
+            if (err && err.name === 'AbortError') return;
             // Error feedback is outside the keyed list. Last good cards and
             // owner Stop choices remain intact while the list can be retried.
             if (!lastTabs) list.textContent = '';
@@ -1450,14 +1186,12 @@ export function initWidgets(ctx = {}) {
         }
     }
 
-    // A reorder (handle drag / keys) hands over the next key order: remember it,
-    // re-sort the last good list, relayout in place, persist. No node moves.
+    // A reorder (handle drag / keys) hands over the next order of the shown cards: merge it
+    // into the stored order (a card not on screen keeps its slot), re-sort, relayout, persist.
     function persistWidgetOrder(order) {
-        const normalized = normalizeWidgetOrder(order);
+        const normalized = mergeWidgetOrder(uiPreferences.widget_order, order);
         uiPreferences = { ...uiPreferences, widget_order: normalized };
-        if (lastTabs) {
-            lastTabs = sortTabsByWidgetOrder(lastTabs, normalized);
-        }
+        if (lastTabs) lastTabs = sortTabsByWidgetOrder(lastTabs, normalized);
         relayout();
         apiClient.saveUiPreferences({ widget_order: normalized }).catch((err) => {
             console.warn('Failed to save widget order', err);
@@ -1465,9 +1199,10 @@ export function initWidgets(ctx = {}) {
     }
 
     // Framed card, effective policy `auto` or `retain` (both start on show; only
-    // `retain` survives leaving), and the owner has not stopped it this session.
+    // `retain` survives leaving), and the ledger holds neither the owner's Stop
+    // nor a start of this revision the page did not outlive (nor `?hold=all`).
     const startsOnShow = (tab) => effectiveStartMode(tab, uiPreferences) !== 'manual'
-        && !stoppedByOwner.has(widgetKey(tab));
+        && !holds.reason(stopHoldKey(tab)) && !holds.reason(codeHoldKey(tab), tab.revision);
 
     // Mount one card and keep its head controls truthful: the facade stands in
     // while it starts (idempotent — never over a settling frame), a failed mount
@@ -1475,7 +1210,7 @@ export function initWidgets(ctx = {}) {
     // the owner left meanwhile ends stopped with its facade, never a stale Stop.
     async function startWidget(card, tab, isCurrent) {
         const mount = card.querySelector('[data-widget-mount]');
-        if (isFramedWidget(tab)) renderWidgetFacade(mount, tab);
+        if (isFramedWidget(tab)) renderWidgetFacade(mount, tab, isBoardFrame(tab) ? geometryOf(tab).height : 0);
         syncWidgetCardControls(card, 'starting', effectiveStartMode(tab, uiPreferences));
         try {
             await mountTrackedTab(card, tab, isCurrent);
@@ -1484,6 +1219,7 @@ export function initWidgets(ctx = {}) {
         }
         if (isCurrent()) syncWidgetCardControls(card, widgetDisposers.has(widgetKey(tab)) ? 'running' : 'stopped', effectiveStartMode(tab, uiPreferences));
         else if (isFramedWidget(tab)) await settleStopped(card, tab);
+        fitCard(widgetKey(tab));
     }
 
     // A framed card that is not to run now: let an ordered stop still in flight
@@ -1500,22 +1236,23 @@ export function initWidgets(ctx = {}) {
         }
         if (widgetMounting.has(key)) await widgetMounting.get(key).promise.catch(() => {});
         if (widgetDisposers.has(key) || !card.isConnected) return;
-        renderWidgetFacade(card.querySelector('[data-widget-mount]'), tab);
+        renderWidgetFacade(card.querySelector('[data-widget-mount]'), tab, isBoardFrame(tab) ? facadeHeight(tab) : 0);
+        fitCard(key);
         syncWidgetCardControls(card, 'stopped', mode);
+        setWidgetCardNote(card, HELD_LINES[holds.reason(codeHoldKey(tab), tab.revision)] || '');
     }
 
     async function stopWidgetByOwner(card, tab) {
-        stoppedByOwner.add(widgetKey(tab));
+        holds.stop(stopHoldKey(tab));
         syncWidgetCardControls(card, 'stopping', effectiveStartMode(tab, uiPreferences));
         await disposeWidgetByKey(widgetKey(tab));
         await settleStopped(card, tab);
-        relayout();
     }
 
     async function startWidgetByOwner(card, tab) {
-        stoppedByOwner.delete(widgetKey(tab));
+        holds.release(stopHoldKey(tab));
+        holds.release(codeHoldKey(tab));
         await startWidget(card, tab, isCurrentFor(renderGeneration));
-        relayout();
     }
 
     // Launch-policy writes are a whole-map replace through the preferences API:
@@ -1551,25 +1288,112 @@ export function initWidgets(ctx = {}) {
     }
 
     retryButton.addEventListener('click', reconcileWidgetList);
-    const cardMenus = bindWidgetCardMenus(list, setWidgetStartMode);
-    window.addEventListener('pagehide', (event) => {
-        if (!event.persisted) cardMenus.destroy();
-    });
+    // Remove on a card kept from the chat takes it off the board; the server's `extension_lifecycle` re-reads the list.
+    async function removeKeptCard(key) {
+        const tab = tabByKey(key);
+        if (!tab?.pinned_card) return;
+        const { ok, error } = await setCardPinned(tab.tab_id, false);
+        const status = list.parentElement?.querySelector('[data-widget-arrange-status]');
+        if (!ok && status) Object.assign(status, { textContent: `The card was not removed: ${error}` }).dataset.tone = 'error';
+    }
+
+    const stopFromMenu = (key) => { const tab = tabByKey(key), card = liveCardFor(list, key); if (tab && card) stopWidgetByOwner(card, tab); };
+    // Only each card's "Shown in chat" group follows the contributions store; the trigger, the
+    // lifecycle items, the launch-policy check and focus stay as they are.
+    function refreshContributionMenus() {
+        for (const tab of lastTabs || []) {
+            // An open menu lives on body (widget_card.js moves it past clipped cards) beside its expanded trigger.
+            const card = liveCardFor(list, widgetKey(tab));
+            const dialog = card?.querySelector('.skills-card-menu-dialog') || (card?.querySelector('[data-widget-menu-trigger][aria-expanded="true"]')
+                ? document.querySelector('body > .skills-card-menu-dialog[open]') : null);
+            if (!dialog) continue;
+            const current = dialog.querySelector(':scope > [data-widget-contributions]');
+            const html = renderWidgetContributionGroup(contributionVisibility(tab.skill));
+            if ((current?.outerHTML || '') === html) continue;
+            const focusedKey = current?.contains(document.activeElement) ? document.activeElement.dataset.widgetContributionKey : '';
+            const fresh = html ? Object.assign(document.createElement('template'), { innerHTML: html }).content.firstElementChild : null;
+            if (current && fresh) current.replaceWith(fresh);
+            else if (current) current.remove();
+            else if (fresh) dialog.querySelector(':scope > [role="group"][aria-label="Size"]')?.before(fresh);
+            if (focusedKey) fresh?.querySelector(`[data-widget-contribution-key="${CSS.escape(focusedKey)}"]`)?.focus();
+        }
+    }
+    // The store's own refresh repaints the menus (onChange); a refused write keeps the last confirmed state.
+    async function toggleContribution(key, hidden) {
+        try {
+            await contributions.setHidden(key, hidden);
+        } catch (err) {
+            const status = list.parentElement?.querySelector('[data-widget-arrange-status]');
+            const message = `Chat visibility was not saved: ${err?.message || err}`;
+            if (status) Object.assign(status, { textContent: message }).dataset.tone = 'error';
+            else console.warn(message);
+        }
+    }
+    // The menu's moves step the card in the shown order, as the move handle's keys do.
+    const placeOf = (key) => {
+        const order = currentWidgetOrder();
+        return order.includes(key) ? { index: order.indexOf(key), count: order.length } : null;
+    };
+    const moveFromMenu = (key, where) => {
+        const order = currentWidgetOrder();
+        const index = widgetMoveIndex(order, key, where);
+        if (index < 0) return;
+        const next = moveWidgetKey(order, key, index);
+        persistWidgetOrder(next);
+        widths.announce(widgetPlaceWords(key, liveCardFor(list, key), next));
+    };
+    const cardMenus = bindWidgetCardMenus(list, setWidgetStartMode, widths, removeKeptCard, stopFromMenu, toggleContribution,
+        { placeOf, onMove: moveFromMenu });
+    const stopContributionFacts = contributions?.onChange?.(refreshContributionMenus);
+    // Show all lifts a card's owner height in this window; Back returns to it and keeps the card's top in view.
     list.addEventListener('click', (event) => {
-        const power = event.target.closest('[data-widget-power]');
-        if (!power || power.disabled) return;
-        const card = power.closest('[data-widget-key]');
+        const card = event.target.closest('[data-widget-expand]')?.closest('[data-widget-key]');
+        const key = card?.dataset.widgetKey || '';
+        if (!key) return;
+        const opening = !widths.isExpanded(key);
+        widths.setExpanded(key, opening);
+        if (opening) return;
+        requestAnimationFrame(() => {
+            const scroller = list.closest('.widgets-scroll');
+            if (scroller && card.getBoundingClientRect().top < scroller.getBoundingClientRect().top) {
+                card.scrollIntoView({ block: 'start' });
+            }
+        });
+    });
+    window.addEventListener('pagehide', (event) => {
+        listRequests.abortAll();
+        if (event.persisted) return;
+        cardMenus.destroy();
+        widths.dispose();
+        stopContributionFacts?.();
+        bodiesObserver.disconnect();
+        BODY_SIZED.forEach((type) => list.removeEventListener(type, refitBodies, true));
+        if (bodiesFrame) cancelAnimationFrame(bodiesFrame);
+        bodiesFrame = 0;
+    });
+    // The head's power starts a stopped card and stops a running one, as the card menu's Stop does (widget_card.js).
+    list.addEventListener('click', (event) => {
+        const card = event.target.closest('[data-widget-power]:not(:disabled)')?.closest('[data-widget-key]');
         const tab = tabByKey(card?.dataset.widgetKey || '');
-        if (!card || !tab) return;
-        if (widgetDisposers.has(widgetKey(tab))) stopWidgetByOwner(card, tab);
-        else startWidgetByOwner(card, tab);
+        if (tab) (widgetDisposers.has(widgetKey(tab)) ? stopWidgetByOwner : startWidgetByOwner)(card, tab);
+    });
+    // A mount that ended by itself (widget_module.js) settles stopped, its fault and Start again kept (widget_card.js).
+    list.addEventListener('ouro-widget-ended', (event) => {
+        const card = event.target.closest('[data-widget-key]'), tab = tabByKey(card?.dataset.widgetKey || '');
+        if (tab) { disposeWidgetByKey(widgetKey(tab)); settleStopped(card, tab); }
     });
 
     window.addEventListener('ouro:page-shown', (event) => {
         if (event.detail?.page === 'widgets') {
             render();
         } else {
+            // A card carried or an edge dragged when the owner left goes back: the release saves nothing.
             cardMenus.close();
+            cancelWidgetCardCarry(list);
+            widths.cancel();
+            // Leaving Widgets cancels ITS sync; once hidden, an unrelated page change
+            // must not cancel a skill-disable retention check (its kept frame would run on).
+            if (widgetsVisible) listRequests.abortAll();
             // Leaving disposes the mounted work — except the frames the owner
             // keeps running, which stay mounted in the hidden page — and stops
             // stale paints; the cards stay in the DOM so the next entry mounts

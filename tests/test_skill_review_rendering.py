@@ -1,75 +1,14 @@
 """The rendered review block: what the agent is shown, and what it is never shown.
 
-Split out of ``tests/test_skill_review.py`` by theme: the concrete fail reasons the history
-section renders and its legacy-signature fallback, the findings grouped by reviewer
-verbatim, the self-verification at attempt two and the circuit breaker at attempt three, the
-payload dict form, and the raw JSON block the tool result never contains.
+The findings grouped by reviewer verbatim, the retry note from round two (open findings and outcome
+duties, no fixed procedure, no invented verdict), the payload dict form the chat detail renders, and
+the raw JSON block the tool result never contains.
 """
 
 from __future__ import annotations
 
 from ouroboros.skill_loader import compute_content_hash
 from ouroboros.tools.registry import ToolContext
-
-
-def test_skill_review_history_section_renders_concrete_fail_reasons():
-    from ouroboros.skill_review import _build_skill_review_history_section
-
-    history = [
-        {
-            "status": "blockers",
-            "content_hash": "abcdef123456",
-            "fail_findings": [
-                {
-                    "item": "companion_process_safety",
-                    "severity": "critical",
-                    "reason_excerpt": "ffmpeg invocation tagged as long-lived",
-                    "model": "openai/gpt-5.5",
-                },
-                {
-                    "item": "bug_hunting",
-                    "severity": "advisory",
-                    "reason_excerpt": "missing exception handling",
-                },
-            ],
-        },
-        {
-            "status": "blockers",
-            "content_hash": "abcdef123456",
-            "fail_findings": [
-                {
-                    "item": "companion_process_safety",
-                    "severity": "critical",
-                    "reason_excerpt": "still flagged on round 2",
-                    "model": "openai/gpt-5.5",
-                },
-            ],
-        },
-    ]
-    section = _build_skill_review_history_section(history, attempt_idx=3)
-    assert "## Previous skill review attempts" in section
-    assert "companion_process_safety" in section
-    assert "ffmpeg invocation tagged as long-lived" in section
-    assert "model=openai/gpt-5.5" in section
-    assert "**IMPORTANT RULES FOR THIS REVIEW:**" in section
-    assert "Do NOT rephrase prior findings under a different checklist `item` name" in section
-    # Convergence rule fires from the 3rd review round of the group onward.
-    assert "Convergence:" in section or "convergence" in section.lower()
-
-
-def test_skill_review_history_section_falls_back_to_signature_for_legacy_entries():
-    from ouroboros.skill_review import _build_skill_review_history_section
-
-    history = [
-        {
-            "status": "warnings",
-            "content_hash": "old",
-            "failure_signature": ["bug_hunting:FAIL:advisory"],
-        }
-    ]
-    section = _build_skill_review_history_section(history)
-    assert "Failure signature:" in section
-    assert "bug_hunting:FAIL:advisory" in section
 
 
 def test_render_skill_review_block_groups_findings_by_reviewer_verbatim():
@@ -110,8 +49,9 @@ def test_render_skill_review_block_groups_findings_by_reviewer_verbatim():
     assert "[PASS] companion_process_safety" in markdown
 
 
-def test_render_skill_review_block_emits_self_verification_at_attempt_two():
+def test_render_skill_review_block_emits_retry_note_at_attempt_two():
     from ouroboros.skill_review import SkillReviewOutcome, render_skill_review_block
+    from ouroboros.tools.review_prompt_text import REVIEW_REPAIR_JUDGMENT
 
     outcome = SkillReviewOutcome(
         skill_name="demo",
@@ -127,15 +67,19 @@ def test_render_skill_review_block_emits_self_verification_at_attempt_two():
         ],
     )
     markdown_first = render_skill_review_block(outcome, attempt_idx=1)
-    assert "Self-verification required" not in markdown_first
+    assert "Before the next skill_review" not in markdown_first
 
     markdown_second = render_skill_review_block(outcome, attempt_idx=2)
-    assert "Self-verification required before next skill_review" in markdown_second
-    assert "Status: addressed / rebutted / pending" in markdown_second
-    assert "Circuit-breaker hint" not in markdown_second
+    note = markdown_second.split("Before the next skill_review:", 1)[1]
+    assert "Finding: bug_hunting — model=openai/gpt-5.5; missing error handling" in note
+    assert REVIEW_REPAIR_JUDGMENT in note
+    assert ("An eligible recorded verdict on an unchanged skill pack under the same review "
+            "contract is not re-reviewed without a genuinely new review_rebuttal") in " ".join(note.split())
+    assert "Status: addressed / rebutted / pending" not in markdown_second
+    assert "Do NOT call skill_review" not in markdown_second
 
 
-def test_render_skill_review_block_emits_circuit_breaker_at_attempt_three():
+def test_render_skill_review_block_later_rounds_keep_one_note_without_circuit_breaker():
     from ouroboros.skill_review import SkillReviewOutcome, render_skill_review_block
 
     outcome = SkillReviewOutcome(
@@ -152,12 +96,15 @@ def test_render_skill_review_block_emits_circuit_breaker_at_attempt_three():
         ],
     )
     markdown = render_skill_review_block(outcome, attempt_idx=3)
-    assert "Self-verification required" in markdown
-    assert "Circuit-breaker hint (attempt 3+)" in markdown
+    assert "Before the next skill_review" in markdown
     assert "split the skill pack" in markdown
+    for retired in ("Circuit-breaker", "two concrete fixes", "STOP retrying", "ONE subject line"):
+        assert retired not in markdown, retired
+    assert markdown.split("Before the next skill_review", 1)[1] == (
+        render_skill_review_block(outcome, attempt_idx=2).split("Before the next skill_review", 1)[1])
 
 
-def test_self_verification_rides_the_series_round_not_the_snapshot():
+def test_retry_note_rides_the_series_round_not_the_snapshot():
     from ouroboros.skill_review import render_skill_review_block
 
     payload = {
@@ -167,16 +114,15 @@ def test_self_verification_rides_the_series_round_not_the_snapshot():
                       "reason": "missing error handling", "model": "reviewer"}],
     }
     markdown = render_skill_review_block(payload, attempt_idx=1)
-    assert "Self-verification required before next skill_review" in markdown
-    assert "Circuit-breaker hint (attempt 3+)" in markdown
+    assert "Before the next skill_review" in markdown
     assert "Skill review round 3 — snapshot beefcafe1234 (attempt 1)" in markdown
     assert "missing error handling" in markdown
     # The record's ordinal wins even when the caller's legacy fallback is larger.
     payload["review_round"] = 1
-    assert "Self-verification required" not in render_skill_review_block(payload, attempt_idx=3)
+    assert "Before the next skill_review" not in render_skill_review_block(payload, attempt_idx=3)
 
 
-def test_history_detail_shape_shows_the_coaching_of_its_round():
+def test_history_detail_shape_shows_the_retry_note_of_its_round():
     from ouroboros.skill_review import render_skill_review_block
 
     payload = {
@@ -187,8 +133,7 @@ def test_history_detail_shape_shows_the_coaching_of_its_round():
     }
     markdown = render_skill_review_block(payload, attempt_idx=1)
     assert "Skill review round 2 — snapshot abc123def456 (attempt 1)" in markdown
-    assert "Self-verification required before next skill_review" in markdown
-    assert "Circuit-breaker hint" not in markdown
+    assert "Before the next skill_review" in markdown
 
 
 def test_render_skill_review_block_handles_payload_dict_form():
@@ -254,15 +199,17 @@ def test_review_skill_tool_result_has_no_raw_json_block(tmp_path, monkeypatch):
     assert "<details>" not in out
 
 
-def test_history_preserves_real_round_and_snapshot_numbers():
-    from ouroboros.skill_review import _build_skill_review_history_section
-    history = [{"review_round": n, "snapshot_attempt": n - 5, "snapshot_revised": n == 9,
-                "status": "warnings", "content_hash": "abc", "failure_signature": [f"reason-{n}"]}
-               for n in range(6, 10)]
-    text = _build_skill_review_history_section(history)
-    assert "Review round 7, snapshot attempt 2" in text
-    assert "Review round 9, snapshot attempt 4" in text
-    assert "snapshot_revised=True" in text and "reason-9" in text
-    assert "Review round 6" not in text and "Attempt 1:" not in text
-    legacy = _build_skill_review_history_section([{"status": "warnings"}])
-    assert "Review round unknown, snapshot attempt unknown" in legacy
+def test_render_skill_review_block_names_the_record_and_marks_advisers():
+    from ouroboros.skill_review import SkillReviewOutcome, render_skill_review_block
+
+    outcome = SkillReviewOutcome(
+        skill_name="demo", status="warnings", content_hash="abc12345", record_id="rl-20261021-abc", reused=True,
+        reviewer_models=["openai/gpt-5.5 [t1]"],
+        findings=[{"item": "error_handling", "verdict": "FAIL", "severity": "advisory", "reason": "swallows",
+                   "model": "openai/gpt-5.5", "slot_id": "t1"},
+                  {"item": "bug_hunting", "verdict": "FAIL", "severity": "critical", "reason": "typo", "model": "scout",
+                   "slot_id": "scout", "additional": True}])
+    markdown = render_skill_review_block(outcome)
+    assert "Review record: rl-20261021-abc (reused, $0)" in markdown
+    assert "### Reviewer: scout (adviser, not counted)" in markdown
+    assert "[FAIL advisory] error_handling: swallows" in markdown

@@ -1,4 +1,6 @@
 /** Historical rows enrich the existing timeline without acquiring live authority. */
+import { foldWaitRow } from './task_checkpoints.js';
+
 export function compareHistoryPosition(left, right) {
     if (!left || !right) return 0;
     const stream = String(left.source || '').localeCompare(String(right.source || ''));
@@ -7,6 +9,24 @@ export function compareHistoryPosition(left, right) {
 
 export function historyRowIds(row) {
     return [row.history_id, ...(row.review_group?.attempts || []).map(attempt => attempt.history_id)].filter(Boolean);
+}
+
+/** During a page replay, every identity key a mounted bubble carries (a superset: keys are only added, `note`): a row
+ * looks for its prior bubble only when one could be mounted, not by scanning the feed per row (O(rows²) a page). */
+export function createReplayKeys() {
+    const keys = { history: new Set(), client: new Set(), origin: new Set(), legacy: new Set() };
+    keys.note = (node) => {
+        if (!node) return;
+        const nodes = node.classList?.contains('chat-bubble') ? [node] : [];
+        for (const bubble of [...nodes, ...(node.querySelectorAll?.('.chat-bubble') || [])]) {
+            const { historyId, clientMessageId, originId, messageKey } = bubble.dataset || {};
+            if (historyId) keys.history.add(historyId);
+            if (clientMessageId) keys.client.add(clientMessageId);
+            if (originId) keys.origin.add(originId);
+            if (messageKey) keys.legacy.add(messageKey);
+        }
+    };
+    return keys;
 }
 
 export function stampHistoryNode(node, id, position) {
@@ -22,26 +42,61 @@ export function mergeHistoricalTimelineItem(record, summary, row, ts) {
     if (summary.visible === false || !(summary.headline || summary.body)) return false;
     const identity = String(row?.history_id || '');
     if (!identity) return false;
+    if (summary.waitEpisode) {  // the same one row per wait kind as live
+        const { changed, index, moved } = foldWaitRow(record, summary, { ts, sourceTs: row.ts || '', earliest: true });
+        if (index === -1 || moved) sortBySource(record);
+        return changed;
+    }
     // A child's lifecycle is one evolving status, just as it is live. Its
-    // authored progress keeps every source record, even when text and time match.
-    const evolving = summary.terminal || String(summary.dedupeKey || '').startsWith('subagent-lifecycle:');
+    // authored progress keeps every source record, even when text and time match;
+    // so does each delegated observation (`activity`), projected per seq at render.
+    // The task's outcome (`task_done|`) is one line too, as live: a read inside the
+    // post-task window projects it still finalizing, which is that line Working,
+    // never a line of work, and a finished card takes nothing from it (live: closedPhase).
+    const outcome = String(summary.dedupeKey || '').startsWith('task_done|');
+    if (outcome && !summary.terminal && record.finished) return false;
+    const evolving = summary.terminal || outcome || String(summary.dedupeKey || '').startsWith('subagent-lifecycle:')
+        || String(summary.dedupeKey || '').startsWith('cardrow|');
+    const activity = summary.activity ? { activity: summary.activity } : {};
     const key = evolving ? summary.dedupeKey : `history:${identity}`;
+    // A child's words and a thought keep their live occurrence alias beside the physical history
+    // identity: history may precede live delivery, or adopt a line before it is redelivered.
+    const occurrence = /^(subagent-line|reasoning):/.test(String(summary.dedupeKey || ''))
+        ? { occurrenceKey: summary.dedupeKey } : {};
+    const source = { sourceHistoryId: identity, sourceHistoryRevision: summary.cardRowRevision,
+        historyPosition: row.history_position };
     let item = record.items.find((entry) => entry.dedupeKey === key);
     if (!item && !evolving) {
         item = record.items.find((entry) => !entry.historyId
-            && entry.dedupeKey === summary.dedupeKey && entry.sourceTs === row.ts);
+            && (entry.occurrenceKey ?? entry.dedupeKey) === summary.dedupeKey && entry.sourceTs === row.ts);
     }
     if (item && evolving) {
+        // Source revision advances independently of live content: an older
+        // fallback can yield to its canonical current row without rolling back
+        // content, while stale sources cannot redirect an already newer locator.
+        const existingPosition = item.historyPosition;
+        const adoptedSource = !item.sourceHistoryId || Number.isSafeInteger(summary.cardRowRevision)
+            && (!Number.isSafeInteger(item.sourceHistoryRevision) || summary.cardRowRevision > item.sourceHistoryRevision);
+        if (adoptedSource) Object.assign(item, source);
         const incomingTime = Date.parse(row.ts), existingTime = Date.parse(item.sourceTs || '');
-        if (incomingTime < existingTime || incomingTime === existingTime
-                && compareHistoryPosition(row.history_position, item.historyPosition) < 0) return false;
+        if (Number.isSafeInteger(item.cardRowRevision)) {
+            // Only a newer revision of this merge's review can enrich an equal receipt revision.
+            const newerReview = summary.cardReview?.record_id && Number.isSafeInteger(summary.cardReview.revision)
+                && (!item.cardReview || summary.cardReview.record_id === item.cardReview.record_id
+                    && summary.cardReview.revision > item.cardReview.revision);
+            if (!Number.isSafeInteger(summary.cardRowRevision) || summary.cardRowRevision < item.cardRowRevision
+                || summary.cardRowRevision === item.cardRowRevision && !newerReview) return adoptedSource;
+        } else if (!Number.isSafeInteger(summary.cardRowRevision) && (incomingTime < existingTime || incomingTime === existingTime
+                && compareHistoryPosition(row.history_position, existingPosition) < 0)) return adoptedSource;
         const update = { headline: summary.headline || item.headline,
+            cardRowRevision: summary.cardRowRevision,
+            cardReview: summary.cardReview || null, evidenceRef: summary.evidenceRef || null,
             fullHeadline: summary.fullHeadline || summary.headline || item.fullHeadline,
             body: summary.body || '', fullBody: summary.fullBody || summary.body || '',
             phase: summary.phase || item.phase, sourceTs: row.ts || item.sourceTs,
-            ts, sourceHistoryId: identity, historyPosition: row.history_position };
+            ts, ...source };
         if (Object.entries(update).every(([key, value]) => key === 'historyPosition'
-            ? JSON.stringify(item[key]) === JSON.stringify(value) : item[key] === value)) return false;
+            ? JSON.stringify(item[key]) === JSON.stringify(value) : item[key] === value)) return adoptedSource;
         Object.assign(item, update);
         return true;
     }
@@ -50,27 +105,40 @@ export function mergeHistoricalTimelineItem(record, summary, row, ts) {
         item.historyId = identity;
         item.historyPosition = row.history_position;
         item.dedupeKey = key;
+        Object.assign(item, occurrence);
         item.count = 1;
+        if (summary.evidenceRef && !item.evidenceRef) item.evidenceRef = summary.evidenceRef;
     } else {
         record.items.push({
+            cardRowRevision: summary.cardRowRevision,
+            cardReview: summary.cardReview || null,
             phase: summary.phase || 'working', headline: summary.headline || 'Update',
             fullHeadline: summary.fullHeadline || summary.headline || 'Update',
             body: summary.body || '', fullBody: summary.fullBody || summary.body || '',
             fullRef: summary.fullRef || '', truncated: summary.truncated || false,
-            ts: ts || '', sourceTs: row.ts || '', count: 1, dedupeKey: key,
-            ...(evolving ? { sourceHistoryId: identity } : { historyId: identity }),
-            historyPosition: row.history_position,
-            lineKey: evolving ? `terminal-${String(key).replace(/[^A-Za-z0-9_-]/g, '-')}`
+            evidenceRef: summary.evidenceRef || null,
+            ts: ts || '', sourceTs: row.ts || '', count: 1, dedupeKey: key, ...activity, ...occurrence,
+            ...(evolving ? source : { historyId: identity, historyPosition: row.history_position }),
+            lineKey: evolving && !String(key).startsWith('cardrow|') ? `terminal-${String(key).replace(/[^A-Za-z0-9_-]/g, '-')}`
                 : `history-${identity.replace(/[^A-Za-z0-9_-]/g, '-')}`,
         });
     }
+    sortBySource(record);
+    return true;
+}
+
+function sortBySource(record) {
     record.items.sort((a, b) => {
         const first = Date.parse(a.sourceTs || ''), second = Date.parse(b.sourceTs || '');
         return (Number.isFinite(first) && Number.isFinite(second) ? first - second : 0)
             || compareHistoryPosition(a.historyPosition, b.historyPosition);
     });
-    return true;
 }
+
+/** Each mounted node a released id removes, as [id, node]: the rows it renders
+ * and the evolving lines that only locate their page by it (never a row stamp). */
+export const historyStamps = root => [['[data-history-id]', 'historyId'], ['[data-source-history-id]', 'sourceHistoryId']]
+    .flatMap(([selector, key]) => Array.from(root.querySelectorAll(selector), node => [node.dataset[key], node]));
 
 /** A page can leave the rendered window only outside reading, focus and selection. */
 export function historyNodeIsProtected(node, viewport, selection = globalThis.getSelection?.()) {
@@ -82,6 +150,16 @@ export function historyNodeIsProtected(node, viewport, selection = globalThis.ge
             try { if (selection.getRangeAt(index).intersectsNode(node)) return true; } catch {}
         }
     }
-    const bounds = viewport.getBoundingClientRect(), rect = node.getBoundingClientRect();
+    return historyNodeOnScreen(node, viewport);
+}
+
+/** A rendered node intersecting the feed's viewport (or a band of it); a collapsed one has no boxes. A row asleep
+ * (chat_row_sleep.js) shows nothing outside its own box, which stays laid out while what it holds is not: off the
+ * screen, it answers for everything in it without laying that out. */
+export function historyNodeOnScreen(node, viewport, bounds = viewport.getBoundingClientRect()) {
+    if (!node?.isConnected) return false;
+    const row = node.closest?.('[data-laid]');
+    if (row && row !== node && !historyNodeOnScreen(row, viewport, bounds)) return false;
+    const rect = node.getBoundingClientRect();
     return Boolean(node.getClientRects().length && rect.bottom > bounds.top && rect.top < bounds.bottom);
 }

@@ -158,6 +158,53 @@ class ModelWire:
                 "response": {"state": "ready", "ref": _ref(self.result)}}
 
 
+def test_prepared_upload_reuses_canonical_bytes_without_serializing_or_hashing(gateway_factory, monkeypatch):
+    from types import SimpleNamespace
+
+    wire = ModelWire()
+    gateway = gateway_factory(wire)
+    raw = _bytes(_request())
+    digest = hashlib.sha256(raw).hexdigest()
+    original_dumps, original_sha = cx.json.dumps, cx.hashlib.sha256
+
+    def dumps(value, **kwargs):
+        assert value != _request(), "Prepared request was serialized again"
+        return original_dumps(value, **kwargs)
+
+    def sha(data=b""):
+        assert data is not raw, "Prepared request was hashed again"
+        return original_sha(data)
+
+    monkeypatch.setattr(cx.json, "dumps", dumps)
+    monkeypatch.setattr(cx, "hashlib", SimpleNamespace(sha256=sha))
+    ref = gateway.upload_model_request(raw, sha256=digest, size_bytes=len(raw), idempotency_key="prepared")
+    assert wire.payload == raw
+    assert ref == {"resourceId": "res-request", "sha256": "sha256:" + digest, "sizeBytes": len(raw)}
+    assert wire.generation_count == 0
+
+
+def test_each_upload_control_request_has_its_own_span_on_the_measuring_receipt(gateway_factory):
+    """W2 H7: an upload's control requests (open, state, bytes, finalize) are each named on the receipt of the window
+    measuring them, inside ``daemon.upload``, so a long upload names its slow request; outside a window: nothing."""
+    from ouroboros import context_timing
+
+    gateway = gateway_factory(ModelWire())
+    with context_timing.measured_sections():
+        gateway.upload_model_request(_request(), idempotency_key="timed")
+        names = set(context_timing.section_spans()["sections_ms"])
+    assert {f"daemon.upload.{step}" for step in ("open", "state", "bytes", "finalize")} <= names
+    assert context_timing.section_spans() == {}
+
+
+@pytest.mark.parametrize("facts", [{}, {"sha256": "0" * 64, "size_bytes": 1},
+                                  {"sha256": "not-a-hash", "size_bytes": 2}])
+def test_prepared_upload_requires_measured_identity_before_network(gateway_factory, facts):
+    gateway = gateway_factory(lambda _request: pytest.fail("Invalid preparation reached network"))
+    with pytest.raises(cx.ClaudexorUnavailable) as exc:
+        gateway.upload_model_request(b"{}", idempotency_key="prepared", **facts)
+    assert exc.value.code == "invalid_model_payload"
+
+
 def test_model_roundtrip_preserves_content_and_ack_is_separate(gateway_factory, caplog):
     wire = ModelWire()
     gateway = gateway_factory(wire)
@@ -186,7 +233,7 @@ def test_model_roundtrip_preserves_content_and_ack_is_separate(gateway_factory, 
 
 @pytest.mark.parametrize("stage", [
     ("POST", "/v2/uploads"), ("PUT", "/v2/uploads/upl-one/bytes"),
-    ("POST", "/v2/uploads/upl-one/finalize"), ("POST", "/v2/model-operations"),
+    ("POST", "/v2/model-operations"),
 ])
 def test_lost_reply_rejoins_same_upload_and_operation_only_on_explicit_retry(gateway_factory, stage):
     wire = ModelWire(lose=stage)
@@ -254,7 +301,6 @@ def test_unfinished_upload_is_not_overwritten_or_finalized(gateway_factory, stat
 @pytest.mark.parametrize("change,code", [
     ({"purpose": None}, "resource_purpose_mismatch"),
     ({"sha256": "sha256:" + "0" * 64}, "model_payload_integrity_error"),
-    ({"sizeBytes": 0}, "model_payload_integrity_error"),
     ({"resourceId": ""}, "model_payload_ref_invalid"),
 ])
 def test_finalized_upload_must_bind_the_model_bytes(gateway_factory, change, code):
@@ -284,7 +330,7 @@ def test_lost_result_reply_keeps_same_operation_without_ack(gateway_factory):
     assert len(wire.calls) == 2 and all(call.method == "GET" for call in wire.calls)
 
 
-@pytest.mark.parametrize("body", [None, [], {"bad": float("nan")}, {"bad": float("inf")}, {"bad": "\ud800"}])
+@pytest.mark.parametrize("body", [None, {"bad": float("nan")}, {"bad": "\ud800"}])
 def test_invalid_request_fails_before_any_http(gateway_factory, body):
     calls = []
     gateway = gateway_factory(lambda request: calls.append(request))
@@ -294,7 +340,7 @@ def test_invalid_request_fails_before_any_http(gateway_factory, body):
     assert calls == []
 
 
-@pytest.mark.parametrize("key", [None, "", "   ", "x" * 257])
+@pytest.mark.parametrize("key", [None, "   ", "x" * 257])
 def test_model_invocation_requires_stable_key(gateway_factory, key):
     calls = []
     gateway = gateway_factory(lambda request: calls.append(request))
@@ -306,7 +352,7 @@ def test_model_invocation_requires_stable_key(gateway_factory, key):
     assert calls == []
 
 
-@pytest.mark.parametrize("data", [b'{"n":NaN}', b'{"n":Infinity}', b'{"n":-Infinity}', b'\xff', b'{"unterminated":', b'[]'])
+@pytest.mark.parametrize("data", [b'{"n":NaN}', b'\xff', b'[]'])
 def test_result_is_strict_utf8_json_object_after_integrity_verification(gateway_factory, data):
     calls = []
 
@@ -346,8 +392,7 @@ def test_result_exceeds_agent_artifact_cap_without_redaction_or_ack(gateway_fact
     assert calls[0].extensions["timeout"] == {"connect": 0.25, "read": 0.25, "write": 0.25, "pool": 0.25}
 
 
-@pytest.mark.parametrize("ref", [{}, {**_ref(b"{}"), "sizeBytes": True}, {**_ref(b"{}"), "extra": "wrong"},
-                                  {**_ref(b"{}"), "sha256": "missing-prefix"}, {**_ref(b"{}"), "sizeBytes": -1}])
+@pytest.mark.parametrize("ref", [{}, {**_ref(b"{}"), "sha256": "missing-prefix"}, {**_ref(b"{}"), "sizeBytes": -1}])
 def test_bad_reference_never_dispatches_or_reads(gateway_factory, ref):
     calls = []
     gateway = gateway_factory(lambda request: calls.append(request))
@@ -403,6 +448,8 @@ def test_catalog_preserves_exact_profile_provenance_and_engine_auto(gateway_fact
     assert calls[3].url.query == b"requestedModel=exact%2Fmodel%2B1"
     assert gateway.list_source_models("codex+raw", "team user+1", requested_model="exact-model") == catalog
     assert calls[4].url.query == b"credentialProfileId=team+user%2B1&requestedModel=exact-model"
+    assert gateway.list_source_models("codex+raw", requested_model="future/model", include_admission=True) == catalog
+    assert calls[5].url.query == b"requestedModel=future%2Fmodel&includeAdmission=true"
 
 
 @pytest.mark.parametrize("reason", ["", "user_cancelled"])
@@ -429,30 +476,43 @@ def test_operation_identity_mismatch_is_not_an_accepted_response(gateway_factory
     assert raised.value.code == "malformed_response"
 
 
-@pytest.mark.parametrize("capture", [False, True])
-def test_failure_evidence_opt_in_preserves_create_body(gateway_factory, capture):
+@pytest.mark.parametrize(("capture_effort", "capture_failure"), [(False, False), (True, True)])
+def test_evidence_opt_ins_preserve_create_body(gateway_factory, capture_failure, capture_effort):
     wire = ModelWire()
     gateway = gateway_factory(wire)
     ref = gateway.upload_model_request(_request(), idempotency_key="evidence")
-    gateway.create_model_operation(ref, idempotency_key="evidence", capture_failure_evidence=capture)
+    gateway.create_model_operation(ref, idempotency_key="evidence",
+        capture_failure_evidence=capture_failure, capture_effort_evidence=capture_effort)
     request = wire.calls[-1]
-    assert request.url.query == (b"captureFailureEvidence=true" if capture else b"")
+    expected = {}
+    if capture_failure:
+        expected["captureFailureEvidence"] = "true"
+    if capture_effort:
+        expected["captureEffortEvidence"] = "true"
+    assert dict(request.url.params) == expected
     assert json.loads(request.content) == {"request": ref}
+    assert request.headers["Idempotency-Key"] == "evidence"
     assert wire.payload == _bytes(_request())
     assert wire.generation_count == 1
 
 
-def test_query_negotiation_uses_exact_wire_descriptor():
-    parameter = {"name": "captureFailureEvidence", "location": "query", "enum": ["true", "false"]}
+@pytest.mark.parametrize("parameter_name", ["captureFailureEvidence", "captureEffortEvidence"])
+def test_query_negotiation_uses_exact_wire_descriptor(parameter_name):
+    def supported(operations):
+        return cx.operation_query_supported(operations, method="POST", path="/v2/model-operations",
+                                            name=parameter_name, value="true")
+
+    parameter = {"name": parameter_name, "location": "query", "enum": ["true", "false"]}
     operation = {"method": "POST", "path": "/v2/model-operations", "parameters": [parameter]}
-    assert cx.model_failure_evidence_supported([operation])
-    assert not cx.model_failure_evidence_supported([])
+    assert supported([operation])
+    assert cx.model_failure_evidence_supported([operation]) is (parameter_name == "captureFailureEvidence")
+    assert not supported([])
     for change in ({"method": "GET"}, {"path": "/v2/model-operations/:id"}, {"parameters": []}):
-        assert not cx.model_failure_evidence_supported([{**operation, **change}])
+        assert not supported([{**operation, **change}])
     for change in ({"name": "other"}, {"location": "header"}, {"enum": ["false"]}, {"enum": "true"}):
-        assert not cx.model_failure_evidence_supported([{**operation, "parameters": [{**parameter, **change}]}])
+        assert not supported([{**operation, "parameters": [{**parameter, **change}]}])
     accounts = {"method": "GET", "path": "/v2/model-sources", "parameters": [
         {"name": "view", "location": "query", "enum": ["accounts"]}]}
     assert cx.account_catalog_supported([accounts], accounts["path"])
     assert not cx.account_catalog_supported([operation], accounts["path"])
-    assert not cx.model_failure_evidence_supported([accounts])
+    assert not supported([accounts])

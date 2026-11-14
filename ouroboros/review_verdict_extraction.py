@@ -14,23 +14,22 @@ import logging
 from typing import Any, Callable, Dict, List, Optional
 
 from ouroboros.config import get_finalization_grace_sec
-from ouroboros.deadline_utils import owner_deadline_exhausted, review_transport_timeout
+from ouroboros.deadline_utils import caller_deadline_arguments, owner_deadline_exhausted, review_transport_timeout
 from ouroboros.triad_review import (
     default_output_contract,
     empty_array_is_verified_clean,
     extract_fenced_json,
     extract_json_array,
-    object_verdict_payload,
+    two_part_payload,
 )
 
 log = logging.getLogger("review_execution")
 
 _UNEXTRACTABLE = "UNEXTRACTABLE"
 
-# The OBJECT variant of the extraction ask (task acceptance): the whole verdict
-# object of the contract, never its findings list alone — a findings-only
-# canonical form loses verdict/outcome_tier/criteria_used/dialogue_status and
-# the coordinator then demotes a completed review to malformed.
+# The OBJECT variant of the extraction ask (a change-review seat's two-part
+# answer): the whole answer object of the contract, never a findings list alone
+# — a findings-only canonical form loses the coupling block the wave reads.
 _SESSION_EXTRACT_OBJECT_PROMPT = (
     "The text below is the final answer of a delegated review session.\n"
     "Canonicalize its verdict. Reply with EXACTLY ONE of:\n"
@@ -99,10 +98,8 @@ def _strictly_parseable(
     ``empty_array_is_verified_clean`` predicate stays untouched — its strictness
     is the reason extraction exists, not a defect extraction papers over.
 
-    ``shape`` gates the predicate: for an OBJECT contract (task acceptance) the
-    whole text must BE the verdict object — a bare ``[]`` is not a clean object
-    verdict, and letting the array predicate answer for it would route an
-    acceptance answer into the array ladder with no verdict/tier/dialogue keys.
+    ``shape`` gates the predicate: a two-part contract accepts its one answer
+    object or the bare change array; every other contract the findings array.
 
     The WHOLE answer must BE the payload. This used to SCAN with
     ``extract_json_array``, so any JSON array of objects appearing anywhere in a
@@ -116,9 +113,13 @@ def _strictly_parseable(
     extraction is for.
     """
     body = str(text or "")
-    if shape == "object":
+    if shape == "two_part":
+        # The two-part object, or the bare change array (recorded by the gate as
+        # a seat that left the coupling block out — still a readable answer).
+        if empty_array_is_verified_clean(body):
+            return True
         try:
-            return object_verdict_payload(json.loads(body.strip())) is not None
+            return two_part_payload(json.loads(body.strip())) is not None
         except (TypeError, ValueError):
             return False
     if empty_array_is_verified_clean(body):
@@ -136,9 +137,9 @@ def _canonical_payload_text(
 ) -> Optional[str]:
     """Canonical text of a structured payload for ``shape``, or None when it
     does not carry the contract's shape."""
-    if shape == "object":
-        verdict = object_verdict_payload(payload)
-        return None if verdict is None else json.dumps(verdict, ensure_ascii=False)
+    if shape == "two_part":
+        answer = two_part_payload(payload)
+        return None if answer is None else json.dumps(answer, ensure_ascii=False)
     findings = _findings_array(payload)
     if findings is None or (findings and array_validator is not None and not array_validator(findings)):
         return None
@@ -148,7 +149,7 @@ def _canonical_payload_text(
 def canonicalize_session_verdict(
     raw_text: str, *, conformance_passed: bool, contract: str = "", llm: Any = None,
     deadline_at: Any = None, transport_timeout_sec: Any = None, shape: str = "array",
-    array_validator: Optional[Callable[[list], bool]] = None,
+    array_validator: Optional[Callable[[list], bool]] = None, allow_extraction: bool = True,
 ) -> tuple[str, str, Dict[str, Any]]:
     """Return ``(canonical_text, method, extraction_usage)`` for a session answer.
 
@@ -164,18 +165,27 @@ def canonicalize_session_verdict(
     extraction_incomplete | unparsed``.
 
     ``shape`` (``triad_review.review_output_shape``) is the contract's FORM:
-    ``array`` (findings list), ``object`` (the whole acceptance verdict object,
-    kept whole on every branch — never reduced to its findings) or ``report``
+    ``array`` (findings list), ``two_part`` (a change-review seat's one answer object,
+    kept whole on every branch — never reduced to its findings), ``report``
     (a free-form product that is passed through verbatim; nothing here may
-    turn a diagnosis into a findings array).
+    turn a diagnosis into a findings array) or ``plan_reply`` (the planning
+    organ's reply object, passed through whole for ``plan_record.parse_reply``).
 
     An array surface may supply its existing row validator. Shape-valid but
     contract-invalid rows then reach the same extraction rail; the host never
     guesses a verdict or severity. Other surfaces keep their own parsing rules.
+
+    ``allow_extraction=False`` is pure collection of an already-paid answer: a
+    narrative that the trusted/strict branches cannot read is returned WHOLE
+    with method ``parse_unavailable``; no Light model is called for it.
     """
     text = str(raw_text or "")
     if shape == "report":
         return text, "report", {}
+    if shape == "plan_reply":
+        # The planning organ's reply object is no verdict: the whole text passes to
+        # plan_record.parse_reply downstream; no strict shape, no light extraction.
+        return text, "plan_reply", {}
     if conformance_passed:
         try:
             payload = json.loads(text.strip())
@@ -189,6 +199,8 @@ def canonicalize_session_verdict(
         # discloses the delta.
     if _strictly_parseable(text, shape, array_validator):
         return text, "strict", {}
+    if not allow_extraction:
+        return text, "parse_unavailable", {}
     if len(text) > _EXTRACT_MAX_CHARS:
         return text, "extraction_incomplete", {}
     canonical, usage = _extract_verdict_via_light_model(
@@ -218,7 +230,14 @@ def _extract_verdict_via_light_model(
     model = get_light_model()
     if owner_deadline_exhausted(deadline_at=deadline_at, reserve_sec=get_finalization_grace_sec()):
         return None, {"model": model, "reason_code": "deadline_exhausted", "dispatch": "not_dispatched"}
-    template = _SESSION_EXTRACT_OBJECT_PROMPT if shape == "object" else _SESSION_EXTRACT_PROMPT
+    from ouroboros.budget_pause import dispatch_fenced
+    from ouroboros.usage_accounting import current_usage_scope as _scope_now
+
+    if dispatch_fenced(getattr(_scope_now(), "task_id", "")):
+        # Observation-only while the owning task pauses (#1196): the raw
+        # answer is kept verbatim; no Light call canonicalizes it on the way out.
+        return None, {"model": model, "reason_code": "budget_pausing_no_extraction", "dispatch": "not_dispatched"}
+    template = _SESSION_EXTRACT_OBJECT_PROMPT if shape == "two_part" else _SESSION_EXTRACT_PROMPT
     prompt = template.format(
         contract=contract or default_output_contract(shape),
         raw_text=raw_text,  # WHOLE — the caller already bounded the one send
@@ -252,10 +271,18 @@ def _extract_verdict_via_light_model(
         transport = review_transport_timeout(model, transport_timeout_sec, deadline_at)
         if transport is not None:
             chat_kwargs["timeout"] = transport
+        # The same deadline − grace window also bounds the send after preparation (#572).
+        chat_kwargs.update(caller_deadline_arguments(deadline_at, None, reserve_sec=get_finalization_grace_sec(),
+                                                     dispatch_only=True))
         with physical_attempt_limit(1), usage_scope(_scope):
             message, usage = llm.chat(**chat_kwargs)
     except Exception as exc:
+        from ouroboros.llm_attempt import refused_by_own_window
         from ouroboros.llm_claudexor import propagate_model_error
+        if refused_by_own_window(exc, own_window_spent=owner_deadline_exhausted(
+                deadline_at=deadline_at, reserve_sec=get_finalization_grace_sec())):
+            # Unsent once its own window ended while it prepared: its result before admission, not a task control.
+            return None, {"model": model, "reason_code": "deadline_exhausted", "dispatch": "not_dispatched"}
         propagate_model_error(exc)
         log.warning("Review session verdict extraction failed: %s", exc)
         return None, {}
@@ -267,7 +294,7 @@ def _extract_verdict_via_light_model(
     usage["model"] = model
     if not body or _UNEXTRACTABLE in body.upper()[:80]:
         return None, usage
-    if shape == "object":
+    if shape == "two_part":
         try:
             payload: Any = json.loads(body)
         except (TypeError, ValueError):

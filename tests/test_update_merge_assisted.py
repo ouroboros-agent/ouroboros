@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import supervisor.git_ops as git_ops
 import supervisor.update_merge as update_merge
+from ouroboros.dialogue_store import THREAD_FORMAT
 
 
 def _git(repo, *args):
@@ -23,6 +24,12 @@ def _init_repo(tmp_path):
     _git(repo, "config", "commit.gpgsign", "false")
     (repo / "a.txt").write_text("base\n")
     (repo / "BIBLE.md").write_text("constitution\n")
+    (repo / "ouroboros").mkdir()
+    # A tree bearing every store a current release carries, its dialogue store naming the thread format it
+    # reads: the ordinary rollback resets at once.
+    for name in ("store.py", "usage_store.py", "dialogue_store.py"):
+        (repo / "ouroboros" / name).write_text("# store\n", encoding="utf-8")
+    (repo / "ouroboros" / "dialogue_store.py").write_text(f"THREAD_FORMAT = {THREAD_FORMAT!r}\n", encoding="utf-8")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "base")
     head = _git(repo, "symbolic-ref", "--short", "HEAD").stdout.strip()
@@ -315,40 +322,32 @@ def test_cleanup_only_gate_block_retries_the_marker_and_never_rolls_back(tmp_pat
     )
 
 
-def test_restore_skips_drop_when_the_stash_list_changed_mid_restore(tmp_path, monkeypatch):
-    """A concurrent stash push between the apply and the drop shifts every
-    selector: the restore must then KEEP the entry (litter) rather than drop a
-    selector that may now name someone else's work."""
+def test_restore_keeps_both_update_and_interleaved_foreign_stash(tmp_path, monkeypatch):
+    """No positional drop exists, so an external stash push cannot lose its entry."""
     repo, head = _init_repo(tmp_path)
     _point_at(monkeypatch, tmp_path, repo, head)
-    (repo / "work.txt").write_text("ours\n")
+    (repo / "work.txt").write_text("ours\n", encoding="utf-8")
     status, our_sha, error = update_merge.stash_local_changes_for_update("race-test")
     assert status == "ok" and our_sha, error
-
     real_capture = git_ops.git_capture
-    state = {"list_calls": 0}
+    calls = []
 
     def racing_capture(cmd):
-        if cmd[:3] == ["git", "stash", "list"] and "--format=%H %gd" in cmd:
-            state["list_calls"] += 1
-            if state["list_calls"] == 2:
-                # Interleave a foreign push right before the post-apply re-list.
-                (repo / "foreign.txt").write_text("someone else\n")
-                subprocess.run(["git", "-C", str(repo), "stash", "push",
-                                "--include-untracked", "-m", "foreign",
-                                "--", "foreign.txt"],
-                               capture_output=True, text=True)
-        return real_capture(cmd)
+        calls.append(cmd)
+        result = real_capture(cmd)
+        if cmd[:3] == ["git", "stash", "apply"]:
+            (repo / "foreign.txt").write_text("someone else\n", encoding="utf-8")
+            assert _git(repo, "stash", "push", "--include-untracked", "-m", "foreign",
+                        "--", "foreign.txt").returncode == 0
+        return result
 
     monkeypatch.setattr(git_ops, "git_capture", racing_capture)
-
-    restored, note = update_merge.restore_update_stash(our_sha, context="race")
-
-    assert restored, note
-    assert (repo / "work.txt").read_text() == "ours\n"
+    result = update_merge.restore_update_stash(our_sha, context="race")
+    assert result.status == "restored", result
+    assert (repo / "work.txt").read_text(encoding="utf-8") == "ours\n"
     shas = _git(repo, "stash", "list", "--format=%H").stdout.split()
-    assert our_sha in shas, "our entry was dropped despite the shifted list"
-    assert len(shas) == 2  # the foreign entry survived too
+    assert our_sha in shas and len(shas) == 2
+    assert not any(cmd[:3] == ["git", "stash", "drop"] for cmd in calls)
 
 
 def test_boot_backfill_reprojects_before_pinning_m0(tmp_path, monkeypatch):
@@ -413,7 +412,7 @@ def test_restore_with_marker_refuses_a_dirty_tree(tmp_path, monkeypatch):
     (repo / "late.txt").write_text("late human edit\n")  # tree dirty again
     tx = {"stash_sha": stash_sha}
 
-    note = update_merge.restore_stash_with_marker(tx, "unwind-test")
+    note = update_merge.restore_stash_with_marker(tx, "unwind-test").note
 
     assert "NOT auto-applied" in note and stash_sha[:12] in note
     assert (repo / "late.txt").read_text() == "late human edit\n"
@@ -473,13 +472,13 @@ def test_live_unmerged_paths_error_is_not_no_conflicts(monkeypatch):
     from supervisor import update_candidate
 
     monkeypatch.setattr(
-        update_candidate._g, "git_capture", lambda cmd: (1, "", "boom")
+        update_candidate._g, "_run_git_process_bounded", lambda cmd, **kw: (1, b"", b"boom")
     )
     assert update_candidate.live_unmerged_paths() is None
 
 
 def test_marker_guarded_restore_replay_does_not_wipe_restored_work(tmp_path, monkeypatch):
-    """Crash between the stash apply and its drop: the tx carries
+    """Crash after the stash apply was recorded: the tx carries
     stash_restored=True, so a replayed restore must be a no-op — never a
     conflicting re-apply whose cleanup resets the already-restored copy."""
     repo, head = _init_repo(tmp_path)
@@ -497,7 +496,7 @@ def test_marker_guarded_restore_replay_does_not_wipe_restored_work(tmp_path, mon
     # Simulate post-restore progress that a naive re-apply would clobber.
     (repo / "work.txt").write_text("owner work + more\n")
     note2 = update_merge.restore_stash_with_marker(tx, "replay")
-    assert note2 == ""  # marker short-circuits: no re-apply, no reset
+    assert note2.status == "restored"  # recorded outcome: no re-apply, no reset
     assert (repo / "work.txt").read_text() == "owner work + more\n", (note1, note2)
 
 
@@ -686,36 +685,34 @@ def test_assisted_objective_is_truthful_for_any_conflict_free_reviewed_merge():
     assert "was rescued to" not in objective
 
 
-def test_boot_resume_does_not_enqueue_a_duplicate_assisted_resolver(monkeypatch):
+def test_boot_resume_does_not_enqueue_a_duplicate_assisted_resolver(tmp_path, monkeypatch):
+    """An older updater's queued resolver whose readable result allows the managed resume is
+    refreshed in place, never enqueued twice (a lost result holds it: test_project_authority_outages)."""
     import supervisor.queue as queue
     import supervisor.workers as workers
+    from ouroboros.task_results import write_task_result
 
+    monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path)
+    write_task_result(tmp_path, "resolver-task", "interrupted", admitted_dispatch="possible")
     monkeypatch.setattr(workers, "ensure_worker_pool_started", lambda **_kwargs: True)
     pending = [{"id": "resolver-task", "type": "task", "legacy_field": "preserved"}]
     monkeypatch.setattr(workers, "PENDING", pending)
     monkeypatch.setattr(workers, "RUNNING", {})
-    monkeypatch.setattr(
-        queue,
-        "enqueue_task",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("existing resolver must not be enqueued again")
-        ),
-    )
+    monkeypatch.setattr(queue, "enqueue_task", lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("existing resolver must not be enqueued again")))
 
-    tx = {
-        "task_id": "resolver-task",
-        "target_sha": "b" * 40,
-        "owner_chat_id": 0,
-    }
+    tx = {"task_id": "resolver-task", "target_sha": "b" * 40, "owner_chat_id": 0}
     task_id = update_merge.enqueue_assisted_resolution_task(tx)
 
     assert task_id == "resolver-task"
     assert pending[0]["legacy_field"] == "preserved"
     assert update_merge.assisted_task_metadata_authorizes(tx, pending[0]["metadata"])
+    assert not pending[0].get("_project_admission_restore_hold")
 
 
 def test_assisted_resolver_readiness_waits_for_clean_tree_boot(tmp_path, monkeypatch):
     import supervisor.workers as workers
+    from supervisor import worker_pool_lifecycle
 
     proc = SimpleNamespace(pid=1234, is_alive=lambda: True)
     monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path / "data")
@@ -726,17 +723,16 @@ def test_assisted_resolver_readiness_waits_for_clean_tree_boot(tmp_path, monkeyp
         return True
 
     monkeypatch.setattr(workers, "ensure_worker_pool_started", start_pool)
-    monkeypatch.setattr(
-        workers,
-        "_first_worker_event_since",
-        lambda *_args: {"pid": 1234, "git_sha": "base-sha"},
-    )
+    # The proof reads every ready row since its start: the resolver's project slot's, never the lane spare's.
+    monkeypatch.setattr(worker_pool_lifecycle, "_worker_events_since",
+                        lambda *_args: [{"pid": 1234, "git_sha": "base-sha"}])
 
     assert update_merge.ensure_assisted_resolver_ready("base-sha", timeout_sec=0.1) is True
 
 
 def test_assisted_resolver_readiness_rejects_wrong_sha(tmp_path, monkeypatch):
     import supervisor.workers as workers
+    from supervisor import worker_pool_lifecycle
 
     proc = SimpleNamespace(pid=1234, is_alive=lambda: True)
     monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path / "data")
@@ -746,11 +742,9 @@ def test_assisted_resolver_readiness_rejects_wrong_sha(tmp_path, monkeypatch):
         "ensure_worker_pool_started",
         lambda **_kwargs: workers.WORKERS.setdefault(0, SimpleNamespace(proc=proc)) is not None,
     )
-    monkeypatch.setattr(
-        workers,
-        "_first_worker_event_since",
-        lambda *_args: {"pid": 1234, "git_sha": "stale-sha"},
-    )
+    # The proof reads every ready row since its start: the resolver's project slot's, never the lane spare's.
+    monkeypatch.setattr(worker_pool_lifecycle, "_worker_events_since",
+                        lambda *_args: [{"pid": 1234, "git_sha": "stale-sha"}])
 
     assert update_merge.ensure_assisted_resolver_ready("base-sha", timeout_sec=0.1) is False
 
@@ -790,7 +784,7 @@ def test_pending_boot_smoke_not_finalized_on_failed_supervisor(tmp_path, monkeyp
     assert update_merge.read_update_tx()["boot_attempts"] == 1
     res2 = update_merge.finalize_managed_update_on_boot(supervisor_ready=False)
     assert res2.get("rolled_back") is True, res2
-    assert update_merge.read_update_tx_strict()[0] == "absent"
+    assert update_merge.read_update_tx()["phase"] == update_merge.MARKER_CLEANUP_RETRY_PHASE
 
 
 def test_healthy_boot_clears_replace_intent_before_finalizing(tmp_path, monkeypatch):
@@ -859,7 +853,7 @@ def test_boot_rolls_back_when_recovered_pre_restart_smoke_fails(
     result = update_merge.finalize_managed_update_on_boot(supervisor_ready=True)
 
     assert result["rolled_back"] is True
-    assert update_merge.read_update_tx_strict()[0] == "absent"
+    assert update_merge.read_update_tx()["phase"] == update_merge.MARKER_CLEANUP_RETRY_PHASE
 
 
 def test_assisted_commit_publishes_smoke_proof_only_after_pass(monkeypatch):
@@ -894,7 +888,7 @@ def test_assisted_commit_crash_before_gates_rolls_back(tmp_path, monkeypatch):
 
     assert result.get("rolled_back") is True, result
     assert _git(repo, "rev-parse", "HEAD").stdout.strip() == plan["base_sha"]
-    assert update_merge.read_update_tx_strict()[0] == "absent"
+    assert update_merge.read_update_tx()["phase"] == update_merge.MARKER_CLEANUP_RETRY_PHASE
 
 
 def test_replace_crash_before_checkout_preserves_dirty_tree(tmp_path, monkeypatch):
@@ -969,7 +963,7 @@ def test_rollback_disarms_replay_before_touching_dirty_tree(tmp_path, monkeypatc
     monkeypatch.setattr(git_ops, "_clear_update_intent", lambda: True)
     recovered = update_merge.finalize_managed_update_on_boot(supervisor_ready=True)
     assert recovered["rolled_back"] is True
-    assert update_merge.read_update_tx_strict()[0] == "absent"
+    assert update_merge.read_update_tx()["phase"] == update_merge.MARKER_CLEANUP_RETRY_PHASE
 
 
 def test_restart_smoke_syncs_dependencies_before_code_checks(monkeypatch):
@@ -1001,6 +995,9 @@ def test_restart_smoke_timeout_kills_process_tree(monkeypatch):
     killed = []
 
     class HungProcess:
+        def poll(self):
+            return self.returncode
+
         returncode = 1
 
         def __init__(self):
@@ -1014,6 +1011,8 @@ def test_restart_smoke_timeout_kills_process_tree(monkeypatch):
             return "", ""
 
     proc = HungProcess()
+    from tests.test_tracked_tree_containment import fake_tree_read
+    fake_tree_read(monkeypatch, proc, remains=False)
     monkeypatch.setattr(update_merge.subprocess, "Popen", lambda *_a, **_k: proc)
     monkeypatch.setattr(platform_layer, "kill_process_tree", lambda value: killed.append(value))
 
@@ -1057,8 +1056,8 @@ def test_boot_recovery_rolls_back_interrupted_materialization(tmp_path, monkeypa
     )
     monkeypatch.setattr(
         workers,
-        "open_repo_writer_admission",
-        lambda expected_reason="": gate_calls.append(("open", expected_reason)),
+        "open_repo_writer_admission_after_update_abort",
+        lambda expected_reason="": gate_calls.append(("open", expected_reason)) or True,
     )
     _git(repo, "reset", "--hard", "HEAD")
     _git(repo, "clean", "-fd")
@@ -1076,7 +1075,7 @@ def test_boot_recovery_rolls_back_interrupted_materialization(tmp_path, monkeypa
     assert result.get("rolled_back") is True, result
     assert _git(repo, "rev-parse", "HEAD").stdout.strip() == plan["base_sha"]
     assert update_merge._merge_head_sha() == ""
-    assert update_merge.read_update_tx_strict()[0] == "absent"
+    assert update_merge.read_update_tx()["phase"] == update_merge.MARKER_CLEANUP_RETRY_PHASE
     assert gate_calls == [("close", "managed_update:rollback")]
 
 
@@ -1107,12 +1106,13 @@ def test_dirty_local_work_is_in_the_reviewed_diff(tmp_path, monkeypatch):
 
 
 def _stub_worker_gates(monkeypatch):
-    """Neutral worker-pool/admission stubs for rollback paths (parallel-safe)."""
+    """Stub pool and saved-work handoff outside these Git-focused rollback tests."""
     import supervisor.workers as workers
 
     monkeypatch.setattr(workers, "ensure_worker_pool_started", lambda **_kwargs: True)
     monkeypatch.setattr(workers, "close_repo_writer_admission", lambda reason: None)
-    monkeypatch.setattr(workers, "open_repo_writer_admission", lambda expected_reason="": None)
+    monkeypatch.setattr(workers, "open_repo_writer_admission_after_update_abort",
+                        lambda expected_reason="": True)
 
 
 def _supervisor_events(tmp_path, event_type):
@@ -1182,7 +1182,7 @@ def test_tests_evidence_records_only_for_authorized_resolver_and_live_suite(tmp_
     suite must not forge a proof)."""
     from ouroboros import preflight_runner as pr
     from ouroboros.commit_admission import preflight_test_proof_matches
-    from tests.test_advisory_preflight import _stub_preflight_lanes
+    from tests.test_git_review_preflight_gate import _stub_preflight_lanes
 
     repo, head, plan, tx = _materialized_conflict_tx(tmp_path, monkeypatch)
     meta = _authority_metadata(tx)
@@ -1222,7 +1222,7 @@ def test_managed_post_commit_gate_reuses_matching_workload_proof(tmp_path, monke
     is a plain resolver-writable file) never suppresses the mandatory run."""
     from ouroboros import preflight_runner as pr
     from ouroboros.tools import git as git_tool
-    from tests.test_advisory_preflight import _stub_preflight_lanes
+    from tests.test_git_review_preflight_gate import _stub_preflight_lanes
 
     repo, head = _init_repo(tmp_path)
     _point_at(monkeypatch, tmp_path, repo, head)
@@ -1545,8 +1545,11 @@ def test_boot_rematerialize_rescues_dirty_work_and_points_resolver_at_it(tmp_pat
     pointer on those two signals would lose the rescue nobody has read yet."""
     import supervisor.queue as queue
     import supervisor.workers as workers
+    from ouroboros.task_results import write_task_result
 
     repo, head, plan, _tx = _materialized_conflict_tx(tmp_path, monkeypatch)
+    # The interrupted resolver's readable result: the managed resume of the same id.
+    write_task_result(git_ops.DRIVE_ROOT, "resolver", "interrupted", admitted_dispatch="possible")
     (repo / "a.txt").write_text("half-finished resolution\n")
     # The residual class: MERGE_HEAD lost while dirty resolution work survives.
     (repo / ".git" / "MERGE_HEAD").unlink()
@@ -1555,7 +1558,8 @@ def test_boot_rematerialize_rescues_dirty_work_and_points_resolver_at_it(tmp_pat
     monkeypatch.setattr(workers, "PENDING", [])
     monkeypatch.setattr(workers, "RUNNING", {})
     captured = []
-    monkeypatch.setattr(queue, "enqueue_task", lambda task, front=False: captured.append(task))
+    monkeypatch.setattr(queue, "DRIVE_ROOT", git_ops.DRIVE_ROOT)
+    monkeypatch.setattr(queue, "enqueue_task", lambda task, front=False, **_k: captured.append(task) or task)
     persisted_before_materialize = []
     real_materialize = update_merge.materialize_assisted_merge_live
 

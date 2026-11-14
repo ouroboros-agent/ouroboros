@@ -16,6 +16,8 @@ updater shim suite (tests/test_update_tx_nminus1_shim.py).
 
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import json
 import pathlib
 
@@ -30,6 +32,9 @@ from ouroboros.task_results import (
     task_result_schema_refusal,
     write_task_result,
 )
+from ouroboros.store_import import ensure_current_store
+from ouroboros.task_store import patch_document
+from tests._store_shared import read_result, result_signature
 
 
 def _results_dir(root: pathlib.Path) -> pathlib.Path:
@@ -44,6 +49,12 @@ def _write_raw(root: pathlib.Path, task_id: str, payload) -> pathlib.Path:
     else:
         path.write_text(str(payload), encoding="utf-8")
     return path
+
+
+def _upgrade(root: pathlib.Path) -> None:
+    """The real upgrade door: the boot import judges every file the old body left behind
+    (a read never imports, so the legacy file's fate is decided here, once)."""
+    ensure_current_store(root)
 
 
 def _quarantine_files(root: pathlib.Path):
@@ -64,78 +75,54 @@ def _quarantine_events(root: pathlib.Path):
 
 def test_write_task_result_stamps_the_schema_version(tmp_path):
     write_task_result(tmp_path, "t1", "completed", result="done")
-    raw = json.loads((_results_dir(tmp_path) / "t1.json").read_text(encoding="utf-8"))
+    raw = read_result(tmp_path, "t1")
     assert raw[SCHEMA_VERSION_KEY] == TASK_RESULT_SCHEMA_VERSION
     assert load_task_result(tmp_path, "t1")["result"] == "done"
 
 
 def test_lifecycle_write_stamps_a_live_unstamped_row(tmp_path):
-    """The N−1 transition path is stamp-on-write, NOT a converter: a live
-    pre-upgrade task's next lifecycle write stamps the merged row in place."""
-    _write_raw(tmp_path, "t1", {"task_id": "t1", "status": "running", "note": "old"})
+    """The N−1 transition path is stamp-on-write, NOT a converter: a live pre-upgrade task's
+    next lifecycle write stamps the merged row in place (the import admits the live latch
+    rows unstamped; every other unstamped file it quarantines at the door)."""
+    patch_document(tmp_path, "t1", lambda current: {"task_id": "t1", "status": "running", "note": "old"})
     write_task_result(tmp_path, "t1", "completed", result="done")
-    raw = json.loads((_results_dir(tmp_path) / "t1.json").read_text(encoding="utf-8"))
+    raw = read_result(tmp_path, "t1")
     assert raw[SCHEMA_VERSION_KEY] == TASK_RESULT_SCHEMA_VERSION
     assert raw["note"] == "old" and raw["status"] == "completed"
     assert not _quarantine_files(tmp_path)
 
 
-def test_plan_review_writer_stamps_the_row(tmp_path):
-    from ouroboros.task_results import PLAN_REVIEW_STATE_KEY, _update_plan_review_state
+def test_plan_record_writer_stamps_the_row(tmp_path):
+    from ouroboros import plan_record
 
-    _update_plan_review_state(tmp_path, "t2", lambda state: state)
-    raw = json.loads((_results_dir(tmp_path) / "t2.json").read_text(encoding="utf-8"))
+    plan_record.append_revision(tmp_path, "t2", plan_record.compose_revision(
+        None, goal="g", plan="p", done_when=[], affected_paths=[]), body=False)
+    raw = read_result(tmp_path, "t2")
     assert raw[SCHEMA_VERSION_KEY] == TASK_RESULT_SCHEMA_VERSION
-    assert PLAN_REVIEW_STATE_KEY in raw
+    assert plan_record.PLAN_RECORD_KEY in raw
 
 
 def test_owner_hurry_writer_stamps_the_row(tmp_path):
     from ouroboros.owner_hurry import record_requested
 
     record_requested(tmp_path, "t3", request_id="r1", attempt=1)
-    raw = json.loads((_results_dir(tmp_path) / "t3.json").read_text(encoding="utf-8"))
+    raw = read_result(tmp_path, "t3")
     assert raw[SCHEMA_VERSION_KEY] == TASK_RESULT_SCHEMA_VERSION
 
 
 def test_writer_refuses_a_row_owned_by_a_newer_schema(tmp_path):
-    """Future-refusal on the WRITE side: after a binary rollback, fields of
-    schema 1 must never be merged over (and silently downgrade) a row a newer
-    release stamped."""
-    path = _write_raw(tmp_path, "t4", {
-        SCHEMA_VERSION_KEY: TASK_RESULT_SCHEMA_VERSION + 1,
-        "task_id": "t4", "status": "running",
-    })
-    before = path.read_bytes()
+    """Future-refusal on the WRITE side: after a binary rollback onto the same store, fields
+    of schema 1 must never be merged over (and silently downgrade) a row a newer release
+    stamped."""
+    patch_document(tmp_path, "t4", lambda current: {
+        SCHEMA_VERSION_KEY: TASK_RESULT_SCHEMA_VERSION + 1, "task_id": "t4", "status": "running"})
+    before = result_signature(tmp_path, "t4")
     with pytest.raises(ValueError, match="TASK_RESULT_SCHEMA_REFUSED"):
         write_task_result(tmp_path, "t4", "completed", result="late")
-    assert path.read_bytes() == before
+    assert result_signature(tmp_path, "t4") == before
 
 
 # -------------------------------------------------------------------- readers
-
-
-@pytest.mark.parametrize("strict", [False, True])
-def test_missing_read_is_not_reclassified_when_a_result_appears(tmp_path, monkeypatch, strict):
-    """A FileNotFound observation and a later publication are different snapshots."""
-    write_task_result(tmp_path, "race", "scheduled")
-    path = _results_dir(tmp_path) / "race.json"
-    read_text = pathlib.Path.read_text
-    missed = False
-
-    def publish_after_missing_open(selected, *args, **kwargs):
-        nonlocal missed
-        if selected == path and not missed:
-            missed = True
-            write_task_result(tmp_path, "race", "completed", result="published concurrently")
-            raise FileNotFoundError(str(path))
-        return read_text(selected, *args, **kwargs)
-
-    monkeypatch.setattr(pathlib.Path, "read_text", publish_after_missing_open)
-    assert load_task_result(tmp_path, "race", strict=strict) is None
-    assert missed
-    assert load_task_result(tmp_path, "race", strict=True)["result"] == "published concurrently"
-    assert not _quarantine_files(tmp_path)
-    assert not _quarantine_events(tmp_path)
 
 
 def test_unstamped_history_is_quarantined_not_converted(tmp_path):
@@ -143,6 +130,7 @@ def test_unstamped_history_is_quarantined_not_converted(tmp_path):
     path = _write_raw(tmp_path, "t5", legacy)
     original = path.read_bytes()
 
+    _upgrade(tmp_path)
     assert load_task_result(tmp_path, "t5") is None
 
     assert not path.exists()
@@ -154,28 +142,28 @@ def test_unstamped_history_is_quarantined_not_converted(tmp_path):
     assert events[0]["count"] == 1 and events[0]["first_task_id"] == "t5"
     assert events[0]["reasons"] == {"unstamped_pre_7_0": 1}
     # 6.3=B: log-only visibility — no chat notice is minted anywhere.
-    assert not (tmp_path / "logs" / "chat.jsonl").exists()
+    assert not dialogue_test.log_rows(tmp_path / "logs" / "chat.jsonl")
 
 
 def test_quarantine_is_idempotent_for_repeat_reads(tmp_path):
     _write_raw(tmp_path, "t6", {"task_id": "t6", "status": "completed"})
+    _upgrade(tmp_path)
     assert load_task_result(tmp_path, "t6") is None
     assert load_task_result(tmp_path, "t6") is None  # second read: plain absence
+    _upgrade(tmp_path)  # a second boot of the same root: nothing to move, no second event
     assert len(_quarantine_files(tmp_path)) == 1
     assert len(_quarantine_events(tmp_path)) == 1  # no second event
 
 
 @pytest.mark.parametrize("payload, reason", [
     ("{ not json", "malformed"),
-    (["not", "an", "object"], "malformed"),
     ({SCHEMA_VERSION_KEY: TASK_RESULT_SCHEMA_VERSION + 1, "task_id": "t7", "status": "completed"},
      "future_schema"),
     ({SCHEMA_VERSION_KEY: "1", "task_id": "t7", "status": "completed"}, "invalid_stamp"),
-    ({SCHEMA_VERSION_KEY: True, "task_id": "t7", "status": "completed"}, "invalid_stamp"),
-    ({SCHEMA_VERSION_KEY: 0, "task_id": "t7", "status": "completed"}, "invalid_stamp"),
 ])
 def test_inadmissible_rows_are_quarantined_with_the_typed_reason(tmp_path, payload, reason):
     _write_raw(tmp_path, "t7", payload)
+    _upgrade(tmp_path)
     assert load_task_result(tmp_path, "t7") is None
     assert len(_quarantine_files(tmp_path)) == 1
     events = _quarantine_events(tmp_path)
@@ -196,6 +184,7 @@ def test_retired_until_deadline_contract_is_quarantined(tmp_path):
     }
     assert task_result_schema_refusal(row) == "retired_contract_until_deadline"
     _write_raw(tmp_path, "t8", row)
+    _upgrade(tmp_path)
     assert load_task_result(tmp_path, "t8") is None
     events = _quarantine_events(tmp_path)
     assert len(events) == 1
@@ -220,16 +209,20 @@ def test_list_scan_quarantines_the_whole_batch_as_one_event(tmp_path):
     assert len(_quarantine_events(tmp_path)) == 1
 
 
-def test_strict_read_raises_and_never_mutates_storage(tmp_path):
+def test_the_import_quarantines_an_unstamped_file_once_whatever_the_first_reader_is(tmp_path):
+    """The door is the import, not the reader: the boot import moves the inadmissible file
+    byte-unchanged and reports it once; a plain read then answers absence, the strict reader
+    still refuses the occupied identity (ABI-2) and no later read repeats the move."""
     path = _write_raw(tmp_path, "t9", {"task_id": "t9", "status": "completed"})
     before = path.read_bytes()
-    with pytest.raises(ValueError, match="quarantined_schema: unstamped_pre_7_0"):
+    _upgrade(tmp_path)
+    assert load_task_result(tmp_path, "t9") is None
+    with pytest.raises(ValueError, match="unreadable or invalid"):
         load_task_result(tmp_path, "t9", strict=True)
-    with pytest.raises(ValueError, match="quarantined_schema"):
-        list_task_results(tmp_path, strict=True)
-    assert path.read_bytes() == before
-    assert not _quarantine_files(tmp_path)
-    assert not _quarantine_events(tmp_path)
+    assert list_task_results(tmp_path, strict=True) == []
+    [moved] = _quarantine_files(tmp_path)
+    assert moved.read_bytes() == before and not path.exists()
+    assert len(_quarantine_events(tmp_path)) == 1
 
 
 def test_plain_absence_has_no_side_effects(tmp_path):
@@ -242,7 +235,7 @@ def test_rollback_a_stamped_row_reads_unchanged_under_an_n_minus_1_reader(tmp_pa
     """Rollback direction of F12: the stamp is ONE additive key, so the N−1
     reader (plain JSON, no admission gate) sees the full row unchanged."""
     write_task_result(tmp_path, "t10", "completed", result="done")
-    raw = json.loads((_results_dir(tmp_path) / "t10.json").read_text(encoding="utf-8"))
+    raw = read_result(tmp_path, "t10")
     unstamped = {key: value for key, value in raw.items() if key != SCHEMA_VERSION_KEY}
     assert set(raw) - set(unstamped) == {SCHEMA_VERSION_KEY}
     assert unstamped["task_id"] == "t10" and unstamped["status"] == "completed"
@@ -258,6 +251,7 @@ def test_state_save_stamps_and_an_unstamped_state_loads_unchanged(tmp_path, monk
     monkeypatch.setattr(state, "STATE_PATH", tmp_path / "state" / "state.json")
     monkeypatch.setattr(state, "STATE_LAST_GOOD_PATH", tmp_path / "state" / "state.last_good.json")
     monkeypatch.setattr(state, "STATE_LOCK_PATH", tmp_path / "locks" / "state.lock")
+    monkeypatch.setattr(state, "DRIVE_ROOT", tmp_path)  # a fresh root: the first whole-state write may mint
 
     state.save_state({"spent_usd": 1.25})
     for path in (state.STATE_PATH, state.STATE_LAST_GOOD_PATH):

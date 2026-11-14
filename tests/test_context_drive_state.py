@@ -7,6 +7,7 @@ open obligations that must survive that retirement.
 """
 
 from __future__ import annotations
+from tests._store_shared import seed_result
 
 
 
@@ -28,10 +29,15 @@ def test_drive_state_section_is_typed_projection_with_pointer(tmp_path):
             return tmp_path / p
 
     (tmp_path / "state").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "state" / "state.initialized.json").write_text(  # a completed initialization proves its controls
+        json.dumps({"initialization_id": "init-1", "phase": "complete"}), encoding="utf-8")
     (tmp_path / "state" / "state.json").write_text(json.dumps({
+        "initialization_id": "init-1",
         "session_id": "abc123",
         "current_branch": "ouroboros",
         "evolution_mode_enabled": False,
+        "bg_consciousness_enabled": False,
+        "bg_consciousness_stop_source": "owner",  # the mind sees who holds the clock off
         "budget_drift_alert": True,
         "budget_drift_pct": 48.05,
         "spent_usd": 1699.3,
@@ -45,6 +51,7 @@ def test_drive_state_section_is_typed_projection_with_pointer(tmp_path):
     assert section.startswith("## Drive state")
     assert '"session_id": "abc123"' in section
     assert '"budget_drift_alert": true' in section
+    assert '"bg_consciousness_stop_source": "owner"' in section
     # Internal caches / duplicated spend narrative are OMITTED but NAMED.
     assert '"managed_update_cache"' not in section
     assert '"usage_accounting"' not in section
@@ -60,14 +67,14 @@ def test_drive_state_section_is_typed_projection_with_pointer(tmp_path):
     assert "read_file" not in empty
 
 
-def test_review_ledger_caps_runs_and_attempts_with_omission_notes(tmp_path):
+def test_review_ledger_caps_attempts_with_omission_notes(tmp_path):
     """W3 adjacent (b): the historical review ledger rides into EVERY task's
-    context — cap runs/attempts at the 5 most recent with EXPLICIT omission
+    context — cap attempts at the 5 most recent with EXPLICIT omission
     notes (the continuation pattern) and truncate commit messages; the full
-    ledger stays behind review_status."""
+    ledger stays behind review_status. The retired advisory lane's archived
+    rows never render there."""
     from ouroboros.review_state import (
         AdvisoryReviewState,
-        AdvisoryRunRecord,
         CommitAttemptRecord,
         format_status_section,
     )
@@ -75,27 +82,21 @@ def test_review_ledger_caps_runs_and_attempts_with_omission_notes(tmp_path):
     state = AdvisoryReviewState()
     long_msg = "feat: " + ("y" * 2000)
     for i in range(8):
-        state.add_run(AdvisoryRunRecord(
-            snapshot_hash=f"hash{i:04d}00000000",
-            commit_message=long_msg if i == 7 else f"commit {i}",
-            status="fresh",
-            ts=f"2026-01-0{i + 1}T00:00:00",
-        ))
+        state.advisory_runs.append({"snapshot_hash": f"hash{i:04d}00000000", "commit_message": f"archived run {i}",
+                                    "status": "fresh", "ts": f"2026-01-0{i + 1}T00:00:00"})
     for i in range(8):
         state.record_attempt(CommitAttemptRecord(
             status="succeeded",
-            commit_message=f"attempt commit {i}",
+            commit_message=long_msg if i == 6 else f"attempt commit {i}",
             ts=f"2026-01-0{i + 1}T01:00:00",
             attempt=i + 1,
         ))
 
     section = format_status_section(state)
 
-    assert "3 older advisory run(s) omitted" in section
     assert "3 older attempt(s) omitted" in section
     assert "review_status" in section
-    assert "hash0007" in section       # newest kept
-    assert "hash0000" not in section   # oldest omitted
+    assert "hash000" not in section and "archived run" not in section  # the archive never renders
     assert "attempt commit 7" in section
     assert "attempt commit 0" not in section
     # The 2000-char commit message is display-truncated with the explicit notice.
@@ -202,11 +203,8 @@ def test_settled_continuation_with_open_obligations_survives_age_retirement(tmp_
 
     _aged_continuation("unresolvedtask", ["obl-open-1"])
     _aged_continuation("closedtask", ["obl-long-gone"])
-    task_results = tmp_path / "task_results"
-    task_results.mkdir(parents=True, exist_ok=True)
     for tid in ("unresolvedtask", "closedtask"):
-        (task_results / f"{tid}.json").write_text(
-            _json.dumps({"_schema_version": 1, "id": tid, "status": "failed"}), encoding="utf-8")
+        seed_result(tmp_path, tid, {"_schema_version": 1, "id": tid, "status": "failed"})
 
     state = AdvisoryReviewState(open_obligations=[
         ObligationItem(

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import importlib.util
 import pathlib
+import sys
 
 import pytest
 
@@ -52,11 +53,12 @@ def facades():
 
 def _assert_identical(out_path: pathlib.Path, rendered: str):
     rendered += "\n" if not rendered.endswith("\n") else ""
-    assert out_path.is_file(), (
-        f"{out_path.name} is missing — run `python scripts/regenerate_inventories.py`")
+    regenerate = f"run scripts/regenerate_inventories.py with this test's Python ({sys.executable})"
+    assert out_path.is_file(), f"{out_path.name} is missing: {regenerate}"
     assert out_path.read_text(encoding="utf-8") == rendered, (
-        f"{out_path.name} is stale (regeneration changes it) — run "
-        "`python scripts/regenerate_inventories.py`")
+        f"{out_path.name} is stale: {regenerate} and commit docs/inventories/ with the changes it describes, "
+        "alone when they are already committed; untracked files count, and another task's uncommitted work "
+        "owes its own regeneration.")
 
 
 def test_frozen_contracts_inventory_is_byte_identical(frozen):
@@ -69,6 +71,66 @@ def test_data_layout_inventory_is_byte_identical(layout):
 
 def test_facade_inventory_is_byte_identical(facades):
     _assert_identical(inv.FACADE_OUT, facades[0])
+
+
+def test_ui_control_text_inventory_is_byte_identical():
+    _assert_identical(inv.UI_CONTROLS_OUT, inv.build_ui_control_inventory()[0])
+
+
+def test_ui_control_scan_lists_fixed_text_and_only_counts_the_rest():
+    from scripts.ui_control_inventory import scan_controls
+
+    rows, interpolated = scan_controls(
+        """
+        <button class="btn btn-default btn-sm" type="button">Retry</button>
+        <button class="chat-attach-btn" aria-label="Attach file"><svg viewBox="0 0 1 1"></svg></button>
+        <button class="btn ${tone}" type="button"><span>Save &amp; close</span></button>
+        <button class="btn">${escapeHtml(label)}</button>
+        <button class="icon-only"><svg></svg></button>
+        <button class="btn btn-default" type="button"
+            ${rows.length >= MAX_ROWS ? 'disabled' : ''}>Add subagent</button>
+        const go = document.createElement('button');
+        go.className = 'btn btn-sm btn-default';
+        go.textContent = 'Turn into project';
+        const dynamic = document.createElement('button');
+        dynamic.textContent = labelFor(row);
+        """
+    )
+    # Fixed text is listed with its classes; an icon-only control is named by its fixed
+    # accessible name; an interpolated class is shown as a gap, never guessed.
+    assert rows == [
+        ("Retry", "btn btn-default btn-sm"),
+        ("[icon] Attach file", "chat-attach-btn"),
+        ("Save & close", "btn …"),
+        # A comparison inside a templated attribute is not the end of the tag.
+        ("Add subagent", "btn btn-default"),
+        ("Turn into project", "btn btn-sm btn-default"),
+    ]
+    # Run-time text, a nameless icon and a computed label are counted, not invented.
+    assert interpolated == 3
+
+
+def test_ui_control_scan_lists_a_modules_own_button_factory_by_its_literal_calls():
+    from scripts.ui_control_inventory import scan_controls
+
+    rows, interpolated = scan_controls(
+        """
+        const button = (label, data, tone = 'btn-default', key = '') => `<button type="button" class="btn ${tone} btn-sm" ${data} data-key="${attr(data)}"${key ? ` data-i18n-fmt="${attr(key)}"` : ''}>${text(label)}</button>`;
+        ${button('Show what can go', 'data-free-preview')}
+        ${button('Free', 'data-free-go', 'btn-danger', 'storage.free.go')}
+        ${button(goLabel(free, checked), 'data-free-go', 'btn-danger')}
+        const pill = (label) => `<button class="pill">Pin</button>`;
+        ${pill('Unpin')}
+        """
+    )
+    # The factory's template is no control; each call with a literal label is one, with the classes its
+    # arguments and the factory's defaults resolve to. An arrow whose button text is fixed is not a factory.
+    assert rows == [
+        ("Pin", "pill"),
+        ("Show what can go", "btn btn-default btn-sm"),
+        ("Free", "btn btn-danger btn-sm"),
+    ]
+    assert interpolated == 1, "a call whose label is computed is counted, not invented"
 
 
 # ---------------------------------------------------------------------------
@@ -89,13 +151,10 @@ def test_frozen_table_is_nonempty_and_covers_known_owners(frozen):
 
 
 def test_contracts_package_coverage_gap_is_pinned(frozen):
-    """The two known §11.1 gaps are pinned; a NEW contracts-package module
+    """§11.1 rows cover the whole contracts package; a NEW contracts-package module
     that never gets a §11.1 row must turn this red even after regeneration."""
     doc = frozen[0]
-    known_gaps = {
-        "ouroboros/contracts/skill_payload_policy.py",
-        "ouroboros/contracts/task_constraint.py",
-    }
+    known_gaps: set[str] = set()
     listed = {line[3:-1] for line in doc.splitlines()
               if line.startswith("- `ouroboros/contracts/")}
     assert listed == known_gaps, (
@@ -112,7 +171,7 @@ def test_every_data_layout_entry_resolves(layout):
 
 def test_data_layout_probes_key_durable_files(layout):
     doc = layout[0]
-    for token in ("settings.json", "queue_snapshot.json", "usage_attempts.jsonl",
+    for token in ("settings.json", "queue_snapshot.json", "usage.sqlite",
                   "terminal_deliveries.json", "chat.jsonl"):
         assert f"`{token}`" in doc, f"layout inventory lost the `{token}` entry"
 
@@ -241,6 +300,48 @@ def test_frozen_section_uses_markdown_headings_not_fenced_examples():
     section = inv.frozen_section_text(text)
     assert "Actual content" in section
     assert "Fake content" not in section and "Outside" not in section
+
+
+def test_the_inventories_read_a_candidate_the_same_staged_or_not(tmp_path, monkeypatch):
+    """The commit gate stages a candidate and unstages it after a red, and Ouroboros cannot stage by hand:
+    new and deleted modules, anchors and folders read the same staged or not, and every row follows the disk."""
+    import subprocess
+
+    def git(*args):
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                        "-c", "commit.gpgsign=false", *args], cwd=tmp_path, check=True, capture_output=True)
+
+    def write(path, text):
+        (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / path).write_text(text, encoding="utf-8")
+
+    book = ("# Book\n\n## 11.1 What is frozen\n\n| Contract | File | Anchored by |\n|---|---|---|\n"
+            "| `A` | `ouroboros/contracts/a.py` | `tests/test_a.py` |\n\n## Data layout (`~/Ouroboros/`)\n\n"
+            "````\n~/Ouroboros/\n└── data/\n    ├── state/\n{}    └── gone.json\n````\n")
+    write("docs/ARCHITECTURE.md", book.format(""))
+    write("ouroboros/contracts/a.py", "A = 1\n")
+    write("tests/test_a.py", "def test_a():\n    pass\n")
+    write("ouroboros/keeps.py", "ROOT, STATE = 'data', 'state'\n")
+    write("ouroboros/gone.py", "STORE = 'gone.json'\n")
+    git("init", "-q")
+    git("add", ".")
+    git("commit", "-qm", "base")
+    monkeypatch.setattr(inv, "REPO_ROOT", tmp_path)
+    assert inv.build_frozen_inventory()[1] == inv.build_layout_inventory()[1] == []
+    write("docs/ARCHITECTURE.md", book.format("    ├── fresh.json\n"))
+    write("ouroboros/fresh.py", "STORE = 'fresh.json'\n")
+    write("ouroboros/contracts/b.py", "B = 1\n")
+    write("skills/demo/state/notes.md", "a folder named like a layout entry\n")
+    (tmp_path / "ouroboros" / "gone.py").unlink()
+    (tmp_path / "tests" / "test_a.py").unlink()
+    frozen, layout = inv.build_frozen_inventory(), inv.build_layout_inventory()
+    git("add", "-A")
+    assert (frozen, layout) == (inv.build_frozen_inventory(), inv.build_layout_inventory())
+    assert "- `ouroboros/contracts/b.py`" in frozen[0] and "`tests/test_a.py` (MISSING)" in frozen[0]
+    for row in ("| `data/` | `data` | code-ref |", "| `state/` | `state` | repo-dir |",
+                "| `fresh.json` | `fresh.json` | code-ref |", "| `gone.json` | `gone.json` | UNRESOLVED |"):
+        assert row in layout[0], row
+    assert len(frozen[1]) == len(layout[1]) == 1
 
 
 def test_missing_member_refuses_generator_before_partial_inventory(tmp_path, monkeypatch):

@@ -4,17 +4,9 @@ from pathlib import Path
 import pytest
 
 from ouroboros.contracts.task_contract import build_task_contract
-from ouroboros.presence_authority import (
-    PresenceAuthorityError,
-    build_presence_capability_ceiling,
-    presence_ceiling_allows_binding,
-    presence_ceiling_allows_delegated_read,
-    presence_ceiling_allows_delegated_surface,
-    presence_ceiling_allows_tool,
-    presence_ceiling_from_payload,
-    presence_ceiling_payload,
-)
-from ouroboros.presence_capabilities import (
+from ouroboros.presence_authority import PresenceAuthorityError, presence_ceiling_allows_binding, presence_ceiling_allows_delegated_read, presence_ceiling_allows_delegated_surface, presence_ceiling_allows_tool, presence_ceiling_from_payload, presence_ceiling_payload
+from tests.frozen_presence_authority import build_presence_capability_ceiling
+from tests.frozen_presence_capabilities import (
     PresenceArgumentBinding,
     PresenceProfileResolution,
     PresenceResourceTarget,
@@ -24,7 +16,7 @@ from ouroboros.presence_capabilities import (
     PresenceToolTarget,
     presence_state_fingerprint,
 )
-from ouroboros.presence_runtime import ResolvedPresenceRuntime
+from tests.frozen_presence_runtime import ResolvedPresenceRuntime
 from ouroboros.tool_access import ResolvedResourceBinding
 from ouroboros.tools.registry import ToolContext, ToolEntry, ToolRegistry
 
@@ -59,16 +51,30 @@ def test_ceiling_compiles_exact_tools_scripts_resources_and_digest():
     )
 
     # The profile selected chat_history and one script; the cognitive baseline
-    # (own memory, no new authority) is compiled in beside them.
+    # (own memory, no new authority) and the own-work baseline (this binding's
+    # readers, host-bound to its scope, and tell_task) are compiled in beside them.
     assert [grant.name for grant in ceiling.tool_grants] == [
         "chat_history",
+        "get_task_result",
         "knowledge_list",
         "knowledge_read",
         "knowledge_write",
+        "memory_mark",
+        "memory_read",
+        "recent_tasks",
         "skill_exec",
+        "tell_task",
         "update_identity",
         "update_scratchpad",
+        "update_world",
     ]
+    scoped = {grant.name: [(item.argument_path, item.static_value) for item in grant.bindings]
+              for grant in ceiling.tool_grants if grant.name in {"get_task_result", "recent_tasks", "tell_task"}}
+    assert scoped == {
+        "get_task_result": [(("presence_scope",), "own_binding")],
+        "recent_tasks": [(("presence_scope",), "own_binding")],
+        "tell_task": [],
+    }
     script = next(grant for grant in ceiling.tool_grants if grant.name == "skill_exec")
     assert [(item.argument_path, item.static_value) for item in script.bindings] == [
         (("skill",), "calendar"),
@@ -226,21 +232,27 @@ def test_registry_filters_schema_dispatch_and_resolved_targets(tmp_path):
 
     names = {schema["function"]["name"] for schema in registry.schemas()}
     assert names == {
-        "presence_finish",
+        "finish_task",  # ceiling-only work has no speaker metadata; local completion grants no resource
         "presence_cancel_work",
         "read_file",
         "chat_history",
+        "get_task_result",
         "knowledge_list",
         "knowledge_read",
         "knowledge_write",
+        "memory_mark",
+        "memory_read",
+        "recent_tasks",
+        "tell_task",
         "update_identity",
         "update_scratchpad",
+        "update_world",
     }
     # Own memory is advertised and it runs; nothing that acts outside this mind
     # comes with it, in the schemas or in dispatch.
     assert "PRESENCE_CAPABILITY_BLOCKED" not in registry.execute(
         "knowledge_write",
-        {"topic": "presence-note", "content": "what this exchange taught me", "scope": "global"},
+        {"topic": "presence-note", "mode": "overwrite", "content": "what this exchange taught me", "scope": "global"},
     )
     assert (data / "memory" / "knowledge" / "presence-note.md").exists()
     for blocked in ("write_file", "run_command", "send_user_message"):
@@ -259,10 +271,11 @@ def test_registry_filters_schema_dispatch_and_resolved_targets(tmp_path):
     )
     assert registry.execute(
         "read_file", {"root": "active_workspace", "path": "shared/allowed.txt"}
-    ).endswith("\nok")
+    ).endswith("\tok")
 
 
-def test_presence_argument_bindings_override_model_supplied_values(tmp_path):
+def test_presence_argument_bindings_override_model_supplied_values(tmp_path, monkeypatch):
+    monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_SAFETY_MODE", "off")
     selection = PresenceSelection(
         "1" * 64,
         PresenceToolTarget("builtin", "bound_tool"),

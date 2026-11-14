@@ -1,11 +1,10 @@
-"""Wire placeholders for Settings/MCP secrets and secret-byte egress masking.
+"""Settings/MCP placeholders and secret redaction for diagnostic projections.
 
 Each placeholder reader recognizes only a shape emitted by its matching
 producer. Keeping the small mechanical contract here prevents a display
 placeholder from being persisted without treating arbitrary values ending in
-``...`` as secrets to erase. This module is also the SSOT for well-known
-secret BYTE shapes (entropy token formats, PEM private keys) masked on the
-tool-output egress before model context/history.
+``...`` as secrets to erase. Known token and PEM patterns belong to stored
+diagnostic projections; file-tool results preserve their source content.
 """
 
 from __future__ import annotations
@@ -29,6 +28,7 @@ MASKED_SECRET_SETTING_KEYS = frozenset(
         "ANTHROPIC_API_KEY",
         "MINIMAX_API_KEY",
         "DEEPSEEK_API_KEY",
+        "ZAI_API_KEY",
         "GITHUB_TOKEN",
         "OUROBOROS_NETWORK_PASSWORD",
     }
@@ -174,10 +174,17 @@ def looks_masked_secret(value: Any) -> bool:
     return text == CONFIGURED_SECRET_PLACEHOLDER or looks_masked_mcp_secret(text)
 
 
-# Well-known entropy token formats (SSOT; ``observability`` reuses this list
-# for forensic redaction). Each pattern names a provider/protocol shape whose
-# match is a credential with high precision — never a generic "looks random"
-# heuristic, so ordinary file content survives masking.
+# JSON Schema words that redaction and schema presentation share (``redaction._redact_any``,
+# ``mcp_schema.wrap_schema_text``): a name map's keys name parameters or definitions, never credentials;
+# a subschema says what it accepts by at least one kind keyword; notes describe it and hold no instance data.
+SCHEMA_MAPS = frozenset({"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"})
+SCHEMA_ARRAYS = frozenset({"allOf", "anyOf", "oneOf", "prefixItems"})
+SCHEMA_KINDS = frozenset({"type", "$ref", "enum", "const"}) | SCHEMA_ARRAYS
+SCHEMA_NOTES = frozenset({"type", "$ref", "title", "description", "format"})
+
+
+# Well-known entropy token formats (SSOT; ``redaction`` reuses this list
+# for forensic redaction). File-tool results do not apply these patterns.
 SECRET_TOKEN_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
     ("bearer_token", re.compile(r"(?i)\bBearer\s+[A-Za-z0-9_\-./+=]{16,}")),
     ("basic_auth", re.compile(r"(?i)\bBasic\s+[A-Za-z0-9+/=]{16,}")),
@@ -201,53 +208,13 @@ SECRET_TOKEN_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
     ),
 )
 
-# A PEM private-key block, masked whole. When a read slice cuts the file before
-# the END marker the tail is still key material, so an unterminated block masks
-# through end-of-text (raw key bytes must never survive on a truncation edge).
+# A PEM private-key block for retained diff projections, including an
+# unterminated final block. Source file reads never apply this expression.
 _PEM_PRIVATE_KEY_RE = re.compile(
     r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----"
     r"(?:.*?-----END [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----|.*\Z)",
     re.DOTALL,
 )
-
-def mask_secret_bytes(text: str, *, preserve_layout: bool = False) -> Tuple[str, int]:
-    """Mask secret-shaped byte spans in final tool output; return (text, count).
-
-    Egress seam for owner-home (``user_files``) content: the root agent may
-    read the file, and bytes in a recognized credential format or a PEM
-    private-key block leave as ``***`` (#447 X1/В23). Coverage is exactly those
-    two, so secrets in unrecognized formats are not detected, in every scope.
-    Readers that mask before selecting a line/character window set
-    ``preserve_layout``: replacement keeps character positions and line breaks,
-    so a window inside a key cannot lose its header or shift later source.
-    Disclosed residuals: a dictionary-word password has no shape to match, and
-    key material of an unknown format reaching an egress without its PEM header
-    or provider prefix (a bare 40-character AWS secret, a mid-block base64 line)
-    is delivered raw. The owner removed the 40-character opaque-run rule that
-    used to cover that case, knowing it is a relaxation and not a repair
-    (answer 5=A, 2026-09-11): search and read now show the same bytes.
-    """
-    out = str(text or "")
-    count = 0
-
-    def _replacement(value: str) -> str:
-        return "".join(char if char.isspace() else "*" for char in value) if preserve_layout else "***"
-
-    def _mask(_match: re.Match[str]) -> str:
-        nonlocal count
-        count += 1
-        return _replacement(_match.group())
-
-    def _mask_url(match: re.Match[str]) -> str:
-        nonlocal count
-        count += 1
-        return f"{match.group(1)}{_replacement(match.group(2))}:{_replacement(match.group(3))}@"
-
-    out = _PEM_PRIVATE_KEY_RE.sub(_mask, out)
-    for rule, pattern in SECRET_TOKEN_PATTERNS:
-        out = pattern.sub(_mask_url if rule == "url_credentials" else _mask, out)
-    return out, count
-
 
 def strip_masked_secrets(settings: Dict[str, Any], *, known_setting_keys: Collection[str]) -> Dict[str, Any]:
     """Blank recognized top-level placeholders before read or persistence.

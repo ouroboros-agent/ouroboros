@@ -1,12 +1,24 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import html as html_lib
 import mimetypes
+import os
+import pathlib
 import re
+import stat
 from typing import Any, BinaryIO, Dict, Optional
 
 import httpx
+
+from ..scripts.telegram_settings import (
+    validate_telegram_api_base as _telegram_api_base,
+    validate_telegram_files_dir as _telegram_files_dir,
+    validate_telegram_proxy as _telegram_proxy,
+)
+from .telegram_i18n import Index
+from .telegram_poll_binding import bot_id
 
 # Telegram hard-caps a single sendMessage at 4096 UTF-16 code units.
 _TELEGRAM_TEXT_LIMIT = 4096
@@ -22,7 +34,7 @@ _NOT_MODIFIED_PREFIX = "bad request: message is not modified"
 
 def _u16len(value: str) -> int:
     """Return Telegram's text length: UTF-16 code units, not code points."""
-    return sum(2 if ord(char) > 0xFFFF else 1 for char in value)
+    return len(value.encode("utf-16-le", "surrogatepass")) // 2
 
 
 def _take_u16_prefix(value: str, budget: int) -> tuple[str, str]:
@@ -59,6 +71,24 @@ class TelegramRequestRejected(RuntimeError):
 
 class TelegramTransportError(RuntimeError):
     """Telegram could not return a trustworthy API response yet."""
+
+
+class TelegramTokenMissing(ValueError):
+    """No bot token is accepted: there is nothing to send with, which is a wait and never a failure."""
+
+
+class TelegramBindingChanged(RuntimeError):
+    """The accepted bot token changed after this client was built, so it makes no further request; a request whose
+    failure arrives after the change ends the same way, never as a failure of the token now in force.
+
+    ``accepted`` counts the requests of this client Telegram accepted (an ``ok`` answer; a refusal is not
+    one): those parts stay as they are, and a caller never sends them, or the rest, again through another
+    token's client. Broad fallbacks re-raise it instead of trying another form of the same request.
+    """
+
+    def __init__(self, accepted: int = 0) -> None:
+        super().__init__("The Telegram bot token changed; this operation stopped before its next request.")
+        self.accepted = int(accepted)
 
 
 # Shared degraded-transport pacing contract for the poller and notifier loops:
@@ -560,45 +590,99 @@ def _telegram_html_to_plain(value: str) -> str:
     return html_lib.unescape(re.sub(r"<[^>]+>", "", value))
 
 
+def message_chunks(text: str, parse_mode: str = "HTML") -> list[str]:
+    """The Telegram messages ``send_message`` sends for ``text``, blank parts dropped."""
+    source = str(text or "")
+    if parse_mode != "HTML":
+        return [chunk for chunk in _chunk_raw_text(source) if chunk.strip()]
+    return [chunk for chunk in markdown_to_telegram_chunks(source) if _telegram_html_to_plain(chunk).strip()]
+
+
 class TelegramClient:
-    def __init__(self, token: str, *, trust_env: bool = False):
+    def __init__(self, token: str, *, trust_env: bool = False, proxy: Optional[str] = None,
+                 on_message=None, reply_to_message_id: int = 0,
+                 api_base_url: Optional[str] = None, files_dir: Optional[str] = None, binding=None,
+                 generation: Optional[int] = None):
+        # A client of the bridge's accepted token (lib/telegram_token.py) is one identity: the token and
+        # generation of ONE snapshot (the caller's, which also chose its bot-specific references, or taken
+        # here). A binding that moved on since makes it refuse its next request, never switch tokens.
+        self._binding, self.generation, self.accepted = binding, 0, 0
+        if binding is not None:
+            if generation is None:
+                token, generation = binding.snapshot()
+            self.generation = int(generation)
         self.token = str(token or "").strip()
+        # The bot this client speaks as, fixed with its token: every id it reads or sends is this bot's.
+        self.bot_id = bot_id(self.token)
         self.trust_env = bool(trust_env)
+        # One observer per mirrored host row, called for EVERY confirmed part,
+        # including media and edits. A later chunk failure cannot erase earlier ids.
+        self.on_message = on_message
+        self.reply_to_message_id = int(reply_to_message_id)
         if not self.token:
-            raise ValueError("TELEGRAM_BOT_TOKEN is missing")
-        self.api_base = f"https://api.telegram.org/bot{self.token}"
-        self.file_base = f"https://api.telegram.org/file/bot{self.token}"
+            raise TelegramTokenMissing("TELEGRAM_BOT_TOKEN is missing")
+        # An explicit proxy replaces ambient proxies for these calls only. With the default
+        # base the target stays https://api.telegram.org, so TLS runs end to end through the
+        # tunnel: the proxy sees the host, never the token-bearing path, and redirects are
+        # never followed. A TELEGRAM_API_BASE origin serves the same Bot API from the owner's
+        # server with that origin's own transport security; files_dir is a --local store.
+        self.proxy = _telegram_proxy(proxy)
+        base = _telegram_api_base(api_base_url)
+        self.api_base = f"{base}/bot{self.token}"
+        self.file_base = f"{base}/file/bot{self.token}"
+        self.files_dir = _telegram_files_dir(files_dir)
+
+    def check_binding(self) -> None:
+        """Before each request: after a token change this client asks Telegram nothing more."""
+        if self._binding is not None and not self._binding.current(self.generation):
+            raise TelegramBindingChanged(self.accepted)
+
+    def _failed(self, failure: Exception) -> Exception:
+        """What a failed request raises: its own failure while this client's token is in force. Once the binding
+        moved on, any failure (a refusal, a broken transport, an unreadable answer) belongs to the replaced token,
+        so it ends as the typed change with the parts Telegram accepted, never as a failure of the token now in force."""
+        if self._binding is not None and not self._binding.current(self.generation):
+            return TelegramBindingChanged(self.accepted)
+        return failure
 
     async def call(self, method: str, *, data: Optional[dict] = None, files: Optional[dict] = None, timeout: int = 30) -> Dict[str, Any]:
+        self.check_binding()
         method_text = str(method or "")
         safe_method = method_text if re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", method_text) else "request"
+        if self.reply_to_message_id and method_text in {"sendMessage", "sendPhoto", "sendVideo", "sendDocument", "sendAudio"}:
+            data = {**(data or {}), "reply_to_message_id": self.reply_to_message_id,
+                    "allow_sending_without_reply": True}
         try:
             # trust_env trades ambient-proxy/SSL_CERT isolation for a proxy-routed install's
             # only egress; decided once by the caller via net_transport.env_proxies_configured.
-            async with httpx.AsyncClient(timeout=timeout, trust_env=self.trust_env) as client:
+            async with httpx.AsyncClient(
+                timeout=timeout, trust_env=self.trust_env, proxy=self.proxy, follow_redirects=False,
+            ) as client:
+                self.check_binding()  # entering the transport may yield: the request itself starts only here
                 response = await client.post(f"{self.api_base}/{method_text}", data=data, files=files)
         except httpx.TimeoutException:
-            raise TelegramTransportError(f"Telegram API timed out during {safe_method}.") from None
+            raise self._failed(TelegramTransportError(f"Telegram API timed out during {safe_method}.")) from None
         except httpx.HTTPError as exc:
-            raise TelegramTransportError(
+            raise self._failed(TelegramTransportError(
                 f"Telegram API transport failed during {safe_method} ({type(exc).__name__})."
-            ) from None
+            )) from None
         try:
             payload = response.json()
         except ValueError:
-            raise TelegramTransportError(
+            raise self._failed(TelegramTransportError(
                 f"Telegram API returned invalid JSON during {safe_method}."
-            ) from None
+            )) from None
         if not isinstance(payload, dict):
-            raise TelegramTransportError(
+            raise self._failed(TelegramTransportError(
                 f"Telegram API returned an invalid response during {safe_method}."
-            )
+            ))
         try:
             api_status = int(payload.get("error_code") or response.status_code)
         except (TypeError, ValueError):
             api_status = response.status_code
         description = str(payload.get("description") or "").strip()
         if safe_method == "editMessageText" and description.casefold().startswith(_NOT_MODIFIED_PREFIX):
+            self._observe_message(data, data)
             # Preserve the one benign signal callers rely on without forwarding
             # Telegram's free-form suffix (which may echo the token-bearing URL).
             raise TelegramRequestRejected(
@@ -606,22 +690,37 @@ class TelegramClient:
                 status_code=response.status_code,
             )
         if response.status_code >= 400:
-            raise TelegramRequestRejected(
+            raise self._failed(TelegramRequestRejected(
                 f"Telegram API {safe_method} returned HTTP {response.status_code}.",
                 status_code=response.status_code,
                 plain_retry_safe=(safe_method == "sendMessage" and response.status_code == 400),
-            )
+            ))
         if not payload.get("ok"):
-            raise TelegramRequestRejected(
+            raise self._failed(TelegramRequestRejected(
                 f"Telegram API rejected {safe_method}.",
                 status_code=api_status,
                 plain_retry_safe=(safe_method == "sendMessage" and api_status == 400),
-            )
+            ))
+        self.accepted += 1
+        self._observe_message(data, payload.get("result"))
         return payload
 
+    def _observe_message(self, data, result) -> None:
+        """Only a returned Message (or an unchanged edit) proves its Telegram id."""
+        if self.on_message is None or not isinstance(result, dict):
+            return
+        chat_id = (data or {}).get("chat_id")
+        message_id = result.get("message_id")
+        if chat_id is not None and message_id:
+            self.on_message(int(chat_id), int(message_id))
+
     async def _download_bytes(self, file_path: str) -> bytes:
+        self.check_binding()
         try:
-            async with httpx.AsyncClient(timeout=30, trust_env=self.trust_env) as client:
+            async with httpx.AsyncClient(
+                timeout=30, trust_env=self.trust_env, proxy=self.proxy, follow_redirects=False,
+            ) as client:
+                self.check_binding()
                 async with client.stream("GET", f"{self.file_base}/{file_path}") as response:
                     if response.status_code >= 400:
                         raise RuntimeError(f"Telegram file download returned HTTP {response.status_code}")
@@ -637,39 +736,75 @@ class TelegramClient:
                             raise RuntimeError("Telegram file exceeds the 10 MiB download limit.")
                         content.extend(chunk)
         except httpx.TimeoutException:
-            raise RuntimeError("Telegram file download timed out.") from None
+            raise self._failed(RuntimeError("Telegram file download timed out.")) from None
         except httpx.HTTPError as exc:
-            raise RuntimeError(
+            raise self._failed(RuntimeError(
                 f"Telegram file download transport failed ({type(exc).__name__})."
-            ) from None
+            )) from None
+        except TelegramBindingChanged:
+            raise  # no fallback to the local store either: the operation ends here
+        except RuntimeError as exc:
+            failure = self._failed(exc)
+            if failure is not exc:
+                raise failure from None  # nor after a replaced token's late failure
+            if not self.files_dir:
+                raise
+            # Off the shared event loop: the store may be a slow or network disk.
+            content = await asyncio.to_thread(self._read_file_from_disk, file_path, exc)
         return bytes(content)
+
+    def _read_file_from_disk(self, file_path: str, cause: Exception) -> bytes:
+        """Read a file of a --local server from its store (tdlib/telegram-bot-api#26).
+
+        Absolute paths are taken as the server names them, others are joined under the
+        store. Lexical confinement runs first, a pure comparison, so a UNC path is refused
+        before resolve() could touch an unrelated share; either spelling of the store passes
+        (it may be a symlinked one, as /tmp on macOS). The resolved path must stay inside the
+        resolved store and is the one opened, without following a final symlink; the type
+        comes from the open file, and at most the cap plus one byte is read.
+        """
+        configured = pathlib.Path(self.files_dir)
+        store = configured.resolve()
+        raw = pathlib.Path(str(file_path or ""))
+        candidate = raw if raw.is_absolute() else store / raw
+        if not (candidate.is_relative_to(configured) or candidate.is_relative_to(store)):
+            raise cause from None
+        resolved = candidate.resolve()
+        if not resolved.is_relative_to(store):
+            raise cause from None
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+        try:
+            handle = os.fdopen(os.open(resolved, flags), "rb")
+        except OSError:
+            raise cause from None
+        with handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise cause from None
+            data = handle.read(_MAX_TELEGRAM_DOWNLOAD_BYTES + 1)
+        if len(data) > _MAX_TELEGRAM_DOWNLOAD_BYTES:
+            raise RuntimeError("Telegram file exceeds the 10 MiB download limit.") from cause
+        return data
 
     async def get_updates(self, offset: int) -> list[dict]:
         payload = await self.call("getUpdates", data={"timeout": 20, "offset": offset}, timeout=25)
         return list(payload.get("result") or [])
 
-    async def send_message(self, chat_id: int, text: str, parse_mode: str = "HTML") -> int:
+    async def send_message(self, chat_id: int, text: str, parse_mode: str = "HTML", *,
+                           disable_notification: bool = False) -> int:
         """Send a text message, chunking past Telegram's 4096-unit limit.
 
         Markdown is converted at block granularity before chunks are packed.
         Protected blocks stay whole unless one block exceeds Telegram's limit;
         oversized blocks are split with active HTML tags re-balanced.
         Returns the LAST chunk's message_id (0 on parse failure / empty input).
+        The optional on_message observer receives every confirmed chunk id.
+        ``disable_notification`` asks Telegram to deliver every part without sound:
+        the owner still gets a notification, a silent one.
         """
-        source = str(text or "")
-        chunks = (
-            markdown_to_telegram_chunks(source)
-            if parse_mode == "HTML"
-            else _chunk_raw_text(source)
-        )
+        muted = {"disable_notification": True} if disable_notification else {}
         last_message_id = 0
-        for formatted in chunks:
-            visible_text = (
-                _telegram_html_to_plain(formatted) if parse_mode == "HTML" else formatted
-            )
-            if not visible_text.strip():
-                continue
-            data = {"chat_id": str(chat_id), "text": formatted}
+        for formatted in message_chunks(text, parse_mode):
+            data = {"chat_id": str(chat_id), "text": formatted, **muted}
             if parse_mode:
                 data["parse_mode"] = parse_mode
             try:
@@ -679,7 +814,7 @@ class TelegramClient:
                     raise
                 payload = await self.call(
                     "sendMessage",
-                    data={"chat_id": str(chat_id), "text": _telegram_html_to_plain(formatted)},
+                    data={"chat_id": str(chat_id), "text": _telegram_html_to_plain(formatted), **muted},
                     timeout=20,
                 )
             try:
@@ -705,6 +840,8 @@ class TelegramClient:
         try:
             await self.call("editMessageText", data=data, timeout=20)
             return True
+        except TelegramBindingChanged:
+            raise  # never a failed edit to fall back from: nothing more goes out through this token
         except Exception as exc:
             # "message is not modified" means the bubble already shows this exact
             # text — treat it as success so the caller does NOT post a duplicate.
@@ -821,109 +958,93 @@ class TelegramClient:
         try:
             await self.call("editMessageText", data=data, timeout=20)
             return True
+        except TelegramBindingChanged:
+            raise
         except Exception as exc:
             return str(exc) == "Telegram API editMessageText: message is not modified."
 
 
-_LOCALIZED_TEXTS = {
-    "en": {
-        "menu_title_strict": "🤖 **Ouroboros Control Panel**\nStrict mode is active. Commands are blocked.\n\nSelect action:",
-        "menu_title": "🤖 **Ouroboros Control Centre**\nCommand Mode: `{command_mode}`\nLanguage: `{lang}`\n\nExplore and monitor the core using the buttons below:",
-        "btn_metrics": "📉 Status & Metrics",
-        "btn_mind": "🧠 Mind & BG",
-        "btn_language": "🌐 Select language",
-        "btn_refresh": "🔄 Update parameter card",
-        "btn_back": "⬅️ Back to main panel",
-        "btn_stop_bg": "🔴 Pause background thoughts",
-        "btn_start_bg": "🟢 Resume background thoughts",
-        "btn_thoughts": "💭 What are you thinking about?",
-        "metrics_title": "📊 **Ouroboros live metrics**\n\n{info_text}\n---",
-        "mind_title": "🧠 **Background Consciousness**\n\nCurrent state: {state_str}\n\nBackground thinking processes information between your chat queries.",
-        "mind_thoughts": "\n\n**Recent thoughts catalog:**\n{thoughts_text}",
-        "mind_state_active": "🟢 **Thinking** (running)",
-        "mind_state_sleeping": "🔴 **Sleeping** (paused)",
-        "lang_title": "🌐 Select chatbot bridge interface language:\nCurrently active: **English**",
-        "lang_en": "🇬🇧 English",
-        "lang_ru": "🇷🇺 Русский",
-        "help_text": (
-            "🤖 **Ouroboros Telegram Help**\n\n"
-            "Available commands:\n"
-            "• `/menu` — Show interactive control panel with active tabs\n"
-            "• `/language` — Change bridge interface language\n"
-            "• `/status` — Request live system status (if allowed)\n"
-            "• `/help` — Show this friendly usage guide\n\n"
-            "Modes description (changed in Web UI → Settings → Telegram):\n"
-            "• **strict** — block all command injections (only `/menu`, `/help`, `/language`)\n"
-            "• **safe_commands** — allow status monitoring\n"
-            "• **full_access** — allow status + background loop start/stop"
-        ),
-        "slash_blocked_strict": "⛔ Slash commands are not allowed in strict mode. Use `/menu` to see available options, or change mode in Settings → Telegram.",
-        "slash_blocked_mode": "⛔ This command is not allowed in the current mode. Use `/menu` to see available options.",
-        "not_authorized": "Not authorized",
-        "updating_status": "Updating status metrics...",
-        "extracting_thoughts": "Extracting thoughts...",
-        "injecting_consciousness": "Injecting consciousness signal...",
-        "restricted_safe": "⛔ Restricted in safe mode",
-        "lang_changed": "✅ Language changed to English",
-        "unknown_command": "Unknown command",
-        "metrics_budget_status": "• **Budget Status:**\n  Spent: `${spent_usd:.4f}`\n  Limit: `${total_budget:.2f}`\n  Remaining: `${rem:.4f}`\n\n• **System Environment:**\n  Branch: `{branch}`\n  BG Thoughts: `{bg_status}`",
-        "bg_active_label": "ACTIVE",
-        "bg_sleeping_label": "SLEEPING",
-        "btn_settings": "⚙️ Settings",
-        "settings_title": "⚙️ **Telegram Settings**\nConfigure the Telegram control panel and message display:",
-        "btn_silent_on": "🔕 Silent Mode: ON",
-        "btn_silent_off": "🔔 Silent Mode: OFF",
-        "silent_toggled_on": "🔕 Silent mode enabled — new thoughts will replace the last message",
-        "silent_toggled_off": "🔔 Silent mode disabled — each thought becomes a new message",
-    },
-    "ru": {
-        "menu_title_strict": "🤖 **Панель управления Ouroboros**\nРежим Strict активен. Команды заблокированы.\n\nВыберите действие:",
-        "menu_title": "🤖 **Центр управления Ouroboros**\nРежим команд: `{command_mode}`\nЯзык: `{lang}`\n\nУправляйте и следите за ядром с помощью кнопок:",
-        "btn_metrics": "📉 Статус и метрики",
-        "btn_mind": "🧠 Фоновое сознание",
-        "btn_language": "🌐 Выбор языка",
-        "btn_refresh": "🔄 Обновить показатели",
-        "btn_back": "⬅️ Назад в меню",
-        "btn_stop_bg": "🔴 Приостановить размышления",
-        "btn_start_bg": "🟢 Продолжить размышления",
-        "btn_thoughts": "💭 О чём ты думаешь сейчас?",
-        "metrics_title": "📊 **Живые показатели Ouroboros**\n\n{info_text}\n---",
-        "mind_title": "🧠 **Фоновое Сознание**\n\nТекущее состояние: {state_str}\n\nФоновое мышление анализирует информацию между вашими запросами.",
-        "mind_thoughts": "\n\n**Последние мысли из лога:**\n{thoughts_text}",
-        "mind_state_active": "🟢 **Думает** (активно)",
-        "mind_state_sleeping": "🔴 **Спит** (на паузе)",
-        "lang_title": "🌐 Выберите язык интерфейса бота-моста:\nАктивный язык: **Русский**",
-        "lang_en": "🇬🇧 English",
-        "lang_ru": "🇷🇺 Русский",
-        "help_text": (
-            "🤖 **Справка по Telegram в Ouroboros**\n\n"
-            "Доступные команды:\n"
-            "• `/menu` — Открыть интерактивную панель управления\n"
-            "• `/language` — Изменить и настроить язык интерфейса\n"
-            "• `/status` — Запросить текущий статус системы (если разрешено)\n"
-            "• `/help` — Показать это руководство\n\n"
-            "Описание режимов (меняется в Web UI → Settings → Telegram):\n"
-            "• **strict** — блокировать ввод команд (доступны только `/menu`, `/help`, `/language`)\n"
-            "• **safe_commands** — разрешить просмотр метрик и статуса\n"
-            "• **full_access** — доступ ко всем кнопкам, включая запуск/паузу фонового сознания"
-        ),
-        "slash_blocked_strict": "⛔ Слэш-команды запрещены в режиме strict. Используйте `/menu` или измените режим в Settings → Telegram.",
-        "slash_blocked_mode": "⛔ Эта команда не разрешена в текущем режиме. Используйте `/menu` для вызова управления.",
-        "not_authorized": "Доступ ограничен",
-        "updating_status": "Обновление метрик...",
-        "extracting_thoughts": "Извлечение мыслей...",
-        "injecting_consciousness": "Отправка сигнала сознания...",
-        "restricted_safe": "⛔ Ограничено в режиме Safe",
-        "lang_changed": "✅ Язык интерфейса изменен на Русский",
-        "unknown_command": "Неизвестная команда",
-        "metrics_budget_status": "• **Бюджетный статус:**\n  Потрачено: `${spent_usd:.4f}`\n  Лимит: `${total_budget:.2f}`\n  Осталось: `${rem:.4f}`\n\n• **Окружение системы:**\n  Ветка Git: `{branch}`\n  Фоновые мысли: `{bg_status}`",
-        "bg_active_label": "АКТИВНЫ",
-        "bg_sleeping_label": "СПЯТ",
-        "btn_settings": "⚙️ Настройки",
-        "settings_title": "⚙️ **Настройки Telegram**\nНастройте панель Telegram и отображение сообщений:",
-        "btn_silent_on": "🔕 Тихий режим: ВКЛ",
-        "btn_silent_off": "🔔 Тихий режим: ВЫКЛ",
-        "silent_toggled_on": "🔕 Тихий режим включён — новые мысли будут заменять предыдущее сообщение",
-        "silent_toggled_off": "🔔 Тихий режим выключен — каждая мысль становится отдельным сообщением",
-    }
+_MENU_TEXTS_EN = {
+    "menu_title_strict": "🤖 **Ouroboros Control Panel**\nStrict mode is active. Owner /panic remains available.\n\nSelect action:",
+    "menu_title": "🤖 **Ouroboros Control Centre**\nCommand Mode: `{command_mode}`\nLanguage: `{language}`\n\nExplore and monitor the core using the buttons below:",
+    "btn_metrics": "📉 Status & Metrics",
+    "btn_mind": "🧠 Mind & BG",
+    "btn_tasks": "📋 Tasks",
+    "btn_language": "🌐 Interface language",
+    "btn_refresh": "🔄 Update parameter card",
+    "btn_back": "⬅️ Back to main panel",
+    "btn_stop_bg": "🔴 Pause background thoughts",
+    "btn_start_bg": "🟢 Resume background thoughts",
+    "metrics_title": "📊 **Ouroboros live metrics**\n\n{info_text}\n---",
+    "mind_title": "🧠 **Background Consciousness**\n\nCurrent state: {state_str}\n\nBackground thinking processes information between your chat queries.",
+    "mind_state_active": "🟢 **Thinking** (running)",
+    "mind_state_sleeping": "🔴 **Sleeping** (paused)",
+    "tasks_title": "📋 Tasks",
+    "lang_title": (
+        "🌐 **Interface language of this installation**\n"
+        "The web UI, the desktop window and this bot follow one choice.\n"
+        "Currently active: **{language}**\n\n"
+        "For any other language send `/language <name>` — a code such as pt-BR, a language name, "
+        "or a description of a language to invent."
+    ),
+    "lang_english": "🇬🇧 English (source)",
+    "lang_changed": "✅ Interface language changed to {language}",
+    "lang_failed": "⚠️ The language could not be changed: {reason}",
+    "lang_needs_model": "⚠️ A language name needs a model: set one up in Settings → Models, or send a code such as `/language pt-BR`.",
+    "help_text": (
+        "🤖 **Ouroboros Telegram Help**\n\n"
+        "Available commands:\n"
+        "• `/menu` — Show interactive control panel with active tabs\n"
+        "• `/language` — Change the interface language of this installation\n"
+        "• `/status` — Request live system status (if allowed)\n"
+        "• `/panic` — Emergency stop for the bound owner, in every mode\n"
+        "• `/help` — Show this friendly usage guide\n\n"
+        "Modes description (changed in Web UI → Settings → Telegram):\n"
+        "• **strict** — allow only `/menu`, `/help`, `/language` and owner `/panic`\n"
+        "• **safe_commands** — allow status monitoring\n"
+        "• **full_access** — allow status + background loop start/stop"
+    ),
+    "slash_blocked_strict": "⛔ Slash commands are not allowed in strict mode. Use `/menu` to see available options, or change mode in Settings → Telegram.",
+    "slash_blocked_mode": "⛔ This command is not allowed in the current mode. Use `/menu` to see available options.",
+    "not_authorized": "Not authorized",
+    "updating_status": "Updating status metrics...",
+    "injecting_consciousness": "Injecting consciousness signal...",
+    "restricted_safe": "⛔ Restricted in safe mode",
+    "unknown_command": "Unknown command",
+    "use_miniapp": "Use the Mini App.",
+    "update_failed": "Could not deliver that Telegram update to Ouroboros.",
+    "reply_not_linked": "Sent, but not linked to the earlier work: a message from before this bridge update can't be matched safely.",
+    "metrics_budget_status": "• **Budget Status:**\n  Spent: `${spent_usd}`\n  Limit: `${total_budget}`\n  Remaining: `${rem}`\n\n• **System Environment:**\n  Branch: `{branch}`\n  BG Thoughts: `{bg_status}`",
+    "file_too_large_notice": "{filename} is saved in Ouroboros. This file exceeds the Telegram upload limit and cannot be mirrored here.",
+    "file_open_app_hint": "Open the app to download it.",
+    "attachments_not_attached": "Not attached to the task: {names}",
+    "routing_choose_target": "Choose a target for the last message:",
+    "routing_more_targets": "…and {count} more in the web chat.",
+    "routing_reply_with_number": "Reply with a number, or tap an option in the web chat.",
+    "btn_open_app": "Open Ouroboros",
+    "budget_unbounded": "unbounded",
+    "bg_active_label": "ACTIVE",
+    "bg_sleeping_label": "SLEEPING",
+    "btn_settings": "⚙️ Settings",
+    "settings_title": "⚙️ **Telegram Settings**\nConfigure the Telegram control panel and message display:",
+    "btn_silent_on": "🔕 Silent Mode: ON",
+    "btn_silent_off": "🔔 Silent Mode: OFF",
+    "quiet_toggled_on": "🔕 Silent mode on: replies and progress arrive without sound; questions, files "
+                        "and problems keep their sound.",
+    "quiet_toggled_off": "🔔 Silent mode off: replies arrive with their usual sound.",
+    "cmd_menu": "Interactive panel",
+    "cmd_language": "Interface language",
+    "cmd_status": "Request status",
+    "cmd_help": "Usage guide",
+    "cmd_evolve": "Start an evolution campaign",
+    "cmd_bg": "Background consciousness on/off",
+    "cmd_review": "Run a self-review",
+    "cmd_restart": "Restart the agent",
+    "cmd_panic": "Emergency stop",
+    "panic_earlier": "An earlier Panic message was not executed again. Its previous outcome is unknown.",
+    "panic_unconfirmed": "Panic was not confirmed and will not be retried. Check Ouroboros on the host computer.",
 }
+# Every line the bridge composes is English source here and translated by the install's
+# memory under the one interface language (lib/telegram_i18n.py); the skill ships no
+# dictionary, the light model fills the memory when a language is chosen.
+_LOCALIZED_TEXTS = Index("menu", _MENU_TEXTS_EN, "the Telegram bot's control panel: titles, buttons, notices, command descriptions")

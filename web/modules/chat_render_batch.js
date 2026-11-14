@@ -1,50 +1,126 @@
 // Chat timeline ordering, keyed item reconciliation and reading anchors.
 // These helpers own no history source, navigation or task authority.
 import { compareHistoryPosition } from './chat_history_replay.js';
+import { foldWaitRow } from './task_checkpoints.js';
+import { measure } from './layout_batch.js';
+import { appendDelegatedItem, reconcileDelegatedItems } from './delegated_activity.js';
+import { isStoreMigrating } from './api_client.js';
+import { tr } from './i18n.js';
 
 const nodePosition = node => node?.dataset?.historySource
     ? { source: node.dataset.historySource, offset: Number(node.dataset.historyOffset) } : null;
 
+// A feed holding only chrome has no conversation: the history control, the typing
+// indicator, Main's empty-state greeting and an ephemeral notice (Restart
+// complete). The loading state and the greeting share this one rule.
+export const feedIsEmpty = messages => Array.from(messages.children).every(node =>
+    node.classList.contains('chat-load-older') || node.classList.contains('typing-bubble')
+    || node.classList.contains('chat-empty-welcome') || node.dataset.ephemeral === '1');
+
+const GAP_NOTE = 'Some saved history is not loaded. Shown messages may have gaps.';
+const gapNoticeDocs = new WeakSet();
+
 /**
  * History chrome only; the chat instance retains navigation and reading state.
  *
- * There is no "Load newer" control. Whether a newer page is cached is a fact
- * about the bounded page cache, not about what the reader can see, so a button
- * driven by it appeared under a fully visible transcript and asked for one click
- * per cached page. Loading newer pages is automatic at the bottom edge; the
- * floating scroll-to-latest button remains the only return-to-present control.
+ * `Load more history` only ever loads OLDER messages and shows only while there
+ * are older ones, including those a newer read revealed behind the reader's chain
+ * (owner decisions 2026-09-14, 2026-10-05). Whether a newer page is
+ * cached is a fact about the bounded page cache, not about what the reader can
+ * see, so it never drives this button: a released newer page returns through a
+ * positive gesture at an unambiguous island edge, and the floating scroll-to-latest
+ * button remains the only return-to-present control.
  */
-export function createHistoryControls(messagesDiv) {
+export function createHistoryControls(messagesDiv, statusHost = null, {
+    // The gap's fact stands at the edge of history it concerns (the note at the feed's start); a room announces nothing
+    // over its newest rows (U021). A caller with a place for a one-time announcement passes it here.
+    onGapNotice = null, isVisible = () => messagesDiv.isConnected && messagesDiv.offsetParent !== null,
+} = {}) {
     const doc = messagesDiv.ownerDocument;
     const root = doc.createElement('div');
     root.className = 'chat-load-older';
     const button = doc.createElement('button');
     button.type = 'button';
-    button.className = 'chat-load-older-btn';
+    button.className = 'chat-load-older-btn ui-hit-area';
     const note = doc.createElement('span');
     note.className = 'chat-load-older-note';
-    root.append(button, note);
+    const gapNote = doc.createElement('span');
+    gapNote.className = 'chat-history-gap';
+    gapNote.hidden = true;
+    root.append(button, note, gapNote);
+    // The recent-window read is the chat's own request, not a pager page, so its
+    // in-flight and failed states are carried here and drawn by the same control
+    // (issue #1102: an empty feed under a green header read as a dead app, and a
+    // failed read looked identical to a slow one).
+    let recent = null;
+    let notice = null;
+    let pendingNotice = false;
+    // Hidden hydration still draws the durable edge note. Only a showing room
+    // spends the document's announcement; showing it never reads history again.
+    function showNotice() {
+        if (!pendingNotice || doc.hidden || !isVisible() || gapNoticeDocs.has(doc) || typeof onGapNotice !== 'function') return;
+        gapNoticeDocs.add(doc);
+        notice = onGapNotice(tr('history.gap', GAP_NOTE), messagesDiv);
+    }
     return {
         olderButton: button,
-        render(snapshot, windows) {
-            const error = snapshot.error;
+        showNotice,
+        destroy() { pendingNotice = false; notice?.dispose?.(); notice = null; },
+        // Only an EMPTY feed (or a failure already on screen) gets the loading
+        // state: an ordinary refresh never puts chrome over a painted transcript.
+        // Returns whether there is a state to draw, so a painted feed costs nothing.
+        beginRecent() {
+            if (recent?.error || feedIsEmpty(messagesDiv)) recent = { loading: true };
+            return Boolean(recent);
+        },
+        // A failure is shown where the loading state was; elsewhere the reader
+        // keeps the transcript they have and the next sync reconciles it.
+        endRecent(error = null) { recent = error ? { error } : null; },
+        recentFailed: () => Boolean(recent?.error),
+        render(snapshot, coverage = {}, approximate = false) {
+            const error = recent?.error || snapshot.error;
+            const migrating = isStoreMigrating(error);
+            const hydrating = Boolean(recent?.loading);
+            const loading = hydrating || Boolean(snapshot.loading);
             const changedView = error?.body?.reason_code === 'history_view_changed';
-            const noteText = error ? String(error.message || error)
-                : snapshot.olderExhausted ? 'Beginning of saved history' : '';
+            const incomplete = coverage.gaps === true;
+            pendingNotice = snapshot.initialized && !migrating && !error
+                && !(hydrating && feedIsEmpty(messagesDiv)) && incomplete;
+            showNotice();
+            const gapText = incomplete ? tr('history.gap', GAP_NOTE) : '';
+            let noteText = migrating ? 'Saved history is being upgraded…' : error ? 'Some saved history could not be loaded.'
+                : hydrating && feedIsEmpty(messagesDiv) ? ''
+                : incomplete ? gapText
+                : !hydrating && coverage.complete ? 'Beginning of saved history' : '';
+            if (approximate) noteText = `${error ? `${noteText} ` : ''}Saved position could not be restored exactly.`;
+            // Failure and approximate restoration move into persistent chrome when it describes the reading
+            // window; the gap explanation and ordinary beginning marker belong at the feed's start.
+            const host = statusHost && noteText && Boolean(error || approximate) ? statusHost : root;
+            if (note.parentNode !== host) host.appendChild(note);
+            note.classList.toggle('chat-history-status', host === statusHost);
+            // A concurrent read/position problem must not consume the persistent gap explanation.
+            const separateGap = incomplete && Boolean(error || approximate)
+                && !(hydrating && feedIsEmpty(messagesDiv));
+            // A grown room's exhausted chain offers the way on (it rebases to the present); a chain a navigation
+            // began ends at its older end: ↓ is the way to the present.
+            const buttonHidden = migrating || (!error && !snapshot.canOlder
+                && !(coverage.horizonGap && !snapshot.away) && !hydrating);
             const fields = [
-                [button, { textContent: snapshot.loading ? 'Loading…'
-                    : changedView ? 'Refresh history' : error ? 'Retry loading messages' : 'Load older messages',
-                    disabled: Boolean(snapshot.loading), hidden: !error && !snapshot.canOlder }],
+                [button, { textContent: hydrating ? 'Loading saved history…' : loading ? 'Loading…'
+                    : changedView ? 'Refresh history' : error ? 'Retry loading messages' : 'Load more history',
+                    disabled: loading, hidden: buttonHidden }],
                 [note, { textContent: noteText, hidden: !noteText }],
+                [gapNote, { textContent: separateGap ? gapText : '', hidden: !separateGap }],
+                [root, { hidden: buttonHidden && (host !== root || !noteText) && !separateGap }],
             ];
             for (const [node, values] of fields) {
                 for (const [key, value] of Object.entries(values)) if (node[key] !== value) node[key] = value;
             }
-            if ((snapshot.initialized || error) && !root.isConnected) messagesDiv.prepend(root);
-            const hasGaps = [...windows].some(value => (value?.truncated_by || [])
-                .some(cause => !['quota', 'archive_floor', 'lineage_cap', 'page'].includes(cause)));
-            return { complete: Boolean(snapshot.initialized && snapshot.olderExhausted
-                && !snapshot.canNewer && !hasGaps && !error), truncated_by: hasGaps ? ['read_gap'] : [] };
+            if (hydrating) root.setAttribute('aria-busy', 'true'); else root.removeAttribute('aria-busy');
+            if ((snapshot.initialized || error || hydrating) && !root.isConnected) messagesDiv.prepend(root);
+            root.classList.toggle('has-gaps', !migrating && (incomplete || Boolean(error)));
+            return { ...coverage, complete: Boolean(coverage.complete && !error),
+                error: Boolean(error), note: noteText, truncated_by: incomplete ? ['unloaded'] : [] };
         },
     };
 }
@@ -82,8 +158,6 @@ export function createLiveCardBound(cap) {
     let raisedInFlight = false;
     return {
         isArmed: () => armed,
-        /** The offline bootstrap painted sessionStorage: the next sync must rebuild. */
-        arm() { armed = true; },
         observe(size) { if (size > floor + cap) armed = true; },
         begin() {
             inherited = armed;
@@ -154,7 +228,7 @@ export function createHistoryResyncScheduler({
 /**
  * Insert a top-level timeline node chronologically while keeping typing last.
  * Equal timestamps preserve arrival order; timestamp-free nodes append.
- * (Moved verbatim from chat.js — that module sits at its byte ceiling.)
+ * (Moved from chat.js — that module sits at its byte ceiling.)
  */
 // A focused text control keeps its own caret; Chromium mirrors it into the
 // document Selection, so clearing and rebuilding document ranges around a
@@ -182,12 +256,27 @@ function restoreTextControlCaret(active, caret) {
     }
 }
 
-export function insertTimelineNode(messages, node, typing = null) {
+/** The focus, caret and selection a move of mounted nodes would lose, kept to give back after it. Reading the
+ * selection lays the page out in Chromium: a write that moves nothing keeps nothing. */
+export function keepSelection(doc) {
+    const active = doc?.activeElement;
+    const caret = textControlCaret(active);
+    const selection = caret ? null : doc?.getSelection?.();
+    const ranges = Array.from({ length: selection?.rangeCount || 0 }, (_, index) => {
+        const range = selection.getRangeAt(index);
+        return [range.startContainer, range.startOffset, range.endContainer, range.endOffset];
+    });
+    return { active, caret, selection, ranges };
+}
+
+export function insertTimelineNode(messages, node, typing = null, kept = null) {
     const rawNodeTs = node?.dataset?.ts;
     const nodeTs = rawNodeTs == null || rawNodeTs === '' ? NaN : Number(rawNodeTs);
     let before = null;
     if (Number.isFinite(nodeTs)) {
-        for (const child of Array.from(messages?.children || [])) {
+        const children = messages?.children || [];
+        for (let index = 0; index < children.length; index += 1) {
+            const child = children[index];
             if (child === node || child === typing) continue;
             const rawChildTs = child?.dataset?.ts;
             const childTs = rawChildTs == null || rawChildTs === '' ? NaN : Number(rawChildTs);
@@ -201,13 +290,9 @@ export function insertTimelineNode(messages, node, typing = null) {
     const target = before || (typing?.parentNode === messages ? typing : null);
     if (node.parentNode === messages && node.nextElementSibling === target) return { before };
     const doc = messages.ownerDocument;
-    const active = doc?.activeElement;
-    const caret = textControlCaret(active);
-    const selection = caret ? null : doc?.getSelection?.();
-    const ranges = Array.from({ length: selection?.rangeCount || 0 }, (_, index) => {
-        const range = selection.getRangeAt(index);
-        return [range.startContainer, range.startOffset, range.endContainer, range.endOffset];
-    });
+    // Only a mounted row that moves can lose the focus, caret or selection in it; a new row is just inserted. A page
+    // that moves many rows passes the selection it read once (`kept`).
+    const { active, caret, selection, ranges } = node.isConnected ? kept || keepSelection(doc) : { ranges: [] };
     if (target) messages.insertBefore(node, target);
     else messages.appendChild(node);
     if (active && node.contains?.(active) && doc.activeElement !== active) active.focus({ preventScroll: true });
@@ -234,8 +319,9 @@ export function captureLiveCardProjection(record) {
         record.phaseEl?.hidden, record.phaseEl?.className, record.phaseEl?.textContent,
         record.titleEl?.textContent, record.activityEl?.textContent,
         record.metaEl?.innerHTML, record.countEl?.hidden, record.countEl?.textContent,
-        record.inlineTypingEl?.style?.display, record.toggleEl?.textContent,
-        record.summaryButtonEl?.getAttribute?.('aria-expanded'),
+        record.summaryButtonEl?.querySelector?.('[data-live-when]')?.textContent,
+        record.phaseEl?.dataset?.chipTone, record.toggleEl?.textContent,
+        record.disclosureEl?.getAttribute?.('aria-expanded'),
         root.querySelector?.('.chat-live-actions')?.innerHTML || '',
     ];
 }
@@ -246,20 +332,44 @@ export function liveCardProjectionChanged(before, record) {
     return before.some((value, index) => value !== after[index]);
 }
 
+// The expanded state belongs to the card's one disclosure, the "Details" button; the summary band
+// above it is reading content and states nothing (a Main portal hides the button: work_portal.js).
+// Its word stays; `aria-expanded` and the turned chevron say open or closed.
 export function syncLiveCardToggle(record) {
     if (!record?.toggleEl) return;
     const expanded = record.root.dataset.expanded === '1';
-    const text = expanded ? 'Hide details' : 'Show details';
+    const text = 'Details';
     const ariaExpanded = expanded ? 'true' : 'false';
     if (record.toggleEl.textContent !== text) record.toggleEl.textContent = text;
-    if (record.summaryButtonEl?.getAttribute('aria-expanded') !== ariaExpanded) {
-        record.summaryButtonEl?.setAttribute('aria-expanded', ariaExpanded);
+    if (record.disclosureEl && record.disclosureEl.getAttribute('aria-expanded') !== ariaExpanded) {
+        record.disclosureEl.setAttribute('aria-expanded', ariaExpanded);
     }
 }
 
 // Incremental timeline DOM writes share the Chat viewport boundary but own no
 // scroll state. Keeping them here also keeps the byte-capped instance factory
 // focused on event projection rather than HTML replacement mechanics.
+function timelineItemForAnchor(record, anchor) {
+    if (!anchor?.lineKey) return null;
+    const owner = anchor.cardChain?.[0]?.taskId;
+    if (owner && record.groupId && owner !== record.groupId) return null;
+    // Mounted keys preserve focus/selection in one session; the row or evolving
+    // lifecycle identity survives a fresh card built from saved history.
+    if (anchor.lineHistoryId) return record.items.find(item => item.historyId === anchor.lineHistoryId) || null;
+    if (anchor.lineLifecycleKey) return record.items.find(item => item.dedupeKey === anchor.lineLifecycleKey) || null;
+    return record.items.find(item => item.lineKey === anchor.lineKey) || null;
+}
+
+/** A card timeline's scroll before a write: whether it rests at its end, where it is, its newest line. A timeline shows
+ * only while its card is expanded or its episode open (style.css `.chat-live-timeline`); hidden, it shows no scroll, focus
+ * or selection to keep (null: a selection left inside it is not restored), and reading its box would lay out a row
+ * that sleeps (chat_row_sleep.js) on its own. */
+export function timelineScroll(record) {
+    const el = record.timelineEl;
+    if (record.root?.dataset?.expanded !== '1' && !el.parentElement?.open) return null;
+    return { pinned: el.scrollHeight - el.scrollTop - el.clientHeight <= 24, top: el.scrollTop, newest: el.lastElementChild };
+}
+
 export function createLiveCardTimelineRenderer({ withStableViewport, buildTimelineItemHtml, isReplayActive = () => false }) {
     // Remember generated markup, not the enhanced DOM: a timestamp update must
     // not undo markdown controls or replace a body the reader has selected.
@@ -312,21 +422,20 @@ export function createLiveCardTimelineRenderer({ withStableViewport, buildTimeli
         wrapper.innerHTML = buildTimelineItemHtml(item, record).trim();
         return wrapper.firstElementChild;
     };
-    const render = (record) => {
+    // Where a timeline is scrolled before a write changes it, and the selection it keeps. A caller that changes many
+    // cards measures theirs at once (`render(record, { scroll, kept })`: a page and its release); a timeline whose
+    // scroll an earlier write of this batch still owes keeps the state that write read.
+    const owed = new WeakMap();
+    const render = (record, before = null) => {
         if (defer(record)) return false;
         record._timelineDirty = false;
+        reconcileDelegatedItems(record); // replay, page release and reorders re-project per seq
         return withStableViewport(() => {
             const el = record.timelineEl;
-            const pinned = el.scrollHeight - el.scrollTop - el.clientHeight <= 24;
-            const prevTop = el.scrollTop;
+            const at = owed.get(el) || before || { scroll: timelineScroll(record) };
+            const { scroll } = at;
             const byKey = new Map(Array.from(el.children).map((node) => [node.dataset.liveLineKey, node]));
-            const active = el.ownerDocument?.activeElement;
-            const caret = textControlCaret(active);
-            const selection = caret ? null : el.ownerDocument?.getSelection?.();
-            const ranges = Array.from({ length: selection?.rangeCount || 0 }, (_, index) => {
-                const range = selection.getRangeAt(index);
-                return [range.startContainer, range.startOffset, range.endContainer, range.endOffset];
-            });
+            const { active, caret, selection, ranges } = scroll ? at.kept || keepSelection(el.ownerDocument) : { ranges: [] };
             let changed = false;
             let moved = false;
             record.items.forEach((item, index) => {
@@ -362,7 +471,16 @@ export function createLiveCardTimelineRenderer({ withStableViewport, buildTimeli
                     }
                 }
             }
-            if (changed) el.scrollTop = pinned ? el.scrollHeight : prevTop;
+            // Only a new newest line keeps a pinned timeline at its end; a disclosure
+            // or late full output keeps the line being read where it is. The scroll is
+            // written once the batch's writes are done, with every other card's (layout_batch.js).
+            if (changed && scroll) {
+                owed.set(el, at);
+                measure(() => {
+                    owed.delete(el);
+                    return scroll.pinned && el.lastElementChild !== scroll.newest ? el.scrollHeight : scroll.top;
+                }, (top) => { el.scrollTop = top; });
+            }
             return changed && Boolean(el.isConnected);
         });
     };
@@ -386,8 +504,13 @@ export function createLiveCardTimelineRenderer({ withStableViewport, buildTimeli
         if (!node || !patchNode(current, node)) return false;
         return Boolean(record.timelineEl.isConnected);
     };
+    // A room away draws nothing (room_retire.js): a timeline that a late read changed meanwhile is owed, and drawn once
+    // on the room's return from what that read kept.
+    const owedAway = new Set();
     return {
         renderLiveCardTimeline: render,
+        oweTimeline: (record) => { owedAway.add(record); },
+        drawOwedTimelines: () => { const owed = [...owedAway]; owedAway.clear(); owed.forEach((record) => render(record)); },
         appendTimelineItem: append,
         patchLastTimelineItem: (item, record) => replace(
             item, record, record.timelineEl.lastElementChild,
@@ -398,6 +521,37 @@ export function createLiveCardTimelineRenderer({ withStableViewport, buildTimeli
             return replace(item, record, current);
         },
     };
+}
+
+// A live card's header chrome: a saved role inside its owner card.
+const CARD_HEADER = [
+    '[data-live-summary-button]',
+    '[data-live-title]',
+    '[data-live-activity]',
+    '[data-live-meta]',
+    '.chat-live-actions',
+    '.chat-live-project-card-btn',
+];
+
+// The feed's bounded, separately scrolling boxes: a card timeline, a fetched
+// full output, a Reviews group's Record facts. Each clips what it holds.
+const BOUNDED_BOX = '[data-live-timeline], .chat-live-line-body-full, [data-review-attempt-detail]';
+
+/** An explicit exact-line landing scrolls every clipping owner before the feed. */
+export function revealTimelineNode(node, feed, clearance) {
+    for (let box = node.parentElement; box && box !== feed; box = box.parentElement) {
+        if (box.matches?.(BOUNDED_BOX)) {
+            box.scrollTop += node.getBoundingClientRect().top - box.getBoundingClientRect().top;
+        }
+    }
+    feed.scrollTop += node.getBoundingClientRect().top - feed.getBoundingClientRect().top - clearance;
+}
+
+// A node's own bounded reading box: an expanded line's fetched full output or
+// a Reviews group's Record facts. The owner card timeline is found from the node.
+function innerBox(node) {
+    if (node?.matches?.('[data-review-attempt-detail]')) return node;
+    return node?.matches?.('.chat-live-line') ? node.querySelector?.(':scope > .chat-live-line-body-full') || null : null;
 }
 
 /**
@@ -417,16 +571,25 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
                 && !node.classList.contains('chat-load-older')
         );
         const messagesRect = messagesDiv.getBoundingClientRect();
+        // The phone drawer scales the room card. Anchors are in scroll pixels, not transformed screen pixels.
+        const scale = messagesRect.height / messagesDiv.offsetHeight || 1;
         let topNode = nodes.find((item) => {
             const rect = item.getBoundingClientRect();
             return rect.bottom > messagesRect.top && rect.top < messagesRect.bottom;
         }) || null;
         if (!topNode) return null;
+        const firstShown = nodes.indexOf(topNode);
 
         // A live-card can span several screens while the reader is inside a
         // child summary or timeline line. Preserve that visible boundary, not
         // merely the root card whose own top may be far above the viewport.
         let node = topNode;
+        if (!topNode.dataset?.historyId && !topNode.classList.contains('chat-live-card')) {
+            // Media owns a layout wrapper around keyed bubbles, the saved preview (chat_preview.js) its rows.
+            // Save the physical child being read, not an unidentifiable wrapper.
+            node = [...topNode.querySelectorAll('[data-history-id], [data-preview-history-id]')]
+                .find(child => child.getBoundingClientRect().bottom > messagesRect.top) || topNode;
+        }
         if (topNode.classList.contains('chat-live-card')) {
             const selector = [
                 '.chat-live-card',
@@ -437,7 +600,6 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
                 '.chat-live-actions',
                 '.chat-live-line',
                 '[data-review-section]',
-                '[data-review-section-toggle]',
                 '[data-review-hydrate-status]',
                 '[data-review-group]',
                 '[data-review-attempt]',
@@ -466,6 +628,12 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
                 .filter(({ rect }) => rect.top <= messagesRect.top && rect.bottom > messagesRect.top)
                 .sort((a, b) => b.depth - a.depth);
             node = belowTop[0]?.node || crossing[0]?.node || topNode;
+            // Header chrome heads what it discloses: when it is all that precedes
+            // an expanded line, that line is being read, and anchoring it lets a
+            // reopen expand it again instead of saving the header alone.
+            const header = candidate => candidate.classList.contains('chat-live-card') || CARD_HEADER.some(role => candidate.matches(role));
+            const content = header(node) ? belowTop.find(({ node: candidate }) => !header(candidate))?.node : null;
+            if (content?.matches('.chat-live-line') && content.dataset?.expanded === '1') node = content;
             if (node === topNode && topNode.getBoundingClientRect().top < messagesRect.top) {
                 // The card's visible part holds nothing anchorable (a wait row, a
                 // block without work): keep the reader's view of what FOLLOWS the
@@ -480,6 +648,40 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
             }
         }
 
+        // A visible bounded full output or Review detail the reader entered
+        // (the top edge is inside it) or scrolled is the place being read; its
+        // line or detail anchors, so reopening expands and scrolls it again.
+        // Visible means one common part inside the feed and every bounded box
+        // around it: overlapping each clip at different places shows nothing.
+        const shown = (box, rect) => {
+            let top = Math.max(rect.top, messagesRect.top), bottom = Math.min(rect.bottom, messagesRect.bottom);
+            for (let clip = box.parentElement?.closest?.(BOUNDED_BOX); clip && messagesDiv.contains(clip);
+                clip = clip.parentElement?.closest?.(BOUNDED_BOX)) {
+                const edge = clip.getBoundingClientRect();
+                top = Math.max(top, edge.top); bottom = Math.min(bottom, edge.bottom);
+            }
+            return top < bottom;
+        };
+        // Such a box sits in its row's flow, so only the rows reaching into the view can hold one: they are searched,
+        // not the whole feed on every capture.
+        const shownRows = [];
+        for (let index = firstShown; index < nodes.length; index += 1) {
+            const rect = nodes[index].getBoundingClientRect();
+            if (rect.top >= messagesRect.bottom) break;
+            if (rect.bottom > messagesRect.top) shownRows.push(nodes[index]);
+        }
+        const reading = shownRows.flatMap(row => Array.from(row.querySelectorAll?.('.chat-live-line-body-full, [data-review-attempt-detail]') || []))
+            .map(box => ({ box, rect: box.getBoundingClientRect() }))
+            .filter(({ box, rect }) => box.getClientRects().length && shown(box, rect)
+                && (box.scrollTop > 0 || rect.top < messagesRect.top))
+            .sort((a, b) => a.rect.top - b.rect.top)
+            .map(({ box }) => (box.matches('[data-review-attempt-detail]') ? box : box.closest('.chat-live-line')))
+            .find(owner => owner && nodes.some(item => item.contains(owner)));
+        if (reading) {
+            node = reading;
+            topNode = nodes.find(item => item.contains(reading));
+        }
+
         const cardChain = [];
         let card = node.classList.contains('chat-live-card')
             ? node
@@ -488,35 +690,47 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
             cardChain.push({
                 node: card,
                 taskId: card.dataset?.taskId || '',
-                offset: card.getBoundingClientRect().top - messagesRect.top,
+                offset: (card.getBoundingClientRect().top - messagesRect.top) / scale,
             });
             card = card.parentElement?.closest?.('.chat-live-card') || null;
         }
 
         const ts = topNode.dataset?.ts || '';
-        const anchorRole = [
-            '[data-live-summary-button]',
-            '[data-live-title]',
-            '[data-live-activity]',
-            '[data-live-meta]',
-            '.chat-live-actions',
-            '.chat-live-project-card-btn',
-        ].find((candidate) => node.matches?.(candidate)) || '';
+        const anchorRole = CARD_HEADER.find((candidate) => node.matches?.(candidate)) || '';
+        const lineKey = node.matches?.('.chat-live-line') ? (node.dataset?.liveLineKey || '') : '';
+        const lineItem = lineKey ? (liveCardRecords.get(cardChain[0]?.taskId)?.items || [])
+            .find(item => item.lineKey === lineKey) : null;
+        const lifecycleKey = String(lineItem?.dedupeKey || '');
         return {
             node,
+            // The line's physical source selects its page; its immutable row or
+            // lifecycle key below selects the line inside that page's mixed card.
+            historyId: lineItem?.historyId || lineItem?.sourceHistoryId
+                || node.closest?.('[data-history-id]')?.dataset?.historyId
+                || node.dataset?.previewHistoryId || topNode.dataset?.historyId || '',
+            reviewKey: ['reviewAttemptDetail', 'reviewAttempt', 'reviewGroup', 'reviewSection']
+                .find(key => node.dataset?.[key]) || '',
+            reviewValue: node.dataset?.reviewAttemptDetail || node.dataset?.reviewAttempt
+                || node.dataset?.reviewGroup || node.dataset?.reviewSection || '',
             cardChain,
-            lineKey: node.matches?.('.chat-live-line') ? (node.dataset?.liveLineKey || '') : '',
+            lineKey,
+            lineHistoryId: lineItem?.historyId || '',
+            lineLifecycleKey: (lineItem?.sourceHistoryId
+                || lifecycleKey.startsWith('subagent-lifecycle:')
+                || lifecycleKey.startsWith('task_done|')
+                || lifecycleKey.startsWith('cardrow|')) ? lifecycleKey : '',
+            lineExpanded: node.matches?.('.chat-live-line') && node.dataset?.expanded === '1',
             anchorRole,
             topNode,
             clientMessageId: topNode.dataset?.clientMessageId || '',
             ts,
             ordinal: ts ? nodes.filter((item) => item.dataset?.ts === ts).indexOf(topNode) : -1,
-            offset: node.getBoundingClientRect().top - messagesRect.top,
-            topOffset: topNode.getBoundingClientRect().top - messagesRect.top,
+            offset: (node.getBoundingClientRect().top - messagesRect.top) / scale,
+            topOffset: (topNode.getBoundingClientRect().top - messagesRect.top) / scale,
         };
     }
 
-    function restoreVisibleTimelineAnchor(anchor) {
+    function restoreVisibleTimelineAnchor(anchor, { exact = false, cardOnly = false } = {}) {
         if (!anchor) return false;
         const isRendered = (node) => {
             if (!node?.isConnected || !messagesDiv.contains(node)) return false;
@@ -525,13 +739,46 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
         };
         const restoreNode = (node, offset) => {
             if (!isRendered(node)) return false;
-            const currentOffset = node.getBoundingClientRect().top
-                - messagesDiv.getBoundingClientRect().top;
-            messagesDiv.scrollTop += currentOffset - offset;
+            const rect = messagesDiv.getBoundingClientRect(), scale = rect.height / messagesDiv.offsetHeight || 1;
+            const currentOffset = (node.getBoundingClientRect().top - rect.top) / scale;
+            // A node still in place leaves the feed alone: even a write of the
+            // same scrollTop stops a scroll the engine animates (WebKit's End).
+            // Subpixel transform noise rounds down in WebKit's scrollTop setter; writing it every frame drifts.
+            if (Math.abs(currentOffset - offset) > 0.5) messagesDiv.scrollTop += currentOffset - offset;
             return true;
         };
 
         if (restoreNode(anchor.node, anchor.offset)) return true;
+        // The saved node found: its owner timeline puts it back at its offset
+        // there (that scroll moves the node), then its own box scrolls. A box
+        // that is missing, or an own box that cannot reach its scroll, is not
+        // exact. A timeline at its scroll limit has done what it can: its node
+        // still takes the exact feed offset, and a reflowed earlier row only
+        // moves the box around it.
+        const restoreSaved = (node) => {
+            const timeline = node.closest?.('[data-live-timeline]'), inner = innerBox(node);
+            let settled = true;
+            if (Number.isFinite(anchor.timelineOffset)) {
+                const offset = () => node.getBoundingClientRect().top - timeline.getBoundingClientRect().top;
+                if (timeline) timeline.scrollTop += offset() - anchor.timelineOffset;
+                const miss = timeline ? offset() - anchor.timelineOffset : NaN;
+                settled = Boolean(timeline) && (Math.abs(miss) <= 1 || (miss > 0
+                    ? timeline.scrollTop >= timeline.scrollHeight - timeline.clientHeight - 1
+                    : timeline.scrollTop <= 0));
+            }
+            if (Number.isFinite(anchor.innerTop)) {
+                if (inner) inner.scrollTop = anchor.innerTop;
+                settled = settled && Boolean(inner) && Math.abs(inner.scrollTop - anchor.innerTop) <= 1;
+            }
+            return restoreNode(node, anchor.offset) && (settled || !exact);
+        };
+
+        const historyId = anchor.historyId || anchor.id;
+        if (historyId && !anchor.lineKey && !anchor.reviewKey && !anchor.anchorRole) {
+            const node = Array.from(messagesDiv.querySelectorAll('[data-history-id]'))
+                .find(item => item.dataset.historyId === historyId);
+            if (isRendered(node)) return restoreSaved(node);
+        }
 
         const cardChain = Array.isArray(anchor.cardChain) && anchor.cardChain.length
             ? anchor.cardChain
@@ -543,20 +790,31 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
             return isRendered(record?.root) ? record.root : null;
         };
         const ownerCard = resolveCard(cardChain[0]);
+        if (ownerCard && anchor.reviewKey) {
+            const node = Array.from(ownerCard.querySelectorAll('[data-review-section], [data-review-group], [data-review-attempt], [data-review-attempt-detail]'))
+                .find(item => item.dataset?.[anchor.reviewKey] === anchor.reviewValue);
+            if (isRendered(node)) return restoreSaved(node);
+        }
         if (ownerCard && anchor.lineKey) {
+            const item = timelineItemForAnchor(liveCardRecords.get(cardChain[0]?.taskId) || { items: [] }, anchor);
+            const lineKey = item?.lineKey || (anchor.lineHistoryId || anchor.lineLifecycleKey ? '' : anchor.lineKey);
             const line = Array.from(ownerCard.querySelectorAll('.chat-live-line'))
-                .find((candidate) => candidate.dataset?.liveLineKey === anchor.lineKey
+                .find((candidate) => candidate.dataset?.liveLineKey === lineKey
                     && candidate.closest('.chat-live-card') === ownerCard);
-            if (restoreNode(line, anchor.offset)) return true;
+            if (isRendered(line)) return restoreSaved(line);
         }
         if (ownerCard && anchor.anchorRole) {
             const roleNode = Array.from(ownerCard.querySelectorAll(anchor.anchorRole))
                 .find((candidate) => candidate.closest('.chat-live-card') === ownerCard);
-            if (restoreNode(roleNode, anchor.offset)) return true;
+            if (isRendered(roleNode)) return restoreSaved(roleNode);
         }
+        if (exact && (anchor.lineKey || anchor.reviewKey || anchor.anchorRole)) return false;
+        if (exact && cardChain.length && restoreNode(ownerCard, anchor.offset)) return true;
+        if (exact && !anchor.clientMessageId) return false;
         for (const entry of cardChain) {
             if (restoreNode(resolveCard(entry), entry.offset)) return true;
         }
+        if (cardOnly) return false;
 
         let node = isRendered(anchor.topNode) ? anchor.topNode : null;
         if (!node && anchor.clientMessageId) {
@@ -564,14 +822,48 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
                 (item) => item.dataset?.clientMessageId === anchor.clientMessageId
             ) || null;
         }
-        if (!node && anchor.ts) {
+        if (!node && anchor.ts && !exact) {
             const matches = Array.from(messagesDiv.children).filter((item) => item.dataset?.ts === anchor.ts);
             node = matches[anchor.ordinal] || matches[0] || null;
         }
         return restoreNode(node, anchor.topOffset ?? anchor.offset);
     }
 
-    return { captureVisibleTimelineAnchor, restoreVisibleTimelineAnchor };
+    function serializeTimelineAnchor(anchor = captureVisibleTimelineAnchor()) {
+        if (!anchor) return null;
+        const { node, topNode: _topNode, cardChain, ...fields } = anchor;
+        // A bounded box scrolls on its own: the node keeps its offset inside its
+        // owner timeline, and its own full output or Review detail its scroll.
+        const timeline = node?.closest?.('[data-live-timeline]'), inner = node && innerBox(node);
+        return { ...fields, cardChain: (cardChain || []).map(({ taskId, offset }) => ({ taskId, offset })),
+            ...(timeline && messagesDiv.contains(timeline) ? { timelineOffset:
+                node.getBoundingClientRect().top - timeline.getBoundingClientRect().top } : {}),
+            ...(inner ? { innerTop: inner.scrollTop } : {}) };
+    }
+
+    /** Positioning waits for the data owners of the saved place: the Review
+     * detail it names and the full output an expanded line is still fetching. */
+    function anchorOwnersReady(anchor, reviewReady) {
+        const taskId = anchor?.cardChain?.[0]?.taskId;
+        if (anchor?.reviewKey && !reviewReady(taskId)) return false;
+        const record = anchor?.lineExpanded && liveCardRecords.get(taskId);
+        return !(record && timelineItemForAnchor(record, anchor)?._fetchingFull);
+    }
+    return { captureVisibleTimelineAnchor, restoreVisibleTimelineAnchor, serializeTimelineAnchor, anchorOwnersReady };
+}
+
+/** The row a child's live note lands in, given the frame's source occurrence. A frame a row already holds keeps that row.
+ * Otherwise the newest unsaved note is the line it replaces in place, but never across a thought: a thought is its own
+ * row, so a note that came after one stands after it, the order replay shows. A saved row is never a line, and rows loaded
+ * before the note change nothing: identity is the occurrence alone. */
+export function childProgressKey(record, occurrence) {
+    if (record.items.some((item) => item.occurrenceKey === occurrence)) return occurrence;
+    for (let index = record.items.length - 1; index >= 0; index -= 1) {
+        const { dedupeKey, occurrenceKey } = record.items[index];
+        if (dedupeKey?.startsWith('subagent-progress:')) return dedupeKey;
+        if ([dedupeKey, occurrenceKey].some((key) => key?.startsWith('reasoning:'))) break;
+    }
+    return `subagent-progress:${occurrence}`;
 }
 
 /** Update one live timeline item using the same keys the card's producer owns.
@@ -579,13 +871,24 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
  * lifecycle notes keep their existing in-place semantics and disclosure key.
  */
 export function updateLiveTimelineItem(record, summary, { ts, rawTs, syntheticKey, headline, inPlaceByKey }) {
+    // A delegated observation is its own source record; its projection is per seq.
+    if (summary.activity) return appendDelegatedItem(record, summary, { ts, rawTs, syntheticKey, headline });
+    if (summary.waitEpisode) {
+        const { changed, index } = foldWaitRow(record, summary, { ts, sourceTs: rawTs });
+        return { timelineUpdate: !changed ? 'duplicate-skip' : index === -1 ? 'append' : 'patch-at', patchIndex: index };
+    }
     let timelineUpdate = 'none', patchIndex = -1;
     const lastIdx = record.items.length - 1;
     // Full-array dedup keeps routine history syncs from growing Notes.
-    const existingIdx = record.items.findIndex((it) => it.dedupeKey === syntheticKey);
+    const existingIdx = record.items.findIndex((it) => it.dedupeKey === syntheticKey || it.occurrenceKey === syntheticKey);
     if (existingIdx !== -1 && inPlaceByKey) {
         const it = record.items[existingIdx];
+        if (Number.isSafeInteger(it.cardRowRevision)
+            && (!Number.isSafeInteger(summary.cardRowRevision) || summary.cardRowRevision <= it.cardRowRevision)) {
+            return { timelineUpdate: 'duplicate-skip', patchIndex };
+        }
         const patch = {
+            cardRowRevision: summary.cardRowRevision,
             phase: summary.phase || it.phase,
             headline: headline || it.headline,
             fullHeadline: summary.fullHeadline || headline || it.fullHeadline,
@@ -593,6 +896,7 @@ export function updateLiveTimelineItem(record, summary, { ts, rawTs, syntheticKe
             fullBody: summary.fullBody || summary.body || it.fullBody || '',
             fullRef: summary.fullRef || it.fullRef || '',
             truncated: summary.truncated || it.truncated || false,
+            evidenceRef: summary.evidenceRef || it.evidenceRef || null,
             // A call's failure frame replaces its receipt start: the row is
             // content again once it reports an error.
             receipt: Boolean(summary.receipt),
@@ -600,6 +904,8 @@ export function updateLiveTimelineItem(record, summary, { ts, rawTs, syntheticKe
             // Replay compares the child's current status with older pages.
             // Its source time advances with the live status, not with narration.
             ...(syntheticKey.startsWith('subagent-lifecycle:') && rawTs ? { sourceTs: rawTs } : {}),
+            // A replaced note's row now holds this frame; the saved copy of the one it replaced stands as its own row.
+            ...(summary.occurrenceKey ? { occurrenceKey: summary.occurrenceKey, sourceTs: rawTs } : {}),
         };
         if (Object.entries(patch).some(([key, value]) => it[key] !== value)) {
             Object.assign(it, patch);
@@ -632,6 +938,7 @@ export function updateLiveTimelineItem(record, summary, { ts, rawTs, syntheticKe
     } else {
         const lineKey = `line-${Date.now()}-${Math.random().toString(16).slice(2)}`;
         record.items.push({
+            cardRowRevision: summary.cardRowRevision,
             phase: summary.phase || 'working',
             headline: headline || 'Update',
             fullHeadline: summary.fullHeadline || headline || 'Update',
@@ -639,11 +946,14 @@ export function updateLiveTimelineItem(record, summary, { ts, rawTs, syntheticKe
             fullBody: summary.fullBody || summary.body || '',
             fullRef: summary.fullRef || '',
             truncated: summary.truncated || false,
+            // A late-review row's exact record link (#1369); null on every other row.
+            evidenceRef: summary.evidenceRef || null,
             receipt: Boolean(summary.receipt),
             ts: ts || '',
             sourceTs: rawTs,
             count: 1,
             dedupeKey: syntheticKey,
+            occurrenceKey: summary.occurrenceKey,
             lineKey,
         });
         timelineUpdate = 'append';
@@ -663,4 +973,19 @@ export function upsertToolFoldRow(record, view, ts, rawTs) {
     return updateLiveTimelineItem(record, view, {
         ts: first ? ts : '', rawTs, syntheticKey, headline: view.headline, inPlaceByKey: true,
     });
+}
+
+/** Replay places evidence at its earliest recorded call observation. A surviving start
+ *  outranks the history carrier, which can predate the calls it merely delivers. Without a
+ *  recorded start, retain an earlier carrier (legacy late-settlement placement); no missing
+ *  timestamp is reconstructed, and a partial history cannot prove the task's first call. */
+export function replayedEvidenceTs(evidence, carrierTs) {
+    let at = carrierTs, best = Infinity, observedStart = false;
+    for (const { ts, fact } of evidence?.observations || []) {
+        const time = /^\d{4}-\d\d-\d\dT/.test(ts) ? Date.parse(ts) : NaN;
+        if (Number.isFinite(time) && fact === 'started') observedStart = true;
+        if (time < best) [at, best] = [ts, time];
+    }
+    const carrier = Date.parse(carrierTs);
+    return observedStart || !Number.isFinite(carrier) || best < carrier ? at : carrierTs;
 }

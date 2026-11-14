@@ -1,0 +1,29 @@
+# Manual, paid provider diagnostics; retain the filename for dispatch clients.
+# A provider outage can be red while the code is correct. This standalone run
+# selects all canaries; ci.yml's manual/tag runs select required and optional
+# groups separately, with the required group still gating release publication.
+name: Provider canaries (manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# No concurrency group: each requested paid result keeps its own run.
+
+jobs:
+  integration-test:
+    uses: ./.github/workflows/provider-canary.yml
+    secrets:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      OPENROUTER_PROVIDER_ROUTES_API_KEY: ${{ secrets.OPENROUTER_PROVIDER_ROUTES_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      CLOUDRU_FOUNDATION_MODELS_API_KEY: ${{ secrets.CLOUDRU_FOUNDATION_MODELS_API_KEY }}
+      CLOUDRU_FOUNDATION_MODELS_BASE_URL: ${{ secrets.CLOUDRU_FOUNDATION_MODELS_BASE_URL }}
+      GIGACHAT_CREDENTIALS: ${{ secrets.GIGACHAT_CREDENTIALS }}
+    permissions:
+      contents: read

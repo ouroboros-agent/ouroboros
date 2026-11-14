@@ -7,6 +7,8 @@ trivial python3 script. No network, no real LLM calls — the
 """
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import asyncio
 import json
 import shlex
@@ -173,8 +175,9 @@ def test_skill_preflight_reports_python_syntax_error(tmp_path, monkeypatch):
 
 def test_skill_preflight_file_limit_omission_is_degraded_not_blocked(tmp_path, monkeypatch):
     # A file count beyond the syntax-check headroom is a DEGRADED note, NOT a hard block:
-    # the skill-review pass now reads every file under a pack-level token budget (chunked
-    # when oversized), so preflight must not re-introduce an arbitrary file-count gate.
+    # the skill review judges every file (a packet seat gets the whole payload when it fits,
+    # else its index; retrieving seats read the frozen copy), so preflight must not
+    # re-introduce an arbitrary file-count gate.
     ctx = _make_ctx(tmp_path)
     skills_root = tmp_path / "skills"
     skills_root.mkdir()
@@ -191,7 +194,8 @@ def test_skill_preflight_file_limit_omission_is_degraded_not_blocked(tmp_path, m
     assert result["ok"] is True  # proceeds to the authoritative token-budgeted review
     assert result["omitted_count"] > 0
     assert result.get("degraded") is True
-    assert "token budget" in result.get("degraded_note", "")
+    note = result.get("degraded_note", "")
+    assert "the skill review still judges every file" in note and "NOT delivered" in note, note
 
 
 def test_skill_preflight_missing_validator_runtime_is_tolerated(tmp_path, monkeypatch):
@@ -336,10 +340,9 @@ def test_skill_preflight_reports_missing_pluginapi_permissions(tmp_path, monkeyp
     assert {"route", "widget", "read_settings"} <= missing
 
 
-@pytest.mark.serial
 def test_run_shell_writes_a_self_authored_marker_example(tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
-    monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_SAFETY_MODE", "off")
     ctx = _make_ctx(tmp_path)
     marker = ctx.repo_dir / "example" / ".self_authored.json"
     marker.parent.mkdir()
@@ -355,7 +358,6 @@ def test_run_shell_writes_a_self_authored_marker_example(tmp_path, monkeypatch):
     assert marker.read_bytes() == b"{}"
 
 
-@pytest.mark.serial
 def test_run_shell_blocks_actual_self_authored_marker_write_pre_exec(tmp_path, monkeypatch):
     """The explicit redirect targets the actual runtime skill metadata.
 
@@ -434,9 +436,6 @@ def test_skill_exec_refuses_when_unconfigured(tmp_path, monkeypatch):
 # ``ouroboros.config.save_settings`` and ``_data_write`` settings.json
 # block, exercised in tests/test_runtime_mode_elevation.py.
 # ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
 # Review-status + enable gating
 # ---------------------------------------------------------------------------
 
@@ -461,7 +460,7 @@ def test_skill_exec_refuses_disabled_skill(tmp_path, monkeypatch):
     assert "disabled" in result
 
 
-def test_skill_exec_refuses_non_pass_review(tmp_path, monkeypatch):
+def test_skill_exec_refuses_a_review_without_a_verdict_and_runs_past_blockers(tmp_path, monkeypatch):
     skills_root = tmp_path / "skills"
     skill_dir = _build_skill(skills_root, "hello")
     ctx = _make_ctx(tmp_path)
@@ -470,16 +469,20 @@ def test_skill_exec_refuses_non_pass_review(tmp_path, monkeypatch):
     save_review_state(
         ctx.drive_root,
         "hello",
-        SkillReviewState(status="blockers", content_hash=content_hash),
+        SkillReviewState(status="pending", content_hash=content_hash),
     )
     monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
-    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
+    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")  # retired: read by nothing
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     result = skill_exec_mod._handle_skill_exec(
         ctx, skill="hello", script="scripts/hello.py"
     )
     assert "SKILL_EXEC_BLOCKED" in result
-    assert "'blockers'" in result
+    assert "'pending'" in result
+    # Blocker findings are recorded and returned; outside Cyber Pro they veto nothing.
+    save_review_state(ctx.drive_root, "hello", SkillReviewState(status="blockers", content_hash=content_hash))
+    ran = json.loads(skill_exec_mod._handle_skill_exec(ctx, skill="hello", script="scripts/hello.py"))
+    assert ran["exit_code"] == 0
 
 
 def test_skill_exec_refuses_stale_review(tmp_path, monkeypatch):
@@ -501,6 +504,8 @@ def test_skill_exec_refuses_stale_review(tmp_path, monkeypatch):
     )
     assert "SKILL_EXEC_BLOCKED" in result
     assert "edited since the last review" in result
+    assert "current executable reviewer verdict" in result
+    assert "qualified author acceptance" in result
 
 
 def test_skill_exec_refuses_extension_skill_in_phase3(tmp_path, monkeypatch):
@@ -611,12 +616,13 @@ def test_skill_exec_refuses_instruction_type_skill(tmp_path, monkeypatch):
     assert "'instruction'" in result, result
 
 
-def test_skill_exec_rejects_runtime_outside_allowlist(tmp_path, monkeypatch):
+@pytest.mark.parametrize("runtime", ["", "perl"])
+def test_skill_exec_rejects_runtime_outside_allowlist(tmp_path, monkeypatch, runtime):
     skills_root = tmp_path / "skills"
     skill_dir = _build_skill(
         skills_root,
         "hello",
-        manifest=_valid_script_manifest("hello", runtime="perl"),
+        manifest=_valid_script_manifest("hello", runtime=runtime),
     )
     ctx = _make_ctx(tmp_path)
     _mark_reviewed_and_enabled(ctx.drive_root, skill_dir, "hello")
@@ -626,6 +632,7 @@ def test_skill_exec_rejects_runtime_outside_allowlist(tmp_path, monkeypatch):
         ctx, skill="hello", script="scripts/hello.py"
     )
     assert "SKILL_EXEC_ERROR" in result
+    assert f"declared runtime {runtime!r}" in result
     assert "allowlist" in result
 
 
@@ -911,7 +918,6 @@ def test_toggle_skill_allows_warnings_review(tmp_path, monkeypatch):
     skill_dir = _build_skill(skills_root, "alpha")
     ctx = _make_ctx(tmp_path)
     monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
-    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "advisory")
     save_review_state(
         ctx.drive_root,
         "alpha",
@@ -925,32 +931,11 @@ def test_toggle_skill_allows_warnings_review(tmp_path, monkeypatch):
     assert enabled_resp["executable_review"] is True
 
 
-def test_toggle_skill_allows_warnings_under_blocking(tmp_path, monkeypatch):
+def test_skill_exec_allows_warnings(tmp_path, monkeypatch):
     skills_root = tmp_path / "skills"
     skill_dir = _build_skill(skills_root, "alpha")
     ctx = _make_ctx(tmp_path)
     monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
-    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
-    save_review_state(
-        ctx.drive_root,
-        "alpha",
-        SkillReviewState(status="warnings", content_hash=compute_content_hash(skill_dir)),
-    )
-
-    resp = skill_exec_mod._handle_toggle_skill(ctx, skill="alpha", enabled=True)
-
-    enabled_resp = json.loads(resp)
-    assert enabled_resp["enabled"] is True
-    assert enabled_resp["review_status"] == "warnings"
-    assert enabled_resp["executable_review"] is True
-
-
-def test_skill_exec_allows_warnings_under_blocking(tmp_path, monkeypatch):
-    skills_root = tmp_path / "skills"
-    skill_dir = _build_skill(skills_root, "alpha")
-    ctx = _make_ctx(tmp_path)
-    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
-    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
     save_enabled(ctx.drive_root, "alpha", True)
     save_review_state(
         ctx.drive_root,
@@ -965,12 +950,9 @@ def test_skill_exec_allows_warnings_under_blocking(tmp_path, monkeypatch):
     assert "hello from skill" in payload["stdout"]
 
 
-def test_toggle_skill_blocks_stale_dependency_fingerprint(tmp_path, monkeypatch):
-    from ouroboros.marketplace.isolated_deps import (
-        DEPS_STATE_FILENAME,
-        FINGERPRINT_FILENAME,
-        isolated_env_dir,
-    )
+def test_toggle_skill_refreshes_a_stale_dependency_fingerprint(tmp_path, monkeypatch):
+    """Inverted pin: a stale fingerprint used to refuse Enable; the enable owner now refreshes it."""
+    from ouroboros.marketplace.isolated_deps import DEPS_STATE_FILENAME, FINGERPRINT_FILENAME, isolated_env_dir
     from ouroboros.skill_loader import skill_state_dir
 
     skills_root = tmp_path / "skills"
@@ -992,11 +974,14 @@ def test_toggle_skill_blocks_stale_dependency_fingerprint(tmp_path, monkeypatch)
     env_dir = isolated_env_dir(skill_dir)
     env_dir.mkdir(parents=True)
     (env_dir / FINGERPRINT_FILENAME).write_text(json.dumps(stale_state), encoding="utf-8")
+    installs = []
+    monkeypatch.setattr("ouroboros.marketplace.isolated_deps._install_python_packages",
+                        lambda packages, *args, **kwargs: installs.append(list(packages)) or [])
 
     resp = skill_exec_mod._handle_toggle_skill(ctx, skill="alpha", enabled=True)
 
-    assert json.loads(resp.split(": ", 1)[1])["deps_status"] == "stale"
-    assert not (state_dir / "enabled.json").exists()
+    assert json.loads(resp)["enabled"] is True and installs == [["wheel"]]
+    assert (state_dir / "enabled.json").exists()
 
 
 def test_skill_exec_refuses_missing_manifest_permission_grant(tmp_path, monkeypatch):
@@ -1024,6 +1009,47 @@ def test_skill_exec_refuses_missing_manifest_permission_grant(tmp_path, monkeypa
 
     assert "SKILL_EXEC_GRANT_REQUIRED" in resp
     assert "inject_chat" in resp
+    assert "earlier version" not in resp  # never granted: nothing earlier to name
+
+
+def test_grant_refusals_name_the_earlier_version_the_grant_belongs_to(tmp_path, monkeypatch):
+    """Audit 08.11 item 1: after the payload changed, the execution refusal and the toggle refusal say the
+    owner's grant belongs to an earlier version of the files; the toggle keeps its one sentence and carries
+    the fact in ``detail``."""
+    from ouroboros.skill_loader import save_skill_grants
+
+    skills_root = tmp_path / "skills"
+    manifest = (
+        "---\n"
+        "name: alpha\n"
+        "description: Permission grant test.\n"
+        "version: 0.1.0\n"
+        "type: script\n"
+        "runtime: python3\n"
+        "permissions: [inject_chat]\n"
+        "scripts:\n"
+        "  - name: hello.py\n"
+        "    description: Print hello.\n"
+        "---\n"
+        "# body\n"
+    )
+    skill_dir = _build_skill(skills_root, "alpha", manifest=manifest)
+    ctx = _make_ctx(tmp_path)
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    _mark_reviewed_and_enabled(ctx.drive_root, skill_dir, "alpha")
+    save_skill_grants(ctx.drive_root, "alpha", [], content_hash="earlier-bytes", requested_keys=[],
+                      granted_permissions=["inject_chat"], requested_permissions=["inject_chat"])
+
+    ran = skill_exec_mod._handle_skill_exec(ctx, skill="alpha", script="hello.py")
+    assert ran.startswith("⚠️ SKILL_EXEC_GRANT_REQUIRED") and "review gate already permits" in ran
+    assert "inject_chat was granted to an earlier version of this skill's files" in ran
+    assert "hash" not in ran.lower()
+
+    save_enabled(ctx.drive_root, "alpha", False)
+    toggled = skill_exec_mod._handle_toggle_skill(ctx, skill="alpha", enabled=True)
+    assert toggled.startswith("⚠️ SKILL_TOGGLE_ERROR") and '"code": "grants"' in toggled, toggled
+    assert '"error": "Grant it the keys and permissions it asks for first."' in toggled
+    assert '"detail": "inject_chat was granted to an earlier version of this skill\'s files' in toggled
 
 
 def test_toggle_skill_reports_missing_manifest_permission_grant(tmp_path, monkeypatch):
@@ -1074,8 +1100,6 @@ def test_generated_repair_enable_requires_expressed_owner_source(tmp_path, monke
 @pytest.mark.parametrize("tool_name,args", [
     ("run_command", {"cwd": "skill_payload", "cmd": ["python", "-c", "print('x')"]}),
     ("browse_page", {"url": "https://example.invalid"}),
-    ("browser_action", {"action": "evaluate", "value": "1 + 1"}),
-    ("schedule_subagent", {"objective": "inspect skill", "expected_output": "findings"}),
     ("skill_exec", {"skill": "alpha", "script": "run.py"}),
 ])
 def test_skill_development_keeps_normal_capabilities(tool_name, args, tmp_path, monkeypatch):
@@ -1174,8 +1198,6 @@ def test_selected_skill_blocks_marketplace_sidecar_writes(sidecar, tmp_path):
 @pytest.mark.parametrize("tool_name,args", [
     ("write_file", {"root": "skill_payload", "bucket": "external", "skill_name": "beta", "path": "notes.txt", "content": "x"}),
     ("read_file", {"root": "skill_payload", "bucket": "external", "skill_name": "beta", "path": "SKILL.md"}),
-    ("list_files", {"root": "skill_payload", "bucket": "external", "skill_name": "beta", "path": "."}),
-    ("skill_review", {"skill": "beta"}),
     ("skill_preflight", {"skill": "beta"}),
 ])
 def test_selected_skill_cannot_redirect_payload_tools(tool_name, args, tmp_path, monkeypatch):
@@ -1322,7 +1344,7 @@ def test_selected_skill_blocks_self_authored_marker_write(tmp_path):
 
 
 def test_skill_development_review_uses_ordinary_extension_reconciliation(tmp_path, monkeypatch):
-    import types
+    from ouroboros.skill_review import SkillReviewOutcome
 
     ctx = _make_ctx(tmp_path)
     skills_root = tmp_path / "skills"
@@ -1335,7 +1357,7 @@ def test_skill_development_review_uses_ordinary_extension_reconciliation(tmp_pat
     monkeypatch.setattr(
         skill_exec_mod,
         "_review_skill_impl",
-        lambda _ctx, skill_name: types.SimpleNamespace(
+        lambda _ctx, skill_name: SkillReviewOutcome(
             skill_name=skill_name,
             status="pass",
             content_hash="hash",
@@ -1443,11 +1465,7 @@ def test_stale_review_job_is_marked_interrupted(tmp_path, monkeypatch):
     assert data["interrupt_reason"] == "owner_process_exited"
     events_text = (ctx.drive_root / "logs" / "events.jsonl").read_text(encoding="utf-8")
     assert "skill_review_interrupted" in events_text
-    progress = [
-        json.loads(line)
-        for line in (ctx.drive_root / "logs" / "progress.jsonl").read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    progress = dialogue_test.log_rows(ctx.drive_root / "logs" / "progress.jsonl")
     assert progress[-1]["task_id"] == "skill_lifecycle_review_alpha_skill-job-old"
     assert progress[-1]["lifecycle"]["status"] == "interrupted"
     assert progress[-1]["lifecycle"]["phase"] == "interrupted"
@@ -1455,8 +1473,8 @@ def test_stale_review_job_is_marked_interrupted(tmp_path, monkeypatch):
 
 def test_reconcile_stale_review_jobs_heals_dead_running_job(tmp_path, monkeypatch):
     # The periodic supervisor reconcile (server.py) calls this to heal a worker
-    # that died mid-review and left review_job.json at status=running in a
-    # headless/no-UI run where boot/extensions-API reconciles never fire.
+    # that died mid-review and left review_job.json at status=running between
+    # boots (the Skills list GET is a passive read and heals nothing).
     from ouroboros.skill_review_runner import (
         reconcile_stale_review_jobs,
         review_job_state_path,
@@ -1599,7 +1617,10 @@ def test_toggle_skill_rejects_stale_pass_review(tmp_path, monkeypatch):
 
     resp = skill_exec_mod._handle_toggle_skill(ctx, skill="alpha", enabled=True)
     assert "SKILL_TOGGLE_ERROR" in resp
-    assert "fresh executable review" in resp
+    # The stale verdict no longer counts; the typed refusal's detail names both authorities.
+    assert '"error": "It turns on after a review passes."' in resp and ('"detail": "a current executable reviewer '
+            'verdict or a qualified author acceptance of these exact bytes"') in resp
+    assert '"blocking_reason": "review_stale"' in resp
 
 
 def test_skill_exec_rejects_misserialized_args(tmp_path, monkeypatch):
@@ -2029,6 +2050,7 @@ def test_env_denylist_blocks_secret_forwarding(tmp_path, monkeypatch):
             "GITHUB_TOKEN": "ghp_leak",
             "TIMEZONE": "UTC",
             "SOME_OK_KEY": "visible-value",
+            "TOTAL_BUDGET": 7,
         },
     ):
         env = se._scrub_env(
@@ -2037,6 +2059,7 @@ def test_env_denylist_blocks_secret_forwarding(tmp_path, monkeypatch):
                 "GITHUB_TOKEN",
                 "OUROBOROS_NETWORK_PASSWORD",
                 "SOME_OK_KEY",
+                "TOTAL_BUDGET",
             ],
             skill_state_dir_path=skill_state_dir_path,
             skill_name="ok",
@@ -2048,8 +2071,10 @@ def test_env_denylist_blocks_secret_forwarding(tmp_path, monkeypatch):
     assert "GITHUB_TOKEN" not in env
     assert "OUROBOROS_NETWORK_PASSWORD" not in env
     # Non-protected manifest-requested keys still flow without grants; custom
-    # secrets become grant-bound after the owner stores them in Settings.
-    assert env["SOME_OK_KEY"] == "visible-value"
+    # secrets become grant-bound after the owner stores them in Settings, as
+    # the very document the values come from shows them (never a second read).
+    assert env["TOTAL_BUDGET"] == "7"
+    assert "SOME_OK_KEY" not in env
 
     with patch.object(se, "load_settings", return_value={"OPENROUTER_API_KEY": "sk-or-v1-GRANTED"}):
         granted_env = se._scrub_env(

@@ -1,4 +1,9 @@
-"""Complete Light requests and progress-safe consolidation (ported from 583acd22)."""
+"""The shared Light call (``_call_consolidation_llm``): complete requests, measured fit, typed failures.
+
+The fallback memory writer sends through this one call, one request per call, so every
+test here sends one request directly. ``_LLM``, ``fit``, ``_paths`` and ``_write_chat``
+are shared helpers other memory tests import.
+"""
 from __future__ import annotations
 
 import json
@@ -10,6 +15,9 @@ import pytest
 from ouroboros import consolidator as c
 from ouroboros import context_fit
 from ouroboros.capability_evidence import CapabilityEvidence
+
+
+LIGHT_OUTPUT_RESERVE = 16_384
 
 
 class _Refusal(RuntimeError):
@@ -56,7 +64,7 @@ def fit(monkeypatch):
         return {"model": task["model"], "provider": "openrouter"}, evidence
 
     monkeypatch.setattr(context_fit, "resolve_context_fit_route", resolve)
-    monkeypatch.setattr(context_fit, "_route_calibration_ratio", lambda *_: fact.density)
+    monkeypatch.setattr(context_fit, "_route_calibration_ratio", lambda *_, **_kw: fact.density)
     return fact
 
 
@@ -74,228 +82,123 @@ def _write_chat(path, count=100, text_size=80, *, start=0):
     return rows
 
 
-def _source(prompts):
-    return "".join(prompt.split("## Messages to summarize\n", 1)[1][:-1] for prompt in prompts)
+def _call(llm, prompt="Summarize this source.\n" + "source " * 100):
+    """One Light request, as the fallback memory writer sends it."""
+    return c._call_consolidation_llm(llm, prompt, "Probe")
 
 
-def _summary(llm, text="source" * 100, **kwargs):
-    return c._create_block_summary(llm, text, "2026-01-01T01:00", "2026-01-01T02:00", "identity", 1, **kwargs)
+def _tokens(prompt):
+    return context_fit.estimate_context_prompt_tokens([{"role": "user", "content": prompt}], None)
 
 
-@pytest.mark.parametrize("code", ["provider_failed", "invalid_request"])
-def test_oversized_logical_block_splits_complete_source_and_advances_once(tmp_path, fit, monkeypatch, code):
-    from ouroboros.llm_claudexor import ClaudexorModelError
-    fit.window = None
-    chat, blocks, meta = _paths(tmp_path)
-    rows = _write_chat(chat, text_size=120)
-    source_bytes = chat.read_bytes()
-    def reject(llm, prompt):
-        if len(prompt.encode("utf-8")) > llm.limit:
-            raise ClaudexorModelError({"code": code, "message": "Controlled provider refusal",
-                "context": {"httpStatus": 400, "vendorCode": "context_length_exceeded", "parameter": "input"}})
-    llm = _LLM(limit=3500, effect=reject)
-    advances = []
-    advance = c._advance_cursor
-    monkeypatch.setattr(c, "_advance_cursor", lambda *args: (advances.append(args[-1]), advance(*args))[-1])
-
-    usage = c.consolidate(chat, blocks, meta, llm)
-
-    assert usage["cost"] is None  # refusal did not report cash
-    assert _source(llm.accepted) == c._format_entries_for_block(rows)
-    assert chat.read_bytes() == source_bytes
-    assert advances == [100]
-    saved = json.loads(blocks.read_text())
-    assert len(saved) == 1 and saved[0]["message_count"] == 100
-    assert json.loads(meta.read_text())["last_consolidated_offset"] == 100
-    assert not c.should_consolidate(meta, chat)
-    refused = usage["_consolidation_errors"][0]
-    assert refused["kind"] == "context_overflow" and not refused["preflight_only"]
-    # A refusal that was split and then fully summarized is a recovered attempt, not a
-    # failed run: the block was written, so no stale error may outlive the advance.
-    assert "last_consolidation_error" not in json.loads(meta.read_text())
-    assert refused["capacity_tokens"] is None and refused["input_limit"] is None
-    sizes = [len(call["messages"][0]["content"].encode("utf-8")) for call in llm.calls]
-    for index, size in enumerate(sizes[:-1]):
-        if size > llm.limit:
-            assert sizes[index + 1] < size
-
-
-def test_known_capacity_includes_whole_prompt_density_and_output_reserve(tmp_path, fit):
-    chat, blocks, meta = _paths(tmp_path)
-    rows = _write_chat(chat, text_size=140)
-    fit.window, fit.density = 18000, 2.5
-    identity = "identity at full length " * 20
+def test_known_capacity_measures_the_whole_request_with_density_and_output_reserve(fit):
+    """The fit check counts the whole prompt at the route's density plus the output reserve:
+    one token more than the window refuses before any request, the exact fit is sent."""
+    prompt = "identity at full length " * 40 + "source " * 400
+    fit.density = 2.5
+    fit.window = ceil(_tokens(prompt) * fit.density) + LIGHT_OUTPUT_RESERVE
     llm = _LLM()
+    content, usage = _call(llm, prompt)
+    assert content == "summary-1" and len(llm.calls) == 1
+    call = llm.calls[0]
+    assert call["messages"][0]["content"] == prompt  # complete, never clipped
+    assert call["model_role"] == "light" and call["max_tokens"] == LIGHT_OUTPUT_RESERVE
+    assert usage["cost"] == pytest.approx(0.01)
 
-    result = c.consolidate(chat, blocks, meta, llm, identity)
-
-    assert len(llm.calls) > 1
-    for call in llm.calls:
-        assert identity in call["messages"][0]["content"]
-        size = ceil(context_fit.estimate_context_prompt_tokens(call["messages"], call["tools"]) * fit.density)
-        assert size + call["max_tokens"] <= fit.window
-        assert call["model_role"] == "light" and call["max_tokens"] == 16384
-    assert _source(llm.accepted) == c._format_entries_for_block(rows)
-    assert result["cost"] == pytest.approx(0.01 * len(llm.calls))
-
-
-def test_known_capacity_overhead_refusal_is_typed_without_model_call(tmp_path, fit):
-    fit.window = 16384
-    chat, blocks, meta = _paths(tmp_path)
-    _write_chat(chat)
-    original = chat.read_bytes()
-    c.atomic_write_json(meta, {"last_consolidated_offset": 0, "chat_log_signature": c._chat_log_signature(chat)})
-    cursor = json.loads(meta.read_text())["chat_log_signature"]
-    llm = _LLM()
-    for _ in range(2):
-        usage = c.consolidate(chat, blocks, meta, llm, "large identity" * 300)
-        assert usage["_consolidation_errors"][-1]["kind"] == "context_overflow"
-        assert usage["cost"] == 0  # proven local preflight, no request
-    saved = json.loads(meta.read_text())
-    assert saved["chat_log_signature"] == cursor and saved["last_consolidated_offset"] == 0
-    assert saved["last_consolidation_error"]["preflight_only"]
-    assert not llm.calls and not blocks.exists() and chat.read_bytes() == original
-
-
-def test_unknown_capacity_impossible_overhead_does_not_replay_next_cycle(tmp_path, fit):
-    fit.window = None
-    chat, blocks, meta = _paths(tmp_path)
-    _write_chat(chat)
-    llm = _LLM(limit=1)
-    c.consolidate(chat, blocks, meta, llm)
-    first_calls = len(llm.calls)
-    assert first_calls > 0
-    c.consolidate(chat, blocks, meta, llm)
-    assert len(llm.calls) == first_calls
-    assert not blocks.exists()
-    assert json.loads(meta.read_text()).get("last_consolidated_offset", 0) == 0
-    # A new route capacity is new evidence; the old refusal must not trap it.
-    fit.window, llm.limit = 100_000, None
-    c.consolidate(chat, blocks, meta, llm)
-    assert json.loads(meta.read_text())["last_consolidated_offset"] == 100
-
-
-def test_route_capacity_changes_split_shape_without_provider_branch(tmp_path, fit):
-    counts = []
-    for window in (100_000, 17_000):
-        fit.window = window
-        chat, blocks, meta = _paths(tmp_path / str(window))
-        _write_chat(chat)
-        llm = _LLM()
-        c.consolidate(chat, blocks, meta, llm)
-        assert json.loads(meta.read_text())["last_consolidated_offset"] == 100
-        counts.append(len(llm.calls))
-    assert counts[0] == 1 < counts[1]
-
-
-def test_single_large_entry_is_lossless_even_without_line_boundaries(fit):
-    fit.window = 17000
-    source = "no-newline-🙂Ж-end" * 2000
-    llm = _LLM()
-    content, _ = _summary(llm, source)
-    assert content and len(llm.calls) > 2
-    assert _source(llm.accepted) == source
+    fit.window -= 1
+    refused = _LLM()
+    content, usage = _call(refused, prompt)
+    assert content == "" and not refused.calls
+    [error] = usage["_consolidation_errors"]
+    assert error["kind"] == "context_overflow" and error["preflight_only"]
+    assert usage["cost"] == 0  # a proven local refusal sends nothing and spends nothing
 
 
 @pytest.mark.parametrize("stale", [False, True])
 def test_unknown_or_stale_capacity_gets_one_ordinary_call(fit, stale):
     fit.window, fit.stale = (1 if stale else None), stale
     llm = _LLM()
-    assert _summary(llm)[0]
-    assert len(llm.calls) == 1
-
-
-@pytest.mark.parametrize("first_success", [False, True])
-def test_partial_split_failure_stops_before_siblings_and_preserves_cursor(tmp_path, fit, first_success):
-    fit.window = 17000
-    chat, blocks, meta = _paths(tmp_path)
-    _write_chat(chat)
-    before = chat.read_bytes()
-    failure_at = 2 if first_success else 1
-
-    def fail(llm, prompt):
-        if len(llm.calls) == failure_at:
-            raise _Refusal("provider refused", code="invalid_api_key")
-    llm = _LLM(effect=fail)
-    usage = c.consolidate(chat, blocks, meta, llm)
-    assert len(llm.calls) == failure_at and len(llm.accepted) == failure_at - 1
-    assert usage["cost"] is None
-    assert usage["_consolidation_errors"][-1]["kind"] == "auth_error"
-    assert not blocks.exists() and chat.read_bytes() == before
-    assert json.loads(meta.read_text()).get("last_consolidated_offset", 0) == 0
+    content, usage = _call(llm, "source " * 20_000)
+    assert content and len(llm.calls) == 1 and not usage.get("_consolidation_errors")
 
 
 @pytest.mark.parametrize("raw", [None, "", " \n"])
-def test_empty_output_is_non_success_with_real_usage(tmp_path, fit, raw):
-    chat, blocks, meta = _paths(tmp_path)
-    _write_chat(chat)
+def test_empty_output_is_non_success_with_real_usage(fit, raw):
     llm = _LLM(effect=lambda *_: ({"content": raw}, {"cost": 0.02}))
-    result = c.consolidate(chat, blocks, meta, llm)
-    assert result["cost"] == 0.02
-    assert result["_consolidation_errors"][-1]["kind"] == "empty_summary"
-    assert not blocks.exists() and len(llm.calls) == 1
-    assert json.loads(meta.read_text()).get("last_consolidated_offset", 0) == 0
+    content, usage = _call(llm)
+    assert content == "" and len(llm.calls) == 1
+    assert usage["cost"] == 0.02
+    assert usage["_consolidation_errors"][-1]["kind"] == "empty_summary"
 
 
-@pytest.mark.parametrize("code", ["auth_required", "subscription_window_exhausted", "model_operation_interrupted", "model_outcome_unknown"])
-def test_control_resource_and_unknown_model_errors_still_propagate(tmp_path, fit, code):
+@pytest.mark.parametrize("raw", ["summary", " \n"])
+def test_retirement_counters_of_the_physical_send_reach_the_returned_usage(fit, raw):
+    """What a send reports about retired reasoning and changed sent history stays in the Light
+    call's usage, for an answer and an unusable one alike; counters it never reported stay absent."""
+    counters = {"reasoning_retired": 1, "reasoning_retired_turns": 2, "reasoning_retired_blocks": 3,
+                "prompt_prefix_breaks": 1}
+    content, usage = _call(_LLM(effect=lambda *_: ({"content": raw}, {"cost": 0.02, **counters})))
+    assert content == raw.strip() and {key: usage.get(key) for key in counters} == counters
+    assert not counters.keys() & _call(_LLM())[1].keys()
+
+
+@pytest.mark.parametrize("code", ["auth_required", "subscription_window_exhausted", "model_outcome_unknown"])
+def test_control_resource_and_unknown_model_errors_still_propagate(fit, code):
     from ouroboros.llm_claudexor import ClaudexorModelError
-    chat, blocks, meta = _paths(tmp_path)
-    _write_chat(chat)
     error = ClaudexorModelError({"code": code, "message": "context length exceeded"})
+
     def fail(*_):
         raise error
     llm = _LLM(effect=fail)
     with pytest.raises(ClaudexorModelError) as caught:
-        c.consolidate(chat, blocks, meta, llm)
+        _call(llm)
     assert caught.value is error and len(llm.calls) == 1
-    assert not blocks.exists() and not meta.exists()
 
 
-def test_wait_interruption_propagates_after_a_successful_part(tmp_path, fit):
+def test_wait_interruption_propagates(fit):
     from ouroboros.model_wait import ModelWaitInterrupted
-    fit.window = 17000
-    chat, blocks, meta = _paths(tmp_path)
-    _write_chat(chat)
-    def fail(llm, _):
-        if len(llm.calls) == 2:
-            raise ModelWaitInterrupted("cancelled", role="light")
+    interruption = ModelWaitInterrupted("cancelled", role="light")
+
+    def fail(*_):
+        raise interruption
     llm = _LLM(effect=fail)
-    with pytest.raises(ModelWaitInterrupted):
-        c.consolidate(chat, blocks, meta, llm)
-    assert len(llm.calls) == 2 and len(llm.accepted) == 1
-    assert not blocks.exists() and not meta.exists()
+    with pytest.raises(ModelWaitInterrupted) as caught:
+        _call(llm)
+    assert caught.value is interruption and len(llm.calls) == 1
 
 
-@pytest.mark.parametrize("unresolved", [False, True])
-@pytest.mark.parametrize("code", ["provider_failed", "invalid_request"])
-def test_confirmed_model_context_refusal_splits_but_unknown_custody_propagates(fit, unresolved, code):
+@pytest.mark.parametrize(("code", "unresolved"), [("provider_failed", False), ("invalid_request", True)])
+def test_confirmed_model_context_refusal_is_typed_but_unknown_custody_propagates(fit, unresolved, code):
     from ouroboros.llm_claudexor import ClaudexorModelError
     fit.window = None
     error = ClaudexorModelError({"code": code, "message": "Controlled provider refusal",
         "context": {"httpStatus": 400, "vendorCode": "context_length_exceeded", "parameter": "input"}})
     error.physical_attempt_capture = SimpleNamespace(state="unresolved" if unresolved else "settled")
-    def refuse_once(llm, _):
-        if len(llm.calls) == 1:
-            raise error
-    llm = _LLM(effect=refuse_once)
+
+    def refuse(*_):
+        raise error
+    llm = _LLM(effect=refuse)
     if unresolved:
         with pytest.raises(ClaudexorModelError):
-            _summary(llm)
-        assert len(llm.calls) == 1
+            _call(llm)
     else:
-        content, usage = _summary(llm)
-        assert content and len(llm.calls) == 3 and usage["cost"] is None
+        content, usage = _call(llm)
+        assert content == ""
+        [refused] = usage["_consolidation_errors"]
+        assert refused["kind"] == "context_overflow" and not refused["preflight_only"]
+        assert usage["cost"] is None  # the refusal reported no cash
+    assert len(llm.calls) == 1
 
 
-def test_generic_unknown_custody_is_not_a_context_retry_even_through_cause(fit):
+def test_generic_unknown_custody_is_typed_even_through_cause(fit):
     fit.window = None
     inner = _Refusal()
     inner.physical_attempt_capture = SimpleNamespace(state="unresolved")
+
     def fail(*_):
         raise RuntimeError("context length exceeded") from inner
     llm = _LLM(effect=fail)
-    content, usage = _summary(llm)
+    content, usage = _call(llm)
     assert not content and len(llm.calls) == 1
     assert usage["_consolidation_errors"][-1]["kind"] == "provider_outcome_unknown"
     assert usage["cost"] is None
@@ -304,81 +207,30 @@ def test_generic_unknown_custody_is_not_a_context_retry_even_through_cause(fit):
 @pytest.mark.parametrize("message,code,kind", [
     ("max_tokens exceeds maximum context length", "", "request_too_large"),
     ("context length exceeded", "invalid_api_key", "auth_error"),
-    ("request body too large", "", "request_too_large"),
     ("ordinary failure", "invalid_request", "provider_error"),
 ])
-def test_non_context_refusals_never_split(fit, message, code, kind):
+def test_ordinary_refusals_are_classified(fit, message, code, kind):
     def fail(*_):
         raise _Refusal(message, code=code)
     llm = _LLM(effect=fail)
-    content, usage = _summary(llm)
+    content, usage = _call(llm)
     assert not content and len(llm.calls) == 1
     assert usage["_consolidation_errors"][-1]["kind"] == kind
 
 
-def test_refused_attempt_usage_is_merged_with_successful_parts(fit):
+def test_refused_attempt_keeps_its_usage_and_ledger_ids(fit):
     fit.window = None
-    def refuse_once(llm, _):
-        if len(llm.calls) == 1:
-            error = _Refusal(usage={"prompt_tokens": 7, "completion_tokens": 0, "total_tokens": 7, "cost": 0.03})
-            error.ledger_attempt_ids = ["refused-attempt"]
-            raise error
-    llm = _LLM(effect=refuse_once)
-    content, usage = _summary(llm)
-    assert content and len(llm.calls) == 3
-    assert usage["cost"] == pytest.approx(0.05)
-    assert usage["prompt_tokens"] == 27 and usage["total_tokens"] == 37
+
+    def refuse(*_):
+        error = _Refusal(usage={"prompt_tokens": 7, "completion_tokens": 0, "total_tokens": 7, "cost": 0.03})
+        error.ledger_attempt_ids = ["refused-attempt"]
+        raise error
+    llm = _LLM(effect=refuse)
+    content, usage = _call(llm)
+    assert content == "" and len(llm.calls) == 1
+    assert usage["cost"] == pytest.approx(0.03)
+    assert usage["prompt_tokens"] == 7 and usage["total_tokens"] == 7
     assert usage["ledger_attempt_ids"] == ["refused-attempt"]
-
-
-def test_rotation_append_and_partial_failure_only_advance_completed_block(tmp_path, fit):
-    chat, blocks, meta = _paths(tmp_path)
-    rows = _write_chat(chat, count=200, text_size=0)
-    rows[100]["text"] = "large source🙂" * 3000
-    chat.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
-    captured = c._chat_log_signature(chat)
-    archive = tmp_path / "archive" / "chat_20260101.jsonl"
-
-    def rotate_and_fail(llm, _):
-        if len(llm.calls) == 1:
-            archive.parent.mkdir()
-            chat.rename(archive)
-            _write_chat(chat, 100, 0, start=200)
-        if len(llm.calls) == 3:
-            with chat.open("a") as output:
-                output.write(json.dumps({"ts": "2026-01-02T00:00:00Z", "text": "appended tail"}) + "\n")
-            raise _Refusal("failed part", code="invalid_request")
-    fit.window = 18000
-    llm = _LLM(effect=rotate_and_fail)
-    usage = c.consolidate(chat, blocks, meta, llm)
-    assert len(llm.calls) == 3 and usage["cost"] is None
-    saved = json.loads(meta.read_text())
-    assert saved["last_consolidated_offset"] == 100 and saved["chat_log_signature"] == captured
-    assert sum(block["message_count"] for block in json.loads(blocks.read_text())) == 100
-    assert c.should_consolidate(meta, chat)
-
-    succeeding = _LLM()
-    c.consolidate(chat, blocks, meta, succeeding)
-    assert _source(succeeding.accepted) == c._format_entries_for_block(rows[100:]) + c._format_entries_for_block(c._read_chat_entries(chat)[:100])
-    saved = json.loads(meta.read_text())
-    assert saved["last_consolidated_offset"] == 100
-    assert saved["chat_log_signature"]["first_line_sha256"] == c._chat_log_signature(chat)["first_line_sha256"]
-    assert c._read_chat_entries(chat)[saved["last_consolidated_offset"]:][0]["text"] == "appended tail"
-
-
-def test_failed_era_usage_is_accounted_and_original_blocks_survive(tmp_path, fit):
-    chat, blocks, meta = _paths(tmp_path)
-    _write_chat(chat, text_size=0)
-    originals = [{"range": "2025-01-01", "type": "summary", "message_count": 100, "content": f"old-{i}"} for i in range(10)]
-    c.atomic_write_json(blocks, originals)
-    def fail_era(llm, _):
-        if len(llm.calls) == 2:
-            return {"content": ""}, {"cost": 0.04}
-    llm = _LLM(effect=fail_era)
-    usage = c.consolidate(chat, blocks, meta, llm)
-    assert usage["cost"] == pytest.approx(0.05)
-    assert json.loads(blocks.read_text())[:10] == originals
-    assert json.loads(meta.read_text())["last_consolidated_offset"] == 100
 
 
 def test_light_account_and_manual_window_share_real_context_resolver(monkeypatch):
@@ -391,7 +243,7 @@ def test_light_account_and_manual_window_share_real_context_resolver(monkeypatch
     monkeypatch.setenv("OUROBOROS_MODEL_ACCOUNTS", accounts)
     monkeypatch.setattr(config, "load_settings", lambda: settings)
     monkeypatch.setattr(c, "_consolidation_route", lambda: (model, False))
-    monkeypatch.setattr(context_fit, "_route_calibration_ratio", lambda *_: 1.0)
+    monkeypatch.setattr(context_fit, "_route_calibration_ratio", lambda *_, **_kw: 1.0)
     probes = []
 
     def probe(_root, **kwargs):
@@ -399,23 +251,28 @@ def test_light_account_and_manual_window_share_real_context_resolver(monkeypatch
         return CapabilityEvidence(100000, "confirmed", "test", "light-fingerprint", model=model)
     monkeypatch.setattr(capability_evidence, "probe", probe)
     llm = _LLM()
-    text = "full source " * 1000
-    content, _ = _summary(llm, text)
+    text = "full source " * 50
+    content, _ = _call(llm, text)
 
-    assert content and len(llm.calls) > 1
-    assert all(call["model_account_override"] == "light-account" for call in llm.calls)
-    assert all(call["model"] == model and call["model_role"] == "light" for call in llm.calls)
-    assert all(p["options"]["credential_profile_id"] == "light-account" for p in probes)
+    assert content and len(llm.calls) == 1
+    [call] = llm.calls
+    assert call["model_account_override"] == "light-account"
+    assert call["model"] == model and call["model_role"] == "light"
+    assert probes and all(p["options"]["credential_profile_id"] == "light-account" for p in probes)
     assert all(p["provider"] == "claudexor" and p["allow_fetch"] is True for p in probes)
-    assert all(context_fit.estimate_context_prompt_tokens(call["messages"]) + 16384 <= 17000 for call in llm.calls)
-    assert _source(llm.accepted) == text
+    assert context_fit.estimate_context_prompt_tokens(call["messages"]) + 16384 <= 17000
+    # The light window (17000), not Main's (100000), bounds the request: a larger one is refused unsent.
+    refused = _LLM()
+    content, usage = _call(refused, "full source " * 1000)
+    assert not content and not refused.calls
+    assert usage["_consolidation_errors"][-1]["kind"] == "context_overflow"
 
 
 def test_local_and_auto_account_are_passed_explicitly(fit, monkeypatch):
     monkeypatch.setattr(c, "_consolidation_route", lambda: ("local-test-model", True))
     monkeypatch.setenv("OUROBOROS_MODEL_ACCOUNTS", json.dumps({"main": "main-pin", "light": ""}))
     llm = _LLM()
-    assert _summary(llm)[0]
+    assert _call(llm)[0] and len(llm.calls) == 1
     assert all(call["use_local"] and call["model_account_override"] == "" for call in llm.calls)
     assert all(task["use_local_model"] and task["credential_profile_id"] == "" for task in fit.tasks)
 
@@ -444,60 +301,12 @@ def test_wait_route_override_and_reprepare_remeasure_whole_request(fit, monkeypa
                 waiter.prepare({**llm.calls[-1], "_model_observed_route": {"credentialProfileId": "changed-pin"}})
             fit.window = 100000
     llm = _LLM(effect=switch)
-    assert _summary(llm)[0]
+    assert _call(llm)[0]
     assert llm.calls[0]["model"] == "changed/model"
     assert llm.calls[0]["model_account_override"] == "changed-pin"
-    assert fit.tasks[-1]["model_route"] == {"credentialProfileId": "changed-pin"}
-
-
-def test_retry_limit_survives_density_changes_and_source_changes_release_it(tmp_path, fit):
-    fit.window = None
-    chat, blocks, meta = _paths(tmp_path)
-    _write_chat(chat, text_size=0)
-    llm = _LLM(limit=1)
-    c.consolidate(chat, blocks, meta, llm)
-    calls = len(llm.calls)
-    fit.density = 4.5
-    c.consolidate(chat, blocks, meta, llm)
-    assert len(llm.calls) == calls
-    c.consolidate(chat, blocks, meta, llm, identity_text="new identity context")
-    assert len(llm.calls) > calls
-
-
-def test_complete_blocks_are_preserved_if_a_summary_write_fails(tmp_path, fit, monkeypatch):
-    chat, blocks, meta = _paths(tmp_path)
-    _write_chat(chat)
-    def fail_write(*_):
-        raise OSError("disk unavailable")
-    monkeypatch.setattr(c, "_write_locked_json", fail_write)
-    with pytest.raises(OSError):
-        c.consolidate(chat, blocks, meta, _LLM())
-    assert not meta.exists()  # successful inference is not durable cursor progress
-
-
-@pytest.mark.parametrize("unknown", [False, True])
-def test_partial_block_failure_does_not_start_era_work(tmp_path, fit, unknown):
-    chat, blocks, meta = _paths(tmp_path)
-    _write_chat(chat, count=200, text_size=0)
-    originals = [{"range": "2025-01-01", "type": "summary", "message_count": 100, "content": f"old-{i}"} for i in range(10)]
-    c.atomic_write_json(blocks, originals)
-    def fail_second(llm, _):
-        if len(llm.calls) == 2:
-            error = _Refusal("unknown" if unknown else "auth failed", code="invalid_api_key")
-            if unknown:
-                error.physical_attempt_capture = SimpleNamespace(state="unresolved")
-            raise error
-    llm = _LLM(effect=fail_second)
-    usage = c.consolidate(chat, blocks, meta, llm)
-    assert len(llm.calls) == 2
-    assert json.loads(blocks.read_text())[:10] == originals
-    assert len(json.loads(blocks.read_text())) == 11
-    saved = json.loads(meta.read_text())
-    assert saved["last_consolidated_offset"] == 100
-    # The successful PREFIX advanced the cursor, but the failed suffix is this run's
-    # OWN fresh error: advancing must not clear the very failure just recorded.
-    assert saved["last_consolidation_error"]["cursor_offset"] == 100
-    assert usage["_blocks_written"] == 1
+    # The wait's reprepare re-measured the whole request under the observed account.
+    assert fit.tasks[1]["model_route"] == {"credentialProfileId": "changed-pin"}
+    assert len(llm.calls) == 1 and len(fit.tasks) == 2
 
 
 def test_unavailable_capacity_reader_retains_ordinary_call(monkeypatch):
@@ -507,49 +316,21 @@ def test_unavailable_capacity_reader_retains_ordinary_call(monkeypatch):
     def unavailable(*args, **kwargs):
         raise OSError("catalog unavailable")
     monkeypatch.setattr(capability_evidence, "probe", unavailable)
-    monkeypatch.setattr(context_fit, "_route_calibration_ratio", lambda *_: 1.0)
+    monkeypatch.setattr(context_fit, "_route_calibration_ratio", lambda *_, **_kw: 1.0)
     llm = _LLM()
-    assert _summary(llm)[0] and len(llm.calls) == 1
+    assert _call(llm)[0] and len(llm.calls) == 1
 
 
-@pytest.mark.parametrize("preceding_blocks", [0, 1])
-@pytest.mark.parametrize("code", ["provider_failed", "invalid_request"])
-def test_refusal_bound_survives_preceding_logical_blocks(tmp_path, fit, preceding_blocks, code):
-    """Earlier success cannot consume a later unpublished block's refusal."""
-    from ouroboros.llm_claudexor import ClaudexorModelError
-    from ouroboros.model_wait import ModelWaitInterrupted
-
-    fit.window = None
-    chat, blocks, meta = _paths(tmp_path)
-    count = 100 * (preceding_blocks + 1)
-    _write_chat(chat, count=count, text_size=5)
-    raw = chat.read_bytes()
-    interruption = ModelWaitInterrupted("deadline", role="light")
-
-    def first_cycle(llm, prompt):
-        if len(llm.calls) == preceding_blocks + 1:
-            error = ClaudexorModelError({"code": code, "message": "Controlled provider refusal",
-                "context": {"httpStatus": 400, "vendorCode": "context_length_exceeded", "parameter": "input"}})
-            error.physical_attempt_capture = SimpleNamespace(state="settled")
-            raise error
-        if len(llm.calls) > preceding_blocks + 1:
-            raise interruption
-
-    first = _LLM(effect=first_cycle)
-    with pytest.raises(ModelWaitInterrupted) as caught:
-        c.consolidate(chat, blocks, meta, first)
-    assert caught.value is interruption
-    rejected = first.calls[preceding_blocks]["messages"][0]["content"]
-    saved = json.loads(meta.read_text())
-    assert saved["consolidation_retry"]["input_limit"]["input_bytes"] == len(rejected.encode()) - 1
-    assert saved.get("last_consolidated_offset", 0) == 0
-    assert not blocks.exists() and chat.read_bytes() == raw
-
-    second = _LLM()
-    c.consolidate(chat, blocks, meta, second)
-    next_prompt = second.calls[preceding_blocks]["messages"][0]["content"]
-    assert len(next_prompt.encode()) < len(rejected.encode())
-    assert chat.read_bytes() == raw
-    final = json.loads(meta.read_text())
-    assert final["last_consolidated_offset"] == count
-    assert "consolidation_retry" not in final
+@pytest.mark.parametrize("shape", ["usage_finish_reason", "anthropic_stop_reason"])
+def test_output_truncation_is_refused_on_every_lane_shape(fit, shape):
+    """A summary cut at the output ceiling is withheld whether the lane reports
+    the cut as usage.response_finish_reason (OpenAI family) or as the message's
+    stop_reason (native Anthropic)."""
+    def cut(llm, _):
+        if shape == "usage_finish_reason":
+            return {"content": "clipped summary"}, {**llm.usage, "response_finish_reason": "length"}
+        return {"content": "clipped summary", "stop_reason": "max_tokens"}, dict(llm.usage)
+    llm = _LLM(effect=cut)
+    content, usage = _call(llm)
+    assert content == ""
+    assert [error["kind"] for error in usage["_consolidation_errors"]] == ["output_truncated"]

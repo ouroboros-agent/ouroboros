@@ -51,6 +51,7 @@ from ouroboros.contracts import (
     read_schema_version,
     with_schema_version,
 )
+from tests._source_scan import parse
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -124,10 +125,14 @@ def test_public_api_is_stable():
 def test_budget_profile_frozen_key_set():
     """§11.1 additive ABI pin (v6.56.0): the normalized budget_profile key set.
 
-    ``cost_hard_stop_pct`` is the additive in-task cost hard-stop knob
-    (None -> historical 50%-of-remaining stop; 0 -> no in-task stop, never a
-    $0 ceiling). Removing or renaming any key here is a deliberate ABI break.
+    ``cost_hard_stop_pct`` is the additive in-task cost hard-stop knob of an
+    EXPLICIT experiment profile. The key and its accepted inputs are frozen; the
+    meaning of None changed by owner decision 2026-10-07 (#1128): None is no
+    explicit stop — not the old 50%-of-remaining default — and 0 stays the
+    explicit no-stop bench contract, never a $0 ceiling. Removing or renaming
+    any key here is a deliberate ABI break.
     """
+    from ouroboros import task_pacing
     from ouroboros.contracts.task_contract import normalize_budget_profile
 
     profile = normalize_budget_profile(None)
@@ -141,6 +146,11 @@ def test_budget_profile_frozen_key_set():
     assert profile["cost_hard_stop_pct"] is None
     assert normalize_budget_profile({"cost_hard_stop_pct": 0})["cost_hard_stop_pct"] == 0
     assert normalize_budget_profile({"cost_hard_stop_pct": "37"})["cost_hard_stop_pct"] == 37
+    # The semantic half of the pin: None resolves to no stop, explicit 37 to its authored share.
+    ordinary = task_pacing.resolve_cost_ceiling(100.0, profile, root_cap_usd=400.0)
+    assert (ordinary.state, ordinary.basis) == ("disabled", task_pacing.COST_BASIS_NO_DEFAULT_STOP)
+    authored = task_pacing.resolve_cost_ceiling(100.0, normalize_budget_profile({"cost_hard_stop_pct": "37"}))
+    assert (authored.state, authored.ceiling_usd) == ("active", 37.0)
 
 
 def test_task_contract_preserves_protected_artifact_policy():
@@ -168,6 +178,24 @@ def test_task_contract_preserves_protected_artifact_policy():
             "deny": ["read_bytes", "hash"],
         }
     ]
+
+
+def test_task_contract_review_answer_is_an_optional_additive_key():
+    """``review_answer`` (owner, 8 Nov 2026): present only when true, from any carrier the contract already reads,
+    so ordinary contracts keep their exact historical shape; it is no answer protocol and no marker instruction."""
+    from types import SimpleNamespace
+
+    from ouroboros.contracts.task_contract import answer_protocol_active, review_answer_required
+
+    assert "review_answer" not in build_task_contract({}) and "review_answer" not in build_task_contract(
+        {"metadata": {"review_answer": "false"}})
+    for task in ({"review_answer": True}, {"metadata": {"review_answer": "true"}},
+                 {"task_contract": {"review_answer": True}}):
+        contract = build_task_contract(task)
+        assert contract["review_answer"] is True and contract["answer_protocol"] == ""
+        ctx = SimpleNamespace(task_contract=contract, task_metadata={})
+        assert review_answer_required(ctx) is True and answer_protocol_active(ctx) is False
+    assert review_answer_required(SimpleNamespace(task_contract={}, task_metadata={})) is False
 
 
 def test_task_contract_normalizes_observable_acceptance_claims():
@@ -411,27 +439,28 @@ def _collect_dict_literals_with_type(
 
 def _collect_literal_progress_meta_keys(source_path: pathlib.Path) -> set[str]:
     """Collect literal progress_meta keys that can reach ChatOutbound frames."""
+    from tests._progress_meta_scan import progress_meta_keys
 
-    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    tree = parse(source_path.read_text(encoding="utf-8"))
     keys: set[str] = set()
     meta_helper_names = {"_subagent_rejection_meta", "_subagent_progress_meta", "_subagent_scheduled_meta"}
     # A producer may build the dict under a local name and hand it over as
-    # ``progress_meta=<name>`` (events_runtime_controls: ``incident_meta``);
-    # every such name is an alias of ``progress_meta`` for the walk below, or
-    # the scan is blind to exactly those emitters and stays green when their
-    # keys drop out of the carriers.
+    # ``progress_meta=<name>`` (the retired cancellation-incident emitter did,
+    # as ``incident_meta``); every such name is an alias of ``progress_meta``
+    # for the walk below, or the scan is blind to exactly those emitters and
+    # stays green when their keys drop out of the carriers.
     meta_names = {"progress_meta"}
     for node in ast.walk(tree):
         if isinstance(node, ast.keyword) and node.arg == "progress_meta" and isinstance(node.value, ast.Name):
             meta_names.add(node.value.id)
     for node in ast.walk(tree):
         if isinstance(node, ast.keyword) and node.arg == "progress_meta" and isinstance(node.value, ast.Dict):
-            literal_keys, unknown = _dict_literal_keys(node.value)
+            literal_keys, unknown = progress_meta_keys(tree, node.value)
             assert not unknown, f"progress_meta literal in {source_path.name} has dynamic keys: {unknown}"
             keys.update(literal_keys)
         elif isinstance(node, ast.Assign):
             if any(isinstance(target, ast.Name) and target.id in meta_names for target in node.targets) and isinstance(node.value, ast.Dict):
-                literal_keys, unknown = _dict_literal_keys(node.value)
+                literal_keys, unknown = progress_meta_keys(tree, node.value)
                 assert not unknown, f"progress_meta assignment in {source_path.name} has dynamic keys: {unknown}"
                 keys.update(literal_keys)
             for target in node.targets:
@@ -464,13 +493,13 @@ def _collect_literal_progress_meta_keys(source_path: pathlib.Path) -> set[str]:
                 and node.args
                 and isinstance(node.args[0], ast.Dict)
             ):
-                literal_keys, unknown = _dict_literal_keys(node.args[0])
+                literal_keys, unknown = progress_meta_keys(tree, node.args[0])
                 assert not unknown, f"progress_meta.update in {source_path.name} has dynamic keys: {unknown}"
                 keys.update(literal_keys)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in meta_helper_names:
             for child in ast.walk(node):
                 if isinstance(child, ast.Return) and isinstance(child.value, ast.Dict):
-                    literal_keys, unknown = _dict_literal_keys(child.value)
+                    literal_keys, unknown = progress_meta_keys(tree, child.value)
                     assert not unknown, f"{node.name} return in {source_path.name} has dynamic keys: {unknown}"
                     keys.update(literal_keys)
     return keys
@@ -568,7 +597,7 @@ def test_chat_outbound_matches_message_bus_sends():
         )
 
 
-def test_chat_outbound_declares_progress_meta_keys_used_by_runtime():
+def test_chat_outbound_declares_progress_meta_keys_used_by_runtime(tmp_path):
     """Progress metadata is merged into ChatOutbound frames by message_bus."""
 
     from ouroboros.gateway.contracts import ChatOutbound
@@ -590,9 +619,19 @@ def test_chat_outbound_declares_progress_meta_keys_used_by_runtime():
         progress_keys.update(_collect_literal_progress_meta_keys(source_path))
 
     assert progress_keys, "no literal progress_meta keys found"
-    # The named-dict idiom must be seen: this key has exactly one emitter and
-    # it hands the dict over as ``progress_meta=incident_meta``.
-    assert "cancel_physical_task_id" in progress_keys, sorted(progress_keys)
+    # The named-dict idiom (``progress_meta=<local name>``) has no live emitter
+    # since the cancellation incident row was retired, so the alias walk is
+    # proven on a synthetic producer: a future named-dict emitter cannot slip
+    # past the scan unnoticed.
+    synthetic = tmp_path / "named_dict_producer.py"
+    synthetic.write_text(
+        "def emit(ctx):\n"
+        "    incident_meta = {\"task_incident\": \"synthetic_fault\"}\n"
+        "    incident_meta[\"synthetic_physical_task_id\"] = \"t\"\n"
+        "    ctx.send_with_budget(1, \"x\", progress_meta=incident_meta)\n",
+        encoding="utf-8",
+    )
+    assert {"task_incident", "synthetic_physical_task_id"} <= _collect_literal_progress_meta_keys(synthetic)
     assert progress_keys <= declared, (
         "progress_meta emits keys not declared in ChatOutbound: "
         f"{sorted(progress_keys - declared)}"
@@ -760,46 +799,35 @@ def _find_async_fn(tree: ast.AST, name: str) -> ast.AsyncFunctionDef | None:
 
 
 def test_state_response_matches_server_payload():
-    """StateResponse declared keys must cover every ``/api/state`` success payload.
+    """StateResponse declared keys must equal the ``/api/state`` success payload's keys.
 
-    The error path returns ``{"error": str}`` with HTTP 500 — that shape is
-    intentionally outside the frozen contract, so the test whitelists
-    ``{"error"}`` only for dicts that contain it (error branch).
+    The payload is the state publication's produced fields (``state_publication.produced_fields``),
+    the per-request process facts (``state_publication.live_fields``) and the request's bindings pair
+    (``task_bindings``/``task_bindings_unchanged``, joined by ``state_publication.response_body``).
+    The error path returns ``{"error": str}`` with HTTP 500 — outside the frozen contract.
+    ``StateResponse`` is total=True, so a missing declared key fails as loudly as a leaked one.
     """
     from ouroboros.gateway.contracts import StateResponse
 
-    tree = ast.parse((REPO_ROOT / "ouroboros" / "gateway" / "state.py").read_text(encoding="utf-8"))
-    api_state_fn = _find_async_fn(tree, "api_state")
-    assert api_state_fn is not None
+    def returned_keys(path, name):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        function = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == name)
+        literals = [node.value for node in ast.walk(function)
+                    if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict)]
+        assert len(literals) == 1, f"{name} must return one dict literal"
+        keys, unknown = _dict_literal_keys(literals[0])
+        assert not unknown, f"{name} uses non-constant keys: {unknown}"
+        return keys
 
+    gateway = REPO_ROOT / "ouroboros" / "gateway"
+    produced = returned_keys(gateway / "state_publication.py", "produced_fields")
+    live = returned_keys(gateway / "state_publication.py", "live_fields")
+    bindings = {"task_bindings", "task_bindings_unchanged"}
+    assert not produced & live and not (produced | live) & bindings, "a key would be written twice"
     declared = set(StateResponse.__annotations__.keys())
-    response_dicts = _api_route_response_dicts(api_state_fn)
-    assert response_dicts, "api_state exposes no JSONResponse dict literal"
-
-    happy_path_checked = False
-    for literal in response_dicts:
-        keys, unknown = _dict_literal_keys(literal)
-        assert not unknown, (
-            f"api_state response uses non-constant keys: {unknown}"
-        )
-        # The error path has exactly one key ``error``; whitelist it explicitly
-        # rather than blanket-excluding ``error`` from the happy-path contract.
-        if keys == {"error"}:
-            continue
-        leaked = keys - declared
-        assert not leaked, (
-            f"/api/state happy-path emits keys not declared in StateResponse: {leaked}"
-        )
-        # Enforce required-key presence too. ``StateResponse`` is total=True,
-        # so every declared key is required; a missing one means the runtime
-        # silently dropped a declared field and the frozen contract should fail
-        # loudly.
-        missing = declared - keys
-        assert not missing, (
-            f"/api/state happy-path is missing declared StateResponse keys: {missing}"
-        )
-        happy_path_checked = True
-    assert happy_path_checked, "api_state exposes no happy-path response dict"
+    keys = produced | live | bindings
+    assert not keys - declared, f"/api/state happy-path emits keys not declared in StateResponse: {keys - declared}"
+    assert not declared - keys, f"/api/state happy-path is missing declared StateResponse keys: {declared - keys}"
 
 
 def test_health_response_matches_server_payload():
@@ -1005,6 +1033,14 @@ def test_skill_manifest_scheduled_tasks_contract():
     assert manifest.scheduled_tasks == [{"name": "refresh", "cron": "0 * * * *"}]
 
 
+def test_a_schedule_suggestion_needs_no_background_permission():
+    """A suggestion installs nothing, so validation asks for no supervised_task; other checks still warn."""
+    head = ("---\nname: cron-skill\ndescription: Cron skill\nversion: 0.1.0\ntype: instruction\n"
+            "scheduled_tasks:\n  - name: refresh\n    cron: \"0 * * * *\"\n")
+    assert parse_skill_manifest_text(head + "---\nbody\n").validate() == []
+    assert parse_skill_manifest_text(head + "timeout_sec: 0\n---\nbody\n").validate() == ["timeout_sec must be positive"]
+
+
 # Removed in v5.15.x: test_skill_manifest_body_only_markdown_can_start_with_link_syntax
 # and test_skill_manifest_body_only_markdown_can_start_with_thematic_break.
 # Both pinned narrow YAML-frontmatter-vs-body-markdown edge cases that
@@ -1157,15 +1193,15 @@ def test_skill_manifest_schema_version_is_stable():
 
 
 # ---------------------------------------------------------------------------
-# Constitutional guard: owner-chosen review enforcement is not self-overridable
-# (NW-2 / BIBLE P3). This is the un-deletable backstop for the 58a52c4 incident
-# class, in which a self-evolution cycle hardcoded
+# Constitutional guard: no finding is hardcoded to block or pass (NW-2 / BIBLE
+# P3). This is the un-deletable backstop for the 58a52c4 incident class, in
+# which a self-evolution cycle hardcoded
 # ``_ALWAYS_BLOCKING_ITEMS = {version_bump, forgotten_touchpoints}`` so those
-# findings blocked commits even under owner-chosen ``advisory`` enforcement.
-# It lives in this FROZEN_CONTRACT file specifically so the agent cannot
-# weaken or delete it from a normal self-worktree. The behavioural invariant:
-# under advisory enforcement, a critical LLM finding for ANY checklist item
-# must NOT block, at every enforcement layer the incident touched.
+# findings blocked commits. It lives in this FROZEN_CONTRACT file specifically
+# so the agent cannot weaken or delete it from a normal self-worktree. The
+# behavioural invariant, with no setting at all: a critical LLM finding for ANY
+# checklist item returns as the outcome and never refuses, at every layer the
+# incident touched; the reviewer's answer informs and the author decides.
 # ---------------------------------------------------------------------------
 
 
@@ -1189,73 +1225,94 @@ def _advisory_guard_make_git_ctx(tmp_path):
     return ToolContext(repo_dir=repo, drive_root=drive)
 
 
-def test_advisory_enforcement_not_self_overridable_triad(tmp_path, monkeypatch):
-    """BIBLE P3 / NW-2: advisory mode must downgrade a critical TRIAD finding
-    for the incident's triad item (``version_bump``) — no per-item always-block."""
+def test_no_finding_is_hardcoded_to_block_triad(tmp_path, monkeypatch):
+    """BIBLE P3 / NW-2: a critical TRIAD finding for the incident's triad item
+    (``version_bump``) is returned, never refused — no per-item always-block. The
+    wave really reaches the verdict: both seats answer, the coupling part is clean,
+    the change part FAILs, and the gate hands the finding back as a warning."""
     import importlib
+    import json as _json
+
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.tools.scope_review_contract import SCOPE_REQUIRED_ITEMS
+
     review = importlib.import_module("ouroboros.tools.review")
     ctx = _advisory_guard_make_git_ctx(tmp_path)
-
-    def _fake_run_cmd(cmd, cwd=None):
-        cmd = list(cmd)
-        if cmd[:5] == ["git", "diff", "--cached", "--name-status"]:
-            return "M\tx.py"
-        if cmd[:4] == ["git", "diff", "--cached", "--name-only"]:
-            return "x.py"
-        if cmd[:3] == ["git", "diff", "--cached"]:
-            return "diff --cached"
-        return ""
-
-    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "advisory")
-    monkeypatch.setattr(review, "run_cmd", _fake_run_cmd)
-    monkeypatch.setattr(
-        review, "_handle_multi_model_review",
-        lambda *a, **k: __import__("json").dumps({"results": [
-            {"model": "m1", "verdict": "PASS", "tokens_in": 0, "tokens_out": 0, "cost_estimate": 0.0,
-             "text": '[{"item":"version_bump","verdict":"FAIL","severity":"critical","reason":"VERSION not bumped"}]'},
-            {"model": "m2", "verdict": "PASS", "tokens_in": 0, "tokens_out": 0, "cost_estimate": 0.0,
-             "text": '[{"item":"version_bump","verdict":"PASS","severity":"critical","reason":"looks fine to me"}]'},
-        ]}),
-    )
-    result = review._run_unified_review(ctx, "test commit", repo_dir=ctx.repo_dir)
-    assert result is None, "advisory mode must not block a critical version_bump finding (58a52c4 class)"
+    clean = [{"item": item, "verdict": "PASS", "severity": "advisory",
+              "reason": f"Checked {item} against the staged diff and the touched modules; no issue."}
+             for item in sorted(SCOPE_REQUIRED_ITEMS)]
+    finding = {"item": "version_bump", "verdict": "FAIL", "severity": "critical", "reason": "VERSION not bumped"}
+    answers = [_json.dumps({"change": [finding] if failing else [], "change_clean": not failing, "coupling": clean})
+               for failing in (True, False)]
+    results = [{"model": f"m{i + 1}", "slot_id": f"slot_{i + 1}", "verdict": "UNKNOWN", "text": text}
+               for i, text in enumerate(answers)]
+    prepared = {
+        "prompt": "", "stable_prefix_len": 0, "models": ["m1", "m2"], "routes": [ReviewRouteKind.API_CHAT] * 2,
+        "target_repo": ctx.repo_dir, "layer": "body", "task_evidence": None, "governance_manifest": [],
+        "governance_packet_slots": [], "retrieving_manifests": [], "brief_texts": {},
+        "row_plan": {"models": ["m1", "m2"], "routes": [ReviewRouteKind.API_CHAT] * 2, "slot_ids": ["slot_1", "slot_2"],
+                     "parts": [("change", "coupling")] * 2, "retrieves": [True, True],
+                     "session_tasks": ["BRIEF", "BRIEF"], "brief_shas": ["a", "b"]},
+    }
+    monkeypatch.setattr(review, "_handle_multi_model_review", lambda *a, **k: _json.dumps({"results": results}))
+    result = review._dispatch_unified_review(ctx, "test commit", prepared)
+    assert result is None, "a critical version_bump finding must not refuse (58a52c4 class)"
+    verdict = ctx._last_review_verdict
+    assert verdict["aggregate"] == "FAIL" and verdict["per_question"]["change"] == "FAIL"
+    assert ctx._last_review_block_reason == "critical_findings"
+    said = " ".join(str(note) for note in ctx._review_advisory)
+    assert "version_bump" in said and "explicit decision" in said
 
 
 @pytest.mark.parametrize("crit_item", ["forgotten_touchpoints", "intent_alignment"])
-def test_advisory_enforcement_not_self_overridable_scope(crit_item, tmp_path, monkeypatch):
-    """BIBLE P3 / NW-2: advisory mode must NOT block a critical SCOPE finding —
-    ``forgotten_touchpoints`` is the incident's scope item."""
+def test_no_finding_is_hardcoded_to_block_coupling(crit_item, tmp_path, monkeypatch):
+    """BIBLE P3 / NW-2: a critical COUPLING finding never refuses —
+    ``forgotten_touchpoints`` is the incident's Part-2 item. The reducer still
+    says FAIL (the fact: ``per_question.coupling``), the record keeps the seat's
+    finding, and the gate returns it exactly as it returns a Part-1 finding."""
     import importlib
     import json as _json
-    scope = importlib.import_module("ouroboros.tools.scope_review")
 
-    class _Ctx:
-        repo_dir = str(tmp_path)
-        task_id = "advisory-guard"
-        pending_events = []
+    from ouroboros import review_ledger as rl
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.tools.scope_review_contract import SCOPE_REQUIRED_ITEMS
 
-        def drive_logs(self):
-            return tmp_path
-
-    raw = []
-    for item_id in sorted(scope._SCOPE_REQUIRED_ITEMS):
-        if item_id == crit_item:
-            raw.append({"item": item_id, "verdict": "FAIL", "severity": "critical",
-                        "reason": f"Staged diff violates {item_id} per the fixture."})
-        else:
-            raw.append({"item": item_id, "verdict": "PASS", "severity": "advisory",
-                        "reason": f"Checked {item_id} against the staged fixture."})
-    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "advisory")
-    # Isolate advisory finding enforcement from the row's output sizing: this
-    # synthetic route is explicitly full-window.
-    from ouroboros.reviewer_window import ReviewerWindow
-
-    monkeypatch.setattr(scope, "_scope_window",
-                        lambda _model, **_k: ReviewerWindow(1_000_000, "confirmed"))
-    monkeypatch.setattr(scope, "_call_scope_llm",
-                        lambda *a, **k: (_json.dumps(raw), {"prompt_tokens": 1, "completion_tokens": 1}, None))
-    result = scope.run_scope_review(_Ctx(), "test commit", scope_model="test")
-    assert result.blocked is False, f"advisory mode must not block scope critical {crit_item!r} (58a52c4 class)"
+    review = importlib.import_module("ouroboros.tools.review")
+    ctx = _advisory_guard_make_git_ctx(tmp_path)
+    matrix = [{"item": item, "verdict": "FAIL" if item == crit_item else "PASS",
+               "severity": "critical" if item == crit_item else "advisory",
+               "reason": (f"Staged diff violates {item} per the fixture." if item == crit_item
+                          else f"Checked {item} against the staged diff and the touched modules; no issue.")}
+              for item in sorted(SCOPE_REQUIRED_ITEMS)]
+    two_part = _json.dumps({"change": [], "change_clean": True, "coupling": matrix})
+    results = [
+        {"model": "m1", "slot_id": "slot_1", "verdict": "UNKNOWN", "text": two_part},
+        {"model": "m2", "slot_id": "slot_2", "verdict": "UNKNOWN", "text": two_part},
+    ]
+    prepared = {
+        "prompt": "", "stable_prefix_len": 0, "models": ["m1", "m2"], "routes": [ReviewRouteKind.API_CHAT] * 2,
+        "target_repo": ctx.repo_dir, "layer": "body",
+        "task_evidence": None, "governance_manifest": [], "governance_packet_slots": [],
+        "retrieving_manifests": [], "brief_texts": {},
+        "row_plan": {"models": ["m1", "m2"], "routes": [ReviewRouteKind.API_CHAT] * 2, "slot_ids": ["slot_1", "slot_2"],
+                     "parts": [("change", "coupling")] * 2, "retrieves": [True, True],
+                     "session_tasks": ["BRIEF", "BRIEF"], "brief_shas": ["a", "b"]},
+    }
+    monkeypatch.setattr(review, "_handle_multi_model_review", lambda *a, **k: _json.dumps({"results": results}))
+    result = review._dispatch_unified_review(ctx, "test commit", prepared)
+    assert result is None, f"a coupling critical {crit_item!r} must not refuse (58a52c4 class)"
+    verdict = ctx._last_review_verdict
+    assert verdict["aggregate"] == "FAIL" and verdict["per_question"]["coupling"] == "FAIL"
+    assert verdict["per_question"]["change"] == "PASS"
+    coupling = ctx._last_coupling_result
+    # ``blocked`` is the gate's fact (as the old scope result's was): the FAIL is
+    # recorded and blocks nothing.
+    assert coupling.blocked is False and coupling.verdict == "FAIL"
+    assert coupling.critical_findings[0]["item"] == crit_item
+    assert ctx._last_review_block_reason == "critical_findings"
+    assert ctx._review_advisory and crit_item in " ".join(str(note) for note in ctx._review_advisory)
+    rows = rl.build_rows({"triad_raw": ctx._last_triad_raw_results})
+    assert rl.reduce_verdict(rows)["aggregate"] == "FAIL"  # the record reduces to the same fact
 
 
 def test_skill_and_extension_permissions_are_kept_in_sync():
@@ -1292,11 +1349,12 @@ def test_plugin_api_surface_is_frozen():
         "get_settings",
         "get_state_dir",
         "skill_job_dir",
-        "get_runtime_info",
+        "get_runtime_info", "read_memory",
         "register_supervised_task",
         "register_companion_process",
         "subscribe_event",
-        "get_skill_token",
+        "get_skill_token", "register_realtime_provider", "register_live_conversation",  # 2.1: additive, in-process only
+        "get_settings_state", "refresh_companion_process",  # 2.4: served to every 2.x declaration, refused to legacy 1.3
     }
     members = {
         m for m in dir(PluginAPI)
@@ -1310,8 +1368,10 @@ def test_plugin_api_surface_is_frozen():
 def test_plugin_api_version_matches_documented_surface():
     from ouroboros.contracts.plugin_api import PLUGIN_API_VERSION, VALID_EXTENSION_PERMISSIONS
 
-    assert PLUGIN_API_VERSION == "2.0"
+    assert PLUGIN_API_VERSION == "2.4"
     assert "presence" in VALID_EXTENSION_PERMISSIONS
+    # Additive (owner A4=A, 2026-10-03): a granted skill may leave the owner a signed System row.
+    assert "notify_owner" in VALID_EXTENSION_PERMISSIONS
     # ABI-1: absent manifest field binds the LEGACY generation by construction
     # (owner-ratified: 1.3, deliberately NOT 1.4), and the version's surface
     # fingerprint is recorded (fail-closed in both directions).
@@ -1527,6 +1587,8 @@ def test_login_job_browser_envelopes_keep_their_required_discriminators():
     assert set(problem) - {"error"} == {
         "code",
         "required_actions",
+        "context",
+        "retryable",
     }
     assert get_args(success["setup_login_source"]) == (
         "per_harness", "setup_job_admission", "legacy_global_operation",

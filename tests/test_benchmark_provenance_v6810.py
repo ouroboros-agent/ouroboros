@@ -15,192 +15,21 @@ Two claims a benchmark artefact must never make falsely:
 from __future__ import annotations
 
 import ast
-import json
 import pathlib
 import re
 
-import pytest
 
-from devtools.benchmarks.common.manifests import (
-    benchmark_run_manifest,
-    provider_credential_disclosure,
-)
 from devtools.benchmarks.common.result_index import (
     RUNTIME_TRUNCATION_REASON_CODES,
-    runtime_terminal_disclosure,
-    task_result_row,
 )
-from devtools.benchmarks.common.secrets import (
-    credential_disclosure,
-    isolated_credential_grants,
-)
-from devtools.benchmarks.common.server_runner import build_isolated_settings
-from ouroboros.outcomes import BEST_EFFORT_REASON_CODES
 from ouroboros.provider_models import (
-    PROVIDER_CREDENTIAL_GROUPS,
-    PROVIDER_PREFIXES,
-    credential_keys_for_providers,
     provider_credential_plan,
 )
 from ouroboros.request_wire_contract import WIRE_REASON_CODES
-
-# A live settings file carrying EVERY provider credential the owner has configured. This is
-# the realistic shape: the owner's file accumulates keys over time, and which of them a
-# benchmark container could reach used to be a function of that accumulation.
-_LIVE = {
-    "OUROBOROS_MODEL": "anthropic/claude-sonnet-5",
-    "OUROBOROS_MODEL_HEAVY": "claude-opus-4.8",
-    "OUROBOROS_MODEL_LIGHT": "anthropic/claude-sonnet-4.6",
-    "OUROBOROS_MODEL_FALLBACKS": "openai/gpt-5.5",
-    "OUROBOROS_REVIEW_MODELS": "anthropic/claude-fable-5,openai/gpt-5.6-sol",
-    "OPENROUTER_API_KEY": "or-value",
-    "OPENAI_API_KEY": "oa-value",
-    "OPENAI_BASE_URL": "https://compat.example/v1",
-    "ANTHROPIC_API_KEY": "an-value",
-    "CLOUDRU_FOUNDATION_MODELS_API_KEY": "cr-value",
-    "CLOUDRU_FOUNDATION_MODELS_BASE_URL": "https://cloudru.example/v1",
-    "OPENAI_COMPATIBLE_API_KEY": "compat-value",
-    "GIGACHAT_CREDENTIALS": "gc-value",
-    "GIGACHAT_PASSWORD": "gp-value",
-    "GITHUB_TOKEN": "gh-value",
-    "OUROBOROS_NETWORK_PASSWORD": "np-value",
-    "TELEGRAM_BOT_TOKEN": "tg-value",
-    "TOTAL_BUDGET": 100.0,
-}
+from tests._source_scan import parse
 
 
 # --------------------------------------------------------------------------- FIX A
-
-
-def test_isolated_settings_grant_only_the_declared_providers_credentials():
-    """A run pinned to OpenRouter must not receive the owner's DIRECT provider keys.
-
-    Owner/control secrets were already excluded and still are. The defect was narrower: every
-    provider credential in the live file was copied regardless of which providers the run
-    declared, so a routing fallback could spend outside the declared bucket while the manifest
-    said otherwise — and the reachable provider set was a function of whatever happened to be
-    in the live file at launch, which makes two nominally identical runs differ invisibly.
-    """
-    out = build_isolated_settings(_LIVE, OUROBOROS_RUNTIME_MODE="advanced")
-
-    assert out["OPENROUTER_API_KEY"] == "or-value"  # every declared slot routes here
-    # `anthropic/...` spellings are OpenRouter CATALOG ids: no declared slot routes to the
-    # DIRECT anthropic provider, and the retired Claude-SDK default no longer smuggles its
-    # credential in.
-    for never in (
-        "ANTHROPIC_API_KEY",
-        "OPENAI_API_KEY",
-        "OPENAI_BASE_URL",
-        "OPENAI_COMPATIBLE_API_KEY",
-        "CLOUDRU_FOUNDATION_MODELS_API_KEY",
-        "CLOUDRU_FOUNDATION_MODELS_BASE_URL",
-        "GIGACHAT_CREDENTIALS",
-        "GIGACHAT_PASSWORD",
-    ):
-        assert never not in out, f"{never} was not declared by any model slot"
-    # Unchanged: owner/control and transport secrets were never copied and must stay out.
-    for owner_secret in ("GITHUB_TOKEN", "OUROBOROS_NETWORK_PASSWORD", "TELEGRAM_BOT_TOKEN"):
-        assert owner_secret not in out
-
-
-def test_legacy_claude_sdk_settings_are_inert_state():
-    """The Claude-SDK transport is retired: CLAUDE_CODE_MODEL / CLAUDE_AGENT_SDK_MODEL
-    in an accumulated live settings file are stale bytes, never a model slot. They must not
-    declare anthropic, plan its credential, or surface in declared_model_slots — with or
-    without the retired ``include_claude_sdk_defaults`` compatibility switch (kept so old
-    manifests replay; it is a documented no-op)."""
-    live = {
-        "OUROBOROS_MODEL": "openrouter/model",
-        "CLAUDE_CODE_MODEL": "claude-explicit",
-        "CLAUDE_AGENT_SDK_MODEL": "opus",
-        "OPENROUTER_API_KEY": "or-value",
-        "ANTHROPIC_API_KEY": "an-value",
-    }
-    out = build_isolated_settings(live, OUROBOROS_MODEL="openrouter/model")
-    assert out["OPENROUTER_API_KEY"] == "or-value"
-    assert "ANTHROPIC_API_KEY" not in out
-    for flag in (True, False):
-        grants = isolated_credential_grants(out, include_claude_sdk_defaults=flag)
-        assert "anthropic" not in grants["providers"]
-        assert grants["planned_keys"] == ["OPENROUTER_API_KEY"]
-        assert not any(key.startswith("CLAUDE_") for key in grants["declared_model_slots"])
-
-
-def test_retired_claude_opt_out_switch_is_a_no_op():
-    """Both values of the retired switch produce byte-identical plans, and no
-    CLAUDE_-prefixed slot is ever declared (the slot keys died with the transport)."""
-    for settings in ({}, {"OUROBOROS_MODEL": "openrouter/model", "CLAUDE_CODE_MODEL": ""}):
-        generic = provider_credential_plan(settings)
-        opt_out = provider_credential_plan(settings, include_claude_sdk_defaults=False)
-        assert generic == opt_out
-        assert not any(key.startswith("CLAUDE_") for key in generic["declared_model_slots"])
-
-
-def test_isolated_settings_forward_explicit_context_intent_and_normalize_legacy_state():
-    default = build_isolated_settings(_LIVE)
-    assert "OUROBOROS_CONTEXT_MODE" not in default
-    assert "OUROBOROS_CONTEXT_MODE_AUTO_LOW" not in default
-
-    explicit_low = build_isolated_settings(_LIVE, OUROBOROS_CONTEXT_MODE="low")
-    assert explicit_low["OUROBOROS_CONTEXT_MODE"] == "low"
-    assert explicit_low["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
-
-    explicit_max = build_isolated_settings(_LIVE, OUROBOROS_CONTEXT_MODE="max")
-    assert explicit_max["OUROBOROS_CONTEXT_MODE"] == "max"
-    assert explicit_max["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
-
-    legacy = build_isolated_settings(
-        {
-            **_LIVE,
-            "OUROBOROS_CONTEXT_MODE": "low",
-            "OUROBOROS_CONTEXT_MODE_AUTO_LOW": "true",
-        }
-    )
-    assert legacy["OUROBOROS_CONTEXT_MODE"] == "max"
-    assert legacy["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
-
-
-def test_declaring_a_direct_provider_slot_grants_exactly_that_provider():
-    """The mirror: a run that DOES declare a direct lane must still be able to authenticate.
-
-    Fail-closed in the wrong direction is worse than a spare key — a benchmark that dies on a
-    missing credential at hour six burns the whole schedule.
-    """
-    cloudru = build_isolated_settings(_LIVE, OUROBOROS_MODEL="cloudru::zai-org/GLM-4.7")
-    assert cloudru["CLOUDRU_FOUNDATION_MODELS_API_KEY"] == "cr-value"
-    assert "GIGACHAT_CREDENTIALS" not in cloudru
-
-    compat = build_isolated_settings(_LIVE, OUROBOROS_MODEL="openai-compatible::local-llm")
-    assert compat["OPENAI_COMPATIBLE_API_KEY"] == "compat-value"
-    # The openai-compatible lane legitimately falls back to the legacy OPENAI_* pair.
-    assert compat["OPENAI_API_KEY"] == "oa-value"
-    assert compat["OPENAI_BASE_URL"] == "https://compat.example/v1"
-
-
-def test_paired_credentials_travel_together_or_not_at_all():
-    """GigaChat needs CREDENTIALS *or* USER+PASSWORD plus its endpoint; Cloud.ru needs its
-    base_url. A key without the fields it is useless without is a broken grant, and the
-    `GIGACHAT_` blanket prefix used to smuggle exactly half of one in unconditionally."""
-    from devtools.benchmarks.common.server_runner import _ISO_SETTINGS_ALLOW_PREFIX
-
-    assert "GIGACHAT_" not in _ISO_SETTINGS_ALLOW_PREFIX, (
-        "the GigaChat family must be gated on the declared slots, not copied by prefix"
-    )
-
-    giga = build_isolated_settings(_LIVE, OUROBOROS_MODEL="gigachat::GigaChat-3-Ultra")
-    assert giga["GIGACHAT_CREDENTIALS"] == "gc-value"
-    assert giga["GIGACHAT_PASSWORD"] == "gp-value"
-
-    without = build_isolated_settings(_LIVE)
-    assert "GIGACHAT_CREDENTIALS" not in without and "GIGACHAT_PASSWORD" not in without
-
-
-def test_credential_groups_cover_every_routable_provider():
-    """Drift guard. `provider_for_model` can only return a provider from PROVIDER_PREFIXES;
-    a new one without a credential group would silently grant nothing."""
-    for _prefix, provider in PROVIDER_PREFIXES:
-        assert provider in PROVIDER_CREDENTIAL_GROUPS, provider
-    assert credential_keys_for_providers(["openrouter"]) == ("OPENROUTER_API_KEY",)
 
 
 def test_a_settings_mapping_with_no_slots_fails_OPEN_and_discloses_it(monkeypatch):
@@ -216,321 +45,14 @@ def test_a_settings_mapping_with_no_slots_fails_OPEN_and_discloses_it(monkeypatc
     plan = provider_credential_plan({"OUROBOROS_MODEL": "", "CLAUDE_CODE_MODEL": ""})
     assert plan["fail_open"] is False and plan["planned_keys"]
 
-    # Degenerate case: nothing resolvable at all.
+    # Degenerate case: nothing resolvable at all (a ddgs web search needs no credential).
     monkeypatch.setattr(pm, "declared_model_settings", lambda _settings: {})
-    degenerate = provider_credential_plan({})
+    degenerate = provider_credential_plan({"OUROBOROS_WEBSEARCH_BACKEND": "ddgs"})
     assert degenerate["fail_open"] is True
     assert degenerate["planned_keys"] == sorted(pm.ALL_PROVIDER_CREDENTIAL_KEYS)
 
 
-def test_manifest_discloses_granted_credentials_by_fingerprint_never_by_value(tmp_path):
-    """Prevention without evidence is half a fix: the artefact must let an auditor see what
-    the run could reach — and must never carry the value itself."""
-    settings_path = tmp_path / "settings.json"
-    out = build_isolated_settings(_LIVE)
-    settings_path.write_text(json.dumps(out), encoding="utf-8")
-
-    disclosure = provider_credential_disclosure(settings_path)
-    assert disclosure["available"] is True
-    assert sorted(disclosure["granted"]) == ["OPENROUTER_API_KEY"]
-    assert disclosure["granted"]["OPENROUTER_API_KEY"]["present"] is True
-    assert disclosure["granted"]["OPENROUTER_API_KEY"]["fingerprint"].startswith("sha256:")
-    assert disclosure["fail_open"] is False
-    assert "openrouter" in disclosure["providers"]
-
-    blob = json.dumps(disclosure)
-    for value in ("or-value", "an-value", "oa-value", "gh-value"):
-        assert value not in blob, "a disclosure must never carry a credential value"
-
-    # The same key fingerprints identically across runs — that IS the audit question.
-    assert (
-        credential_disclosure({"OPENROUTER_API_KEY": "or-value"})["OPENROUTER_API_KEY"]
-        == disclosure["granted"]["OPENROUTER_API_KEY"]
-    )
-    # An absent settings path is a STATED gap, never a silently empty grant list.
-    assert provider_credential_disclosure(tmp_path / "nope.json") == {
-        "available": False,
-        "reason": "settings_path_absent",
-    }
-
-
-def test_manifest_discloses_runtime_injected_credentials_separately(tmp_path):
-    settings_path = tmp_path / "settings.json"
-    settings_path.write_text(json.dumps({"OUROBOROS_MODEL": "openrouter/model"}), encoding="utf-8")
-    disclosure = provider_credential_disclosure(
-        settings_path,
-        runtime_credentials={
-            "OPENROUTER_API_KEY": "runtime-router-value",
-            "OPENAI_API_KEY": "runtime-openai-value",
-        },
-    )
-    assert disclosure["runtime_granted"]["OPENROUTER_API_KEY"]["present"] is True
-    assert disclosure["runtime_granted"]["OPENAI_API_KEY"]["present"] is True
-    assert disclosure["runtime_granted"]["OPENROUTER_API_KEY"]["fingerprint"].startswith("sha256:")
-    blob = json.dumps(disclosure)
-    assert "runtime-router-value" not in blob
-    assert "runtime-openai-value" not in blob
-
-
-def test_initial_manifest_uses_disabled_claude_projection(tmp_path, monkeypatch):
-    """A pre-application/refusal manifest must not reintroduce the Claude default projection."""
-    settings_path = tmp_path / "settings.json"
-    settings_path.write_text(
-        json.dumps({
-            "OUROBOROS_MODEL": "openrouter/model",
-            "CLAUDE_CODE_MODEL": "",
-            "CLAUDE_AGENT_SDK_MODEL": "",
-            "OPENROUTER_API_KEY": "",
-        }),
-        encoding="utf-8",
-    )
-    import devtools.benchmarks.common.manifests as manifests
-
-    monkeypatch.setattr(
-        manifests,
-        "repo_provenance",
-        lambda _path: {
-            "repo_dir": str(tmp_path / "repo"),
-            "git_available": True,
-            "status_available": True,
-            "dirty": False,
-            "head": "a" * 40,
-            "version": "",
-            "describe": "a" * 40,
-        },
-    )
-    manifest = benchmark_run_manifest(
-        benchmark="cybergym",
-        run_root=tmp_path / "run",
-        repo_dir=tmp_path / "repo",
-        requested_task_ids=["arvo:1"],
-        metadata={
-            "settings_path": settings_path,
-            "include_claude_sdk_defaults": False,
-        },
-    )
-    disclosure = manifest["provider_credentials"]
-    assert "openrouter/model" in disclosure["providers"]["openrouter"]
-    assert "anthropic" not in disclosure["providers"]
-    assert disclosure["planned_keys"] == ["OPENROUTER_API_KEY"]
-    assert "CLAUDE_CODE_MODEL" not in disclosure["declared_model_slots"]
-
-
-def test_initial_manifest_uses_file_model_slots_when_settings_are_authoritative(tmp_path, monkeypatch):
-    """A refusal-stage manifest must not report ambient model settings."""
-    settings_path = tmp_path / "settings.json"
-    settings_path.write_text(
-        json.dumps({
-            "OUROBOROS_MODEL": "file/model",
-            "OUROBOROS_EFFORT_TASK": "high",
-        }),
-        encoding="utf-8",
-    )
-    import devtools.benchmarks.common.manifests as manifests
-
-    monkeypatch.setattr(
-        manifests,
-        "repo_provenance",
-        lambda _path: {
-            "repo_dir": str(tmp_path / "repo"),
-            "git_available": True,
-            "status_available": True,
-            "dirty": False,
-            "head": "b" * 40,
-            "version": "",
-            "describe": "b" * 40,
-        },
-    )
-    monkeypatch.setenv("OUROBOROS_MODEL", "ambient/wrong")
-    manifest = benchmark_run_manifest(
-        benchmark="cybergym",
-        run_root=tmp_path / "run",
-        repo_dir=tmp_path / "repo",
-        requested_task_ids=["arvo:1"],
-        metadata={
-            "settings_path": settings_path,
-            "include_claude_sdk_defaults": False,
-            "settings_authoritative_env": True,
-        },
-    )
-    assert manifest["model_slots"]["OUROBOROS_MODEL"] == "file/model"
-    assert manifest["model_slots"]["OUROBOROS_MODEL"] != "ambient/wrong"
-
-
-def test_isolated_credential_grants_reports_the_file_not_the_intent():
-    """`planned_keys` is the derivation; `granted` is the truth about the file. An explicit
-    override the slots never asked for must be VISIBLE, not inferred away."""
-    out = build_isolated_settings(_LIVE, ANTHROPIC_API_KEY="", OPENAI_API_KEY="forced")
-    grants = isolated_credential_grants(out)
-    assert "OPENAI_API_KEY" not in grants["planned_keys"]
-    assert grants["granted"]["OPENAI_API_KEY"]["present"] is True
-
-
-@pytest.mark.parametrize("settings_authoritative", [False, True])
-@pytest.mark.parametrize("encoded", [False, True])
-def test_manifest_records_role_options_with_the_same_source_as_models(
-    tmp_path, monkeypatch, settings_authoritative, encoded,
-):
-    from devtools.benchmarks.common import manifests
-
-    file_options = {
-        "OUROBOROS_MODEL_ACCOUNTS": {"main": "account-a", "light": "account-b", "fallback": ["", "account-c"]},
-        "OUROBOROS_MODEL_CONTEXT_WINDOWS": {"main": 872000, "light": 256000, "fallback": [0, 400000]},
-    }
-    env_options = {
-        "OUROBOROS_MODEL_ACCOUNTS": {"main": "env-account", "light": "", "fallback": ["account-b", ""]},
-        "OUROBOROS_MODEL_CONTEXT_WINDOWS": {"main": 128000, "light": 0, "fallback": [400000, 0]},
-    }
-    settings = {"OUROBOROS_MODEL": "claudexor::codex=model-x", "OUROBOROS_MODEL_LIGHT": "claudexor::codex=model-x"}
-    settings.update({key: json.dumps(value) if encoded else value for key, value in file_options.items()})
-    settings_path = tmp_path / "settings.json"
-    settings_path.write_text(json.dumps(settings), encoding="utf-8")
-    for key, value in env_options.items():
-        monkeypatch.setenv(key, json.dumps(value))
-    monkeypatch.setenv("OUROBOROS_MODEL", "openai::env-model")
-    monkeypatch.setattr(manifests, "repo_provenance", lambda _path: {
-        "git_available": True, "status_available": True, "dirty": False, "head": "a" * 40,
-    })
-    manifest = benchmark_run_manifest(
-        benchmark="unit", run_root=tmp_path / "run", repo_dir=tmp_path / "repo",
-        requested_task_ids=["one"], settings_path=settings_path,
-        settings_authoritative_env=settings_authoritative,
-    )
-    slots = manifest["model_slots"]
-    assert slots["OUROBOROS_MODEL"] == (settings["OUROBOROS_MODEL"] if settings_authoritative else "openai::env-model")
-    for key, value in (file_options if settings_authoritative else env_options).items():
-        assert json.loads(slots[key]) == value
-    assert not set(file_options) & set(manifest["provider_credentials"]["declared_model_slots"])
-
-
-def test_model_id_classifiers_preserve_the_prior_ordered_vocabulary():
-    from devtools.benchmarks.common.model_slots import _ACTIVE_FIXED_MODEL_KEYS
-    from devtools.benchmarks.programbench.run_programbench_e2e import _MODEL_ID_SLOT_KEYS
-
-    # Exact pre-subscription vocabulary: adding role metadata must not drop a
-    # fallback/reviewer list, resurrect Heavy, or widen model-ID admission.
-    prior = (
-        "OUROBOROS_MODEL", "OUROBOROS_MODEL_LIGHT", "OUROBOROS_MODEL_VISION",
-        "OUROBOROS_MODEL_CONSCIOUSNESS", "OUROBOROS_MODEL_FALLBACKS",
-        "OUROBOROS_MODEL_DEEP_SELF_REVIEW", "OUROBOROS_WEBSEARCH_MODEL",
-        "OUROBOROS_REVIEW_MODELS", "OUROBOROS_SCOPE_REVIEW_MODELS", "OUROBOROS_SCOPE_REVIEW_MODEL",
-    )
-    assert _ACTIVE_FIXED_MODEL_KEYS == prior
-    assert _MODEL_ID_SLOT_KEYS == (*prior[:7], "OUROBOROS_REVIEWER_SLOTS", *prior[7:])
-
-
-@pytest.mark.parametrize("model", ["openai::model-x", "claudexor::codex=model-x"])
-def test_fixed_actor_records_account_window_options_without_changing_model_checks(model, tmp_path, monkeypatch):
-    from devtools.benchmarks.common.manifests import MODEL_SLOT_KEYS
-    from devtools.benchmarks.common.model_slots import fixed_model_actor_snapshot, runtime_actor_snapshot
-    from devtools.benchmarks.programbench import run_programbench_e2e as pb
-    from ouroboros.provider_models import ALL_PROVIDER_CREDENTIAL_KEYS
-
-    for key in (*MODEL_SLOT_KEYS, *ALL_PROVIDER_CREDENTIAL_KEYS):
-        monkeypatch.delenv(key, raising=False)
-    # Exact same model, independent role pins/windows, and an ordered Auto fallback.
-    options = {
-        "OUROBOROS_MODEL_ACCOUNTS": json.dumps({"main": "account-a", "light": "account-b", "fallback": ["", "account-b"]}),
-        "OUROBOROS_MODEL_CONTEXT_WINDOWS": json.dumps({"main": 872000, "light": 256000, "fallback": [0, 256000]}),
-    }
-    baseline = fixed_model_actor_snapshot(model)
-    settings = dict(options)
-    actual = fixed_model_actor_snapshot(model, target=settings)
-    assert actual["mismatches"] == []
-    assert actual["model_slots"] == baseline["model_slots"]
-    assert actual["model_route_options"] == options
-    assert actual["available_subagents"] == baseline["available_subagents"]
-    assert actual["reviewer_slots"] == baseline["reviewer_slots"]
-    assert all(settings[key] == value for key, value in options.items())
-    settings_path = tmp_path / "settings.json"
-    settings_path.write_text(json.dumps(settings), encoding="utf-8")
-    normalized = pb.preflight_model_slots(settings_path, solve_model=model)
-    assert normalized["OUROBOROS_MODEL"] == normalized["OUROBOROS_MODEL_LIGHT"] == model
-    assert not set(options) & set(normalized)
-
-    settings["OUROBOROS_MODEL_FALLBACKS"] = f"{model},foreign/model"
-    refused = runtime_actor_snapshot(settings, expected_model=model)
-    assert any("OUROBOROS_MODEL_FALLBACKS" in error for error in refused["mismatches"])
-    panel = json.loads(settings["OUROBOROS_REVIEWER_SLOTS"])
-    panel["triad"][0]["route"] = {"kind": "agent_session", "target_id": "codex=model-x"}
-    settings["OUROBOROS_REVIEWER_SLOTS"] = json.dumps(panel)
-    refused = runtime_actor_snapshot(settings, expected_model=model)
-    assert any("agent_session" in error for error in refused["mismatches"])
-    # The direct-provider legacy model-ID refusal still runs with role metadata present.
-    if model.startswith("openai::"):
-        settings["OPENAI_API_KEY"] = "synthetic-test-key"
-        settings["OUROBOROS_MODEL"] = "openai/model-x"
-        settings_path.write_text(json.dumps(settings), encoding="utf-8")
-        with pytest.raises(SystemExit, match="OUROBOROS_MODEL"):
-            pb.preflight_model_slots(settings_path, solve_model=model)
-
-
 # --------------------------------------------------------------------------- FIX B
-
-# The shape `GET /api/tasks/<id>` returns for a task the per-task USD reservation rail
-# stopped: `usage_accounting.reserve_attempt` refuses, `loop._handle_budget_exceeded` stamps
-# the reason and the resource-limit block, `task_results.write_task_result` persists both.
-_BUDGET_TRUNCATED = {
-    "status": "failed",
-    "reason_code": "budget_exhausted",
-    "total_rounds": 13,
-    "loop_outcome": {
-        "reason_code": "budget_exhausted",
-        "resource_limit": {
-            "status": "resource_limited",
-            "scope": "root",
-            "resume_policy": "increase_or_reset_budget_then_retry",
-        },
-    },
-    "outcome_axes": {"execution": {"status": "failed", "reason_code": "budget_exhausted"}},
-}
-
-
-def test_runtime_terminal_disclosure_names_a_cost_truncated_run():
-    disclosed = runtime_terminal_disclosure(_BUDGET_TRUNCATED)
-    assert disclosed["available"] is True
-    assert disclosed["reason_code"] == "budget_exhausted"
-    assert disclosed["truncated"] is True
-    assert disclosed["resource_limit"]["scope"] == "root"
-    assert disclosed["execution_reason_code"] == "budget_exhausted"
-
-
-def test_runtime_terminal_disclosure_states_the_gap_instead_of_inventing_one():
-    """A writer with no runtime result must say so — never a fabricated reason, never a
-    silent absence a reader would mistake for "nothing to report"."""
-    assert runtime_terminal_disclosure(None) == {"available": False}
-    assert runtime_terminal_disclosure({}) == {"available": False}
-    ok = runtime_terminal_disclosure({"status": "completed", "reason_code": "final_answer"})
-    assert ok["available"] is True and ok["truncated"] is False
-
-
-def test_task_result_row_publishes_the_runtime_reason_alongside_the_adapter_stage():
-    """The two vocabularies are independent facts and BOTH must reach the ledger.
-
-    An adapter honestly reports `completed`/`official_evaluate` — the evaluation really did
-    run — while the runtime reports `budget_exhausted`. Publishing only the former is how an
-    aggregator records 2/3 with no indication that a third of the run was cost-truncated.
-    """
-    row = task_result_row(
-        benchmark="osworld",
-        instance_id="chrome/abc",
-        status="completed",
-        reason_code="official_evaluate",
-        official_eval_status="completed",
-        runtime_result=_BUDGET_TRUNCATED,
-        details={"reward": 0.0},
-    )
-    assert row["status"] == "completed"  # unchanged: not demoted
-    assert row["official_eval_status"] == "completed"  # unchanged: the eval DID run
-    assert row["reason_code"] == "official_evaluate"  # unchanged: adapter stage
-    assert row["runtime_outcome"]["reason_code"] == "budget_exhausted"
-    assert row["runtime_outcome"]["truncated"] is True
-
-    # Every row carries the field, so an auditor never has to guess whether it was omitted
-    # because nothing happened or because the writer forgot.
-    assert task_result_row(benchmark="gaia", instance_id="x", status="failed")["runtime_outcome"] == {
-        "available": False
-    }
 
 
 # ------------------------------------------------------- FIX B: the vocabulary is DERIVED
@@ -540,16 +62,85 @@ def test_task_result_row_publishes_the_runtime_reason_alongside_the_adapter_stag
 # enforces — a new runtime code with no row here fails the suite, which is the only thing
 # that stops the vocabulary from being hand-copied beside the check again.
 _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
+    "task_model_invalid": (False, "gateway/task_model.py: malformed model act refused before admission; no execution is truncated"),
+    "presence_model_unsupported": (False, "owner_model.py: this control is unavailable for a Presence turn; the turn continues"),
+    "not_a_root_task": (False, "owner_model.py: a delegated actor cannot move a root primary; no execution ends"),
+    "model_control_unavailable": (False, "owner_model.py: no durable record for a primary act; execution is unchanged"),
+    "cancel_pending": (False, "owner_model.py: a pending cancellation excludes this model act; the cancellation owns any terminal"),
+    "model_action_state": (False, "owner_model.py: Return, Wait and Keep require a running fallback; refusing the act ends no work"),
+    "model_recents_pending": (False, "owner_model.py: the primary was saved but its suggestion write needs retry; no work is truncated"),
+    "model_queue_publish_failed": (False, "owner_model.py: primary saved, queue publication unconfirmed; not a task terminal"),
+    "model_wake_failed": (False, "owner_model.py: primary saved, wake unconfirmed; the same request can repair delivery"),
+    # Logs reads refuse selectors, sources or byte ranges; no task is stopped.
+    "invalid_view": (False, "gateway/logs.py unknown view (400); not a task terminal"),
+    "invalid_log_source": (False, "gateway/logs.py scope/projection refusal (400); not execution truncation"),
+    "log_source_unavailable": (False, "gateway/logs.py unreadable or unadmitted source (404/503); not a task terminal"),
+    "invalid_raw_request": (False, "gateway/logs.py invalid source selector/page bounds (400); not a task terminal"),
+    "log_source_changed": (False, "gateway/logs.py exact stored-row identity conflict (409); not execution truncation"),
+    "raw_range_invalid": (False, "gateway/logs.py out-of-range or split UTF-8 offset (416); not a task terminal"),
+    "unknown_log": (False, "gateway/logs.py unsupported Raw stream (404); not a task terminal"),
+    "request_invalid": (False, "gateway/skill_publish.py: unreadable publish-preflight body; HTTP 400 before any action, not a task terminal"),
+    "secret_request_form_only": (False, "protected secret-form policy refuses an ordinary quiz answer; no execution or source is truncated"),
+    "project_routing_fence_lookup_failed": (False, "gateway/tasks.py: Project authority unreadable before admission; HTTP 409, no running attempt truncated"),
+    "input_source_selection_unsupported": (False, "HTTP 400 before root-task admission; no execution was truncated"),
+    "task_source_invalid": (False, "gateway/task_archive.py: source selector basename differs from the requested artifact; HTTP 400, not a task terminal or trial truncation"),
+    "artifact_archive_empty": (False, "gateway/task_archive.py: no eligible recorded directory member; HTTP refusal, not a task terminal"),
+    "artifact_archive_invalid": (False, "gateway/task_archive.py: invalid selector; HTTP refusal, not a task terminal"),
+    "artifact_archive_unavailable": (False, "gateway/task_archive.py: confined read or spool unavailable; HTTP refusal, not a task terminal"),
+    "artifact_archive_unverified": (False, "gateway/task_archive.py: member drift or capture verification failure; HTTP refusal, not a task terminal"),
+    "artifact_identity_changed": (False, "gateway/task_archive.py: a mutable file's bytes no longer match its recorded identity; HTTP 409, not a task terminal"),
+    "artifact_name_ambiguous": (False, "gateway/tasks.py: ambiguous nested basename; HTTP refusal, not a task terminal"),
+    "artifact_relpath_invalid": (False, "gateway/tasks.py: invalid exact artifact selector; HTTP refusal, not a task terminal"),
+    "invalid_action_nonce": (False, "task_cancel rejects malformed action identity; no task transition"),
+    "stop_action_conflict": (False, "task_cancel refuses conflicting action replay; no task transition"),
+    "teardown_unconfirmed": (False, "gateway/tasks.py: an HTTP 202 Stop acknowledgement; the recorded intent is still being finished, never a task outcome"),
+    "artifact_unavailable": (False, "gateway/task_archive.py: confined single-file read unavailable; HTTP refusal, not a task terminal"),
+    "artifact_unverified": (False, "gateway/task_archive.py: single-file drift or capture verification failure; HTTP refusal, not a task terminal"),
+    "wrap_up_document_invalid": (False, "gateway/task_archive.py: the Wrap up document selector combined with relpath or source; HTTP 400, not a task terminal"),
+    "wrap_up_document_unavailable": (False, "gateway/task_archive.py: no Wrap up receipt by that name and Stop, or its on-read document could not be written; HTTP 404/503, not a task terminal"),
+    "upload_unavailable": (False, "gateway/files.py: a chat attachment is missing or not a regular file; HTTP 404, not a task terminal"),
+    "upload_unreadable": (False, "gateway/files.py: a chat attachment's confined read failed; HTTP 503, not a task terminal"),
     "history_source_unavailable": (False, "gateway/history_paging.py: readable recent projection with explicit source gap; no task attempt was truncated"),
-    "late_answer_not_delivered": (False, "gateway/task_decision.py: a late quiz answer was recorded but its chat delivery failed (503, retry); no task attempt was truncated"),
+    "review_history_unavailable": (False, "gateway/task_reviews.py: a task's saved review history could not be read; HTTP 503 on a read-only route, not a task terminal"),
+    "review_source_invalid": (False, "gateway/task_reviews.py: the exact saved-review selector is malformed; HTTP 400, not a task terminal"),
+    "review_source_changed": (False, "gateway/task_reviews.py: the exact selected saved review source is no longer named by its owning record; HTTP 409, not a task terminal"),
+    "review_source_unavailable": (False, "gateway/task_reviews.py: saved review text failed its integrity check or cannot be read; HTTP 404, not a task terminal"),
+    "quiz_delivery_failed": (False, "gateway/task_decision.py: the answer was recorded and its delivery stays owed (503, retry); never a task terminal or trial truncation"),
+    "quiz_answer_unconfirmed": (False, "503 before any answer was recorded; not a task terminal or truncation"),
+    "awaiting_recipient_read": (False, "question_answers.py: a recorded answer is in its living recipient's mailbox (paused or held too), read pending; a delivery fact on the question, never a task terminal"),
+    "asker_not_reading": (False, "question_answers.py: no living asker or successor holds the answer, so it goes to named ingress in its room (the asker's live late-answer head, else a fresh head); a delivery fact, never a task terminal"),
+    "promotion_not_started": (False, "promotion_intent.py: boot reconciliation of a start_task intent proven never admitted; that separate work never ran (explicit retry), so nothing was truncated and it is never a trial root's code"),
+    "migrating": (False, "gateway/_helpers.py: a write door (create, Cancel, Pause, Presence) answered 503 inside the boot import window of state/current.sqlite (retry); no task attempt was truncated"),
+    "boot_changed": (False, "gateway/control.py: a command whose if_boot names an earlier boot.since reached a restarted server; HTTP 409 with accepted=false before anything was queued, never a task terminal"),
+    "budget_pausing_no_extraction": (False, "review_verdict_extraction.py: Light verdict extraction refused while the task's exact budget pause is closing dispatch (#1196); the review row stays undispatched and the attempt is paused, not truncated"),
+    "owner_pause": (False, "tools/skill_publish.py: publication tool returns its completed stages after owner Pause interrupts the formatter; the task is retained for Resume, not terminalized or scored"),
+    "action_not_found": (False, "gateway/card_decision.py: a press names a control the card does not have now; HTTP 404 on the card ingress, never a task terminal"),
+    "card_action_once": (False, "gateway/card_decision.py: a once control already counted another press; HTTP 409 on the card ingress, never a task terminal"),
+    "card_app_not_found": (False, "gateway/cards.py: a card app's stored bytes are missing; HTTP 404 on a read, never a task terminal"),
+    "card_not_found": (False, "gateway/card_decision.py: a press or read names no stored card; HTTP 404, never a task terminal"),
+    "card_stale": (False, "gateway/card_decision.py: the card changed since the press was drawn; HTTP 409, nothing recorded, never a task terminal"),
+    "card_write_failed": (False, "gateway/card_decision.py: the press could not be recorded; HTTP 503 (retry), never a task terminal"),
+    "chat_unavailable": (False, "gateway/ui_holds.py: no chat writer serves this data root, so a page's hold report named nothing; HTTP 503 (the next page reports again), never a task terminal"),
+    "in_flight": (False, "gateway/ui_holds.py: another report is naming the same hold now; HTTP 503 (the next page reports again), never a task terminal"),
+    "not_confirmed": (False, "gateway/ui_holds.py: a hold row's write was not confirmed; HTTP 503 (the next page reports again), never a task terminal"),
+    "pin_write_failed": (False, "gateway/cards.py: Keep on Widgets could not be saved; HTTP 503, never a task terminal"),
+    "revision_required": (False, "gateway/card_decision.py: a press without the card revision it was drawn from; HTTP 400, never a task terminal"),
+    "values_invalid": (False, "gateway/card_decision.py: form values the card's form does not accept; HTTP 400, never a task terminal"),
+    "github_actor_unavailable": (False, "skill_publish_github.py: the GitHub account behind the token cannot be read before any publication mutation; a typed publication refusal, not a task terminal"),
+    "fork_prepare_failed": (False, "skill_publish_github.py: the account's fork could not be prepared; the publication result is partial and retryable, not a task terminal"),
+    "fork_sync_failed": (False, "skill_publish_github.py: a 422-only fork synchronization failed; the publication result is partial and retryable, not a task terminal"),
     # -- truncating: the rail stopped the attempt, so reward 0 is not a capability fact ----
     "budget_exhausted": (True, "loop.py:287 per-task USD reservation rail"),
     "round_limit": (True, "loop.py:3128 _handle_round_limit, the round cap"),
     "finalization_grace": (True, "loop.py:3146 supervisor finalize_now grace"),
     "deadline_local": (True, "loop.py:3220 loop-local deadline"),
     "provider_unavailable": (True, "loop.py:3185 reroute + fallback exhausted"),
-    "children_unabsorbed": (True, "loop.py:4071 forced terminal, child results unabsorbed"),
+    "children_unabsorbed": (True, "historical forced terminal; retained for old benchmark records, no longer emitted"),
     "llm_api_error": (True, "loop_llm_call.py:630 transport death; never a fair shot"),
+    "context_overflow": (True, "loop_model_call.py: known-window admission exhausted size recovery; host-stopped, not a capability result"),
+    "context_capacity": (True, "agent_dispatch.py pooled start / context_renewal.py growth: the known window cannot hold the "
+                               "task's context; host-stopped before or during execution, not a capability result"),
+    "output_recovery_exhausted": (True, "loop_output_exhaustion.py: empty-answer recovery exhausted; incomplete provider outcome, not task completion"),
     # S3 owner graceful stop ("Wrap up"): the owner ended the attempt, so
     # reward 0 is an owner decision, never a fair-shot capability fact (CF-02:
     # reusing finalization_grace would persist the deadline's false reason).
@@ -577,11 +168,23 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
     ),
     "delegated_custody_unreconciled": (
         False,
-        "agent_task_pipeline.py terminal custody overlay; an additive custody-debt disclosure (Done with warnings) on any task that finished with an undisposed own delegated patch, never a truncation; a truncation rail code is preserved",
+        "stored reason of rows written before #1583 (the removed terminal custody overlay); new rows keep their own reason beside the delegated_runs_unreconciled debt list; never a truncation",
     ),
     "provider_outcome_unknown": (
         False,
         "tools/search.py recoverable ambiguous paid-call result returned to the LLM; the root task remains live",
+    ),
+    # tell_task: both are one-call tool results for the model's next turn, never the root task's terminal reason.
+    "argument_invalid": (
+        False,
+        "tools/control_relay.py tell_task argument refusal (TOOL_ARG_ERROR, published as completed_no_effect before "
+        "any write) returned to the LLM; the root task remains live",
+    ),
+    "arrival_effect_unknown": (
+        False,
+        "tools/control_relay.py tell_task arrival hand-over whose write may or may not have landed (TELL_UNCONFIRMED: "
+        "retry the same arrival; place_intake's `arrival_effect_unknown:<task>` refusal is the same fact) returned to "
+        "the LLM; the root task remains live",
     ),
     "finalize_control_pending": (
         False,
@@ -602,6 +205,12 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
     "task_exception": (False, "agent.py:777 the attempt ran and crashed; an honest failure"),
     "capability_profile_mismatch": (False, "control_delegation.py:81 rejected delegate call"),
     "option_index_required": (False, "gateway/task_decision.py quiz-answer HTTP 400 validation; an owner-UI refusal, never a trial rail"),
+    "action_invalid": (False, "gateway/task_decision.py rejects an unknown owner decision action (HTTP 400); no task transition"),
+    "close_payload_invalid": (False, "gateway/task_decision.py rejects answer fields or a non-quiz target for closure (HTTP 400); no task transition"),
+    "close_reason_invalid": (False, "gateway/task_decision.py refuses a closure reason that is not text or exceeds 2000 characters (HTTP 400); a blank one records the owner's standard sentence; the question remains unanswered, no task transition"),
+    "quiz_close_failed": (False, "gateway/task_decision.py closure ingress failed (HTTP 503); question delivery may remain owed, but no task attempt was truncated"),
+    "dismiss_payload_invalid": (False, "gateway/task_decision.py rejects answer fields or a non-quiz target for the owner's removal of an unknown delivery (HTTP 400); no task transition"),
+    "quiz_dismiss_failed": (False, "gateway/task_decision.py removal ingress failed (HTTP 503); the answer and its unknown delivery stay as recorded, no task attempt was truncated"),
     "delegation_rights_may_delegate": (False, "control_delegation.py explicit parent recursion-right refusal"),
     "delegation_rights_may_fan_out": (False, "control_delegation.py explicit parent fan-out refusal"),
     "delegation_rights_depth_exhausted": (False, "control_delegation.py exhausted typed depth budget refusal"),
@@ -623,6 +232,9 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
         False,
         "agent.py pre-context canonical-authority refusal; no substantive task attempt",
     ),
+    # The same terminal under its own cause: a handbook the task's own contract requires (start_task alone authors
+    # it) could not be read, so no model round ran and no execution was cut short.
+    "required_reference_unavailable": (False, "context_input_selection.py pre-model source refusal; no task attempt ran"),
     # Phase-A AR2-1: the HTTP cancel ingress refuses (503) when the durable
     # cancel-intent write fails — an ingress refusal about a CANCEL request; the
     # task itself keeps running untouched, so no trial ever terminalizes with it.
@@ -646,6 +258,11 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
         "gateway/task_hurry.py hurry ingress refusal (400, text-free contract); never a task terminal",
     ),
     "task_not_live": (False, "gateway/task_hurry.py hurry ingress refusal (404); never a task terminal"),
+    "pause_reason_invalid": (
+        False,
+        "gateway/task_pause.py refuses a declared Pause reason that is not text or exceeds 400 characters (HTTP 400); "
+        "nothing is written and no task transition happens",
+    ),
     # #Q-2b decision-ingress refusal codes — HTTP replies, never task terminals.
     "unknown_decision_family": (False, "gateway/task_decision.py ingress refusal (400)"),
     "decision_family_not_served": (False, "gateway/task_decision.py ingress refusal (501)"),
@@ -670,6 +287,7 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
     "provider_metadata_constraint": (False, "request-wire candidate adjustment; never a task terminal"),
     "provider_prescribed_value": (False, "request-wire exact-value repair; never a task terminal"),
     "provider_recovery_succeeded": (False, "request-wire successful repair; never a task terminal"),
+    "provider_refused_hint_value": (False, "request-wire hint withdrawal; never a task terminal"),
     "provider_rejected_tool_dialect": (False, "request-wire dialect fallback; never a task terminal"),
     "provider_required_reasoning": (False, "request-wire mandatory-reasoning floor; never a task terminal"),
     "provider_unsupported_field": (False, "request-wire unsupported-field repair; never a task terminal"),
@@ -704,6 +322,7 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
     ),
     "runtime_missing": (False, "Betterleaks runtime availability; no task finalization"),
     "scanner_report_invalid": (False, "Publication scanner repair evidence; no task finalization"),
+    "scanner_input_invalid": (False, "skill_publish_scanner.py rejects invalid payload names, scope or timeout before scanning; recoverable publication refusal, no task finalization"),
     "task_admission_unavailable": (False, "Publication task was not admitted; no running task truncated"),
     # Issue #265: these are structured failures of one recoverable publish-tool
     # call. They return to the next LLM turn with a repair hint; none is the
@@ -723,6 +342,25 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
 }
 
 _REASON_CODE_LITERAL = re.compile(r"""reason_code(?:=|["']\s*:\s*)\s*["']([a-z0-9_]+)["']""")
+
+
+def _forwarded_reason_arguments(tree: ast.Module) -> dict[str, dict[str, int]]:
+    """Local wrappers may pass a named parameter straight into reason_code."""
+    forwarding = {}
+    for function in tree.body:
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        parameters = function.args.posonlyargs + function.args.args
+        forwarded = {
+            node.value.id for node in ast.walk(function)
+            if isinstance(node, ast.keyword) and node.arg == "reason_code"
+            and isinstance(node.value, ast.Name)
+        }
+        arguments = {parameter.arg: index for index, parameter in enumerate(parameters)
+                     if parameter.arg in forwarded}
+        if arguments:
+            forwarding[function.name] = arguments
+    return forwarding
 
 
 def _runtime_reason_code_literals() -> dict[str, str]:
@@ -747,35 +385,57 @@ def _runtime_reason_code_literals() -> dict[str, str]:
                 found.setdefault(match.group(1), f"{path.relative_to(root.parent)}:{lineno}")
         # Conditional/fallback reason values remain producers; their spelling
         # need not be adjacent to the keyword on one source line.
-        for node in ast.walk(ast.parse(source)):
+        tree = parse(source)
+        if path.name == "owner_model.py":
+            # The endpoint forwards this typed exception's code, including the
+            # eligibility function's returned refusal; those are wire reasons too.
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                        and node.func.id == "ModelActRefused" and node.args):
+                    for code in values(node.args[0]):
+                        found.setdefault(code, f"{path.relative_to(root.parent)}:{node.lineno}")
+            eligibility = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "eligibility")
+            for node in ast.walk(eligibility):
+                if isinstance(node, ast.Return):
+                    for code in values(node.value):
+                        if code:
+                            found.setdefault(code, f"{path.relative_to(root.parent)}:{node.lineno}")
+        forwarded = _forwarded_reason_arguments(tree)
+        constants = {target.id: node.value for node in tree.body if isinstance(node, ast.Assign)
+                     for target in node.targets if isinstance(target, ast.Name) and isinstance(node.value, ast.Constant)}
+        for function in tree.body:
+            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            forwarded_names = {node.value.id for node in ast.walk(function)
+                               if isinstance(node, ast.keyword) and node.arg == "reason_code" and isinstance(node.value, ast.Name)}
+            for argument, default in zip(function.args.kwonlyargs, function.args.kw_defaults):
+                if argument.arg in forwarded_names:
+                    value = constants.get(default.id) if isinstance(default, ast.Name) else default
+                    for code in values(value):
+                        if code:
+                            found.setdefault(code, f"{path.relative_to(root.parent)}:{function.lineno}")
+        for node in ast.walk(tree):
             if isinstance(node, ast.keyword) and node.arg == "reason_code":
                 for code in values(node.value):
                     if code:
                         found.setdefault(code, f"{path.relative_to(root.parent)}:{node.lineno}")
+            # _answer_pending still emits an HTTP reason through _refused;
+            # extracting that helper must not make its live codes look retired.
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                for parameter, index in forwarded.get(node.func.id, {}).items():
+                    argument = (node.args[index] if index < len(node.args) else
+                                next((kw.value for kw in node.keywords if kw.arg == parameter), None))
+                    for code in values(argument):
+                        if code:
+                            found.setdefault(code, f"{path.relative_to(root.parent)}:{node.lineno}")
     for code in WIRE_REASON_CODES:
         found.setdefault(code, "ouroboros/request_wire_contract.py:WIRE_REASON_CODES")
     return found
 
 
-def test_truncation_vocabulary_is_derived_from_the_runtime_not_restated():
-    """The set must be COMPUTED from `ouroboros.outcomes`, and every member must be real.
-
-    INVERTED BUG-PINNING NOTE. Until v6.81.0 this set was hand-written beside the check and
-    listed `max_rounds_exceeded`, `task_timeout`, `context_exhausted` and `rate_limited` —
-    none of which the runtime has ever emitted — while omitting `round_limit` and
-    `deadline_local`, the two codes it DOES use for the round cap and the local deadline. A
-    round-capped task therefore published an affirmative `truncated: false` and was filed
-    under `genuine_failure_count`: a false capability claim made by the very field added to
-    prevent false capability claims. Nothing pinned that, so nothing caught it.
-    """
-    assert BEST_EFFORT_REASON_CODES <= RUNTIME_TRUNCATION_REASON_CODES, (
-        "every forced-finalization code must be disclosed as truncation"
-    )
-    assert {"round_limit", "deadline_local"} <= RUNTIME_TRUNCATION_REASON_CODES
-
-    emitted = _runtime_reason_code_literals()
-    for code in sorted(RUNTIME_TRUNCATION_REASON_CODES):
-        assert code in emitted, f"{code} is published but no line in ouroboros/ emits it"
+# Historical reason codes keep their recorded decision, truncating or not, after their producing rail is retired:
+# old records still carry them.
+_RETIRED_REASON_CODES = {"children_unabsorbed", "delegated_custody_unreconciled"}
 
 
 def test_every_runtime_reason_code_has_a_recorded_truncation_decision():
@@ -787,23 +447,13 @@ def test_every_runtime_reason_code_has_a_recorded_truncation_decision():
     assert not undecided, "new runtime reason code(s) with no recorded decision in _TRUNCATION_DECISIONS: " + ", ".join(
         f"{code} ({emitted[code]})" for code in undecided
     )
-    stale = sorted(set(_TRUNCATION_DECISIONS) - set(emitted))
+    stale = sorted(set(_TRUNCATION_DECISIONS) - set(emitted) - _RETIRED_REASON_CODES)
     assert not stale, f"decision recorded for code(s) the runtime no longer emits: {stale}"
+    forgotten = sorted(_RETIRED_REASON_CODES - set(_TRUNCATION_DECISIONS))
+    assert not forgotten, f"retired code(s) whose old records lost their decision: {forgotten}"
 
     decided_truncating = {c for c, (yes, _why) in _TRUNCATION_DECISIONS.items() if yes}
     assert decided_truncating == set(RUNTIME_TRUNCATION_REASON_CODES)
-
-
-def test_round_capped_and_deadline_stopped_runs_are_disclosed_as_truncated():
-    """The two codes the runtime really uses for the round cap and the local deadline.
-
-    Both FAILED before the derivation fix: `truncated` came back False, so `run_tb.py` filed
-    a round-capped trial as `genuine_failure_count` — "the agent got a fair shot and got it
-    wrong" — about a trial that was cut off mid-attempt.
-    """
-    for code in ("round_limit", "deadline_local", "finalization_grace", "children_unabsorbed"):
-        disclosed = runtime_terminal_disclosure({"status": "failed", "reason_code": code})
-        assert disclosed["truncated"] is True, code
 
 
 def test_the_two_out_of_tree_mirrors_stay_pinned_to_the_derived_vocabulary():

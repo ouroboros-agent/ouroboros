@@ -6,6 +6,8 @@ import json
 import re
 
 from ouroboros.memory import Memory
+from ouroboros import dialogue_store as ds
+from tests._dialogue import import_all
 from ouroboros.tools.control import get_tools
 
 
@@ -42,6 +44,7 @@ def test_chat_history_combines_archive_and_live_with_shared_provenance(tmp_path)
         _row("2026-08-21T09:00:00Z", "live hello"),
     ])
 
+    import_all(tmp_path)
     history = Memory(tmp_path).chat_history(count=2)
 
     assert history.index("archived hello") < history.index("live hello")
@@ -60,6 +63,7 @@ def test_chat_history_exact_provenance_and_inclusive_date_filters(tmp_path):
         _row("2026-08-20T10:00:01Z", "too late"),
     ])
 
+    import_all(tmp_path)
     history = Memory(tmp_path).chat_history(
         count=20,
         provider="telegram",
@@ -105,8 +109,7 @@ def test_chat_history_snapshot_refuses_append_between_pages(tmp_path):
     assert snapshot is not None
     assert "match b" in first and "match c" in first
 
-    with (tmp_path / "logs" / "chat.jsonl").open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(_row("2026-08-21T09:03:00Z", "match d")) + "\n")
+    ds.append(tmp_path, "chat", _row("2026-08-21T09:03:00Z", "match d"))
 
     second = memory.chat_history(
         count=2, offset=2, search="match", snapshot=snapshot.group(1),
@@ -139,27 +142,24 @@ def test_chat_history_snapshot_pages_when_source_is_unchanged(tmp_path):
     assert mismatch.startswith("CHAT_HISTORY_SNAPSHOT_CHANGED:")
 
 
-def test_chat_history_snapshot_retries_append_during_capture(tmp_path, monkeypatch):
-    _write(tmp_path / "logs" / "chat.jsonl", [_row("2026-08-21T09:00:00Z", "first")])
+def test_chat_history_snapshot_freezes_the_upper_bound_during_capture(tmp_path, monkeypatch):
+    ds.append(tmp_path, "chat", _row("2026-08-21T09:00:00Z", "first"))
     memory = Memory(tmp_path)
-    original = memory._read_chat_generation
+    original = ds.iter_rows
     appended = False
 
-    def read_then_append(path, **kwargs):
+    def read_then_append(root, stream, **kwargs):
         nonlocal appended
-        rows, gaps = original(path, **kwargs)
         if not appended:
             appended = True
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(_row("2026-08-21T09:01:00Z", "second")) + "\n")
-        return rows, gaps
+            ds.append(root, stream, _row("2026-08-21T09:01:00Z", "second"))
+        yield from original(root, stream, **kwargs)
 
-    monkeypatch.setattr(memory, "_read_chat_generation", read_then_append)
+    monkeypatch.setattr(ds, "iter_rows", read_then_append)
     entries, coverage = memory.read_chat_generations()
-
-    assert [row["text"] for row in entries] == ["first", "second"]
-    assert coverage["capture_attempts"] == 2
-    assert coverage["snapshot_stable"] is True
+    assert [row["text"] for row in entries] == ["first"]
+    assert coverage["capture_attempts"] == 1 and coverage["snapshot_stable"] is True
+    assert [row["text"] for row in memory.read_chat_generations()[0]] == ["first", "second"]
 
 
 def test_chat_history_gap_never_claims_complete_or_exhausted(tmp_path):
@@ -202,15 +202,14 @@ def test_explicit_chat_history_surfaces_missing_consolidation_generation(tmp_pat
     assert "completeness unknown" in no_survivors
 
 
-def test_chat_history_keeps_durable_gap_after_consolidator_rebases_cursor(tmp_path):
-    from ouroboros.consolidator import consolidate, should_consolidate
-
+def test_chat_history_reads_the_frozen_cursor_gap_and_a_durable_gap_block(tmp_path):
+    """The old writer is retired, but its frozen cursor and blocks are still read: a cursor
+    whose generation is gone stays a typed gap, and a durable gap block it once wrote is
+    reported beside it, changing the snapshot a stale page was cut from."""
     _write(tmp_path / "logs" / "chat.jsonl", [_row("2026-08-21T09:00:00Z", "survivor")])
     memory_dir = tmp_path / "memory"
     memory_dir.mkdir(parents=True)
-    blocks_path = memory_dir / "dialogue_blocks.json"
-    meta_path = memory_dir / "dialogue_meta.json"
-    meta_path.write_text(json.dumps({
+    (memory_dir / "dialogue_meta.json").write_text(json.dumps({
         "last_consolidated_offset": 50,
         "chat_log_signature": {"first_line_sha256": "f" * 64, "size": 999},
     }), encoding="utf-8")
@@ -220,22 +219,13 @@ def test_chat_history_keeps_durable_gap_after_consolidator_rebases_cursor(tmp_pa
     old_snapshot = re.search(r"snapshot=([0-9a-f]{64})", first)
     assert old_snapshot is not None
     assert "consolidation_cursor_generation_missing" in first
-    assert should_consolidate(meta_path, tmp_path / "logs" / "chat.jsonl") is True
+    assert "durable_consolidation_gap" not in first
 
-    class NoLlmExpected:
-        def chat(self, **_kwargs):
-            raise AssertionError("gap rebasing below BLOCK_SIZE must not call the LLM")
-
-    assert consolidate(
-        chat_path=tmp_path / "logs" / "chat.jsonl",
-        blocks_path=blocks_path,
-        meta_path=meta_path,
-        llm_client=NoLlmExpected(),
-    ) is None
-    blocks = json.loads(blocks_path.read_text(encoding="utf-8"))
-    assert blocks[0]["gap_id"].startswith("gap:")
-    assert "[MEMORY GAP]" in blocks[0]["content"]
-
+    (memory_dir / "dialogue_blocks.json").write_text(json.dumps([{
+        "ts": "2026-08-21T10:00:00Z", "type": "summary", "range": "unknown", "message_count": 0,
+        "gap_id": "gap:" + "f" * 64,
+        "content": "[MEMORY GAP] The chat-log generation holding the consolidation cursor could not be located.",
+    }]), encoding="utf-8")
     second = memory.chat_history(count=20)
     stale_page = memory.chat_history(count=20, snapshot=old_snapshot.group(1))
     assert "durable_consolidation_gap" in second

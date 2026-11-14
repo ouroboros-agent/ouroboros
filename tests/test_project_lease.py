@@ -3,6 +3,8 @@
 from __future__ import annotations
 import pathlib
 
+import pytest
+
 from ouroboros.contracts.chat_id_policy import (
     PROJECT_CHAT_ID_MIN,
     WEB_UI_CHAT_ID,
@@ -35,6 +37,7 @@ def test_running_project_ids_counts_top_level_scoped_tasks_only():
         _task("beta"),                       # bare task dict
         _meta(_task("", tid="plain")),       # unscoped: no lane
         _meta(_task("gamma", role="subagent")),  # swarm member: no lease of its own
+        {**_meta(_task("delta")), "lane": "conversation"},  # a room's reply turn answers beside its work
         "garbage",
         None,
     ]
@@ -59,6 +62,38 @@ def test_candidate_is_leasable_matrix():
     assert candidate_is_leasable(_task("beta"), leased) is True
     # The leased project's OWN subagents must not deadlock the swarm.
     assert candidate_is_leasable(_task("alpha", role="subagent"), leased) is True
+
+
+def test_the_lane_is_its_trees_while_a_sleeping_root_waits_on_live_members():
+    """A sleep is its actor's wait: its tree keeps the lane its live children write under (``lane_holders``)."""
+    from ouroboros.project_lease import lane_holders
+
+    sleep = {"reason": "sleep", "sleep": {}}
+    root = {**_task("alpha", tid="root"), "root_task_id": "root", "_budget_pause": sleep}
+    kid = {**_task("alpha", role="subagent", tid="kid"), "root_task_id": "root"}
+    foreign = {**_task("alpha", tid="foreign"), "root_task_id": "foreign"}
+    foreign_kid = {**_task("alpha", role="subagent", tid="f-kid"), "root_task_id": "foreign"}
+    holders = lane_holders([_meta(kid)], [root, foreign, foreign_kid])
+    assert holders == {"alpha": {"root"}}, "a running child keeps its sleeping root's lane"
+    assert candidate_is_leasable(kid, set(), holders=holders), "its own tree's lane admits it"
+    assert not candidate_is_leasable(foreign, set(), holders=holders)
+    assert not candidate_is_leasable(foreign_kid, set(), holders=holders), "another tree's child waits too"
+    woken = {**{k: v for k, v in root.items() if k != "_budget_pause"}, "_budget_pause_resume": {"pause": sleep}}
+    assert lane_holders([], [woken, kid]) == {"alpha": {"root"}}, "woken, not yet started: a queued child keeps it"
+    assert lane_holders([], [root, foreign]) == {}, "nothing of its tree alive: the sleep alone keeps nothing"
+    assert candidate_is_leasable(foreign, set(), holders={}) and candidate_is_leasable(foreign_kid, set(), holders={})
+    assert lane_holders([_meta(kid)], [{**root, "_budget_pause": {"reason": "owner"}}]) == {}, "a Pause keeps its rule"
+    assert lane_holders([_meta(foreign)], []) == {"alpha": {"foreign"}}
+    assert lane_holders([{**_meta(foreign), "lane": "conversation"}], []) == {}
+    # A released tree takes its lane back only once it is free, never beside another tree: no two trees wait
+    # on each other. Of two sleeping trees whose members are all queued, the first queued keeps it.
+    taken = lane_holders([_meta(foreign)], [root, kid])
+    assert taken == {"alpha": {"foreign"}} and not candidate_is_leasable(kid, set(), holders=taken)
+    other = {**_task("alpha", tid="other"), "root_task_id": "other", "_budget_pause": sleep}
+    other_kid = {**_task("alpha", role="subagent", tid="o-kid"), "root_task_id": "other"}
+    first = lane_holders([], [root, kid, other, other_kid])
+    assert first == {"alpha": {"root"}} and candidate_is_leasable(kid, set(), holders=first)
+    assert not candidate_is_leasable(other_kid, set(), holders=first)
 
 
 def test_project_chat_id_policy():
@@ -264,15 +299,20 @@ def test_reconcile_leaves_a_tombstoned_workspace_store_tombstoned(tmp_path):
     assert reserved == {_TOMB_ID: PROJECT_TOMBSTONED}
 
 
-def test_reconcile_recovers_a_marked_real_room_with_its_name(tmp_path):
+@pytest.mark.parametrize("witnessed", [False, True])
+def test_reconcile_recovers_a_marked_real_room_with_its_name(tmp_path, witnessed):
     """The recovery case the binding gate alone cannot cover: a REAL room named in
     Cyrillic hashes into the same proj_<hash> namespace as workspace stores (its id
     carries no binding when the owner created it by name). Once a reconcile tick has
     stamped the store's `.project.json`, losing the registry row is recoverable WITH
     the room's display name — better than the pre-guard behavior, which resurrected
-    it under the machine name."""
+    it under the machine name. Reconstruction creates a new execution incarnation;
+    neither a store marker nor the commit witness certifies the old assignment."""
+    from ouroboros import projects_registry as registry
     from ouroboros.project_facts import project_id_from_display_name
-    from ouroboros.projects_registry import create_project, list_projects, reconcile_projects
+    from ouroboros.projects_registry import (
+        _registry_witness_path, create_project, list_projects, reconcile_projects,
+    )
 
     pid = project_id_from_display_name("динозавры")
     assert pid.startswith("proj_")
@@ -283,7 +323,10 @@ def test_reconcile_recovers_a_marked_real_room_with_its_name(tmp_path):
     assert (tmp_path / "projects" / pid / ".project.json").is_file()
 
     # Registry catastrophe: the rows are lost wholesale.
+    prior = registry.project_admission_view(tmp_path, pid, frozen=True)
     (tmp_path / "state" / "projects.json").unlink()
+    if not witnessed:
+        _registry_witness_path(tmp_path).unlink()  # a loss before any witness stamp
 
     assert reconcile_projects(tmp_path) == 1
     rows = list_projects(tmp_path)
@@ -291,6 +334,10 @@ def test_reconcile_recovers_a_marked_real_room_with_its_name(tmp_path):
     assert rows[0]["name"] == "динозавры"
     assert rows[0]["origin"] == "owner"
     assert rows[0]["created_at"] == born, "recovery restores provenance, not a fresh mint"
+    assert rows[0]["routing_incarnation"] != prior["project"]["routing_incarnation"]
+    with pytest.raises(registry.ProjectAdmissionError, match="changed"):
+        with registry.project_admission_guard(tmp_path, prior):
+            pytest.fail("Reconstruction must not authorize the old prepared work")
 
 
 def test_marker_maintenance_never_mkdirs_and_skips_reconcile_origin(tmp_path):
@@ -404,6 +451,45 @@ def test_journal_and_workpad_roundtrip(tmp_path, monkeypatch):
     # Unscoped ctx without explicit id refuses honestly.
     bare = types.SimpleNamespace(project_id="", task_id="t", drive_root=tmp_path)
     assert "no project scope" in tools["journal_write"].handler(bare, kind="note", text="x")
+
+
+@pytest.mark.parametrize("failure", ["torn_temp_write", "failed_replace"])
+def test_a_failed_workpad_replacement_keeps_the_whole_previous_page(tmp_path, monkeypatch, failure):
+    """#1854: a replacement that dies mid-write or at the swap leaves the complete
+    previous page and says so; it never exposes an empty or torn page or a stray temp."""
+    import errno
+    import os
+    import types
+
+    monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path)
+    from ouroboros.project_facts import project_workpad_path
+    from ouroboros.tools import project_journal as pj
+
+    ctx = types.SimpleNamespace(project_id="racer", task_id="t-9", drive_root=tmp_path)
+    assert pj._workpad_write(ctx, "## old plan\n- wheels\n").startswith("OK:")
+
+    real_write_bytes = pathlib.Path.write_bytes
+
+    def torn_write(self, data):
+        real_write_bytes(self, data[:5])  # the first bytes land, then the disk fills
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    def failed_replace(src, dst):
+        raise OSError(errno.EIO, "I/O error")
+
+    with monkeypatch.context() as patched:
+        if failure == "torn_temp_write":
+            patched.setattr(pathlib.Path, "write_bytes", torn_write)
+        else:
+            patched.setattr(os, "replace", failed_replace)
+        failed = pj._workpad_write(ctx, "## new plan\n- engine\n")
+    assert failed.startswith("⚠️ TOOL_ERROR (workpad_write)")
+    assert pj._workpad_read(ctx) == "## old plan\n- wheels\n"
+    assert [p.name for p in project_workpad_path("racer").parent.iterdir()] == ["workpad.md"]
+
+    assert pj._workpad_write(ctx, "## new plan\n- engine\n").startswith("OK:")
+    assert pj._workpad_read(ctx) == "## new plan\n- engine\n"
+    assert [p.name for p in project_workpad_path("racer").parent.iterdir()] == ["workpad.md"]
 
 
 def test_stale_tombstone_marker_is_swept_by_the_next_reconcile_tick(tmp_path, monkeypatch):

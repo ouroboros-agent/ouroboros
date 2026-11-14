@@ -34,7 +34,7 @@ function fixture(t, response, routes = new Map()) {
         ws: { on(type, handler) { handlers.set(type, handler); return () => handlers.delete(type); },
             isConnected: () => true, send() {} },
         state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
-        updateUnreadBadge() {}, stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }),
+        updateUnreadBadge() {}, stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
             isCurrent: () => true, apply() {} },
         chatId: 2, idPrefix: 'chat', mountEl: mount, asPanel: true,
     });
@@ -124,4 +124,23 @@ test('evicting an offscreen page removes all its task rows before rendering that
     assert.equal(f.counters.timelineParses, 0, 'removed rows are never parsed again during page release');
     assert.equal(timeline.children.length, 0);
     assert.equal(walkCard(f.messages, 'busy-task'), null);
+});
+
+// A page's rows look their prior bubble up only when one could be mounted (C5): the feed is scanned a fixed number of
+// times per page, not once or more per row (frozen: four scans per row, O(rows²) per page).
+test('replaying a page scans the feed a fixed number of times, however many rows it holds', async t => {
+    const feedScans = new Map();
+    for (const count of [50, 200]) {
+        await t.test(`${count} rows`, async t => {
+            const f = fixture(t, page(Array.from({ length: count }, (_, index) => message(index))));
+            let scans = 0;
+            const all = f.messages.querySelectorAll, one = f.messages.querySelector.bind(f.messages);
+            f.messages.querySelectorAll = selector => { scans += 1; return all(selector); };
+            f.messages.querySelector = selector => { scans += 1; return one(selector); };
+            assert.equal((await f.instance.refreshHistory({ revision: 1 })).painted, true);
+            assert.equal(f.messages.querySelectorAll('.chat-bubble[data-history-id]').length, count, 'every row mounted once');
+            feedScans.set(count, scans - 1);
+        });
+    }
+    assert.ok(feedScans.get(200) <= feedScans.get(50) + 4, `feed scans for 50 / 200 rows: ${[...feedScans.values()]}`);
 });

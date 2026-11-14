@@ -79,12 +79,53 @@ def normalize_root(root: str | None, *, default: ResourceRoot = "active_workspac
     return candidate  # type: ignore[return-value]
 
 
+def entry_path(path: pathlib.Path) -> pathlib.Path:
+    """A directory entry's physical address: its folder resolved, its own name never followed, so a
+    symlink stays the link itself. ``..`` names no entry and resolves whole. A loop above the name
+    raises (RuntimeError before Python 3.13, which resolves it as far as it can)."""
+    path = pathlib.Path(path)
+    return path.resolve(strict=False) if path.name == ".." else path.parent.resolve(strict=False) / path.name
+
+
 def path_is_relative_to(path: pathlib.Path, root: pathlib.Path) -> bool:
     try:
         pathlib.Path(path).resolve(strict=False).relative_to(pathlib.Path(root).resolve(strict=False))
         return True
     except (OSError, ValueError):
         return False
+
+
+def docker_process_alias_target(ctx: Any, operation: str, text: str, records: list, physical: pathlib.Path):
+    """``(active_workspace record, host target)`` for a Docker process cwd, else None.
+
+    Only shell/service (all four process tools) bind aliases; copy/write keep
+    host targets. A real host address inside active_workspace outranks an alias.
+    Identity mounts keep normal host-root checks; only ``BackendPathNoMatch``
+    falls back for an alias. Invalid or outside-active aliases refuse.
+    """
+    if operation not in {"shell", "service"} or not _tool_access().is_absolute_path_text(text):
+        return None
+    from ouroboros.workspace_executor import BackendPathNoMatch, executor_ref_from_ctx, map_backend_path
+
+    try:
+        executor = executor_ref_from_ctx(ctx)
+    except ValueError:
+        return None  # No usable executor keeps host routing.
+    if executor is None or executor.kind != "docker_exec":
+        return None
+    active = next((record for record in records if record[0] == "active_workspace"), None)
+    if active and path_is_relative_to(physical, active[1]):
+        return active, physical
+    try:
+        mapped = map_backend_path(executor, text)
+    except BackendPathNoMatch:
+        return None
+    if mapped == physical:
+        return None  # An identity mount grants no root; ordinary host rules decide.
+    if active and path_is_relative_to(mapped, active[1]):
+        return active, mapped
+    raise ValueError(f"backend cwd {text!r} maps to host path {mapped}, "
+                     f"outside active_workspace ({active[1] if active else 'unavailable'})")
 
 
 def normalize_root_relative(root: pathlib.Path, path: str) -> str:
@@ -163,9 +204,19 @@ def workspace_mode_block_reason(ctx: Any) -> str:
         workspace = pathlib.Path(workspace_root).resolve(strict=False)
     except (OSError, TypeError, ValueError):
         return "workspace_root is invalid"
+    # A readonly child's selected folder is a focus, never a write workspace.
+    # Keep its role/tool ceiling while allowing source/data subdirectories.
+    constraint = _tool_access().normalize_task_constraint(getattr(ctx, "task_constraint", None))
+    readonly = constraint is not None and constraint.mode == _tool_access().LOCAL_READONLY_SUBAGENT_MODE
+    child = _tool_access()._is_subagent_ctx(ctx)
+    acting = (constraint is not None and constraint.mode == _tool_access().ACTING_SUBAGENT_MODE
+              and constraint.surface in _tool_access().VALID_WRITE_SURFACES)
+    if readonly or (child and not acting):
+        return ""
     protected_values = (
         ("Ouroboros system repo", getattr(ctx, "system_repo_dir", None) or getattr(ctx, "repo_dir", None)),
         ("Ouroboros repo", getattr(ctx, "repo_dir", None)),
+        ("Ouroboros serving repo", getattr(ctx, "serving_repo_dir", None)),
         ("Ouroboros data drive", getattr(ctx, "drive_root", None)),
         (
             "Ouroboros parent data drive",

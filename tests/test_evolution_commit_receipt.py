@@ -226,6 +226,7 @@ def test_rescue_link_uses_shared_campaign_cas_and_preserves_commit_receipt(
 
 
 def test_commit_receipt_uses_campaign_sidecar_before_rescue(tmp_path, monkeypatch):
+    from ouroboros import platform_layer
     from ouroboros.platform_layer import (
         acquire_exclusive_file_lock,
         release_exclusive_file_lock,
@@ -239,7 +240,19 @@ def test_commit_receipt_uses_campaign_sidecar_before_rescue(tmp_path, monkeypatc
     lock_fd = acquire_exclusive_file_lock(lock_path, timeout_sec=1.0)
     assert lock_fd is not None
     done = threading.Event()
+    acquiring = threading.Event()
+    released = threading.Event()
     result = {}
+
+    def _acquire_after_release(path, **kwargs):
+        if path == lock_path:
+            acquiring.set()
+            released.wait()
+        return acquire_exclusive_file_lock(path, **kwargs)
+
+    # Keep real contention, but start the acquisition timeout after the fixture
+    # releases its lock, as in the rescue interleaving test above.
+    monkeypatch.setattr(platform_layer, "acquire_exclusive_file_lock", _acquire_after_release)
 
     def _record() -> None:
         result.update(evolution_lifecycle.record_evolution_commit(
@@ -250,11 +263,15 @@ def test_commit_receipt_uses_campaign_sidecar_before_rescue(tmp_path, monkeypatc
     thread = threading.Thread(target=_record, daemon=True)
     thread.start()
     try:
+        assert acquire_exclusive_file_lock(lock_path, timeout_sec=0.001) is None
+        assert acquiring.wait(2.0) is True
         assert done.wait(0.1) is False
     finally:
         release_exclusive_file_lock(lock_path, lock_fd)
+        released.set()
+        thread.join(timeout=2.0)
     assert done.wait(2.0) is True
-    thread.join(timeout=1.0)
+    assert not thread.is_alive()
     assert result["ok"] is True
     assert evolution_lifecycle._read_evolution_campaign()["active_transaction"][
         "commit_receipt"

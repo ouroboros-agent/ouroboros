@@ -2,16 +2,24 @@ from __future__ import annotations
 
 import base64
 import http.server
+import json
+import logging
 import os
+import pathlib
 import socketserver
+import subprocess
+import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from ouroboros import chromium_runtime, owner_pause
+from ouroboros.task_results import write_task_result
 from ouroboros.tools.browser import _browse_page, _browser_action, cleanup_browser
 from ouroboros.contracts.task_constraint import TaskConstraint
 from ouroboros.server_entrypoint import bound_service_socket
-from ouroboros.tools.registry import ToolContext
+from ouroboros.tools.registry import ToolContext, ToolRegistry
 
 
 pytestmark = pytest.mark.browser
@@ -33,6 +41,51 @@ class _StaticHandler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, *_args):
         return
+
+
+# Software WebGL (ANGLE + SwiftShader) must still draw in the pinned headless shell.
+_WEBGL_RED_PIXEL = """() => { const canvas = document.createElement('canvas'); canvas.width = canvas.height = 4;
+  const gl = canvas.getContext('webgl'); if (!gl) return 'no-webgl';
+  gl.clearColor(1, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  const pixel = new Uint8Array(4); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+  return Array.from(pixel).join(','); }"""
+
+
+def _pinned_executable() -> str:
+    from ouroboros.tools import browser as browser_mod
+
+    return browser_mod._pinned_chromium(allow_install=False)
+
+
+def _pinned_chromium_command_lines() -> list:
+    """Command lines of the live processes started from the pinned headless shell
+    (Linux ``/proc``, which slim images keep without procps; ``ps`` elsewhere)."""
+    folder = str(pathlib.Path(_pinned_executable()).parent)
+    if sys.platform.startswith("linux"):
+        lines = []
+        for entry in pathlib.Path("/proc").iterdir():
+            try:
+                if entry.name.isdigit():
+                    lines.append((entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace"))
+            except OSError:
+                continue
+    else:
+        lines = subprocess.run(["ps", "-A", "-ww", "-o", "command="], capture_output=True, text=True,
+                               timeout=30, check=True).stdout.splitlines()
+    return [line for line in lines if folder in line]
+
+
+def _assert_chromium_sandbox_facts(text: str, sandbox: bool) -> None:
+    """The result names the pinned build and the sandbox state, and the processes agree."""
+    assert f"chromium {chromium_runtime.CHROMIUM_VERSION} (Playwright; {chromium_runtime.conditions(sandbox)})" in text
+    if os.name == "nt":
+        return
+    lines = _pinned_chromium_command_lines()
+    renderers = [line for line in lines if "--type=renderer" in line]
+    assert renderers, lines
+    assert all(("--no-sandbox" in line) is (not sandbox) for line in lines), lines
+    if sandbox and sys.platform == "darwin":
+        assert all("--seatbelt-client" in line for line in renderers), renderers
 
 
 @pytest.fixture()
@@ -64,7 +117,6 @@ def test_browser_tools_launch_real_chromium(tmp_path, static_page_url, monkeypat
     assert "origin_not_granted" in _browse_page(subagent_ctx, url="http://10.0.0.1")
     assert "BROWSER_LOCAL_READONLY_BLOCKED" in _browse_page(subagent_ctx, url="http://169.254.1.1")
     assert "BROWSER_LOCAL_READONLY_BLOCKED" in _browse_page(subagent_ctx, url="http://[::]/")
-    assert "BROWSER_LOCAL_READONLY_BLOCKED" in _browse_page(subagent_ctx, url=f"file://{tmp_path / 'settings.json'}")
     assert "BROWSER_LOCAL_READONLY_BLOCKED" in _browser_action(subagent_ctx, action="evaluate", value="1 + 1")
 
     install_flags = []
@@ -98,7 +150,13 @@ def test_browser_tools_launch_real_chromium(tmp_path, static_page_url, monkeypat
                     pytest.fail(text)
                 pytest.skip(text)
             pytest.skip(text)
+        if text.startswith("⚠️ BROWSER_CHROMIUM_"):
+            if expect_chromium:
+                pytest.fail(text)
+            pytest.skip(text)
         assert "Browser smoke OK" in text
+        _assert_chromium_sandbox_facts(text, chromium_runtime.sandbox_enabled())
+        assert _browser_action(ctx, action="evaluate", value=_WEBGL_RED_PIXEL).startswith("255,0,0,255")
 
         screenshot = _browser_action(ctx, action="screenshot")
         if screenshot.startswith("⚠️ BROWSER_INFRA_ERROR"):
@@ -107,6 +165,53 @@ def test_browser_tools_launch_real_chromium(tmp_path, static_page_url, monkeypat
             pytest.skip(screenshot)
         raw = base64.b64decode(ctx.browser_state.last_screenshot_b64 or "")
         assert raw.startswith(b"\x89PNG\r\n\x1a\n")
+        cleanup_browser(ctx)  # Independent Sync API contexts cannot nest on one thread.
+        local = tmp_path / "outside-start" / "index.html"
+        local.parent.mkdir()
+        local.write_text("<h1>Parent-readable local artifact</h1>", encoding="utf-8")
+        try:
+            assert "Parent-readable local artifact" in _browse_page(subagent_ctx, url=local.as_uri())
+            assert "BROWSER_LOCAL_READONLY_BLOCKED" in _browser_action(subagent_ctx, action="evaluate", value="1 + 1")
+        finally:
+            cleanup_browser(subagent_ctx)
+
+    finally:
+        cleanup_browser(ctx)
+
+
+def _pinned_chromium_or_skip() -> None:
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    try:
+        _pinned_executable()
+    except chromium_runtime.ChromiumRefusal as refusal:
+        pytest.skip(refusal.tool_text())
+
+
+def test_the_administrator_opt_out_is_real_warned_and_disclosed(tmp_path, static_page_url, monkeypatch, caplog):
+    _pinned_chromium_or_skip()
+    monkeypatch.setenv(chromium_runtime.SANDBOX_ENV, "off")
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    try:
+        with caplog.at_level(logging.WARNING, logger="ouroboros.tools.browser"):
+            text = _browse_page(ctx, url=static_page_url)
+        assert "Browser smoke OK" in text, text
+        _assert_chromium_sandbox_facts(text, False)
+        assert any("sandbox is OFF" in record.getMessage() for record in caplog.records)
+    finally:
+        cleanup_browser(ctx)
+
+
+@pytest.mark.skipif(not (sys.platform.startswith("linux") and hasattr(os, "geteuid") and os.geteuid() == 0),
+                    reason="Chromium refuses its sandbox for root on Linux only")
+def test_root_on_linux_refuses_chromium_without_the_opt_out(tmp_path, static_page_url, monkeypatch):
+    _pinned_chromium_or_skip()
+    monkeypatch.delenv(chromium_runtime.SANDBOX_ENV, raising=False)
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    try:
+        text = _browse_page(ctx, url=static_page_url)
+        assert text.startswith(f"⚠️ {chromium_runtime.SANDBOX_UNAVAILABLE}: "), text
+        assert "running as root" in text.lower() and f"{chromium_runtime.SANDBOX_ENV}=off" in text
+        assert ctx.browser_state.browser is None
     finally:
         cleanup_browser(ctx)
 
@@ -132,5 +237,170 @@ def test_browser_tools_launch_real_webkit_mobile_device(tmp_path, static_page_ur
         assert "Browser smoke OK" in text
         assert getattr(ctx.browser_state, "_browser_engine", "") == "webkit"
         assert getattr(ctx.browser_state, "_browser_device", "") == "iPhone 13"
+    finally:
+        cleanup_browser(ctx)
+
+
+# #1606: the repaired built-in, through the registry and its sticky executor, against the
+# production module-widget mount (web/modules/widget_module.js) and a plain iframe.
+_REPO = pathlib.Path(__file__).resolve().parents[1]
+_WIDGET = ("const root=document.querySelector('#root'); root.innerHTML=`<h2>VISIBLE_MODULE_CONTROL</h2>"
+           "<button id=\"bridge\">Read through bridge</button><p id=\"answer\">Not read yet</p>`;"
+           "document.querySelector('#bridge').onclick=async()=>{const r=await OuroborosWidget.fetch("
+           "'/api/extensions/repro/probe'); document.querySelector('#answer').textContent=await r.text();};")
+_WIDGET_PAGE = """<!doctype html><html lang="en"><meta charset="utf-8"><title>srcdoc observer</title>
+<body><h1>VISIBLE_PARENT_CONTROL</h1><iframe id="plain" src="/plain.html"></iframe>
+<section><div id="mount"></div></section><pre id="status">Loading</pre>
+<script type="module">import {mountModuleWidget} from '/web/modules/widget_module.js';
+window.dispose = await mountModuleWidget(document.querySelector('#mount'),
+  {skill: 'repro', ws_prefix: 'repro.', tab_id: 'main', generation: 'g1'},
+  {kind: 'module', entry: 'widget.js', height: 240});
+document.querySelector('#status').textContent = 'Parent mounted';
+window.probe = () => { const f = document.querySelector('#mount iframe');
+  return {srcdocLength: f.srcdoc.length, csp: f.srcdoc.includes('Content-Security-Policy'),
+          sandbox: f.getAttribute('sandbox')}; };</script></body></html>"""
+
+
+@pytest.fixture()
+def widget_page_url():
+    bodies = {"/": (_WIDGET_PAGE, "text/html"), "/plain.html": ("<p id='plain-ok'>PLAIN_FRAME_OK</p>", "text/html"),
+              "/api/extensions/repro/module/widget.js": (_WIDGET, "text/javascript"),
+              "/api/extensions/repro/probe": ("BRIDGE_CONSUMER_OK", "text/plain")}
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=str(_REPO), **kwargs)
+
+        def do_GET(self):  # noqa: N802 - stdlib callback name
+            if self.path not in bodies:
+                return super().do_GET()
+            body, kind = bodies[self.path][0].encode(), bodies[self.path][1]
+            self.send_response(200)
+            self.send_header("Content-Type", kind)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):  # noqa: N802 - stdlib callback name
+            # The parent's lease controls; a classic mount mints its route lease before it frames the module.
+            if not self.path.startswith("/api/widgets/asset-leases"):
+                return self.send_error(404)
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            token = "t" * 43
+            reply = {"ok": True} if self.path.endswith("/revoke") else {
+                "token": token, "base_url": f"/api/widget-resources/{token}/", "expires_in": 120, "renew_after": 40}
+            body = json.dumps(reply).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}/"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_builtin_renders_the_production_srcdoc_widget_and_its_bridge(tmp_path, monkeypatch, widget_page_url, engine):
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    import ouroboros.safety as safety
+
+    monkeypatch.setattr(safety, "check_safety", lambda *_a, **_k: (True, ""))
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path))
+    write_task_result(tmp_path, "root", "running", root_task_id="root")
+    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
+    registry._ctx.task_id = registry._ctx.root_task_id = "root"
+    expected = engine in _EXPECTED_BROWSER_ENGINES or "all" in _EXPECTED_BROWSER_ENGINES
+    frame = "#mount iframe >> internal:control=enter-frame >> "
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        def call(name, **args):
+            return owner_pause.submit_tool(registry._ctx, name, executor.submit, registry.execute_result,
+                                           name, args).result()
+        try:
+            page = call("browse_page", url=widget_page_url, engine=engine, wait_for="text=Parent mounted")
+            if "Executable doesn't exist" in page.text or "playwright install" in page.text.lower():
+                if expected:
+                    pytest.fail(page.text[:500])
+                pytest.skip(page.text[:300])
+            assert "VISIBLE_PARENT_CONTROL" in (page.producer_text or ""), page.text
+            conditions = page.host_annotations[-1]
+            assert conditions.startswith(f"Browser conditions: {engine} ") and "except iframe.contentWindow" in conditions
+            probe = call("browser_action", action="evaluate", value="JSON.stringify(window.probe())")
+            facts = json.loads(probe.producer_text)
+            assert facts["srcdocLength"] > 1000 and facts["csp"], facts  # the native setter ran
+            assert facts["sandbox"] == "allow-scripts allow-pointer-lock allow-downloads"  # opaque origin kept
+            assert probe.host_annotations == (conditions,)
+            plain = call("browser_action", action="wait", selector="#plain >> internal:control=enter-frame >> #plain-ok")
+            assert json.loads(plain.text)["status"] == "reached", plain.text
+            visible = call("browser_action", action="wait", selector=frame + "text=VISIBLE_MODULE_CONTROL")
+            assert json.loads(visible.text)["status"] == "reached", visible.text
+            assert call("browser_action", action="click", selector=frame + "#bridge").status == "ok"
+            answered = call("browser_action", action="wait", selector=frame + "#answer:has-text('BRIDGE_CONSUMER_OK')")
+            assert json.loads(answered.text)["status"] == "reached", answered.text
+            shot = call("browser_action", action="screenshot")
+            assert shot.host_annotations == (conditions,)
+            raw = base64.b64decode(registry._ctx.browser_state.last_screenshot_b64 or "")
+            assert raw.startswith(b"\x89PNG")
+            (tmp_path / f"srcdoc-widget-{engine}.png").write_bytes(raw)  # retained for visual inspection
+        finally:
+            executor.submit(cleanup_browser, registry._ctx).result()
+
+
+# R7: the real extraction (Playwright text, DOM, the markdown walker and a caller's expression) is returned
+# whole, never cut by the handler before the loop's exact-source delivery.
+_BIG_MARKERS = ("BIG_HEAD_41d2", "BIG_MIDDLE_7f3a", "BIG_TAIL_9c1d")
+
+
+@pytest.fixture()
+def large_page_url():
+    paragraphs = [f"<p>{('p%05d ' % i) * 10}</p>" for i in range(1600)]  # ~120 000 characters of text
+    paragraphs.insert(800, f"<p>{_BIG_MARKERS[1]}</p>")
+    body = f"<html><body><p>{_BIG_MARKERS[0]}</p>{''.join(paragraphs)}<p>{_BIG_MARKERS[2]}</p></body></html>".encode()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - stdlib callback name
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            return
+
+    server = socketserver.TCPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}/"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_real_chromium_large_page_outputs_are_returned_whole(tmp_path, large_page_url):
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    try:
+        for output, floor in (("text", 100_000), ("markdown", 100_000), ("html", 110_000)):
+            text = _browse_page(ctx, url=large_page_url, output=output)
+            if text.startswith("⚠️ BROWSER_INFRA_ERROR"):
+                pytest.skip(text[:300])
+            assert len(text) > floor and "[truncated]" not in text, (output, len(text))
+            assert all(marker in text for marker in _BIG_MARKERS), output
+        evaluated = _browser_action(ctx, action="evaluate", value="'E'.repeat(25000) + 'EVAL_TAIL_5a5a'")
+        assert "E" * 25_000 + "EVAL_TAIL_5a5a" in evaluated and "[truncated]" not in evaluated  # host notes may follow
     finally:
         cleanup_browser(ctx)

@@ -11,6 +11,8 @@ module's docstring.
 
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import json
 import os
 import pathlib
@@ -333,6 +335,8 @@ def isolated_settings(*, stub: StubModelServer | None, paid: bool = False, **ove
         "OUROBOROS_MAX_WORKERS": 4,
         "TOTAL_BUDGET": 10.0,
         "OUROBOROS_PER_TASK_COST_USD": 10.0,
+        # A fresh root with a ready provider would clone the skill hub from GitHub at boot (#1995).
+        "OUROBOROS_STARTER_SKILLS": "[]",
     }
     if paid:
         model, key_env, value = paid_model_and_key()
@@ -383,7 +387,10 @@ def clone_repo(destination: pathlib.Path) -> pathlib.Path:
     worktree.
     """
     clone = pathlib.Path(destination) / "clone"
-    subprocess.run(["git", "clone", "--no-hardlinks", "-q", str(REPO_ROOT), str(clone)],
+    # Transport packs reachable history instead of copying the source's loose,
+    # unreachable objects. Still full history/all branches/tags, independently
+    # owned objects, no alternates or shared lifetime with the source.
+    subprocess.run(["git", "clone", "--no-local", "-q", str(REPO_ROOT), str(clone)],
                    check=True, capture_output=True)
     subprocess.run(["git", "checkout", "-B", "ouroboros"], cwd=str(clone),
                    check=True, capture_output=True)
@@ -472,17 +479,19 @@ def events(data_root, event_type: str) -> list:
 
 
 def task_result(data_root, task_id: str) -> dict:
-    path = pathlib.Path(data_root) / "task_results" / f"{task_id}.json"
-    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    from tests._store_shared import read_result
+    return read_result(pathlib.Path(data_root), task_id) or {}
 
 
-def task_result_bytes(data_root, task_id: str) -> bytes:
-    return (pathlib.Path(data_root) / "task_results" / f"{task_id}.json").read_bytes()
+def task_result_signature(data_root, task_id: str):
+    """``(write_seq, updated_at)`` of the stored row: changes on every write, like the file bytes did."""
+    from tests._store_shared import result_signature
+    return result_signature(pathlib.Path(data_root), task_id)
 
 
 def chat_bytes(data_root) -> bytes:
     path = pathlib.Path(data_root) / "logs" / "chat.jsonl"
-    return path.read_bytes() if path.exists() else b""
+    return dialogue_test.log_bytes(path)
 
 
 def queue_snapshot(data_root) -> dict:

@@ -18,6 +18,7 @@ import subprocess
 import pytest
 
 from ouroboros import delegate_custody as custody
+from ouroboros.unindexed import COPIES
 from tests._governance_docs_shared import architecture_text
 from ouroboros.subagent_worktrees import (
     find_execution_snapshot,
@@ -176,7 +177,7 @@ def _terminal_wait(ctx, monkeypatch, *, run_id="run-p1",
             pass
 
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
-    return json.loads(delegate._delegate_wait(ctx, run_id, wait_sec=1))
+    return json.loads(delegate._read_run(ctx, run_id))
 
 
 # -- 1A: selector, authority, custody shape -------------------------------------
@@ -321,22 +322,23 @@ def test_markerless_native_delegates_as_external_and_rebinds_by_marker(
     custody._CUSTODY.clear()
 
 
-def test_second_delegation_on_same_payload_is_refused_cheaply(tmp_path, monkeypatch):
-    import ouroboros.claudexor_daemon as daemon
+def test_second_delegation_on_same_payload_has_an_independent_capture(tmp_path, monkeypatch):
+    from ouroboros.gateways import claudexor as gw
 
     ctx = _payload_ctx(tmp_path, monkeypatch)
     _seed_skill(tmp_path / "data")
-    payload, _ = _start_payload_run(ctx, monkeypatch)
-    assert payload["status"] == "started"
+    first, _ = _start_payload_run(ctx, monkeypatch)
 
-    def _no_gateway():
-        raise AssertionError("busy refusal must land BEFORE any gateway work")
+    class Second(_StartStub):
+        def start_run(self, request, *, idempotency_key=""):
+            return {"runId": "run-p2"}
 
-    monkeypatch.setattr(daemon, "ensure_owned_gateway", _no_gateway)
-    out = json.loads(_exact_payload_start(
-        ctx, "second", root="skill_payload", bucket="external", skill_name="alpha"))
-    assert out["reason"] == "replacement_requires_settlement", out
-    assert out["open_run_ids"] == ["run-p1"]
+    monkeypatch.setattr(gw, "ClaudexorGateway", lambda: Second({}))
+    second = json.loads(_exact_payload_start(ctx, "second", root="skill_payload", bucket="external", skill_name="alpha"))
+    assert first["status"] == second["status"] == "started"
+    runs = custody.replay(tmp_path / "data")
+    assert runs["run-p1"].snapshot_id != runs["run-p2"].snapshot_id
+    assert runs["run-p1"].execution_root != runs["run-p2"].execution_root
     custody._CUSTODY.clear()
 
 
@@ -460,7 +462,7 @@ def test_capture_transports_utf8_with_nul_and_loader_junk_stays_out(tmp_path, mo
     entry = _payload_entry(handle, skill)
     capture = _capture_terminal_patch(ctx, entry)
     assert capture["status"] == "ready_with_changes", capture
-    manifest = json.loads(pathlib.Path(capture["manifest_artifact"]).read_text())
+    manifest = json.loads(pathlib.Path(capture["manifest_artifact"]).read_text(encoding="utf-8"))
     assert manifest["capture_kind"] == "skill_payload"
     assert set(manifest["tracked_changed"]) == {"table.txt", "plugin.py", "notes.txt"}
     assert manifest["blocked_reserved_paths"] == []
@@ -576,7 +578,7 @@ def test_reserved_path_patch_refuses_whole_apply_and_preserves_candidate(tmp_pat
 
     ctx, skill, handle, entry, capture = _captured(tmp_path, monkeypatch, edit=edit)
     assert capture["status"] == "ready_with_changes", capture
-    manifest = json.loads(pathlib.Path(capture["manifest_artifact"]).read_text())
+    manifest = json.loads(pathlib.Path(capture["manifest_artifact"]).read_text(encoding="utf-8"))
     assert manifest["blocked_reserved_paths"] == [".clawhub.json"]
     out = _integrate_delegated_patch(ctx, "run-p1", "apply", "")
     assert "INTEGRATE_DELEGATED_RESERVED_PATHS" in out, out
@@ -636,6 +638,10 @@ def test_registry_golden_e2e_start_wait_apply_review_stale(tmp_path, monkeypatch
         "    description: Run.\n---\n", encoding="utf-8")
     (skill / "scripts").mkdir()
     (skill / "scripts" / "run.py").write_text("print('ok')\n", encoding="utf-8")
+    # Credential-like names are ordinary payload on the whole path (owner choice): one already
+    # in the live payload, others the child creates; synthetic fixtures, no real keys.
+    (skill / ".env").write_bytes(b"TOKEN=synthetic-live\n")
+    (skill / "credentials.json").write_bytes(b'{"fixture": true}\n')
     sibling = _seed_skill(data, name="beta")
     sibling_bytes = (sibling / "SKILL.md").read_bytes()
     # A PASS review bound to the CURRENT payload content.
@@ -663,20 +669,30 @@ def test_registry_golden_e2e_start_wait_apply_review_stale(tmp_path, monkeypatch
         "root": "skill_payload", "bucket": "external", "skill_name": "alpha"}))
     assert started["status"] == "started", started
     exec_root = pathlib.Path(str(seen["request"]["scope"]["root"]))
+    assert (exec_root / ".env").read_bytes() == b"TOKEN=synthetic-live\n"  # passed to the child whole
     # The deterministic "harness" edits the private snapshot only.
     (exec_root / "notes.txt").write_text("DONE\n", encoding="utf-8")
+    created = {".env": b"TOKEN=synthetic-edited\n", "prod.env": b"MODE=fixture\n",
+               "id_rsa": b"SYNTHETIC KEY FIXTURE\n"}
+    for rel, body in created.items():
+        (exec_root / rel).write_bytes(body)
     assert (skill / "notes.txt").read_text(encoding="utf-8") == "PENDING\n"
 
     out = _terminal_wait(ctx, monkeypatch)
     assert out["status"] == "terminal"
     capture = out["workspace_capture"]
     assert capture["status"] == "ready_with_changes", capture
+    manifest = json.loads(pathlib.Path(capture["manifest_artifact"]).read_text(encoding="utf-8"))
+    assert set(manifest["tracked_changed"]) == {"notes.txt", *created}
+    assert manifest["blocked_reserved_paths"] == []
     assert (skill / "notes.txt").read_text(encoding="utf-8") == "PENDING\n"
 
     applied = registry.execute("integrate_delegated_patch", {
         "run_id": "run-p1", "decision": "apply", "reason": "golden"})
     assert "✅ Integrated" in applied, applied
     assert (skill / "notes.txt").read_text(encoding="utf-8") == "DONE\n"
+    assert {rel: (skill / rel).read_bytes() for rel in created} == created
+    assert (skill / "credentials.json").read_bytes() == b'{"fixture": true}\n'
     assert not (skill / ".git").exists()
     # Sibling skill + lifecycle sidecars byte-identical; enablement unchanged.
     assert (sibling / "SKILL.md").read_bytes() == sibling_bytes
@@ -687,15 +703,12 @@ def test_registry_golden_e2e_start_wait_apply_review_stale(tmp_path, monkeypatch
 
     # Sol P2-1: CLOSE the loop with the REAL skill preflight + review path over
     # the APPLIED content — reviewer LLM faked deterministically, no live model.
-    from tests.test_skill_review_persist_guard import _pass_actor
+    from tests.test_skill_review_persist_guard import _clean_wave
 
-    monkeypatch.setattr(
-        "ouroboros.skill_review._run_skill_advisory_pre_review",
-        lambda *_a, **_kw: {"status": "empty"})
-    monkeypatch.setattr(
-        "ouroboros.tools.review._handle_multi_model_review",
-        lambda *_a, **_kw: json.dumps(
-            {"results": [_pass_actor("fake/a"), _pass_actor("fake/b")]}))
+    _clean_wave(monkeypatch)  # the golden pool's seats answer clean through the real custody layer
+    from ouroboros.skill_review_packs import frozen_payload_files
+
+    assert {".env", "credentials.json", *created} <= {row["path"] for row in frozen_payload_files(skill)}
     preflight = json.loads(registry.execute("skill_preflight", {"skill": "alpha"}))
     assert preflight.get("ok") is True, preflight
     review_out = registry.execute("skill_review", {"skill": "alpha"})
@@ -836,15 +849,18 @@ def test_payload_instructions_variant_is_payload_only(tmp_path, monkeypatch, acc
     from ouroboros.tools.delegate import _HOST_INSTRUCTIONS, _host_instructions
 
     ordinary = _host_instructions(delegated_run_shape(False))
-    assert "do not touch the host's runtime controls, skills, or memory" in ordinary
+    ban = ("do not touch the host's runtime controls, or modify its memory or skills; unless your assignment "
+           "restricts reads, you may read the memory files your session references name")
+    assert ban in ordinary
     assert "PAYLOAD ASSIGNMENT" not in ordinary
     mutating = _host_instructions(delegated_run_shape(True, access))
-    assert "do not touch the host's runtime controls, skills, or memory" in mutating
+    assert ban in mutating
     payload = _host_instructions(delegated_run_shape(True, access), payload_skill="alpha")
-    assert "runtime controls, skills, or memory" not in payload
-    assert "do not touch the host's runtime controls or memory" in payload
+    assert "modify its memory or skills" not in payload
+    assert ("do not touch the host's runtime controls, or modify its memory; unless your assignment "
+            "restricts reads, you may read the memory files your session references name") in payload
     assert "PAYLOAD ASSIGNMENT" in payload and "'alpha'" in payload
-    assert "do not touch the host's runtime controls, skills, or memory" in _HOST_INSTRUCTIONS  # source intact
+    assert ban in _HOST_INSTRUCTIONS  # source intact
 
 
 def test_idempotent_already_applied_branch_runs_the_finalizer(tmp_path, monkeypatch):
@@ -887,81 +903,31 @@ def test_reconcile_queue_failure_degrades_the_receipt_honestly(tmp_path, monkeyp
     custody._CUSTODY.clear()
 
 
-def test_parallel_starts_on_same_payload_yield_exactly_one_winner(tmp_path, monkeypatch):
-    """Gate fix 5 + Sol delta 5a: deterministic REQUESTED→STARTED window, x50.
-
-    Both starts pass the cheap early check and provision; the winner then claims
-    (durable START_REQUESTED) and is HELD inside the gateway POST — after its
-    request row, before its STARTED row. The loser runs its locked busy predicate
-    strictly inside that window: the old two-pass read could miss a holder whose
-    transition landed between the passes; the single-pass snapshot cannot. Fifty
-    fresh-drive iterations prove the interleaving is stable, not schedule-lucky."""
+def test_parallel_starts_on_same_payload_both_reach_transport(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
     import threading
-
-    import ouroboros.tools.delegate as delegate
-    import ouroboros.tools.delegate_integration as integration
     from ouroboros.gateways import claudexor as gw
 
-    real_provision = integration._provision_payload_snapshot
-    real_replay = custody.replay
-    for iteration in range(50):
-        base = tmp_path / f"iter{iteration}"
-        base.mkdir()
-        ctx = _payload_ctx(base, monkeypatch)
-        _seed_skill(base / "data")
-        delegate._CUSTODY.clear()
-        barrier = threading.Barrier(2, timeout=30)
-        in_window = threading.Event()   # winner: REQUESTED durable, STARTED not
-        release = threading.Event()     # loser observed busy; let winner finish
+    ctx = _payload_ctx(tmp_path, monkeypatch)
+    _seed_skill(tmp_path / "data")
+    at_post = threading.Barrier(2, timeout=30)
+    keys = []
 
-        def _synced(*args, **kwargs):
-            result = real_provision(*args, **kwargs)
-            barrier.wait()
-            if threading.current_thread().name != "winner":
-                assert in_window.wait(30), "winner never reached its window"
-            return result
+    class Independent(_StartStub):
+        def start_run(self, request, *, idempotency_key=""):
+            keys.append(idempotency_key)
+            at_post.wait()
+            return {"runId": "run-" + idempotency_key}
 
-        class _WindowStub(_StartStub):
-            def start_run(self, request, *, idempotency_key=""):
-                in_window.set()
-                assert release.wait(30), "the loser never settled"
-                return super().start_run(request, idempotency_key=idempotency_key)
-
-        def _replay_hook(drive_root, rows=None):
-            state = real_replay(drive_root, rows=rows)
-            if (threading.current_thread().name != "winner"
-                    and in_window.is_set() and not release.is_set()):
-                # Mutant-killer: the winner's STARTED row lands durably AFTER
-                # this pass returned and BEFORE the pending projection runs —
-                # the exact hole a two-pass (re-reading) predicate had. Only a
-                # single shared row snapshot still reports busy here.
-                release.set()
-                thread.join(timeout=30)
-            return state
-
-        seen: dict = {}
-        monkeypatch.setattr(custody, "replay", _replay_hook)
-        monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _WindowStub(seen))
-        monkeypatch.setattr(integration, "_provision_payload_snapshot", _synced)
-        monkeypatch.setattr(delegate, "_provision_payload_snapshot", _synced)
-        winner_out: list = []
-
-        def _winner():
-            winner_out.append(json.loads(_exact_payload_start(
-                ctx, "start winner", root="skill_payload", bucket="external",
-                skill_name="alpha")))
-
-        thread = threading.Thread(target=_winner, name="winner")
-        thread.start()
-        loser = json.loads(_exact_payload_start(
-            ctx, "start loser", root="skill_payload", bucket="external",
-            skill_name="alpha"))
-        release.set()
-        thread.join(timeout=60)
-        assert not thread.is_alive(), f"iteration {iteration}: winner hung"
-        assert loser["status"] == "refused", (iteration, loser)
-        assert loser["reason"] == "payload_delegation_busy", (iteration, loser)
-        assert winner_out and winner_out[0]["status"] == "started", (iteration, winner_out)
+    monkeypatch.setattr(gw, "ClaudexorGateway", lambda: Independent({}))
+    def start():
+        return json.loads(_exact_payload_start(ctx, "same deliberate work", root="skill_payload", bucket="external", skill_name="alpha"))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        a, b = pool.submit(start), pool.submit(start)
+        results = [a.result(timeout=60), b.result(timeout=60)]
+    assert all(item["status"] == "started" for item in results), results
+    assert len(set(keys)) == 2
+    assert len(custody.open_runs(tmp_path / "data")) == 2
     custody._CUSTODY.clear()
 
 
@@ -978,23 +944,24 @@ def test_snapshot_root_under_runtime_data_refuses_provisioning(tmp_path):
 
 
 def test_registry_save_failure_leaves_no_orphan_snapshot_dir(tmp_path, monkeypatch):
-    """Gate fix 7: a registry-write failure removes the snapshot directory —
-    an unregistered directory would be invisible to disposal/retention."""
+    """Gate fix 7: a failed record write removes the snapshot directory —
+    an unrecorded directory would be invisible to disposal/retention."""
     import ouroboros.subagent_worktrees as worktrees
 
     data = tmp_path / "data"
     skill = _seed_skill(data)
 
     def _boom(*_a, **_k):
-        raise OSError("registry disk full")
+        raise OSError("record disk full")
 
-    monkeypatch.setattr(worktrees, "_save_registry", _boom)
-    with pytest.raises(OSError, match="registry disk full"):
+    monkeypatch.setattr(worktrees, "_put_record", _boom)
+    with pytest.raises(OSError, match="record disk full"):
         provision_payload_snapshot(
             target_root=skill, task_id="t1", snapshot_id="snapReg",
             worktree_root=tmp_path / "snaps", data_dir=data)
-    leftovers = list((tmp_path / "snaps").glob("dlgp_*")) if (tmp_path / "snaps").exists() else []
+    leftovers = [*(tmp_path / "snaps").glob("dlgp_*"), *(tmp_path / "snaps").glob(f"{COPIES}/dlgp_*")]
     assert leftovers == [], leftovers
+    assert worktrees.find_execution_snapshot("snapReg", data_dir=data) is None
 
 
 def test_first_wins_is_keyed_on_the_first_shape_carrying_row(tmp_path):
@@ -1165,7 +1132,7 @@ def test_symlinked_git_dir_is_typed_capture_failure(tmp_path, monkeypatch):
 
 def test_schema_and_docs_split_git_staging_from_payload_live_apply():
     """Sol P2-3 pin: integrate_delegated_patch's schema and the deep-delegation
-    docs describe the Git lane as staged-into-active-root and the payload lane
+    docs describe the Git lane as staged-into-recorded-target and the payload lane
     as a live non-Git CAS apply — no universal 'staged' claim covers both."""
     from ouroboros.tools.subagent_integration import get_tools
 
@@ -1174,12 +1141,12 @@ def test_schema_and_docs_split_git_staging_from_payload_live_apply():
     assert "LIVE apply into the non-Git payload" in desc
     assert "nothing is staged into your active root" in desc
     decision = entry.schema["parameters"]["properties"]["decision"]["description"]
-    assert "STAGED into your active root" in decision
+    assert "STAGED into the recorded target" in decision
     assert "applied LIVE into the non-Git payload" in decision
     arch = architecture_text()
-    assert "staging substrate differs" in arch
-    assert "A SKILL-PAYLOAD target captures through the payload adapter" in arch
-    assert "QUEUES the extension reconcile request" in arch
+    for identifier in ("integrate_delegated_patch", "integrate_payload_patch",
+                       "provision_payload_snapshot", "request_extension_reconcile"):
+        assert identifier in arch, identifier
 
 
 def test_registry_and_custody_baseline_disagreement_fails_capture_typed(
@@ -1248,6 +1215,32 @@ def test_child_added_gitattributes_and_crlf_file_transport_raw(tmp_path, monkeyp
     assert "✅ Integrated" in out, out
     assert (skill / "table.csv").read_bytes() == b"a,b\r\n1,2\r\n"
     assert payload_content_hash(skill) == manifest["result_content_hash"]
+    custody._CUSTODY.clear()
+
+
+@pytest.mark.parametrize("note,bucket", [(".self_authored.json", "external"),
+                                         (".ouroboroshub.json", "ouroboroshub"), (".clawhub.json", "clawhub")])
+def test_payload_carrying_its_buckets_install_note_integrates(tmp_path, monkeypatch, note, bucket):
+    """The snapshot copy sits outside data/skills/<bucket>/: the CAS hashes the bucket's
+    per-install note there and in the live folder alike, so the edit still integrates."""
+    from ouroboros.tools.delegate import _capture_terminal_patch
+    from ouroboros.tools.delegate_integration import payload_content_hash
+    from ouroboros.tools.subagent_integration import _integrate_delegated_patch
+
+    ctx = _payload_ctx(tmp_path, monkeypatch)
+    skill = _seed_skill(tmp_path / "data", bucket=bucket)
+    (skill / note).write_text('{"origin": "host"}\n', encoding="utf-8")
+    handle = provision_payload_snapshot(target_root=skill, task_id="t-payload", snapshot_id="snapP")
+    custody._CUSTODY.clear()
+    (pathlib.Path(handle.path) / "notes.txt").write_text("DONE\n", encoding="utf-8")
+    entry = _payload_entry(handle, skill)
+    entry.resource_ref["source"] = bucket
+    capture = _capture_terminal_patch(ctx, entry)
+    assert capture["status"] == "ready_with_changes", capture
+    out = _integrate_delegated_patch(ctx, "run-p1", "apply", "")
+    assert "✅ Integrated" in out, out
+    assert (skill / "notes.txt").read_text(encoding="utf-8") == "DONE\n"
+    assert payload_content_hash(skill) == _capture_manifest(capture)["result_content_hash"]
     custody._CUSTODY.clear()
 
 
@@ -1423,20 +1416,32 @@ def test_host_states_the_typed_access_profile_once_and_says_it_governs():
     derived, and the run died unable to reach its own read surface. The host
     renders ONE sentence from `DelegatedRunShape.access`, names it as the
     native-mechanism text, while explicit task constraints still bind."""
-    from ouroboros.delegate_start_instructions import access_instruction
+    from ouroboros.delegate_start_instructions import INVESTIGATION_INSTRUCTION, access_instruction
     from ouroboros.subagents import delegated_run_shape
     from ouroboros.tools.delegate import _host_instructions
 
     precedence = ("this line governs native process access, while explicit task "
                   "constraints and the assigned edit target still bind.")
-    readonly = _host_instructions(delegated_run_shape(False))
-    assert "ACCESS: you may read and run read-only commands inside this root" in readonly
+    # #1609: technical access alone decides the shape, so the read-only run is the
+    # explicitly readonly one.
+    readonly = _host_instructions(delegated_run_shape(False, "readonly"))
+    assert "The starting folder is a location, not a read boundary." in readonly
+    assert "parent's existing read authority" in readonly and "Make no edits or writes" in readonly
     assert readonly.count(precedence) == 1  # one sentence, never a paragraph
+    assert INVESTIGATION_INSTRUCTION not in readonly
 
     acting = _host_instructions(delegated_run_shape(True))
     assert "ACCESS: you may edit inside this root" in acting
     assert acting.count(precedence) == 1
     assert "read and run read-only commands" not in acting
+    assert INVESTIGATION_INSTRUCTION not in acting
+
+    # A non-acting child that captured writable access is an evidence-only investigation:
+    # the same ONE access sentence, followed once by the purpose that forbids applying.
+    investigation = _host_instructions(delegated_run_shape(False))
+    assert "ACCESS: you may edit inside this root" in investigation
+    assert investigation.count(precedence) == 1
+    assert investigation.count(INVESTIGATION_INSTRUCTION) == 1
     full = _host_instructions(delegated_run_shape(True, "full"))
     assert full.count(precedence) == 1
     assert "No filesystem sandbox is requested" in full
@@ -1444,7 +1449,7 @@ def test_host_states_the_typed_access_profile_once_and_says_it_governs():
     assert "source edits delivered through the assigned root" in full
 
     assignment = "ASSIGNMENT\nRead-only, no edits or commands."
-    with_assignment = _host_instructions(delegated_run_shape(False), assignment)
+    with_assignment = _host_instructions(delegated_run_shape(False, "readonly"), assignment)
     assert with_assignment.endswith("\n\n" + assignment)  # assignment still last
     assert with_assignment.index(precedence) < with_assignment.index(assignment)
 

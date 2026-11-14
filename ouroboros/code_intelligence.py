@@ -1,9 +1,7 @@
-"""Internal deterministic code inventory v2.
-
-No embeddings, no LSP, no SQLite, and no raw source cache. This is a compact
-structural projection used by digest/review context builders and read-only
-code-query tools. The persisted JSON index is additive and derived-only:
-source text is read for parsing, never cached.
+"""Deterministic code inventory v5 for digest/review context and read-only queries.
+Persisted JSON holds local structural facts, never source buffers; no embeddings, LSP or SQLite.
+Cross-file import candidates and occurrences join against current source at query time;
+a cached name match is never a semantic binding.
 """
 
 from __future__ import annotations
@@ -16,13 +14,17 @@ import os
 import pathlib
 import re
 import subprocess
-from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, Iterable, List
+import time
+import unicodedata
+from collections import Counter
+from dataclasses import asdict, dataclass, field, replace
+from typing import Any, Callable, Dict, Iterable, List
 
+from ouroboros import work_domain
+from ouroboros.code_import_candidates import import_specs, is_import_node
 from ouroboros.utils import atomic_write_json, utc_now_iso
 
-
-CODE_INTELLIGENCE_SCHEMA_VERSION = 2
+CODE_INTELLIGENCE_SCHEMA_VERSION = 5
 
 SKIP_DIRS = frozenset({
     ".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
@@ -35,7 +37,7 @@ SEARCH_SKIP_GLOBS = frozenset({
     "*.png", "*.jpg", "*.jpeg", "*.gif", "*.ico", "*.webp",
     "*.woff", "*.woff2", "*.ttf", "*.eot",
     "*.min.js", "*.min.css", "*.map",
-    "*.db", "*.sqlite", "*.sqlite3",
+    "*.db", "*.sqlite", "*.sqlite3", *(f"*.{db}-{part}" for db in ("db", "sqlite", "sqlite3") for part in ("journal", "wal", "shm")),
     "*.lock",
 })
 _SKIP_DIRS = set(SKIP_DIRS)
@@ -44,6 +46,11 @@ _ROUTE_RE = re.compile(r"""(?i)(?:route|path)\s*[:=]\s*['"]([^'"]+)['"]|@\w+\.ro
 _SENSITIVE_NAME_RE = re.compile(r"(?i)(token|secret|credential|private[_-]?key|api[_-]?key|password|passwd)")
 _SENSITIVE_EXTENSIONS = {".json", ".env", ".key", ".pem", ".p12", ".pfx", ".crt", ".cer"}
 _MAX_INDEX_FILE_BYTES = 2_000_000
+_MAX_ENUMERATION_PATHS = 20_000
+_MAX_ENUMERATION_SECONDS = 45.0
+# Bound optional imports separately from source/files; overflow requests a source parse, never a truncated answer.
+_MAX_LOCAL_IMPORT_FACTS = 2000
+_MAX_LOCAL_IMPORT_CHARS = 128_000
 
 
 @dataclass
@@ -63,10 +70,31 @@ class CallSiteFact:
 
 
 @dataclass
-class ReferenceFact:
-    name: str
+class ImportFact:
+    specifier: str
     line: int
+    column: int
+    slot: str
     enclosing: str = ""
+
+
+class _ImportFacts:
+    """One bounded file-local projection; no snippets or joined target paths."""
+
+    def __init__(self):
+        self.rows: list[ImportFact] = []
+        self.complete = True
+        self.chars = 0
+
+    def add(self, specifier: str, line: int, column: int, slot: str, enclosing: str):
+        if not self.complete:
+            return
+        self.chars += len(specifier) + len(slot) + len(enclosing)
+        if len(self.rows) >= _MAX_LOCAL_IMPORT_FACTS or self.chars > _MAX_LOCAL_IMPORT_CHARS:
+            self.complete = False
+            self.rows.clear()
+            return
+        self.rows.append(ImportFact(specifier, line, column, slot, enclosing))
 
 
 @dataclass
@@ -80,11 +108,12 @@ class FileFact:
     syntax_error: str = ""
     symbols: List[SymbolFact] = field(default_factory=list)
     imports: List[str] = field(default_factory=list)
-    resolved_import_paths: List[str] = field(default_factory=list)
     routes: List[str] = field(default_factory=list)
     call_sites: List[CallSiteFact] = field(default_factory=list)
-    references: List[ReferenceFact] = field(default_factory=list)
     exports: List[str] = field(default_factory=list)
+    import_facts: List[ImportFact] = field(default_factory=list)
+    import_facts_complete: bool = False
+    import_facts_method: str = ""
 
 
 @dataclass
@@ -92,29 +121,18 @@ class CodeInventory:
     schema_version: int
     repo_root: str
     git_head: str
-    created_at: str
+    created_at: str = field(compare=False)  # Build time is not inventory content.
     files: List[FileFact]
     coverage: Dict[str, int]
+    nested_roots: List[str] = field(default_factory=list)
+    enumeration_limits: List[str] = field(default_factory=list)
 
     def to_json(self) -> Dict[str, object]:
-        return {
-            "schema_version": self.schema_version,
-            "repo_root": self.repo_root,
-            "git_head": self.git_head,
-            "created_at": self.created_at,
-            "files": [
-                {
-                    **asdict(file),
-                    "symbols": [asdict(symbol) for symbol in file.symbols],
-                }
-                for file in self.files
-            ],
-            "coverage": dict(self.coverage),
-        }
+        return asdict(self)  # recursive: files, symbols and import facts become plain JSON values
 
 
 def inventory_cache_path(repo_root: pathlib.Path, drive_root: pathlib.Path) -> pathlib.Path:
-    root = pathlib.Path(repo_root).resolve(strict=False)
+    root = work_domain.settle(repo_root)
     repo_key = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
     return pathlib.Path(drive_root) / "state" / "code_intel" / repo_key / "inventory.json"
 
@@ -135,10 +153,9 @@ def prune_stale_code_intel_roots(
     """
     import shutil
 
-    from ouroboros.retention import age_cutoff, get_gc_retention_days
+    from ouroboros.retention import age_cutoff, get_gc_retention_days, keep_until
 
-    if retention_days is None:
-        retention_days = get_gc_retention_days()
+    retention_days = get_gc_retention_days() if retention_days is None else retention_days
     cutoff = age_cutoff(retention_days, now)
     report: Dict[str, Any] = {"removed": [], "kept": 0, "errors": []}
     cache_root = pathlib.Path(drive_root) / "state" / "code_intel"
@@ -154,6 +171,7 @@ def prune_stale_code_intel_roots(
             report["kept"] += 1
             continue
         if mtime >= cutoff:
+            keep_until(report, mtime, retention_days)
             report["kept"] += 1
             continue
         try:
@@ -184,19 +202,11 @@ def _call_from_json(raw: Any) -> CallSiteFact:
     )
 
 
-def _reference_from_json(raw: Any) -> ReferenceFact:
-    data = raw if isinstance(raw, dict) else {}
-    return ReferenceFact(
-        name=str(data.get("name") or ""),
-        line=int(data.get("line") or 0),
-        enclosing=str(data.get("enclosing") or ""),
-    )
-
-
 def _file_from_json(raw: Any) -> FileFact | None:
     if not isinstance(raw, dict):
         return None
-    required = ("path", "sha256", "size", "language", "token_estimate")
+    required = ("path", "sha256", "size", "language", "token_estimate",
+                "import_facts", "import_facts_complete", "import_facts_method")
     if any(key not in raw for key in required):
         return None
     try:
@@ -210,51 +220,47 @@ def _file_from_json(raw: Any) -> FileFact | None:
             syntax_error=str(raw.get("syntax_error") or ""),
             symbols=[item for item in (_symbol_from_json(s) for s in raw.get("symbols") or []) if item.name],
             imports=sorted({str(item) for item in (raw.get("imports") or []) if str(item)}),
-            resolved_import_paths=sorted({str(item) for item in (raw.get("resolved_import_paths") or []) if str(item)}),
             routes=sorted({str(item) for item in (raw.get("routes") or []) if str(item)}),
             call_sites=[item for item in (_call_from_json(s) for s in raw.get("call_sites") or []) if item.name],
-            references=[item for item in (_reference_from_json(s) for s in raw.get("references") or []) if item.name],
             exports=sorted({str(item) for item in (raw.get("exports") or []) if str(item)}),
+            import_facts=[ImportFact(**item) for item in raw.get("import_facts", [])],
+            import_facts_complete=raw.get("import_facts_complete") is True,
+            import_facts_method=str(raw.get("import_facts_method") or ""),
         )
     except Exception:
         return None
 
 
 def load_cached_inventory(repo_root: pathlib.Path, drive_root: pathlib.Path) -> CodeInventory | None:
-    """Load a v2 derived inventory cache, returning None for v1/malformed data."""
+    """Load current local facts; old caches may contain stale cross-file joins."""
     path = inventory_cache_path(repo_root, drive_root)
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
-    if not isinstance(raw, dict) or int(raw.get("schema_version") or 0) < CODE_INTELLIGENCE_SCHEMA_VERSION:
+    if not isinstance(raw, dict) or raw.get("schema_version") != CODE_INTELLIGENCE_SCHEMA_VERSION:
         return None
-    files = []
-    for item in raw.get("files") or []:
-        fact = _file_from_json(item)
-        if fact is None:
-            return None
-        files.append(fact)
-    coverage: Dict[str, int] = {}
+    files = [_file_from_json(item) for item in raw.get("files") or []]
+    if any(fact is None for fact in files):
+        return None
     raw_cov = raw.get("coverage")
-    if isinstance(raw_cov, dict):
-        coverage = {str(k): int(v or 0) for k, v in raw_cov.items()}
-    else:
-        for file in files:
-            coverage[file.disposition] = coverage.get(file.disposition, 0) + 1
+    coverage = ({str(k): int(v or 0) for k, v in raw_cov.items()} if isinstance(raw_cov, dict)
+                else dict(Counter(file.disposition for file in files)))
     return CodeInventory(
         schema_version=CODE_INTELLIGENCE_SCHEMA_VERSION,
-        repo_root=str(raw.get("repo_root") or pathlib.Path(repo_root).resolve(strict=False)),
+        repo_root=str(raw.get("repo_root") or work_domain.settle(repo_root)),
         git_head=str(raw.get("git_head") or ""),
         created_at=str(raw.get("created_at") or ""),
         files=files,
         coverage=coverage,
+        nested_roots=list(raw.get("nested_roots") or []),
+        enumeration_limits=list(raw.get("enumeration_limits") or []),
     )
 
 
 def _git_head(repo_root: pathlib.Path) -> str:
     try:
-        proc = subprocess.run(
+        proc = work_domain.run(
             ["git", "rev-parse", "HEAD"],
             cwd=str(repo_root),
             capture_output=True,
@@ -262,28 +268,158 @@ def _git_head(repo_root: pathlib.Path) -> str:
             timeout=5,
         )
         return proc.stdout.strip() if proc.returncode == 0 else ""
+    except work_domain.WorkDomainUnsettled:
+        raise
     except Exception:
         return ""
 
 
-def _tracked_files(repo_root: pathlib.Path) -> List[pathlib.Path]:
+def _enumerate_files(
+    repo_root: pathlib.Path,
+    *,
+    scope: str = "",
+    path_allowed: Callable[[pathlib.Path], bool] | None = None,
+) -> tuple[List[pathlib.Path], List[str], List[str]]:
+    """Enumerate Git-visible files, expanding embedded repositories on demand.
+
+    Nested roots supply their own ignores, with visibility checked before entry and no directory-link traversal.
+    Filesystem fallback discloses its missing ignores. Bounds count visited entries/time, not matches;
+    scope selects the initial root so unrelated entries spend no budget.
+    """
+    root = work_domain.settle(repo_root)
+    selected = root / pathlib.PurePosixPath(str(scope or "").replace("\\", "/"))
     try:
-        proc = subprocess.run(
-            ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-            cwd=str(repo_root),
-            capture_output=True,
-            timeout=10,
-        )
-        if proc.returncode == 0:
-            return [repo_root / part.decode("utf-8", errors="replace") for part in proc.stdout.split(b"\0") if part]
-    except Exception:
-        pass
-    paths: List[pathlib.Path] = []
-    for dirpath, dirnames, filenames in os.walk(repo_root):
-        dirnames[:] = [d for d in sorted(dirnames) if d not in _SKIP_DIRS]
-        for name in sorted(filenames):
-            paths.append(pathlib.Path(dirpath) / name)
-    return paths
+        selected_parts = selected.relative_to(root).parts
+    except ValueError:
+        raise ValueError("scope must stay within the inventory root") from None
+    if ".." in selected_parts:
+        raise ValueError("scope must stay within the inventory root")
+    paths: set[pathlib.Path] = set()
+    nested: set[str] = set()
+    limits: set[str] = set()
+    pending: list[tuple[pathlib.Path, str]] = []
+    seen: set[pathlib.Path] = set()
+    visited = 0
+    deadline = time.monotonic() + _MAX_ENUMERATION_SECONDS
+
+    def budget() -> bool:
+        if visited >= _MAX_ENUMERATION_PATHS:
+            limits.add(f"enumeration_entry_limit:{_MAX_ENUMERATION_PATHS}")
+            return False
+        if time.monotonic() >= deadline:
+            limits.add(f"enumeration_time_limit:{_MAX_ENUMERATION_SECONDS:g}s")
+            return False
+        return True
+
+    def permitted(path: pathlib.Path) -> bool:
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            return False
+        if ".." in rel.parts or any(part in _SKIP_DIRS for part in rel.parts):
+            return False
+        return path_allowed is None or path_allowed(path)
+
+    def visible(path: pathlib.Path) -> bool:
+        nonlocal visited
+        visited += 1
+        return permitted(path)
+
+    def add(path: pathlib.Path) -> None:
+        if not visible(path):
+            return
+        if (work_domain.kind(path) == "link"):
+            # File symlinks are classified by _file_fact before any source read.
+            # In particular, no traversal may escape through a directory link.
+            if work_domain.is_dir(path):
+                limits.add("directory_symlinks_not_followed")
+            else:
+                paths.add(path)
+        elif work_domain.is_dir(path):
+            pending.append((path, ""))
+        else:
+            paths.add(path)
+
+    if selected != root:
+        if not permitted(selected):
+            return [], [], []
+        # Check each directory before inspecting its Git marker. A scoped walk
+        # inside a nested repo still reports that repo, even without visiting
+        # the ancestor in its listing. Never enter through a directory symlink.
+        directory = root
+        for part in selected_parts:
+            directory /= part
+            if not permitted(directory):
+                return [], [], []
+            if (work_domain.kind(directory) == "link") and (directory != selected or work_domain.is_dir(directory)):
+                return [], [], ["directory_symlinks_not_followed"]
+            if work_domain.is_dir(directory) and work_domain.exists(directory / ".git"):
+                nested.add(directory.relative_to(root).as_posix())
+    if work_domain.is_dir(selected):
+        pending.append((selected, ""))
+    elif work_domain.is_file(selected) or work_domain.kind(selected) == "link":
+        pending.append((selected.parent, selected.name))
+    else:
+        return [], sorted(nested), []
+
+    while pending and budget():
+        directory, filename = pending.pop()
+        if directory in seen:
+            continue
+        seen.add(directory)
+        if directory != root and work_domain.exists(directory / ".git"):
+            nested.add(directory.relative_to(root).as_posix())
+        try:
+            command = ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"]
+            if filename:
+                command.extend(["--", ":(literal)" + filename])
+            proc = work_domain.run(
+                command,
+                cwd=str(directory), capture_output=True,
+                timeout=max(0.01, min(10.0, deadline - time.monotonic())),
+            )
+        except work_domain.WorkDomainUnsettled:
+            raise
+        except (OSError, subprocess.TimeoutExpired):
+            proc = None
+        if proc is not None and proc.returncode == 0:
+            for part in sorted(set(proc.stdout.split(b"\0"))):
+                if not part:
+                    continue
+                if not budget():
+                    break
+                add(directory / os.fsdecode(part.rstrip(b"/")))
+            continue
+        limits.add("filesystem_fallback_without_git_ignores")
+        if filename:
+            add(directory / filename)
+            continue
+        # os.walk does not follow directory symlinks. Prune before descending,
+        # including caller-invisible roots and nested repos with their own rules.
+        for dirpath, dirnames, filenames in (work_domain.walk(directory) if work_domain.is_work(directory)
+                                           else os.walk(directory, followlinks=False)):
+            if not budget():
+                break
+            current = pathlib.Path(dirpath)
+            descend = []
+            for name in sorted(dirnames):
+                if not budget():
+                    break
+                child = current / name
+                if not visible(child):
+                    continue
+                if work_domain.kind(child) == "link":
+                    limits.add("directory_symlinks_not_followed")
+                elif work_domain.exists(child / ".git"):
+                    pending.append((child, ""))
+                else:
+                    descend.append(name)
+            dirnames[:] = descend
+            for name in sorted(filenames):
+                if not budget():
+                    break
+                add(current / name)
+    return sorted(paths), sorted(nested), sorted(limits)
 
 
 def _language(path: pathlib.Path) -> str:
@@ -292,8 +428,12 @@ def _language(path: pathlib.Path) -> str:
         ".py": "python",
         ".js": "javascript",
         ".jsx": "javascript",
+        ".mjs": "javascript",
+        ".cjs": "javascript",
         ".ts": "typescript",
         ".tsx": "typescript",
+        ".mts": "typescript",
+        ".cts": "typescript",
         ".go": "go",
         ".md": "markdown",
         ".json": "json",
@@ -310,8 +450,6 @@ def _signature(node: ast.AST) -> str:
     if isinstance(node, ast.ClassDef):
         return f"class {node.name}"
     return ""
-
-
 
 
 def _resolve_relative_import(rel_path: pathlib.PurePosixPath, module: str, level: int) -> str:
@@ -333,16 +471,16 @@ def _call_name(node: ast.AST) -> str:
     return ""
 
 
-def _python_facts(text: str, rel_path: pathlib.PurePosixPath) -> tuple[List[SymbolFact], List[str], str, List[CallSiteFact], List[ReferenceFact]]:
+def _python_facts(text: str, rel_path: pathlib.PurePosixPath, *,
+                  import_facts: _ImportFacts | None = None) -> tuple[List[SymbolFact], List[str], str, List[CallSiteFact]]:
     try:
         tree = ast.parse(text)
     except SyntaxError as exc:
-        return [], [], f"{exc.msg} at line {exc.lineno}", [], []
+        return [], [], f"{exc.msg} at line {exc.lineno}", []
     symbols: List[SymbolFact] = []
     imports: List[str] = []
     calls: List[CallSiteFact] = []
-    references: List[ReferenceFact] = []
-    stack: list[tuple[ast.AST, str]] = [(tree, "")]
+    stack: list[tuple[ast.AST, tuple[str, ...]]] = [(tree, ())]
     while stack:
         node, enclosing = stack.pop()
         child_enclosing = enclosing
@@ -354,7 +492,7 @@ def _python_facts(text: str, rel_path: pathlib.PurePosixPath) -> tuple[List[Symb
                 line_end=int(getattr(node, "end_lineno", getattr(node, "lineno", 0)) or 0),
                 signature=_signature(node),
             ))
-            child_enclosing = node.name
+            child_enclosing = (*enclosing, node.name)
         elif isinstance(node, ast.Assign):
             if all(isinstance(target, ast.Name) and target.id.isupper() for target in node.targets):
                 for target in node.targets:
@@ -375,27 +513,22 @@ def _python_facts(text: str, rel_path: pathlib.PurePosixPath) -> tuple[List[Symb
         elif isinstance(node, ast.Call):
             name = _call_name(node.func)
             if name:
-                calls.append(CallSiteFact(name, int(getattr(node, "lineno", 0) or 0), enclosing))
-        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
-            references.append(ReferenceFact(node.id, int(getattr(node, "lineno", 0) or 0), enclosing))
-        elif isinstance(node, ast.Attribute):
-            references.append(ReferenceFact(node.attr, int(getattr(node, "lineno", 0) or 0), enclosing))
+                calls.append(CallSiteFact(name, int(getattr(node, "lineno", 0) or 0), enclosing[-1] if enclosing else ""))
+        if import_facts is not None and isinstance(node, (ast.Import, ast.ImportFrom)):
+            if isinstance(node, ast.Import):
+                specs = {alias.name for alias in node.names}
+            else:
+                base = "." * node.level + (node.module or "")
+                specs = {base} if base else set()
+                specs.update(base + ("" if base.endswith(".") else ".") + alias.name
+                             for alias in node.names if base and alias.name != "*")
+            for spec in sorted(specs):
+                import_facts.add(spec, node.lineno, node.col_offset + 1,
+                                 "ast." + type(node).__name__, " / ".join(enclosing[-2:]))
         stack.extend((child, child_enclosing) for child in reversed(list(ast.iter_child_nodes(node))))
     symbols = sorted(symbols, key=lambda item: (item.line_start, item.name))
     calls = sorted(calls, key=lambda item: (item.line, item.enclosing, item.name))
-    references = sorted(references, key=lambda item: (item.line, item.enclosing, item.name))
-    return symbols, sorted(set(imports)), "", calls, references
-
-
-def _resolve_python_import(repo_root: pathlib.Path, module: str) -> str:
-    rel = pathlib.Path(*str(module or "").split("."))
-    for candidate in (repo_root / rel.with_suffix(".py"), repo_root / rel / "__init__.py"):
-        if candidate.is_file():
-            try:
-                return candidate.relative_to(repo_root).as_posix()
-            except ValueError:
-                return ""
-    return ""
+    return symbols, sorted(set(imports)), "", calls
 
 
 def extract_js_imports(text: str) -> list[str]:
@@ -441,7 +574,6 @@ _TS_CALL_TYPES = {"call", "call_expression", "method_invocation", "function_call
                   "invocation_expression", "macro_invocation"}
 _TS_IMPORT_TYPES = {"import_declaration", "import_spec", "import_statement", "use_declaration",
                     "using_directive", "preproc_include", "package_clause"}
-_TS_MAX_SYMBOLS = 4000
 
 
 @functools.lru_cache(maxsize=32)
@@ -464,36 +596,36 @@ def _ts_node_name(node: Any) -> str:
     return ""
 
 
-def _ts_callee_name(node: Any) -> str:
-    for field_name in ("function", "name", "method"):
-        target = node.child_by_field_name(field_name)
-        if target is not None:
-            if target.type in _TS_NAME_TYPES and target.text:
-                return target.text.decode("utf-8", "replace").rsplit(".", 1)[-1].rsplit("::", 1)[-1]
-            # member/scoped call (obj.method(), pkg.Func(), a::b()): the callee is
-            # the FINAL identifier (the method/function), not the receiver/namespace.
-            # Iterate in reverse so `obj.doThing()` -> doThing, `fmt.Sprintf()` ->
-            # Sprintf (matches the Python ast path and the former JS regex).
-            for child in reversed(target.children):
-                if child.type in _TS_NAME_TYPES and child.text:
-                    return child.text.decode("utf-8", "replace")
-    return ""
+def _ts_callee_leaf(node: Any) -> Any:
+    """Terminal identifier of a syntactic callee, never its receiver. Past member/name fields only a sole unlabelled
+    operand (parentheses, `x!`) or a final name after labelled qualifiers (PHP ``\\A\\foo``) continues; ``getters[key]`` names none."""
+    target = next((t for t in map(node.child_by_field_name, ("function", "name", "method")) if t is not None), None)
+    while target is not None:
+        if target.child_count == 0:
+            return target if target.type in _TS_NAME_TYPES else None
+        child = next((c for c in map(target.child_by_field_name, ("attribute", "property", "field", "name", "function")) if c is not None), None)
+        if child is None:  # type arguments are no operand, so C# Target<int>() still names Target
+            ops = [(target.field_name_for_child(i), c) for i, c in enumerate(target.children) if c.is_named and c.type != "type_argument_list"]
+            if ops and ops[-1][0] is None and None not in [label for label, _ in ops[:-1]] and (len(ops) == 1 or ops[-1][1].type in _TS_NAME_TYPES):
+                child = ops[-1][1]
+        target = child
+    return None
 
 
-def _treesitter_facts(text: str, lang: str):
-    """Generic structural facts for a non-Python language via tree-sitter.
+def _treesitter_facts(text: str, lang: str, *, raw: bytes | None = None,
+                      import_facts: _ImportFacts | None = None):
+    """Structural facts via tree-sitter, also used for partial Python imports.
 
-    Returns (symbols, imports, syntax_error, calls, references) or None when the
-    grammar/library is unavailable (the caller then marks structural_unavailable).
+    Returns (symbols, imports, syntax_error, calls), or None without a parser.
     """
-    grammar = _TS_LANGUAGES.get(lang)
+    grammar = "python" if lang == "python" else _TS_LANGUAGES.get(lang)
     if not grammar:
         return None
     parser = _ts_parser(grammar)
     if parser is None:
         return None
     try:
-        tree = parser.parse(text.encode("utf-8", "replace"))
+        tree = parser.parse(raw if raw is not None else text.encode("utf-8", "replace"))
     except Exception:
         return None
     symbols: List[SymbolFact] = []
@@ -501,83 +633,114 @@ def _treesitter_facts(text: str, lang: str):
     imports: List[str] = []
     root = tree.root_node
     # Iterative DFS carrying the enclosing definition name (for call attribution).
-    stack: list[tuple[Any, str]] = [(root, "")]
+    stack: list[tuple[Any, str, tuple[str, ...]]] = [(root, "", ())]
     while stack:
-        node, enclosing = stack.pop()
+        node, enclosing, ancestors = stack.pop()
         child_enclosing = enclosing
+        child_ancestors = ancestors
         ntype = node.type
+        if import_facts is not None and is_import_node(node, lang):
+            for spec in import_specs(node, lang):
+                import_facts.add(spec, node.start_point[0] + 1, node.start_point[1] + 1,
+                                 ntype, " / ".join(ancestors[-2:]))
         if ntype in _TS_DEF_KINDS:
+            name_node = node.child_by_field_name("name")
+            if name_node is not None:
+                child_ancestors = (*ancestors, name_node.text.decode("utf-8", "replace"))
+        declaration_kind = _TS_DEF_KINDS.get(ntype)
+        if ntype == "variable_declarator" and node.parent is not None:
+            parent = node.parent
+            name_node = node.child_by_field_name("name")
+            if (parent.type in {"lexical_declaration", "variable_declaration"}
+                    and name_node is not None and name_node.type == "identifier"):
+                declaration_kind = "constant" if any(c.type == "const" for c in parent.children) else "variable"
+        if declaration_kind:
             name = _ts_node_name(node)
-            if name and len(symbols) < _TS_MAX_SYMBOLS:
+            if name:
                 sig = (node.text.decode("utf-8", "replace").splitlines() or [""])[0].strip()[:200] if node.text else ""
-                symbols.append(SymbolFact(name, _TS_DEF_KINDS[ntype], node.start_point[0] + 1, node.end_point[0] + 1, sig))
+                symbols.append(SymbolFact(name, declaration_kind, node.start_point[0] + 1, node.end_point[0] + 1, sig))
                 child_enclosing = name
         elif ntype in _TS_CALL_TYPES:
-            callee = _ts_callee_name(node)
-            if callee:
-                calls.append(CallSiteFact(callee, node.start_point[0] + 1, enclosing))
+            callee = _ts_callee_leaf(node)
+            if callee is not None and callee.text:
+                calls.append(CallSiteFact(callee.text.decode("utf-8", "replace"), node.start_point[0] + 1, enclosing))
         elif ntype in _TS_IMPORT_TYPES and node.text:
             spec = (node.text.decode("utf-8", "replace").splitlines() or [""])[0].strip()[:200]
             if spec:
                 imports.append(spec)
-        stack.extend((child, child_enclosing) for child in reversed(node.children))
+        stack.extend((child, child_enclosing, child_ancestors) for child in reversed(node.children))
     syntax_error = "syntax error" if root.has_error else ""
     symbols.sort(key=lambda s: (s.line_start, s.name))
     calls.sort(key=lambda c: (c.line, c.enclosing, c.name))
-    return symbols, sorted(set(imports)), syntax_error, calls, []
+    return symbols, sorted(set(imports)), syntax_error, calls
 
 
-def _file_fact(repo_root: pathlib.Path, path: pathlib.Path) -> FileFact:
+def _path_fact(repo_root: pathlib.Path, path: pathlib.Path) -> FileFact:
+    """Admission known before any source read (containment, name, size); ``not_parsed`` when admitted."""
     try:
         rel = path.relative_to(repo_root).as_posix()
     except ValueError:
         try:
-            rel = path.resolve(strict=False).relative_to(repo_root).as_posix()
+            rel = work_domain.settle(path).relative_to(repo_root).as_posix()
         except ValueError:
             return FileFact(str(path), "", 0, _language(path), 0, disposition="path_escape")
-    if path.is_symlink():
-        try:
-            path.resolve(strict=False).relative_to(repo_root)
-        except ValueError:
-            return FileFact(rel, "", 0, _language(path), 0, disposition="path_escape")
+    try:
+        work_domain.settle(path).relative_to(work_domain.settle(repo_root))
+    except (OSError, ValueError):
+        return FileFact(rel, "", 0, _language(path), 0, disposition="path_escape")
     if _is_sensitive_inventory_path(rel):
         return FileFact(rel, "", 0, _language(path), 0, disposition="sensitive")
     try:
-        stat_size = path.stat().st_size
+        stat_size = (work_domain.lstat(path) if work_domain.is_work(path) else path.stat()).st_size
     except OSError as exc:
         return FileFact(rel, "", 0, _language(path), 0, disposition=f"read_error:{exc}")
-    if stat_size > _MAX_INDEX_FILE_BYTES:
-        return FileFact(rel, "", stat_size, _language(path), 0, disposition="oversized")
+    disposition = "oversized" if stat_size > _MAX_INDEX_FILE_BYTES else "not_parsed"
+    return FileFact(rel, "", stat_size, _language(path), 0, disposition=disposition)
+
+
+def _file_fact(repo_root: pathlib.Path, path: pathlib.Path) -> FileFact:
+    admitted = _path_fact(repo_root, path)
+    if admitted.disposition != "not_parsed":
+        return admitted
+    rel = admitted.path
     try:
-        raw = path.read_bytes()
+        raw = work_domain.read_bytes(path, limit=_MAX_INDEX_FILE_BYTES + 1)
+    except work_domain.WorkDomainUnsettled:
+        raise
     except OSError as exc:
         return FileFact(rel, "", 0, _language(path), 0, disposition=f"read_error:{exc}")
+    if len(raw) > _MAX_INDEX_FILE_BYTES:
+        return FileFact(rel, "", len(raw), _language(path), 0, disposition="oversized")
     digest = hashlib.sha256(raw).hexdigest()
     lang = _language(path)
     token_est = max(1, len(raw) // 4)
     if b"\0" in raw[:4096]:
         return FileFact(rel, digest, len(raw), lang, token_est, disposition="binary")
     text = raw.decode("utf-8", errors="replace")
+    local_imports = _ImportFacts()
     if lang == "python":
-        symbols, imports, syntax_error, calls, references = _python_facts(text, pathlib.PurePosixPath(rel))
-        resolved = [p for p in (_resolve_python_import(repo_root, module) for module in imports) if p]
+        symbols, imports, syntax_error, calls = _python_facts(text, pathlib.PurePosixPath(rel), import_facts=local_imports)
+        import_method = "python ast"
+        if syntax_error or text.encode("utf-8") != raw:
+            # Preserve partial-tree import syntax in invalid Python as well.
+            local_imports = _ImportFacts()
+            parsed = _treesitter_facts(text, lang, raw=raw, import_facts=local_imports)
+            local_imports.complete &= parsed is not None
+            import_method = "tree-sitter/python" if parsed is not None else ""
         return FileFact(
-            rel,
-            digest,
-            len(raw),
-            lang,
-            token_est,
+            rel, digest, len(raw), lang, token_est,
             syntax_error=syntax_error,
             symbols=symbols,
             imports=imports,
-            resolved_import_paths=resolved,
             call_sites=calls,
-            references=references,
+            import_facts=local_imports.rows,
+            import_facts_complete=local_imports.complete,
+            import_facts_method=import_method,
         )
     if lang in _TS_LANGUAGES:
-        ts = _treesitter_facts(text, lang)
+        ts = _treesitter_facts(text, lang, raw=raw, import_facts=local_imports)
         if ts is not None:
-            symbols, ts_imports, syntax_error, calls, references = ts
+            symbols, ts_imports, syntax_error, calls = ts
             # JS/TS keep their dedicated import + route extraction (route detection
             # is framework-shaped, not a tags concern); symbols/calls now come from
             # tree-sitter instead of the old per-line regex.
@@ -590,12 +753,26 @@ def _file_fact(repo_root: pathlib.Path, path: pathlib.Path) -> FileFact:
             return FileFact(
                 rel, digest, len(raw), lang, token_est,
                 syntax_error=syntax_error, symbols=symbols, imports=imports,
-                routes=routes, call_sites=calls, references=references,
+                routes=routes, call_sites=calls,
+                import_facts=local_imports.rows,
+                import_facts_complete=local_imports.complete,
+                import_facts_method=f"tree-sitter/{_TS_LANGUAGES[lang]}",
             )
-        # A known code language but no grammar/tree-sitter available: surface a
-        # VISIBLE structural-unavailable disposition instead of silently guessing.
-        return FileFact(rel, digest, len(raw), lang, token_est, disposition=f"structural_unavailable:{lang}")
-    return FileFact(rel, digest, len(raw), lang, token_est)
+    # A known code language without grammar/tree-sitter, or an unknown suffix: no outline parser
+    # ran, so surface a VISIBLE structural-unavailable disposition, never an indexed empty
+    # outline or a silent guess. The text still participates in occurrence evidence.
+    return FileFact(rel, digest, len(raw), lang, token_est, disposition=f"structural_unavailable:{lang}")
+
+
+def _name_absent(name: str, raw: bytes, language: str) -> bool:
+    """True when bytes due an outline parse cannot hold symbol ``name``: tree-sitter names are
+    their slices; Python AST names, NFKC identifiers between ASCII delimiters, stay whole in
+    the text's NFKC. Binary, undecodable and non-outline files keep their ordinary parse."""
+    if b"\0" in raw[:4096] or (language != "python" and language not in _TS_LANGUAGES):
+        return False
+    text = raw.decode("utf-8", "replace")
+    return text.encode("utf-8") == raw and name not in text and (
+        language != "python" or text.isascii() or name not in unicodedata.normalize("NFKC", text))
 
 
 def _is_sensitive_inventory_path(rel_path: str) -> bool:
@@ -610,14 +787,14 @@ def _is_sensitive_inventory_path(rel_path: str) -> bool:
 
 def _is_excluded_inventory_path(path: pathlib.Path, excluded_paths: list[pathlib.Path]) -> bool:
     try:
-        resolved = pathlib.Path(path).resolve(strict=False)
+        resolved = work_domain.settle(path)
     except Exception:
         return False
     for excluded in excluded_paths:
         if resolved == excluded:
             return True
         try:
-            if excluded.is_dir():
+            if work_domain.is_dir(excluded):
                 resolved.relative_to(excluded)
                 return True
         except Exception:
@@ -628,102 +805,152 @@ def _is_excluded_inventory_path(path: pathlib.Path, excluded_paths: list[pathlib
 def build_code_inventory(
     repo_root: pathlib.Path,
     *,
+    scope: str = "",
     drive_root: pathlib.Path | None = None,
     persist: bool = True,
     exclude_paths: Iterable[pathlib.Path] | None = None,
+    path_allowed: Callable[[pathlib.Path], bool] | None = None,
+    parse: bool = True,
+    name: str = "",
 ) -> CodeInventory:
-    root = pathlib.Path(repo_root).resolve(strict=False)
-    cached = load_cached_inventory(root, drive_root) if drive_root is not None else None
+    """Current inventory facts; ``parse=False`` lists admitted paths only, never cached. ``name`` leaves
+    files whose current bytes cannot hold that outline name unparsed (``name_absent``), likewise uncached."""
+    root = work_domain.settle(repo_root)
+    deadline = time.monotonic() + _MAX_ENUMERATION_SECONDS
+    cached = load_cached_inventory(root, drive_root) if drive_root is not None and parse else None
     cached_by_path = {file.path: file for file in (cached.files if cached else [])}
     excluded_paths = [
-        pathlib.Path(path).expanduser().resolve(strict=False)
+        work_domain.settle(pathlib.Path(path).expanduser())
         for path in (exclude_paths or [])
     ]
+    filtered = pathlib.PurePosixPath(str(scope or "").replace("\\", "/")) != pathlib.PurePosixPath(".")
+
+    def visible(path: pathlib.Path) -> bool:
+        nonlocal filtered
+        allowed = (not _is_excluded_inventory_path(path, excluded_paths)
+                   and (path_allowed is None or path_allowed(path)))
+        filtered |= not allowed
+        return allowed
+
+    paths, nested_roots, enumeration_limits = _enumerate_files(root, scope=scope, path_allowed=visible)
+    walked = None if any("limit" in note for note in enumeration_limits) else {
+        path.relative_to(root).as_posix() for path in paths}
     files = []
-    for path in _tracked_files(root):
-        try:
-            rel_parts = path.relative_to(root).parts
-        except ValueError:
-            rel_parts = path.parts
-        if any(part in _SKIP_DIRS for part in rel_parts):
+    for path in paths:
+        if time.monotonic() >= deadline:
+            enumeration_limits.append(f"inventory_time_limit:{_MAX_ENUMERATION_SECONDS:g}s")
+            break
+        if not work_domain.is_file(path) and not (work_domain.kind(path) == "link"):
             continue
-        if _is_excluded_inventory_path(path, excluded_paths):
-            continue
-        if path.is_file():
-            rel = ""
+        rel = path.relative_to(root).as_posix()
+        # Admit containment/name/size before cache validation, so an oversized cache entry never forces a hash read.
+        raw, cached_file = None, cached_by_path.get(rel)
+        admitted = _path_fact(root, path) if cached_file is not None or (parse and name) else None
+        if admitted is not None and admitted.disposition == "not_parsed":
             try:
-                rel = path.relative_to(root).as_posix()
-            except ValueError:
+                raw = work_domain.read_bytes(path, limit=_MAX_INDEX_FILE_BYTES + 1)
+            except work_domain.WorkDomainUnsettled:
+                raise
+            except OSError:
                 pass
-            try:
-                digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            except Exception:
-                digest = ""
-            cached_file = cached_by_path.get(rel)
-            if cached_file is not None and digest and cached_file.sha256 == digest:
-                files.append(cached_file)
-            else:
-                files.append(_file_fact(root, path))
-    coverage: Dict[str, int] = {}
-    for file in files:
-        coverage[file.disposition] = coverage.get(file.disposition, 0) + 1
+        if (cached_file is not None and raw is not None
+                and len(raw) <= _MAX_INDEX_FILE_BYTES
+                and cached_file.language == _language(path)
+                and (cached_file.disposition != "indexed"
+                     or cached_file.language == "python" or cached_file.language in _TS_LANGUAGES)
+                and cached_file.sha256 == hashlib.sha256(raw).hexdigest()):
+            files.append(cached_file)
+        elif parse and name and raw is not None and len(raw) <= _MAX_INDEX_FILE_BYTES and _name_absent(name, raw, admitted.language):
+            files.append(replace(admitted, disposition="name_absent"))
+        else:
+            files.append(_file_fact(root, path) if parse else _path_fact(root, path))
     inventory = CodeInventory(
         schema_version=CODE_INTELLIGENCE_SCHEMA_VERSION,
         repo_root=str(root),
         git_head=_git_head(root),
         created_at=utc_now_iso(),
         files=files,
-        coverage=coverage,
+        coverage=dict(Counter(file.disposition for file in files)),
+        nested_roots=nested_roots,
+        enumeration_limits=enumeration_limits,
     )
-    if persist and drive_root is not None:
-        path = inventory_cache_path(root, pathlib.Path(drive_root))
-        atomic_write_json(path, inventory.to_json(), trailing_newline=True)
+    stored, seen = inventory, {file.path for file in files}
+    if cached is not None and any("limit" in note for note in enumeration_limits):
+        # A bounded refresh keeps unvisited cached facts in the disposable cache only:
+        # every reuse rechecks path and hash, and a complete refresh drops deletions.
+        tail = [f for f in cached.files if f.path not in seen and (walked is None or f.path in walked)]
+        kept = sorted([*files, *tail], key=lambda f: f.path)
+        stored = replace(inventory, files=kept, coverage=dict(Counter(f.disposition for f in kept)))
+    # A caller-scoped view must not replace the shared full-source cache.
+    if persist and parse and not name and drive_root is not None and not filtered and stored != cached:
+        atomic_write_json(inventory_cache_path(root, pathlib.Path(drive_root)), stored.to_json(), trailing_newline=True)
+        from ouroboros.maintenance_retirement import artifact_changed
+        artifact_changed(drive_root)
     return inventory
 
 
+def _in_scope(path: str, scope: str) -> bool:
+    scope = str(scope or "").strip().replace("\\", "/").rstrip("/")
+    if scope.startswith("./"):
+        scope = scope[2:]
+    return scope in {"", "."} or path == scope or path.startswith(scope + "/")
+
+
+def render_digest_entry(file: FileFact) -> str:
+    """Render one bounded overview entry, including unavailable-file status."""
+    parts = [f"== {file.path} ({file.size} bytes, {file.language}) =="]
+    if file.disposition != "indexed":
+        parts.append(f"  Status: {file.disposition}")
+    if file.syntax_error:
+        parts.append(f"  Syntax: {file.syntax_error}")
+    for label, items, limit in (
+        ("Symbols", [symbol.name for symbol in file.symbols], 20),
+        ("Imports", file.imports, 12),
+        ("Routes", file.routes, 12),
+        ("Calls", [call.name for call in file.call_sites], 12),
+    ):
+        if items:
+            value = ", ".join(items[:limit])
+            if len(items) > limit:
+                value += f", ... ({len(items)} total)"
+            parts.append(f"  {label}: {value}")
+    return "\n".join(parts)
+
+
+def digest_rollups(inventory: CodeInventory, scope: str = "") -> Dict[str, Any]:
+    """Scope totals independent of the selected page; no completeness claim."""
+    files = [file for file in inventory.files if _in_scope(file.path, scope)]
+    languages: Dict[str, int] = {}
+    dispositions: Dict[str, int] = {}
+    for file in files:
+        languages[file.language] = languages.get(file.language, 0) + 1
+        dispositions[file.disposition] = dispositions.get(file.disposition, 0) + 1
+    indexed = [file for file in files if file.disposition == "indexed"]
+    return {
+        "files": len(files), "indexed": len(indexed),
+        "symbols": sum(len(file.symbols) for file in indexed),
+        "line_est": sum(max(1, file.token_estimate // 20) for file in indexed),
+        "languages": dict(sorted(languages.items())),
+        "dispositions": dict(sorted(dispositions.items())),
+    }
+
+
 def render_codebase_digest(inventory: CodeInventory) -> str:
-    lines: List[str] = []
-    total_lines_est = 0
-    total_symbols = 0
-    for file in inventory.files:
-        if file.disposition != "indexed":
-            continue
-        line_est = max(1, file.token_estimate // 20)
-        total_lines_est += line_est
-        total_symbols += len(file.symbols)
-        parts = [f"\n== {file.path} ({file.size} bytes, {file.language}) =="]
-        if file.symbols:
-            names = ", ".join(symbol.name for symbol in file.symbols[:20])
-            if len(file.symbols) > 20:
-                names += f", ... ({len(file.symbols)} total)"
-            parts.append(f"  Symbols: {names}")
-        if file.imports:
-            imports = ", ".join(file.imports[:12])
-            if len(file.imports) > 12:
-                imports += f", ... ({len(file.imports)} total)"
-            parts.append(f"  Imports: {imports}")
-        if file.routes:
-            parts.append("  Routes: " + ", ".join(file.routes[:12]))
-        if file.call_sites:
-            calls = ", ".join(call.name for call in file.call_sites[:12])
-            if len(file.call_sites) > 12:
-                calls += f", ... ({len(file.call_sites)} total)"
-            parts.append(f"  Calls: {calls}")
-        lines.append("\n".join(parts))
+    """Compatibility whole-inventory renderer; query_code pages entries itself."""
+    totals = digest_rollups(inventory)
     return (
-        f"Codebase Digest ({len(inventory.files)} files, ~{total_lines_est} line-est, "
-        f"{total_symbols} symbols, head={inventory.git_head[:12] or 'unknown'})\n"
-        + "\n".join(lines)
+        f"Codebase Digest ({totals['files']} files, ~{totals['line_est']} line-est, "
+        f"{totals['symbols']} symbols, head={inventory.git_head[:12] or 'unknown'})\n"
+        + "\n\n".join(render_digest_entry(file) for file in inventory.files)
     )
 
 
 def symbol_definitions(inventory: CodeInventory, name: str = "", *, path: str = "", kind: str = "any") -> list[tuple[FileFact, SymbolFact]]:
     matches: list[tuple[FileFact, SymbolFact]] = []
-    path_filter = str(path or "").strip().replace("\\", "/")
     for file in inventory.files:
         if file.disposition != "indexed":
             continue
-        if path_filter and not (file.path == path_filter or file.path.startswith(path_filter.rstrip("/") + "/")):
+        if not _in_scope(file.path, path):
             continue
         for symbol in file.symbols:
             if name and symbol.name != name:
@@ -734,88 +961,16 @@ def symbol_definitions(inventory: CodeInventory, name: str = "", *, path: str = 
     return sorted(matches, key=lambda item: (item[0].path, item[1].line_start, item[1].name))
 
 
-def symbol_references(inventory: CodeInventory, name: str, *, path: str = "") -> list[tuple[FileFact, ReferenceFact]]:
-    definition_paths = {file.path for file, _ in symbol_definitions(inventory, name, path=path)}
-    matches: list[tuple[FileFact, ReferenceFact]] = []
-    for file in inventory.files:
-        if file.disposition != "indexed":
-            continue
-        for ref in file.references:
-            if ref.name != name:
-                continue
-            if definition_paths and file.path in definition_paths and ref.line in {
-                symbol.line_start for def_file, symbol in symbol_definitions(inventory, name, path=path) if def_file.path == file.path
-            }:
-                continue
-            matches.append((file, ref))
-    return sorted(matches, key=lambda item: (item[0].path, item[1].line, item[1].enclosing))
-
-
-def symbol_callers(inventory: CodeInventory, name: str, *, path: str = "") -> list[tuple[FileFact, CallSiteFact]]:
-    # Best-effort: path disambiguates definitions, but dynamic method resolution is intentionally approximate.
-    if path and not {file.path for file, _ in symbol_definitions(inventory, name, path=path)}:
-        return []
-    matches: list[tuple[FileFact, CallSiteFact]] = []
-    for file in inventory.files:
-        if file.disposition != "indexed":
-            continue
-        for call in file.call_sites:
-            if call.name == name:
-                matches.append((file, call))
-    return sorted(matches, key=lambda item: (item[0].path, item[1].line, item[1].enclosing))
-
-
-def symbol_callees(inventory: CodeInventory, name: str, *, path: str = "") -> list[tuple[FileFact, CallSiteFact]]:
-    definition_files = {file.path for file, _ in symbol_definitions(inventory, name, path=path)}
-    matches: list[tuple[FileFact, CallSiteFact]] = []
-    for file in inventory.files:
-        if file.disposition != "indexed":
-            continue
-        if definition_files and file.path not in definition_files:
-            continue
-        for call in file.call_sites:
-            if call.enclosing == name or call.enclosing.endswith(f".{name}"):
-                matches.append((file, call))
-    return sorted(matches, key=lambda item: (item[0].path, item[1].line, item[1].name))
-
-
-def impact_files(inventory: CodeInventory, target: str, *, depth: int = 1) -> list[tuple[FileFact, str]]:
-    depth = max(1, min(5, int(depth or 1)))
-    target_text = str(target or "").strip().replace("\\", "/")
-    impacted: dict[str, str] = {}
-    frontier: set[str] = set()
-    if target_text.endswith((".py", ".js", ".jsx", ".ts", ".tsx")) or "/" in target_text:
-        frontier.add(target_text)
-    else:
-        frontier.update(file.path for file, _ in symbol_definitions(inventory, target_text))
-    path_to_file = {file.path: file for file in inventory.files}
-    for hop in range(depth):
-        next_frontier: set[str] = set()
-        for file in inventory.files:
-            if file.disposition != "indexed":
-                continue
-            if set(file.resolved_import_paths) & frontier:
-                impacted.setdefault(file.path, f"imports depth {hop + 1}")
-                next_frontier.add(file.path)
-            if target_text and any(ref.name == target_text for ref in file.references):
-                impacted.setdefault(file.path, f"references {target_text}")
-                next_frontier.add(file.path)
-        frontier = next_frontier
-        if not frontier:
-            break
-    for path in sorted(frontier):
-        impacted.setdefault(path, "target")
-    return [(path_to_file[path], reason) for path, reason in sorted(impacted.items()) if path in path_to_file]
-
-
-def relevant_files(inventory: CodeInventory, query: str, *, limit: int = 40) -> list[tuple[FileFact, float, str]]:
+def relevant_files(inventory: CodeInventory, query: str, *, path: str = "", limit: int | None = 40) -> list[tuple[FileFact, float, str]]:
     tokens = {
         token.casefold()
         for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", str(query or ""))
     }
     scored: list[tuple[FileFact, float, str]] = []
     for file in inventory.files:
-        if file.disposition != "indexed":
+        if not _in_scope(file.path, path):
+            continue
+        if file.disposition != "indexed" and not file.disposition.startswith("structural_unavailable:"):
             continue
         reasons: list[str] = []
         score = 0.0
@@ -842,4 +997,4 @@ def relevant_files(inventory: CodeInventory, query: str, *, limit: int = 40) -> 
         if score > 0:
             scored.append((file, score, "; ".join(reasons)))
     scored.sort(key=lambda item: (-item[1], item[0].path))
-    return scored[: max(1, int(limit or 40))]
+    return scored if limit is None else scored[: max(1, int(limit or 40))]

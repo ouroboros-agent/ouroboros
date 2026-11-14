@@ -9,6 +9,8 @@ from __future__ import annotations
 import pathlib
 import types
 
+import pytest
+
 from ouroboros import delegate_custody as custody
 from ouroboros import delegate_terminal
 from ouroboros.task_results import (
@@ -17,6 +19,7 @@ from ouroboros.task_results import (
     load_task_result,
     write_task_result,
 )
+from tests._store_shared import result_exists, result_signature
 
 
 def _stale_terminal_result(tmp_path: pathlib.Path, task_id: str, **extra) -> None:
@@ -133,9 +136,10 @@ def test_boot_backfill_fixes_row_settled_in_a_previous_generation(tmp_path):
     assert custody == {
         "unreconciled": [], "trigger": "boot_backfill", "audit_status": "ok",
         "open_run_ids": [], "pending_invocation_ids": [], "undisposed_patch_run_ids": [],
-        "terminal_runs": [{"run_id": "run-1", "state": "succeeded", "model": "",
-                           "profile_id": "", "selected_subagent_id": ""}],
+        # The stored actor key stays in the durable audit row, never in this model-facing handoff.
+        "terminal_runs": [{"run_id": "run-1", "state": "succeeded", "model": "", "profile_id": ""}],
     }
+    assert "selected_subagent_id" in envelope["terminal_runs"][0]
 
 
 def test_truncated_custody_disclosure_names_both_retry_lineage_rows(tmp_path):
@@ -156,8 +160,8 @@ def test_truncated_custody_disclosure_names_both_retry_lineage_rows(tmp_path):
     custody = summary["delegated_custody"]
     assert custody["unreconciled_omitted"] == 2
     assert custody["full_source"] == [
-        "read_file(root='runtime_data', path='task_results/t-retry.json')",
-        "read_file(root='runtime_data', path='task_results/t-orig.json')",
+        "get_task_result(task_id='t-retry', include_authority=True)",
+        "get_task_result(task_id='t-orig', include_authority=True)",
     ]
 
 
@@ -230,14 +234,13 @@ def test_second_boot_is_a_byte_level_noop_for_a_permanently_stale_row(tmp_path):
                            delegated_runs_unreconciled=["run-2"])
     assert delegate_terminal.backfill_terminal_reconciliations(tmp_path) == ["t-incident"]
 
-    row_path = tmp_path / "task_results" / "t-incident.json"
     events_path = tmp_path / "logs" / "events.jsonl"
-    row_before = row_path.read_bytes()
+    row_before = result_signature(tmp_path, "t-incident")
     events_before = events_path.read_bytes()
 
     assert delegate_terminal.backfill_terminal_reconciliations(tmp_path) == []
 
-    assert row_path.read_bytes() == row_before
+    assert result_signature(tmp_path, "t-incident") == row_before
     assert events_path.read_bytes() == events_before
 
 
@@ -258,33 +261,45 @@ def test_boot_backfill_adds_the_envelope_to_a_flat_only_kill_row(tmp_path):
     assert envelope["trigger"] == "boot_backfill"
     assert envelope["open_run_ids"] == ["run-6"]
 
-    row_path = tmp_path / "task_results" / "t-flat.json"
     events_path = tmp_path / "logs" / "events.jsonl"
-    row_before, events_before = row_path.read_bytes(), events_path.read_bytes()
+    row_before, events_before = result_signature(tmp_path, "t-flat"), events_path.read_bytes()
     assert delegate_terminal.backfill_terminal_reconciliations(tmp_path) == []
-    assert row_path.read_bytes() == row_before
+    assert result_signature(tmp_path, "t-flat") == row_before
     assert events_path.read_bytes() == events_before
 
 
-def test_lock_timeout_refresh_is_false_and_emits_no_evidence(tmp_path, monkeypatch):
+@pytest.mark.parametrize("ledger", ["imported", "cold"])
+def test_lock_timeout_refresh_is_false_and_emits_no_evidence(tmp_path, monkeypatch, ledger):
     """R3 honesty: a refresh whose write never landed returns False and emits
-    NO custody evidence — the event may not claim a heal the store refused —
-    and the row heals on the next boot."""
+    NO custody or cost evidence — the event may not claim a heal the store refused —
+    and the row heals on the next boot. The money read the custody debt owes may be
+    a cold usage store's first: its one-time import records itself, nothing else."""
+    import json
+
     import ouroboros.task_results as task_results_mod
+    from ouroboros import usage_store
 
     _emit_started(tmp_path, "run-7", "t-lock2")
     _emit_settled(tmp_path, "run-7", "t-lock2")
     _stale_terminal_result(tmp_path, "t-lock2",
                            delegated_runs_unreconciled=["run-7"])
+    if ledger == "imported":
+        usage_store.migrate_from_journal(tmp_path)  # what the server does at boot, before any sweep
     events_path = tmp_path / "logs" / "events.jsonl"
     events_before = events_path.read_bytes()
 
     def _timeout(*_args, **_kwargs):
         raise TimeoutError("lock held elsewhere")
 
-    monkeypatch.setattr(task_results_mod, "update_json_locked", _timeout)
+    monkeypatch.setattr(task_results_mod, "patch_document", _timeout)
     assert delegate_terminal.refresh_terminal_reconciliation(tmp_path, "t-lock2") is False
-    assert events_path.read_bytes() == events_before
+    if ledger == "imported":
+        assert events_path.read_bytes() == events_before
+    else:
+        events_after = events_path.read_bytes()
+        assert events_after.startswith(events_before)
+        added = [json.loads(line)["type"] for line in events_after[len(events_before):].splitlines()]
+        assert added == ["usage_import_completed"], added
     assert load_task_result(tmp_path, "t-lock2")["delegated_runs_unreconciled"] == ["run-7"]
 
     monkeypatch.undo()
@@ -293,8 +308,10 @@ def test_lock_timeout_refresh_is_false_and_emits_no_evidence(tmp_path, monkeypat
 
 
 def test_boot_backfill_shares_one_custody_replay_snapshot(tmp_path, monkeypatch):
-    """Auditing N stored rows must not rescan the unbounded event log 4·N
-    times: the whole backfill pays exactly one ``replay()`` pass."""
+    """Auditing N stored rows must not re-read the custody rows 4·N times: the whole
+    backfill pays exactly one ``custody_audit_snapshot`` read, and never a chain fold."""
+    from ouroboros import delegate_custody_current as current
+
     for index in range(3):
         run_id, task_id = f"run-{index}", f"t-batch-{index}"
         _emit_started(tmp_path, run_id, task_id)
@@ -302,15 +319,16 @@ def test_boot_backfill_shares_one_custody_replay_snapshot(tmp_path, monkeypatch)
         _stale_terminal_result(tmp_path, task_id,
                                delegated_runs_unreconciled=[run_id])
 
-    replays: list = []
-    real_replay = custody.replay
+    snapshots: list = []
+    real_snapshot = current.snapshot
     monkeypatch.setattr(
-        custody, "replay",
-        lambda *args, **kwargs: replays.append(1) or real_replay(*args, **kwargs),
+        current, "snapshot",
+        lambda *args, **kwargs: snapshots.append(1) or real_snapshot(*args, **kwargs),
     )
+    monkeypatch.setattr(custody, "_iter_rows", lambda *a, **kw: pytest.fail("chain fold on the backfill"))
     refreshed = delegate_terminal.backfill_terminal_reconciliations(tmp_path)
     assert sorted(refreshed) == ["t-batch-0", "t-batch-1", "t-batch-2"]
-    assert len(replays) == 1
+    assert len(snapshots) == 1
 
 
 def test_backfill_lock_timeout_is_fail_soft_and_heals_on_the_next_boot(tmp_path, monkeypatch):
@@ -324,7 +342,7 @@ def test_backfill_lock_timeout_is_fail_soft_and_heals_on_the_next_boot(tmp_path,
     def _timeout(*_args, **_kwargs):
         raise TimeoutError("lock held elsewhere")
 
-    monkeypatch.setattr(task_results_mod, "update_json_locked", _timeout)
+    monkeypatch.setattr(task_results_mod, "patch_document", _timeout)
     delegate_terminal.backfill_terminal_reconciliations(tmp_path)  # must not raise
     assert load_task_result(tmp_path, "t-locked")["delegated_runs_unreconciled"] == ["run-4"]
 
@@ -348,7 +366,7 @@ def test_same_boot_sweep_settlement_is_cleared_in_the_same_generation(tmp_path, 
     monkeypatch.setattr(server_mod, "DATA_DIR", tmp_path)
 
     def fake_reconcile(drive_root, *, running_task_ids, gateway_factory,
-                       recoverable_task_ids):
+                       recoverable_handles, replay_pending, observe_pending):
         _emit_settled(tmp_path, "run-5", "t-late")
         return []
 
@@ -378,7 +396,7 @@ def test_recorder_and_refresh_never_mint_a_row_for_an_absent_task(tmp_path):
     delegate_terminal.record_terminal_reconciliation(tmp_path, "t-none", clean)
     assert delegate_terminal.refresh_terminal_reconciliation(
         tmp_path, "t-none", trigger="kill_path_clear") is False
-    assert not (tmp_path / "task_results" / "t-none.json").exists()
+    assert not result_exists(tmp_path, "t-none")
 
 
 def _kill_env(tmp_path, monkeypatch):
@@ -407,7 +425,9 @@ def test_kill_fast_lane_clears_a_stale_disclosure(tmp_path, monkeypatch):
         reason_code="delegated_custody_unreconciled",
         delegated_runs_unreconciled=["run-stale"], delegated_runs_settled=0,
     )
-    ci.request_cancel(env.drive, "t-fast")
+    # The ingress saw live ownership (a worker still winding down) and minted on the
+    # settled target; by the time custody runs the worker is gone: the fast lane.
+    ci.request_cancel(env.drive, "t-fast", allow_settled_target=True)
 
     assert env.tl.cancel_task_custody("t-fast", deliver=False) == env.tl.CANCEL_ALREADY_SETTLED
 
@@ -429,9 +449,8 @@ def test_kill_fast_lane_adds_no_write_when_nothing_is_stale(tmp_path, monkeypatc
 
     env = _kill_env(tmp_path, monkeypatch)
     write_task_result(env.drive, "t-clean-kill", STATUS_FAILED, result="settled")
-    ci.request_cancel(env.drive, "t-clean-kill")
-    row_path = tmp_path / "task_results" / "t-clean-kill.json"
-    row_before = row_path.read_bytes()
+    ci.request_cancel(env.drive, "t-clean-kill", allow_settled_target=True)
+    row_before = result_signature(tmp_path, "t-clean-kill")
 
     writes: list = []
     real_write = task_results_mod.write_task_result
@@ -442,7 +461,7 @@ def test_kill_fast_lane_adds_no_write_when_nothing_is_stale(tmp_path, monkeypatc
     assert env.tl.cancel_task_custody(
         "t-clean-kill", deliver=False) == env.tl.CANCEL_ALREADY_SETTLED
     assert writes == []
-    assert row_path.read_bytes() == row_before
+    assert result_signature(tmp_path, "t-clean-kill") == row_before
 
 
 def test_miss_lane_already_settled_clears_stale_disclosure(tmp_path, monkeypatch):
@@ -474,8 +493,7 @@ def test_miss_lane_already_settled_clears_stale_disclosure(tmp_path, monkeypatch
     import ouroboros.task_results as task_results_mod
 
     write_task_result(env.drive, "t-miss-clean", STATUS_FAILED, result="settled")
-    row_path = tmp_path / "task_results" / "t-miss-clean.json"
-    row_before = row_path.read_bytes()
+    row_before = result_signature(tmp_path, "t-miss-clean")
     writes: list = []
     real_write = task_results_mod.write_task_result
     monkeypatch.setattr(
@@ -487,7 +505,7 @@ def test_miss_lane_already_settled_clears_stale_disclosure(tmp_path, monkeypatch
         intent={"task_id": "t-miss-clean", "request_id": "r2", "generation": 1},
     ) == cp.CANCEL_ALREADY_SETTLED
     assert writes == []
-    assert row_path.read_bytes() == row_before
+    assert result_signature(tmp_path, "t-miss-clean") == row_before
 
 
 def test_reaper_self_finalized_branch_clears_stale_disclosure(tmp_path, monkeypatch):
@@ -527,8 +545,7 @@ def test_reaper_self_finalized_branch_clears_stale_disclosure(tmp_path, monkeypa
     import ouroboros.task_results as task_results_mod
 
     write_task_result(env.drive, "t-self-clean", STATUS_FAILED, result="self-finalized")
-    row_path = tmp_path / "task_results" / "t-self-clean.json"
-    row_before = row_path.read_bytes()
+    row_before = result_signature(tmp_path, "t-self-clean")
     writes: list = []
     real_write = task_results_mod.write_task_result
     monkeypatch.setattr(
@@ -537,7 +554,7 @@ def test_reaper_self_finalized_branch_clears_stale_disclosure(tmp_path, monkeypa
     )
     _reap("t-self-clean")
     assert writes == []
-    assert row_path.read_bytes() == row_before
+    assert result_signature(tmp_path, "t-self-clean") == row_before
 
 
 def test_retry_lineage_stops_resurrecting_cleared_run(tmp_path):
@@ -632,13 +649,16 @@ def test_cursor_pass_heals_tasks_the_outcome_sweep_never_names(tmp_path):
     assert delegate_terminal.refresh_recently_settled_terminals(tmp_path) == 0
 
 
-def test_cursor_defers_running_task_without_starving_later_settlements(tmp_path):
-    """The grok finding: a SETTLED row for a still-RUNNING parent must not pin
-    the byte offset — later settlements past the per-tick window would starve.
-    The offset always advances; the deferred task rides a durable map and is
-    healed on the tick after its result turns terminal."""
-    import json
+def _receipts(root):
+    from ouroboros import obligations as o
 
+    return sorted(tid for tid, facts in o.members(root, "delegated_runs").items() if facts.get("closed_runs"))
+
+
+def test_cursor_defers_running_task_without_starving_later_settlements(tmp_path):
+    """The grok finding, store era: a SETTLED receipt for a still-RUNNING parent waits in
+    its own ``delegated_runs`` row — later settlements of other tasks heal at once, and
+    the deferred task heals on the tick after its result turns terminal."""
     _emit_started(tmp_path, "run-a", "t-longlived")
     write_task_result(
         tmp_path, "t-longlived", STATUS_RUNNING,
@@ -649,11 +669,7 @@ def test_cursor_defers_running_task_without_starving_later_settlements(tmp_path)
     )
     _emit_settled(tmp_path, "run-a", "t-longlived")
     assert delegate_terminal.refresh_recently_settled_terminals(tmp_path) == 0
-    cursor = json.loads(
-        (tmp_path / "state/delegate_terminal_refresh_cursor.json").read_text()
-    )
-    assert cursor["offset"] > 0  # never pinned on the deferred row
-    assert list(cursor["deferred"]) == ["t-longlived"]
+    assert _receipts(tmp_path) == ["t-longlived"]  # the receipt waits for its terminal result
 
     # A LATER terminal-boundary settlement heals immediately — not starved
     # behind the still-running parent.
@@ -680,7 +696,32 @@ def test_cursor_defers_running_task_without_starving_later_settlements(tmp_path)
     )
     assert delegate_terminal.refresh_recently_settled_terminals(tmp_path) == 1
     assert load_task_result(tmp_path, "t-longlived")["actual_substrate"] == "harness_used"
-    cursor = json.loads(
-        (tmp_path / "state/delegate_terminal_refresh_cursor.json").read_text()
+    assert _receipts(tmp_path) == []
+    assert not (tmp_path / "state/delegate_terminal_refresh_cursor.json").exists()
+
+
+def test_cursor_refresh_defers_a_task_whose_owner_is_still_live(tmp_path):
+    """The cursor pass reads the SAME live-owner source as the two custody sweeps
+    (INV-B): a task whose result is terminal while its worker still bills — the
+    post-task synthesis window — is deferred, not rewritten under the live owner.
+    Candidates first, liveness second: the batch comes from the receipts, the live
+    set is read afterwards. Both directions."""
+    _emit_started(tmp_path, "run-live", "t-still-billing")
+    write_task_result(
+        tmp_path, "t-still-billing", STATUS_FAILED,
+        actual_substrate="harness_attempted",
+        delegated_runs_started=1, delegated_runs_settled=0,
+        delegated_runs_succeeded=0, delegated_runs_failed=0,
+        delegated_runs_source_unresolved=0,
     )
-    assert cursor["deferred"] == {}
+    _emit_settled(tmp_path, "run-live", "t-still-billing")
+
+    assert delegate_terminal.refresh_recently_settled_terminals(
+        tmp_path, live_task_ids=lambda: {"t-still-billing"}) == 0
+    assert load_task_result(tmp_path, "t-still-billing")["actual_substrate"] == "harness_attempted"
+    assert _receipts(tmp_path) == ["t-still-billing"]
+
+    # Quiet direction: once the owner is gone the deferred task heals from its receipt.
+    assert delegate_terminal.refresh_recently_settled_terminals(
+        tmp_path, live_task_ids=lambda: set()) == 1
+    assert load_task_result(tmp_path, "t-still-billing")["actual_substrate"] == "harness_used"

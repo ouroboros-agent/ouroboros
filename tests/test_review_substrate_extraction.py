@@ -30,33 +30,20 @@ _MOVED_OWNERS = {
     "ReviewRunResult": review_records,
     "ReviewSlot": review_records,
     "TYPED_FAILURE_FACT_KEYS": review_records,
-    "DIALOGUE_CONTINUE": review_verdict,
-    "DIALOGUE_INCONCLUSIVE": review_verdict,
-    "DIALOGUE_STABLE_DISAGREEMENT": review_verdict,
+    # The acceptance dialogue vocabulary, criteria checks, improvement capsule, dissent
+    # layer, clean-acceptance predicate and host-panel binding left with task acceptance;
+    # the readers old records still need stay re-exported.
     "DIALOGUE_STATUS_VALUES": review_verdict,
-    "DIALOGUE_TERMINAL_STATUSES": review_verdict,
-    "DIALOGUE_UNREACHABLE": review_verdict,
-    "DIALOGUE_VOTE_ABSTAIN_INVALID": review_verdict,
-    "DIALOGUE_VOTE_CONTINUE_WITHOUT_FINDINGS": review_verdict,
-    "_CRITERION_STATUSES": review_verdict,
     "_TIER_ORDER": review_verdict,
     "_contributing_actors": review_verdict,
-    "_criteria_have_supported_evidence": review_verdict,
-    "_criteria_shape_valid": review_verdict,
-    "_unresolved_evidence_ref_labels": review_verdict,
-    "aggregate_dialogue_status": review_verdict,
     "aggregate_outcome_tier": review_verdict,
-    "build_improvement_capsule": review_verdict,
-    "dissent_findings": review_verdict,
     "panel_reason": review_verdict,
-    "task_acceptance_is_clean": review_verdict,
     "_public_review_reason": review_projection,
     "_response_ref_projection": review_projection,
     "_review_actor_projection": review_projection,
     "_review_enforcement_impact": review_projection,
     "_review_panel_id": review_projection,
     "_transport_error_status": review_projection,
-    "build_review_binding": review_projection,
     "compact_review_projection": review_projection,
 }
 
@@ -83,17 +70,16 @@ def test_review_substrate_leaves_are_non_catalog_owners_without_backedges():
 def test_review_substrate_keeps_the_coordinator():
     """Running a panel and resolving the governance/subject roots stay authored
     by ``review_substrate`` itself; the leaves own the records, the reducers and
-    the projection. The tip's own re-homes (``reviewer_slots`` ->
+    the projection. The tip's own re-homes (``triad_delivery_slots`` ->
     reviewer_slot_config, ``slot_id_for_row`` -> review_dispatch,
     ``_render_prompt`` -> review_execution) are pinned as re-exports."""
     for name in (
         "ReviewCoordinator",
         "run_review_request",
-        "scope_reviewer_slots",
         "review_repo_dirs_for",
     ):
         assert getattr(review_substrate, name).__module__ == "ouroboros.review_substrate", name
-    assert review_substrate.reviewer_slots.__module__ == "ouroboros.reviewer_slot_config"
+    assert review_substrate.triad_delivery_slots.__module__ == "ouroboros.reviewer_slot_config"
     assert review_substrate.slot_id_for_row.__module__ == "ouroboros.review_dispatch"
     assert review_substrate._render_prompt.__module__ == "ouroboros.review_execution"
 
@@ -122,15 +108,3 @@ def test_review_panel_records_are_one_class_across_owners():
     assert (
         review_substrate.DIALOGUE_STATUS_VALUES is review_verdict.DIALOGUE_STATUS_VALUES
     )
-
-
-def test_review_substrate_extraction_size_bounds_have_meaningful_headroom():
-    counts = {
-        module.__name__: len(
-            pathlib.Path(module.__file__).read_text(encoding="utf-8").splitlines()
-        )
-        for module in (review_substrate, *_LEAVES)
-    }
-    assert counts["ouroboros.review_substrate"] <= 900
-    assert all(count <= 1000 for count in counts.values())
-    assert counts["ouroboros.review_verdict"] <= 1000

@@ -6,7 +6,8 @@ agent never drift:
   - ``gateway/projects.py`` turn-into-project conversion (reuses an admission name,
     or names inline as a race fallback);
   - ``ensure_project_scope`` (the agent self-creates + names a project);
-  - ``admission_names`` (headless runs and chat promotion, no model call);
+  - ``admission_names`` (headless runs and chat promotion, no model call), also for the
+    head a late answer or card press starts (``late_input_names``: by what it answers);
   - ``spawn_turn_namer`` (a direct Main turn, named once it starts working:
     the first non-addressing tool call triggers one bounded Light call).
 
@@ -24,10 +25,13 @@ import contextvars
 import logging
 import pathlib
 import threading
+import time
 from dataclasses import replace
 from typing import Any, Callable, Dict, Optional, Sequence
 
 log = logging.getLogger("ouroboros.project_naming")
+
+CONTINUE_TITLE_PREFIX = "Continue: "
 
 
 def _light_use_local(explicit: Optional[bool]) -> bool:
@@ -96,7 +100,7 @@ def _light_naming_model() -> str:
 
 
 def _naming_timeout_sec() -> float:
-    """Provider-call transport timeout for the naming LIGHT call. SSOT: config
+    """Operation ceiling for the naming LIGHT call. SSOT: config
     SETTINGS_DEFAULTS (no duplicated literal — the default IS the SSOT value)."""
     from ouroboros.config import runtime_setting
 
@@ -173,6 +177,7 @@ def llm_project_name(
     llm_client: Optional[Any] = None,
     drive_root: Optional[Any] = None,
     task_id: str = "",
+    caller_deadline_ts: Optional[float] = None,
 ) -> str:
     """SYNC bounded LLM-first project title. On ANY failure returns the heuristic
     fallback over ``fallback_candidates`` then ``owner_text``. Never raises.
@@ -180,8 +185,9 @@ def llm_project_name(
     ``use_local=None`` (the default) routes via the runtime ``USE_LOCAL_LIGHT`` flag so a
     local-only / local-light deployment names with its configured local model instead of a
     remote provider. The provider call is wrapped in the #4 per-model concurrency slot so a
-    flurry of namers cannot storm one model's rate limit, carries a bounded transport timeout
-    so a stalled provider can't wedge card creation, and — when ``drive_root`` is given —
+    flurry of namers cannot storm one model's rate limit. One absolute deadline covers
+    preparation, slot waiting and recovery; an earlier caller bound wins. Already-sent
+    work retains settlement custody. When ``drive_root`` is given, the call
     runs through ``chat_observed`` for its forensic trace. The physical send is bound to a
     ``project_naming`` usage scope, which is the sole monetary authority for the attempt.
     """
@@ -191,6 +197,9 @@ def llm_project_name(
         return fb
     use_local = _light_use_local(use_local)
     try:
+        deadline_ts = time.time() + _naming_timeout_sec()
+        if caller_deadline_ts is not None:
+            deadline_ts = min(deadline_ts, caller_deadline_ts)
         from ouroboros import model_concurrency
         from ouroboros.llm import LLMClient
 
@@ -208,11 +217,12 @@ def llm_project_name(
             reasoning_effort="low",
             max_tokens=256,
             use_local=use_local,
-            timeout=_naming_timeout_sec(),
+            timeout=max(0.0, deadline_ts - time.time()),
+            caller_deadline_ts=deadline_ts,
         )
         from ouroboros.usage_accounting import usage_scope
 
-        with model_concurrency.model_call_slot(model, use_local):
+        with model_concurrency.model_call_scope(model, use_local, deadline_ts=deadline_ts):
             with usage_scope(_project_naming_usage_scope(drive_root, task_id)):
                 if drive_root is not None:
                     from ouroboros.llm_observability import chat_observed
@@ -255,6 +265,8 @@ async def llm_project_name_async(
     if not text:
         return fb
     eff_timeout = _naming_async_timeout_sec() if timeout_sec is None else float(timeout_sec)
+    # Capture both ceilings before scheduling: a delayed worker gets only what remains.
+    deadline_ts = time.time() + min(eff_timeout, _naming_timeout_sec())
     try:
         return await asyncio.wait_for(
             asyncio.to_thread(
@@ -265,8 +277,9 @@ async def llm_project_name_async(
                 llm_client=llm_client,
                 drive_root=drive_root,
                 task_id=task_id,
+                caller_deadline_ts=deadline_ts,
             ),
-            timeout=max(0.1, eff_timeout),
+            timeout=max(0.0, deadline_ts - time.time()),
         )
     except Exception:
         log.debug("llm_project_name_async timed out/failed; using heuristic", exc_info=True)
@@ -292,8 +305,13 @@ def _refresh_root_cost_after_naming(drive_root: Any, task_id: str) -> None:
 
 def spawn_turn_namer(
     drive_root: Any, task_id: str, text: str, *, broadcast: Optional[Callable[[dict], None]] = None,
+    fallback_candidates: Sequence[object] = (),
 ) -> None:
     """Coin an LLM title for a direct turn that started working, in a DAEMON thread.
+
+    ``fallback_candidates`` are ``llm_project_name``'s: a turn admitted with its own name
+    passes that name, so a failed or unavailable Light call leaves it standing (it is
+    never rewritten as its fallback) instead of naming the turn from ``text``.
 
     Called once per Main turn from the first non-addressing tool-call frame (the
     seam that already stamps that frame as work: ``supervisor/log_addressing.py``),
@@ -318,14 +336,12 @@ def spawn_turn_namer(
     except (OSError, TypeError, ValueError):
         return
 
+    deadline_ts = time.time() + _naming_timeout_sec()
+
     def _work() -> None:
         try:
-            # v6.58.0 (§3.4b): HARD total wall-clock bound. The transport timeout bounds
-            # ONE attempt, but llm.chat's retry/fallback chain under a degraded provider
-            # could stretch the whole call to tens of minutes (the incident where the
-            # card was named 24 minutes late). A title is cosmetic: if it hasn't landed
-            # within the transport budget + slack, drop it — the id/title heuristics and
-            # the convert path's own bounded inline call (8s) already cover naming.
+            # Stop publishing after the naming window plus the existing settlement
+            # slack. A physical call may outlive that wait; keep its late cost refresh.
             _result: list[str] = []
             _detached = threading.Event()
             _finished = threading.Event()
@@ -342,7 +358,10 @@ def spawn_turn_namer(
 
             def _call() -> None:
                 try:
-                    _result.append(llm_project_name(body, drive_root=drive_root, task_id=task_id))
+                    _result.append(llm_project_name(
+                        body, fallback_candidates=fallback_candidates, drive_root=drive_root, task_id=task_id,
+                        caller_deadline_ts=deadline_ts,
+                    ))
                 except Exception:
                     log.debug("turn namer inner call failed for %s", task_id, exc_info=True)
                 finally:
@@ -354,7 +373,7 @@ def spawn_turn_namer(
             copy_task_settings_context(settings_context)
             inner = threading.Thread(target=settings_context.run, args=(_call,), name=f"namer-call-{task_id}", daemon=True)
             inner.start()
-            if not _finished.wait(timeout=max(0.0, _naming_timeout_sec() + 30.0)):
+            if not _finished.wait(timeout=max(0.0, deadline_ts + 30.0 - time.time())):
                 _detached.set()
                 # Close the race where settlement lands between wait() and
                 # the detached marker. The once-guard covers both interleavings.
@@ -369,6 +388,9 @@ def spawn_turn_namer(
             name = _result[0]
             if not name:
                 return
+            if any(fallback_candidates) and name == fallback_project_name(*fallback_candidates, body):
+                _refresh_root_cost_after_naming(drive_root, task_id)  # the call settled; nothing coined
+                return  # the name it would fall back to already stands
             from ouroboros.task_results import (
                 STATUS_RUNNING,
                 load_task_result,
@@ -384,12 +406,19 @@ def spawn_turn_namer(
             # the status advanced past our read — acceptable for a best-effort title).
             current = load_task_result(drive_root, task_id) or {}
             status = str(current.get("status") or "") or STATUS_RUNNING
-            write_task_result(drive_root, task_id, status, suggested_name=name)
+            written = {"kept": False}
+
+            def _unless_adopted(existing: Dict[str, Any], fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+                """In the write itself: a Continue's adopted subject outranks this late cosmetic name."""
+                written["kept"] = not work_name_adopted(existing)
+                return fields if written["kept"] else None
+
+            write_task_result(drive_root, task_id, status, suggested_name=name, _field_projector=_unless_adopted)
             # A cosmetic namer may settle concurrently with or after the ordinary
             # post-task worker.  The shared refresh/checkpoint critical section
             # linearizes both cases without marking an unfinished phase complete.
             _refresh_root_cost_after_naming(drive_root, task_id)
-            if broadcast is not None:
+            if broadcast is not None and written["kept"]:
                 try:
                     broadcast({"type": "task_named", "task_id": task_id, "suggested_name": name})
                 except Exception:
@@ -403,6 +432,23 @@ def spawn_turn_namer(
         threading.Thread(target=settings_context.run, args=(_work,), name=f"namer-{task_id}", daemon=True).start()
     except Exception:
         log.debug("turn namer thread spawn failed for %s", task_id, exc_info=True)
+
+
+def summary_names_run(metadata: Any, task_contract: Any = None) -> bool:
+    """An accepted closing sentence names a wake or an unbound schedule run.
+
+    Completion admission already excludes children; an ordinary root's sentence is only its closing line.
+    """
+    from ouroboros.consciousness_authority import is_focus_wake, is_own_clock_wake
+    from ouroboros.dialogue_provenance import presence_caller_binding
+    from types import SimpleNamespace
+
+    meta = metadata if isinstance(metadata, dict) else {}
+    occurrence = meta.get("schedule_occurrence")
+    binding = presence_caller_binding(SimpleNamespace(task_metadata=meta, task_contract=task_contract))
+    return (is_own_clock_wake(meta) or is_focus_wake(meta)
+            or (isinstance(occurrence, dict) and bool(str(occurrence.get("schedule_id") or "").strip())
+                and bool(str(occurrence.get("token") or "").strip()) and binding is None))
 
 
 def admission_names(body: Dict[str, Any], description: str) -> tuple:
@@ -424,3 +470,115 @@ def admission_names(body: Dict[str, Any], description: str) -> tuple:
     if explicit:
         return explicit, explicit
     return "", clean_model_title(strip_markdown(description), max_len=PROJECT_NAME_MAX)
+
+
+def derived_run_name(task: Dict[str, Any]) -> str:
+    """The name a listed run shows until its namer coins one: its stored ``suggested_name``, else
+    ``admission_names`` over its request — the description a caller or a delegation wrote (a child's
+    text opens with its role block), else the owner's own text. A Presence turn's text is its
+    correspondent's words, never its name. "" when nothing names it."""
+    stored = str(task.get("suggested_name") or "").strip()
+    if stored or task.get("_presence_turn"):
+        return stored
+    request = task.get("description") or task.get("objective") or task.get("text") or ""
+    return admission_names(task, str(request))[1]
+
+
+def without_continue(name: Any) -> str:
+    """``name`` without the host's own ``Continue: `` prefixes, however many; every reader of a work's name strips them
+    here (the card's JavaScript pins the same prefix)."""
+    name = str(name or "").lstrip()
+    while name.startswith(CONTINUE_TITLE_PREFIX):
+        name = name[len(CONTINUE_TITLE_PREFIX):].lstrip()
+    return name.strip()
+
+
+def summary_stands_as_name(record: Dict[str, Any]) -> bool:
+    """A run's display name is its own closing sentence and no author titled it: the equality the closing write
+    leaves, its gist's first sentence (``task_finalization``), or the whole gist a one-sentence summary wrote before.
+    Every root once took its sentence as its name, so the current producer's narrower rule proves less."""
+    from ouroboros.text_sentences import first_sentence
+
+    name, gist = str(record.get("suggested_name") or "").strip(), str(record.get("wake_summary") or "").strip()
+    return bool(name) and name in (gist, first_sentence(gist)) and not str(record.get("title") or "").strip()
+
+
+def _host_subject(record: Dict[str, Any]) -> str:
+    """What the host itself calls an unnamed run: its wake's cause, its schedule, else its request's first line."""
+    from ouroboros.task_finalization import wake_cause_title
+
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    return (wake_cause_title(metadata) or str(record.get("schedule_name") or metadata.get("schedule_name") or "").strip()
+            or derived_run_name({**record, "suggested_name": ""}))
+
+
+def work_shown_name(record: Optional[Dict[str, Any]]) -> str:
+    """A work's name as its card shows it (coined, else authored); a sentence standing in for one gives way to its subject."""
+    record = record if isinstance(record, dict) else {}
+    if summary_stands_as_name(record):
+        return without_continue(_host_subject(record))
+    return without_continue(record.get("suggested_name")) or without_continue(record.get("title"))
+
+
+def work_name_open(record: Dict[str, Any]) -> bool:
+    """No author titled this work and its display name is empty or provably the host's own stand-in. A name the
+    record cannot prove host-derived may be someone's choice, and stays."""
+    if str(record.get("title") or "").strip():
+        return False
+    shown = str(record.get("suggested_name") or "").strip()
+    return not shown or summary_stands_as_name(record) or shown == _host_subject(record)
+
+
+def work_name_adopted(record: Dict[str, Any]) -> bool:
+    """A Continue's author gave this work its subject: ``adopt_continued_work_name`` writes both slots with one name."""
+    title = str(record.get("title") or "").strip()
+    return bool(title) and title == str(record.get("suggested_name") or "").strip()
+
+
+def continued_work_name(proposed: Any) -> str:
+    """The name a Continue's author proposed as it would stand; "" when nothing is left of it."""
+    from ouroboros.projects_registry import PROJECT_NAME_MAX
+    from ouroboros.utils import strip_markdown
+
+    return without_continue(clean_model_title(strip_markdown(str(proposed or "")), max_len=PROJECT_NAME_MAX))
+
+
+def adopt_continued_work_name(txn: Any, work_id: str, name: str) -> tuple:
+    """``(name, "")`` when the work's first record carries this name after this transaction, else ``("", why)``.
+
+    The caller's own write commits or rolls back with it. Enriches that terminal record, both slots at once: ``title``
+    is the first-writer mark, so a later Continue cannot rename it. Its status, outcome, sentence, attempt and clock
+    are not written. Reads and writes that one address only."""
+    from ouroboros.obligations import pending_drive_rule
+    from ouroboros.task_results import require_writable_task_result_schema, stamp_task_result_schema
+    from ouroboros.utils import utc_now_iso
+
+    try:
+        current = txn.load(work_id)
+        if not current:
+            return "", "the work's first record is missing"
+        if not str(current.get("status") or "").strip() or str(current.get("task_id") or "") != work_id:
+            raise ValueError("unbindable first record")
+        require_writable_task_result_schema(current)
+    except ValueError:
+        log.debug("Naming work %s failed", work_id, exc_info=True)
+        return "", "the work's first record could not be read or written"
+    if str(current.get("title") or "") == name:  # the same name again (a retried call) is that name standing
+        return name, ""
+    if not work_name_open(current):
+        return "", f"the work is already named {work_shown_name(current)!r}"
+    updated = stamp_task_result_schema({**current, "title": name, "suggested_name": name, "updated_at": utc_now_iso()})
+    txn.store_task(updated, pending_drive=pending_drive_rule(txn, current, updated), current=current)
+    return name, ""
+
+
+def late_input_names(metadata: Dict[str, Any], answered: str, owner_words: str) -> tuple:
+    """``(suggested_name, naming input)`` of the head a late answer or a press on a finished author's card
+    starts, never its host frame: ``answered`` is what it answers (``owner_quiz.late_answer_name``,
+    ``card_decision.card_press_name``), the owner's words when that is empty. Derived as ``admission_names``
+    derives: an authored ``metadata.title`` wins and needs no namer (naming input ``""``). Otherwise the one
+    Main namer at first work (``spawn_turn_namer``) reads the answered text and the owner's words, with the
+    admission name as its fallback; an input that later joins the head never renames it.
+    """
+    title, name = admission_names(metadata, answered or owner_words)
+    return name, "" if title else "\n".join(part for part in (answered, owner_words) if part)

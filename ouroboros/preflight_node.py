@@ -18,6 +18,7 @@ pytest plugins).
 from __future__ import annotations
 
 import pathlib
+import os
 import shutil
 import subprocess
 import time
@@ -27,14 +28,16 @@ from ouroboros.platform_layer import probe_node_version, resolve_bundled_node
 
 # Version floor for the browser-module suite: the object form of
 # `t.mock.timers.enable({apis: [...]})` used by web/tests needs Node >= 20.11.
+# The bound of one Node test, the pytest passes' `--timeout=300` in milliseconds (`--test-timeout`: Node >= 20.11).
+NODE_TEST_TIMEOUT_FLAG = "--test-timeout=300000"
 # CI provisions 22; the bundled runtime is 24.x.
 NODE_MIN_VERSION = (20, 11)
 
 # The web package boundary and its test glob. `web/package.json` runs
-# `node --test tests/*.test.js` FROM web/, and both CI jobs mirror that exact
-# step; the parity test derives the CI command from these two constants, so the
-# gate, CI, and the package script cannot drift apart silently. The gate globs
-# in Python (sorted, cross-platform) instead of relying on a shell.
+# `node --test tests/*.test.js` FROM web/; the gate and both CI jobs (through
+# `scripts/run_tests.py --node`) run `candidate_node_tests` over these two
+# constants, so the gate, CI, and the package script cannot drift apart silently.
+# The lane globs in Python (sorted, cross-platform) instead of relying on a shell.
 WEB_DIR = "web"
 TESTS_GLOB = "tests/*.test.js"
 
@@ -77,6 +80,22 @@ def resolve_node() -> Optional[str]:
     return bundled or shutil.which("node")
 
 
+def node_environment(env: dict) -> dict:
+    """Give Python tests and their children the Node selected for the web lane.
+    Preserve other PATH entries; discovery alone adds no runtime requirement or probe."""
+    projected = dict(env)
+    node = resolve_node()
+    if node:
+        current = shutil.which("node", path=env.get("PATH", os.defpath))
+        if pathlib.Path(node).is_absolute() and os.path.normcase(node) == os.path.normcase(current or ""):
+            return projected  # The selected Node is already reachable; keep other tool precedence.
+        directory = str(pathlib.Path(node).absolute().parent)
+        entries = env.get("PATH", "").split(os.pathsep) if env.get("PATH") else []
+        projected["PATH"] = os.pathsep.join([directory, *(entry for entry in entries
+            if os.path.normcase(entry) != os.path.normcase(directory))])
+    return projected
+
+
 def _version_tuple(version: str) -> tuple:
     """Leading numeric components of a `--version` string, floor-comparable."""
     parts = []
@@ -93,7 +112,7 @@ def _version_tuple(version: str) -> tuple:
 def run_node_tests(
     worktree: pathlib.Path,
     temp_root: pathlib.Path,
-    timeout: float,
+    timeout: Optional[float],
     max_output: int,
 ) -> Optional[dict]:
     """Run the candidate's browser-module suite once, contained, or block typed.
@@ -102,16 +121,19 @@ def run_node_tests(
     the candidate). Otherwise a small result dict whose ``error`` key carries
     the bounded typed diagnosis — ``None`` on green. The caller runs this as
     the FIRST consumer of the shared preflight budget, before any pytest pass.
+    ``reap_error`` is the container's reason when a process the lane spawned
+    was not proven gone (empty otherwise): the caller then keeps the tree.
     """
     # Lazy sibling import: preflight_runner imports this module at its top, so
     # the shared helpers must be reached at call time, not import time.
     from ouroboros import preflight_runner as pr
+    from ouroboros.preflight_inventory import note_lane_process
     from ouroboros.process_containment import ProcessContainer
 
     files = candidate_node_tests(worktree)
     if not files:
         return None
-    result = {"files": len(files), "node": None, "returncode": None, "error": None}
+    result = {"files": len(files), "node": None, "returncode": None, "error": None, "reap_error": "", "execution": "not_run"}
     node = resolve_node()
     if not node:
         result["error"] = pr._diagnosis(
@@ -146,61 +168,51 @@ def run_node_tests(
     # reaped unconditionally, and a live-or-undeterminable leftover is a hard
     # block whatever the exit code said. Run from the candidate's web/ with
     # web-relative paths so imports resolve exactly as under `npm test`.
-    container = ProcessContainer()
+    container = ProcessContainer(lifeline=True, overload=True)
     started = time.monotonic()
     # NODE_OPTIONS admits --test-only/--test-*-pattern/--require: an inherited
     # operator value can silently green a red suite — same class the pytest
     # lane closes by scrubbing PYTEST_* (see _preflight_env).
-    env = pr._preflight_env(temp_root, worktree)
+    env = pr._preflight_env(temp_root, worktree, cwd=pathlib.Path(worktree) / WEB_DIR)
     env.pop("NODE_OPTIONS", None)
-    proc = container.spawn(
-        [node, "--test", *files],
-        cwd=str(pathlib.Path(worktree) / WEB_DIR),
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    reap_error = ""
+    from ouroboros.test_evidence import FileOutput
+
+    capture = FileOutput(temp_root, "node")
+    proc = None
+    # `--test-timeout` (Node >= 20.11): the per-test bound the pytest passes have (`--timeout=300`), so a hung
+    # web test ends that test, not a full run that has no total deadline (owner 5A).
+    argv = [node, "--test", NODE_TEST_TIMEOUT_FLAG, f"--test-concurrency={env['PYTEST_XDIST_AUTO_NUM_WORKERS']}", *files]
     try:
+        proc = container.spawn(argv, background=True, cwd=str(pathlib.Path(worktree) / WEB_DIR),
+                               env=env, stdout=capture.stdout, stderr=capture.stderr)
+        result["execution"] = "executed"
         try:
-            stdout, stderr = proc.communicate(timeout=timeout)
-            returncode: Optional[int] = proc.returncode
-            output = (stdout or "") + (stderr or "")
-        except subprocess.TimeoutExpired as expired:
+            returncode: Optional[int] = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
             pr._terminate_preflight_tree(proc, temp_root)
-            partial = (
-                pr._partial_stream_text(expired.output)
-                + pr._partial_stream_text(expired.stderr)
-            )
-            reap_error = container.reap()
+            returncode = None
+        reap_error = container.reap()
+        if proc.poll() is None:
             try:
-                stdout, stderr = proc.communicate(timeout=10)
-                partial = ((stdout or "") + (stderr or "")) or partial
+                proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                for stream in (proc.stdout, proc.stderr):
-                    try:
-                        if stream is not None:
-                            stream.close()
-                    except Exception:
-                        pass
-                try:
-                    proc.wait(timeout=5)
-                except Exception:
-                    pass
-            returncode, output = None, partial
-        if not reap_error:
-            reap_error = container.reap()
+                reap_error = reap_error or "direct node process did not exit after reap"
+        output = capture.finish(returncode=returncode, containment_error=reap_error, argv=argv)
+        result["evidence_errors"] = list(capture.errors)
+    except BaseException as exc:
+        if proc is not None and proc.poll() is None:
+            pr._terminate_preflight_tree(proc, temp_root)
+        note_lane_process(exc, container, proc)
+        raise
     finally:
-        try:
-            if proc.poll() is None:
-                pr._terminate_preflight_tree(proc, temp_root)
-        except Exception:
-            pass
+        if proc is not None and proc.poll() is None:
+            pr._terminate_preflight_tree(proc, temp_root)
         container.reap()
         container.close()
+        capture.close()
     elapsed = time.monotonic() - started
     result["returncode"] = returncode
+    result["reap_error"], result["containment_token"] = reap_error, container.token
     if reap_error:
         result["error"] = pr._diagnosis(
             "⚠️ PRE_PUSH_TEST_ERROR: PREFLIGHT_CONTAINMENT_FAILED (hard block): "

@@ -1,12 +1,13 @@
 """Project questions share their durable ask with every display lens."""
+
 import ast
 import pathlib
 import re
 import json
-import os
 
 import pytest
 
+from ouroboros import dialogue_store as ds
 from ouroboros.gateway.history import _assemble_history_response
 from ouroboros.owner_quiz import quiz_states, record_asked, record_answered, reconcile_terminal
 from ouroboros.owner_wait import set_owner_wait
@@ -52,8 +53,9 @@ def test_real_escalation_bridge_history_detail_and_answer(tmp_path, monkeypatch)
     details = ["Single-machine files", "Multiple writers over network"]
     assert pointer["option_details"] == details and pointer["stake"] == "Where every later write lands."
     assert not {"comment", "answered_index"} & pointer.keys()
-    stored = (tmp_path / "logs/chat.jsonl").read_text().splitlines()
-    assert len(stored) == 1 and json.loads(stored[0])["chat_id"] == project["chat_id"]
+    from tests._dialogue import chat_rows
+    stored = chat_rows(tmp_path)
+    assert len(stored) == 1 and stored[0]["chat_id"] == project["chat_id"]
     main = json.loads(_assemble_history_response(tmp_path, 1, 10, 0))["messages"]
     assert len(main) == 1 and main[0]["quiz_id"] == qid
     assert main[0]["option_details"] == details and main[0]["stake"] == "Where every later write lands."
@@ -71,13 +73,18 @@ def test_real_escalation_bridge_history_detail_and_answer(tmp_path, monkeypatch)
     main = json.loads(_assemble_history_response(tmp_path, 1, 10, 0))["messages"]
     assert main[0]["quiz_state"] == "answered" and main[0]["answered_index"] == 1
     assert main[0]["question"] == "Which storage?" and main[0]["options"] == ["Local", "Shared"]
-    assert main[0]["text"] == "You answered in Question Project"
+    # Saved in the live asker's mailbox until its saved read; that read settles it.
+    assert main[0]["text"] == "Answer saved · the task reads it when it continues in Question Project"
+    from ouroboros.owner_mailbox import acknowledge_transcript_entry, drain_owner_entries
+    [entry] = drain_owner_entries(tmp_path, "task-1")
+    assert entry["kind"] == "quiz_answer" and acknowledge_transcript_entry(tmp_path, "task-1", entry)
+    main = json.loads(_assemble_history_response(tmp_path, 1, 10, 0))["messages"]
+    assert main[0]["quiz_state"] == "answered" and main[0]["text"] == "You answered in Question Project"
     assert reconcile_terminal(tmp_path, "task-1") == []
     assert quiz_states(tmp_path, "task-1")[qid]["option_details"][1] == "Multiple writers over network"
 
 
 def test_pointer_quota_and_dedup(tmp_path):
-    from ouroboros.utils import append_jsonl
 
     project = create_project(tmp_path, "many-questions", name="Many Questions")
     for i in range(8):
@@ -86,9 +93,9 @@ def test_pointer_quota_and_dedup(tmp_path):
         row = {"type": "quiz", "direction": "out", "chat_id": project["chat_id"], "task_id": "t1",
                "ts": f"2026-09-09T00:00:0{i}Z", "text": "?", "quiz": {"quiz_id": qid,
                "options": ["a", "b"], "wait_for_answer": True}}
-        append_jsonl(tmp_path / "logs/chat.jsonl", row)
-        append_jsonl(tmp_path / "logs/chat.jsonl", row)
-    append_jsonl(tmp_path / "logs/chat.jsonl", {**row, "quiz": {**row["quiz"], "quiz_id": "optional", "wait_for_answer": False}})
+        ds.append(tmp_path, "chat", row)
+        ds.append(tmp_path, "chat", row)
+    ds.append(tmp_path, "chat", {**row, "quiz": {**row["quiz"], "quiz_id": "optional", "wait_for_answer": False}})
     messages = json.loads(_assemble_history_response(tmp_path, 1, 3, 0))["messages"]
     assert len(messages) == 3
     assert len({(row["task_id"], row["quiz_id"]) for row in messages}) == 3
@@ -122,7 +129,7 @@ def test_an_optional_question_projects_into_main_with_its_assumption_and_never_r
     assert live["system_type"] == "project_question_pointer" and live["chat_id"] == 1
     assert live["assumption"] == "WebP meanwhile" and live["recommended_index"] == 1
     assert live["options"] == ["PNG", "WebP"] and "wait_for_answer" not in live
-    assert live["content"] == "Unanswered · an answer is still accepted in Mixed Project"
+    assert live["content"] == "Unanswered in Mixed Project"
 
     # The same task now waits on a newer required question.
     assert _escalate(ctx, question="Publish?", wait_for_answer=True,
@@ -136,7 +143,7 @@ def test_an_optional_question_projects_into_main_with_its_assumption_and_never_r
     calm, waiting = main[optional["quiz_id"]], main[required["quiz_id"]]
     assert "owner_wait_state" not in calm and "wait_for_answer" not in calm
     assert calm["assumption"] == "WebP meanwhile" and calm["recommended_index"] == 1
-    assert calm["text"] == "Unanswered · an answer is still accepted in Mixed Project"
+    assert calm["text"] == "Unanswered in Mixed Project"
     assert waiting["owner_wait_state"] == "waiting" and waiting["recommended_index"] == 0
     assert waiting["text"] == "Waiting for your answer in Mixed Project"
     # The Project room's own card of the optional question reads the same facts.
@@ -145,10 +152,11 @@ def test_an_optional_question_projects_into_main_with_its_assumption_and_never_r
     assert "owner_wait_state" not in room[optional["quiz_id"]]
 
 
-@pytest.mark.parametrize("same_timestamp", [False, True])
-def test_activity_question_uses_same_memo_and_preserves_wait_semantics(tmp_path, monkeypatch, same_timestamp):
+def test_activity_question_uses_same_memo_and_preserves_wait_semantics(tmp_path, monkeypatch):
+    """The census memo is keyed by the row's write signature: one body read per change, none
+    while the row is unchanged, and a wait transition is seen on the next census."""
     from ouroboros.gateway import state as gs
-    from ouroboros import utils
+    from ouroboros import task_store
     from supervisor import queue
 
     project = create_project(tmp_path, "waiting-project", name="Waiting Project")
@@ -160,9 +168,10 @@ def test_activity_question_uses_same_memo_and_preserves_wait_semantics(tmp_path,
     monkeypatch.setattr(queue, "PENDING", [])
     monkeypatch.setattr(queue, "RUNNING", {"t1": {"task": {"id": "t1", "project_id": project["id"], "chat_id": project["chat_id"]}}})
     gs._FINALIZING_MEMO.clear()
+    asked_at = quiz_states(tmp_path, "t1")["q1"]["asked_at"]
     reads = []
-    real = utils.read_json_dict
-    monkeypatch.setattr(utils, "read_json_dict", lambda path: (reads.append(str(path)), real(path))[1])
+    real = task_store.read_document
+    monkeypatch.setattr(task_store, "read_document", lambda root, tid, **kw: (reads.append(str(tid)), real(root, tid, **kw))[1])
     rows = gs._chat_activities_snapshot_safe(tmp_path, direct_turns=[])
     assert rows[0]["required_question"]["quiz_state"] == "open"
     assert rows[0]["required_question"]["text"] == "Waiting for your answer in Waiting Project"
@@ -176,27 +185,18 @@ def test_activity_question_uses_same_memo_and_preserves_wait_semantics(tmp_path,
     # pointer carries it as `ts`. Losing that stamp does not fail loudly — it silently
     # stops every fold (web/modules/chat_decision.js::appendActivityQuestion), so the
     # cross-boundary contract is pinned on the producer side too.
-    assert rows[0]["required_question"]["ts"] == quiz_states(tmp_path, "t1")["q1"]["asked_at"]
-    assert reads.count(str(tmp_path / "task_results/t1.json")) == 1
+    assert rows[0]["required_question"]["ts"] == asked_at
+    assert reads.count("t1") == 1
     gs._chat_activities_snapshot_safe(tmp_path, direct_turns=[])
-    assert reads.count(str(tmp_path / "task_results/t1.json")) == 1
-    path = tmp_path / "task_results/t1.json"
-    before = path.stat()
+    assert reads.count("t1") == 1  # unchanged signature: the memo answers
     set_owner_wait(tmp_path, "t1", {"quiz_id": "q1", "wait_id": "w1", "state": "resumed"}, "w1")
-    if same_timestamp:
-        # Atomic replacement within one filesystem timestamp tick can retain
-        # both mtime and size: waiting/resumed have the same serialized length.
-        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
-        after = path.stat()
-        assert after.st_ino != before.st_ino
-        assert (after.st_mtime_ns, after.st_size) == (before.st_mtime_ns, before.st_size)
-    previous_reads = reads.count(str(path))
+    previous_reads = reads.count("t1")
     rows = gs._chat_activities_snapshot_safe(tmp_path, direct_turns=[])
     assert rows[0]["required_question"]["owner_wait_state"] == "resumed"
-    assert rows[0]["required_question"]["text"] == "Unanswered · the task continued; an answer is still accepted in Waiting Project"
-    assert reads.count(str(path)) == previous_reads + 1
+    assert rows[0]["required_question"]["text"] == "Unanswered · task continued in Waiting Project"
+    assert reads.count("t1") == previous_reads + 1
     gs._chat_activities_snapshot_safe(tmp_path, direct_turns=[])
-    assert reads.count(str(path)) == previous_reads + 1
+    assert reads.count("t1") == previous_reads + 1
     assert quiz_states(tmp_path, "t1")["q1"]["state"] == "open"
     # A wait that ended on its OWN bound resumed without an answer, so the
     # question is still wanted: no new wait state, just the additive reason.
@@ -205,7 +205,7 @@ def test_activity_question_uses_same_memo_and_preserves_wait_semantics(tmp_path,
     gs._FINALIZING_MEMO.clear()
     rows = gs._chat_activities_snapshot_safe(tmp_path, direct_turns=[])
     pointer = rows[0]["required_question"]
-    assert pointer["text"] == "Unanswered · the task continued; an answer is still accepted in Waiting Project"
+    assert pointer["text"] == "Unanswered · task continued in Waiting Project"
     assert pointer["owner_wait_resume_reason"] == "timeout"
 
 
@@ -225,12 +225,13 @@ def test_question_presentation_shared_fixture():
     """Both sides of the parity fixture: Python emits exactly the fixture row for each case, and the
     browser (web/tests/question_presentation.test.js) reads the fixture status out of that row."""
     from pathlib import Path
+    from ouroboros.gateway.main_decisions import question_waits
     from ouroboros.project_dialogue import project_question_pointer
 
     cases = json.loads((Path(__file__).resolve().parents[1] /
                         'web/tests/fixtures/question_presentation_parity.json').read_text(encoding="utf-8"))
     keys = ("quiz_state", "owner_wait_state", "owner_wait_resume_reason", "wait_for_answer",
-            "wait_ended_at", "answered_index", "comment", "source_status")
+            "wait_ended_at", "answered_index", "comment", "source_status", "question_delivery")
     for case in cases:
         block = {"quiz_id": "q", **case["block"]} if case["block"] is not None else None
         wait = {"quiz_id": "q", **case["owner_wait"]} if case["owner_wait"] is not None else None
@@ -240,8 +241,13 @@ def test_question_presentation_shared_fixture():
         assert pointer["text"] == case["status"] + " in Project", case["case"]
         assert {key: pointer[key] for key in keys if key in pointer} == case["row"], case["case"]
         assert pointer["question"] == "Which?" and pointer["options"] == ["a", "b"]
+        # Whether it still waits on the owner: the one rule Main's pill counts by and every room's turn follows.
+        assert question_waits(pointer) is case["waits"], case["case"]
         # A legacy label-only ask retained no details; Main says so exactly as the Project card does.
         assert "option_details" not in pointer and "stake" not in pointer
+    # An undelivered answer is the owner's to remove in its Project only: Main's own question has no such row.
+    lost = {"quiz_state": "answered", "question_delivery": {"state": "owed", "reason_code": "late_answer_delivery_unknown"}}
+    assert question_waits({**lost, "project_id": "p"}) and not question_waits(lost)
     narrow = project_question_pointer({"task_id": "task", "quiz_id": "q", "wait_for_answer": True},
                                       {"quiz_id": "q", "state": "open"}, {"id": "p", "chat_id": 12, "name": "Project"}, None)
     assert not {"question", "options", "option_details", "stake"} & narrow.keys(), \
@@ -251,14 +257,12 @@ def test_question_presentation_shared_fixture():
 def test_project_room_quiz_row_carries_the_wait_facts(tmp_path):
     """A wait the owner resumed by ordinary input leaves no frame behind: the replayed card
     reads the task's wait record like the Main pointer does."""
-    from ouroboros.utils import append_jsonl
-
     project = create_project(tmp_path, "resumed-project", name="Resumed Project")
     write_task_result(tmp_path, "t1", STATUS_RUNNING, project_id=project["id"], chat_id=project["chat_id"])
     record_asked(tmp_path, "t1", quiz_id="q1", question="Which?", options=["a", "b"], wait_for_answer=True)
-    append_jsonl(tmp_path / "logs/chat.jsonl", {"type": "quiz", "direction": "out", "chat_id": project["chat_id"],
-                 "task_id": "t1", "ts": "2026-09-16T00:00:00Z", "text": "Which?",
-                 "quiz": {"quiz_id": "q1", "options": ["a", "b"], "wait_for_answer": True}})
+    ds.append(tmp_path, "chat", {"type": "quiz", "direction": "out", "chat_id": project["chat_id"],
+              "task_id": "t1", "ts": "2026-09-16T00:00:00Z", "text": "Which?",
+              "quiz": {"quiz_id": "q1", "options": ["a", "b"], "wait_for_answer": True}})
     room = json.loads(_assemble_history_response(tmp_path, project["chat_id"], 10, 0))["messages"]
     assert "owner_wait_state" not in room[0]["quiz"]
     set_owner_wait(tmp_path, "t1", {"quiz_id": "q1", "wait_id": "w1", "state": "waiting"})
@@ -268,7 +272,7 @@ def test_project_room_quiz_row_carries_the_wait_facts(tmp_path):
     room = json.loads(_assemble_history_response(tmp_path, project["chat_id"], 10, 0))["messages"]
     assert room[0]["quiz"]["owner_wait_state"] == "resumed" and room[0]["quiz"]["wait_for_answer"] is True
     main = json.loads(_assemble_history_response(tmp_path, 1, 10, 0))["messages"]
-    assert main[0]["text"] == "Unanswered · the task continued; an answer is still accepted in Resumed Project"
+    assert main[0]["text"] == "Unanswered · task continued in Resumed Project"
     set_owner_wait(tmp_path, "t1", {"quiz_id": "q2", "wait_id": "w2", "state": "waiting"})
     room = json.loads(_assemble_history_response(tmp_path, project["chat_id"], 10, 0))["messages"]
     assert room[0]["quiz"]["owner_wait_state"] == "resumed"
@@ -328,11 +332,24 @@ def test_project_question_pointer_display_fields_share_one_contract():
     # History: the producer itself emits every field the browser merges.
     block = {"quiz_id": "q", "state": "open", "question": "Which?", "options": ["a", "b"],
              "option_details": ["A detail", ""], "stake": "What rides on it", "assumption": "a",
-             "recommended_index": 0}
+             "recommended_index": 0, "host_facts": "Asked by task t, origin unknown.",
+             "materials": [{"task_id": "t", "name": "brief.md", "label": "brief.md"}]}
     pointer = project_question_pointer({"task_id": "t", "quiz_id": "q"}, block,
                                        {"id": "p", "chat_id": 12, "name": "Project"}, None)
-    assert browser_fields <= set(pointer), sorted(browser_fields - set(pointer))
+    # Secret metadata is optional on ordinary questions, but must survive the same producer.
+    assert browser_fields - {"secret_request"} <= set(pointer), sorted(browser_fields - set(pointer) - {"secret_request"})
+    secret_request = {"plugin_name": "telegram", "fields": [{"id": "botToken", "setting_key": "TELEGRAM_BOT_TOKEN"}]}
+    protected = project_question_pointer({"task_id": "t", "quiz_id": "q"},
+                                        {**block, "options": [], "secret_request": secret_request},
+                                        {"id": "p", "chat_id": 12, "name": "Project"}, None)
+    assert protected["secret_request"] == secret_request
     assert pointer["option_details"] == ["A detail", ""] and pointer["stake"] == "What rides on it"
+    assert pointer["host_facts"] == "Asked by task t, origin unknown."
+    assert pointer["materials"] == block["materials"]
+    # A block that recorded no host sentence yields a pointer without the key, never an empty one.
+    bare = project_question_pointer({"task_id": "t", "quiz_id": "q"}, {**block, "host_facts": ""},
+                                    {"id": "p", "chat_id": 12, "name": "Project"}, None)
+    assert "host_facts" not in bare
 
     # Live delivery: the frame literal plus its copied key loop, all declared in ChatOutbound.
     send_quiz = _function_node(REPO_ROOT / "supervisor" / "message_bus.py", "send_quiz")
@@ -356,3 +373,86 @@ def test_project_question_pointer_display_fields_share_one_contract():
     assert len(census) == 1, "_task_activity_facts keeps the quiz display fields in one key tuple"
     quiz_sourced = browser_fields - {"project_name"}
     assert quiz_sourced <= set(census[0]), sorted(quiz_sourced - set(census[0]))
+
+
+def _census_row_with_quiz_wait(tmp_path, monkeypatch, *, project_id: str = "", chat_id: int = 0):
+    from ouroboros.gateway import state as gs
+    from supervisor import queue
+
+    write_task_result(tmp_path, "t1", STATUS_RUNNING, project_id=project_id,
+                      root_phase_checkpoint={"post_task_synthesis": "running"})
+    record_asked(tmp_path, "t1", quiz_id="q1", question="?", options=["a", "b"], wait_for_answer=True)
+    set_owner_wait(tmp_path, "t1", {"quiz_id": "q1", "wait_id": "w1", "state": "waiting"})
+    monkeypatch.setattr(queue, "PENDING", [])
+    monkeypatch.setattr(queue, "RUNNING", {"t1": {"task": {"id": "t1", "project_id": project_id, "chat_id": chat_id}}})
+    gs._FINALIZING_MEMO.clear()
+    return gs
+
+
+def test_unreadable_question_detail_is_disclosed_per_row_never_read_as_unblocked(tmp_path, monkeypatch):
+    """A row that MAY be blocked on an owner answer must not project as free of questions."""
+    from ouroboros import project_dialogue
+
+    project = create_project(tmp_path, "waiting-project", name="Waiting Project")
+    gs = _census_row_with_quiz_wait(tmp_path, monkeypatch, project_id=project["id"], chat_id=project["chat_id"])
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("quiz detail unreadable")
+
+    monkeypatch.setattr(project_dialogue, "project_question_pointer", _boom)
+    rows = gs._chat_activities_snapshot_safe(tmp_path, direct_turns=[])
+    assert rows[0]["required_question_unavailable"] is True
+    assert "required_question" not in rows[0]
+    # The rest of the census stays intact: the row is still there with its own live phase.
+    assert rows[0]["phase"] in {"working", "finalizing"}
+
+
+def test_quiz_wait_without_a_project_pointer_is_disclosed_not_dropped(tmp_path, monkeypatch):
+    """A recorded owner-question wait whose Project pointer cannot be built is unknown, not absent."""
+    gs = _census_row_with_quiz_wait(tmp_path, monkeypatch, project_id="", chat_id=0)
+    rows = gs._chat_activities_snapshot_safe(tmp_path, direct_turns=[])
+    assert rows[0]["required_question_unavailable"] is True
+    assert "required_question" not in rows[0]
+
+
+def test_readable_question_detail_carries_no_unavailable_flag(tmp_path, monkeypatch):
+    project = create_project(tmp_path, "waiting-project", name="Waiting Project")
+    gs = _census_row_with_quiz_wait(tmp_path, monkeypatch, project_id=project["id"], chat_id=project["chat_id"])
+    rows = gs._chat_activities_snapshot_safe(tmp_path, direct_turns=[])
+    assert rows[0]["required_question"]["quiz_state"] == "open"
+    assert "required_question_unavailable" not in rows[0]
+
+
+@pytest.mark.parametrize("project_bound", [False, True])
+@pytest.mark.parametrize("registry_unavailable", [False, True])
+def test_census_wait_facts_survive_optional_project_detail_and_resume(
+    tmp_path, monkeypatch, project_bound, registry_unavailable,
+):
+    from ouroboros import projects_registry
+
+    project = create_project(tmp_path, "wait-room", name="Wait room") if project_bound else {}
+    gs = _census_row_with_quiz_wait(
+        tmp_path, monkeypatch, project_id=project.get("id", ""), chat_id=project.get("chat_id", 1),
+    )
+    if registry_unavailable:
+        monkeypatch.setattr(projects_registry, "list_reserved_projects",
+                            lambda *_: (_ for _ in ()).throw(OSError("registry unreadable")))
+    waiting = gs._chat_activities_snapshot_safe(tmp_path, direct_turns=[])[0]
+    assert waiting["owner_wait"] == {"quiz_id": "q1", "owner_wait_state": "waiting", "quiz_state": "open"}
+    assert bool(waiting.get("required_question_unavailable")) is (registry_unavailable or not project_bound)
+
+    assert record_answered(tmp_path, "t1", quiz_id="q1", option_index=0, request_id="answer")["ok"]
+    # The answer can land before the waiting worker writes resumed. Preserve
+    # both facts instead of fabricating a resumed execution state.
+    answered = gs._chat_activities_snapshot_safe(tmp_path, direct_turns=[])[0]["owner_wait"]
+    assert answered["owner_wait_state"] == "waiting" and answered["quiz_state"] == "answered"
+    set_owner_wait(tmp_path, "t1", {"quiz_id": "q1", "wait_id": "w1", "state": "resumed"})
+    resumed = gs._chat_activities_snapshot_safe(tmp_path, direct_turns=[])[0]["owner_wait"]
+    assert resumed["owner_wait_state"] == "resumed" and resumed["quiz_state"] == "answered"
+
+
+def test_census_does_not_turn_a_non_quiz_wait_into_an_owner_question(tmp_path, monkeypatch):
+    gs = _census_row_with_quiz_wait(tmp_path, monkeypatch, chat_id=1)
+    write_task_result(tmp_path, "t1", STATUS_RUNNING, owner_wait={"state": "waiting", "wake_at": "later"})
+    row = gs._chat_activities_snapshot_safe(tmp_path, direct_turns=[])[0]
+    assert "owner_wait" not in row and "required_question" not in row

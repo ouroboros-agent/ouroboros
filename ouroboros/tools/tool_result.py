@@ -1,4 +1,13 @@
-"""Typed internal tool results with a byte-compatible legacy text adapter."""
+"""Typed internal tool results with a byte-compatible legacy text adapter.
+
+Host route and safety notes trail the producer payload in ``text``. When notes are
+added, ``producer_text`` keeps the payload captured before composition and
+``host_annotations`` the notes, both outside the bounded ``meta``; annotated ``text``
+and the typed status stay authoritative. Unannotated results leave both fields empty.
+``loop_tool_execution`` stores ``producer_text`` as a separate task source exposed as
+``PRODUCER_RESULT_SOURCE_JSON`` (distinct from ``FULL_RESULT_SOURCE_JSON``) and
+re-appends the notes when the annotated text is truncated.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +15,7 @@ import json
 import re
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from functools import wraps
 from types import MappingProxyType
 from typing import Any, Literal, Mapping
 
@@ -128,6 +138,15 @@ TOOL_CODE_SPECS: Mapping[str, ToolCodeSpec] = MappingProxyType(
             "warning",
             "inspect the version-control refusal",
         ),
+        # #1969: an apply that had to prepare its capture returns it for inspection
+        # and applies nothing. The protocol worked, so the call is no error; its own
+        # bucket stays outside the success set, so no integration effect is claimed.
+        "INTEGRATION_INSPECTION_REQUIRED": _code_spec(
+            "ok",
+            "inspection_required",
+            "info",
+            "read the retained capture, then decide it with a later apply",
+        ),
         "LEGACY_WARNING": _code_spec(
             "ok",
             "ok",
@@ -155,11 +174,27 @@ TOOL_CODE_SPECS: Mapping[str, ToolCodeSpec] = MappingProxyType(
             "warning",
             "use an authority permitted by the task contract",
         ),
+        # ``body_candidate.CandidateRefused``: the task's own-body candidate could not be
+        # prepared, resumed or isolated; prior invocation effects are not erased.
+        **{code: _code_spec("blocked", "blocked", "warning", "inspect or repair the retained body candidate")
+           for code in (
+            "CANDIDATE_UNAVAILABLE", "CANDIDATE_PATH_OCCUPIED", "CANDIDATE_MISSING",
+            "CANDIDATE_OWNER_LIVE", "CANDIDATE_OWNER_PROCESSES_LIVE", "CANDIDATE_OWNER_CHANGED",
+            "CANDIDATE_NOT_APPLICABLE", "CANDIDATE_ALREADY_OWNED", "CANDIDATE_OWNER_UNKNOWN",
+            "CANDIDATE_ENVIRONMENT_UNAVAILABLE",
+        )},
         "CORE_PROTECTION_BLOCKED": _code_spec(
             "blocked",
             "protected_blocked",
             "warning",
             "use the reviewed protected-write path",
+        ),
+        "MANAGED_BY_DEPLOYMENT": _code_spec(  # the serving checkout or a required extension (deployment_policy)
+            "blocked",
+            "protected_blocked",
+            "warning",
+            "author in a body candidate or another workspace; the administrator deploys the serving program "
+            "and the extensions it requires",
         ),
         # The two demanded roots are DISTINCT codes and the merged `ROOT_REQUIRED`
         # parent is retired: the recovery walk credits a retry only when the write
@@ -282,11 +317,13 @@ TOOL_CODE_SPECS: Mapping[str, ToolCodeSpec] = MappingProxyType(
             "warning",
             "stay within the admitted repair surface",
         ),
+        # A completed command's observation, never a refusal: the call is no error, and
+        # its own bucket keeps the note readable in the journal and the trace.
         "ARTIFACT_OUTPUT_UNDECLARED": _code_spec(
-            "blocked",
+            "ok",
             "artifact_output_undeclared",
             "warning",
-            "declare the produced artifact",
+            "register a named file if it is a result for the human; otherwise none",
         ),
         # Family parents. Each carries the legacy status of the family the loop
         # chain matched by text prefix, so the whole family keeps landing in the
@@ -339,11 +376,17 @@ TOOL_CODE_SPECS: Mapping[str, ToolCodeSpec] = MappingProxyType(
             "warning",
             "use a permitted interpreter and script path",
         ),
-        "SAFETY_VIOLATION": _code_spec(
+        "SAFETY_VIOLATION": _code_spec(  # old records only: the Supervisor now returns a call or holds it
             "blocked",
             "safety_violation",
             "error",
             "choose a safe alternative",
+        ),
+        "SAFETY_RETURNED": _code_spec(
+            "blocked", "safety_returned", "warning", "change the call, drop it, or issue it again in a later step",
+        ),
+        "SAFETY_UNAVAILABLE": _code_spec(
+            "unavailable", "safety_unavailable", "warning", "issue the identical call again in a later step",
         ),
         "LEGACY_BLOCKED": _code_spec(
             "blocked",
@@ -351,17 +394,86 @@ TOOL_CODE_SPECS: Mapping[str, ToolCodeSpec] = MappingProxyType(
             "warning",
             "follow the refusal text",
         ),
+        # Refusal codes preserve authority and phase separately. Only the
+        # positive pre-entry variant proves that this handler never ran.
+        "OWNER_LAUNCH_AUTHORITY_UNAVAILABLE": _code_spec(
+            "unavailable", "unavailable", "warning", "follow the reported phase and reconcile prior effects before retry",
+        ),
+        "STOP_ACTION_CONFLICT": _code_spec(
+            "blocked", "blocked", "warning", "retry the original Stop action unchanged",
+        ),
+        "OWNER_PAUSE_NOT_STARTED": _code_spec(
+            "blocked",
+            "blocked",
+            "info",
+            "issue the call again after the owner resumes the task",
+        ),
+        "OWNER_OPERATION_REFUSED": _code_spec(
+            "blocked", "blocked", "warning", "reconcile prior effects before repeating the call",
+        ),
+        "TOOL_ADMISSION_UNAVAILABLE": _code_spec(
+            "unavailable", "unavailable", "warning", "inspect the reported admission cause",
+        ),
         "CAPABILITY_UNAVAILABLE": _code_spec(
             "unavailable",
             "unavailable",
             "warning",
             "enable or configure the capability",
         ),
+        "IMAGE_RATE_LIMITED": _code_spec(
+            "unavailable",
+            "unavailable",
+            "warning",
+            "retry after the image window resets; the text lane is unaffected",
+        ),
+        "IMAGE_OUTCOME_UNKNOWN": _code_spec(
+            "error",
+            "error",
+            "error",
+            "call recover_image for the original request_id; never blind-retry generation",
+        ),
+        # Direct image APIs (gateways/image_api.py): the request never left the
+        # host (nothing billed; a new call is safe), the provider answered with a
+        # terminal refusal, or the paid response arrived but part of it could not
+        # be retained (recover from the retained response, never regenerate).
+        "IMAGE_NOT_DISPATCHED": _code_spec(
+            "unavailable",
+            "unavailable",
+            "warning",
+            "repair connectivity and call again; nothing was sent or billed",
+        ),
+        "IMAGE_PROVIDER_REJECTED": _code_spec(
+            "error",
+            "error",
+            "error",
+            "correct the request or choose another route; the provider refused this one",
+        ),
+        "IMAGE_RESULT_INCOMPLETE": _code_spec(
+            "error",
+            "error",
+            "error",
+            "call recover_image for the original request_id; inspect retained artifacts; do not generate again",
+        ),
+        "PATH_BLOCKED": _code_spec(
+            "blocked",
+            "blocked",
+            "warning",
+            "select an input file inside the task's readable resource roots and grants",
+        ),
+        "MCP_CATALOG_UNAVAILABLE": _code_spec(
+            "unavailable", "unavailable", "warning", "refresh or repair the MCP listing; tool absence is unknown",
+        ),
         "MCP_UNAVAILABLE": _code_spec(
             "unavailable",
             "unavailable",
             "warning",
             "enable or repair the MCP provider",
+        ),
+        "MCP_AUTH_REQUIRED": _code_spec(
+            "unavailable",
+            "unavailable",
+            "warning",
+            "the owner signs in (Settings → Tools, or a link from remote_mcp_sign_in)",
         ),
         "EXTENSION_UNAVAILABLE": _code_spec(
             "unavailable",
@@ -404,6 +516,13 @@ TOOL_CODE_SPECS: Mapping[str, ToolCodeSpec] = MappingProxyType(
             "unknown_tool",
             "error",
             "select a registered visible tool",
+        ),
+        # A route's physical ceiling on schemas per request: the tools stay callable.
+        "TOOL_SCHEMA_LIMIT": _code_spec(
+            "unavailable",
+            "resource_constraint_blocked",
+            "warning",
+            "load fewer schemas at once, or work on a route without the ceiling",
         ),
         "TOOL_ERROR": _code_spec(
             "error",
@@ -480,8 +599,8 @@ TOOL_CODE_SPECS: Mapping[str, ToolCodeSpec] = MappingProxyType(
             "error",
             "follow the legacy failure text",
         ),
-        # Unreachable from core producers (only SAFETY_VIOLATION spells a
-        # violation today, and it is claimed by an exact branch), but a skill or
+        # Unreachable from core producers (none spells a violation now; an old
+        # SAFETY_VIOLATION record is claimed by an exact branch), but a skill or
         # MCP payload can emit an arbitrary ``⚠️ X_VIOLATION`` and the legacy
         # chain gave it its own status. Ported rather than folded into `error`.
         "LEGACY_VIOLATION": _code_spec(
@@ -496,12 +615,25 @@ TOOL_CODE_SPECS: Mapping[str, ToolCodeSpec] = MappingProxyType(
 
 @dataclass(frozen=True)
 class ToolResult:
-    """Internal result; ``text`` remains the complete model-facing projection."""
+    """Internal result; ``text`` includes notes, ``producer_text`` never does.
+
+    Producer text is captured only when the host adds annotations, before any
+    composition. It is not bounded metadata and is never reconstructed from text.
+
+    Optional producer fact: ``meta.operation_outcome="completed_no_effect"``
+    describes a pre-effect refusal or completed read; ``completed`` describes
+    a foreground process exit, including nonzero. Neither metadata nor business
+    success grants custody settlement: the host observes handler unwind/join,
+    while independent process, receipt, model and delegated owners retain their
+    own unfinished work. Missing metadata does not keep a joined local call live.
+    """
 
     status: ToolStatus
     code: str
     text: str
     meta: Mapping[str, Any] = field(default_factory=dict)
+    producer_text: str | None = None
+    host_annotations: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.code, str) or not _CODE_RE.fullmatch(self.code):
@@ -513,6 +645,12 @@ class ToolResult:
             raise ValueError(f"status {self.status!r} does not match {self.code} ({spec.status!r})")
         if not isinstance(self.text, str):
             raise TypeError("tool result text must be a string")
+        if self.producer_text is not None and not isinstance(self.producer_text, str):
+            raise TypeError("tool producer text must be a string or None")
+        if not isinstance(self.host_annotations, tuple) or any(
+            not isinstance(note, str) for note in self.host_annotations
+        ):
+            raise TypeError("host annotations must be a tuple of strings")
         raw_meta = dict(self.meta or {})
         if any(not isinstance(key, str) for key in raw_meta):
             raise ValueError("tool result meta keys must be strings")
@@ -566,6 +704,8 @@ def _replace_tool_result(
         code=selected_code,
         text=result.text if text is None else text,
         meta=meta,
+        producer_text=result.producer_text,
+        host_annotations=result.host_annotations,
     )
 
 
@@ -578,6 +718,18 @@ def _publish_tool_result(ctx: Any, result: ToolResult) -> str:
     elif hasattr(ctx, _TOOL_RESULT_ATTR):
         setattr(ctx, _TOOL_RESULT_ATTR, result)
     return result.text
+
+
+def append_published_text(ctx: Any, text: str, suffix: str) -> str:
+    """Append ``suffix`` to a handler's returned text. A typed result this invocation
+    published for exactly that text grows the same suffix (status, code and meta stay),
+    so the registry still pairs the returned string with its typed result."""
+    if not suffix:
+        return text
+    prior = _published_tool_result(ctx, None)
+    if isinstance(prior, ToolResult) and prior.text == text:
+        return _publish_tool_result(ctx, _replace_tool_result(prior, text=text + suffix))
+    return text + suffix
 
 
 def _install_tool_result_sidecar(
@@ -607,6 +759,82 @@ def _restore_tool_result_sidecar(token: Token) -> None:
     _TOOL_RESULT_STATE.reset(token)
 
 
+def publish_no_effect(ctx: Any, result: str | ToolResult, *, tool_name: str = "") -> str:
+    """Publish a producer-proven refusal before this invocation's first effect.
+
+    Call only at the validation boundary, never on a generic error/timeout path.
+    Preserve typed classification/text; this outcome fact grants no custody settlement.
+    """
+    prior = _published_tool_result(ctx, None)
+    typed = result if isinstance(result, ToolResult) else (
+        prior if isinstance(prior, ToolResult) and prior.text == result
+        else LegacyTextResultAdapter.from_text(tool_name, result))
+    return _publish_tool_result(ctx, _replace_tool_result(
+        typed, meta_updates={"operation_outcome": "completed_no_effect"}))
+
+
+def completed_local_read(handler):
+    """Publish completion from a synchronous first-party reader's returned body.
+
+    Only producers with no external work/effects to settle may use this. A
+    warning, refusal or partial read is still a completed read, not permission
+    to retry unknown work. Escaping exceptions publish no completion fact.
+    Preserve the text ABI and any existing typed result/annotations exactly.
+    """
+    @wraps(handler)
+    def read(ctx, *args, **kwargs):
+        sentinel = object()
+        token = _install_tool_result_sidecar(ctx, sentinel)
+        try:
+            result = handler(ctx, *args, **kwargs)
+            published = _published_tool_result(ctx, sentinel)
+        finally:
+            _restore_tool_result_sidecar(token)
+        typed = result if isinstance(result, ToolResult) else (
+            published if isinstance(published, ToolResult) and published.text == result
+            else LegacyTextResultAdapter.from_text(handler.__name__, result))
+        typed = _replace_tool_result(typed, meta_updates={"operation_outcome": "completed_no_effect"})
+        return typed if isinstance(result, ToolResult) else _publish_tool_result(ctx, typed)
+    return read
+
+
+def launch_refusal_result(reason: str | Exception, *, not_started: bool | None = None) -> ToolResult:
+    """A refused submission does not erase earlier effects of its invocation."""
+    from ouroboros.owner_pause import LaunchBusy, NOT_STARTED_TEXT, _TOOL_OPERATION
+    from ouroboros.store import StoreError
+
+    if not_started is None:
+        not_started = getattr(reason, "invocation_not_started", None)
+        active = _TOOL_OPERATION.get()
+        if not_started is None and active:
+            with active[2]["phase_lock"]:
+                not_started = active[2].get("not_started")
+    store_refusal = isinstance(reason, StoreError)
+    physical = (getattr(reason, "reason", None) or f"{type(reason).__name__}: {reason}"
+                if isinstance(reason, (LaunchBusy, StoreError)) else None)
+    semantic = "store_unavailable" if store_refusal else str(reason)
+    unavailable = store_refusal or semantic == "owner_launch_authority_unavailable"
+    code = ("TOOL_ADMISSION_UNAVAILABLE" if store_refusal else
+            "OWNER_LAUNCH_AUTHORITY_UNAVAILABLE" if unavailable else
+            "OWNER_PAUSE_NOT_STARTED" if not_started is True else "OWNER_OPERATION_REFUSED")
+    phase = ("NOT STARTED — the tool handler was not entered." if not_started is True else
+             "This submission was refused; the invocation may already have effects. "
+             "Reconcile those effects before repeating the call.")
+    if not_started is True and semantic in {"owner_pause_authority_unreadable", "model_sleep_authority_unreadable"}:
+        phase = ("NOT STARTED — pause/sleep authority could not be read. The tool handler was not entered; "
+                 "repair the authority before retrying.")
+    elif not_started is True and semantic == "operation_already_returned":
+        phase = "NOT STARTED — this invocation has ended; it cannot submit more work."
+    detail = f"{semantic}; launch reason: {physical}" if physical is not None else semantic
+    text = (NOT_STARTED_TEXT if not_started is True and semantic == "owner_pause"
+            else f"⚠️ {code}: {phase}")
+    return ToolResult(status="unavailable" if unavailable else "blocked", code=code,
+                      text=f"{text} ({detail})",
+                      meta={"owner_pause_not_started": not_started is True,
+                            "control_reason": semantic,
+                            **({"launch_reason": physical} if physical is not None else {})})
+
+
 def _publish_process_result(
     ctx: Any,
     code: str,
@@ -618,7 +846,7 @@ def _publish_process_result(
     shell_regex_auto_corrected: bool = False,
     meta: Mapping[str, Any] | None = None,
 ) -> str:
-    """Publish trusted process facts through the transient string-bound sidecar."""
+    """Publish process facts; only the executor producer can certify completion."""
 
     facts = dict(meta or {})
     if exit_code is not None:
@@ -647,28 +875,25 @@ def _wrap_run_script_process_result(
     result: str,
     audit_note: str,
     script_path: Any,
+    note_meta: Mapping[str, Any] | None = None,
 ) -> str:
     """Republish an inner shell result after the exact run-script text wrapper."""
 
     if str(result).lstrip().startswith("⚠️"):
         # The result already owns line 1 with its own typed marker, which is what
-        # the failure classifier reads — the nudge appends after it.
+        # the failure classifier reads — the note appends after it.
         tail = f"\n{audit_note}" if audit_note else ""
         wrapped = f"{result}{tail}\n# script_path={script_path}"
-    elif audit_note:
-        # The nudge used to REPLACE the whole _run_shell payload (a successful
-        # script's answer was gone; re-running was the sole recovery). Marker
-        # first — ARTIFACT_OUTPUT_UNDECLARED is a typed policy-denial surface the
-        # classifier reads off line 1 — payload appended, as in run_command.
-        wrapped = f"{audit_note}\n\n# script_path={script_path}\n{result}"
     else:
-        wrapped = f"# script_path={script_path}\n{result}"
+        # The script's own answer leads; the undeclared-output note trails it, as
+        # in run_command: a first-line `⚠️ IDENTIFIER` reads as a refusal.
+        wrapped = f"# script_path={script_path}\n{result}" + (f"\n\n{audit_note}" if audit_note else "")
     base = _published_tool_result(ctx, None)
     if isinstance(base, ToolResult) and base.text == result:
         code = "ARTIFACT_OUTPUT_UNDECLARED" if audit_note and base.status == "ok" else base.code
         return _publish_tool_result(
             ctx,
-            _replace_tool_result(base, text=wrapped, code=code),
+            _replace_tool_result(base, text=wrapped, code=code, meta_updates=note_meta),
         )
     return wrapped
 
@@ -676,6 +901,7 @@ def _wrap_run_script_process_result(
 _EXACT_IDENTIFIER_CODES = MappingProxyType(
     {
         "ACCESS_DENIED": "ACCESS_BLOCKED",
+        "MCP_AUTH_REQUIRED": "MCP_AUTH_REQUIRED",
         "TOOL_ACCESS_BLOCKED": "ACCESS_BLOCKED",
         "ACTING_NO_WORKSPACE_BLOCKED": "ACCESS_BLOCKED",
         "ACTING_SUBAGENT_BLOCKED": "ACCESS_BLOCKED",
@@ -683,12 +909,19 @@ _EXACT_IDENTIFIER_CODES = MappingProxyType(
         "LOCAL_READONLY_SUBAGENT_BLOCKED": "ACCESS_BLOCKED",
         "MUTATIVE_SUBAGENTS_DISABLED": "ACCESS_BLOCKED",
         "CORE_PROTECTION_BLOCKED": "CORE_PROTECTION_BLOCKED",
+        "MANAGED_BY_DEPLOYMENT": "MANAGED_BY_DEPLOYMENT",
         "ROOT_REQUIRED_USER_FILES": "ROOT_REQUIRED_USER_FILES",
         "ROOT_REQUIRED_ACTIVE_WORKSPACE": "ROOT_REQUIRED_ACTIVE_WORKSPACE",
         "USER_FILES_PATH_BLOCKED": "USER_FILES_PATH_BLOCKED",
+        "OWNER_PAUSE_NOT_STARTED": "OWNER_PAUSE_NOT_STARTED",
+        "OWNER_LAUNCH_AUTHORITY_UNAVAILABLE": "OWNER_LAUNCH_AUTHORITY_UNAVAILABLE",
+        "OWNER_OPERATION_REFUSED": "OWNER_OPERATION_REFUSED",
+        "TOOL_ADMISSION_UNAVAILABLE": "TOOL_ADMISSION_UNAVAILABLE",
+        "STOP_ACTION_CONFLICT": "STOP_ACTION_CONFLICT",
         "COGNITIVE_TOOL_REQUIRED": "COGNITIVE_TOOL_REQUIRED",
         "RESOURCE_CONSTRAINT_BLOCKED": "RESOURCE_CONSTRAINT_BLOCKED",
         "RESOURCE_POLICY_BLOCKED": "RESOURCE_POLICY_BLOCKED",
+        "TOOL_SCHEMA_LIMIT": "TOOL_SCHEMA_LIMIT",
         "DATA_READ_BLOCKED": "DATA_BLOCKED",
         "DATA_LIST_BLOCKED": "DATA_BLOCKED",
         "WORKSPACE_MODE_BLOCKED": "WORKSPACE_BLOCKED",
@@ -703,9 +936,13 @@ _EXACT_IDENTIFIER_CODES = MappingProxyType(
         "ARTIFACT_OUTPUT_UNDECLARED": "ARTIFACT_OUTPUT_UNDECLARED",
         "ARTIFACT_OUTPUT_ERROR": "ARTIFACT_OUTPUT_ERROR",
         "SAFETY_VIOLATION": "SAFETY_VIOLATION",
+        "SAFETY_RETURNED": "SAFETY_RETURNED",
+        "SAFETY_UNAVAILABLE": "SAFETY_UNAVAILABLE",
         "CAPABILITY_UNAVAILABLE": "CAPABILITY_UNAVAILABLE",
         "MCP_DISABLED": "MCP_UNAVAILABLE",
-        "MCP_TOOL_NOT_FOUND": "MCP_UNAVAILABLE",
+        # Catalog gaps differ from proven absence and disabled providers.
+        "MCP_CATALOG_UNAVAILABLE": "MCP_CATALOG_UNAVAILABLE",
+        "MCP_TOOL_NOT_FOUND": "UNKNOWN_TOOL",
         "MCP_TOOL_DISALLOWED": "ACCESS_BLOCKED",
         "MCP_TOOL_TIMEOUT": "MCP_TIMEOUT",
         "MCP_TOOL_ERROR": "MCP_ERROR",
@@ -715,7 +952,15 @@ _EXACT_IDENTIFIER_CODES = MappingProxyType(
         # hung-session backlog refusal is browser unavailability.
         "BROWSER_SESSION_RETIRED": "TOOL_TIMEOUT",
         "BROWSER_ACTION_OUTCOME_UNKNOWN": "TOOL_ERROR",
-        "BROWSER_BACKLOG_RETIRED_SESSIONS": "LEGACY_UNAVAILABLE",
+        "BROWSER_BACKLOG_RETIRED_SESSIONS": "LEGACY_UNAVAILABLE", "BROWSER_PREPARING": "LEGACY_UNAVAILABLE",
+        # imagegen typed markers: the same no-blind-retry contract as the
+        # browser unknown-outcome marker, with the rate window its own lane.
+        "IMAGE_RATE_LIMITED": "IMAGE_RATE_LIMITED",
+        "IMAGE_OUTCOME_UNKNOWN": "IMAGE_OUTCOME_UNKNOWN",
+        "IMAGE_NOT_DISPATCHED": "IMAGE_NOT_DISPATCHED",
+        "IMAGE_PROVIDER_REJECTED": "IMAGE_PROVIDER_REJECTED",
+        "IMAGE_RESULT_INCOMPLETE": "IMAGE_RESULT_INCOMPLETE",
+        "PATH_BLOCKED": "PATH_BLOCKED",
         "TOOL_ARG_ERROR": "TOOL_ARG_ERROR",
         "INVALID_ARG": "TOOL_ARG_ERROR",
         "CHILD_RESULT_DISPOSITION_INVALID": "TOOL_ARG_ERROR",
@@ -731,10 +976,11 @@ _EXACT_IDENTIFIER_CODES = MappingProxyType(
         "ROUTE_UNCONFIRMED": "TOOL_REPORTED_FAILURE",
         "ROUTING_UNCONFIRMED": "TOOL_REPORTED_FAILURE",
         "NEEDS_MANUAL_TARGET": "TOOL_REPORTED_FAILURE",
-        # ensure_project_scope joined the same rail: a refused or unconfirmed
-        # bind scoped nothing durably.
-        "SCOPE_REJECTED": "TOOL_REPORTED_FAILURE",
-        "SCOPE_UNCONFIRMED": "TOOL_REPORTED_FAILURE",
+        # ensure_project_scope joined the same rail (a refused/unconfirmed bind scoped
+        # nothing durably); cross-focus refusals split availability from policy.
+        "SCOPE_REJECTED": "TOOL_REPORTED_FAILURE", "SCOPE_UNCONFIRMED": "TOOL_REPORTED_FAILURE",
+        "FOCUS_PROJECTION_UNAVAILABLE": "LEGACY_UNAVAILABLE", "FOCUS_TASK_NOT_LIVE": "LEGACY_UNAVAILABLE",
+        "FOCUS_STALE": "LEGACY_BLOCKED", "TOOL_FORBIDDEN": "LEGACY_BLOCKED", "FOCUS_SOURCE_UNRESOLVED": "LEGACY_UNAVAILABLE", "FOCUS_SOURCE_UNRETAINED": "LEGACY_UNAVAILABLE",
         "TOOL_ERROR": "TOOL_ERROR",
         "TOOL_INTERNAL_ERROR": "TOOL_INTERNAL_ERROR",
         "EXECUTOR_UNAVAILABLE": "LEGACY_UNAVAILABLE",
@@ -755,6 +1001,27 @@ _EXACT_IDENTIFIER_CODES = MappingProxyType(
         "RUN_SCRIPT_BLOCKED": "RUN_SCRIPT_BLOCKED",
         "REVIEW_BLOCKED": "REVIEW_BLOCKED",
         "GIT_ERROR": "GIT_ERROR",
+        "INTEGRATE_DELEGATED_INSPECT_CAPTURE": "INTEGRATION_INSPECTION_REQUIRED",
+        # #1657: source-confirmed refusals/failures with invariant meanings.
+        # These reuse existing codes; no suffix rule or custody/completion fact
+        # is inferred from text. In particular, conflict/partial/overflow and
+        # interrupted publication can follow effects that must be retained.
+        "SEND_LINKS_NO_CHAT": "LEGACY_UNAVAILABLE",
+        "SEND_LINKS_TOO_MANY": "TOOL_ARG_ERROR",
+        "ESCALATE_PARENT_SETTLED": "LEGACY_UNAVAILABLE",
+        "ESCALATE_UNWRITTEN": "TOOL_ERROR",
+        "FILE_TOO_LARGE": "TOOL_ARG_ERROR",
+        "SKILL_EXEC_EXTENSION": "TOOL_ARG_ERROR",
+        "SKILL_EXEC_GRANT_REQUIRED": "LEGACY_BLOCKED",
+        "SKILL_EXEC_ARGV_TOO_LARGE": "TOOL_ARG_ERROR",
+        "SKILL_EXEC_OVERFLOW": "TOOL_ERROR",
+        "SKILL_REPAIR_STALE": "LEGACY_BLOCKED",
+        "SERVICE_ALREADY_RUNNING": "LEGACY_BLOCKED",
+        "CHERRY_PICK_CONFLICT": "TOOL_ERROR",
+        "RESTORE_PARTIAL": "TOOL_ERROR",
+        "EVOLUTION_AUTHORITY_REVOKED": "LEGACY_BLOCKED",
+        "EVOLUTION_COMMIT_ORPHANED": "TOOL_ERROR",
+        "EVOLUTION_PUBLICATION_STOPPED": "LEGACY_BLOCKED",
     }
 )
 
@@ -825,6 +1092,12 @@ def _structured_failure(text: str) -> bool:
 def _classification(code: str, meta: Mapping[str, Any] | None = None) -> tuple[ToolStatus, str, dict[str, Any]]:
     spec = TOOL_CODE_SPECS[code]
     return spec.status, code, dict(meta or {})
+
+
+def safety_refusal(text: str) -> tuple[ToolStatus, str]:
+    """``(status, code)`` of a call ``check_safety`` did not let through: held without a reading, else returned."""
+    code = "SAFETY_UNAVAILABLE" if text.startswith("⚠️ SAFETY_UNAVAILABLE") else "SAFETY_RETURNED"
+    return TOOL_CODE_SPECS[code].status, code
 
 
 def _classify_legacy_text(
@@ -966,6 +1239,14 @@ def _compose_execute_result_result(
         else LegacyTextResultAdapter.from_text(tool_name, base)
     )
     text = _compose_execute_result(base_result.text, route_note, safety_msg)
+    notes = tuple(note for note in (route_note, safety_msg) if note)
+    source = {
+        "producer_text": (
+            base_result.producer_text if base_result.producer_text is not None
+            else base_result.text if notes else None
+        ),
+        "host_annotations": base_result.host_annotations + notes,
+    }
     meta = dict(base_result.meta)
     if route_note:
         meta["route_note"] = True
@@ -982,6 +1263,7 @@ def _compose_execute_result_result(
             code=base_result.code,
             text=text,
             meta=meta,
+            **source,
         )
     if base_result.code == "OK":
         return ToolResult(
@@ -989,6 +1271,7 @@ def _compose_execute_result_result(
             code="SAFETY_WARNING",
             text=text,
             meta=meta,
+            **source,
         )
     meta["safety_warning"] = True
     return ToolResult(
@@ -996,4 +1279,5 @@ def _compose_execute_result_result(
         code=base_result.code,
         text=text,
         meta=meta,
+        **source,
     )

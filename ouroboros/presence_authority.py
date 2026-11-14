@@ -1,4 +1,4 @@
-"""Immutable positive authority compiled from one reviewed presence profile."""
+"""Decode frozen Presence authority; new focuses use consciousness authority."""
 
 from __future__ import annotations
 
@@ -8,14 +8,21 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
+from ouroboros.dialogue_provenance import (  # the provenance predicate; authority re-exports it
+    PRESENCE_OWN_WORK_SCOPE,
+    presence_caller_binding,
+    presence_metadata_binding as presence_metadata_binding,
+    presence_effective_hops,
+    presence_effective_related,
+    presence_queue_task,
+    presence_record_binding,
+    presence_related_work,
+    presence_target_record,
+)
 from ouroboros.presence_capabilities import (
     PresenceArgumentBinding,
-    PresenceProfileResolution,
-    PresenceResourceTarget,
-    PresenceScriptTarget,
-    PresenceToolTarget,
 )
-from ouroboros.tool_capabilities import COGNITIVE_MEMORY_TOOL_NAMES
+from ouroboros.contracts.task_contract import canonical_tool_name
 
 PRESENCE_CEILING_SCHEMA_VERSION = 1
 _SHA256_LEN = 64
@@ -284,83 +291,20 @@ def presence_ceiling_from_payload(value: Any) -> PresenceCapabilityCeiling:
     return ceiling
 
 
-def build_presence_capability_ceiling(
-    *,
-    skill_name: str,
-    skill_content_hash: str,
-    state_fingerprint: str,
-    resolution: PresenceProfileResolution,
-) -> PresenceCapabilityCeiling:
-    """Compile active selections; missing required requests refuse admission."""
-
-    if not isinstance(resolution, PresenceProfileResolution) or not resolution.required_selections_present:
-        raise PresenceAuthorityError("presence_authority_missing_required", "resolution.missing_required")
-    tools: list[PresenceToolGrant] = []
-    resources: list[PresenceResourceGrant] = []
-    for selection in resolution.active:
-        target = selection.target
-        if isinstance(target, PresenceToolTarget):
-            tools.append(PresenceToolGrant(target.name, selection.argument_bindings))
-        elif isinstance(target, PresenceScriptTarget):
-            bindings = (
-                PresenceArgumentBinding(("skill",), "static", static_value=target.skill),
-                PresenceArgumentBinding(("script",), "static", static_value=target.script),
-                *selection.argument_bindings,
-            )
-            tools.append(PresenceToolGrant("skill_exec", tuple(bindings)))
-        elif isinstance(target, PresenceResourceTarget):
-            resources.append(
-                PresenceResourceGrant(
-                    target.root,
-                    target.operations,
-                    target.path_prefix,
-                    target.bucket,
-                    target.skill_name,
-                )
-            )
-    # The cognitive baseline is part of the ceiling, not of the profile: an
-    # admitted conversation is still this mind, so it keeps its own memory in
-    # every room instead of losing what the exchange taught it. It adds no
-    # authority over settings, delivery, or the filesystem. A name the profile
-    # already selected keeps THAT grant, because its host-authored argument
-    # bindings are the exact facts apply_presence_argument_bindings overrides
-    # the model with; an unselected name arrives with no bindings at all.
-    selected = {grant.name for grant in tools}
-    tools.extend(
-        PresenceToolGrant(name)
-        for name in sorted(COGNITIVE_MEMORY_TOOL_NAMES)
-        if name not in selected
-    )
-    provisional = PresenceCapabilityCeiling(
-        skill_name=_text(skill_name, "skill_name"),
-        skill_content_hash=_sha(skill_content_hash, "skill_content_hash"),
-        profile_fingerprint=resolution.profile_fingerprint,
-        state_fingerprint=_sha(state_fingerprint, "state_fingerprint"),
-        selection_fingerprint=resolution.selection_fingerprint,
-        model_slot=resolution.runtime.model_slot,
-        inline_max_rounds=resolution.runtime.inline_max_rounds,
-        tool_grants=tuple(sorted(tools, key=lambda item: item.name)),
-        resource_grants=tuple(sorted(resources, key=lambda item: (item.root, item.path_prefix))),
-        digest="0" * _SHA256_LEN,
-    )
-    payload = presence_ceiling_payload(provisional)
-    return PresenceCapabilityCeiling(
-        **{**provisional.__dict__, "digest": payload["digest"]}
-    )
-
-
 def presence_ceiling_allows_tool(ceiling: PresenceCapabilityCeiling, tool_name: str) -> bool:
-    return any(grant.name == tool_name for grant in ceiling.tool_grants)
+    return any(canonical_tool_name(grant.name) == tool_name for grant in ceiling.tool_grants)  # frozen old spellings
 
 
-def presence_ceiling_allows_delegated_surface(ctx: Any, surface: str) -> bool:
+def presence_ceiling_allows_delegated_surface(ctx: Any, surface: str, workspace_root: str = "") -> bool:
     """Keep mutative descendants inside an explicitly selected logical write root."""
 
     ceiling = presence_ceiling_from_context(ctx)
     if ceiling is None:
         return True
+    from ouroboros.workspace_copies import workspace_copy_source_is_system
+
     required_root = {
-        "self_worktree": "system_repo",
+        "self_worktree": ("system_repo" if workspace_copy_source_is_system(ctx, workspace_root) else "active_workspace"),
         "external_workspace": "active_workspace",
     }.get(str(surface or "").strip())
     return bool(required_root and any(
@@ -452,7 +396,7 @@ def apply_presence_argument_bindings(ctx: Any, tool_name: str, args: Mapping[str
     result = dict(args or {})
     if ceiling is None:
         return result
-    grant = next((item for item in ceiling.tool_grants if item.name == tool_name), None)
+    grant = next((item for item in ceiling.tool_grants if canonical_tool_name(item.name) == tool_name), None)
     if grant is None:
         return result
     for binding in grant.bindings:
@@ -473,11 +417,14 @@ def presence_ceiling_from_context(ctx: Any) -> PresenceCapabilityCeiling | None:
     return presence_ceiling_from_payload(raw) if raw is not None else None
 
 
-def presence_ceiling_allows_binding(ceiling: PresenceCapabilityCeiling, binding: Any) -> bool:
-    """Intersect an already-resolved registry target with the positive ceiling."""
+def presence_ceiling_allows_binding(ceiling: PresenceCapabilityCeiling, binding: Any, *, entry: bool = False) -> bool:
+    """Intersect an already-resolved registry target with the positive ceiling. An ``entry`` target is
+    a directory entry read as itself (a symlink is its link): only its folder is resolved, never its name."""
+
+    from ouroboros.tool_access_paths import entry_path
 
     try:
-        target = Path(binding.target_path).resolve(strict=False)
+        target = entry_path(binding.target_path) if entry else Path(binding.target_path).resolve(strict=False)
         base = Path(binding.base_path).resolve(strict=False)
         logical_base = getattr(binding, "logical_base_path", None)
         if logical_base is not None:
@@ -518,13 +465,73 @@ def presence_ceiling_allows_binding(ceiling: PresenceCapabilityCeiling, binding:
     return False
 
 
+def presence_effective_refusal(ctx: Any, task_id: str, effective: Any, *, drive_root: Any = None,
+                               same_tree: bool = False) -> str:
+    """Refusal when an admitted ``task_id``'s effective projection reaches work the caller may not address.
+
+    A retry successor replaces the requested record's content, so each hop is judged
+    by the same rule before anything is projected; the foreign id is not named.
+    """
+
+    for hop in presence_effective_hops(task_id, effective):
+        if presence_work_refusal(ctx, hop, drive_root=drive_root, same_tree=same_tree):
+            return (
+                f"⚠️ PRESENCE_CAPABILITY_BLOCKED: task {task_id}'s effective result continues in work "
+                "that was not started from this place; a place turn reads only that work."
+            )
+    return ""
+
+
+def presence_work_refusal(ctx: Any, task_id: str, *, drive_root: Any = None, same_tree: bool = False) -> str:
+    """Refusal text when a Presence caller may not address ``task_id``, else ``""``.
+
+    A non-Presence caller is never narrowed here; a delegated descendant of a
+    Presence-bound task is one through its inherited binding authority.
+    ``presence_target_record`` decides, and a record naming another binding refuses.
+    ``same_tree`` also admits the caller's own task tree, its root included (its
+    lineage reads). ``drive_root`` defaults to the caller's task-status root.
+    """
+
+    binding = presence_caller_binding(ctx)
+    if binding is None:
+        return ""
+    if drive_root is None:
+        metadata = getattr(ctx, "task_metadata", None)
+        drive_root = ((metadata.get("budget_drive_root") if isinstance(metadata, Mapping) else "")
+                      or getattr(ctx, "budget_drive_root", "") or ctx.drive_root)
+    target = str(task_id or "").strip()
+    record = presence_target_record(drive_root, target)
+    if isinstance(record, Mapping) and presence_related_work(binding, record):
+        return ""
+    if same_tree and isinstance(record, Mapping):
+        metadata = getattr(ctx, "task_metadata", None)
+        own_id = str(getattr(ctx, "task_id", "") or "")
+        own_root = str((metadata or {}).get("root_task_id") or own_id) if isinstance(metadata, Mapping) else own_id
+        if own_id and (target in {own_id, own_root} or str(record.get("parent_task_id") or "") == own_id
+                       or str(record.get("root_task_id") or "") == own_root):
+            return ""
+    return (
+        f"⚠️ PRESENCE_CAPABILITY_BLOCKED: task {target or '?'} is not independent work started from "
+        "this place (any of its conversations); a place turn "
+        "addresses only that work."
+    )
+
+
 __all__ = [
     "PRESENCE_CEILING_SCHEMA_VERSION",
+    "PRESENCE_OWN_WORK_SCOPE",
+    "presence_caller_binding",
+    "presence_effective_refusal",
+    "presence_effective_related",
+    "presence_queue_task",
+    "presence_record_binding",
+    "presence_related_work",
+    "presence_target_record",
+    "presence_work_refusal",
     "PresenceAuthorityError",
     "PresenceCapabilityCeiling",
     "PresenceResourceGrant",
     "PresenceToolGrant",
-    "build_presence_capability_ceiling",
     "apply_presence_argument_bindings",
     "presence_ceiling_allows_binding",
     "presence_ceiling_allows_delegated_surface",

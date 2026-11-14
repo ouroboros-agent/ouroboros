@@ -98,12 +98,20 @@ def test_bundle_dir_env_is_exported_to_the_server_and_cli():
 
 def test_embedded_python_env_redirects_both_bundle_writes(tmp_path, monkeypatch):
     monkeypatch.setenv("PYTHONNOUSERSITE", "1")
+    monkeypatch.delenv("PYTHONPYCACHEPREFIX", raising=False)
     env = bootstrap_module.embedded_python_env(tmp_path)
     state = tmp_path / "state"
-    assert env["PYTHONPYCACHEPREFIX"] == str(state / "pycache")
+    assert env["PYTHONPYCACHEPREFIX"] == str(state / "pycache.noindex")
     assert env["PYTHONUSERBASE"] == str(state / "python-userbase")
     # An inherited no-user-site would install to the user site then refuse to import it.
     assert "PYTHONNOUSERSITE" not in env
+
+
+def test_a_child_keeps_a_custom_bytecode_prefix_and_leaves_the_legacy_default(tmp_path):
+    custom, legacy = str(tmp_path / "custom-cache"), str(tmp_path / "state" / "pycache")
+    assert bootstrap_module.embedded_python_env(tmp_path, {"PYTHONPYCACHEPREFIX": custom})["PYTHONPYCACHEPREFIX"] == custom
+    child = bootstrap_module.embedded_python_env(tmp_path, {"PYTHONPYCACHEPREFIX": legacy})
+    assert child["PYTHONPYCACHEPREFIX"] == str(tmp_path / "state" / "pycache.noindex")
 
 
 def test_pip_install_target_args_only_for_the_embedded_interpreter(tmp_path):
@@ -166,18 +174,8 @@ def test_install_deps_reports_a_failing_pip(tmp_path):
 
 # --------------------------------------------------------------------------
 # XG-7B.3: install_deps' False must reach the decisions that consume it — the
-# launcher wrapper, bootstrap, and the restart loop — not die in a bare call.
+# bootstrap and restart loop — not die in a bare call.
 # --------------------------------------------------------------------------
-
-def test_the_launcher_wrapper_propagates_the_install_result(monkeypatch):
-    import launcher
-
-    monkeypatch.setattr(launcher, "_bootstrap_context", lambda: None)
-    monkeypatch.setattr(launcher, "_install_deps_impl", lambda ctx: False)
-    assert launcher._install_deps() is False
-    monkeypatch.setattr(launcher, "_install_deps_impl", lambda ctx: True)
-    assert launcher._install_deps() is True
-
 
 def test_bootstrap_repo_reports_a_failed_dependency_install(tmp_path, monkeypatch):
     sink = []
@@ -189,7 +187,6 @@ def test_bootstrap_repo_reports_a_failed_dependency_install(tmp_path, monkeypatc
         save_settings=lambda s: None, log=_log_stub(sink),
     )
     monkeypatch.setattr(bootstrap_module, "ensure_managed_repo", lambda c: "updated")
-    monkeypatch.setattr(bootstrap_module, "bootstrap_native_skills", lambda c: None)
     monkeypatch.setattr(bootstrap_module, "install_deps", lambda c: False)
     assert bootstrap_module.bootstrap_repo(context) is False
     # WARNING, not ERROR, for the same reason as `install_deps` itself: bootstrap
@@ -207,7 +204,7 @@ def test_a_restart_with_a_failed_dependency_install_pauses_and_discloses(
     monkeypatch, tmp_path, caplog,
 ):
     """XG-7B.3 through the REAL caller: agent_lifecycle_loop used to discard
-    _install_deps' result and restart an evolved checkout without the packages
+    install_deps' result and restart an evolved checkout without the packages
     its reviewed commit added. It must retry once, visibly, and name the
     consequence when the retry also fails."""
     import logging
@@ -216,27 +213,26 @@ def test_a_restart_with_a_failed_dependency_install_pauses_and_discloses(
     import launcher
 
     monkeypatch.setattr(launcher, "_shutdown_event", threading.Event())
-    monkeypatch.setattr(launcher, "_cleanup_recorded_server_process", lambda reason: None)
-    monkeypatch.setattr(launcher, "_kill_stale_runtime_ports", lambda port: None)
+    monkeypatch.setattr(launcher, "_cleanup_recorded_server_process", lambda reason: [])
     # The per-generation stray sweep must never signal a real process from a test.
     monkeypatch.setattr(launcher, "_reap_same_install_strays", lambda reason: [])
     monkeypatch.setattr(
         launcher, "_cleanup_recorded_server_group_for_pid", lambda pid, reason: None,
     )
     monkeypatch.setattr(launcher, "_update_server_process_record_port", lambda pid, port: None)
-    monkeypatch.setattr(launcher, "_poll_port_file", lambda timeout=30, abort_event=None: 52123)
-    monkeypatch.setattr(launcher, "_wait_for_server", lambda port, timeout=45, abort_event=None: True)
+    monkeypatch.setattr(launcher, "_await_generation_endpoint", lambda *a, **kw: 52123)
+    monkeypatch.setattr(launcher, "_wait_for_server", lambda port, timeout=45, abort_event=None, proc=None: True)
     monkeypatch.setattr(launcher, "PORT_FILE", tmp_path / "port")
-    monkeypatch.setattr(launcher, "_sync_existing_repo_from_bundle", lambda: None)
+    monkeypatch.setattr(launcher, "sync_existing_repo_from_bundle", lambda ctx: None)
     monkeypatch.setattr("time.sleep", lambda seconds: None)
 
     install_calls = []
 
-    def _failing_install():
+    def _failing_install(ctx):
         install_calls.append(1)
         return False
 
-    monkeypatch.setattr(launcher, "_install_deps", _failing_install)
+    monkeypatch.setattr(launcher, "install_deps", _failing_install)
 
     starts = []
 
@@ -265,16 +261,14 @@ def test_a_restart_with_a_failed_dependency_install_pauses_and_discloses(
 # F2: no unverified download may become the packaged runtime.
 # --------------------------------------------------------------------------
 
-@pytest.mark.parametrize(
-    "script",
-    sorted(p.name for p in (REPO_ROOT / "scripts").glob("download_*_standalone.*")),
-)
-def test_every_standalone_download_verifies_a_checksum(script):
-    text = (REPO_ROOT / "scripts" / script).read_text(encoding="utf-8").lower()
-    assert "sha256" in text, f"{script} downloads a runtime without verifying it"
-    assert any(token in text for token in ("mismatch", "verified")), (
-        f"{script} computes a hash but never refuses on mismatch"
-    )
+def test_every_standalone_download_verifies_a_checksum(subtests):
+    for script in sorted(p.name for p in (REPO_ROOT / "scripts").glob("download_*_standalone.*")):
+        with subtests.test(script=script):
+            text = (REPO_ROOT / "scripts" / script).read_text(encoding="utf-8").lower()
+            assert "sha256" in text, f"{script} downloads a runtime without verifying it"
+            assert any(token in text for token in ("mismatch", "verified")), (
+                f"{script} computes a hash but never refuses on mismatch"
+            )
 
 
 def test_windows_python_download_pins_the_release_checksum():
@@ -291,26 +285,6 @@ def test_windows_python_download_checks_native_dependency_install_exits():
 
 # --------------------------------------------------------------------------
 # F5: Update Now must go through the merge plan, not the hard-reset hatch.
-# --------------------------------------------------------------------------
-
-def test_update_now_posts_the_merge_aware_strategy():
-    """Update Now decides its strategy FROM THE MERGE PLAN (v6.88.0 flow:
-    preflight -> verifiedUpdatePlan -> typed apply; the shared verifier wraps
-    updateStrategyForPlan since the 2026-08-31 redesign); the legacy
-    'replace'/'stash' escape hatch must stay out of the normal path (it lives
-    only behind the explicit Recovery confirmation)."""
-    text = (REPO_ROOT / "web" / "modules" / "updates.js").read_text(encoding="utf-8")
-    apply_fn = text.split("async function applyUpdate", 1)[1].split("\n    }", 1)[0]
-    code = "\n".join(
-        line for line in apply_fn.splitlines() if not line.strip().startswith("//")
-    )
-    assert "updatePreflight" in code
-    assert "verifiedUpdatePlan" in code
-    for legacy in ("'replace'", "'stash'"):
-        assert legacy not in code, f"Update Now still reaches for the legacy {legacy} path"
-    assert "assisted_started" in code
-
-
 # --------------------------------------------------------------------------
 # G2: a settings key that never reaches the environment is a silent no-op.
 # --------------------------------------------------------------------------
@@ -349,9 +323,11 @@ def test_skill_lifecycle_timeout_setting_reaches_the_queue(monkeypatch):
 # control still readable) read as correct — and, once the clear grew a real
 # withdrawal, its unstubbed event bus spawned a live SyncManager per run. The
 # harness below covers the same resume through the real path, plus the mailbox.
+# Since #1376 silence opens no episode; an explicit deadline or the live task
+# lifetime setting (``ceiling``, a mutable cell the owner may raise) opens it.
 # --------------------------------------------------------------------------
 
-def _enforce_harness(monkeypatch, tmp_path, running, *, idle=900, grace=300):
+def _enforce_harness(monkeypatch, tmp_path, running, *, idle=900, grace=300, ceiling=None):
     """Drive the real enforce loop the way the supervisor loop actually drives it.
 
     The bus is PUMPED: server.py drains the event queue through ``dispatch_event``
@@ -372,8 +348,8 @@ def _enforce_harness(monkeypatch, tmp_path, running, *, idle=900, grace=300):
     monkeypatch.setattr(queue_mod, "RUNNING", running)
     monkeypatch.setattr(queue_mod, "PENDING", [])
     monkeypatch.setattr(queue_mod, "get_task_idle_timeout_sec", lambda: idle)
-    monkeypatch.setattr(queue_mod, "get_per_call_timeout_ceiling_sec", lambda: 60)
-    monkeypatch.setattr(queue_mod, "get_task_abs_ceiling_sec", lambda: 10_000_000)
+    lifetime = ceiling if ceiling is not None else [10_000_000]
+    monkeypatch.setattr(queue_mod, "get_task_abs_ceiling_sec", lambda: lifetime[0])
     monkeypatch.setattr(queue_mod, "FINALIZATION_GRACE_SEC", grace)
     monkeypatch.setattr(queue_mod, "persist_queue_snapshot", lambda **_k: True)
     monkeypatch.setattr(queue_mod, "_ensure_reaper_started", lambda: None)
@@ -417,34 +393,42 @@ def _live_finalize_controls(drive, task_id):
 def test_resuming_task_has_its_finalize_now_control_withdrawn(monkeypatch, tmp_path):
     """The latch and the mailbox control are ONE episode: clearing the latch while
     the durable finalize_now stays readable let the task drain a stale kill order
-    and finalize early with no terminal condition pending."""
+    and finalize early with no terminal condition pending. Here the owner lifts the
+    lifetime that opened the episode, which leaves only the task's own progress."""
     task_id = "t-episode"
     meta = {
         "task": {"id": task_id, "chat_id": 7},
         "started_at": 1000.0, "last_progress_at": 1000.0, "worker_id": 0,
     }
-    tick = _enforce_harness(monkeypatch, tmp_path, {task_id: meta})
+    lifetime = [500]
+    tick = _enforce_harness(monkeypatch, tmp_path, {task_id: meta}, ceiling=lifetime)
 
-    tick(2000.0)  # idle past the timeout: the grace episode opens
+    tick(2000.0)  # past the task lifetime: the grace episode opens
     assert meta["finalization_requested_at"] == 2000.0
+    assert meta["finalization_reason"] == "absolute_ceiling"
     assert len(_live_finalize_controls(tmp_path, task_id)) == 1
 
-    meta["last_progress_at"] = 2100.0  # the task itself went back to work
+    lifetime[0] = None  # the owner lifts the lifetime ...
+    meta["last_progress_at"] = 2100.0  # ... and the task itself went back to work
     tick(2110.0)
     assert "finalization_requested_at" not in meta
     assert _live_finalize_controls(tmp_path, task_id) == []
 
 
-def test_wedged_orchestrator_with_a_flickering_subtree_still_reaches_the_kill(
+def test_wedged_orchestrator_with_a_flickering_subtree_keeps_one_episode_until_its_deadline_kill(
     monkeypatch, tmp_path,
 ):
-    """A DESCENDANT's progress spares the orchestrator from the kill but is not the
-    orchestrator answering its own grace request. Revoking the episode on subtree
-    activity re-armed it on every flicker: the window never elapsed and one
-    finalize_now control piled up per tick."""
+    """A DESCENDANT's progress spares the orchestrator but is not the orchestrator
+    answering. Revoking an episode on subtree activity re-armed it on every flicker:
+    the window never elapsed and one control piled up per tick. Silence alone keeps
+    ONE attention episode across every flicker and never reaps (#1376); the
+    orchestrator's own deadline still reaches the kill through one finalize_now."""
+    import datetime as dt
+
     orch, child = "orch1", "child1"
+    deadline = dt.datetime.fromtimestamp(20_500.0, tz=dt.timezone.utc).isoformat()
     orch_meta = {
-        "task": {"id": orch, "chat_id": 7},
+        "task": {"id": orch, "chat_id": 7, "deadline_at": deadline},
         "started_at": 1000.0, "last_progress_at": 1000.0, "worker_id": 0,
     }
     child_meta = {
@@ -456,16 +440,23 @@ def test_wedged_orchestrator_with_a_flickering_subtree_still_reaches_the_kill(
     running = {orch: orch_meta, child: child_meta}
     tick = _enforce_harness(monkeypatch, tmp_path, running)
 
-    now = 1000.0
-    for step in range(20):
+    now, episodes = 1000.0, set()
+    for step in range(30):
         now += 1000.0
         if step % 2 == 0:  # the child progresses every other tick
             child_meta["last_progress_at"] = now
         tick(now)
         if orch not in queue_mod.RUNNING:
             break
+        if now < 20_500.0:
+            assert "finalization_requested_at" not in orch_meta, f"silence opened a grace episode at {now}"
+            episodes.add((orch_meta.get("silence_attention") or {}).get("episode_id"))
 
-    assert orch not in queue_mod.RUNNING, "wedged orchestrator was never reaped"
+    episodes.discard(None)
+    assert len(episodes) == 1, "a subtree flicker re-armed or answered the silence episode"
+    assert orch_meta["silence_attention"]["state"] == "pending_attention"
+    assert orch not in queue_mod.RUNNING, "wedged orchestrator never reached its deadline kill"
+    assert queue_mod._reap_queue.get_nowait()["terminal_reason"] == "deadline"
     assert len(_live_finalize_controls(tmp_path, orch)) == 1
     assert child in queue_mod.RUNNING  # the progressing child is untouched
 
@@ -476,11 +467,15 @@ def test_supervisor_grace_toast_is_not_the_task_answering_it(monkeypatch, tmp_pa
     Counting it as the task's own work made the supervisor answer its own question:
     the toast stamped last_progress_at, the next 0.5s tick read the task as resumed,
     and the episode was withdrawn — taking the finalize_now with it, so cooperative
-    finalization never reached a wedged task at all.
+    finalization never reached a wedged task at all. Silence opens no episode
+    (#1376), so the task's explicit deadline opens this one.
     """
+    import datetime as dt
+
     task_id = "t-narration"
     meta = {
-        "task": {"id": task_id, "chat_id": 7},
+        "task": {"id": task_id, "chat_id": 7,
+                 "deadline_at": dt.datetime.fromtimestamp(2000.0, tz=dt.timezone.utc).isoformat()},
         "started_at": 1000.0, "last_progress_at": 1000.0, "worker_id": 0,
     }
     tick = _enforce_harness(monkeypatch, tmp_path, {task_id: meta}, grace=120)
@@ -489,7 +484,7 @@ def test_supervisor_grace_toast_is_not_the_task_answering_it(monkeypatch, tmp_pa
     assert meta["finalization_requested_at"] == 2000.0
     tick(2000.5)  # the toast is dispatched here, exactly as the loop does it
 
-    assert any("reached idle_timeout" in line for line in tick.delivered), (
+    assert any("Task t-narration: The task reached its deadline." in line for line in tick.delivered), (
         "the harness never drained the bus — the toast under test was never dispatched"
     )
     assert meta["last_progress_at"] == 1000.0, "host narration counted as the task's work"
@@ -507,9 +502,11 @@ def test_a_spared_task_still_gets_its_whole_grace_window(monkeypatch, tmp_path):
 
     An orchestrator blocked in wait_tasks makes no own progress and drains no
     mailbox. If its episode's clock runs down while the subtree keeps it
-    deliberately alive, it is killed at the first tick the subtree goes quiet —
+    deliberately alive, it is killed at the first tick a stop is due again —
     with the finalize_now still unread. It must get the full window from the
-    moment sparing ends, and still only ONE episode and ONE control.
+    moment sparing ends, and still only ONE episode and ONE control. Silence opens
+    no episode (#1376): the task lifetime does, and sparing needs that live
+    setting lifted while the child works.
     """
     orch, child = "orch2", "child2"
     orch_meta = {
@@ -518,22 +515,25 @@ def test_a_spared_task_still_gets_its_whole_grace_window(monkeypatch, tmp_path):
     }
     child_meta = {
         "task": {"id": child, "chat_id": 7, "parent_task_id": orch, "root_task_id": orch},
-        "started_at": 1000.0, "last_progress_at": 1000.0, "worker_id": 1,
+        "started_at": 1900.0, "last_progress_at": 1900.0, "worker_id": 1,
     }
     from supervisor import queue as queue_mod
 
     running = {orch: orch_meta, child: child_meta}
-    tick = _enforce_harness(monkeypatch, tmp_path, running, grace=120)
+    lifetime = [500]
+    tick = _enforce_harness(monkeypatch, tmp_path, running, grace=120, ceiling=lifetime)
 
-    tick(2000.0)  # both silent: the orchestrator's episode opens
+    tick(2000.0)  # past its lifetime: the orchestrator's episode opens
     assert orch_meta["finalization_requested_at"] == 2000.0
 
-    child_meta["last_progress_at"] = 2050.0  # the child resumes: orchestrator spared
+    lifetime[0] = None  # the owner lifts the lifetime ...
+    child_meta["last_progress_at"] = 2050.0  # ... while the child works: orchestrator spared
     for now in (2060.0, 2500.0, 2900.0):  # long past 2000 + 120
         tick(now)
         assert orch in queue_mod.RUNNING, f"spared orchestrator was killed at {now}"
 
-    running.pop(child)  # the child finishes; the subtree goes quiet
+    running.pop(child)  # the child finishes; the subtree goes quiet ...
+    lifetime[0] = 500  # ... as the lifetime holds again
     tick(2900.5)
     assert orch in queue_mod.RUNNING, "killed at the first quiet tick with zero grace"
     assert len(_live_finalize_controls(tmp_path, orch)) == 1, "a second episode was opened"
@@ -543,15 +543,87 @@ def test_a_spared_task_still_gets_its_whole_grace_window(monkeypatch, tmp_path):
     assert len(_live_finalize_controls(tmp_path, orch)) == 1
 
 
-def test_child_settlement_stamps_parent_activity_and_withdraws_grace(
+@pytest.mark.parametrize("case, readable_after", [
+    ("lifetime_lifted", False),
+    ("root_post_work_started", False),
+    ("observation_pending_then_current", False),
+    ("lifetime_still_reached", True),
+    ("owner_stop_live", True),
+    ("owner_stop_latch_without_visible_intent", True),
+])
+def test_quiet_work_keeps_a_finalize_now_only_while_its_stop_still_applies(
+    monkeypatch, tmp_path, case, readable_after,
+):
+    """Quiet is no stop condition (#1376). A grace episode whose hard bound stopped
+    holding (the owner lifted the lifetime; a root's post-task work began) is withdrawn
+    whole on the first quiet tick with a current observation, and the silence is dated
+    instead. A bound that still holds, an owner stop (live, or its latch alone) and a
+    stale observation mirror keep the control readable."""
+    from ouroboros.outcomes import REASON_OWNER_REQUESTED_FINALIZATION
+    from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, write_owner_message
+    from supervisor import queue as queue_mod
+
+    task_id = "t-quiet"
+    meta = {
+        "task": {"id": task_id, "chat_id": 7, "root_task_id": task_id},
+        "started_at": 1000.0, "last_progress_at": 1000.0, "worker_id": 0,
+    }
+    owner_stop = case.startswith("owner_stop")
+    lifetime = [None if owner_stop else 500]
+    tick = _enforce_harness(monkeypatch, tmp_path, {task_id: meta}, grace=120, ceiling=lifetime)
+    if owner_stop:  # the owner-stop episode's own latch and control (supervisor/owner_stop.py)
+        write_owner_message(tmp_path, REASON_OWNER_REQUESTED_FINALIZATION, task_id,
+                            msg_id="owner-stop-control", kind=KIND_FINALIZE_NOW)
+        meta.update(finalization_requested_at=2000.0, finalization_control_msg_id="owner-stop-control",
+                    finalization_reason=REASON_OWNER_REQUESTED_FINALIZATION)
+        if case == "owner_stop_live":
+            monkeypatch.setattr("supervisor.owner_stop.running_owner_stop_tasks", lambda *_a, **_k: {task_id})
+    else:
+        tick(2000.0)  # past the lifetime: the hard bound opens the episode
+        assert meta["finalization_reason"] == "absolute_ceiling"
+    assert len(_live_finalize_controls(tmp_path, task_id)) == 1
+
+    if case in ("lifetime_lifted", "observation_pending_then_current"):
+        lifetime[0] = None
+    elif case == "root_post_work_started":
+        from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+
+        write_task_result(tmp_path, task_id, STATUS_COMPLETED, root_task_id=task_id,
+                          root_phase_checkpoint={"post_task_synthesis": "running"})
+    if case == "observation_pending_then_current":
+        queue_mod._enforce_task_timeouts_locked(
+            types.SimpleNamespace(WORKERS={}), 2050.0, 7, {}, pending_events={task_id})
+        assert len(_live_finalize_controls(tmp_path, task_id)) == 1, "decided on a stale mirror"
+    tick(2051.0)  # quiet, inside the old window
+
+    readable = _live_finalize_controls(tmp_path, task_id)
+    if readable_after:
+        assert len(readable) == 1 and meta.get("finalization_requested_at")
+    else:
+        assert readable == [] and "finalization_requested_at" not in meta
+        assert meta["silence_attention"]["state"] == "pending_attention"
+        tick(3000.0)  # quiet work is never reaped once no bound holds; drain the notice
+        assert task_id in queue_mod.RUNNING and queue_mod._reap_queue.empty()
+        assert any("finalization condition no longer applies" in text for text in tick.delivered)
+        assert not any("resumed work" in text for text in tick.delivered)
+    if owner_stop:
+        assert meta["finalization_control_msg_id"] == "owner-stop-control"
+        assert ("silence_attention" in meta) is (case != "owner_stop_live")
+    elif case == "lifetime_still_reached":
+        tick(2121.0)  # the bound still holds: its window elapses into the kill
+        assert task_id not in queue_mod.RUNNING
+        assert queue_mod._reap_queue.get_nowait()["terminal_reason"] == "absolute_ceiling"
+
+
+def test_child_settlement_stamps_parent_activity_and_answers_its_silence(
     monkeypatch, tmp_path,
 ):
     """Q5 (slime saga): a coordinator waiting on children was idle-killed 120s
     after its last child DELIVERED its result — delivery did not count as parent
     activity, so the parent died exactly when integration should start. The
-    child's terminal dispatch now stamps the PARENT's own progress, so a parent
-    inside a finalization-grace episode is spared and the episode is withdrawn
-    whole by the EXISTING spare machinery (own progress answers the request)."""
+    child's terminal dispatch now stamps the PARENT's own progress. Silence no
+    longer kills (#1376); that own progress answers the parent's silence episode,
+    which borrowed subtree activity never does."""
     from supervisor import events as events_mod
     from supervisor import queue as queue_mod
 
@@ -571,11 +643,13 @@ def test_child_settlement_stamps_parent_activity_and_withdraws_grace(
     running = {orch: orch_meta, child: child_meta}
     tick = _enforce_harness(monkeypatch, tmp_path, running, grace=120)
 
-    tick(2000.0)  # both idle: the orchestrator's grace episode opens
-    assert orch_meta["finalization_requested_at"] == 2000.0
-    assert len(_live_finalize_controls(tmp_path, orch)) == 1
+    tick(2000.0)  # both idle: the orchestrator's silence episode opens, no grace
+    first = orch_meta["silence_attention"]
+    assert first["state"] == "pending_attention" and first["observed_at"] == 2000.0
+    assert "finalization_requested_at" not in orch_meta
+    assert _live_finalize_controls(tmp_path, orch) == []
 
-    tick(2050.0)  # inside the grace window; also moves the clock the stamp reads
+    tick(2050.0)  # still silent; also moves the clock the stamp reads
     # The child's terminal result is DELIVERED — the settled task_done dispatch.
     ctx = types.SimpleNamespace(
         DRIVE_ROOT=tmp_path, RUNNING=running, PENDING=[], WORKERS={},
@@ -592,13 +666,17 @@ def test_child_settlement_stamps_parent_activity_and_withdraws_grace(
     assert child not in running
     assert orch_meta["last_progress_at"] == 2050.0, "settlement did not stamp the parent"
 
-    tick(2055.0)  # own progress: the episode is withdrawn whole, parent spared
+    tick(2055.0)  # own progress: the same episode is answered, parent spared
     assert orch in queue_mod.RUNNING
+    assert orch_meta["silence_attention"]["episode_id"] == first["episode_id"]
+    assert orch_meta["silence_attention"]["state"] == "progress_observed"
     assert "finalization_requested_at" not in orch_meta
-    assert _live_finalize_controls(tmp_path, orch) == []
 
-    tick(3000.0)  # the stamp is one-shot: a genuinely idle parent still reaches
-    assert orch_meta.get("finalization_requested_at") == 3000.0  # a fresh episode
+    tick(3000.0)  # the stamp is one-shot: a genuinely idle parent gets a fresh episode
+    fresh = orch_meta["silence_attention"]
+    assert fresh["episode_id"] != first["episode_id"] and fresh["state"] == "pending_attention"
+    assert fresh["last_progress_at"] == 2050.0 and fresh["observed_at"] == 3000.0
+    assert orch in queue_mod.RUNNING and _live_finalize_controls(tmp_path, orch) == []
 
 
 def test_provider_outage_root_terminal_notifies_owner_chat(tmp_path):
@@ -798,6 +876,9 @@ def test_cancelling_a_subagent_rescues_its_partial_result(monkeypatch, tmp_path)
     monkeypatch.setattr(
         observability, "latest_llm_response_text", lambda root, tid: "half-written answer",
     )
+    from ouroboros.cancel_intents import request_cancel
+
+    request_cancel(tmp_path, "live-salvage", allow_settled_target=True)
 
     assert q.cancel_task_custody("live-salvage") == q.CANCEL_CANCELLED
     result = load_task_result(tmp_path, "live-salvage")
@@ -858,9 +939,10 @@ def test_salvage_without_a_durable_copy_keeps_everything_in_the_note(tmp_path):
 def test_cancelling_a_subagent_preserves_the_full_output_on_the_canonical_drive(
     monkeypatch, tmp_path,
 ):
-    """End to end through the REAL cancel path: publication deletes the child
-    drive, so the full blob must already have a copy on the canonical drive and
-    the terminal result must point at it (XG-7B.1, BIBLE P1)."""
+    """End to end through the REAL cancel path: the child drive goes later, through the
+    off-loop settlement (``task_custody.settle_child_drive``), so the full blob must already
+    have a copy on the canonical drive and the terminal result must point at it (XG-7B.1,
+    BIBLE P1)."""
     from ouroboros import observability
     from ouroboros.headless import HEADLESS_TASKS_DIR
     from ouroboros.task_results import load_task_result
@@ -902,10 +984,15 @@ def test_cancelling_a_subagent_preserves_the_full_output_on_the_canonical_drive(
         },
     }, raising=False)
     monkeypatch.setattr(q, "_emit_cancel_task_done", lambda *a, **k: None)
+    from ouroboros.cancel_intents import request_cancel
+
+    request_cancel(tmp_path, task_id, allow_settled_target=True)
 
     assert q.cancel_task_custody(task_id) == q.CANCEL_CANCELLED
 
-    assert not child_drive.exists(), "publication no longer deletes the child drive?"
+    from tests._cancel_intents_shared import settled_off_loop
+
+    assert not settled_off_loop(tmp_path, task_id, child_drive), "history remains custodied until background retention"
     result = load_task_result(tmp_path, task_id)
     assert result["status"] == "cancelled"
     assert "full copy preserved at " in result["result"]
@@ -914,6 +1001,11 @@ def test_cancelling_a_subagent_preserves_the_full_output_on_the_canonical_drive(
     )
     assert tmp_path in preserved.parents, "the full copy must live on the canonical drive"
     assert preserved.read_text(encoding="utf-8") == full
+    from ouroboros.headless import retry_child_task_refs
+
+    retry_child_task_refs(tmp_path, child_drive, task_id)
+    assert settled_off_loop(tmp_path, task_id, child_drive)
+    assert not child_drive.exists() and preserved.read_text(encoding="utf-8") == full
 
 
 def test_the_bind_host_is_never_stamped_from_settings_over_the_environment(monkeypatch):
@@ -977,7 +1069,7 @@ def test_start_agent_never_overwrites_an_operator_env_host(monkeypatch, tmp_path
 
 
 def test_an_owner_restart_re_execs_without_the_inherited_runtime_mode_pin(monkeypatch, tmp_path):
-    """The re-exec env is the whole mechanism, so assert on the real env it hands execvpe.
+    """Assert on the environment passed to either platform's transfer primitive.
 
     ``OUROBOROS_BOOT_RUNTIME_MODE`` exists so a CHILD inherits the parent's ratchet
     baseline. Carried across the OWNER's own restart it also pinned the mode the
@@ -996,6 +1088,8 @@ def test_an_owner_restart_re_execs_without_the_inherited_runtime_mode_pin(monkey
         captured["env"] = dict(env)
 
     monkeypatch.setattr(os, "execvpe", _capture_exec)
+    monkeypatch.setattr("ouroboros.process_custody.spawn_supervised",
+                        lambda argv, **kw: _capture_exec(argv[0], argv, kw["env"]))
     monkeypatch.setenv(BOOT_RUNTIME_MODE_ENV_KEY, "light")
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
 

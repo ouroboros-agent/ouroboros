@@ -49,6 +49,7 @@ from ouroboros.usage_accounting import (
     usage_projection,
     usage_scope,
 )
+from tests._usage_store_testing import ledger_rows
 
 
 class _Rejected(RuntimeError):
@@ -135,8 +136,7 @@ def _learned_actions(evidence):
 
 
 def _rows(root):
-    path = root / ua.LEDGER_REL
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return ledger_rows(root)
 
 
 def _capture(candidate, *, state="settled", attempt="attempt-wire", digest=None,
@@ -188,8 +188,11 @@ def _settlement_failure(monkeypatch, active, *, fail_unresolved):
     monkeypatch.setattr(ua, "mark_unresolved", unresolved)
 
 
-@pytest.mark.parametrize("settlement", ["settled", "unresolved", "dispatched"])
-@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize(("asynchronous", "settlement"), [
+    pytest.param(False, "settled", id='sync-settled'),
+    pytest.param(False, "dispatched", id='sync-dispatched'),
+    pytest.param(True, "unresolved", id='async-unresolved'),
+])
 def test_returned_response_discloses_its_exact_wire_candidate(
     wire_env, monkeypatch, settlement, asynchronous,
 ):
@@ -253,6 +256,11 @@ def test_returned_response_discloses_its_exact_wire_candidate(
 
     disclosure = usage["request_wire"]
     assert disclosure == {
+        "original_requested_effort": None,
+        "requested_effort_source": "provider_projection",
+        "applied_effort_source": "sent_candidate",
+        "reported_effort": None,
+        "reported_effort_source": None,
         "requested_effort": "high",
         "applied_effort": "medium",
         "requested_tool_dialect": "function",

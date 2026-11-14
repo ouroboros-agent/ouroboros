@@ -28,7 +28,6 @@ from devtools.benchmarks.cybergym.cybergym_adapter import (
     directory_tree_digest,
     final_poc_record,
     final_submission,
-    official_pin_skip_reason,
     parse_strict_bool,
     pre_admission_report,
     project_budget,
@@ -43,7 +42,7 @@ from devtools.benchmarks.cybergym.cybergym_adapter import (
     verify_mask_map,
 )
 from ouroboros.configured_subagents import parse_configured_subagents
-from ouroboros.reviewer_slot_config import parse_reviewer_slots
+from tests.test_cybergym_benchmark import RETIRED_REVIEW_KEYS
 
 
 def test_safe_ids_and_argv_are_path_safe(tmp_path):
@@ -65,28 +64,29 @@ def test_safe_ids_and_argv_are_path_safe(tmp_path):
     assert all(isinstance(part, str) for part in argv)
 
 
-def test_official_pin_skips_arvo_64622_without_calling_executor(tmp_path):
-    assert official_pin_skip_reason("arvo:64622") == "broken_symlink_official_pin"
-    assert official_pin_skip_reason("arvo:1065") == ""
+def test_arvo_64622_is_dispatched_like_every_pinned_task(tmp_path, monkeypatch):
+    """Its dangling link now extracts, so neither skip call site remains."""
+    from devtools.benchmarks.cybergym.cybergym_executor import CyberGymExecutor, ExecutorFailure
+    from tests.test_cybergym_executor import _config
 
-    called: list[str] = []
+    executor = CyberGymExecutor(_config(tmp_path))
+    started: list[bool] = []
 
-    def boom(task, task_dir):
-        called.append(task.task_id)
-        raise AssertionError("executor must not run a skipped official pin")
+    def start():
+        started.append(True)
+        raise ExecutorFailure("fixture stops after dispatch")
 
+    monkeypatch.setattr(executor, "start", start)
     rows = run_campaign(
-        ["arvo:64622", "arvo:1"],
-        run_root=tmp_path / "pin-skip",
-        executor=boom,
+        ["arvo:64622"],
+        run_root=tmp_path / "run",
+        executor=executor.run_task,
         estimated_cost_usd=1,
         budget_cap_usd=5,
     )
-    assert called == ["arvo:1"]
-    assert rows[0]["task_id"] == "arvo:64622"
-    assert rows[0]["status"] == "infra_failed"
-    assert rows[0]["lifecycle"] == "broken_symlink_official_pin"
-    assert rows[0]["infra_reason"] == "broken_symlink_official_pin"
+    assert started == [True]
+    assert (rows[0]["task_id"], rows[0]["lifecycle"]) == ("arvo:64622", "executor_failed")
+    assert rows[0]["error"] == "fixture stops after dispatch"
 
 
 def test_applied_server_provenance_rewrites_manifest_command(tmp_path):
@@ -393,7 +393,7 @@ def test_launcher_paid_limits_and_immutable_hash_declarations_are_bounded():
         values = dict(
             model=OFFICIAL_MODEL,
             budget_usd=3500.0,
-            timeout_sec=14_400,
+            timeout_sec=21_600,
             max_rounds=200,
             per_task_cost_usd=20.0,
             workers=64,
@@ -411,7 +411,7 @@ def test_launcher_paid_limits_and_immutable_hash_declarations_are_bounded():
 
     for kwargs, message in (
         ({"budget_usd": 3500.01}, "budget_usd"),
-        ({"timeout_sec": 14_401}, "timeout_sec"),
+        ({"timeout_sec": 21_601}, "timeout_sec"),
         ({"max_rounds": 0}, "max_rounds"),
         ({"per_task_cost_usd": 0}, "per_task_cost_usd"),
         ({"per_task_cost_usd": 3500.01}, "per_task_cost_usd"),
@@ -1063,8 +1063,9 @@ def test_applied_settings_metadata_is_read_back_from_written_snapshot(tmp_path):
     assert applied["OUROBOROS_MAX_ROUNDS"] == 1000
     assert applied["OUROBOROS_PER_TASK_COST_USD"] == 20.0
     assert applied["OUROBOROS_MAX_WORKERS"] == 3
-    assert applied["OUROBOROS_REVIEW_MODELS"] == OFFICIAL_MODEL
-    assert applied["OUROBOROS_REVIEW_ENFORCEMENT"] == "advisory"
+    assert not RETIRED_REVIEW_KEYS.intersection(applied)
+    assert not RETIRED_REVIEW_KEYS.intersection(metadata["model_slots"])
+    assert "OUROBOROS_REVIEW_ENFORCEMENT" not in applied, "the retired key is never applied"
     assert applied["OUROBOROS_REVIEW_MAX_CYCLES"] == "2"
     assert applied["OUROBOROS_SAFETY_MODE"] == "off"
     assert applied["OUROBOROS_MAIN_WEB_SEARCH"] == "off"
@@ -1075,14 +1076,11 @@ def test_applied_settings_metadata_is_read_back_from_written_snapshot(tmp_path):
     assert "CLAUDE_CODE_MODEL" not in applied  # retired transport setting
     assert "CLAUDE_AGENT_SDK_MODEL" not in applied  # retired transport setting
     assert applied["OUROBOROS_EFFORT_TASK"] == "high"
-    assert applied["OUROBOROS_EFFORT_REVIEW"] == "max"
-    assert applied["OUROBOROS_EFFORT_SCOPE_REVIEW"] == "max"
     subagents = parse_configured_subagents(applied["OUROBOROS_SUBAGENTS"])
-    assert subagents.enabled is False
-    reviewers = parse_reviewer_slots(applied["OUROBOROS_REVIEWER_SLOTS"])
-    assert len(reviewers.triad) == len(reviewers.scope) == 1
-    assert all(row.effort == "max" for row in (*reviewers.triad, *reviewers.scope))
-    assert reviewers.advisory.enabled is False
+    assert subagents.enabled is False  # delegation off; the review pool ignores that switch
+    [seat] = [row for row in subagents.items if row.review_eligible]
+    assert (seat.route.target_id, seat.effort, seat.delivery) == (OFFICIAL_MODEL, "max", "packet")
+    assert "OUROBOROS_REVIEWER_SLOTS" not in applied
 
 
 @pytest.mark.parametrize(
@@ -1593,3 +1591,30 @@ def test_reconcile_skips_attempts_already_in_result_index(tmp_path):
     assert report["status"] == "nothing_pending"
     assert report["pending_attempts"] == 0
     assert report["already_recorded"] == ["arvo:1"]
+
+
+def test_the_result_review_of_the_measured_task_is_a_supported_recorded_choice(tmp_path):
+    """The runner's own knobs for the measured task's result review (owner, 8 Nov 2026): the stock run keeps it Off;
+    a selected mode and paid-wave ceiling are applied and recorded beside the other applied settings."""
+    from types import SimpleNamespace
+
+    from devtools.benchmarks.cybergym.run_cybergym import (
+        _prepare_applied_settings, _validate_launcher_values, parse_args,
+    )
+
+    stock = parse_args([])
+    assert (stock.task_review_mode, stock.review_max_cycles) == ("off", "2")
+    assert not hasattr(stock, "review_enforcement"), "the retired flag is gone"
+    template = tmp_path / "settings.json"
+    template.write_text("{}", encoding="utf-8")
+    (tmp_path / "run").mkdir()
+    path, metadata = _prepare_applied_settings(template, tmp_path / "run", SimpleNamespace(
+        model=OFFICIAL_MODEL, budget_usd=3500, timeout_sec=4, max_rounds=1000, per_task_cost_usd=20, workers=3,
+        task_review_mode="required", review_max_cycles="Unlimited"))
+    applied = json.loads(path.read_text(encoding="utf-8"))
+    assert (applied["OUROBOROS_TASK_REVIEW_MODE"], applied["OUROBOROS_REVIEW_MAX_CYCLES"]) == ("required", "unlimited")
+    assert "OUROBOROS_REVIEW_ENFORCEMENT" not in applied
+    assert metadata["result_review"] == {"mode": "required", "max_cycles": "unlimited"}
+    bad = parse_args(["--review-max-cycles", "0", "--dry-run"])
+    with pytest.raises(ValueError, match="review_max_cycles"):
+        _validate_launcher_values(bad)

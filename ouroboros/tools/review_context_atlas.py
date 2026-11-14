@@ -8,7 +8,9 @@ them. Bodies are never rendered here; the reviewer opens any path in full with
 
 Two parts, both deterministic and both derived from the same per-file facts:
 
-* the COVERAGE INDEX — one ``disposition<TAB>path`` row for every tracked path,
+* the COVERAGE INDEX — one row for every tracked path: a bare ``path`` for the
+  ordinary ``indexed`` class (the overwhelming majority, so the constant label is
+  not repeated a thousand times), ``disposition<TAB>path`` for every other class,
   with the policy-excluded classes (tests, non-agent-logic directories, binary
   media, vendored/minified files) collapsed to one
   ``disposition<TAB>directory/ (N files)`` row per directory, so the whole tree
@@ -437,7 +439,10 @@ def _render_index_text(
             collapsed[(facts.disposition, "" if parent == "." else parent)] += 1
         else:
             detailed.append((facts.disposition, rel))
-    index_lines = [f"{disposition}\t{rel}" for disposition, rel in sorted(detailed)]
+    # The default class is the whole point of the map, so it is the bare path;
+    # only a non-default class spends a label on its row.
+    index_lines = [rel if disposition == "indexed" else f"{disposition}\t{rel}"
+                   for disposition, rel in sorted(detailed)]
     index_lines += [
         f"{disposition}\t{directory}/ ({count} files)"
         for (disposition, directory), count in sorted(collapsed.items())
@@ -446,25 +451,21 @@ def _render_index_text(
     parts = [
         "## Repository index",
         "",
-        "A deterministic map of this repository: structural facts only, no file "
-        "bodies and no LLM-generated claims. Every path below is on disk in the "
-        "candidate tree — read any of them in full with your own `read_file`.",
+        "Candidate structural facts; bodies via `read_file`.",
         "",
         "### Coverage index",
         "",
-        f"All {len(facts_by_path):,} tracked path(s) as `disposition<TAB>path`. "
-        "The policy-excluded classes (excluded_test, excluded_dir, binary_media, "
-        "vendored_minified) are collapsed to one `disposition<TAB>directory/ (N "
-        "files)` row per directory; a touched path and a listed importer always "
-        "keep their own row.",
+        f"{len(facts_by_path):,} tracked paths: bare = readable `indexed`; else "
+        "`disposition<TAB>path`. excluded_test/excluded_dir/binary_media/"
+        "vendored_minified collapse to directory/count rows, except touched "
+        "paths and listed importers. Read any path; this is not an access filter.",
         "",
         format_prompt_code_block("\n".join(index_lines), "text"),
         "",
         "### Touched paths",
         "",
-        "Size, digest, language, top-level symbols, imported modules, and the "
-        f"tracked files that import each path (at most {INDEX_MAX_TOUCHED_IMPORTERS} "
-        "listed, with the total disclosed).",
+        "Size/SHA/language, top-level symbols, imports, tracked importers "
+        f"(limit {INDEX_MAX_TOUCHED_IMPORTERS}; totals disclosed).",
         "",
         "\n".join(_render_row(row) for row in touched_rows) or "(no touched paths)",
         "",
@@ -482,3 +483,15 @@ def _normalize_path(path: str) -> str:
     while cleaned.startswith("./"):
         cleaned = cleaned[2:]
     return pathlib.PurePosixPath(cleaned).as_posix() if cleaned else ""
+
+
+def index_material() -> list:
+    """Review-contract material (``commit_gate.commit_review_contract_fingerprint``): the index's frame over
+    placeholder facts, empty and filled, and one touched row with and without importers. Paths, sizes, symbols and
+    counts are data."""
+    row = {"path": "⟨path⟩", "size": 1, "language": "⟨language⟩", "sha256": "⟨sha⟩", "disposition": "⟨disposition⟩",
+           "symbols": ["⟨symbol⟩"], "symbols_total": 2, "imports": ["⟨module⟩"], "imports_total": 2}
+    facts = {"⟨path⟩": _FileFacts("⟨path⟩"), "⟨dir⟩/⟨file⟩": _FileFacts("⟨dir⟩/⟨file⟩", disposition="excluded_dir")}
+    return [_render_index_text({}, detail_paths=set(), touched_rows=[], importer_rows=[]),
+            _render_index_text(facts, detail_paths=set(), touched_rows=[row],
+                               importer_rows=[{**row, "imported_by": ["⟨path⟩"], "imported_by_total": 2}])]

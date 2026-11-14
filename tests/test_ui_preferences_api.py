@@ -1,4 +1,5 @@
 from __future__ import annotations
+from tests._dialogue import advance_room_revision
 
 import asyncio
 import json
@@ -14,7 +15,7 @@ from ouroboros.gateway.router import collect_routes
 def test_ui_preferences_round_trip_and_normalization(tmp_path):
     from starlette.testclient import TestClient
 
-    from ouroboros.projects_registry import create_project, increment_project_visible_revision
+    from ouroboros.projects_registry import create_project
 
     app = Starlette(routes=collect_routes(data_dir=tmp_path))
     app.state.drive_root = tmp_path
@@ -22,19 +23,26 @@ def test_ui_preferences_round_trip_and_normalization(tmp_path):
         initial = client.get("/api/ui/preferences")
         assert initial.status_code == 200
         assert initial.json() == {
+            "voice": {"stt": "", "tts": "", "tts_voice": ""},
+            "contributions": {"hidden": [], "order": []},
             "widget_order": [],
             "widget_start_mode": {},
+            "widget_size": {},
             "nested_subagents_expanded": False,
             "sidebar_width": 0,
             "project_panel_width": 0,
             "project_seen_revision": {},
+            "main_seen_revision": None,
+            "read_ahead_revisions": {},
+            "welcome": {"mode": "default", "text": ""},
+            "model_recents": [],
         }
 
         create_project(tmp_path, "racer", name="Racer")
         create_project(tmp_path, "site", name="Site")
-        increment_project_visible_revision(tmp_path, project_id="racer")
-        increment_project_visible_revision(tmp_path, project_id="racer")
-        increment_project_visible_revision(tmp_path, project_id="site")
+        advance_room_revision(tmp_path, project_id="racer")
+        advance_room_revision(tmp_path, project_id="racer")
+        advance_room_revision(tmp_path, project_id="site")
 
         # Paint ACKs merge monotonically. A future value is clamped to the current
         # visible revision; stale tabs cannot move a cursor backwards.
@@ -122,14 +130,105 @@ def test_ui_preferences_round_trip_and_normalization(tmp_path):
         assert client.post("/api/ui/preferences", json={"project_seen_revision": {"racer": "bad"}}).status_code == 400
         assert client.post("/api/ui/preferences", json={"unknown": True}).status_code == 400
 
+        # The interface language is an install-wide SETTING (OUROBOROS_UI_LANGUAGE via
+        # /api/ui/i18n/language), never a UI preference: here it is an unknown key.
+        assert client.post("/api/ui/preferences", json={"language": "ru"}).status_code == 400
+        assert "language" not in client.get("/api/ui/preferences").json()
+
+
+def test_empty_chat_welcome_preference_round_trip_and_refusals(tmp_path):
+    from starlette.testclient import TestClient
+
+    app = Starlette(routes=collect_routes(data_dir=tmp_path))
+    app.state.drive_root = tmp_path
+    with TestClient(app) as client:
+        assert client.get("/api/ui/preferences").json()["welcome"] == {"mode": "default", "text": ""}
+        custom = {"mode": "custom", "text": "Привет <b>мир</b>\nagain"}
+        response = client.post("/api/ui/preferences", json={"welcome": custom})
+        assert response.status_code == 200
+        assert response.json()["welcome"] == custom
+        assert client.get("/api/ui/preferences").json()["welcome"] == custom
+        for invalid in ({"mode": "custom", "text": "  "}, {"mode": "custom", "text": "x" * 501},
+                        {"mode": "other", "text": "x"}, {"mode": "custom"}, None):
+            assert client.post("/api/ui/preferences", json={"welcome": invalid}).status_code == 400
+            assert client.get("/api/ui/preferences").json()["welcome"] == custom
+        hidden = {"mode": "hidden", "text": custom["text"]}
+        assert client.post("/api/ui/preferences", json={"welcome": hidden}).json()["welcome"] == hidden
+        assert client.post("/api/ui/preferences", json={"widget_order": ["skill:x"]}).json()["welcome"] == hidden
+        default = {"mode": "default", "text": custom["text"]}
+        assert client.post("/api/ui/preferences", json={"welcome": default}).json()["welcome"] == default
+
+
+def test_hand_edited_welcome_is_read_without_disturbing_other_keys(tmp_path):
+    """`welcome` has no Settings control: the owner edits the file (docs/DESIGN.md)."""
+    from starlette.testclient import TestClient
+
+    app = Starlette(routes=collect_routes(data_dir=tmp_path))
+    app.state.drive_root = tmp_path
+    path = tmp_path / "state" / "ui_preferences.json"
+    path.parent.mkdir(parents=True)
+    with TestClient(app) as client:
+        for welcome in ({"mode": "hidden", "text": ""}, {"mode": "custom", "text": "Доброе утро"},
+                        {"mode": "default", "text": ""}):
+            path.write_text(json.dumps({"sidebar_width": 300, "welcome": welcome}), encoding="utf-8")
+            prefs = client.get("/api/ui/preferences").json()
+            assert prefs["welcome"] == welcome and prefs["sidebar_width"] == 300
+        # A value the POST contract refuses reads as the default instead of resetting every
+        # other key, and cannot block their writes; the next write stores the default.
+        for invalid in ({"mode": "Hidden", "text": ""}, {"mode": "custom", "text": " "},
+                        {"mode": "custom", "text": "x" * 501}, {"mode": "custom"},
+                        {"mode": "hidden", "text": "", "extra": 1}, "hidden", None):
+            path.write_text(json.dumps({"sidebar_width": 300, "welcome": invalid}), encoding="utf-8")
+            prefs = client.get("/api/ui/preferences").json()
+            assert prefs["welcome"] == {"mode": "default", "text": ""} and prefs["sidebar_width"] == 300
+        response = client.post("/api/ui/preferences", json={"nested_subagents_expanded": True})
+        assert response.status_code == 200 and response.json()["sidebar_width"] == 300
+        stored = json.loads(path.read_text(encoding="utf-8"))
+        assert stored["welcome"] == {"mode": "default", "text": ""} and stored["nested_subagents_expanded"] is True
+
+
+def test_welcome_text_with_a_lone_surrogate_is_refused_and_read_as_default(tmp_path):
+    """JSON's "\\ud800" escape parses to a str UTF-8 cannot encode; it never reaches a response or the file."""
+    from starlette.testclient import TestClient
+
+    app = Starlette(routes=collect_routes(data_dir=tmp_path))
+    app.state.drive_root = tmp_path
+    path = tmp_path / "state" / "ui_preferences.json"
+    path.parent.mkdir(parents=True)
+    lone = {"mode": "custom", "text": "Hello \ud800 there"}
+    # json.dumps escapes non-ASCII, so the file carries the astral emoji as a "🌅" pair.
+    normal = {"mode": "custom", "text": "Доброе утро 🌅 中文"}
+    with TestClient(app) as client:
+        path.write_text(json.dumps({"sidebar_width": 300, "welcome": normal}), encoding="utf-8")
+        assert client.get("/api/ui/preferences").json()["welcome"] == normal
+        response = client.post("/api/ui/preferences", json={"welcome": normal})
+        assert response.status_code == 200 and response.json()["welcome"] == normal
+        stored = path.read_bytes()
+        response = client.post("/api/ui/preferences", content=json.dumps({"welcome": lone}),
+                               headers={"Content-Type": "application/json"})
+        assert response.status_code == 400
+        assert response.json()["error"] == "welcome text must be valid Unicode"
+        assert path.read_bytes() == stored
+        # A hand edit carrying one reads as the default without costing the other keys,
+        # and an unrelated write succeeds and stores the default.
+        path.write_text(json.dumps({"sidebar_width": 300, "welcome": lone}), encoding="utf-8")
+        prefs = client.get("/api/ui/preferences").json()
+        assert prefs["welcome"] == {"mode": "default", "text": ""} and prefs["sidebar_width"] == 300
+        response = client.post("/api/ui/preferences", json={"nested_subagents_expanded": True})
+        assert response.status_code == 200, response.text
+        assert response.json()["sidebar_width"] == 300
+        stored = json.loads(path.read_text(encoding="utf-8"))
+        assert stored["welcome"] == {"mode": "default", "text": ""}
+        assert stored["sidebar_width"] == 300 and stored["nested_subagents_expanded"] is True
+
 
 def test_ui_preferences_concurrent_paint_acks_are_monotonic(tmp_path):
     from ouroboros.gateway.ui_preferences import api_ui_preferences_post
-    from ouroboros.projects_registry import create_project, increment_project_visible_revision
+    from ouroboros.projects_registry import create_project
 
     create_project(tmp_path, "race", name="Race")
     for _ in range(5):
-        increment_project_visible_revision(tmp_path, project_id="race")
+        advance_room_revision(tmp_path, project_id="race")
     barrier = threading.Barrier(2)
 
     def _post(revision: int) -> int:
@@ -205,3 +304,160 @@ def test_ui_preferences_widget_start_mode_override(tmp_path):
         kept = bounded.json()["widget_start_mode"]
         assert len(kept) == 200
         assert all(many[key] == mode for key, mode in kept.items())
+
+
+def test_ui_preferences_widget_size_merges_by_card_and_clamps(tmp_path):
+    """Owner Widgets card sizes: a POST merges by card key and null deletes one,
+    widths clamp to the 12-column board (0: the author's span), heights to their
+    bounds (0: as tall as the content), a size with neither is none, keys are
+    never checked against live widgets, the map is bounded, and there is no
+    conditional write: the last write wins, like widget_order."""
+    from starlette.testclient import TestClient
+
+    app = Starlette(routes=collect_routes(data_dir=tmp_path))
+    app.state.drive_root = tmp_path
+    with TestClient(app) as client:
+        def sizes():
+            return client.get("/api/ui/preferences").json()["widget_size"]
+
+        assert sizes() == {}
+        first = client.post("/api/ui/preferences", json={"widget_size": {
+            "game:main": {"w": 12, "h": 0}, "gone_skill:old": {"w": 6, "h": 0},
+        }})
+        assert first.status_code == 200
+        assert first.json()["widget_size"] == {"game:main": {"w": 12, "h": 0}, "gone_skill:old": {"w": 6, "h": 0}}
+        # Merge: a write names only the card it changes; the others stay.
+        second = client.post("/api/ui/preferences", json={"widget_size": {"gauge:live": {"w": 4}}})
+        assert second.json()["widget_size"] == {
+            "game:main": {"w": 12, "h": 0}, "gone_skill:old": {"w": 6, "h": 0}, "gauge:live": {"w": 4, "h": 0},
+        }
+        # A null value deletes one key (the card falls back to its author span).
+        assert client.post("/api/ui/preferences", json={"widget_size": {"gone_skill:old": None}}).json()["widget_size"] == {
+            "game:main": {"w": 12, "h": 0}, "gauge:live": {"w": 4, "h": 0},
+        }
+        # Other keys leave the sizes alone, and a size write leaves the order alone.
+        assert client.post("/api/ui/preferences", json={"widget_order": ["gauge:live", "game:main"]}).json()["widget_size"] == sizes()
+        assert client.post("/api/ui/preferences", json={"widget_size": {"game:main": {"w": 8, "h": 0}}}).json()["widget_order"] == [
+            "gauge:live", "game:main",
+        ]
+        # The file is the store: a revisit (and a restart) reads the same widths back.
+        stored = json.loads((tmp_path / "state" / "ui_preferences.json").read_text(encoding="utf-8"))
+        assert stored["widget_size"] == {"game:main": {"w": 8, "h": 0}, "gauge:live": {"w": 4, "h": 0}}
+
+        # Out-of-range widths clamp to 0..12 and heights to 120..8192 (0 stays natural); a size
+        # with neither axis is none; keys are trimmed; blank and oversized keys and extra
+        # fields are dropped.
+        clamped = client.post("/api/ui/preferences", json={"widget_size": {
+            " wide:card ": {"w": 99, "h": 640, "x": 3}, "tiny:card": {"w": -5}, "short:card": {"w": 0, "h": 40},
+            "tall:card": {"w": 2, "h": 99999}, "": {"w": 4}, "x" * 201: {"w": 4},
+        }})
+        assert clamped.status_code == 200
+        stored_sizes = clamped.json()["widget_size"]
+        assert {key: stored_sizes[key] for key in ("wide:card", "short:card", "tall:card")} == {
+            "wide:card": {"w": 12, "h": 640}, "short:card": {"w": 0, "h": 120}, "tall:card": {"w": 2, "h": 8192},
+        }
+        assert "tiny:card" not in stored_sizes, "no width and no height is no size"
+        assert "" not in stored_sizes and "x" * 201 not in stored_sizes
+
+        # The axes are independent writes of one card: a height alone keeps the author's width,
+        # a later width keeps the height, and a size with neither deletes the card's entry.
+        assert client.post("/api/ui/preferences", json={"widget_size": {"axes:card": {"w": 0, "h": 432}}}).json()[
+            "widget_size"]["axes:card"] == {"w": 0, "h": 432}
+        assert client.post("/api/ui/preferences", json={"widget_size": {"axes:card": {"w": 3, "h": 432}}}).json()[
+            "widget_size"]["axes:card"] == {"w": 3, "h": 432}
+        assert "axes:card" not in client.post("/api/ui/preferences", json={"widget_size": {
+            "axes:card": {"w": 0, "h": 0}}}).json()["widget_size"]
+
+        # Any other shape is a 400 and stores nothing; the PR-era condition key is unknown.
+        before = sizes()
+        for bad in (
+            {"widget_size": ["game:main"]},
+            {"widget_size": "wide"},
+            {"widget_size": {"game:main": [4, 0]}},
+            {"widget_size": {"game:main": {"h": 0}}},
+            {"widget_size": {"game:main": {"w": "4"}}},
+            {"widget_size": {"game:main": {"w": 4.5}}},
+            {"widget_size": {"game:main": {"w": True}}},
+            {"widget_size": {"game:main": {"w": 4, "h": None}}},
+            {"widget_sizes": {}},
+            {"widget_size": {"game:main": {"w": 4}}, "widget_layout_if": {}},
+        ):
+            assert client.post("/api/ui/preferences", json=bad).status_code == 400, bad
+        assert sizes() == before
+
+        # A null map clears every width.
+        assert client.post("/api/ui/preferences", json={"widget_size": None}).json()["widget_size"] == {}
+        # Bounded at 200 keys; the most recently changed cards are the ones kept.
+        many = {f"skill:{i}": {"w": 4, "h": 0} for i in range(250)}
+        bounded = client.post("/api/ui/preferences", json={"widget_size": many})
+        assert list(bounded.json()["widget_size"]) == list(many)[:200]
+        newest = client.post("/api/ui/preferences", json={"widget_size": {"late:card": {"w": 6}}}).json()["widget_size"]
+        assert len(newest) == 200
+        assert list(newest)[-1] == "late:card" and "skill:0" not in newest
+
+
+def test_corrupt_stored_preferences_read_as_defaults(tmp_path):
+    """The preferences file is shared (project read cursors, panel widths, the
+    empty-Main welcome); a corrupt one reads as defaults instead of failing the
+    whole surface, and the next write replaces it."""
+    from starlette.testclient import TestClient
+
+    app = Starlette(routes=collect_routes(data_dir=tmp_path))
+    app.state.drive_root = tmp_path
+    path = tmp_path / "state" / "ui_preferences.json"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b'{"widget_size":')
+    with TestClient(app) as client:
+        read = client.get("/api/ui/preferences")
+        assert read.status_code == 200
+        assert read.json()["widget_size"] == {} and read.json()["sidebar_width"] == 0
+        written = client.post("/api/ui/preferences", json={"widget_size": {"game:main": {"w": 6, "h": 0}}})
+        assert written.status_code == 200
+        assert json.loads(path.read_text(encoding="utf-8"))["widget_size"] == {"game:main": {"w": 6, "h": 0}}
+
+
+def test_widget_board_bounds_have_one_value_in_python_and_the_browser():
+    """The server clamps with the bounds the browser normalizes with; its bound of `w` is Full width."""
+    import re
+    from pathlib import Path
+
+    from ouroboros.gateway import ui_preferences as prefs
+
+    source = (Path(__file__).resolve().parent.parent / "web" / "modules" / "widget_size.js").read_text(encoding="utf-8")
+
+    def js(name: str) -> int:
+        match = re.search(rf"export const {name} = (\d+);", source)
+        assert match, name
+        return int(match.group(1))
+
+    assert js("WIDGET_FULL_SPAN") == prefs.WIDGET_GRID_COLUMNS
+    assert js("WIDGET_SIZE_MAX_ITEMS") == prefs._MAX_WIDGET_SIZE_ITEMS
+    assert js("WIDGET_HEIGHT_MIN") == prefs.WIDGET_HEIGHT_MIN
+    assert js("WIDGET_HEIGHT_MAX") == prefs.WIDGET_HEIGHT_MAX
+
+
+def test_model_recents_are_bounded_deduplicated_and_server_written(tmp_path):
+    from starlette.testclient import TestClient
+    from ouroboros.gateway.ui_preferences import record_model_recent
+
+    app = Starlette(routes=collect_routes(data_dir=tmp_path))
+    app.state.drive_root = tmp_path
+    client = TestClient(app)
+    assert client.post("/api/ui/preferences", json={"sidebar_width": 250}).status_code == 200
+    for index in range(6):
+        record_model_recent(tmp_path, f"vendor/model-{index}")
+    expected = [{"model": f"vendor/model-{index}", "use_local": False} for index in (5, 4, 3, 2)]
+    assert client.get("/api/ui/preferences").json()["model_recents"] == expected
+    record_model_recent(tmp_path, "vendor/model-3")
+    expected = [expected[2], expected[0], expected[1], expected[3]]
+    assert client.get("/api/ui/preferences").json()["model_recents"] == expected
+    # Locality is part of route identity; both choices stay visible.
+    record_model_recent(tmp_path, "vendor/model-3", True)
+    expected = [{"model": "vendor/model-3", "use_local": True}, *expected[:3]]
+    before = (tmp_path / "state/ui_preferences.json").read_bytes()
+    for value in ([], expected, "invalid"):
+        assert client.post("/api/ui/preferences", json={"model_recents": value}).status_code == 400
+        assert (tmp_path / "state/ui_preferences.json").read_bytes() == before
+    assert client.post("/api/ui/preferences", json={"nested_subagents_expanded": True}).status_code == 200
+    result = client.get("/api/ui/preferences").json()
+    assert result["model_recents"] == expected and result["sidebar_width"] == 250

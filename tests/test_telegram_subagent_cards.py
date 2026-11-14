@@ -21,12 +21,20 @@ class _Api:
 
 
 class _Rec:
+    bot_id = ""
     sent = []; edited = []; _id = [1000]
-    def __init__(self, token, **_kwargs): pass
-    async def send_message(self, chat_id, text, parse_mode="HTML"):
-        _Rec._id[0] += 1; _Rec.sent.append((chat_id, text, parse_mode, _Rec._id[0])); return _Rec._id[0]
+    muted = []
+    def __init__(self, token, **kwargs): self.on_message = kwargs.get("on_message")
+    async def send_message(self, chat_id, text, parse_mode="HTML", *, disable_notification=False):
+        _Rec._id[0] += 1; _Rec.sent.append((chat_id, text, parse_mode, _Rec._id[0]))
+        if disable_notification:
+            _Rec.muted.append(_Rec._id[0])
+        if self.on_message: self.on_message(chat_id, _Rec._id[0])
+        return _Rec._id[0]
     async def edit_message_text(self, chat_id, message_id, text, parse_mode="HTML"):
-        _Rec.edited.append((chat_id, message_id, text, parse_mode)); return True
+        _Rec.edited.append((chat_id, message_id, text, parse_mode))
+        if self.on_message: self.on_message(chat_id, message_id)
+        return True
     async def send_chat_action(self, chat_id, action="typing"): pass
 
 
@@ -37,16 +45,20 @@ def _setup(tmp_path, monkeypatch, **settings):
     (sd / "settings.json").write_text(json.dumps(base), encoding="utf-8")
     monkeypatch.setattr(plugin, "TelegramClient", _Rec)
     _Rec.sent = []; _Rec.edited = []; _Rec._id = [1000]
+    _Rec.muted = []
     return plugin, _Api(sd)
 
 
-def test_subagent_gets_one_edited_bubble(tmp_path, monkeypatch):
-    plugin, api = _setup(tmp_path, monkeypatch)
+@pytest.mark.parametrize("silent", ["off", "on"])
+def test_subagent_gets_one_edited_bubble(tmp_path, monkeypatch, silent):
+    plugin, api = _setup(tmp_path, monkeypatch, TELEGRAM_SILENT_MODE=silent)
     handle = plugin._make_outbound(api)
     asyncio.run(handle({"text": "Subagent abc scheduled (researcher)", "is_progress": True,
                         "subagent_event": "scheduled", "subagent_task_id": "abc123", "subagent_role": "researcher"}))
     assert len(_Rec.sent) == 1 and not _Rec.edited
     first_id = _Rec.sent[0][3]
+    # A helper's card is technical progress: Silent mode sends it without sound.
+    assert _Rec.muted == ([first_id] if silent == "on" else [])
     asyncio.run(handle({"text": "Subagent abc completed (researcher)", "is_progress": True,
                         "subagent_event": "completed", "subagent_task_id": "abc123", "subagent_role": "researcher", "cost_usd": 0.04}))
     assert len(_Rec.sent) == 1                       # NO second message
@@ -68,6 +80,49 @@ def test_mirror_progress_off_gates_firehose(tmp_path, monkeypatch):
     assert not _Rec.sent and not _Rec.edited         # explicit opt-out drops it
 
 
+@pytest.mark.parametrize("mirror", ["off", "on"])
+def test_a_cards_placed_row_is_a_progress_note_here(tmp_path, monkeypatch, mirror):
+    """The web shows a card's host rows inside the task card; this transport has none, so a
+    root's own placed row (a late review settlement, a custody note) follows the owner's
+    progress toggle. A child's row still waits for its root, toggle or not."""
+    plugin, api = _setup(tmp_path, monkeypatch, TELEGRAM_MIRROR_PROGRESS=mirror)
+    handle = plugin._make_outbound(api)
+    row = {"text": "Reviewers rejected the answer after it was delivered.", "role": "system",
+           "system_type": "acceptance_late_settlement", "card_row": "reviews", "task_id": "root-1"}
+    asyncio.run(handle(row))
+    child = {**row, "delegation_role": "subagent", "root_task_id": "root-done"}
+    asyncio.run(handle(child))  # its root's outcome is unreadable: the row waits
+    assert [sent[1] for sent in _Rec.sent] == ([row["text"]] if mirror == "on" else [])
+    # Once the root has finished, a child's late row goes as it always did, toggle or not.
+    from ouroboros.task_results import task_result_path
+
+    data = tmp_path / "data"
+    api.get_runtime_info = lambda: {"data_dir": str(data)}
+    task_result_path(data, "root-done").write_text(json.dumps({"status": "completed"}), encoding="utf-8")
+    _Rec.sent = []
+    asyncio.run(handle(child))
+    assert [sent[1] for sent in _Rec.sent] == [row["text"]]
+
+
+@pytest.mark.parametrize("mirror", [None, "off", "on"])
+def test_wrap_up_receipt_row_goes_while_other_card_rows_follow_the_toggle(tmp_path, monkeypatch, mirror):
+    """#1564: the host types Wrap up's saved-work row as a terminal receipt, so it reaches
+    this chat with progress mirroring off; an untyped custody row and progress do not."""
+    plugin, api = _setup(tmp_path, monkeypatch, **({} if mirror is None else {"TELEGRAM_MIRROR_PROGRESS": mirror}))
+    handle = plugin._make_outbound(api)
+    row = {"role": "system", "system_type": "custody_notice", "card_row": "timeline", "task_id": "root-1"}
+    receipt = {**row, "text": "Work saved at Wrap up:\n- Subtask kid (Stopped): its text is saved",
+               "card_row_id": "cascade:root-1:ci_1:retained_work", "terminal_receipt": "retained_work"}
+    custody = {**row, "text": "Open delegated execution: run-x.", "card_row_id": "final:root-1:abc:custody_notice"}
+    for event in (receipt, custody, {"text": "Thinking...", "is_progress": True}):
+        asyncio.run(handle(event))
+    sent = [entry[1] for entry in _Rec.sent]
+    assert sent[0] == receipt["text"]
+    assert (custody["text"] in sent) is (mirror == "on")
+    if mirror != "on":
+        assert sent == [receipt["text"]]
+
+
 def test_real_reply_is_sent(tmp_path, monkeypatch):
     plugin, api = _setup(tmp_path, monkeypatch)
     handle = plugin._make_outbound(api)
@@ -75,9 +130,16 @@ def test_real_reply_is_sent(tmp_path, monkeypatch):
     assert len(_Rec.sent) == 1 and "answer" in _Rec.sent[0][1]
 
 
-@pytest.mark.parametrize("silent", [None, "off", "on"], ids=["default", "off", "on"])
-def test_terminal_host_notice_preserves_answer_and_silent_reply_chain(tmp_path, monkeypatch, silent):
-    """The real split delivery keeps both authors' text through Telegram's edit mode."""
+@pytest.mark.parametrize(("silent", "notify"), [
+    pytest.param(None, "off", id='default-off'),
+    ("off", "on"),
+    ("on", "off"),
+])
+def test_a_terminal_answer_reaches_telegram_alone_and_keeps_every_reply(tmp_path, monkeypatch, silent, notify):
+    """The real terminal delivery sends the model's answer alone, as its own message: the
+    host notice stays a field of the result and never becomes a second message, and
+    Silent mode mutes the replies without replacing any of them; additional completion
+    notices have their own opt-in toggle."""
     from collections import deque
     import queue
 
@@ -87,7 +149,9 @@ def test_terminal_host_notice_preserves_answer_and_silent_reply_chain(tmp_path, 
     from supervisor import events_chat_delivery as delivery, message_bus
     from supervisor.terminal_delivery import pending_deliveries
 
-    settings = {} if silent is None else {"TELEGRAM_SILENT_MODE": silent}
+    settings = {"TELEGRAM_NOTIFY_TASKS": notify}
+    if silent is not None:
+        settings["TELEGRAM_SILENT_MODE"] = silent
     plugin, api = _setup(tmp_path, monkeypatch, **settings)
     handle = plugin._make_outbound(api)
     published, frames = [], []
@@ -101,7 +165,6 @@ def test_terminal_host_notice_preserves_answer_and_silent_reply_chain(tmp_path, 
     monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
     monkeypatch.setattr(message_bus, "get_bridge", lambda: bridge)
     monkeypatch.setattr(message_bus, "load_state", lambda: {"owner_id": 7})
-    monkeypatch.setattr(message_bus, "_advance_project_visible_revision", lambda _chat: None)
     monkeypatch.setattr(message_bus, "publish_event", publish)
     monkeypatch.setattr(delivery, "_DELIVERED_MESSAGE_IDS", deque(maxlen=256))
     host = types.SimpleNamespace(DRIVE_ROOT=tmp_path, RUNNING={}, append_jsonl=append_jsonl,
@@ -113,18 +176,19 @@ def test_terminal_host_notice_preserves_answer_and_silent_reply_chain(tmp_path, 
                                      drive_logs=lambda: tmp_path / "logs")
     ongoing = ["I found the source.", "I am checking the result."]
     for text in ongoing:
-        assert "sent to owner chat" in _send_user_message(tool_ctx, text)
+        assert "accepted for delivery to owner chat" in _send_user_message(tool_ctx, text)
         delivery._handle_send_message(events.get_nowait(), host)
     assert not tool_ctx.pending_events
     assert all(row["system_type"] == "proactive_message" for row in published)
     assert all("task_terminal_status" not in row for row in published)
-    assert len(_Rec.edited) == (1 if silent == "on" else 0)
+    assert _Rec.edited == []
 
     answer, notice = "Complete model answer: λ", "Plan review stayed open; inspect the task details."
     event = prepare_terminal_send_event(tmp_path, task, answer, {
         "terminal_origin": "model_final", "terminal_host_notice": notice,
     }, {"type": "send_message", "task_id": task["id"], "chat_id": 1,
         "text": answer, "log_text": answer, "format": "markdown"}, presence=False)
+    assert "terminal_host_notice" not in event
     register_final_answer_owed(task, event, env_drive_root=tmp_path)
     delivery_id = event["delivery_id"]
     delivery._handle_send_message(event, host)
@@ -133,24 +197,81 @@ def test_terminal_host_notice_preserves_answer_and_silent_reply_chain(tmp_path, 
     assert sent_counts == (len(_Rec.sent), len(_Rec.edited), len(published))
     assert event["text"] == event["log_text"] == answer and event["delivery_id"] == delivery_id
     assert [(row["role"], row["content"]) for row in frames] == [
-        *(('assistant', text) for text in ongoing), ('assistant', answer), ('system', notice),
+        *(('assistant', text) for text in ongoing), ('assistant', answer),
     ]
     assert pending_deliveries(tmp_path) == []
     visible = {row[3]: row[1] for row in _Rec.sent}
-    for _chat, message_id, text, _format in _Rec.edited:
-        visible[message_id] = text
-    assert list(visible.values()) == ([answer, notice] if silent == "on" else [*ongoing, answer, notice])
-    if silent == "on":
-        # The system notice neither overwrites nor takes ownership of the normal edit chain.
-        assert plugin._get_silent_msg(api, 42) == _Rec.sent[0][3]
-        delivery._handle_send_message({"type": "send_message", "chat_id": 1,
-                                       "text": "Separate host receipt", "role": "system",
-                                       "system_type": "terminal_incident"}, host)
-        receipt_id = _Rec.sent[-1][3]
-        assert "sent to owner chat" in _send_user_message(tool_ctx, "A later ongoing reply.")
-        delivery._handle_send_message(events.get_nowait(), host)
-        assert _Rec.edited[-1][1:3] == (_Rec.sent[0][3], "A later ongoing reply.")
-        assert all(row[1] != receipt_id for row in _Rec.edited)
+    assert list(visible.values()) == [*ongoing, answer]
+    assert all(notice not in text for text in visible.values())
+    assert _Rec.muted == (list(visible) if silent == "on" else [])
+    # A host notice keeps its sound and a later reply is again its own message.
+    delivery._handle_send_message({"type": "send_message", "chat_id": 1,
+                                   "text": "Separate host receipt", "role": "system",
+                                   "system_type": "terminal_incident"}, host)
+    receipt_id = _Rec.sent[-1][3]
+    assert receipt_id not in _Rec.muted
+    assert "accepted for delivery to owner chat" in _send_user_message(tool_ctx, "A later ongoing reply.")
+    delivery._handle_send_message(events.get_nowait(), host)
+    assert _Rec.sent[-1][1] == "A later ongoing reply." and _Rec.edited == []
+    assert plugin._get_silent_msg(api, "", 42) == 0
+
+
+def test_routing_refusal_speaks_in_the_third_person(tmp_path, monkeypatch):
+    """astra A-miss1: the mirror's routing refusal names no narrator."""
+    plugin, api = _setup(tmp_path, monkeypatch)
+    handle = plugin._make_outbound(api)
+    asyncio.run(handle({"annotation_type": "routing_ack", "status": "needs_manual_target",
+                        "options": [{"task_id": "t1", "label": "Fix the parser"}]}))
+    (message,) = [row[1] for row in _Rec.sent]
+    lines = message.splitlines()
+    assert lines[0] == "Choose a target for the last message:"
+    assert "1. Fix the parser" in lines
+    assert not any(line.startswith("I ") for line in lines) and "I couldn't" not in message
+
+
+@pytest.mark.parametrize("silent", ["off", "on"])
+def test_a_landed_receipt_stays_silent_unless_a_file_was_not_attached(tmp_path, monkeypatch, silent):
+    """A landed act publishes nothing here either; only a file the host could not attach earns one
+    plain line, sent fresh: it never edits or takes over silent mode's tracked answer."""
+    plugin, api = _setup(tmp_path, monkeypatch, TELEGRAM_SILENT_MODE=silent)
+    plugin._set_silent_msg(api, "", 42, 555)
+    handle = plugin._make_outbound(api)
+    ack = {"annotation_type": "routing_ack", "status": "delivered", "action": "steer_task", "target": "t1",
+           "attachment_manifest": [{"ordinal": 0, "label": "a.png", "status": "staged"}]}
+    asyncio.run(handle(ack))
+    assert _Rec.sent == []
+    ack["attachment_manifest"].append({"ordinal": 1, "label": "b.pdf", "status": "rejected", "reason": "source_missing"})
+    asyncio.run(handle(ack))
+    assert [(row[1], row[2]) for row in _Rec.sent] == [("Not attached to the task: b.pdf", "")]
+    assert _Rec.edited == [] and plugin._get_silent_msg(api, "", 42) == 555
+
+
+def test_the_not_attached_line_speaks_the_install_language(tmp_path, monkeypatch):
+    """The bridge composes these lines itself (the not-attached line and the picker's own lines), so
+    one message reads its own text table in the install's language; target labels and file names
+    stay as the host and the owner gave them."""
+    from ouroboros import i18n_memory as memory
+
+    plugin, api = _setup(tmp_path, monkeypatch)
+    data = tmp_path / "data"
+    plugin.telegram_i18n.configure(data)
+    monkeypatch.setenv("OUROBOROS_UI_LANGUAGE", "ru")
+    memory.update_memory(data, "ru", lambda doc: (memory.apply_generated(doc, {
+        "code:tg.menu.attachments_not_attached": {"text": "Не приложено к задаче: {names}"},
+        "code:tg.menu.routing_choose_target": {"text": "Куда отправить последнее сообщение:"},
+        "code:tg.menu.routing_more_targets": {"text": "…и ещё {count} в веб-чате."},
+        "code:tg.menu.routing_reply_with_number": {"text": "Ответьте номером или выберите вариант в веб-чате."},
+    }, model="test"), doc)[1], create=True)
+    handle = plugin._make_outbound(api)
+    rejected = [{"ordinal": 0, "label": "отчёт.pdf", "status": "rejected", "reason": "source_missing"}]
+    asyncio.run(handle({"annotation_type": "routing_ack", "status": "delivered", "target": "t1",
+                        "attachment_manifest": rejected}))
+    assert [row[1] for row in _Rec.sent] == ["Не приложено к задаче: отчёт.pdf"]
+    asyncio.run(handle({"annotation_type": "routing_ack", "status": "needs_manual_target", "attachment_manifest": rejected,
+                        "options": [{"task_id": f"t{n}", "label": f"Work {n}"} for n in range(1, 10)]}))
+    assert _Rec.sent[-1][1].splitlines() == [
+        "Куда отправить последнее сообщение:", *[f"{n}. Work {n}" for n in range(1, 9)], "…и ещё 1 в веб-чате.",
+        "Ответьте номером или выберите вариант в веб-чате.", "Не приложено к задаче: отчёт.pdf"]
 
 
 def test_subagent_cards_off_hides_activity(tmp_path, monkeypatch):
@@ -342,49 +463,6 @@ def test_load_runtime_state_rejects_invalid_port_before_http(monkeypatch):
         assert asyncio.run(state._load_runtime_state(Api(port))) == {}
 
 
-def test_recent_thoughts_discloses_long_entry_and_reconstructible_source(tmp_path):
-    plugin = _load_plugin()
-    data = tmp_path / "data"
-    log = data / "logs" / "progress.jsonl"
-    log.parent.mkdir(parents=True)
-    timestamp = "2026-07-30T10:11:12Z"
-    task_id = "task-abcdef123456"
-    log.write_text(
-        json.dumps({"ts": timestamp, "task_id": task_id, "text": "x" * 300}) + "\n",
-        encoding="utf-8",
-    )
-
-    class Api:
-        @staticmethod
-        def get_runtime_info():
-            return {"data_dir": str(data)}
-
-    text = plugin._load_recent_thoughts(Api())
-
-    assert "OMISSION NOTE: truncated at 100 chars; original length 300" in text
-    assert f"Full ref: data/logs/progress.jsonl @ {timestamp} task {task_id}" in text
-    assert text.endswith("Showing up to 4 recent entries. Full source: data/logs/progress.jsonl")
-
-
-def test_recent_thoughts_preserves_short_entry_and_discloses_list_projection(tmp_path):
-    plugin = _load_plugin()
-    data = tmp_path / "data"
-    log = data / "logs" / "progress.jsonl"
-    log.parent.mkdir(parents=True)
-    note = "plain short entry byte intact"
-    log.write_text(json.dumps({"text": note}) + "\n", encoding="utf-8")
-
-    class Api:
-        @staticmethod
-        def get_runtime_info():
-            return {"data_dir": str(data)}
-
-    assert plugin._load_recent_thoughts(Api()) == (
-        f"• {note}\n\n"
-        "Showing up to 4 recent entries. Full source: data/logs/progress.jsonl"
-    )
-
-
 def test_subagent_progress_edits_one_bubble_not_a_flood(tmp_path, monkeypatch):
     # Complaint #1: a stream of progress notes for ONE subagent must edit a
     # single bubble in place (the note changes each time), never post new ones.
@@ -417,3 +495,84 @@ def test_edit_message_not_modified_treated_as_success():
     assert asyncio.run(client.edit_message_text(42, 100, "x", parse_mode="")) is True
     client.call = call_real_error
     assert asyncio.run(client.edit_message_text(42, 100, "x", parse_mode="")) is False
+
+
+def test_helper_rejection_card_carries_the_owner_sentence(tmp_path, monkeypatch):
+    """#1403: the real rejection producer's frame, merged the way the bridge publishes
+    chat.outbound (text + progress_meta), reaches the unchanged skill's helper card with
+    the owner sentence; the parent model's instruction stays in the stored result."""
+    from types import SimpleNamespace
+
+    from supervisor.events_schedule_task import _reject_schedule_task
+    from tests._store_shared import read_result
+
+    frames = []
+    ctx = SimpleNamespace(DRIVE_ROOT=tmp_path / "drive", send_with_budget=lambda chat_id, text, **kw: frames.append(
+        {"chat_id": chat_id, "text": text, "is_progress": kw.get("is_progress", False), "task_id": kw.get("task_id", ""),
+         "role": kw["role"], "system_type": kw["system_type"], **kw.get("progress_meta", {})}))
+    detail = "Subagent not scheduled: the worker pool is unavailable. Do the work inline yourself, or retry after /restart."
+    _reject_schedule_task(ctx, tid="kid12345", chat_id=42, delegation_role="subagent", parent_id="root1",
+                          root_task_id="root1", role="researcher", result_fields={}, detail=detail,
+                          fallback_message="⚠️ Task kid12345 not scheduled: worker pool unavailable.")
+    assert read_result(tmp_path / "drive", "kid12345")["result"] == detail
+    plugin, api = _setup(tmp_path, monkeypatch)
+    asyncio.run(plugin._make_outbound(api)(frames[0]))
+    card = _Rec.sent[0][1]
+    assert "Task kid12345 not scheduled: worker pool unavailable." in card
+    assert "inline yourself" not in card and "/restart" not in card
+
+
+@pytest.mark.parametrize("owner_sentence", [False, True])
+@pytest.mark.parametrize("abandoned", [False, True])
+@pytest.mark.parametrize("persistence", ["saved", "failed", "busy"])
+@pytest.mark.parametrize("delegation_role", ["subagent", "root"])
+def test_rejection_preserves_persistence_qualification(tmp_path, monkeypatch, owner_sentence,
+                                                     abandoned, persistence, delegation_role):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from ouroboros.store import StoreBusy
+    from supervisor import events_schedule_task, task_admission
+
+    detail = "Subagent not scheduled: worker pool unavailable. Do the work inline yourself."
+    owner = "Task kid12345 not scheduled: worker pool unavailable."
+    addendum = (" Another owner now holds this request; nothing was overwritten." if abandoned else
+                " The refusal was not recorded (scheduled_result_authority_unknown); recovery keeps the request.")
+    # The owner's sentence keeps the uncertainty and the kept request, without the internal code.
+    owner_addendum = addendum.replace(" (scheduled_result_authority_unknown)", "")
+    refusal = Mock(side_effect={"saved": None, "failed": OSError("store unavailable"),
+                                "busy": StoreBusy("current store busy: database is locked", reason="contention")}[persistence])
+    monkeypatch.setattr(task_admission, "persist_never_admitted_refusal", refusal)
+    preparation = SimpleNamespace(token="claim-1", refusal_fields=lambda: {},
+                                  abandon=Mock(return_value=abandoned), after_refusal=Mock())
+    sent = []
+    ctx = SimpleNamespace(DRIVE_ROOT=tmp_path, send_with_budget=lambda *a, **kw: sent.append((a, kw)))
+    kwargs = dict(tid="kid12345", chat_id=42, delegation_role=delegation_role, parent_id="root1",
+                  root_task_id="root1", role="researcher", result_fields={}, detail=detail,
+                  fallback_message="⚠️ " + owner if owner_sentence else "", preparation=preparation)
+    if persistence == "busy":
+        with pytest.raises(StoreBusy):
+            events_schedule_task._reject_schedule_task(ctx, **kwargs)
+    else:
+        assert events_schedule_task._reject_schedule_task(ctx, **kwargs) is (persistence == "saved")
+    refusal.assert_called_once()
+    assert refusal.call_args.kwargs["result"] == detail, "the parent model keeps the full producer detail"
+    assert refusal.call_args.kwargs["admission_token"] == "claim-1"
+    assert preparation.abandon.call_count == (persistence == "failed")
+    assert preparation.after_refusal.call_count == (persistence == "saved")
+    if persistence == "busy" or (delegation_role == "root" and not owner_sentence):
+        assert sent == []
+        return
+    failed = persistence == "failed"
+    expected = owner + (owner_addendum if failed else "") if owner_sentence else detail + (addendum if failed else "")
+    ((chat_id, text), fields), = sent
+    if owner_sentence:
+        assert "scheduled_result_authority_unknown" not in text, "owner words carry no internal code"
+    assert chat_id == 42 and text == "⚠️ " + expected
+    assert fields["role"] == "system"
+    if delegation_role == "subagent":
+        assert fields["system_type"] == "subagent_admission_notice"
+        assert fields["progress_meta"]["error"] == expected, "the web card reads this public error field"
+        assert fields["task_id"] == "root1"
+    else:
+        assert fields["system_type"] == "task_admission_notice"

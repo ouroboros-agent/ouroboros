@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from ouroboros import llm_claudexor, loop_forced_finalization as forced, task_pacing
+from ouroboros import llm_claudexor, llm_substitution, loop_forced_finalization as forced, task_pacing
 from ouroboros.contracts.task_contract import normalize_budget_profile
 from ouroboros.loop_model_call import _RoundModelCallContext, _adopt_fallback_route, _call_round_model
 from ouroboros.llm import LLMClient
@@ -17,16 +17,28 @@ from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, task_model_binding
 from ouroboros.model_wait import task_model_wait_scope
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.usage_accounting import PhysicalAttemptPreconditionFailed
+from ouroboros.send_clock import CLOCK_NOTE_PREFIX
 from tests.test_llm_claudexor import MODEL, ROUTE, result, setup as setup
+
+
+def _unclocked(messages):
+    """A Main send ends with exactly one host clock line (``send_clock``); the rest is canonical."""
+    assert str(messages[-1].get("content") or "").startswith(CLOCK_NOTE_PREFIX), messages[-1]
+    assert not any(str(row.get("content") or "").startswith(CLOCK_NOTE_PREFIX) for row in messages[:-1])
+    return messages[:-1]
 
 
 @pytest.fixture
 def acting(setup, monkeypatch):
     root, gateway, client = setup
+    from ouroboros.task_results import write_task_result
+    write_task_result(root, "task-one", "running", root_task_id="task-one", _attempt=1)
     gateway.results *= 4
     gateway.dispatch *= 4
     monkeypatch.setenv(MODEL_ACCOUNTS_KEY, json.dumps({"main": "main-only", "fallback": ["fallback-only"]}))
-    monkeypatch.setenv("OUROBOROS_IMAGE_INPUT_MODE", "inline")
+    # Auto is the mode that asks the route's catalog (Inline sends without asking),
+    # so these sends show which account binding that read used.
+    monkeypatch.setenv("OUROBOROS_IMAGE_INPUT_MODE", "auto")
     catalogs = []
 
     def catalog(source, profile=None, *, requested_model=None):
@@ -59,7 +71,8 @@ def test_forced_call_keeps_configured_actor_account_and_image(acting):
     normal, final = [payload for payload, _ in acting.gateway.uploads]
     assert normal["account"] == {"mode": "pin", "profileId": "actor-only"}
     assert final["account"] == normal["account"]
-    assert normal["messages"] == final["messages"] == acting.messages
+    # The direct call binds no Main clock; the forced final is a Main send and does.
+    assert normal["messages"] == _unclocked(final["messages"]) == acting.messages
 
 
 def test_prospective_image_preparation_keeps_actor_pin(acting):
@@ -112,7 +125,7 @@ def test_prospective_build_reads_the_failed_profile_without_spending_it(acting):
     # The fact is keyed by the affinity the dispatch declares: the install-scoped
     # Codex key, no longer the execution id.
     shared_key = llm_claudexor.cache_key_for_model(MODEL)
-    token = llm_claudexor._FAILED_PROFILE.set((shared_key, "codex", "exact-model", "account-a"))
+    token = llm_substitution._FAILED_PROFILE.set((shared_key, "codex", "exact-model", "account-a"))
     try:
         with task_model_wait_scope(task={"id": "task-one", "_attempt": 1}, drive_root=acting.root,
                                    event_queue=None, worker_slot_held=True) as wait:
@@ -120,12 +133,12 @@ def test_prospective_build_reads_the_failed_profile_without_spending_it(acting):
                 "model": MODEL, "use_local": False, "model_account_override": ""}
             request, prepared = task_pacing.prepared_wrapup_candidate(
                 acting.ctx, deepcopy(acting.ctx.messages), allow_server_web_search=False)
-            assert llm_claudexor._FAILED_PROFILE.get()[3] == "account-a"  # observed, not spent
+            assert llm_substitution._FAILED_PROFILE.get()[3] == "account-a"  # observed, not spent
             assert forced._call_forced_model_once(acting.ctx, initial_messages=prepared,
                                                   admitted_request=request) == "Ответ 🐍"
-        assert llm_claudexor._FAILED_PROFILE.get() == ()  # the dispatch spent it, exactly once
+        assert llm_substitution._FAILED_PROFILE.get() == ()  # the dispatch spent it, exactly once
     finally:
-        llm_claudexor._FAILED_PROFILE.reset(token)
+        llm_substitution._FAILED_PROFILE.reset(token)
     payload = acting.gateway.uploads[0][0]
     assert payload["account"] == {"mode": "auto"}  # the refused account is not preferred back
     assert payload["options"] == {"reasoningEffort": "high", "cacheKey": shared_key}
@@ -156,7 +169,8 @@ def test_subscription_prospective_and_send_share_transcript_normalization(acting
     assert forced._call_forced_model_once(acting.ctx, initial_messages=prepared,
                                           admitted_request=request) == "Ответ 🐍"
     sent = acting.gateway.uploads[0][0]["messages"]
-    assert sent == normalized and messages == original
+    # The answered send's clock line joins the canonical transcript; nothing else changes.
+    assert _unclocked(sent) == normalized and _unclocked(messages) == original
     assert len(acting.gateway.creates) == 1
     if shape == "mid_round_image":
         assert sent[3]["role"] == "tool" and sent[3]["tool_call_id"] == "shot"
@@ -178,7 +192,7 @@ def test_forced_and_prospective_preserve_task_actor_override_including_auto(acti
                                               admitted_request=request) == "Ответ 🐍"
     payload = acting.gateway.uploads[0][0]
     assert payload["account"] == ({"mode": "pin", "profileId": pin} if pin else {"mode": "auto"})
-    assert payload["messages"] == acting.messages
+    assert _unclocked(payload["messages"]) == acting.messages
     assert acting.catalogs[-1][1] == (pin or None)
 
 
@@ -213,7 +227,10 @@ def test_task_binding_priority_is_role_then_plan_then_frozen_actor(acting):
 
 
 @pytest.mark.parametrize("fallback", [False, True])
-def test_browser_attachment_uses_live_binding_before_main_send(acting, fallback):
+def test_browser_attachment_is_canonical_and_asks_no_catalog(acting, fallback):
+    """The screenshot joins the canonical turn on any binding; which account's catalog
+    decides what a route receives is the send's question (pinned by the ordinary
+    and prospective sends above), never the attach step's."""
     from ouroboros.tools.browser import _inject_native_screenshot
 
     ctx = acting.tools._ctx
@@ -228,7 +245,7 @@ def test_browser_attachment_uses_live_binding_before_main_send(acting, fallback)
                 "model": MODEL, "use_local": False, "model_account_override": "temporary-actor"}
         _inject_native_screenshot(ctx, "QUFBQQ==")
     assert ctx.messages and ctx.messages[-1]["content"][-1]["type"] == "image_url"
-    assert acting.catalogs[-1][1] == ("fallback-only" if fallback else "temporary-actor")
+    assert acting.catalogs == []
 
 
 @pytest.mark.parametrize("fallback", [False, True])
@@ -245,7 +262,9 @@ def test_ordinary_round_uses_the_same_actor_or_active_plan_binding(acting, fallb
     assert message["content"] == "Ответ 🐍"
     payload = acting.gateway.uploads[0][0]
     assert payload["account"] == {"mode": "pin", "profileId": "fallback-only" if fallback else "actor-only"}
-    assert payload["messages"] == acting.messages
+    from tests.test_subscription_main_wait import _without_context_facts
+
+    assert _without_context_facts(_unclocked(payload["messages"]), physical=True) == acting.messages
 
 
 TURN = {"route": ROUTE, "format": "codex.turn.v1", "payload": {"turnState": "the-running-turn"}}
@@ -295,9 +314,12 @@ def test_the_dispatched_forced_result_replaces_the_loop_slot(acting, turn_engine
 @pytest.mark.parametrize("version", ["3.10.3", ""])
 def test_an_older_or_unobserved_engine_keeps_the_legacy_candidate_and_send(acting, monkeypatch, version):
     """No field at all, and the same bytes a slotless caller would have priced."""
-    from ouroboros import llm_claudexor
+    from ouroboros import llm_claudexor, send_clock
 
     monkeypatch.setattr(llm_claudexor, "owned_engine_version", lambda: version)
+    # Each candidate carries the host clock line to the second; price both at one instant.
+    instant = send_clock._now()
+    monkeypatch.setattr(send_clock, "_now", lambda: instant)
     _none, legacy, _messages = _admitted_wrapup(acting, opted=False)
     _slot, request, prepared = _admitted_wrapup(acting, TURN)
     assert request.candidate_raw_sha256 == legacy.candidate_raw_sha256
@@ -324,7 +346,7 @@ def test_the_budget_soft_landing_wraps_up_with_the_model_not_the_host_text(actin
     acting.ctx.messages = [{"role": "user", "content": "Please finish"}]
     acting.ctx.llm_trace = {}
     acting.tools._ctx.model_turn_state = ModelTurnState(deepcopy(TURN))
-    ceiling = task_pacing.resolve_cost_ceiling(100.0, normalize_budget_profile(None), root_cap_usd=0.5)
+    ceiling = task_pacing.resolve_cost_ceiling(100.0, normalize_budget_profile({"cost_hard_stop_pct": 50}), root_cap_usd=0.5)
     text, _usage, _trace = loop_module._soft_land_exhausted_ceiling(acting.ctx, ceiling)
     assert "Ответ 🐍" in text and "no working room" not in text
     assert acting.gateway.uploads[0][0]["nativeContinuation"] == TURN
@@ -360,3 +382,91 @@ def test_a_failed_probe_between_the_candidate_and_the_send_keeps_the_priced_byte
     payload = acting.gateway.uploads[0][0]
     assert payload["nativeContinuation"] == TURN and len(acting.gateway.creates) == 1
     assert acting.tools._ctx.model_turn_state is slot and slot.envelope is None
+
+
+def _sent_images_then_eviction(acting, with_reasoning):
+    """Ten images already sent, then an eleventh evicts six of them (stamped on the live slot)."""
+    from ouroboros import transcript_prefix
+    from ouroboros.context_budget import LIVE_IMAGE_BLOCKS_HIGH_WATER
+    from ouroboros.loop_messages import _append_or_merge_user_content
+    from ouroboros.tools.compact_context import record_context_view
+    from tests.test_reasoning_binding import signed
+
+    ctx, slot = acting.ctx, acting.tools._ctx
+    slot.task_id = ctx.task_id
+    image = deepcopy(ctx.messages[1]["content"][0])
+    ctx.messages[1]["content"] = [deepcopy(image) for _ in range(LIVE_IMAGE_BLOCKS_HIGH_WATER)]
+    if with_reasoning:
+        ctx.messages.append({"role": "assistant", "content": "Prior response", "reasoning_details": [signed("thought")]})
+    before = deepcopy(ctx.messages)
+    record_context_view(slot, before, ctx.tool_schemas)
+    transcript_prefix.observe_send(slot, before, tools=ctx.tool_schemas, round_idx=1)
+    _append_or_merge_user_content(ctx.messages, [deepcopy(image)], slot=slot)
+    assert getattr(slot, transcript_prefix.SANCTION_ATTR) == "image_eviction"
+    return ctx, slot
+
+
+@pytest.mark.parametrize("with_reasoning", [False, True])
+def test_the_forced_final_counts_a_change_once_with_or_without_signed_reasoning(acting, with_reasoning):
+    from ouroboros import transcript_prefix
+    from ouroboros.preflight_receipts import canonical_data_root
+
+    ctx, slot = _sent_images_then_eviction(acting, with_reasoning)
+    assert forced._call_forced_model_once(ctx) and len(acting.gateway.creates) == 1
+    assert ctx.accumulated_usage.get("prompt_prefix_breaks", 0) == 1
+    record = json.loads(transcript_prefix.history_changes_path(canonical_data_root(slot)).read_text())
+    assert record["origins"]["image_eviction"]["count"] == 1
+
+
+def test_a_forced_final_that_never_dispatched_counts_nothing(acting):
+    import time
+
+    from ouroboros import transcript_prefix
+
+    ctx, slot = _sent_images_then_eviction(acting, with_reasoning=False)
+    before = list(getattr(slot, transcript_prefix.DIGEST_ATTR))
+    ctx.deadline_ts = time.time() - 1
+    assert forced._call_forced_model_once(ctx) == "" and not acting.gateway.creates
+    assert getattr(slot, transcript_prefix.DIGEST_ATTR) == before
+    assert ctx.accumulated_usage.get("prompt_prefix_breaks", 0) == 0
+
+
+@pytest.mark.parametrize("stage", ["before_prepare", "after_prepare", "after_forced_send"])
+def test_a_resumed_task_keeps_one_change_and_its_origin(acting, stage):
+    """Pause, quit and Resume carry the send observer's state: a change made before the
+    checkpoint is neither counted again nor left unnamed after the restore, though the
+    resumed request goes out a round later (a parked tool tail runs first)."""
+    from ouroboros import loop, owner_wait, transcript_prefix
+    from ouroboros.loop_messages import _append_or_merge_user_content
+    from ouroboros.preflight_receipts import canonical_data_root
+
+    ctx, slot = _sent_images_then_eviction(acting, with_reasoning=stage != "before_prepare")
+    if stage == "after_prepare":
+        assert transcript_prefix.retire_main_reasoning(ctx) and ctx.accumulated_usage["prompt_prefix_breaks"] == 1
+    elif stage == "after_forced_send":
+        assert forced._call_forced_model_once(ctx) and ctx.accumulated_usage["prompt_prefix_breaks"] == 1
+    state = json.loads(json.dumps(owner_wait.continuation_state(
+        slot, ctx.messages, {}, ctx.accumulated_usage, ctx.round_idx, ctx.tool_schemas, set())))
+    root = canonical_data_root(slot)
+    restored = SimpleNamespace(task_id=ctx.task_id, drive_root=slot.drive_root, budget_drive_root=root,
+                               task_metadata=deepcopy(slot.task_metadata))
+    messages, usage = [], {}
+    owner_wait.restore_continuation_state(SimpleNamespace(_ctx=restored), state, messages, {}, usage, set())
+    resumed = ctx.round_idx + 1
+    _append_or_merge_user_content(messages, "Continue after restart", slot=restored)  # the resumed request only appends
+    assert transcript_prefix.prepare_reasoning_for_send(restored, messages, ctx.tool_schemas,
+                                                        round_idx=resumed, usage=usage) is None
+    loop._record_transcript_prefix(restored, messages, resumed, usage, None, ctx.task_id,
+                                   slot.drive_root / "logs", ctx.tool_schemas)
+    record = json.loads(transcript_prefix.history_changes_path(root).read_text())
+    assert usage["prompt_prefix_breaks"] == 1
+    assert {origin: row["count"] for origin, row in record["origins"].items()} == {"image_eviction": 1}
+    # The facts line names the change beside the request that carried it.
+    carrier = ctx.round_idx if stage == "after_forced_send" else resumed
+    assert "(image_eviction)" in transcript_prefix.history_change_text(usage["_recent_prefix_breaks"], carrier)
+    # The carried identity is spent: a later change of the same message by the same origin still counts.
+    transcript_prefix.sanction_rewrite(restored, "image_eviction")
+    messages[1] = {**messages[1], "content": "An earlier message edited later"}
+    loop._record_transcript_prefix(restored, messages, resumed + 1, usage, None, ctx.task_id,
+                                   slot.drive_root / "logs", ctx.tool_schemas)
+    assert usage["prompt_prefix_breaks"] == 2

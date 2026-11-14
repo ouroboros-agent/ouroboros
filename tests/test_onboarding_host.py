@@ -22,15 +22,13 @@ from __future__ import annotations
 
 import inspect
 import json
-import pathlib
 import sys
+import threading
 import types
 
 import pytest
 from starlette.applications import Starlette
 from starlette.testclient import TestClient
-
-REPO = pathlib.Path(__file__).resolve().parents[1]
 
 
 # --------------------------------------------------------------------------
@@ -39,33 +37,58 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 # --------------------------------------------------------------------------
 
 
+class _FakeHook:
+    def __init__(self) -> None:
+        self.handlers: list = []
+
+    def __iadd__(self, handler):
+        self.handlers.append(handler)
+        return self
+
+
 class _FakeWindow:
+    """pywebview 5.4's window surface the setup host touches (the caption tint hooks included)."""
+
     def __init__(self) -> None:
         self.destroyed = False
+        self.loaded_urls = []
+        self.events = types.SimpleNamespace(before_show=_FakeHook(), closed=_FakeHook())
 
     def destroy(self) -> None:
         self.destroyed = True
+
+    def load_url(self, url) -> None:
+        self.loaded_urls.append(url)
 
 
 def _install_fake_webview(monkeypatch, on_start=None):
     fake = types.ModuleType("webview")
     fake.windows = []
+    fake.active_window = lambda: next((window for window in reversed(fake.windows) if not window.destroyed), None)
+    fake.menu = types.ModuleType("webview.menu")
+    fake.menu.Menu = lambda title, items: types.SimpleNamespace(title=title, items=items)
+    fake.menu.MenuAction = lambda title, function: types.SimpleNamespace(title=title, function=function)
+    fake.app_menu = []
     created: dict = {}
 
     def create_window(title, url=None, js_api=None, **kwargs):
         created.update({"title": title, "url": url, "js_api": js_api, **kwargs})
         window = _FakeWindow()
+        created["window"] = window
         fake.windows.append(window)
         return window
 
-    def start(*_args, **_kwargs):
+    def start(*_args, **kwargs):
         created["started"] = True
+        if kwargs.get("menu"):  # pywebview 5.4 retains the application menu on an empty list
+            fake.app_menu = kwargs["menu"]
         if on_start is not None:
             on_start(created)
 
     fake.create_window = create_window
     fake.start = start
     monkeypatch.setitem(sys.modules, "webview", fake)
+    monkeypatch.setitem(sys.modules, "webview.menu", fake.menu)
     return created, fake
 
 
@@ -118,7 +141,7 @@ def test_first_run_onboarding_is_presented_only_after_the_gateway_is_healthy():
         "check_git()",
         "bootstrap_repo()",
         "_prepare_first_run_settings()",
-        '_cleanup_recorded_server_process("preflight")',
+        "_requested_server_port()",
         "lifecycle_thread.start()",
         "_await_server_ready(port, _abort, lifecycle_thread)",
         "_present_first_run_onboarding(",
@@ -249,6 +272,75 @@ def test_completion_reporting_restart_required_recycles_the_managed_server(monke
     assert "_await_server_ready(port, _abort, lifecycle_thread)" in src[restart_at:restart_at + 800]
 
 
+def test_macos_recovery_uses_the_live_window_and_current_gateway_after_setup(monkeypatch):
+    from ouroboros import launcher_onboarding as host
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    created, webview = _install_fake_webview(monkeypatch)
+    gateway = {"port": 8899}
+    read_port = lambda: gateway["port"]
+    outcome = host.present_first_run_onboarding(
+        {}, 8765, open_external_url=lambda url: {"ok": True}, read_port=read_port,
+    )
+    setup = created["window"]
+    assert webview.app_menu[0].title == "Help"
+    assert [item.title for item in webview.app_menu[0].items] == ["Open built-in setup"], (
+        "a hung web view commits no load, so the menu offers no reload that pretends to rescue one")
+    setup_action = webview.app_menu[0].items[0]
+    assert setup_action.title == "Open built-in setup"
+    setup_action.function()  # no page JavaScript or bridge receiver participates
+    assert setup.loaded_urls == ["http://127.0.0.1:8899/onboarding?builtin=1"]
+    assert outcome == {"saved": False, "restart_required": False}
+
+    gateway["port"] = 8900
+    setup_action.function()
+    assert setup.loaded_urls[-1] == "http://127.0.0.1:8900/onboarding?builtin=1"
+    gateway["port"] = None
+    setup_action.function()
+    assert len(setup.loaded_urls) == 2, "an unavailable generation has no recovery endpoint"
+
+    created["js_api"].onboarding_finished({"ok": True, "restart_required": True})
+    assert outcome == {"saved": True, "restart_required": True}
+    assert setup.destroyed and webview.active_window() is None
+    gateway["port"] = 8901
+    setup_action.function()  # retained native menu while no window exists
+    failed = webview.create_window("Ouroboros — Startup Failed", html="server unavailable")
+    webview.start(private_mode=False)  # retained menu, exactly like the failure path
+    assert webview.app_menu[0].items[0] is setup_action
+    setup_action.function()
+    assert not failed.loaded_urls and len(setup.loaded_urls) == 2
+    failed.destroy()
+
+    main = webview.create_window("Ouroboros", url="http://127.0.0.1:8901")
+    webview.start(menu=host.setup_recovery_menu(main, read_port))
+    (main_action,) = webview.app_menu[0].items
+    assert main_action is not setup_action, "the main GUI loop replaces the old binding"
+    main_action.function()
+    assert main.loaded_urls == ["http://127.0.0.1:8901/onboarding?builtin=1"]
+    setup_action.function()
+    assert len(setup.loaded_urls) == 2
+    webview.windows.remove(main)
+    main_action.function()
+    assert len(main.loaded_urls) == 1, "a retired window is no longer a navigation target"
+
+
+@pytest.mark.parametrize("platform", ["win32", "linux"])
+def test_recovery_adds_no_menu_chrome_on_other_platforms(monkeypatch, platform):
+    from ouroboros import launcher_onboarding as host
+
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setitem(sys.modules, "webview", None)
+    assert host.setup_recovery_menu(object(), lambda: pytest.fail("must not read a port")) == []
+
+
+def test_launcher_binds_both_recovery_menus_to_its_generation_endpoint():
+    import launcher
+
+    source = inspect.getsource(launcher.main)
+    assert "open_external_url=_open_external_url, read_port=lambda: _generation_port" in source
+    assert "menu=setup_recovery_menu(window, lambda: _generation_port)" in source
+
+
 # --------------------------------------------------------------------------
 # 3. Fresh-install proofs
 # --------------------------------------------------------------------------
@@ -288,7 +380,8 @@ def test_the_desktop_setup_window_cannot_write_settings_at_all(monkeypatch, tmp_
         {}, 8765, open_external_url=lambda url: {"ok": False},
     )
 
-    assert seen["methods"] == ["onboarding_finished", "open_external_url"]
+    # Completion, the external opener and the caption tint: none of them writes settings.
+    assert seen["methods"] == ["onboarding_finished", "open_external_url", "set_native_appearance"]
     assert outcome == {"saved": True, "restart_required": True}
     # The window reported completion, and the LAUNCHER still wrote nothing: the
     # bytes on disk (if any) came from the endpoint the page posted to.
@@ -400,7 +493,7 @@ def test_server_boot_never_writes_the_settings_file():
     assert "SETTINGS_PATH" not in imported
     # The normalization still runs, still reaches the environment, and only then
     # is the owner's runtime-mode baseline pinned against it.
-    applied_at = source.index("apply_runtime_provider_defaults(load_settings())")
+    applied_at = source.index("apply_runtime_provider_defaults(load_settings(migrate=True))")
     env_at = source.index("_apply_settings_to_env(settings)")
     baseline_at = source.index("initialize_runtime_mode_baseline()")
     assert applied_at < env_at < baseline_at
@@ -408,11 +501,11 @@ def test_server_boot_never_writes_the_settings_file():
 
 def test_server_boot_leaves_the_settings_bytes_alone(tmp_path, monkeypatch):
     """The behavioural half of the pin above. A REAL lifespan boot over a document
-    whose provider normalization reports a change (a retired model default the
-    normalization replaces — the exact case the retired boot write persisted) leaves
-    the file's bytes and mtime untouched. The syntactic pin is the fast tripwire; this
-    one also catches a boot write that reaches the disk through some helper other
-    than the named saver.
+    whose provider normalization reports a change (a product-authored Heavy default
+    the normalization clears — the kind of change the retired boot write persisted)
+    leaves the file's bytes and mtime untouched. The syntactic pin is the fast
+    tripwire; this one also catches a boot write that reaches the disk through some
+    helper other than the named saver.
 
     The boot managed-update thread is the one lifespan job stubbed for a reason of its
     own rather than for scope: it is a daemon whose work races this assertion anyway,
@@ -420,12 +513,10 @@ def test_server_boot_leaves_the_settings_bytes_alone(tmp_path, monkeypatch):
     whatever ``REPO_DIR`` resolves to in the process that happens to run pytest."""
     import server as srv
     from ouroboros import config as cfg
-    from ouroboros.server_runtime import (
-        _RETIRED_MODEL_DEFAULT_REPLACEMENTS,
-        apply_runtime_provider_defaults,
-    )
+    from ouroboros.server_runtime import apply_runtime_provider_defaults
 
-    document = {"OUROBOROS_MODEL": next(iter(_RETIRED_MODEL_DEFAULT_REPLACEMENTS))}
+    document = {"OUROBOROS_MODEL_HEAVY": "anthropic/claude-opus-" + "4.7",
+                "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE": "full"}
     assert apply_runtime_provider_defaults(dict(document))[1] is True, (
         "the fixture must give boot something it could persist")
     settings_path = tmp_path / "settings.json"
@@ -458,9 +549,15 @@ def test_server_boot_leaves_the_settings_bytes_alone(tmp_path, monkeypatch):
     monkeypatch.setattr("ouroboros.server_auth.get_configured_network_password", lambda: "")
     before = settings_path.read_bytes()
     before_mtime = settings_path.stat().st_mtime_ns
+    running = set(threading.enumerate())
 
     with TestClient(srv.app):
         pass
+    # The lifespan hands the drive root to its import owner, a daemon that then runs the steps
+    # waiting on publication; a slow runner is still inside them when the client closes.
+    for thread in set(threading.enumerate()) - running:
+        if thread.name in ("current-store-import", "store-ready-steps"):
+            thread.join(60)
 
     assert settings_path.read_bytes() == before, "boot rewrote the settings document"
     assert settings_path.stat().st_mtime_ns == before_mtime
@@ -492,8 +589,8 @@ def test_onboarding_page_is_served_without_a_provider_or_a_supervisor(monkeypatc
         response = client.get("/onboarding")
 
     assert response.status_code == 200
-    assert 'src="/static/modules/onboarding_wizard.js"' in response.text
-    assert 'href="/static/onboarding.css"' in response.text
+    assert 'src="/onboarding/static/modules/onboarding_wizard.js"' in response.text
+    assert 'href="/onboarding/static/onboarding.css"' in response.text
     assert "__OURO_ONBOARDING_BOOTSTRAP__" in response.text
     assert response.headers["cache-control"] == "no-store"
     # Side-effect-free: serving the page authors nothing.
@@ -501,15 +598,15 @@ def test_onboarding_page_is_served_without_a_provider_or_a_supervisor(monkeypatc
 
 
 def test_onboarding_readiness_probe_still_gates_the_blocking_overlay(monkeypatch, tmp_path):
-    from ouroboros.gateway import settings as gw_settings
+    from ouroboros.gateway import onboarding_host  # the probe reads the one live Setup derivation
 
-    monkeypatch.setattr(gw_settings, "load_settings", lambda: {})
+    monkeypatch.setattr(onboarding_host, "load_settings", lambda: {})
     with TestClient(_routes_app(tmp_path)) as client:
         unconfigured = client.get("/api/onboarding")
     assert unconfigured.status_code == 200
 
     monkeypatch.setattr(
-        gw_settings, "load_settings", lambda: {"OPENROUTER_API_KEY": "sk-or-v1-configured"}
+        onboarding_host, "load_settings", lambda: {"OPENROUTER_API_KEY": "sk-or-v1-configured"}
     )
     with TestClient(_routes_app(tmp_path)) as client:
         configured = client.get("/api/onboarding")
@@ -540,27 +637,28 @@ def _onboarding_client(tmp_path):
 def test_the_readiness_probe_never_authors_settings_json(monkeypatch, tmp_path):
     """A GET must never be the first author of settings.json (D-8).
 
-    The fixture is the case that actually persisted: a fresh install whose
-    shipped remote defaults normalization CLEARS because LOCAL_MODEL_SOURCE is
-    present. That write created the file before the owner had answered
-    anything, destroying the fresh-install proof the install presets and the
-    `light` safety default are both gated on.
+    The fixture is the case that actually persisted: a fresh local-first install
+    whose normalization changes a value (today the retired shipped Heavy default it
+    clears). That write created the file before the owner had answered anything,
+    destroying the fresh-install proof the install presets and the `light` safety
+    default are both gated on.
     """
     from ouroboros.config import SETTINGS_DEFAULTS
-    from ouroboros.gateway import settings as gw_settings
+    from ouroboros.gateway import onboarding_host, settings as gw_settings
     from ouroboros.server_runtime import apply_runtime_provider_defaults
 
     settings_path = tmp_path / "settings.json"
     saves: list = []
     fresh_local_first = dict(SETTINGS_DEFAULTS)
     fresh_local_first["LOCAL_MODEL_SOURCE"] = "Qwen/Qwen2.5-7B-Instruct-GGUF"
+    fresh_local_first["OUROBOROS_MODEL_HEAVY"] = "google/gemini-3.5-flash"
 
     # Normalization must still have something to change, or the fixture would
     # prove nothing about persistence.
     _normalized, changed, _keys = apply_runtime_provider_defaults(dict(fresh_local_first))
     assert changed is True
 
-    monkeypatch.setattr(gw_settings, "load_settings", lambda: dict(fresh_local_first))
+    monkeypatch.setattr(onboarding_host, "load_settings", lambda: dict(fresh_local_first))
     monkeypatch.setattr(
         gw_settings, "save_settings",
         lambda *a, **k: (saves.append(a), settings_path.write_text("{}", encoding="utf-8")),
@@ -624,10 +722,10 @@ def test_the_readiness_probe_body_serves_no_stored_credential(monkeypatch, tmp_p
     stored credential reachable through its wizard body is one that does not
     satisfy that gate — an OpenAI-compatible KEY with no base URL. Same class,
     second route."""
-    from ouroboros.gateway import settings as gw_settings
+    from ouroboros.gateway import onboarding_host
 
     stored = {"OPENAI_COMPATIBLE_API_KEY": _SECRET_CANARIES["OPENAI_COMPATIBLE_API_KEY"]}
-    monkeypatch.setattr(gw_settings, "load_settings", lambda: dict(stored))
+    monkeypatch.setattr(onboarding_host, "load_settings", lambda: dict(stored))
     with _onboarding_client(tmp_path) as client:
         response = client.get("/api/onboarding")
 
@@ -639,40 +737,6 @@ def test_the_readiness_probe_body_serves_no_stored_credential(monkeypatch, tmp_p
 # --------------------------------------------------------------------------
 # 5. Completion seam
 # --------------------------------------------------------------------------
-
-
-def test_completion_is_the_single_atomic_endpoint_on_every_host():
-    """D-8 closed. The page posts ONE transaction and has no second way to
-    finish: not the `POST /api/settings` + `POST /api/owner/runtime-mode` pair
-    whose failure between the two writes left providers saved and runtime mode
-    not, and not the desktop `save_wizard` bridge, whose only reason to exist
-    (authoring the fresh-install `light` safety default) the endpoint now
-    discharges itself.
-
-    CHANGED EXPECTATION: this test previously REQUIRED both fallbacks, because
-    the endpoint did not exist in the branch that wrote it. It does now, so the
-    fallbacks were the last thing keeping a first run able to take a
-    non-atomic path."""
-    source = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
-    # The absence assertions read CODE, not prose: the module documents the two
-    # removed paths by name, and a comment must not be able to fail the gate
-    # (nor to satisfy it).
-    code = "\n".join(
-        line for line in source.splitlines() if not line.lstrip().startswith("//"))
-
-    assert "const ONBOARDING_COMPLETE_ENDPOINT = '/api/onboarding/complete';" in code
-    assert "const result = await completeOnboardingAtomically(payload);" in code
-    assert "saveWizardThroughDesktopBridge" not in code
-    assert "saveWizardThroughSettingsPair" not in code
-    assert "save_wizard" not in code
-    assert "/api/owner/runtime-mode" not in code
-    assert "'/api/settings'" not in code
-    # A missing route is now a real error, not a signal to take another path.
-    assert "response.status === 404" not in code
-    # One completion announcer for all three shells (that part is unchanged).
-    assert "function announceCompletion(result)" in source
-    assert "ouroboros:onboarding-complete" in source
-    assert "window.pywebview.api.onboarding_finished" in source
 
 
 def test_the_atomic_completion_route_is_declared_wherever_it_is_implemented(tmp_path):

@@ -26,6 +26,7 @@ from ouroboros.task_results import write_task_result
 from tests._headless_cli_shared import (  # noqa: F401  (autouse fixture applies on import)
     _managed_worker_pool_available,
 )
+from tests._store_shared import seed_result
 
 
 def test_task_event_replay_uses_existing_logs_and_result(tmp_path):
@@ -39,11 +40,8 @@ def test_task_event_replay_uses_existing_logs_and_result(tmp_path):
     )
     result_dir = data / "task_results"
     result_dir.mkdir()
-    (result_dir / f"{task_id}.json").write_text(
-        json.dumps({"_schema_version": 1, "task_id": task_id, "status": "completed",
-                    "result": "done", "ts": "2026-01-01T00:00:01Z"}),
-        encoding="utf-8",
-    )
+    seed_result(data, task_id, {"_schema_version": 1, "task_id": task_id, "status": "completed",
+                    "result": "done", "ts": "2026-01-01T00:00:01Z"})
 
     events = iter_task_events(data, task_id)
 
@@ -128,6 +126,37 @@ def test_logs_tail_parent_filter_includes_child_lineage_events(tmp_path):
 
     assert response.status_code == 200
     assert [row["content"] for row in payload["entries"]] == ["parent", "child"]
+
+
+def test_a_row_written_to_both_planes_reads_once_in_the_logs_tail_and_the_task_stream(tmp_path):
+    """REPLICA_RULE rows a child task writes to its drive and the canonical log read once by their natural
+    key; distinct rows of one type and rows only one plane holds all stay."""
+    from ouroboros.gateway.logs import api_logs_tail
+
+    data = tmp_path / "data"
+    child_logs = data / "state" / "headless_tasks" / "child1" / "data" / "logs"
+    child_logs.mkdir(parents=True)
+    (data / "logs").mkdir(parents=True)
+    error = {"ts": "2026-01-01T00:00:01Z", "type": "llm_api_error", "task_id": "child1", "llm_call_id": "c1"}
+    other = {**error, "ts": "2026-01-01T00:00:02Z", "llm_call_id": "c2"}
+    model_round = {"ts": "2026-01-01T00:00:03Z", "type": "llm_round", "task_id": "child1", "llm_call_id": "c3"}
+    tool = {"ts": "2026-01-01T00:00:04Z", "type": "tool_call", "task_id": "child1", "tool": "read_file", "invocation_id": "i1"}
+    for path, rows in ((child_logs / "events.jsonl", [error, other, model_round]), (data / "logs" / "events.jsonl", [error]),
+                       (child_logs / "tools.jsonl", [tool]), (data / "logs" / "tools.jsonl", [tool])):
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    write_task_result(data, "child1", "running", result="pending", child_drive_root=str(child_logs.parent),
+                      ts="2026-01-01T00:00:00Z")
+    app = Starlette(routes=[Route("/api/logs/{name}", endpoint=api_logs_tail, methods=["GET"])])
+    app.state.drive_root = data
+    client = TestClient(app)
+
+    tail = client.get("/api/logs/events?task_id=child1&limit=10").json()["entries"]
+    assert [(row["type"], row["llm_call_id"]) for row in tail] == [
+        ("llm_api_error", "c1"), ("llm_api_error", "c2"), ("llm_round", "c3")]
+    assert [row["invocation_id"] for row in client.get("/api/logs/tools?task_id=child1&limit=10").json()["entries"]] == ["i1"]
+    stream = [(event["type"], event["data"].get("llm_call_id") or event["data"].get("invocation_id"))
+              for event in iter_task_events(data, "child1") if event["type"] != "task_result"]
+    assert stream == [("llm_api_error", "c1"), ("llm_api_error", "c2"), ("llm_round", "c3"), ("tool_call", "i1")]
 
 
 def test_workspace_event_replay_suppresses_task_done_until_artifacts_terminal(tmp_path):
@@ -256,11 +285,8 @@ def test_task_sse_emits_final_result_after_cursor_saw_scheduled_result(tmp_path)
     data = tmp_path / "data"
     (data / "task_results").mkdir(parents=True)
     task_id = "abc123"
-    (data / "task_results" / f"{task_id}.json").write_text(
-        json.dumps({"_schema_version": 1, "task_id": task_id, "status": "completed",
-                    "result": "done", "ts": "2026-01-01T00:00:01Z"}),
-        encoding="utf-8",
-    )
+    seed_result(data, task_id, {"_schema_version": 1, "task_id": task_id, "status": "completed",
+                    "result": "done", "ts": "2026-01-01T00:00:01Z"})
     app = Starlette(routes=[Route("/api/tasks/{task_id}/events", endpoint=api_task_events, methods=["GET"])])
     app.state.drive_root = data
 

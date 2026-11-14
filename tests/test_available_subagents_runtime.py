@@ -248,12 +248,6 @@ def test_selected_session_visibility_failure_blocks_without_native_substitution(
         ),
     )
     monkeypatch.setattr(agent_module, "envelope_from_task", lambda *_a, **_k: {})
-    monkeypatch.setattr(
-        subagents, "preflight_native_fallback_dispatch",
-        lambda *_a, **_k: (_ for _ in ()).throw(
-            AssertionError("a selected row must never host-fallback to native")
-        ),
-    )
     task = {"id": "child1", "configured_subagent": {"schema": 1}}
     amended, changed = agent_module.preflight_delegate_visibility(
         SimpleNamespace(available_tools=lambda: []), task, dispatch,
@@ -359,13 +353,16 @@ def test_pending_over_budget_recovery_replays_compact_body_and_full_fingerprint(
         ),
     )
     calls = []
-    monkeypatch.setattr(
-        delegate, "exact_start",
-        lambda _ctx, prompt, spec: (
-            calls.append((prompt, spec))
-            or delegate_result({"status": "started", "run_id": "run-source-recovered"})
-        ),
-    )
+    def start(_ctx, prompt, spec):
+        calls.append((prompt, spec))
+        assert custody.record_started(tmp_path, custody.RunCustody(
+            run_id="run-source-recovered", task_id=task["id"], invocation_id=spec["retry_of"],
+            selected_subagent_id=snapshot["selected_subagent_id"], config_fingerprint=snapshot["config_fingerprint"],
+            authority_fingerprint=authority, work_order_fingerprint=full_fingerprint))
+        return delegate_result({"status": "started", "run_id": "run-source-recovered"})
+
+    monkeypatch.setattr(delegate, "exact_start", start)
+    monkeypatch.setattr(recovery, "_run_probe_error", lambda *_a: "")
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id=task["id"])
     ctx.budget_drive_root = str(tmp_path)
     out = recovery.adopt_handoff(ctx, task)
@@ -417,10 +414,9 @@ def test_real_task_context_bootstraps_before_context_and_any_llm(monkeypatch, tm
         order.append("physical_start")
         or delegate_result({"status": "started", "run_id": "run-pre-start"})
     ))
-    monkeypatch.setattr(
-        supervision, "supervised_wait",
-        lambda *_a, **_kw: pytest.fail("the host must not wait inside bootstrap (owner 1=A)"),
-    )
+    for name in ("run_wait", "_publish"):  # neither a wait nor a wake of one
+        monkeypatch.setattr(supervision, name, lambda *_a, **_kw: pytest.fail(
+            "the host must not wait inside bootstrap (owner 1=A)"))
     def build_context(**_kwargs):
         order.append("context_build")
         return [], {}
@@ -443,11 +439,11 @@ def test_real_task_context_bootstraps_before_context_and_any_llm(monkeypatch, tm
         "drive_root": str(drive), "budget_drive_root": str(drive),
     })
     assert order == ["physical_start", "context_build"]
-    assert any("CONFIGURED SESSION STARTUP / WAKE RECEIPT" in item["content"] for item in messages)
-    receipt = next(item["content"] for item in messages if "CONFIGURED SESSION STARTUP / WAKE RECEIPT" in item["content"])
-    assert "configured_session_started" in receipt
-    assert "run-pre-start" in receipt
-    assert "Waiting is your decision" in receipt
+    assert not any("CONFIGURED SESSION STARTUP / WAKE RECEIPT" in item["content"] for item in messages)
+    # The loop appends only after its continuation has restored messages[:].
+    receipt = json.loads(_ctx._configured_startup_wake)
+    assert receipt["status"] == "configured_session_started"
+    assert receipt["startup"]["run_id"] == "run-pre-start"
     assert _ctx._configured_actor_bootstrap["selected_subagent_id"] == "session-builder"
     assert _ctx._configured_actor_bootstrap["canonical_work_order"]
     assert _ctx._configured_actor_bootstrap["physical_started"] is True
@@ -490,6 +486,7 @@ def test_actor_first_delegate_start_binds_snapshot_and_canonical_work_order(monk
             "compiled_work_order": True,
             "work_order_fingerprint": "full-work-order-sha",
             "_coordination_context": "",
+            "effort_fact": {},
             **geometry,
         },
     )]
@@ -713,22 +710,16 @@ def test_actor_first_delegate_start_rejects_alternate_snapshot(monkeypatch, tmp_
         ctx, "retarget me", subagent_id="other-session",
     ).text)
     assert out["status"] == "refused"
-    assert out["reason"] == "configured_actor_route_mismatch"
-    assert out["host_fallback"] is False
+    assert out["reason"] == "unknown_subagent_id"
 
 
 def test_actor_first_retry_cannot_turn_coordination_prompt_into_work_order_prefix(monkeypatch, tmp_path):
+    """An unrecorded retry token is refused before comparing its prompt assertion."""
     import ouroboros.subagent_runtime as runtime
     import ouroboros.claudexor_daemon as daemon
 
-    class Gateway:
-        def harnesses(self):
-            return [{"id": "codex", "manifest": {"capabilities": {}}}]
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(daemon, "ensure_owned_gateway", Gateway)
+    monkeypatch.setattr(daemon, "ensure_owned_gateway",
+                        lambda: pytest.fail("a refused retry must not reach the daemon"))
     snapshot = _snapshot(_settings(_session_row()), "session-builder")
 
     ctx = SimpleNamespace(
@@ -743,17 +734,12 @@ def test_actor_first_retry_cannot_turn_coordination_prompt_into_work_order_prefi
             "work_order_chars": 250001,
         },
     )
-    monkeypatch.setattr(
-        runtime, "exact_start",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("an over-budget retry must refuse before exact_start")
-        ),
-    )
     out = json.loads(runtime.delegate_start_entry(
         ctx, "coordination text is not the canonical assignment", retry_of="inv-1",
     ).text)
     assert out["status"] == "refused"
-    assert out["reason"] == "configured_work_order_unavailable"
+    assert out["reason"] == "unknown_invocation"
+    assert "coordination_text" not in out
 
 
 def test_actor_first_legacy_retry_replays_recorded_partial_body(monkeypatch, tmp_path):
@@ -779,9 +765,14 @@ def test_actor_first_legacy_retry_replays_recorded_partial_body(monkeypatch, tmp
         project_id="", project_owned=False, route="codex",
         work_order_coverage="partial", work_order_source_request={"coverage": "partial"},
     )
-    out = json.loads(runtime.delegate_start_entry(ctx, "ignored", retry_of="inv-legacy").text)
+    out = json.loads(runtime.delegate_start_entry(ctx, "", retry_of="inv-legacy").text)
     assert out["status"] == "started"
-    assert starts == [(stored_prompt, {"retry_of": "inv-legacy", "_resolved_binding": None})]
+    # Empty prompt lets the shared validator replay the stored body unchanged.
+    assert starts == [("", {"retry_of": "inv-legacy", "_resolved_binding": None})]
+    from ouroboros.tools.delegate_integration import _validated_invocation
+
+    record, refusal = _validated_invocation(tmp_path, "inv-legacy", ctx.task_id, "")
+    assert refusal is None and record["request"] == {"prompt": stored_prompt}
 
 
 def test_actor_first_bootstrap_adopts_existing_handoff_without_new_start(monkeypatch, tmp_path):
@@ -793,10 +784,9 @@ def test_actor_first_bootstrap_adopts_existing_handoff_without_new_start(monkeyp
     monkeypatch.setattr(recovery, "adopt_handoff", lambda _ctx, _task: {
         "status": "adopted", "run_id": "run-recovered",
     })
-    monkeypatch.setattr(
-        "ouroboros.delegate_supervision.supervised_wait",
-        lambda *_a, **_kw: pytest.fail("the host must not wait inside bootstrap (owner 1=A)"),
-    )
+    for name in ("run_wait", "_publish"):  # neither a wait nor a wake of one
+        monkeypatch.setattr("ouroboros.delegate_supervision." + name, lambda *_a, **_kw: pytest.fail(
+            "the host must not wait inside bootstrap (owner 1=A)"))
     dispatch = SimpleNamespace(
         blocked=False,
         executor="harness",
@@ -824,12 +814,12 @@ def test_actor_first_bootstrap_adopts_existing_handoff_without_new_start(monkeyp
     mismatch = json.loads(runtime.delegate_start_entry(
         ctx, "switch route", subagent_id="another-session",
     ).text)
-    assert mismatch["reason"] == "configured_actor_route_mismatch"
+    assert mismatch["reason"] == "unknown_subagent_id"
 
 
 def test_atomic_start_attempt_does_not_trigger_legacy_no_delegate_nudges(tmp_path):
     from ouroboros.delegate_evidence import record_start_blocked
-    from ouroboros.loop import _forced_delegation_note, _nanny_finalization_message
+    from ouroboros.loop import _forced_delegation_note, _pre_delivery_notice
     from ouroboros.tools.registry import ToolContext
 
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id="child1")
@@ -840,35 +830,41 @@ def test_atomic_start_attempt_does_not_trigger_legacy_no_delegate_nudges(tmp_pat
         _ctx=ctx,
         available_tools=lambda: ["delegate_start", "delegate_wait", "delegate_cancel"],
     )
-    assert _nanny_finalization_message(tools, tmp_path, "child1") == ""
+    # A refused start is no open run: the finish door has nothing to say about it.
+    assert _pre_delivery_notice(tools, tmp_path, "child1", {"tool_calls": []}, []) == ""
     assert _forced_delegation_note(ctx, {"tool_calls": []}) == ""
 
 
-def test_quiet_windows_renew_and_terminal_plus_mailbox_coalesce(tmp_path):
-    from ouroboros import delegate_custody as custody
-    from ouroboros.delegate_supervision import supervised_wait
+def test_a_quiet_run_keeps_the_sleep_and_its_terminal_plus_mail_coalesce_into_one_wake(tmp_path):
+    """A quiet run keeps a delegate_wait's sleep (nothing renews it and nothing reads it); its terminal and mail that
+    landed beside it are ONE wake: one read of the run, the mail whole in it."""
+    from ouroboros import delegate_custody as custody, delegate_supervision as ds, model_sleep
     from ouroboros.owner_mailbox import write_task_message
+    from tests._run_wait_shared import held_run, wake_now
 
     ctx = SimpleNamespace(
         task_id="child1",
+        task_attempt=1,
         drive_root=tmp_path,
         budget_drive_root=str(tmp_path),
         task_metadata={"configured_subagent": {"config_fingerprint": "fp"}},
     )
+    held_run(tmp_path, "run-1", "child1")
+    chosen = ds._choice({"runs": ["run-1"]})
+    assert model_sleep.wake_reason(ctx, chosen) == ""
+    write_task_message(
+        tmp_path, "new direction", "child1", source_task_id="parent1",
+        provenance="ancestor_task", msg_id="m1",
+    )
+    held_run(tmp_path, "run-1", "child1", ended="succeeded")
     calls = []
 
     def wait_once(_ctx, run_id, _sec, since):
         calls.append((run_id, since))
-        if len(calls) < 3:
-            return json.dumps({"status": "no_progress", "run_id": run_id, "last_seq": len(calls)})
-        write_task_message(
-            tmp_path, "new direction", "child1", source_task_id="parent1",
-            provenance="ancestor_task", msg_id="m1",
-        )
         return json.dumps({"status": "completed", "run_id": run_id, "last_seq": 3})
 
-    out = json.loads(supervised_wait(ctx, "run-1", wait_once=wait_once).text)
-    assert len(calls) == 3
+    out = json.loads(wake_now(ctx, "run-1", wait_once=wait_once, woke_by=model_sleep.wake_reason(ctx, chosen)).text)
+    assert len(calls) == 1
     assert out["status"] == "completed"
     [message] = out["wake_events"]
     assert message["msg_id"] == "m1"
@@ -880,15 +876,13 @@ def test_quiet_windows_renew_and_terminal_plus_mailbox_coalesce(tmp_path):
         json.loads(line)["type"]
         for line in custody.event_log_path(tmp_path).read_text().splitlines()
     }
-    assert {
-        "delegate_supervision_wait_entered",
-        "delegate_supervision_wait_renewed",
-        "delegate_supervision_wake_pending",
-    } <= event_types
+    assert "delegate_supervision_wake_pending" in event_types
+    assert not {"delegate_supervision_wait_entered", "delegate_supervision_wait_renewed"} & event_types
 
 
 def test_pending_wake_replays_until_post_injection_ack(tmp_path):
-    from ouroboros.delegate_supervision import acknowledge_pending_wake, supervised_wait
+    from ouroboros.delegate_supervision import acknowledge_pending_wake, run_wait
+    from tests._run_wait_shared import wake_now
     from ouroboros.owner_mailbox import (
         acknowledged_task_message_ids, write_task_message,
     )
@@ -900,7 +894,7 @@ def test_pending_wake_replays_until_post_injection_ack(tmp_path):
         tmp_path, "full durable direction", "child1", source_task_id="parent1",
         provenance="ancestor_task", msg_id="m1",
     )
-    first = json.loads(supervised_wait(
+    first = json.loads(wake_now(
         ctx, "run-1",
         wait_once=lambda *_a, **_k: json.dumps({
             "status": "no_progress", "run_id": "run-1", "last_seq": 4,
@@ -908,13 +902,8 @@ def test_pending_wake_replays_until_post_injection_ack(tmp_path):
     ).text)
     assert first["wake_events"][0]["text"] == "full durable direction"
     assert acknowledged_task_message_ids(tmp_path, "child1") == set()
-    replay = json.loads(supervised_wait(
-        ctx, "run-1",
-        wait_once=lambda *_a, **_k: (_ for _ in ()).throw(
-            AssertionError("an unacknowledged wake must replay before another poll")
-        ),
-    ).text)
-    assert replay == first
+    replay = json.loads(run_wait(ctx, "run-1").text)  # replayed before any sleep is armed or the run read
+    assert replay.pop("replay_of")["fresh_observation"] is False and replay == first  # marked, else as published
     assert acknowledge_pending_wake(ctx, replay)
     assert acknowledged_task_message_ids(tmp_path, "child1") == {"m1"}
 
@@ -924,6 +913,7 @@ def test_one_shot_checkpoint_is_reasoned_and_consumed(monkeypatch, tmp_path):
     from ouroboros.contracts.task_contract import build_task_contract
     from ouroboros.task_results import STATUS_RUNNING, write_task_result
     import ouroboros.delegate_supervision as supervision
+    from tests._run_wait_shared import held_run, scripted_reads
 
     now = [100.0]
     monkeypatch.setattr(supervision.time, "time", lambda: now[0])
@@ -946,9 +936,11 @@ def test_one_shot_checkpoint_is_reasoned_and_consumed(monkeypatch, tmp_path):
         now[0] += 2
         return json.dumps({"status": "no_progress", "run_id": run_id, "last_seq": 0})
 
-    out = json.loads(supervision.supervised_wait(
-        ctx, "run-1", checkpoint_after_sec=1,
-        checkpoint_reason="inspect a promised artifact", wait_once=wait_once,
+    held_run(tmp_path, "run-1", "child1", route="")
+    scripted_reads(monkeypatch, wait_once)
+    monkeypatch.setattr(supervision, "_TICK_SEC", 0.05)  # the in-slot wait's beat (no continuation owner here)
+    out = json.loads(supervision.run_wait(
+        ctx, "run-1", checkpoint_after_sec=1, checkpoint_reason="inspect a promised artifact",
     ).text)
     wake_id = out.pop("supervision_wake_id")
     assert wake_id
@@ -956,22 +948,15 @@ def test_one_shot_checkpoint_is_reasoned_and_consumed(monkeypatch, tmp_path):
     assert coordination_context["root_task_id"] == "child1"
     assert coordination_context["parent_intent"]["state"] == "absent"
     assert coordination_context["time"]["state"] == "not_set"
-    assert coordination_context["review_capacity"]["state"] == "available"
+    assert out.pop("sleep")["slept_sec"] == 2.0 and out.pop("leaf_live_input") == "unknown"
     assert out == {
-        "status": "inspection_checkpoint",
-        "run_id": "run-1",
-        "reason": "inspect a promised artifact",
-        "last_seq": 0,
+        "status": "inspection_checkpoint", "run_id": "run-1",
+        "reason": "inspect a promised artifact", "last_seq": 0,
     }
-    state = supervision.supervision_checkpoint(ctx)
-    assert state["checkpoint"]["consumed"] is True
-    assert state["checkpoint"]["consumed_by"] == "scheduled_checkpoint"
-    event_types = [
-        json.loads(line)["type"]
-        for line in custody.event_log_path(tmp_path).read_text().splitlines()
-    ]
-    assert "delegate_supervision_checkpoint_scheduled" in event_types
-    assert "delegate_supervision_checkpoint_consumed" in event_types
+    events = [json.loads(line) for line in custody.event_log_path(tmp_path).read_text().splitlines()]
+    assert "delegate_supervision_checkpoint_scheduled" in [event["type"] for event in events]
+    [consumed] = [event for event in events if event["type"] == "delegate_supervision_checkpoint_consumed"]
+    assert consumed["consumed_by"] == "scheduled_checkpoint" and consumed["reason"] == "inspect a promised artifact"
 
 
 def test_task_message_provenance_never_spoofs_owner(tmp_path):
@@ -1019,7 +1004,9 @@ def test_ancestor_can_relay_to_a_true_grandchild_without_owner_spoof(tmp_path):
     assert entry["source_task_id"] == "parent"
     assert entry["relayed_from_task_id"] == "peer"
 
-    # A shared root label plus a parent-cycle is not a descendant proof.
+    # A shared root label plus a parent-cycle is not a descendant proof: the label
+    # admits CONTEXT (a peer_task row the recipient judges, relation ``tree``), never
+    # ancestor steering or a relay, which keep the durable parent chain.
     write_task_result(
         tmp_path, "cycle-a", STATUS_RUNNING, parent_task_id="cycle-b",
         root_task_id="parent", child_drive_root=str(child_drive), result="running",
@@ -1028,35 +1015,33 @@ def test_ancestor_can_relay_to_a_true_grandchild_without_owner_spoof(tmp_path):
         tmp_path, "cycle-b", STATUS_RUNNING, parent_task_id="cycle-a",
         root_task_id="parent", result="running",
     )
-    assert "TASK_FORBIDDEN" in _forward_to_worker(ctx, "cycle-a", "must not deliver")
+    relayed = _forward_to_worker(ctx, "cycle-a", "peer evidence", relayed_from_task_id="peer")
+    assert "TASK_FORBIDDEN" in relayed and "ancestor-only act" in relayed
+    assert "message from a peer task" in _forward_to_worker(ctx, "cycle-a", "context, not steering")
+    [row] = drain_owner_entries(child_drive, "cycle-a", seen_ids=set())
+    assert (row["provenance"], row["relation"]) == ("peer_task", "tree")
+    assert row["source_task_id"] == "parent" and not row.get("relayed_from_task_id")
 
 
-def test_replacement_is_refused_before_gateway_or_post(monkeypatch, tmp_path):
+def test_undisposed_capture_allows_an_independent_actor_selection(monkeypatch, tmp_path):
     from ouroboros import delegate_custody as custody
-    import ouroboros.tools.delegate as delegate
+    import ouroboros.subagent_runtime as runtime
     from ouroboros.tools.registry import ToolContext
-    import ouroboros.claudexor_daemon as daemon
 
-    custody._CUSTODY.clear()
-    monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "codex=gpt-5.6-sol:high")
-    old = custody.RunCustody(
-        run_id="run-old", task_id="child1", route_id="codex", snapshot_id="snap-old",
-    )
+    old = custody.RunCustody(run_id="run-old", task_id="child1", route_id="codex", snapshot_id="snap-old")
     custody.record_started(tmp_path, old)
     custody.emit(tmp_path, custody.SETTLED, {"run_id": "run-old", "task_id": "child1"})
     custody.record_patch_captured(tmp_path, old)
-    custody._CUSTODY.clear()
-    monkeypatch.setattr(daemon, "ensure_owned_gateway", lambda: (_ for _ in ()).throw(
-        AssertionError("gateway must not open before settlement guard")))
-    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
-    ctx.task_id = "child1"
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id="child1")
     snapshot = _snapshot(_settings(_session_row()), "session-builder")
-    out = json.loads(delegate.exact_start(
-        ctx, "replacement work", {"snapshot": snapshot},
-    ).text)
-    assert out["status"] == "refused"
-    assert out["reason"] == "replacement_requires_settlement"
-    assert out["undisposed_patch_run_ids"] == ["run-old"]
+    token = runtime._EXACT_START_SELECTION.set({"snapshot": snapshot})
+    try:
+        actor, refusal = runtime.prepare_delegate_start_actor(ctx, tmp_path, recovering=False, invocation_id="",
+            work_order_fingerprint="new", authority_fingerprint="authority")
+    finally:
+        runtime._EXACT_START_SELECTION.reset(token)
+    assert refusal is None and actor["selected_subagent_id"] == "session-builder"
+    assert not custody.replay(tmp_path)["run-old"].patch_disposed
 
 
 def test_replacement_refuses_unreadable_custody_before_fail_soft_scan(
@@ -1145,7 +1130,7 @@ def test_worker_crash_mismatch_vetoes_without_post_and_cause_matrix(monkeypatch,
     ctx.task_id = "child1"
     ctx.budget_drive_root = str(tmp_path)
     result = recovery.adopt_handoff(ctx, bad)
-    assert result == {"status": "recovery_required", "reason": "successor_binding_mismatch"}
+    assert result["status"] == "recovery_required" and result["reason"] == "config_mismatch"
     assert recovery._read(tmp_path, "child1")["status"] == "vetoed"
 
     planned = recovery.prepare_handoff(
@@ -1214,7 +1199,8 @@ def test_same_run_crash_adoption_uses_exact_binding_and_never_posts(monkeypatch,
     monkeypatch.setattr(delegate, "exact_start", lambda *_a, **_k: (_ for _ in ()).throw(
         AssertionError("a verified live run must be adopted without a second POST")
     ))
-    assert recovery.adopt_handoff(ctx, task) == {
+    adopted = recovery.adopt_handoff(ctx, task)
+    assert {key: adopted[key] for key in ("status", "run_id", "cause")} == {
         "status": "adopted", "run_id": "run-1", "cause": recovery.CAUSE_WORKER_CRASH,
     }
 
@@ -1360,9 +1346,9 @@ def test_planned_restart_selectively_restores_sleeping_leaf_and_wait_state(monke
     assert adopted["status"] == "adopted"
     assert adopted["wake"]["pending_interactions"][0]["question"] == "Choose"
     restored = json.loads(wait_path.read_text(encoding="utf-8"))
-    assert restored["journal_cursor"] == 7
+    assert restored["runs"]["run-1"]["journal_cursor"] == 7
     assert restored["mailbox_acknowledged_ids"] == ["m-old"]
-    assert restored["checkpoint"]["reason"] == "inspect artifact"
+    assert restored["runs"]["run-1"]["checkpoint"]["reason"] == "inspect artifact"
     assert "run-1" not in interactions._REPORTED_INTERACTIONS
     from ouroboros.delegate_supervision import acknowledge_pending_wake
     assert acknowledge_pending_wake(ctx, adopted["wake"])
@@ -1436,3 +1422,60 @@ def test_review_substrate_runs_never_occupy_the_actors_delegation_slot(tmp_path)
     ))
     custody._CUSTODY.clear()
     assert unsettled_start_ids(tmp_path, "actor1")["open_run_ids"] == ["run-mine"]
+
+
+def test_the_legacy_lane_seam_never_selects_an_owner_disabled_migrated_row():
+    """The bounded legacy seam is a compatibility projection, not a second
+    authority: a row the owner switched off is excluded there too, so the seam
+    reports an ambiguous selection instead of quietly starting a paused actor."""
+    from ouroboros.subagent_runtime import SubagentSelectionError, select_subagent_snapshot
+
+    legacy = {"OUROBOROS_MODEL_HEAVY": "owner/custom-heavy"}
+    snapshot, used_legacy = select_subagent_snapshot(
+        legacy, legacy_model_lane="heavy", legacy_model_lane_supplied=True,
+    )
+    assert used_legacy is True and snapshot["selected_subagent_id"] == "legacy-heavy"
+
+    saved = json.loads(_settings(_api_row("legacy-heavy", model="owner/custom-heavy"))[
+        "OUROBOROS_SUBAGENTS"])
+    saved["items"][0]["enabled"] = False
+    migrated = {
+        "OUROBOROS_SUBAGENT_HARNESS": "off",
+        "OUROBOROS_SUBAGENTS": json.dumps(saved),
+    }
+    with pytest.raises(SubagentSelectionError) as refused:
+        select_subagent_snapshot(
+            migrated, legacy_model_lane="heavy", legacy_model_lane_supplied=True,
+        )
+    assert refused.value.code == "subagent_selection_required"
+
+
+def test_an_owner_disabled_local_api_row_no_longer_asks_for_a_local_runtime():
+    """Autostart follows real dispatchable intent: a switched-off local row
+    must not keep a local model server running for work it can never do."""
+    from ouroboros.server_runtime import needs_local_model_autostart
+
+    local_row = _api_row("local-scout", model="owner-model (local)")
+    assert needs_local_model_autostart(_settings(local_row))
+
+    off = dict(local_row, enabled=False)
+    assert not needs_local_model_autostart(_settings(off))
+    # An enabled sibling still needs it.
+    assert needs_local_model_autostart(_settings(off, _api_row(
+        "local-builder", model="other-model (local)")))
+
+
+def test_scheduling_receipt_names_nanny_route_and_billing_for_session_rows_only():
+    from ouroboros.tools.control_scheduling import _finalize_schedule_emission
+    ctx = SimpleNamespace(active_model="claudexor::claude=sonnet-4-6", active_use_local=False, task_metadata={})
+    route = {"model": "claudexor::claude=sonnet-4-6", "use_local_model": False}
+    session_receipt = _finalize_schedule_emission(ctx, {
+        "task_ids": ["11223344"], "objective": "Build feature", "parent_cognitive_route": route,
+        "configured_subagent": _snapshot(_settings(_session_row()), "session-builder"),
+    })
+    assert "route=agent_session, recursive nanny on claudexor::claude=sonnet-4-6 (bills as subscription); exact route/work-order authority is frozen before its first model call" in session_receipt
+    api_receipt = _finalize_schedule_emission(ctx, {
+        "task_ids": ["55667788"], "objective": "Build API feature", "parent_cognitive_route": route,
+        "configured_subagent": _snapshot(_settings(_api_row()), "api-builder"),
+    })
+    assert "route=api_model, ordinary recursive API actor)" in api_receipt and "recursive nanny" not in api_receipt

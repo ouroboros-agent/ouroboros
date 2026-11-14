@@ -3,27 +3,25 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
-from typing import Any, Dict
+from typing import Any, Callable, Dict
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.background import BackgroundTask
 
-from ouroboros import get_version
+from ouroboros import deployment_policy as _deployment_policy, get_version
 from ouroboros.gateway._helpers import json_error, json_exception, request_drive_root, request_json_or, request_repo_dir
 from ouroboros.gateway.ws import broadcast_ws_sync
 from ouroboros.gateway import update_progress
-from ouroboros.outcomes import public_task_result
 from ouroboros.utils import utc_now_iso
 
 log = logging.getLogger(__name__)
 
 _RECENT_VISIBLE_COMMANDS: Dict[str, float] = {}
 _VISIBLE_COMMAND_DEDUPE_SEC = 5.0
-_evo_cache: Dict[str, Any] = {}
-_evo_task: asyncio.Task | None = None
 
 
 def _request_restart(request: Request) -> bool:
@@ -51,12 +49,14 @@ def _managed_update_payload(*, fetch: bool, include_tags: bool) -> dict[str, Any
     from supervisor.update_merge import active_update_tx
 
     status = compute_managed_update_status(fetch=fetch)
-    # The update letter rides the same payload: written only after a FETCHING
-    # check (never on the passive read), projected against the live HEAD/target.
+    # The update description rides the same payload: a FETCHING check records only
+    # facts (never prose, never on the passive read), with the running source separate
+    # from the mutable checkout HEAD that binds apply/preflight.
     letter = None
     try:
         from ouroboros import update_letter as _letter
 
+        status = _letter.runtime_status(status)
         if fetch:
             _letter.refresh_after_check(status)
         letter = _letter.project_letter_for_panel(status)
@@ -68,13 +68,16 @@ def _managed_update_payload(*, fetch: bool, include_tags: bool) -> dict[str, Any
     try:
         tx = active_update_tx()
     except Exception:
-        tx = {}
+        tx = None  # Unread is not absent for the retained attempt.
     update_tx = (
         {
             "active": True,
             "phase": str(tx.get("phase") or ""),
             "task_id": str(tx.get("task_id") or ""),
             "restart_required": bool(tx.get("restart_required")),
+            **({"attempt_id": str(tx["attempt_id"])} if tx.get("attempt_id") else {}),
+            **({"local_work_recovery": True} if tx.get("stash_restore")
+               or tx.get("gate_blocked_reason") == "rollback_restart_pending" else {}),
         }
         if tx
         else {"active": False}
@@ -95,9 +98,10 @@ def _managed_update_payload(*, fetch: bool, include_tags: bool) -> dict[str, Any
         "latest_version": latest_version,
         "official_tags": official_tags,
         "update_tx": update_tx,
-        "update_progress": update_progress.snapshot(),
+        "update_progress": update_progress.snapshot(tx),
         "letter": letter,
         **status,
+        **({"managed_by_deployment": _deployment_policy.BODY_STATUS} if _body_refusal() else {}),
     }
 
 
@@ -141,6 +145,15 @@ async def api_reset(request: Request) -> JSONResponse:
     if lock_error is not None:
         return lock_error
     try:
+        from supervisor.message_bus import try_get_bridge
+
+        bridge = try_get_bridge()
+        if bridge is not None:
+            bridge.panic.invalidate_owner()
+        from ouroboros.launch_roots import durable_basis
+        from supervisor.state_initialization import mark_pending, supervisor_evidence
+
+        basis, _why = durable_basis(data_dir, evidence=supervisor_evidence)  # read before state/ goes: Reset keeps it
         deleted = []
         # Keep synchronization files until restart. Removing the directory that
         # contains the held managed-update lock would let a second updater enter.
@@ -153,6 +166,10 @@ async def api_reset(request: Request) -> JSONResponse:
         if settings_file.exists():
             settings_file.unlink()
             deleted.append("settings.json")
+        # The owner's explicit fresh start (#1307): boot initializes a new state from
+        # this pending witness instead of reading the wiped root as a lost one; the work
+        # folders it never deletes keep their basis (#1239).
+        mark_pending(data_dir, origin="owner_reset", work_root_basis=basis)
         _request_restart(request)
         return JSONResponse({"status": "ok", "deleted": deleted, "restarting": True})
     except Exception as exc:
@@ -165,17 +182,43 @@ async def api_command(request: Request) -> JSONResponse:
     try:
         body = await request.json()
         cmd = body.get("cmd", "")
+        if str(cmd).strip().lower().startswith("/panic"):
+            from ouroboros.panic_source import source_evidence
+            surface = body.get("client_surface")
+            kind = "web_ui_http" if isinstance(surface, dict) else "other_http"
+            panic_evidence = source_evidence(request, kind, client_surface=surface)
+
+        if not isinstance(body.get("reply_to", ""), str):
+            return json_error("reply_to must be an address string", 400, accepted=False)
         if cmd:
             from supervisor.message_bus import get_bridge, log_chat
 
             try:
                 bridge = get_bridge()
             except AssertionError:
-                callback = getattr(request.app.state, "startup_owner_command", None)
-                action = callback(cmd) if callable(callback) else None
-                if action is not None:
-                    return JSONResponse({"status": "ok"}, background=BackgroundTask(action))
-                return json_error("Complete provider setup before sending this command.", 409)
+                bridge = None
+            if str(cmd).strip().lower().startswith("/panic"):
+                from ouroboros.server_control import request_panic
+
+                if request_panic(bridge, cmd, evidence=panic_evidence,
+                                 startup_owner_command=getattr(request.app.state, "startup_owner_command", None)):
+                    return JSONResponse({"status": "ok"})
+                return json_error("Panic emergency owner is unavailable.", 503)
+            if "if_boot" in body:
+                from ouroboros.server_liveness import BOOT
+
+                expected = body["if_boot"]
+                if not isinstance(expected, str) or not expected:
+                    return json_error("if_boot must be a non-empty boot.since string", 400, accepted=False)
+                if expected != BOOT.snapshot(jobs=False)["since"]:
+                    return json_error("Ouroboros restarted before this command arrived.", 409,
+                                      accepted=False, reason_code="boot_changed")
+            from supervisor.message_ingress import ui_control_fact
+
+            try:  # the producer that composed this command from a control names it; typed text never does
+                control = ui_control_fact(body.get("ui_control"), pressed_at=utc_now_iso(), command=str(cmd))
+            except ValueError as exc:
+                return json_error(str(exc), 400, accepted=False)
             visible_text = str(body.get("visible_text") or "").strip()
             task_constraint = body.get("task_constraint") if isinstance(body.get("task_constraint"), dict) else None
             visible_task_id = str(body.get("visible_task_id") or "").strip()
@@ -196,7 +239,17 @@ async def api_command(request: Request) -> JSONResponse:
             # SPA heal/repair posts) would otherwise masquerade as ordinary web
             # frames. The honest stamp names the ENDPOINT — the host cannot know
             # the true caller here (disclosed non-goal).
-            send_kwargs["task_metadata"] = {"client_surface": {"channel": "api_command"}}
+            send_kwargs["task_metadata"] = {"client_surface": {"channel": "api_command"}, "reply_to": body.get("reply_to", ""),
+                                            **({"ui_control": control} if control else {})}
+            # Publication precedes readiness. Bind the independent owner, keeping
+            # this transport's metadata if the supervisor becomes ready meanwhile.
+            if bridge is None or str(cmd).strip().lower() == "/restart":
+                callback = getattr(request.app.state, "startup_owner_command", None)
+                action = callback(cmd, send_kwargs=send_kwargs) if callable(callback) else None
+                if action is not None:
+                    return JSONResponse({"status": "ok"}, background=BackgroundTask(action))
+            if bridge is None:
+                return json_error("Complete provider setup before sending this command.", 409, accepted=False)
             bridge.ui_send(cmd, **send_kwargs)
             if visible_task_id:
                 _RECENT_VISIBLE_COMMANDS[visible_task_id] = time.monotonic()
@@ -254,40 +307,78 @@ async def api_git_log(_request: Request) -> JSONResponse:
         return json_exception(exc)
 
 
+_ROLLBACK_REASONS = {"ui_rollback": "ui_rollback", "vcs_rollback": "agent_rollback_tool"}
+
+
+def _body_refusal() -> dict:
+    """A managed deployment's typed refusal of a door that would replace the serving program, before any lock,
+    fetch, writer fence or restart (``deployment_policy.body_replacement_refusal``); ``{}`` unmanaged."""
+    from ouroboros.deployment_policy import body_replacement_refusal
+    from ouroboros.gateway.owner_settings import MANAGED_BY_DEPLOYMENT
+
+    refusal = body_replacement_refusal()
+    return {"error": refusal, "code": MANAGED_BY_DEPLOYMENT} if refusal else {}
+
+
+def rollback_through_door(target: str, *, door: str, request_restart: Callable[[], bool]) -> tuple[int, dict]:
+    """The one Rollback procedure (the UI button; the agent's ``vcs_rollback``, P4-S): lock,
+    resolve, stop every writer (other tasks are interrupted at once), then either record the
+    authority switch for the restart exit (a target without the store) or restore the
+    checkout now; the restart follows either way, unless Git refused the restore's reset at its
+    index lock (409 ``restore_not_applied``: no restart; the aborted-update path decides readmission).
+    Returns the HTTP status and payload."""
+    from supervisor.git_ops import DRIVE_ROOT, REPO_DIR, git_capture, rollback_to_version
+    from supervisor.git_ops_reset import IndexLockRefusal, refusal_parts
+    from ouroboros.store_switch import switch_or_reset
+
+    reason = _ROLLBACK_REASONS[door]
+    if managed := _body_refusal():
+        return 403, managed
+    refusal = _index_lock_precondition()
+    if refusal is not None:
+        return refusal.status_code, json.loads(refusal.body)
+    lock_fh, lock_error = _acquire_repo_mutation_lock()
+    if lock_error is not None:
+        return lock_error.status_code, json.loads(lock_error.body)
+    try:
+        rc, target_sha, error = git_capture(["git", "rev-parse", "--verify", f"{target}^{{commit}}"])
+        if rc != 0:
+            return 400, {"error": error or f"cannot resolve {target}"}
+        blockers = _quiesce_repo_writers("manual_rollback")
+        if blockers:
+            fence = _fence_failure(blockers)
+            return fence.status_code, json.loads(fence.body)
+        try:
+            ok, msg, deferred = switch_or_reset(
+                DRIVE_ROOT, REPO_DIR, target_sha=target_sha.strip(), target_ref=target, reason=reason, door=door,
+                reset=lambda: rollback_to_version(target_sha, reason=reason))
+        except IndexLockRefusal as exc:
+            if not exc.before_tree_effects:
+                raise
+            # Git refused the restore's only tree command at the held lock, so that reset changed nothing
+            # (the keep branch and rescue made before it stay). No restart the same lock would refuse: the
+            # aborted-update readmission runs, keeping the gate shut while its own guards still hold.
+            _respawn_workers_after_failed_update()
+            return 409, {"error": f"the restore was not applied: Git refused its reset: {refusal_parts(exc)[1]}",
+                         "reason": "restore_not_applied"}
+        if not ok:
+            return 500, {"error": msg, "restart_required": True}
+        try:
+            restarting = request_restart()
+        except Exception:
+            log.warning("rollback restart request failed", exc_info=True)
+            restarting = False
+        return 200, {"status": "ok" if restarting else "restart_required", "message": msg,
+                     "restarting": restarting, "switch_deferred": deferred}
+    finally:
+        _release_repo_mutation_lock(lock_fh)
+
+
 def _git_rollback_fenced(request: Request, target: str) -> JSONResponse:
     """Run the complete restore transaction off the gateway event loop."""
     try:
-        from supervisor.git_ops import git_capture, rollback_to_version
-
-        lock_fh, lock_error = _acquire_repo_mutation_lock()
-        if lock_error is not None:
-            return lock_error
-        try:
-            rc, target_sha, error = git_capture(
-                ["git", "rev-parse", "--verify", f"{target}^{{commit}}"]
-            )
-            if rc != 0:
-                return json_error(error or f"cannot resolve {target}", 400)
-            blockers = _quiesce_repo_writers("manual_rollback")
-            if blockers:
-                return _fence_failure(blockers)
-            ok, msg = rollback_to_version(target_sha, reason="ui_rollback")
-            if not ok:
-                return JSONResponse(
-                    {"error": msg, "restart_required": True}, status_code=500
-                )
-            try:
-                restarting = _request_restart(request)
-            except Exception:
-                log.warning("manual rollback landed but restart request failed", exc_info=True)
-                restarting = False
-            return JSONResponse({
-                "status": "ok" if restarting else "restart_required",
-                "message": msg,
-                "restarting": restarting,
-            })
-        finally:
-            _release_repo_mutation_lock(lock_fh)
+        status, payload = rollback_through_door(target, door="ui_rollback", request_restart=lambda: _request_restart(request))
+        return JSONResponse(payload, status_code=status)
     except Exception as exc:
         return json_exception(exc)
 
@@ -306,6 +397,8 @@ async def api_git_rollback(request: Request) -> JSONResponse:
 
 async def api_git_promote(request: Request) -> JSONResponse:
     """Promote the current dev branch to the runtime's stable branch."""
+    if managed := _body_refusal():
+        return JSONResponse(managed, status_code=403)
     try:
         lock_fh, lock_error = _acquire_repo_mutation_lock()
         if lock_error is not None:
@@ -333,7 +426,9 @@ async def api_git_promote(request: Request) -> JSONResponse:
 async def api_update_status(_request: Request) -> JSONResponse:
     """Return passive managed-update status without fetching."""
     try:
-        return JSONResponse(_managed_update_payload(fetch=False, include_tags=False))
+        return JSONResponse(await asyncio.to_thread(
+            _managed_update_payload, fetch=False, include_tags=False,
+        ))
     except Exception as exc:
         return json_exception(exc)
 
@@ -347,8 +442,8 @@ async def api_update_check(_request: Request) -> JSONResponse:
             include_tags=True,
         )
         if payload.get("check_ok") is True:
-            update_progress.acknowledge_failure()
-            payload["update_progress"] = update_progress.snapshot()
+            # Availability may have changed for every client; the retained attempt has not (#1818).
+            update_progress.notify_changed()
         return JSONResponse(payload)
     except Exception as exc:
         return json_exception(exc)
@@ -357,10 +452,10 @@ async def api_update_check(_request: Request) -> JSONResponse:
 def _respawn_workers_after_failed_update() -> None:
     """Revive workers when an update aborts after they were stopped (no restart follows)."""
     try:
-        from supervisor.workers import ensure_worker_pool_started, open_repo_writer_admission
+        from supervisor.workers import ensure_worker_pool_started, open_repo_writer_admission_after_update_abort
 
-        open_repo_writer_admission()
-        ensure_worker_pool_started(allow_disabled_restart=True)
+        if open_repo_writer_admission_after_update_abort():
+            ensure_worker_pool_started(allow_disabled_restart=True)
     except Exception:
         log.warning("update_apply: failed to respawn workers after aborted update", exc_info=True)
 
@@ -371,11 +466,85 @@ async def api_update_preflight(_request: Request) -> JSONResponse:
     can present the right staged choice (auto / assisted / manual)."""
     try:
         from supervisor.update_merge import plan_managed_update_merge
+        from ouroboros.update_impact import update_effects
 
         plan = await asyncio.to_thread(plan_managed_update_merge, fetch=True)
-        return JSONResponse({"merge_plan": plan})
+        effects = await asyncio.to_thread(update_effects, plan)
+        return JSONResponse({"merge_plan": plan, "effects": effects, **await _preflight_description(plan)})
     except Exception as exc:
         return json_exception(exc)
+
+
+async def _preflight_description(plan: dict) -> dict:
+    """Prose and qualification of exactly this plan's range; unavailable means unknown, never a refusal."""
+    from ouroboros.update_qualification import preflight_description
+
+    try:
+        return await asyncio.to_thread(preflight_description, plan)
+    except Exception:
+        log.warning("update preflight: range description unavailable", exc_info=True)
+        return {"letter": None, "qualification": None}
+
+
+async def api_update_description(request: Request) -> JSONResponse:
+    """The owner's Write/Rewrite: ONE ordinary Main task describes the named range.
+
+    The range must be the one the last check offered or the saved description's own; a
+    request whose task has not ended answers 409 with that task. The task is admitted with
+    its scheduled receipt like any host-started root, and runs on the ordinary Main route.
+    """
+    body = await request_json_or(request, {})
+    body = body if isinstance(body, dict) else {}
+    mode = str(body.get("mode") or "")
+    base_sha, target_sha = (str(body.get(name) or "").strip().lower() for name in ("base_sha", "target_sha"))
+    if mode not in ("write", "rewrite") or not base_sha or not target_sha:
+        return json_error("mode (write or rewrite), base_sha and target_sha are required.", 400)
+    try:
+        from ouroboros.update_letter import RecordBusy, request_description
+
+        try:
+            outcome = await asyncio.to_thread(request_description, mode, base_sha, target_sha,
+                                              admit=_admit_description_task)
+        except RecordBusy:
+            return json_error("The update description record is busy; nothing was requested.", 503)
+        if outcome["outcome"] == "in_flight":
+            return json_error("A description is already being written.", 409,
+                              task_id=outcome["task_id"], task_status=outcome["status"])
+        if outcome["outcome"] == "range_not_offered":
+            return json_error("This range is not the offered update or the saved description's range; "
+                              "check for updates first.", 409, legal_ranges=outcome["legal_ranges"])
+        if outcome["outcome"] == "refused":
+            return json_error(f"The writing task was not accepted ({outcome['reason']}).", 503,
+                              reason=outcome["reason"])
+        update_progress.notify_changed()
+        return JSONResponse({"status": "queued", "task_id": outcome["task_id"], "key": outcome["key"]})
+    except Exception as exc:
+        return json_exception(exc)
+
+
+def _admit_description_task(task_id: str, text: str, metadata: Dict[str, Any]) -> str:
+    """Admit the owner's description request as an ordinary root task in the owner chat;
+    returns ``""`` or the refusal reason. Nothing else is started or stopped. Typed as a root
+    like every host-started one, so a host retry stays this request's own attempt. The press
+    is the web panel's: while the binding is known empty (no owner message yet) the task is
+    Main's, where the panel's door opens it; a bound or unreadable binding is used as read."""
+    from ouroboros.contracts.chat_id_policy import WEB_UI_CHAT_ID
+    from supervisor.queue import enqueue_with_admission_receipt, persist_queue_snapshot
+    from supervisor.state import control_value, load_state
+
+    st = load_state()
+    unbound = control_value(st, "owner_chat_id") == (True, None)
+    admitted = enqueue_with_admission_receipt({
+        "id": task_id, "type": "task", "chat_id": WEB_UI_CHAT_ID if unbound else int(st.get("owner_chat_id") or 0),
+        "root_task_id": task_id, "delegation_role": "root",
+        "text": text, "metadata": metadata, "_require_worker_pool": True, "_require_unique_task_id": True,
+    })
+    if not isinstance(admitted, dict):
+        return "refused"
+    if admitted.get("_admission_blocked"):
+        return str(admitted.get("_worker_pool_disabled_reason") or admitted["_admission_blocked"])
+    persist_queue_snapshot(reason="update_description_requested")
+    return ""
 
 
 _KNOWN_UPDATE_PLAN_KINDS = frozenset({"clean", "conflicting"})
@@ -403,7 +572,38 @@ def _pins_match(plan: dict, base_sha: str, target_sha: str) -> bool:
     )
 
 
+def _index_lock_precondition() -> JSONResponse | None:
+    from supervisor.git_ops_reset import observe_index_lock
+
+    try:
+        fact = observe_index_lock()
+    except (OSError, RuntimeError) as exc:
+        return JSONResponse({
+            "error": f"Not applied: could not check Git's index lock: {exc}. No work was stopped.",
+            "reason": "index_lock_check_failed", "outcome": "not_applied",
+        }, status_code=409)
+    if fact["exists"]:
+        return JSONResponse({
+            "error": f"Not applied: Git index lock exists at {fact['path']}. No work was stopped.",
+            "reason": "index_lock_present", "outcome": "not_applied", "index_lock": fact,
+        }, status_code=409)
+    return None
+
+
 def _quiesce_repo_writers(reason: str) -> list[str]:
+    """Stop the repository writers with admission paused: a launch or Resume already writing its marks
+    hands over to the still-running pool first, and nothing new starts until the pool is stopped
+    (``workspace_preparation.pause_admission``); admission reopens for whatever follows."""
+    from supervisor.workspace_preparation import pause_admission, resume_admission
+
+    pause_admission()
+    try:
+        return _stop_repo_writers(reason)
+    finally:
+        resume_admission()
+
+
+def _stop_repo_writers(reason: str) -> list[str]:
     """Close new writers, drain in-process turns, then prove the pool stopped."""
     from supervisor.git_ops import DRIVE_ROOT
     from supervisor.workers import (
@@ -419,14 +619,23 @@ def _quiesce_repo_writers(reason: str) -> list[str]:
     if blocked:
         open_repo_writer_admission()
         return [f"active:{label}" for label in blocked]
+    from supervisor import workers as worker_state
+    from supervisor.restart_retention import capture_update_returns
+
+    try:
+        with worker_state._queue_lock:
+            update_returns = capture_update_returns(DRIVE_ROOT, worker_state.RUNNING, worker_state.WORKERS,
+                                                   return_ids=())
+    except Exception as exc:
+        return [f"saved_work_handoff:{type(exc).__name__}: {exc}"]
     preserve_running_task_ids: set[str] = set()
+    return_ids: set[str] = set()
     if reason != "manual_rollback":
         try:
             import uuid
 
             from ouroboros.delegate_recovery import prepare_planned_restart_handoffs
             from ouroboros.owner_wait import prepare_owner_wait_handoffs
-            from supervisor import workers as worker_state
 
             restart_transaction_id = uuid.uuid4().hex
             owner_wait_ids = prepare_owner_wait_handoffs(
@@ -438,10 +647,20 @@ def _quiesce_repo_writers(reason: str) -> list[str]:
                 restart_transaction_id=restart_transaction_id,
                 additional_task_ids=owner_wait_ids,
             )
+            from supervisor.restart_retention import prepare_restart_returns
+
+            # The update's restart returns active work and the runnable queue (#1563).
+            return_ids = prepare_restart_returns(DRIVE_ROOT, worker_state.RUNNING, list(worker_state.PENDING),
+                                                transaction_id=restart_transaction_id,
+                                                direct=worker_state.direct_chat_turns(),
+                                                owner_wait_ids=owner_wait_ids)
         except Exception as exc:
             open_repo_writer_admission()
             log.warning("Managed update owner-wait handoff preparation failed", exc_info=True)
             return [f"owner_wait_handoff:{type(exc).__name__}: {exc}"]
+    with worker_state._queue_lock:
+        for task_id, captured in update_returns["rows"].items():
+            captured["returning"] = task_id in return_ids
     update_progress.advance("stopping_workers")
     survivors = kill_workers_for_update(
         result_reason="Task interrupted by an owner-requested managed update.",
@@ -461,7 +680,9 @@ def _quiesce_repo_writers(reason: str) -> list[str]:
         str(item.get("service_id") or item.get("name") or "unknown")
         for item in stopped
         if isinstance(item, dict)
-        and (item.get("stop_failed") or item.get("state") == "running" or item.get("lifecycle") == "running")
+        and (item.get("stop_failed") or item.get("cleanup_dispatched") is False
+             or item.get("state") in {"running", "cleanup_pending"}
+             or item.get("lifecycle") in {"running", "cleanup_pending"})
     ]
     try:
         from ouroboros.process_custody import quiesce_custodied_services
@@ -469,17 +690,29 @@ def _quiesce_repo_writers(reason: str) -> list[str]:
         _custody_ok, custody_blockers = quiesce_custodied_services(DRIVE_ROOT)
     except Exception as exc:
         custody_blockers = [f"custody_ledger:{type(exc).__name__}: {exc}"]
-    return [f"service:{label}" for label in failed] + custody_blockers
+    blockers = [f"service:{label}" for label in failed] + custody_blockers
+    update_returns["quiesced"] = not blockers
+    return blockers
 
 
 def _fence_failure(blockers: list[str], stash_note: str = "") -> JSONResponse:
-    restart_required = not all(str(item).startswith("active:") for item in blockers)
+    active_only = bool(blockers) and all(str(item).startswith("active:") for item in blockers)
+    restart_required = not active_only
+    if active_only:
+        names = ", ".join(str(item)[len("active:"):] for item in blockers)
+        error = (
+            f"Active work is still running or finishing review ({names}). No work was stopped and the repository "
+            "was not changed; wait for it to finish, pause it, or restart Ouroboros to clear the blocker. Paused work "
+            "stays paused until you resume it, and a review that is already running can still block the request."
+        )
+    else:
+        error = (
+            "Could not prove every repository writer stopped. The repository was not "
+            "changed, but runtime shutdown may be incomplete."
+        )
     return JSONResponse(
         {
-            "error": (
-                "Could not prove every repository writer stopped. The repository was not "
-                "changed, but runtime shutdown may be incomplete."
-            ),
+            "error": error,
             "reason": "update_writer_fence_blocked",
             "blockers": blockers,
             "restart_required": restart_required,
@@ -490,22 +723,34 @@ def _fence_failure(blockers: list[str], stash_note: str = "") -> JSONResponse:
 
 
 def _rollback_fenced_update(reason: str, error: str, **extra: Any) -> JSONResponse:
-    from supervisor.update_merge import mark_update_tx_gate_blocked, rollback_managed_update
+    from supervisor.update_merge import (
+        active_update_tx, mark_update_tx_gate_blocked, rollback_managed_update, write_update_tx, _rollback_target_unmet,
+    )
 
+    tx = active_update_tx()
+    failure = tx.get("git_failure") or {}
+    unapplied = bool(failure.get("before_tree_effects")) and not _rollback_target_unmet(
+        str(tx.get("pre_update_sha") or ""), str(tx.get("pre_update_branch") or ""))
+    if tx:
+        tx["rollback_error"] = error
+        write_update_tx(tx)
     update_progress.advance("rolling_back")
     ok, message = rollback_managed_update(reason)
     if ok:
         _respawn_workers_after_failed_update()
         return JSONResponse(
-            {"error": error, "rolled_back": True, "rollback": message, **extra},
+            {"error": error, "rolled_back": not unapplied, "outcome": "not_applied" if unapplied else "rolled_back",
+             "rollback": message, "stash_note": message, **extra},
             status_code=409,
         )
-    mark_update_tx_gate_blocked(reason, message)
+    if not active_update_tx().get("stash_restore"):
+        mark_update_tx_gate_blocked(reason, message)
     return JSONResponse(
         {
             "error": error,
             "rolled_back": False,
             "rollback": message,
+            "stash_note": message,
             "restart_required": True,
             **extra,
         },
@@ -513,11 +758,42 @@ def _rollback_fenced_update(reason: str, error: str, **extra: Any) -> JSONRespon
     )
 
 
-def _restart_response(request: Request, *, strategy: str, plan: dict) -> JSONResponse:
+def _abandon_replace_refused_before_tree(tx: Dict[str, Any], exc: BaseException) -> Dict[str, Any] | None:
+    """Abandon this replace as unapplied, as boot does, when Git refused its FIRST tree step for
+    the held index lock; ``None`` leaves the fenced rollback in charge of anything else.
+
+    Both facts are ``IndexLockRefusal.before_tree_effects`` (Git's own refusal on every attempt,
+    no earlier tree step); the live tx must still be this attempt and HEAD its base. The rescue
+    snapshot and keep branch made before the checkout stay and are reported by the caller.
+    """
+    import subprocess
+    from supervisor.git_ops import git_capture
+    from supervisor.git_ops_reset import IndexLockRefusal, refusal_parts
+    from supervisor.update_merge import abandon_unapplied_replace, read_update_tx_strict, write_update_tx
+
+    if not isinstance(exc, subprocess.CalledProcessError):
+        return None
+    status, live = read_update_tx_strict()
+    if status != "valid" or live.get("phase") != "applying_replace" or live.get("attempt_id") != tx.get("attempt_id"):
+        return None
+    cmd, detail = refusal_parts(exc)
+    before = isinstance(exc, IndexLockRefusal) and exc.before_tree_effects
+    live["git_failure"] = {"cmd": cmd, "stderr": detail, "returncode": exc.returncode, "before_tree_effects": before}
+    write_update_tx(live)
+    if not before:
+        return None
+    rc_h, head, _error = git_capture(["git", "rev-parse", "--verify", "HEAD"])
+    if rc_h != 0 or not head or head != str(live.get("pre_update_sha") or ""):
+        return None
+    return abandon_unapplied_replace(head, cause="index_lock_refused", attempt_id=str(live["attempt_id"]),
+                                     cmd=cmd, stderr=detail)
+
+
+def _restart_response(request: Request, *, strategy: str, plan: dict, keep_branch: str = "") -> JSONResponse:
     try:
         restarting = _request_restart(request)
     except Exception as exc:
-        log.warning("managed update landed but restart request failed", exc_info=True)
+        log.warning("managed update restart request failed", exc_info=True)
         restarting = False
         restart_error = f"{type(exc).__name__}: {exc}"
     else:
@@ -536,11 +812,13 @@ def _restart_response(request: Request, *, strategy: str, plan: dict) -> JSONRes
                 "error": restart_error,
                 "strategy": strategy,
                 "merge_plan": plan,
+                **({"keep_branch": keep_branch} if keep_branch else {}),
             }
         )
     update_progress.advance("restart_requested")
     return JSONResponse(
-        {"status": "ok", "restarting": True, "strategy": strategy, "merge_plan": plan}
+        {"status": "ok", "restarting": True, "strategy": strategy, "merge_plan": plan,
+         **({"keep_branch": keep_branch} if keep_branch else {})}
     )
 
 
@@ -579,6 +857,7 @@ def _stash_local_work_fenced(
         "local_work_carrier": "none",
         "requested_at": utc_now_iso(),
     }
+    update_progress.link(tx)  # bound before this transaction can be written
     rc_ds, dirty_now, dirty_error = git_capture(["git", "status", "--porcelain"])
     if rc_ds != 0:
         _respawn_workers_after_failed_update()
@@ -635,15 +914,42 @@ def _stash_local_work_fenced(
 
 def _unwind_stashed_update(tx: dict, context: str) -> str:
     """Undo the stash prologue when the update aborts before any repo mutation:
-    restore the exact stash entry (marker-guarded — a crash between the stash
-    apply and its drop must not let boot's replay wipe the already-restored
-    copy) and clear the tx. Returns a disclosure note ("" when clean)."""
+    restore the exact stash and clear only a confirmed restoration/preservation
+    outcome. An incomplete result retains its write-ahead marker for boot."""
     from supervisor.update_merge import clear_update_tx, restore_stash_with_marker
 
-    note = restore_stash_with_marker(tx, context)
-    if not clear_update_tx():
-        note = (note + "; " if note else "") + "the update transaction marker could not be cleared"
+    result = restore_stash_with_marker(tx, context)
+    note = result.note
+    if result.complete:
+        cleared = clear_update_tx()
+        if cleared is None:
+            note = (note + "; " if note else "") + "the update transaction marker remains while another transition is active"
+        elif not cleared:
+            note = (note + "; " if note else "") + "the update transaction marker could not be cleared"
     return note
+
+
+def _assisted_update_pays() -> bool:
+    """Whether an assisted update needs paid admission, all a reached global limit refuses: its resolver
+    (a root task, opening on Main) or a seat of the commit-review wave it asks for. The API rows of the
+    review pool are answered at the global axis by ``review_wave_admission`` (the reservation's own rule);
+    session rows ride subscriptions. An unknown answer pays; every send still meets its reservation."""
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.reviewer_slot_config import review_pool_slots
+    from ouroboros.tools.review_helpers import REVIEW_PROMPT_TOKEN_BUDGET
+    from ouroboros.tools.review_multi_model import _review_output_budget
+    from ouroboros.usage_admission import review_wave_admission
+    from supervisor import state
+    from supervisor.worker_assignment import needs_paid_admission
+
+    if needs_paid_admission({"metadata": {}}):
+        return True
+    models = [row.model for row in review_pool_slots() if row.model
+              and str(getattr(row.route, "value", row.route) or "") != ReviewRouteKind.AGENT_SESSION.value]
+    return bool(models) and review_wave_admission(
+        drive_root=state.DRIVE_ROOT, root_task_id="managed-update-admission", models=models,
+        prompt_chars=int(REVIEW_PROMPT_TOKEN_BUDGET) * 4, max_completion_tokens=int(_review_output_budget()),
+        global_limit_usd=float(state.TOTAL_BUDGET_LIMIT or 0.0)).get("fits") is not True
 
 
 def _start_assisted_merge_fenced(plan: dict, tx: dict) -> JSONResponse:
@@ -690,7 +996,7 @@ def _start_assisted_merge_fenced(plan: dict, tx: dict) -> JSONResponse:
              **({"stash_note": note} if note else {})},
             status_code=409,
         )
-    if remaining <= 0:
+    if remaining <= 0 and _assisted_update_pays():
         note = _unwind_stashed_update(tx, "assisted_admission_failed")
         _respawn_workers_after_failed_update()
         return JSONResponse(
@@ -698,125 +1004,30 @@ def _start_assisted_merge_fenced(plan: dict, tx: dict) -> JSONResponse:
              **({"stash_note": note} if note else {})},
             status_code=409,
         )
-    # Affordability floor: a resolution that cannot buy even ONE full triad+scope
-    # review wave would mutate the live tree into a conflicted merge and then
-    # stall mid-review. "One full wave" is priced HONESTLY at the review packs'
-    # own worst-case caps — the shared 920K-token input SSOT per API row, the
-    # triad's default output reserve, and the scope reviewer's 100K output
-    # reserve — with the shared reservation math (agent-session rows ride
-    # subscriptions, not USD budget); fail-open on estimator errors, mirroring
-    # review_wave_admission's own contract.
-    admission = {"fits": True}
+    # Money admission is the known-spend rule every reviewer seat's reservation
+    # applies (#1487), checked just above: known spend below TOTAL_BUDGET admits
+    # the update, a reached limit only one whose every actor is free, and a review
+    # that later reaches the limit pauses on its own fences. One commit-gate wave
+    # over the review pool's paid seats is still
+    # priced at the review packs' own worst-case caps by the one explicit
+    # estimator (``review_admission.managed_update_wave_estimate``), but as
+    # DISCLOSURE, never a second, earlier refusal: a prospective wave larger
+    # than the remainder used to refuse an update the owner's limit still
+    # allowed. Agent-session rows ride subscriptions, not USD budget; an
+    # estimator error is recorded, never a zero, and a broken import is not
+    # swallowed.
+    from ouroboros.tools.review_admission import managed_update_wave_estimate
+
+    estimate_event = managed_update_wave_estimate(float(remaining))
     try:
-        from ouroboros.reviewer_slot_config import commit_scope_rows, commit_triad_rows
-        from ouroboros.tools.review_helpers import REVIEW_PROMPT_TOKEN_BUDGET
-        from ouroboros.usage_accounting import review_wave_admission
+        from supervisor.git_ops import DRIVE_ROOT as _dr
+        from ouroboros.utils import append_jsonl as _aj, utc_now_iso as _n
 
-        # Native-retrieving actor rows (subagent_id + api route) are priced at
-        # the SAME one-pack-call convention as packet rows: their true worst
-        # case is bounded by the episode's own rails (round cap x transcript
-        # cap) and can exceed this estimate, but the typical episode is
-        # pack-sized or smaller, and this floor is an explicitly fail-open
-        # affordability heuristic — over-refusing assisted updates on a
-        # theoretical ceiling would cost more than it protects.
-        triad_models = [
-            row.target_id for row in commit_triad_rows()
-            if not row.is_session and row.target_id
-        ]
-        scope_models = [
-            row.target_id for row in commit_scope_rows()
-            if not row.is_session and row.target_id
-        ]
-        prompt_chars_cap = int(REVIEW_PROMPT_TOKEN_BUDGET) * 4
-        estimated_total = 0.0
-        any_estimate = False
-        unpriced_total = 0
-        for models, max_out in ((triad_models, 65_536), (scope_models, 100_000)):
-            if not models:
-                continue
-            part = review_wave_admission(
-                root_task_id="managed-update-admission",
-                models=models,
-                prompt_chars=prompt_chars_cap,
-                max_completion_tokens=max_out,
-                remaining_usd_override=float(remaining),
-            )
-            part_estimate = part.get("estimated_wave_usd")
-            unpriced_total += int(part.get("unpriced_slots") or 0)
-            if part_estimate is not None:
-                estimated_total += float(part_estimate)
-                any_estimate = True
-            else:
-                # The estimator failed open for this whole surface: every one of
-                # its slots is unknown, not silently zero.
-                unpriced_total += len(models)
-        session_slots = sum(
-            1 for row in (*commit_triad_rows(), *commit_scope_rows()) if row.is_session
-        )
-        if any_estimate:
-            admission = {
-                "fits": estimated_total <= float(remaining) + 1e-9,
-                "estimated_wave_usd": round(estimated_total, 6),
-                "remaining_usd": float(remaining),
-                "unpriced_slots": unpriced_total,
-                "session_slots": session_slots,
-            }
-        if admission.get("fits", True) and (unpriced_total or (session_slots and not any_estimate)):
-            # An ADMITTED wave with unknowable parts must not read as a fully
-            # priced estimate later (P1: represent the gap) — one durable line.
-            try:
-                from supervisor.git_ops import DRIVE_ROOT as _dr
-                from ouroboros.utils import append_jsonl as _aj, utc_now_iso as _n
-
-                _aj(_dr / "logs" / "supervisor.jsonl", {
-                    "ts": _n(), "type": "managed_update_wave_floor_partial_unknown",
-                    "estimated_wave_usd": admission.get("estimated_wave_usd"),
-                    "unpriced_slots": unpriced_total, "session_slots": session_slots,
-                    "remaining_usd": float(remaining),
-                })
-            except Exception:
-                log.debug("wave-floor partial-unknown event write failed", exc_info=True)
+        # One durable disclosure of the wave estimate beside the known room;
+        # unknowable parts are counted, never filled in (P1).
+        _aj(_dr / "logs" / "supervisor.jsonl", {"ts": _n(), **estimate_event})
     except Exception:
-        log.debug("assisted admission wave estimate failed open", exc_info=True)
-        admission = {"fits": True}
-        try:
-            from supervisor.git_ops import DRIVE_ROOT as _dr2
-            from ouroboros.utils import append_jsonl as _aj2, utc_now_iso as _n2
-
-            _aj2(_dr2 / "logs" / "supervisor.jsonl", {
-                "ts": _n2(), "type": "managed_update_wave_floor_estimator_failed",
-                "remaining_usd": float(remaining),
-            })
-        except Exception:
-            log.debug("estimator-failure event write failed", exc_info=True)
-    if not admission.get("fits", True):
-        note = _unwind_stashed_update(tx, "assisted_admission_failed")
-        _respawn_workers_after_failed_update()
-        estimated = admission.get("estimated_wave_usd")
-        try:
-            from supervisor.git_ops import DRIVE_ROOT
-            from ouroboros.utils import append_jsonl, utc_now_iso as _now
-
-            append_jsonl(DRIVE_ROOT / "logs" / "supervisor.jsonl", {
-                "ts": _now(), "type": "managed_update_wave_floor_refused",
-                "estimated_wave_usd": estimated, "remaining_usd": admission.get("remaining_usd"),
-            })
-        except Exception:
-            log.debug("wave-floor refusal event write failed", exc_info=True)
-        return JSONResponse(
-            {"error": (
-                "Assisted update needs enough model budget for at least one full "
-                f"review wave ({'at least ' if admission.get('unpriced_slots') else ''}≈${estimated} "
-                "estimated at the review packs' worst-case caps for the configured reviewer panel"
-                + (f"; {admission['unpriced_slots']} slot(s) unpriced" if admission.get("unpriced_slots") else "")
-                + f", ${round(float(remaining), 2)} remaining); nothing was changed."
-            ),
-             "estimated_wave_usd": estimated,
-             "remaining_usd": admission.get("remaining_usd"),
-             "unpriced_slots": admission.get("unpriced_slots", 0),
-             **({"stash_note": note} if note else {})},
-            status_code=409,
-        )
+        log.debug("wave estimate event write failed", exc_info=True)
 
     _create_rescue_snapshot(
         branch, "ui_update_assisted_merge", _collect_repo_sync_state(),
@@ -839,6 +1050,8 @@ def _start_assisted_merge_fenced(plan: dict, tx: dict) -> JSONResponse:
             + list(plan.get("doc_conflict_paths") or [])
         ),
         "task_id": task_id,
+        # No resolver submitted yet: the first admission of this fresh id is provable.
+        "resolver_submitted_id": "",
         "owner_chat_id": owner_chat_id,
         "resolution_attempts": 0,
         **({"failed_update_ref": prior_attempt_ref} if prior_attempt_ref else {}),
@@ -911,7 +1124,7 @@ def _start_assisted_merge_fenced(plan: dict, tx: dict) -> JSONResponse:
     if not enqueue_assisted_resolution_task(tx):
         return _rollback_fenced_update(
             "assisted_worker_start_failed",
-            "the merge was staged but its resolver worker could not start",
+            "the merge was staged but its resolver could not be started or admitted",
         )
     return JSONResponse({"status": "assisted_started", "task_id": task_id, "merge_plan": plan})
 
@@ -998,6 +1211,9 @@ def _apply_smart_update_fenced(
         release_update_lock,
     )
 
+    refusal = _index_lock_precondition()
+    if refusal is not None:
+        return refusal
     plan = plan_managed_update_merge(fetch=True, build=False)
     kind = str(plan.get("kind") or "")
     if not plan.get("available") or kind not in _KNOWN_UPDATE_PLAN_KINDS:
@@ -1017,7 +1233,7 @@ def _apply_smart_update_fenced(
     try:
         if active_update_tx():
             return JSONResponse({"error": "a managed update is already in progress"}, status_code=409)
-        update_progress.begin()
+        update_progress.begin(base_sha=expected_base_sha, target_sha=expected_target_sha)
         blockers = _quiesce_repo_writers("smart")
         if blockers:
             return _fence_failure(blockers)
@@ -1075,16 +1291,27 @@ def _apply_smart_update_fenced(
             return _apply_clean_merge_fenced(request, plan2, tx)
         return _start_assisted_merge_fenced(plan2, tx)
     except Exception as exc:
-        log.warning("managed smart update failed after writer fence", exc_info=True)
+        log.error("managed smart update failed after writer fence", exc_info=True)
         from supervisor.update_merge import active_update_tx as _active_tx
 
-        if _active_tx():
+        pending = _active_tx()
+        if pending.get("stash_restore"):
+            # A restore may already have returned files even if its completion
+            # record failed. Never route that uncertainty into generic rollback.
+            record = pending["stash_restore"]
+            return JSONResponse(
+                {"error": f"managed update failed: {type(exc).__name__}: {exc}",
+                 "reason": "stash_recovery_incomplete", "restart_required": True,
+                 "stash_note": record.get("note") or "Local work recovery is pending; current files were left unchanged."},
+                status_code=500,
+            )
+        if pending:
             return _rollback_fenced_update(
                 "smart_update_exception",
                 f"managed update failed: {type(exc).__name__}: {exc}",
             )
         _respawn_workers_after_failed_update()
-        return json_exception(exc)
+        return json_exception(exc, 500)  # recorded once above, with its stack
     finally:
         release_update_lock(lock_fh)
 
@@ -1112,8 +1339,11 @@ def _apply_replace_recovery_fenced(
 ) -> JSONResponse:
     import uuid
 
+    from ouroboros.store_switch import switch_or_reset
     from supervisor.git_ops import (
         BRANCH_DEV,
+        DRIVE_ROOT,
+        REPO_DIR,
         _write_update_intent,
         checkout_and_reset,
         prepare_managed_update,
@@ -1127,6 +1357,9 @@ def _apply_replace_recovery_fenced(
         write_update_tx,
     )
 
+    refusal = _index_lock_precondition()
+    if refusal is not None:
+        return refusal
     plan = plan_managed_update_merge(fetch=True, build=False)
     if (
         str(plan.get("kind") or "") not in (_KNOWN_UPDATE_PLAN_KINDS | {"current"})
@@ -1143,7 +1376,7 @@ def _apply_replace_recovery_fenced(
     try:
         if active_update_tx():
             return JSONResponse({"error": "a managed update is already in progress"}, status_code=409)
-        update_progress.begin()
+        update_progress.begin(base_sha=expected_base_sha, target_sha=expected_target_sha)
         blockers = _quiesce_repo_writers("replace_recovery")
         if blockers:
             return _fence_failure(blockers)
@@ -1182,43 +1415,58 @@ def _apply_replace_recovery_fenced(
             "attempt_id": uuid.uuid4().hex[:12],
             "strategy": "replace",
         }
+        update_progress.link(tx, keep_branch=str(payload.get("keep_branch") or ""))
         write_update_tx(tx)
         _write_update_intent(dict(payload["update_intent"]))
         try:
             update_progress.advance("applying")
-            checkout_ok, checkout_msg = checkout_and_reset(
-                BRANCH_DEV,
-                reason="ui_update_apply",
-                unsynced_policy="rescue_and_reset",
-            )
+            # A target without the store: the switch intent, the checkout moves at the restart exit
+            # (store_switch); its smoke is the post-boot one the pending transaction already runs.
+            checkout_ok, checkout_msg, deferred = switch_or_reset(
+                DRIVE_ROOT, REPO_DIR, target_sha=expected_target_sha, target_ref=str(tx["target_ref"]),
+                reason="ui_update_apply", door="update_replace",
+                reset=lambda: checkout_and_reset(BRANCH_DEV, reason="ui_update_apply", unsynced_policy="rescue_and_reset"))
         except Exception as exc:
-            return _rollback_fenced_update(
-                "replace_checkout_exception", f"recovery checkout failed: {exc}", **payload
-            )
+            from supervisor.git_ops_reset import refusal_parts, refusal_text
+
+            abandoned = _abandon_replace_refused_before_tree(tx, exc)
+            if abandoned is None:
+                return _rollback_fenced_update(
+                    "replace_checkout_exception", f"recovery checkout failed: {refusal_text(exc)}", **payload
+                )
+            if not abandoned.get("abandoned"):  # its cleanup failed: the tx holds, as at boot
+                return JSONResponse({"error": abandoned.get("reason"), "rolled_back": False,
+                                     "restart_required": True, **payload}, status_code=500)
+            _respawn_workers_after_failed_update()
+            return JSONResponse({
+                "error": f"the update was not applied: Git refused its first checkout step: {refusal_parts(exc)[1]}",
+                "reason": "replace_not_applied", "abandoned": True, "rolled_back": False, **payload,
+            }, status_code=409)
         if not checkout_ok:
             return _rollback_fenced_update(
                 "replace_checkout_failed", f"recovery checkout failed: {checkout_msg}", **payload
             )
         tx["phase"] = "pending_boot_smoke"
         write_update_tx(tx)
-        update_progress.advance("checking")
-        smoke = update_restart_smoke()
-        if not smoke.get("ok"):
-            return _rollback_fenced_update(
-                "replace_pre_restart_smoke_failed", "pre-restart smoke failed", smoke=smoke
-            )
-        tx["pre_restart_smoke"] = "passed"
-        write_update_tx(tx)
-        return _restart_response(request, strategy="replace", plan=plan2)
+        if not deferred:
+            update_progress.advance("checking")
+            smoke = update_restart_smoke()
+            if not smoke.get("ok"):
+                return _rollback_fenced_update(
+                    "replace_pre_restart_smoke_failed", "pre-restart smoke failed", smoke=smoke
+                )
+            tx["pre_restart_smoke"] = "passed"
+            write_update_tx(tx)
+        return _restart_response(request, strategy="replace", plan=plan2, keep_branch=str(payload.get("keep_branch") or ""))
     except Exception as exc:
-        log.warning("managed replace recovery failed after writer fence", exc_info=True)
+        log.error("managed replace recovery failed after writer fence", exc_info=True)
         if active_update_tx():
             return _rollback_fenced_update(
                 "replace_update_exception",
                 f"managed recovery failed: {type(exc).__name__}: {exc}",
             )
         _respawn_workers_after_failed_update()
-        return json_exception(exc)
+        return json_exception(exc, 500)  # recorded once above, with its stack
     finally:
         release_update_lock(lock_fh)
 
@@ -1239,7 +1487,9 @@ async def _apply_replace_recovery(
 
 async def api_update_apply(request: Request) -> JSONResponse:
     """Apply an exact managed plan; replacement is an explicit recovery only."""
-    body = await request_json_or(request, {}, exceptions=(Exception,))
+    if managed := _body_refusal():
+        return JSONResponse(managed, status_code=403)
+    body = await request_json_or(request, {})
     if not isinstance(body, dict):
         return json_error("JSON body must be an object.", 400)
     # Executable gateway ABI (ABI-3, Q7=A): UpdateApplyRequest declares
@@ -1290,53 +1540,18 @@ async def api_update_apply(request: Request) -> JSONResponse:
 
 
 async def api_evolution_data(request: Request) -> JSONResponse:
-    """Collect evolution metrics for each git tag."""
-    from ouroboros.utils import collect_evolution_metrics
+    """The saved version history at once (``evolution_history``), never waiting for a measurement;
+    ``force`` re-measures in the background. The refresh status says whether a newer copy is coming."""
+    from ouroboros.evolution_history import history
 
-    global _evo_task
-    now = time.time()
     force_refresh = str(request.query_params.get("force") or "").strip().lower() in {"1", "true", "yes"}
-    if not force_refresh and _evo_cache.get("ts") and now - _evo_cache["ts"] < 60:
-        return JSONResponse({
-            "points": _evo_cache["points"],
-            "checkpoints": _evo_cache.get("checkpoints", []),
-            "generated_at": _evo_cache.get("generated_at", ""),
-            "cached": True,
-        })
-    if _evo_task is None or _evo_task.done():
-        _evo_task = asyncio.create_task(
-            collect_evolution_metrics(
-                str(request_repo_dir(request)),
-                data_dir=str(request_drive_root(request)),
-            )
-        )
-    data_points = await _evo_task
-    try:
-        from ouroboros.evolution_checkpoints import CHECKPOINTS_REL
-        from ouroboros.utils import iter_jsonl_objects
-
-        checkpoints = []
-        rows = [
-            row for row in iter_jsonl_objects(request_drive_root(request) / CHECKPOINTS_REL)
-            # cycle_outcome rows are solve-capability digest fodder (different
-            # schema: no git_sha/identity hashes); the Dashboard checkpoints
-            # view renders absorb checkpoints only.
-            if isinstance(row, dict) and row.get("kind") != "cycle_outcome"
-        ]
-        for row in rows[-100:]:
-            checkpoints.append(public_task_result(row))
-    except Exception:
-        checkpoints = []
-    _evo_cache["ts"] = time.time()
-    _evo_cache["points"] = data_points
-    _evo_cache["checkpoints"] = checkpoints
-    _evo_cache["generated_at"] = utc_now_iso()
-    return JSONResponse({
-        "points": data_points,
-        "checkpoints": checkpoints,
-        "generated_at": _evo_cache["generated_at"],
-        "cached": False,
-    })
+    drive_root = request_drive_root(request)
+    payload = await asyncio.to_thread(
+        history.projection, str(request_repo_dir(request)), str(drive_root), force=force_refresh)
+    # Older clients' newest absorb checkpoints: one stat while the journal is unchanged (evolution_history).
+    payload["checkpoints"] = await asyncio.to_thread(history.checkpoints, str(drive_root))
+    payload["generated_at"] = utc_now_iso()
+    return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
 
 __all__ = [

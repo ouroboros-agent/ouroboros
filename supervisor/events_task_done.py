@@ -11,6 +11,7 @@ import logging
 import pathlib
 from typing import Any, Dict
 
+from ouroboros.contracts.chat_id_policy import HIDDEN_CHAT_ID
 from ouroboros.cost_projection import carry_cost_meta, with_cost_aliases
 from ouroboros.outcomes import (
     EXECUTION_DEGRADED,
@@ -19,7 +20,7 @@ from ouroboros.outcomes import (
     normalize_outcome_axes,
 )
 from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
-from ouroboros.task_finalization import send_provider_death_notice
+from ouroboros.task_finalization import quiet_finish, send_provider_death_notice, work_label
 from ouroboros.task_results import (
     STATUS_CANCELLED,
     STATUS_COMPLETED,
@@ -30,7 +31,6 @@ from ouroboros.task_results import (
     write_task_result,
 )
 from ouroboros.utils import append_jsonl, truncate_for_log, utc_now_iso
-from ouroboros.contracts.chat_id_policy import HIDDEN_CHAT_ID
 from supervisor.message_bus import notification_chat_route, row_chat_identity
 
 
@@ -57,17 +57,34 @@ log = logging.getLogger(__name__)
 _DEGRADED_TERMINAL_REASONS = frozenset({"configured_actor_incomplete", "configured_actor_unknown"})
 
 
-def _finished_with_warnings(task_done_event: Dict[str, Any]) -> bool:
-    """True when a `completed` lifecycle carries a degraded execution axis.
+def _finished_with_warnings(
+    task_done_event: Dict[str, Any], result: Dict[str, Any] | None = None,
+) -> bool:
+    """True when a `completed` lifecycle actually ended with warnings.
 
     The chat line used to take its icon and verb from the lifecycle alone, so a
     child that never ran its leaf still read as "✅ … completed" while the web
-    card, computing severity from these same axes, showed a warning. One terminal,
-    one story — for the EXECUTION axis: this mirrors only that axis of
-    `web/modules/log_events.js` `taskOutcomeSeverity`, whose objective and review
-    axes are not read here, so a child degraded on those axes alone still reads
-    as a clean completion in chat.
+    card showed a warning. Mirroring only the EXECUTION axis fixed half of that
+    (#1087): a child degraded on its objective, its review or its artifacts — the
+    other axes the card folds — still read as a clean completion. The shared
+    normalized projection (`project_dialogue.outcome_phase`, the host twin of
+    `taskOutcomeSeverity` that web/tests/fixtures/outcome_phase_parity.json pins)
+    answers the whole question instead, over the result AND the event.
+
+    PRECEDENCE IS THE CALLER'S: this only says "warnings", never which lifecycle
+    word the row uses — a cancelled or failed child keeps its own status display.
+    The axis/reason fallbacks below stay for a frame the shared projection cannot
+    settle (an open post-task checkpoint reads as still working, not as an
+    outcome), so a degraded frame never silently loses its warning.
     """
+    from ouroboros.project_dialogue import outcome_phase
+
+    record = result if isinstance(result, dict) else {}
+    phase = outcome_phase(record, task_done_event)
+    if phase == "warn":
+        return True
+    if phase in {"error", "cancelled"}:
+        return False
     axes = task_done_event.get("outcome_axes")
     execution = axes.get("execution") if isinstance(axes, dict) else None
     if isinstance(execution, dict) and str(execution.get("status") or "") == EXECUTION_DEGRADED:
@@ -75,45 +92,66 @@ def _finished_with_warnings(task_done_event: Dict[str, Any]) -> bool:
     return str(task_done_event.get("reason_code") or "") in _DEGRADED_TERMINAL_REASONS
 
 
-def _authoritative_terminal_cost(
-    task_id: str, task: Dict[str, Any], result: Dict[str, Any], evt: Dict[str, Any], drive_root: pathlib.Path,
-    *, breakdown: Dict[str, Any] | None = None,
-) -> Dict[str, Any]:
-    """Project terminal cost; the optional breakdown belongs to drive_root only."""
-    from ouroboros.cost_projection import honest_accounted_amount
-    from supervisor.state import reconstruct_task_cost
+def _completed_lifecycle_display(
+    task_done_event: Dict[str, Any], result: Dict[str, Any] | None = None,
+) -> tuple[str, str] | None:
+    """Icon and verb for a `completed` lifecycle whose OUTCOME is not clean.
 
-    authority_root = pathlib.Path(task.get("budget_drive_root") or drive_root)
-    if breakdown is not None and authority_root.resolve() != pathlib.Path(drive_root).resolve():
-        breakdown = None  # A split/copyback task keeps its canonical monetary authority.
-    projection = reconstruct_task_cost(task_id, fields=True, drive_root=authority_root,
-                                       **({"breakdown": breakdown} if breakdown is not None else {}))
+    #1087: the card and Telegram fold the axes into one phase; the chat line
+    must speak the same word. A completed lifecycle can still end `error` (a
+    failed review, objective or artifacts), and `_finished_with_warnings`
+    deliberately answers False for that phase — so answering only "warnings"
+    let such a child read "✅ … completed". Returns None for a clean outcome.
+    Lifecycle-keyed fields (`subagent_event`, progress_meta `status`) are never
+    touched: only what the human line SAYS follows the phase.
+    """
+    from ouroboros.project_dialogue import outcome_phase
+
+    record = result if isinstance(result, dict) else {}
+    phase = outcome_phase(record, task_done_event)
+    if phase == "error":
+        return "❌", "finished with a failed outcome"
+    if phase == "cancelled":
+        return "⏹", "stopped"
+    if _finished_with_warnings(task_done_event, record):
+        return "⚠️", "finished with warnings"
+    return None
+
+
+def _terminal_cost_lineage(task_id: str, task: dict, result: dict, evt: dict) -> dict:
+    """The result-derived scopes used by projection and its write-boundary check."""
     from ouroboros.task_results import resolve_task_lineage
 
     metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
-    root_id = str(result.get("root_task_id") or task.get("root_task_id") or evt.get("root_task_id") or "")
-    parent_id = str(result.get("parent_task_id") or task.get("parent_task_id") or evt.get("parent_task_id") or "")
-    lineage = resolve_task_lineage(
-        task_id,
-        metadata=metadata,
-        root_task_id=root_id,
-        parent_task_id=parent_id,
-        delegation_role=(
-            result.get("delegation_role")
-            or task.get("delegation_role")
-            or evt.get("delegation_role")
-        ),
-        original_task_id=(
-            result.get("original_task_id")
-            or task.get("original_task_id")
-            or evt.get("original_task_id")
-        ),
-        timeout_retry_from=(
-            result.get("timeout_retry_from")
-            or task.get("timeout_retry_from")
-            or evt.get("timeout_retry_from")
-        ),
+    fields = {key: result.get(key) or task.get(key) or evt.get(key) for key in (
+        "root_task_id", "parent_task_id", "delegation_role", "original_task_id", "timeout_retry_from",
+    )}
+    return resolve_task_lineage(task_id, metadata=metadata, **fields)
+
+
+
+def _authoritative_terminal_cost(
+    task_id: str, task: Dict[str, Any], result: Dict[str, Any], evt: Dict[str, Any], drive_root: pathlib.Path,
+    *, breakdown: Dict[str, Any] | None = None, canonical_only: bool = False,
+) -> Dict[str, Any]:
+    """Project terminal cost; canonical_only forbids import/read fallback from a probe."""
+    from ouroboros.cost_projection import (
+        COST_SCOPE_ROOT_TREE,
+        build_cost_presentation,
+        honest_accounted_amount,
     )
+    from supervisor.state import reconstruct_task_cost
+
+    authority_root = pathlib.Path(task.get("budget_drive_root") or drive_root)
+    if (breakdown is not None or canonical_only) and authority_root.resolve() != pathlib.Path(drive_root).resolve():
+        if canonical_only:
+            raise ValueError("Cost probe lost canonical monetary authority")
+        breakdown = None  # A split/copyback task keeps its canonical monetary authority.
+    if canonical_only and breakdown is None:
+        raise ValueError("Cost probe requires a prefetched canonical breakdown")
+    projection = reconstruct_task_cost(task_id, fields=True, drive_root=authority_root, custody_root=drive_root,
+                                       **({"breakdown": breakdown} if breakdown is not None else {}))
+    lineage = _terminal_cost_lineage(task_id, task, result, evt)
     is_root = bool(lineage["is_root_task"])
     if is_root and projection.get("cost_accounting_status") == "available":
         try:
@@ -121,7 +159,7 @@ def _authoritative_terminal_cost(
 
             root_id = str(lineage["root_task_id"] or task_id)
             if breakdown is None:
-                subtree = usage_breakdown(authority_root, root_task_id=root_id)
+                subtree = usage_breakdown(authority_root, root_task_id=root_id, custody_root=drive_root, include_custody=True)
             else:
                 from ouroboros._usage_rows import _breakdown_bucket, _with_integrity
 
@@ -143,6 +181,8 @@ def _authoritative_terminal_cost(
                 # non-final purely by a child's open row reported a cause of 0, a flag
                 # no reader could reconstruct.
                 "non_final_rows": int(subtree.get("non_final_rows") or 0),
+                "cost_presentation": build_cost_presentation(subtree, scope=COST_SCOPE_ROOT_TREE),
+                **({"cost_custody": subtree["cost_custody"]} if "cost_custody" in subtree else {}),
             })
         except Exception:
             log.error("Root subtree cost authority unavailable for %s", task_id, exc_info=True)
@@ -152,6 +192,7 @@ def _authoritative_terminal_cost(
                 "accounted_upper_bound_usd": None,
                 "accounted_upper_bound_usd_with_children": None,
                 "cost_with_children_partial": True,
+                "cost_presentation": None,
             })
     elif not is_root:
         from ouroboros.cost_projection import resolve_cost_pair
@@ -159,9 +200,20 @@ def _authoritative_terminal_cost(
         present, rollup = resolve_cost_pair(
             result, "accounted_upper_bound_usd_with_children", "cost_usd_with_children")
         if not present:
-            _, rollup = resolve_cost_pair(
+            present, rollup = resolve_cost_pair(
                 evt, "accounted_upper_bound_usd_with_children", "cost_usd_with_children")
-        projection["accounted_upper_bound_usd_with_children"] = rollup
+        if present:
+            projection["accounted_upper_bound_usd_with_children"] = rollup
+            # A child pipeline mirrors its OWN bound into the rollup key (it never
+            # walks descendants), so for a leaf that mirror carries no second
+            # scope and the own facts stand. A child that ran descendants, or a
+            # rollup that differs from the own bound, is a subtree without
+            # same-scope row facts: an own carrier must not replace it.
+            swarm = result.get("swarm_efficiency")
+            fanned_out = isinstance(swarm, dict) and int(swarm.get("subagent_count") or 0) > 0
+            own_bound = projection.get("accounted_upper_bound_usd")
+            if fanned_out or (rollup is not None and rollup != own_bound):
+                projection["cost_presentation"] = None
         projection["cost_with_children_partial"] = bool(
             result.get("cost_with_children_partial", evt.get("cost_with_children_partial", True))
         )
@@ -178,26 +230,74 @@ def _authoritative_terminal_cost(
     return with_cost_aliases(projection)
 
 
-def _refresh_terminal_task_cost(
-    drive_root: pathlib.Path, task_id: str, *, breakdown: Dict[str, Any] | None = None,
-) -> bool:
-    """Refresh bookkeeping only; a supplied breakdown is bound to drive_root."""
+def _terminal_cost_probe(
+    drive_root: pathlib.Path, task_id: str, current: dict,
+) -> tuple[str, dict, tuple[bool, str] | None]:
+    """Compare one owner's addressed task/root summaries with its stored cost."""
     from ouroboros.task_status import SETTLED_STATUSES
+    from ouroboros import usage_store
+    from ouroboros._usage_rows import _with_integrity
 
-    current = load_task_result(drive_root, task_id, strict=True) or {}
     if current.get("status") not in SETTLED_STATUSES:
-        return False
+        return "ineligible", {}, None
     checkpoint = current.get("root_phase_checkpoint") or {}
     if post_task_synthesis_is_open(checkpoint.get("post_task_synthesis")):
-        return False
-    fields = _authoritative_terminal_cost(task_id, current, current, {}, drive_root, breakdown=breakdown)
-    if fields.get("cost_accounting_status") != "available" or all(current.get(key) == value for key, value in fields.items()):
+        return "ineligible", {}, None
+    lineage = _terminal_cost_lineage(task_id, current, current, {})
+    scopes = bool(lineage["is_root_task"]), str(lineage["root_task_id"])
+    authority = pathlib.Path(current.get("budget_drive_root") or drive_root).resolve()
+    from ouroboros.delegate_custody_usage import cost_coverage, cost_snapshot, with_cost_coverage
+    custody = cost_snapshot(authority, task_id="" if scopes[0] else task_id,
+                            root_task_id=scopes[1] if scopes[0] else "", custody_root=drive_root)
+    degraded = usage_store.integrity_degraded(authority)
+    with usage_store.read(authority) as txn:
+        joined = cost_coverage(custody, txn, authority)
+        breakdown = {"integrity_degraded": degraded,
+                     "by_task": {task_id: with_cost_coverage(
+                         _with_integrity(txn.bucket("task", task_id).render_breakdown(), degraded),
+                         joined, task_id=task_id)},
+                     "by_root": {scopes[1]: with_cost_coverage(
+                         _with_integrity(txn.bucket("root", scopes[1]).render_breakdown(), degraded),
+                         joined)}
+                     if scopes[0] else {}}
+    fields = _authoritative_terminal_cost(task_id, current, current, {}, authority,
+                                          breakdown=breakdown, canonical_only=True)
+    if fields.get("cost_accounting_status") != "available":
+        return "unavailable", fields, scopes
+    return ("equal" if all(current.get(key) == value for key, value in fields.items()
+                           if key != "cost_custody" or key in current) else "differs"), fields, scopes
+
+
+def _refresh_terminal_task_cost(
+    drive_root: pathlib.Path, task_id: str, *, current: dict | None = None,
+) -> bool:
+    """True once available coverage and money agree with the stored projection.
+
+    An absent optional coverage carrier alone is no monetary change. Unknown
+    coverage may be published, but cannot acknowledge cost-refresh debt.
+
+    A caller can reuse its pass's result read. The field writer still merges
+    with the latest row and rechecks terminal/post-task ownership.
+    """
+    from ouroboros.task_status import SETTLED_STATUSES
+
+    if current is None:
+        current = load_task_result(drive_root, task_id, strict=True) or {}
+    outcome, fields, _ = _terminal_cost_probe(pathlib.Path(drive_root), task_id, current)
+    coverage_available = (fields.get("cost_custody") or {}).get("status", "available") == "available"
+    if outcome == "equal":
+        return coverage_available
+    if outcome != "differs":
         return False
 
     def project(latest, patch):
         post = (latest.get("root_phase_checkpoint") or {}).get("post_task_synthesis")
         if latest.get("status") not in SETTLED_STATUSES or post_task_synthesis_is_open(post):
             raise ValueError("Cost refresh lost terminal task ownership")
+        if (any(latest.get(key) != current.get(key) for key in
+                ("budget_drive_root", "owner_pause", "review_operations"))
+                or _terminal_cost_lineage(task_id, latest, latest, {}) != _terminal_cost_lineage(task_id, current, current, {})):
+            raise ValueError("Cost refresh ownership or monetary scope changed")
         return {**patch, "status": latest["status"]}
 
     stored = write_task_result(
@@ -207,13 +307,13 @@ def _refresh_terminal_task_cost(
     event = {"type": "task_cost_finalized", "ts": utc_now_iso(), "task_id": task_id,
              "root_task_id": str(stored.get("root_task_id") or task_id), **carry_cost_meta(stored)}
     if append_jsonl(drive_root / "logs" / "events.jsonl", event):
-        from supervisor.message_bus import try_get_bridge
         from supervisor.log_addressing import address_handler_push
+        from supervisor.message_bus import try_get_bridge
 
         bridge = try_get_bridge()
         if bridge is not None:
             bridge.push_log(address_handler_push(drive_root, event))
-    return True
+    return coverage_available
 
 
 def _task_done_review_projection(
@@ -223,7 +323,7 @@ def _task_done_review_projection(
     value = result.get("review_projection")
     if not isinstance(value, dict):
         value = event.get("review_projection")
-    return value if isinstance(value, dict) and value.get("panels") else {}
+    return value if isinstance(value, dict) and (value.get("panels") or value.get("gaps") or value.get("review_records_omitted")) else {}
 
 
 # Single-shot registry for the provider-death owner notification. The old gate
@@ -290,10 +390,29 @@ def _finish_task_done_dispatch(
 ) -> None:
     """Notify lineage, release queue state, and preserve terminal compatibility."""
 
-    from ouroboros.project_dialogue import (
-        append_terminal_task_projection,
-        enqueue_project_completion_summary,
-    )
+    from ouroboros.post_task_checkpoint import settle_terminal_projection
+    from ouroboros.project_dialogue import append_terminal_task_projection
+    from supervisor.ended_work_helpers import WORK_FINISHED, stored_helper_lineage
+
+    # A helper closed with its ended work left the queue before this event: its card still needs the child's notice.
+    if not task and (final_task_result.get("cancel_origin") or {}).get("source") == WORK_FINISHED:
+        task = stored_helper_lineage(final_task_result)
+    # Every terminal producer reaches the live card through here, so a Continue that ends before any
+    # progress frame still names who asked for it; read from the records the admission was stored on.
+    if "continue_requester" not in task_done_event:
+        from ouroboros.subagent_messages import initiator_meta
+
+        for record in (final_task_result, task, evt):
+            if requester := initiator_meta(record).get("continue_requester"):
+                task_done_event["continue_requester"] = requester
+                break
+
+    try:  # the durable terminal is established: its own clock settles whatever delivery does next
+        from supervisor.consciousness_carriers import finish_pooled_wake
+
+        finish_pooled_wake(ctx, str(task_id or ""), final_task_result, {"metadata": evt.get("metadata"), **task})
+    except Exception:
+        log.warning("Own-clock settlement failed for %s", task_id, exc_info=True)
 
     # This seam is shared by the normal task_done path AND the lifecycle-fault
     # resolver, so open owner-quiz/hurry projections settle on EVERY dispatched
@@ -310,8 +429,15 @@ def _finish_task_done_dispatch(
         ctx.DRIVE_ROOT, str(task_id or ""), task, final_task_result, task_done_event,
     )
 
-    enqueue_project_completion_summary(
-        ctx.DRIVE_ROOT, evt, str(task_id or ""), task, final_task_result, task_done_event,
+    # #1154: ONE continuation owns both halves of a root's owed terminal
+    # projection — the canonical Project row and Main's single mirror. It defers
+    # while post-task synthesis is still open, so the early answer stays in the
+    # Project thread and Main hears once, after the run has really finished; the
+    # post-task callback re-enters the same continuation. A run that owes nothing
+    # (a child, or a root already settled) returns immediately.
+    settle_terminal_projection(
+        ctx.DRIVE_ROOT, str(task_id or ""), task=task,
+        event={**(evt if isinstance(evt, dict) else {}), **task_done_event},
     )
 
     if task_id and str(task.get("delegation_role") or "") == "subagent":
@@ -320,7 +446,7 @@ def _finish_task_done_dispatch(
             or load_task_result(ctx.DRIVE_ROOT, str(task_id or ""))
             or {}
         )
-        from supervisor.subagent_task_truth import enrich_task_done_event
+        from supervisor.subagent_task_truth import enrich_task_done_event, terminal_executor_route
 
         _envelope = enrich_task_done_event(task_done_event, effective_result)
         # Membership, not truthiness (C4): chat 0 real, negative A2A.
@@ -344,10 +470,12 @@ def _finish_task_done_dispatch(
                 STATUS_INTERRUPTED: ("⏹️", STATUS_INTERRUPTED, STATUS_INTERRUPTED),
             }.get(status, ("ℹ️", status or "done", status or "finished"))
             icon, subagent_event, verb = status_display
-            if status == STATUS_COMPLETED and _finished_with_warnings(task_done_event):
+            if status == STATUS_COMPLETED:
                 # Icon and verb only: `subagent_event` and progress_meta `status`
                 # stay the lifecycle values every card and Telegram consumer keys on.
-                icon, verb = "⚠️", "finished with warnings"
+                display = _completed_lifecycle_display(task_done_event, effective_result)
+                if display:
+                    icon, verb = display
             result_text = str(effective_result.get("result") or "")
             trace_text = str(effective_result.get("trace_summary") or "")
             constraint = effective_result.get("task_constraint")
@@ -357,13 +485,15 @@ def _finish_task_done_dispatch(
             # carried no cost field at all.
             _cost_meta = carry_cost_meta(
                 {"accounted_upper_bound_usd": None, **task_done_event})
+            role = str(task.get("role") or "").strip()
+            role_suffix = f" ({role})" if role else ""
             progress_meta = {
                 "subagent_event": subagent_event,
                 "subagent_task_id": str(task_id or ""),
                 "root_task_id": str(task.get("root_task_id") or ""),
                 "parent_task_id": str(task.get("parent_task_id") or ""),
                 "delegation_role": "subagent",
-                "subagent_role": str(task.get("role") or ""),
+                "subagent_role": role,
                 "write_surface": str(constraint.get("surface") or ""),
                 "status": status,
                 # C2/C12 (ABI-3): the honest cost names plus EVERY openness/
@@ -380,6 +510,9 @@ def _finish_task_done_dispatch(
                 "reserved_usd": _cost_meta.get("reserved_usd"),
                 "unresolved_upper_bound_usd": _cost_meta.get("unresolved_upper_bound_usd"),
                 "ledger_integrity_degraded": _cost_meta.get("ledger_integrity_degraded"),
+                # #498: the scoped carrier travels with the amount it explains.
+                "cost_presentation": _cost_meta.get("cost_presentation"),
+                "cost_custody": _cost_meta.get("cost_custody"),
                 "cost_accounting_error": _cost_meta.get("cost_accounting_error"),
                 "cost_accounting_status": str(
                     task_done_event.get("cost_accounting_status") or "unavailable"
@@ -394,7 +527,11 @@ def _finish_task_done_dispatch(
                 # The terminal frame carries the route so the finished card's chip can be
                 # rebuilt on replay, and the completion-seam EVIDENCE (below) so the chip
                 # upgrades from the neutral "dispatched" decision to what actually ran.
-                "executor_route": str(effective_result.get("executor_route") or ""),
+                "executor_route": terminal_executor_route(effective_result),
+                # The effort decision survives the terminal card and its replay (empty = unknown).
+                "effort_level": str(effective_result.get("effort_level") or ""),
+                "effort_requested": str(effective_result.get("effort_requested") or ""),
+                "effort_source": str(effective_result.get("effort_source") or ""),
             }
             if isinstance(_envelope.get("execution_evidence"), dict):
                 progress_meta["execution_evidence"] = _envelope["execution_evidence"]
@@ -410,30 +547,25 @@ def _finish_task_done_dispatch(
                 progress_meta["model_execution"] = task_done_event["model_execution"]
             ctx.send_with_budget(
                 chat_id,
-                f"{icon} Subagent {task_id} {verb} ({task.get('role') or 'researcher'}).",
+                f"{icon} Subagent {task_id} {verb}{role_suffix}.",
                 is_progress=True,
                 task_id=str(task_id or ""),
                 progress_meta=progress_meta,
                 role="system", system_type="subagent_terminal_notice")
 
+    from ouroboros.obligations import drive_finished
+    drive_finished(ctx.DRIVE_ROOT, {**task, "id": task_id}, final_task_result)
+    from ouroboros.model_wait import record_execution_close
+    from ouroboros.task_status import SETTLED_STATUSES
     from supervisor.queue import _queue_lock, clear_acceptance_fence_for_root
 
+    if task_id and task_done_event.get("status") in SETTLED_STATUSES:  # #939: close its clock before the release
+        record_execution_close(ctx.DRIVE_ROOT, str(task_id), task, ctx.RUNNING.get(str(task_id)))
     with _queue_lock:
         if task_id:
             ctx.RUNNING.pop(str(task_id), None)
-            # A child's settled result is the parent's cue to START integrating,
-            # so settlement counts as the PARENT's own progress. Without this
-            # stamp a coordinator blocked in wait_tasks was idle-killed exactly
-            # when its last child delivered (the completed child instantly left
-            # RUNNING, so _subtree_progressing went dark and only the grace
-            # window remained). Own progress also lets the existing spare
-            # machinery (resolve_grace_episode_for_spared_task) withdraw an
-            # outstanding finalization-grace episode on the next enforce tick.
-            # A one-shot event per child terminal — unlike subtree narration,
-            # it cannot re-arm/flicker episodes. `task` is {} for reaper-delivered
-            # terminals (RUNNING popped before dispatch), so fall back to the
-            # durable result for the parent id — same shape the notification
-            # gate handles.
+            # Real child results give the parent time to integrate. Reaper-delivered
+            # terminals may have no RUNNING row; the durable result retains the lineage.
             parent_meta = ctx.RUNNING.get(str(
                 task.get("parent_task_id")
                 or final_task_result.get("parent_task_id") or ""
@@ -448,6 +580,9 @@ def _finish_task_done_dispatch(
             if not getattr(ctx.WORKERS[worker_id], "reaping", False):
                 ctx.WORKERS[worker_id].busy_task_id = None
     if task_id:
+        from ouroboros.presence_carrier import settle_ended_turn
+
+        settle_ended_turn(str(task_id))  # the row is released: a Host waiter its carrier never settled settles now
         try:
             clear_acceptance_fence_for_root(str(task_id))
         except Exception:
@@ -456,23 +591,38 @@ def _finish_task_done_dispatch(
                 task_id,
                 exc_info=True,
             )
+        tree_root = ""
         try:
             from supervisor.queue_transitions import clear_budget_root_fence_for_settled_tree
 
             # Pending-cancel and reaper task_done arrive AFTER the row left
             # PENDING/RUNNING, so `task` is {} here: the tree identity falls
             # back to the event stamp, then the durable result.
-            clear_budget_root_fence_for_settled_tree({
-                "id": str(task_id or ""),
-                "root_task_id": str(
-                    (task if isinstance(task, dict) else {}).get("root_task_id")
-                    or (task_done_event or {}).get("root_task_id")
-                    or (final_task_result or {}).get("root_task_id")
-                    or ""
-                ),
-            })
+            tree_root = str(
+                (task if isinstance(task, dict) else {}).get("root_task_id")
+                or (task_done_event or {}).get("root_task_id")
+                or (final_task_result or {}).get("root_task_id")
+                or ""
+            )
+            clear_budget_root_fence_for_settled_tree({"id": str(task_id or ""), "root_task_id": tree_root})
         except Exception:
             log.warning("Failed to release budget root fence for %s", task_id, exc_info=True)
+        if tree_root:
+            try:
+                from supervisor.owner_pause_control import mark_tree_changed, refresh_owner_pause_tree
+
+                # A member that finished while its tree was pausing may be the
+                # last one the owner's Pause was waiting for — or the last writer
+                # an owner's Continue of that tree was held behind. The root's own
+                # terminal counts too: its late phase ended, or the Pause ended it.
+                # What it left running has no transition of its own: the pass looks.
+                mark_tree_changed(tree_root)
+                refresh_owner_pause_tree(tree_root)
+                from supervisor.continuation_admission import release_settled_continuations
+
+                release_settled_continuations(tree_root)
+            except Exception:
+                log.warning("Owner pause/continue settlement check failed for %s", tree_root, exc_info=True)
     ctx.persist_queue_snapshot(reason="task_done")
     try:
         ctx.bridge.push_log(task_done_event)
@@ -484,10 +634,9 @@ def _finish_task_done_dispatch(
 
     _events()._maybe_notify_provider_death(ctx, task_id, task, final_task_result, task_done_event)
     try:
-        results_dir = pathlib.Path(ctx.DRIVE_ROOT) / "task_results"
-        results_dir.mkdir(parents=True, exist_ok=True)
-        result_file = results_dir / f"{task_id}.json"
-        if not result_file.exists():
+        from ouroboros.task_store import exists
+
+        if not exists(ctx.DRIVE_ROOT, str(task_id or "")):
             write_task_result(
                 ctx.DRIVE_ROOT,
                 str(task_id or ""),
@@ -514,7 +663,9 @@ def _finish_task_done_dispatch(
         try:
             from supervisor.terminal_delivery import cleanup_settled_owner_mailbox
 
-            cleanup_settled_owner_mailbox(ctx.DRIVE_ROOT, str(task_id), task)
+            # The loop thread copies and hashes nothing: a mailbox with unread inputs to carry
+            # waits for the off-loop mailbox sweep or the drive settlement.
+            cleanup_settled_owner_mailbox(ctx.DRIVE_ROOT, str(task_id), task, carry_inputs=False)
         except Exception:
             log.warning("Failed to cleanup terminal owner mailbox for %s", task_id, exc_info=True)
 
@@ -568,6 +719,11 @@ def _resolve_lifecycle_fault(
             task_row = dict(meta["task"])
     except Exception:
         task_row = {}
+    # A missing or unstarted result keeps what the host still knows of this attempt, for every reader.
+    owner = task_row.get("_execution_owner") if isinstance(task_row.get("_execution_owner"), dict) else {}
+    identity = task_row.get("metadata") or evt.get("metadata")
+    known = {"metadata": identity if isinstance(identity, dict) else None, "execution_owner": owner,
+             "task_attempt": owner.get("task_attempt")}
     # GR4-3: the synthetic terminal fires the SAME assisted-update hooks the
     # normal task_done path reaches — an orphaned managed-update transaction or
     # a held assisted writer gate would otherwise survive a lifecycle-fault
@@ -607,6 +763,7 @@ def _resolve_lifecycle_fault(
             return {
                 "status": status, "reason_code": "task_done_lifecycle_fault", "outcome_axes": axes,
                 **({"result": detail} if not current.get("result") else {}),
+                **{key: value for key, value in known.items() if value and not current.get(key)},
             }
 
         write_task_result(
@@ -643,6 +800,9 @@ def _resolve_lifecycle_fault(
         "ts": utc_now_iso(),
         "type": "task_done",
         "task_id": task_id,
+        # #1578: the lineage this writer already holds, never reconstructed from history.
+        **{key: str(stored.get(key) or task_row.get(key) or evt.get(key)) for key in ("root_task_id", "parent_task_id")
+           if stored.get(key) or task_row.get(key) or evt.get(key)},
         "task_type": task_type,
         "chat_id": row_chat_identity(
             _events()._bound_project_chat_id(
@@ -652,10 +812,13 @@ def _resolve_lifecycle_fault(
             default=HIDDEN_CHAT_ID,
         ),
         "status": status,
+        "wake_silent": stored.get("wake_silent") is True, **{key: stored[key] for key in ("wake_summary", "fold_read", "schedule_name") if stored.get(key)}, **work_label(stored, task_row),
+        "quiet_effective": quiet_finish(stored),
         "reason_code": str(stored.get("reason_code") or ""),
         "outcome_axes": normalize_outcome_axes(stored),
     }
-    for key in ("review_projection", "review_status", "artifact_status", "artifact_bundle", "root_phase_checkpoint"):
+    for key in ("review_projection", "review_status", "artifact_status", "artifact_bundle", "root_phase_checkpoint",
+                "execution_owner", "_is_direct_chat"):
         if key in stored:
             task_done_event[key] = stored[key]
     try:
@@ -665,6 +828,7 @@ def _resolve_lifecycle_fault(
     except Exception:
         log.debug("lifecycle-fault cost projection failed for %s", task_id, exc_info=True)
     try:
+        task_done_event["logged_at"] = utc_now_iso()  # the append observation; ts keeps completion time
         append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", task_done_event)
     except Exception:
         log.warning("Failed to log lifecycle-fault task_done to events.jsonl", exc_info=True)
@@ -782,32 +946,6 @@ def _task_done_durable_fault(evt: Dict[str, Any], ctx: Any, task_id: Any) -> boo
         return True
 
 
-def _notify_consciousness_of_root_done(ctx: Any, task: Dict[str, Any], task_metadata: Any,
-                                       final_task_result: Any, task_done_event: Dict[str, Any]) -> None:
-    """A ROOT finishing (any outcome) is a reason for an early consciousness wake —
-    except the owner's own direct turn (В13: an owner message never wakes it, and
-    neither does that turn ending), a wake-up's own finish or a root consciousness
-    started (``metadata.initiator == "consciousness"``), or the chain would never sleep."""
-    metadata = task_metadata if isinstance(task_metadata, dict) else {}
-    if "subagent" in (str(task.get("delegation_role") or ""), str(metadata.get("delegation_role") or "")):
-        return  # the cancel path has already popped the RUNNING row; the event's metadata still says
-    if bool(task_done_event.get("_is_direct_chat")) or bool(task.get("_is_direct_chat")):
-        return
-    from ouroboros.consciousness_authority import is_consciousness_origin
-
-    result_metadata = final_task_result.get("metadata") if isinstance(final_task_result, dict) else None
-    if is_consciousness_origin(result_metadata) or is_consciousness_origin(task_metadata):
-        return
-    consciousness = getattr(ctx, "consciousness", None)
-    if consciousness is None:
-        return
-    try:
-        consciousness.notify(
-            f"task_finished:{task_done_event.get('task_id') or ''}:{task_done_event.get('status') or ''}")
-    except Exception:
-        log.debug("consciousness notify on task_done failed", exc_info=True)
-
-
 def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
     task_id = evt.get("task_id")
     wid = evt.get("worker_id")
@@ -858,7 +996,8 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
             _events()._resolve_lifecycle_fault(evt, ctx, _evt_status)
             return
     recovery = meta.get("_terminal_file_recovery") or {}
-    if task and not (task.get("_is_direct_chat") or _evt_status == STATUS_INTERRUPTED):
+    from ouroboros.task_carrier import conversation_origin
+    if task and not (conversation_origin(task) or _evt_status == STATUS_INTERRUPTED):  # a turn owes no files
         if prepared_attempt is None or (recovery and not recovery.get("event_sent")):
             from supervisor.task_reaper import enqueue_terminal_file_recovery
 
@@ -922,10 +1061,14 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
     )
     eff_cost = terminal_cost.get("accounted_upper_bound_usd")
     eff_rounds = terminal_cost.get("total_rounds")
+    known_result = final_task_result if isinstance(final_task_result, dict) else {}
     task_done_event = {
         "ts": evt.get("ts", utc_now_iso()),
         "type": "task_done",
         "task_id": task_id,
+        # #1578: the lineage this writer already holds, never reconstructed from history.
+        **{key: str(known_result.get(key) or (task or {}).get(key) or evt.get(key)) for key in (
+            "root_task_id", "parent_task_id") if known_result.get(key) or (task or {}).get(key) or evt.get(key)},
         "task_type": task_type,
         "chat_id": row_chat_identity(
             _events()._bound_project_chat_id(
@@ -938,11 +1081,14 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
             default=HIDDEN_CHAT_ID,
         ),
         "status": str(final_task_result.get("status") or evt.get("status") or ""),
+        "wake_silent": known_result.get("wake_silent") is True, **{key: known_result[key] for key in ("wake_summary", "fold_read", "schedule_name") if known_result.get(key)}, **work_label(known_result, task),
+        "quiet_effective": quiet_finish(known_result),
         # The direct-turn fact rides the rebuilt terminal so the chat block keys
         # its chrome on host truth: the worker frame carries it, the durable
         # result carries it, and a reaper-delivered terminal reads the result.
         "_is_direct_chat": bool(evt.get("_is_direct_chat") or (
             isinstance(final_task_result, dict) and final_task_result.get("_is_direct_chat"))),
+        "execution_owner": final_task_result.get("execution_owner") or evt.get("execution_owner") or {},
         "root_phase_checkpoint": final_task_result.get("root_phase_checkpoint") or {},
         "outcome_axes": outcome_axes,
         "reason_code": reason_code,
@@ -966,6 +1112,7 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
     if isinstance(model_execution, dict):
         task_done_event["model_execution"] = model_execution
     try:
+        task_done_event["logged_at"] = utc_now_iso()  # the append observation; ts keeps completion time
         append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", task_done_event)
     except Exception:
         log.warning("Failed to log task_done to events.jsonl", exc_info=True)
@@ -991,8 +1138,6 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
         final_task_result=final_task_result,
         task_done_event=task_done_event,
     )
-    _notify_consciousness_of_root_done(ctx, task, task_metadata, final_task_result, task_done_event)
-
     # v6.91 tree-quiescence coop checkpoint: MUST run after the dispatch
     # bookkeeping above removed this terminal child from RUNNING, or the
     # finishing child still counts live and "zero live members" is never true.

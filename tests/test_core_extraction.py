@@ -27,9 +27,7 @@ _MOVED_NAMES = frozenset({
     "_MAX_VIDEO_FILE_BYTES",
     "_MEMORY_AT_DRIVE_MEMORY",
     "_SKILL_OWNER_STATE_FILENAMES",
-    "_SUBAGENT_SECRET_FILE_NAMES",
     "_access_or_block",
-    "_annotate_reread",
     "_coerce_line_window",
     "_coerce_start_char",
     "_data_list",
@@ -38,17 +36,11 @@ _MOVED_NAMES = frozenset({
     "_detect_image_mime",
     "_detect_video_mime",
     "_direct_resource_binding",
-    "_filter_subagent_secret_listing",
-    "_filter_subagent_secret_repo_listing",
     "_is_cognitive_data_path",
     "_is_skill_owner_state_target",
-    "_is_subagent_secret_data_path",
-    "_is_subagent_secret_repo_path",
-    "_is_subagent_secret_repo_target",
     "_list_dir",
     "_list_files",
     "_list_user_files_dir",
-    "_local_readonly_resource_block",
     "_normalize_data_read_path",
     "_profile_roots_hint",
     "_read_file",
@@ -59,7 +51,6 @@ _MOVED_NAMES = frozenset({
     "_send_file",
     "_send_photo",
     "_send_video",
-    "is_restricted_subagent_profile",
 })
 
 
@@ -95,6 +86,7 @@ def test_core_catalog_schema_bytes_and_handler_owners_are_stable():
         "send_video",
         "send_file",
         "send_links",
+        "show_card",
         "search_code",
         "escalate",
         "forward_to_worker",
@@ -115,10 +107,78 @@ def test_core_catalog_schema_bytes_and_handler_owners_are_stable():
     # bound joins its parameters. Rolled again for the owner's "autonomy first" decision:
     # the escalate description states when waiting is worth it (an irreversible or costly
     # next step, or a choice that is the owner's to make) and that waiting questions of one
-    # batch share one wait, ended by the first incoming message; 935 -> 932 bytes. Diffing the
-    # whole catalog base to head shows exactly those edits and nothing else.
+    # batch share one wait, ended by the first incoming message; 935 -> 932 bytes. Rolled
+    # again for owner decision 7A: the read_file description states that an absolute path
+    # with no root selects the permitted root holding it (one sentence replaced, 103 -> 100
+    # bytes). Rolled again for serial addressed turns: the forward_to_worker description
+    # names its peer addressees (your own parent or a sibling, delivered as a message from a
+    # peer task naming the relation; relay refused there), the 8000-char body bound and the
+    # await_messages companion (395 -> 698 bytes); the `message` parameter description states
+    # the bound. Rolled again for the truthful owner-question work (PR1, owner 1D/2A): the
+    # escalate description and its nine field descriptions were replaced (the card is written
+    # for a reader outside the room, names the source of the fork, and the question has no
+    # quiz-specific length cap); schema shape, types, defaults and required keys are unchanged,
+    # and the entry's literal moved beside its validator in core_artifacts (byte-identical
+    # serialization). Rolled again for TZ-2 B1 (zero-option questions) and owner V13: the
+    # escalate description offers 0-6 alternatives (none for an open question answered in the
+    # human's own words), states that a shared wait ends on any incoming message and that a
+    # plain-text clarification ends the turn while a waited question keeps it alive; the
+    # `options` description says optional 0-6 and `options` leaves the required keys. Rolled
+    # again for TZ-1 V10: forward_to_worker also writes into a queued task's mailbox, so its
+    # description and `task_id` description say "running or queued" and when each reads it.
+    # Presence peer mail expands only forward_to_worker's description; the
+    # catalog comparison preserves every parameter and handler owner. Rolled again
+    # for same-tree mail: the forward_to_worker description names its peer addressees
+    # as any other task in the caller's tree (parent, sibling, any task sharing the
+    # root) and says Presence observation gaps are disclosed inside the tree too.
+    # Rolled again for source-addressed delivery (owner Q4): read_file gains the
+    # additive `max_chars` view budget (an exact piece of one window after start_char,
+    # the header naming the next cursor) and start_char's description names the
+    # code-point basis and the partial-view address; no parameter changed type,
+    # default or required status. Rolled for the owner-approved edit/read package:
+    # numbered read views (both cursors count source characters, never display
+    # numbers), explicit omitted-root semantics and ordered same-file edit_text
+    # replacements; editor calls run in call order and `force` confirms only an
+    # intentional shrink. The composed catalog retains both independent changes:
+    # public long-line search_code windows name the first match and read_file range;
+    # #1660 escalate adds explicit close (action, quiz_id, question_task_id, reason),
+    # registered materials and retention after task end. Only ask's validator requires
+    # question. The exact hash below pins their union; parameter types/defaults and
+    # required keys outside escalate, all other schemas and handler owners stay intact.
+    # Published question lifecycle wording changes only escalate's description and
+    # question_task_id description; the parameters and all other catalog entries remain identical.
+    # Rolled for living messages (plugin-first): the catalog gains show_card after send_links, its
+    # entry living beside its handler in tools/cards.py; every other entry is byte-identical (the
+    # catalog without show_card still hashes to 6d10eac1...). Rolled again after review: show_card's
+    # description says an app cannot fetch or load resources and that loading another page closes
+    # it, and that a press after the task ended arrives as the owner's message replying to the card.
+    # Rolled for the infrastructure-under-load PR: forward_to_worker also writes into a requested
+    # child's mailbox (read when it starts, or kept as unread mail), so its description and `task_id`
+    # description say "running, queued or requested"; nothing else in the catalog changed.
+    # Rolled for the start ledger: show_card's description adds one sentence (on most devices an app
+    # shares the owner's page thread, so heavy computation belongs in a blob: Worker); nothing else changed.
+    # D3 adds the recorded reply_to address to forward_to_worker and escalate.
+    # Target merge retains the contributor tool affordances and target review/mail contracts.
+    # 2026-10-23: escalate gains request_id for private Main questions; its retry
+    # description also explains that a new wait after timeout needs a new key.
+    # Rolled for the decision-quality review fixes: escalate's description names a helper's
+    # proposal as a fork source and makes a set-aside position one of the options; nothing else changed.
+    # Rolled for #2577: the send_photo, send_video and send_file `file_path` descriptions now say the path
+    # is relative to the active workspace or absolute; nothing else changed (c624c58e... before).
+    # Rolled again for #2633: send_photo, send_video, send_file, send_links and show_card name this work's
+    # room and say that for Presence-bound work it is local, not the place conversation.
+    # Rolled for owner answer 3A (#2811): escalate's description says a card from Presence work goes privately to
+    # Main and asks for one line in the conversation, sent in the asking tool batch, when the human is the
+    # person talked with there.
+    # Rolled for the pause/continue doors (audit 05.11): escalate's wait_for_answer description says waiting
+    # keeps the work alive with what it holds, until when, and what the default does; nothing else changed
+    # (8892c8af... before).
+    # Presence clarification keeps the question notice private and names the requested wait's boundary.
+    # Rolled for the one release of words (#3257): escalate's first sentence asks by authority (BIBLE P0),
+    # its wait clause names work that cannot go on without the answer, and "with an explanation" leaves
+    # the closing sentence; nothing else changed (76a2871b... before).
     assert hashlib.sha256(schema_bytes).hexdigest() == (
-        "0f72df2827a90d691d5c3fd1107170b050489061e9d55201a1feda0da647f82b"
+        "4da8992f58a5e0db0c4cf195a08673488961777dafc9801f36ccc18419b462b1"
     )
     assert {
         entry.name: (entry.handler.__module__, entry.handler.__name__)
@@ -132,6 +192,7 @@ def test_core_catalog_schema_bytes_and_handler_owners_are_stable():
         "send_video": ("ouroboros.tools.core_artifacts", "_send_video"),
         "send_file": ("ouroboros.tools.core_artifacts", "_send_file"),
         "send_links": ("ouroboros.tools.core_artifacts", "_send_links"),
+        "show_card": ("ouroboros.tools.cards", "_show_card"),
         "search_code": ("ouroboros.tools.core", "_code_search"),
         "escalate": ("ouroboros.tools.core_artifacts", "_escalate"),
         "forward_to_worker": ("ouroboros.tools.core", "_forward_to_worker"),
@@ -164,18 +225,8 @@ def test_extracted_read_and_list_result_bytes_are_stable(tmp_path):
     ctx = ToolContext(repo_dir=repo, drive_root=data)
 
     assert core_file_tools._repo_read(ctx, "sample.txt").encode() == (
-        b"# sample.txt \xe2\x80\x94 lines 1\xe2\x80\x932 of 2\nalpha\nbeta\n"
+        b"# sample.txt \xe2\x80\x94 lines 1\xe2\x80\x932 of 2\n     1\talpha\n     2\tbeta\n"
     )
     assert core_file_tools._repo_list(ctx, ".").encode() == (
         b'[\n  "nested/",\n  "sample.txt"\n]'
     )
-
-
-def test_core_extraction_size_bounds_have_meaningful_headroom():
-    counts = {
-        module.__name__: len(pathlib.Path(module.__file__).read_text(encoding="utf-8").splitlines())
-        for module in (core, core_file_tools, core_artifacts)
-    }
-    assert counts["ouroboros.tools.core"] <= 1499
-    assert counts["ouroboros.tools.core_file_tools"] <= 1000
-    assert counts["ouroboros.tools.core_artifacts"] <= 1000

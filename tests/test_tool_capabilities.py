@@ -125,8 +125,9 @@ def test_top_level_workspace_focus_has_tool_and_schema_parity(tmp_path, monkeypa
     assert names == schemas
     assert {
         "delegate_start", "delegate_wait", "delegate_cancel", "delegate_answer",
+        "delegate_message",
         "switch_model", "send_photo", "send_video", "send_file", "send_links",
-        "commit_reviewed", "promote_chat_to_task", "vcs_restore",
+        "commit_reviewed", "start_task", "vcs_restore",
     } <= names
 
     # Successor of the retired _WORKSPACE_ALLOWED_TOOLS subset invariant: the
@@ -140,11 +141,13 @@ def test_top_level_workspace_focus_has_tool_and_schema_parity(tmp_path, monkeypa
         LOCAL_READONLY_SUBAGENT_TOOL_NAMES,
     )
 
-    assert LOCAL_READONLY_SUBAGENT_TOOL_NAMES <= names, (
+    # Exact callable aliases intentionally have no second advertised schema.
+    aliases = {entry.name for entry in registry._entries.values() if entry.alias_for in names}
+    assert LOCAL_READONLY_SUBAGENT_TOOL_NAMES <= names | aliases, (
         f"read-only child tools missing from the workspace tool surface: "
         f"{sorted(LOCAL_READONLY_SUBAGENT_TOOL_NAMES - names)}"
     )
-    assert ACTING_SUBAGENT_TOOL_NAMES <= names, (
+    assert ACTING_SUBAGENT_TOOL_NAMES <= names | aliases, (
         f"acting child tools missing from the workspace tool surface: "
         f"{sorted(ACTING_SUBAGENT_TOOL_NAMES - names)}"
     )
@@ -251,7 +254,7 @@ def test_run_shell_list_cmd_works(tmp_path):
     ctx = MagicMock(spec=ToolContext)
     ctx.repo_dir = tmp_path
     ctx.drive_logs.return_value = tmp_path
-    result = _run_shell(ctx, ["echo", "hello"])
+    result = _run_shell(ctx, [sys.executable, "-c", "print('hello')"])
     assert "hello" in result
 
 
@@ -320,8 +323,10 @@ def test_child_profiles_expose_existing_descendant_controls(tmp_path, constraint
     assert {"peek_task", "cancel_task", "discard_child_result"} <= names
 
 
-def test_local_readonly_verify_is_typed_zero_run_only(tmp_path):
+def test_local_readonly_verify_is_typed_zero_run_only(tmp_path, monkeypatch):
     """Readonly actor-first sessions may disclose no-leaf state, never run generic checks."""
+    monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_SAFETY_MODE", "off")
     from ouroboros.contracts.task_constraint import TaskConstraint
     from ouroboros.outcomes import (
         read_verification_receipts,
@@ -417,9 +422,7 @@ def test_ordinary_fresh_start_ignores_actor_first_zero_run_receipt_surface(tmp_p
 
     claimed, refusal = claimed_start_request(
         data,
-        claim_target="",
         actor_ctx=ctx,
-        enforce_actor_idle=True,
         run_id="",
         task_id=ctx.task_id,
         idempotency_key="ordinary-root-invocation",
@@ -610,64 +613,109 @@ def test_policy_hidden_reason_covers_contract_disabled_unregistered_names(tmp_pa
     assert registry.policy_hidden_reason("") is None
 
 
-def test_enable_tools_hidden_label_is_shared_between_surfaces():
-    """Drift pin (adversarial review of 9e59b05d, finding 5): the hidden-vs-missing
-    classification exists on TWO enable_tools surfaces (tool_discovery and the
-    loop's override). Pin both to policy_hidden_reason and the identical label so
-    the surfaces cannot silently diverge in honesty wording."""
+def test_discovery_has_one_implementation_bound_by_the_loop(tmp_path):
+    """#1262 (supersedes the two-surface drift pin): the loop binds tool_discovery's
+    handlers to its resident list instead of carrying its own copies, so the
+    hidden-vs-missing answer has exactly one author."""
     import ouroboros.loop as loop_mod
-    import ouroboros.tools.tool_discovery as td
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
 
-    label = "🚫 Hidden by policy (the tool exists but this task cannot use it)"
     loop_src = inspect.getsource(loop_mod)
-    td_src = inspect.getsource(td)
-    assert label in loop_src, "loop enable_tools override lost the shared hidden-by-policy label"
-    assert label in td_src, "tool_discovery lost the shared hidden-by-policy label"
-    assert loop_src.count("policy_hidden_reason(") >= 1
-    assert td_src.count("policy_hidden_reason(") >= 1
+    assert "policy_hidden_reason(" not in loop_src
+
+    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    ctx.task_contract = {"disabled_tools": ["write_file"]}
+    registry.set_context(ctx)
+    loop_mod._setup_dynamic_tools(registry, [], [])
+    out = registry.execute("enable_tools", {"tools": "write_file, definitely_not_a_tool"})
+    assert "write_file — disabled by this task's contract (disabled_tools)" in out
+    assert "❌ Not found: definitely_not_a_tool" in out
+    assert "write_file" not in out.split("Not found")[-1]
 
 
-def test_discovery_path_consistent_with_policy():
-    """list_available_tools must return the same non-core set as tool_policy.list_non_core_tools."""
-    from ouroboros.tools.registry import ToolRegistry
-    from ouroboros.tool_policy import list_non_core_tools as policy_non_core
+@pytest.mark.parametrize("mode", ["max", "low", "nano"])
+def test_discovery_lists_the_callable_catalog_in_every_mode(mode):
+    """list_available_tools reads ToolRegistry.schemas() in every context mode and
+    names every callable tool once, whether or not its schema is resident."""
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
     import ouroboros.tools.tool_discovery as td
 
     tmp = pathlib.Path(tempfile.mkdtemp())
     registry = ToolRegistry(repo_dir=tmp, drive_root=tmp)
     td.set_registry(registry)
+    ctx = ToolContext(repo_dir=tmp, drive_root=tmp, active_context_mode=mode)
+    registry.set_context(ctx)
+    output = td._list_available_tools(ctx, namespace="builtin")
 
-    # Get what tool_policy says (SSOT)
-    policy_names = {t["name"] for t in policy_non_core(registry)}
-    # Remove meta-tools (discovery excludes them from its listing)
-    policy_names -= {"list_available_tools", "enable_tools"}
-
-    # Get what discovery tool shows
-    from ouroboros.tools.registry import ToolContext
-    ctx = ToolContext(repo_dir=tmp, drive_root=tmp)
-    output = td._list_available_tools(ctx)
-
-    if not policy_names:
-        assert "All tools are already" in output
-    else:
-        for name in policy_names:
-            assert name in output, (
-                f"tool_policy says '{name}' is non-core but discovery doesn't show it"
-            )
+    names = [s["function"]["name"] for s in registry.schemas()]
+    assert names
+    for name in names:
+        assert f"- {name} [" in output, f"schemas() offers {name!r} but discovery does not list it"
+    assert ("[not loaded]" in output) is (mode == "nano")
 
 
 def test_burst_absorb_clause_states_the_prefix_write_cost():
-    """The burst affordance names its cash side, not only its latency win."""
+    """The burst affordance names its cash side, not only its latency win, as facts; the choice
+    between them is the caller's (#1175), and absorbing is wait_tasks' own contract."""
     from ouroboros.tools.registry import ToolRegistry
     from ouroboros.tool_policy import initial_tool_schemas
     import pathlib, tempfile
     tmp = pathlib.Path(tempfile.mkdtemp())
     registry = ToolRegistry(repo_dir=tmp, drive_root=tmp)
-    schema = next(
-        s for s in initial_tool_schemas(registry)
-        if s["function"]["name"] == "schedule_subagent"
+    descriptions = {s["function"]["name"]: s["function"]["description"] for s in initial_tool_schemas(registry)}
+    description = descriptions["schedule_subagent"]
+    assert "Children scheduled in one round run concurrently" in description
+    assert ("on cache-write-priced routes each sibling started before the first responds pays a full "
+            "prefix write") in description
+    assert "With mode=any_terminal it returns as soon as the FIRST child finishes" in descriptions["wait_tasks"]
+
+
+def test_escalate_is_available_wherever_planning_runs():
+    from ouroboros.tool_capabilities import (
+        ACTING_SUBAGENT_TOOL_NAMES, CORE_TOOL_NAMES, LOCAL_READONLY_SUBAGENT_TOOL_NAMES,
     )
-    description = schema["function"]["description"]
-    assert "BURST + ABSORB" in description
-    assert "prefix write" in description
-    assert "burst buys latency and spacing buys cash" in description
+
+    assert all("escalate" in names for names in
+               (CORE_TOOL_NAMES, LOCAL_READONLY_SUBAGENT_TOOL_NAMES, ACTING_SUBAGENT_TOOL_NAMES))
+
+
+def test_enable_tools_answers_a_skill_name_with_its_namespace_tools():
+    """A call asked for screenshots, saw "ext_19_r_unix_computer_use: 24 tools" in the overview and
+    asked enable_tools for "unix_computer_use": the skill's name, not a tool's. The miss now names the
+    namespace and its callable tools by the exact naming rule; an unrelated miss stays a plain miss."""
+    from ouroboros.extension_surface_names import extension_surface_name
+    from ouroboros.tools import tool_discovery as td
+
+    names = [extension_surface_name("unix_computer_use", short) for short in ("screenshot", "click")]
+
+    class Registry:
+        def callable_rows(self, namespace=""):
+            rows = [{"name": name} for name in [*names, "read_file"]]
+            return [row for row in rows if not namespace or td.tool_namespace(row["name"]) == namespace]
+
+    namespace = td.tool_namespace(names[0])
+    lines = td._named_namespace_guidance(Registry(), ["unix_computer_use"], discovery=True)
+    assert lines[0] == f"unix_computer_use names the namespace {namespace}, not one tool; enable its tools by their names."
+    assert any(names[0] in line for line in lines) and any(names[1] in line for line in lines)
+    assert td._named_namespace_guidance(Registry(), [namespace], discovery=True)[0].startswith(f"{namespace} names")
+    assert td._named_namespace_guidance(Registry(), ["definitely_not_a_tool", "read"], discovery=True) == []
+
+
+def test_every_catalog_that_names_extract_pdf_text_names_read_archive():
+    """The two local file readers share every class; the one deliberate difference is the round-one core set,
+    which read_archive leaves for on-demand loading (read_file's binary refusal names it)."""
+    import ouroboros.tool_capabilities as caps
+    import ouroboros.consciousness_authority as authority
+    import ouroboros.safety as safety
+    import ouroboros.tools.registry_guards as guards
+
+    catalogs = {f"{module.__name__}.{name}": value
+                for module in (caps, authority, safety, guards) for name, value in vars(module).items()
+                if isinstance(value, (frozenset, set, tuple, list, dict)) and "extract_pdf_text" in value}
+    assert {"ouroboros.tool_capabilities.CORE_TOOL_NAMES", "ouroboros.tool_capabilities.ACTING_SUBAGENT_TOOL_NAMES",
+            "ouroboros.tool_capabilities.LOCAL_READONLY_SUBAGENT_TOOL_NAMES"} <= set(catalogs)
+    missing = [name for name, value in catalogs.items()
+               if name != "ouroboros.tool_capabilities.CORE_TOOL_NAMES" and "read_archive" not in value]
+    assert not missing, missing
+    assert "read_archive" not in caps.CORE_TOOL_NAMES

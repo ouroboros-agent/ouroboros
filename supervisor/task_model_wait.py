@@ -27,9 +27,12 @@ def handle_task_model_wait(event: dict, ctx: Any) -> None:
             or revision <= 0 or not isinstance(attempt, int) or isinstance(attempt, bool)
             or event.get("state") not in {"waiting", "resolved"}):
         return
-    payload = copy.deepcopy(event)
+    from ouroboros.deployment_policy import served_wait
+
+    payload = served_wait(copy.deepcopy(event))  # as the decision door now answers, whenever the row was written
     row = {key: value for key, value in payload.items()
            if key not in {"type", "ts", "task_id", "quota_clock", "is_progress"}}
+    operation_event = False
     with _queue_lock:
         meta = ctx.RUNNING.get(task_id)
         if isinstance(meta, dict):
@@ -43,9 +46,13 @@ def handle_task_model_wait(event: dict, ctx: Any) -> None:
                 return
             waits[wait_id] = row
             task["model_waits"] = waits
+            # The row stays visible for any owner (an independent review operation
+            # included); only the author's own owner moves the author's execution clock.
+            # A reviewer's quota or result wait is never an author exclusion (#939).
+            author_clock = payload.get("model_wait_owner_id", "") == str(task.get("model_wait_owner_id") or "")
             previous_clock = meta.get("model_wait_quota_clock") or {}
             clock = payload.get("quota_clock") or {}
-            if int(clock.get("revision") or 0) > int(previous_clock.get("revision") or 0):
+            if author_clock and int(clock.get("revision") or 0) > int(previous_clock.get("revision") or 0):
                 meta["model_wait_quota_clock"] = clock
         else:
             # A finished managed task cannot be resurrected by a late waiter.
@@ -56,15 +63,28 @@ def handle_task_model_wait(event: dict, ctx: Any) -> None:
                 from ouroboros.post_task_checkpoint import post_task_model_wait
 
                 owner = post_task_model_wait(ctx.DRIVE_ROOT, task_id)
-                if owner is None or payload.get("model_wait_owner_id", "") != owner.owner_id:
+                if owner is not None and payload.get("model_wait_owner_id", "") == owner.owner_id:
+                    with owner.lock:
+                        current = owner.waits.get(wait_id) or {}
+                        if owner.closed or attempt != owner.attempt or current.get("revision") != revision:
+                            return
+                    payload["chat_id"] = owner.task.get("chat_id")
+                elif isinstance(payload.get("review_operation"), dict):
+                    operation_event = True
+                else:
                     return
-                with owner.lock:
-                    current = owner.waits.get(wait_id) or {}
-                    if owner.closed or attempt != owner.attempt or current.get("revision") != revision:
-                        return
-                payload["chat_id"] = owner.task.get("chat_id")
+    if operation_event:
+        # The author ended; its paid review operation may still be live. Proven
+        # off the queue lock: it reads the canonical row and the controller process.
+        from ouroboros.review_operation import review_operation_event_admitted
+
+        if not review_operation_event_admitted(ctx.DRIVE_ROOT, payload):
+            return
+        payload["chat_id"] = payload["review_operation"].get("chat_id")
     address_ctx_event(ctx, payload)
-    ctx.append_jsonl(ctx.DRIVE_ROOT / "logs" / "progress.jsonl", payload)
+    from ouroboros import dialogue_store
+
+    dialogue_store.append_quietly(ctx.DRIVE_ROOT, "progress", payload)
     ctx.bridge.push_log(payload)
 
 

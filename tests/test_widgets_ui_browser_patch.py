@@ -233,9 +233,9 @@ def test_ui_smoke_widget_changed_card_and_reconnect_reconcile(direct_server_with
 
                 page.route("**/api/ui/preferences", hold_reads)
                 page.locator(f"{card('manual')} [data-widget-menu-trigger]").click()
-                page.locator("body > .skills-card-menu-dialog[open] [data-widget-start-mode=\"auto\"]").click()
+                page.locator("body > .skills-card-menu-dialog:not([data-leaving])[open] [data-widget-start-mode=\"auto\"]").click()
                 page.locator(f"{card('hang')} [data-widget-menu-trigger]").click()
-                page.locator("body > .skills-card-menu-dialog[open] [data-widget-start-mode=\"manual\"]").click()
+                page.locator("body > .skills-card-menu-dialog:not([data-leaving])[open] [data-widget-start-mode=\"manual\"]").click()
                 wait_held(1)
                 page.wait_for_timeout(400)
                 assert len(held) == 1, "the second change must wait for the first write"
@@ -255,13 +255,16 @@ def test_ui_smoke_widget_changed_card_and_reconnect_reconcile(direct_server_with
                     timeout=10_000,
                 )
                 wait_frame(page, "manual", True)
-                assert page.locator(f"{card('manual')} [data-widget-start-mode=\"auto\"]").get_attribute("aria-checked") == "true"
-                assert page.locator(f"{card('hang')} [data-widget-start-mode=\"manual\"]").get_attribute("aria-checked") == "true"
+                # The persisted map can be visible before the client receives the
+                # write response and paints its policy controls.
+                from playwright.sync_api import expect
+                expect(page.locator(f"{card('manual')} [data-widget-start-mode=\"auto\"]")).to_have_attribute("aria-checked", "true")
+                expect(page.locator(f"{card('hang')} [data-widget-start-mode=\"manual\"]")).to_have_attribute("aria-checked", "true")
                 assert hang_frame_kept(page), "Manual changes nothing until Stop"
 
                 # (4) Escape closes the menu and returns focus to the ⋮ trigger.
                 page.locator(f"{card('hang')} [data-widget-menu-trigger]").click()
-                page.locator("body > .skills-card-menu-dialog[open] [data-widget-start-mode=\"manual\"]").wait_for(state="visible", timeout=5_000)
+                page.locator("body > .skills-card-menu-dialog:not([data-leaving])[open] [data-widget-start-mode=\"manual\"]").wait_for(state="visible", timeout=5_000)
                 assert page.evaluate("() => document.activeElement?.hasAttribute('data-widget-start-mode')")
                 page.keyboard.press("Escape")
                 page.locator(f"{card('hang')} [data-widget-start-mode=\"manual\"]").wait_for(state="hidden", timeout=5_000)
@@ -454,7 +457,8 @@ def test_ui_smoke_widget_start_never_joins_a_stale_mount(direct_server_with_data
                 assert page.locator("#widgets-list [data-widget-removed]").count() == 0
 
                 # (b) Owner Start of a stopped auto card, source held, then its revision moves.
-                page.locator(f"{card('auto')} [data-widget-power]").click()  # owner Stop
+                page.locator(f"{card('auto')} [data-widget-menu-trigger]").click()  # owner Stop: the card menu's
+                page.get_by_role("menuitem", name="Stop", exact=True).click()
                 wait_power(page, "auto", "Start")
                 assert state(page, "auto")["iframes"] == 0
                 start_held(page, "auto")
@@ -493,15 +497,12 @@ def test_ui_smoke_widget_start_never_joins_a_stale_mount(direct_server_with_data
 
 @pytest.mark.ui_browser
 @pytest.mark.parametrize("browser_name", ("chromium", "webkit"))
-def test_ui_smoke_widget_last_card_removal_evicts_session_state(direct_server_with_data, browser_name):
-    """Final-gate finding WL-02: a card that disappears must leave nothing of
-    itself behind, on BOTH removal paths. The keyed patch already evicted the
-    declarative session state and the owner's page-session Stop; the rebuild
-    branch — the one the patch never sees, when the LAST card leaves — did not.
-    Stop the ``auto`` card, disable the only skill so the list goes empty, then
-    re-enable it: the card must come back RUNNING, because the Stop that
-    suppressed it belonged to a card that no longer exists. Before the fix it
-    returned as a suppressed facade and only a window reload cleared it."""
+def test_ui_smoke_widget_last_card_removal_keeps_the_owners_stop(direct_server_with_data, browser_name):
+    """The owner's Stop holds until Start on this device (DESIGN "Widgets board"),
+    whatever the card does meanwhile. Stop the ``auto`` card, disable the only
+    skill so the list goes empty (the rebuild branch, which the keyed patch never
+    sees), then re-enable it: the card comes back as its facade with Start, and
+    Start runs it."""
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import sync_playwright
@@ -544,9 +545,10 @@ def test_ui_smoke_widget_last_card_removal_evicts_session_state(direct_server_wi
                 page.locator(card("auto")).wait_for(state="visible", timeout=30_000)
                 wait_power(page, "auto", "Stop")
 
-                # The owner stops the auto card: the suppression is page-session
-                # memory, keyed by this card.
-                page.locator(f'{card("auto")} [data-widget-power]').click()
+                # The owner stops the auto card (the card menu's Stop): the Stop is kept in this device's
+                # start ledger, keyed by this card.
+                page.locator(f'{card("auto")} [data-widget-menu-trigger]').click()
+                page.get_by_role("menuitem", name="Stop", exact=True).click()
                 wait_power(page, "auto", "Start")
                 page.locator(f'{card("auto")} [data-widget-facade]').wait_for(state="visible", timeout=10_000)
 
@@ -560,10 +562,13 @@ def test_ui_smoke_widget_last_card_removal_evicts_session_state(direct_server_wi
                 )
                 assert page.locator("#widgets-list iframe").count() == 0
 
-                # The same keys come back. The Stop belonged to a card that no
-                # longer exists, so the auto card starts again on its own.
+                # The same keys come back, and the owner's Stop with them: the
+                # card rests until Start, which runs it.
                 assert toggle(page, True) == 200
-                page.locator(card("auto")).wait_for(state="visible", timeout=20_000)
+                page.locator(f'{card("auto")} [data-widget-facade]').wait_for(state="visible", timeout=20_000)
+                wait_power(page, "auto", "Start")
+                assert page.locator(f'{card("auto")} iframe').count() == 0
+                page.locator(f'{card("auto")} [data-widget-power]').click()
                 wait_power(page, "auto", "Stop")
                 page.wait_for_function(
                     '(selector) => document.querySelectorAll(`${selector} iframe`).length === 1',

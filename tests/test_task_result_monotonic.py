@@ -11,9 +11,11 @@ Pins the "ghost subagent" / status-corruption protections:
 - normal forward progress and same-status enrichment are unaffected
 """
 
+
 import pytest
 
 from ouroboros import task_results as tr
+from tests._store_shared import seed_result
 
 
 @pytest.fixture()
@@ -57,6 +59,72 @@ def test_same_terminal_status_enrichment_allowed(drive):
     assert data["trace_summary"] == "trace"
 
 
+@pytest.mark.parametrize(("terminal", "previous"), [
+    pytest.param(tr.STATUS_COMPLETED, None, id='completed-None'),
+    pytest.param(tr.STATUS_FAILED, tr.STATUS_RUNNING, id='failed-running'),
+    pytest.param(tr.STATUS_CANCELLED, None, id='cancelled-None'),
+    pytest.param(tr.STATUS_REJECTED_DUPLICATE, tr.STATUS_RUNNING, id='rejected_duplicate-running'),
+])
+def test_first_accepted_root_terminal_write_originates_projection_debt(drive, previous, terminal):
+    if previous is not None:
+        tr.write_task_result(drive, "root", previous)
+    stored = tr.write_task_result(drive, "root", terminal)
+    assert stored["canonical_terminal_projection_origin"] == "terminal_transition"
+    assert "canonical_terminal_projection_ready" not in stored
+    assert tr.load_task_result(drive, "root", strict=True) == stored
+    enriched = tr.write_task_result(drive, "root", terminal,
+                                   canonical_terminal_projection_origin=None, result="enriched")
+    assert enriched["canonical_terminal_projection_origin"] == "terminal_transition"
+
+
+@pytest.mark.parametrize("lineage", [
+    {"parent_task_id": "parent", "root_task_id": "parent", "delegation_role": "subagent"},
+    {"metadata": {"parent_task_id": "parent", "root_task_id": "parent", "delegation_role": "subagent"}},
+    {"root_task_id": "other"},
+])
+def test_child_or_unproven_lineage_cannot_originate_projection_debt(drive, lineage):
+    tr.write_task_result(drive, "child", tr.STATUS_RUNNING, **lineage)
+    stored = tr.write_task_result(drive, "child", tr.STATUS_COMPLETED,
+                                 canonical_terminal_projection_origin="terminal_transition")
+    assert "canonical_terminal_projection_origin" not in stored
+
+
+def test_root_retry_transition_uses_merged_lineage(drive):
+    tr.write_task_result(drive, "retry", tr.STATUS_RUNNING, root_task_id="logical-root",
+                        parent_task_id="", delegation_role="root", original_task_id="previous",
+                        timeout_retry_from="previous")
+    stored = tr.write_task_result(drive, "retry", tr.STATUS_COMPLETED)
+    assert stored["canonical_terminal_projection_origin"] == "terminal_transition"
+
+
+@pytest.mark.parametrize("projector", ["plain", "replica", "enrichment"])
+def test_terminal_enrichment_cannot_adopt_a_historical_result(drive, projector):
+    from ouroboros.post_task_checkpoint import project_replica_task_result_fields
+
+    seed_result(drive, "historical", {"_schema_version": tr.TASK_RESULT_SCHEMA_VERSION,
+                               "task_id": "historical", "status": tr.STATUS_COMPLETED})
+
+    def enrich(_current, fields):
+        return {**fields, "canonical_terminal_projection_origin": "terminal_transition"}
+
+    reducer = {"plain": None, "replica": project_replica_task_result_fields, "enrichment": enrich}[projector]
+    stored = tr.write_task_result(drive, "historical", tr.STATUS_COMPLETED, result="refreshed",
+                                 canonical_terminal_projection_origin="terminal_transition",
+                                 _field_projector=reducer)
+    assert stored["result"] == "refreshed"
+    assert "canonical_terminal_projection_origin" not in stored
+    # A rejected lifecycle write cannot create provenance either.
+    assert tr.write_task_result(drive, "historical", tr.STATUS_FAILED,
+                                canonical_terminal_projection_origin="terminal_transition") == stored
+
+
+def test_replica_cannot_supply_terminal_origin_to_an_effective_read():
+    from ouroboros.post_task_checkpoint import project_replica_task_result_fields
+
+    replica = {"canonical_terminal_projection_origin": "terminal_transition", "result": "worker"}
+    assert project_replica_task_result_fields({}, replica) == {"result": "worker"}
+
+
 def test_replica_projector_keeps_terminal_lifecycle_guard(drive):
     from ouroboros.post_task_checkpoint import project_replica_task_result_fields
 
@@ -82,7 +150,10 @@ def test_writer_selects_current_review_before_locked_projector(drive):
     calls = []
 
     def project(current, fields):
-        assert (drive / "task_results" / "review.json.lock").exists()
+        from ouroboros import store
+        with pytest.raises(store.StoreBusy):  # the projector runs inside the write transaction
+            with store.open_store(drive, write=True, wait_sec=0.0):
+                pass
         assert fields["review_projection"] == current["review_projection"] == {"panels": [panel]}
         calls.append(True)
         return {**fields, "status": current["status"], "review_projection": {
@@ -172,17 +243,18 @@ def test_updated_at_is_written(drive):
     assert tr.load_task_result(drive, "t").get("updated_at")
 
 
-def test_lock_timeout_never_falls_back_to_an_unlocked_authoritative_write(
+def test_a_busy_store_never_falls_back_to_an_unlocked_authoritative_write(
     drive, monkeypatch,
 ):
-    """A timeout preserves prior lifecycle truth instead of accepting stale state."""
+    """A busy store preserves prior lifecycle truth instead of accepting stale state."""
+    from ouroboros.store import StoreBusy
     tr.write_task_result(drive, "locked", tr.STATUS_RUNNING, result="working")
 
-    def _timeout(*_args, **_kwargs):
-        raise TimeoutError("held by concurrent writer")
+    def _busy(*_args, **_kwargs):
+        raise StoreBusy("held by concurrent writer")
 
-    monkeypatch.setattr(tr, "update_json_locked", _timeout)
-    with pytest.raises(TimeoutError, match="concurrent writer"):
+    monkeypatch.setattr(tr, "patch_document", _busy)
+    with pytest.raises(StoreBusy, match="concurrent writer"):
         tr.write_task_result(drive, "locked", tr.STATUS_COMPLETED, result="done")
 
     stored = tr.load_task_result(drive, "locked")
@@ -205,16 +277,17 @@ def test_llm_project_name_uses_cleaned_model_title():
     assert name == "Cyber Racing Arena", f"expected cleaned title, got {name!r}"
 
 
-def test_read_paths_do_not_create_task_results_dir(tmp_path):
-    """v6.40.0: a READ/LIST scan of a never-provisioned root must NOT materialise the
-    ``task_results`` directory (regression: an unguarded scan created stray dirs)."""
+def test_read_paths_create_nothing_under_a_never_provisioned_root(tmp_path):
+    """A READ/LIST of a root that does not exist answers empty and materialises nothing (no
+    ``task_results`` directory, no store); a WRITE provisions the store, not the directory."""
+    from ouroboros import store
     root = tmp_path / "never_provisioned"
     assert tr.list_task_results(root) == []
     assert tr.load_task_result(root, "missing") is None
-    assert not (root / "task_results").exists(), "read must not create the dir"
-    # WRITE still provisions it.
+    assert not root.exists(), "read must not create the root"
     tr.write_task_result(root, "t", tr.STATUS_SCHEDULED)
-    assert (root / "task_results").is_dir()
+    assert store.store_path(root).is_file() and not (root / "task_results").exists()
+    assert tr.load_task_result(root, "t")["status"] == tr.STATUS_SCHEDULED
 
 
 def test_read_with_stub_root_leaks_no_cwd_dir(tmp_path, monkeypatch):

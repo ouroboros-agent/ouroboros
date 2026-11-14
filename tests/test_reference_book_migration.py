@@ -82,7 +82,8 @@ def _git(*args: str) -> bytes | None:
 
 
 def _migration_commit() -> str | None:
-    out = _git("log", "--diff-filter=A", "--format=%H", "--", TRANSFER_TABLE)
+    # Contributor merges can simplify away a deleted path on one parent.
+    out = _git("log", "--full-history", "--diff-filter=A", "--format=%H", "--", TRANSFER_TABLE)
     lines = [line for line in (out or b"").decode().split("\n") if line.strip()]
     return lines[-1] if lines else None
 

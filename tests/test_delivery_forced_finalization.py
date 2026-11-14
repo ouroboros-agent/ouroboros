@@ -7,6 +7,8 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from tests._delivery_candidate_shared import (
     write_child as _write_child,
     write_confirmed_disposition_fixture as _write_confirmed_disposition,
@@ -48,8 +50,26 @@ def _forced_test_context(tmp_path, *, usage=None, incoming=None):
     return loop, registry, ctx, trace
 
 
+def _select_completion(registry, ctx, trace, *, answer=None, answer_sha256=None, action="finish", rationale=""):
+    """Stage the author's current observation and consume its real request."""
+    from ouroboros.loop_delivery import completion_observation, consume_completion_request
+    from ouroboros.tools.control_runtime import stage_completion_request
+
+    registry._ctx._completion_observation = completion_observation(registry._ctx, trace)
+    response = stage_completion_request(registry._ctx, {"action": action, "answer": answer,
+        "answer_sha256": answer_sha256, "rationale": rationale})
+    assert json.loads(response)["status"] == "completion_requested"
+    assert consume_completion_request(registry, ctx, trace), trace.get("completion_refusals")
+
+
 def _bind_host_pass(loop, registry, trace, candidate):
-    """Attach one exact authoritative PASS to the current delivery candidate."""
+    """Attach a pre-fold exact authoritative PASS to the current delivery candidate.
+
+    Nothing writes these any more: the panel records and the binding are the shapes the
+    retired task acceptance stored (its binder's exact output), as a candidate restored
+    from an old record still carries them, so the rails' handling of a historical binding
+    stays pinned.
+    """
 
     trace["review_decision"] = {
         "eligibility": "eligible",
@@ -78,12 +98,15 @@ def _bind_host_pass(loop, registry, trace, candidate):
         "enforcement_impact": "allows_completion",
     }
     trace["review_runs"] = [run]
-    candidate.acceptance_binding = loop._delivery_acceptance_binding(
-        registry,
-        trace,
-        candidate.content_sha256,
-    )
-    registry._ctx._task_acceptance_reviewed = True
+    candidate.acceptance_binding = {
+        **loop._unaccepted_delivery_binding(registry, candidate.content_sha256),
+        "acceptance_status": "pass",
+        "authoritative": True,
+        "panel_id": run["panel_id"],
+        "binding_hash": run["binding_hash"],
+        "fence_hash": run["fence_hash"],
+        "review_evidence_revision": run["evidence_revision"],
+    }
     loop._publish_delivery_candidate(registry, candidate, trace)
     return run
 
@@ -110,6 +133,22 @@ def _assert_forced_deferred_outcome(text, usage, trace, reason_code):
     assert outcome["outcome_axes"]["objective"]["status"] == "best_effort"
     assert outcome["outcome_axes"]["objective"]["source"] == "child_result_disposition"
     assert outcome["outcome_axes"]["objective"]["deferred_count"] == 1
+    # The trace is not stored: the forced rail's verdict reaches the result only through its trace refs.
+    assert outcome["trace_refs"]["forced_finalization"] == trace["forced_finalization"]
+    assert outcome["trace_refs"]["forced_finalization"]["reason_code"] == reason_code
+
+
+def test_forced_verdicts_ride_trace_refs_and_ordinary_finals_carry_none():
+    from ouroboros.outcomes import collect_trace_refs
+
+    verdict = {"reason_code": "round_limit", "source": "round_limit", "degraded": True, "candidate_sha256": "c1"}
+    request = {"form": "native", "status": "refused", "tool_call_count": 1, "reason": "completion_argument"}
+    refs = collect_trace_refs({}, {"forced_finalization": verdict, "forced_completion_request": request})
+    assert refs["forced_finalization"] == verdict and refs["forced_completion_request"] == request
+    verdict["source"] = "mutated after collection"
+    assert refs["forced_finalization"]["source"] == "round_limit"  # a copy, not the live trace object
+    ordinary = collect_trace_refs({}, {"tool_calls": [], "forced_finalization": "not a verdict"})
+    assert "forced_finalization" not in ordinary and "forced_completion_request" not in ordinary
 
 
 def test_round_limit_projects_deferred_child_before_forced_return(tmp_path, monkeypatch):
@@ -146,12 +185,11 @@ def test_post_round_finalize_control_binds_its_grace_deadline(tmp_path, monkeypa
     )
     grace_deadline = time.time() + 42.0
     monkeypatch.setattr(loop, "_resolve_delivery_control", lambda content, *_args: ("fresh", content))
-    monkeypatch.setattr(loop, "_enforce_swarm_actions", lambda *_args: False)
+    monkeypatch.setattr(loop, "_enforce_plan_gate", lambda *_args: False)
     monkeypatch.setattr(loop, "_compute_subagent_handoff", lambda *_args: None)
-    monkeypatch.setattr(loop, "_maybe_enforce_child_absorption_gate", lambda *_args: None)
     monkeypatch.setattr(loop, "_maybe_inject_finalization_nudges", lambda *_args: False)
     monkeypatch.setattr(loop, "_finalize_task_services", lambda *_args: False)
-    monkeypatch.setattr(loop, "_run_task_acceptance_review_once", lambda **_kwargs: False)
+    monkeypatch.setattr("ouroboros.tools.review_result.result_review_at_delivery", lambda *_args: False)
     monkeypatch.setattr(
         loop,
         "_drain_incoming_messages",
@@ -224,17 +262,11 @@ def test_budget_exhaustion_projects_deferred_child_before_forced_return(
     )
 
 
-def test_blocking_open_plan_round_rail_preserves_useful_candidate(tmp_path, monkeypatch):
-    from ouroboros.task_results import (
-        STATUS_RUNNING,
-        record_plan_review_attempt,
-        write_task_result,
-    )
+def test_an_open_plan_round_rail_preserves_useful_candidate(tmp_path, monkeypatch):
+    from tests.test_plan_gate import _plan, _participant, OBJECTION, SEAT
 
     loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
-    registry._ctx.task_metadata["force_plan"] = True
-    write_task_result(tmp_path, "parent1", STATUS_RUNNING, result="running")
-    record_plan_review_attempt(tmp_path, "parent1", fingerprint="a" * 64)
+    _plan(tmp_path, "parent1", participants=[_participant(SEAT, reply=OBJECTION)])
     loop._replace_delivery_candidate(
         registry,
         limit_ctx,
@@ -242,7 +274,6 @@ def test_blocking_open_plan_round_rail_preserves_useful_candidate(tmp_path, monk
         "Useful verified work completed before the rail.",
         control="candidate",
     )
-    monkeypatch.setattr(loop, "get_review_enforcement", lambda: "blocking")
     monkeypatch.setattr(
         loop,
         "call_llm_with_retry",
@@ -252,16 +283,16 @@ def test_blocking_open_plan_round_rail_preserves_useful_candidate(tmp_path, monk
     text, usage, _returned_trace = loop._handle_round_limit(limit_ctx)
 
     assert text.startswith("Useful verified work completed before the rail.")
-    # The wave is still open at finalization, so the disclosure says so in the
-    # present tense: "remained" claimed a panel had ended that nobody closed.
-    assert "Blocking plan review is open" in usage["terminal_host_notice"]
+    # A real counted objection stays open even when the task-wide rail forces
+    # best-effort delivery. It is disclosed without erasing the useful candidate.
+    assert "Plan review is open" in usage["terminal_host_notice"] and "Blocking" not in usage["terminal_host_notice"]
     assert "`round_limit`" in usage["terminal_host_notice"]
     assert usage["reason_code"] == "round_limit"
 
 
 def test_forced_managed_swarm_runs_the_ordinary_final_model_call(tmp_path, monkeypatch):
     loop, registry, limit_ctx, _trace = _forced_test_context(tmp_path)
-    registry._ctx.task_metadata.update({"force_plan": True, "force_plan_source": "swarm"})
+    registry._ctx.task_metadata.update({"subagents_mode": "swarm", "force_plan": True, "force_plan_source": "swarm"})
     calls = []
     monkeypatch.setattr(
         loop, "call_llm_with_retry",
@@ -272,7 +303,8 @@ def test_forced_managed_swarm_runs_the_ordinary_final_model_call(tmp_path, monke
     assert calls == ["forced"]
     assert text == "Verified work before the limit."
     assert usage["reason_code"] == "round_limit"
-    assert "Plan review is open" in usage["terminal_host_notice"]
+    assert not usage.get("terminal_plan_review_open")
+    assert "Plan review is open" not in usage.get("terminal_host_notice", "")
 
 
 def test_presence_handoff_does_not_replace_ordinary_forced_finalization(tmp_path, monkeypatch):
@@ -503,7 +535,7 @@ def test_budget_latch_preserves_stale_candidate_with_resume_disclosure(
     assert forced["source"] == (
         "budget_latched_fallback_stale_evidence_resume_required"
     )
-    assert forced["evidence_current"] is True
+    assert forced["evidence_current"] is False  # Preserved stale bytes are not current evidence.
     assert forced["evidence_revision"] == old.evidence_revision
     assert forced["current_evidence_revision"] == old.evidence_revision
     assert usage["_best_effort_extracted"] is True
@@ -566,7 +598,7 @@ def test_provider_unavailable_preserves_stale_candidate_with_resume_disclosure(
     assert returned_trace["delivery_candidate"]["evidence_current"] is True
     forced = returned_trace["forced_finalization"]
     assert forced["source"] == "host_fallback_stale_evidence_resume_required"
-    assert forced["evidence_current"] is True
+    assert forced["evidence_current"] is False  # Preserved stale bytes are not current evidence.
     assert forced["evidence_revision"] == old.evidence_revision
     assert forced["current_evidence_revision"] == old.evidence_revision
     assert usage["_best_effort_extracted"] is True
@@ -581,7 +613,7 @@ def test_provider_unavailable_keeps_current_model_candidate_byte_exact(
     answer = "Complete current model answer."
     loop._replace_delivery_candidate(registry, limit_ctx, trace, answer, control="replace")
     monkeypatch.setattr(loop, "call_llm_with_retry", lambda *_a, **_k: (None, 0.0))
-    monkeypatch.setattr(loop, "_force_plan_disclosure", lambda *_a, **_k: "\nHOST FACT")
+    monkeypatch.setattr(loop, "_plan_gate_disclosure", lambda *_a, **_k: "\nHOST FACT")
 
     text, usage, returned_trace = loop._handle_provider_unavailable(limit_ctx)
 
@@ -621,7 +653,7 @@ def test_provider_unavailable_forced_model_answer_excludes_host_suffix(
         "call_llm_with_retry",
         lambda *_a, **_k: ({"content": "Fresh forced model answer."}, 0.0),
     )
-    monkeypatch.setattr(loop, "_force_plan_disclosure", lambda *_a, **_k: "\nHOST FACT")
+    monkeypatch.setattr(loop, "_plan_gate_disclosure", lambda *_a, **_k: "\nHOST FACT")
 
     text, usage, returned_trace = loop._handle_provider_unavailable(limit_ctx)
 
@@ -704,16 +736,19 @@ def test_provider_unavailable_prefers_current_candidate_over_incomplete_forced_r
     assert returned_trace["forced_finalization"]["source"] == "retained_candidate"
 
 
-def test_provider_unavailable_without_model_answer_stamps_host_salvage(
+def test_provider_unavailable_without_model_answer_stamps_host_notice(
     tmp_path, monkeypatch,
 ):
+    """Nothing salvaged: the text is the host's own notice, so it is ``host_notice``
+    (its words are the row), never a ``host_salvage`` "preserved output" receipt."""
     loop, _registry, limit_ctx, _trace = _forced_test_context(tmp_path)
     monkeypatch.setattr(loop, "call_llm_with_retry", lambda *_a, **_k: (None, 0.0))
 
     text, usage, _returned_trace = loop._handle_provider_unavailable(limit_ctx)
 
     assert "provider returned no usable response" in text
-    assert usage["terminal_origin"] == "host_salvage"
+    assert usage["terminal_origin"] == "host_notice"
+    assert text == usage["terminal_provider_notice"]
 
 
 def test_deadline_exhausted_forced_finalization_keeps_local_reason(tmp_path, monkeypatch):
@@ -747,7 +782,7 @@ def test_deadline_exhausted_forced_finalization_keeps_local_reason(tmp_path, mon
     assert outcome["outcome_axes"]["execution"]["reason_code"] == "deadline_local"
 
 
-def test_normal_host_notice_stays_outside_candidate_and_panel_subject(tmp_path, monkeypatch):
+def test_normal_host_notice_stays_outside_candidate_and_review_subject(tmp_path, monkeypatch):
     import hashlib
 
     _write_child(tmp_path)
@@ -762,11 +797,11 @@ def test_normal_host_notice_stays_outside_candidate_and_panel_subject(tmp_path, 
     monkeypatch.setattr(loop, "_compute_subagent_handoff", lambda *_a, **_k: None)
     monkeypatch.setattr(loop, "_maybe_inject_finalization_nudges", lambda *_a, **_k: False)
 
-    def capture_panel(*, content, **_kwargs):
+    def capture_review(_ctx, content, _llm_trace, _hold):
         captured["content"] = content
         return False
 
-    monkeypatch.setattr(loop, "_run_task_acceptance_review_once", capture_panel)
+    monkeypatch.setattr("ouroboros.tools.review_result.result_review_at_delivery", capture_review)
     result = loop._no_tool_final_answer(
         "Base complete answer.",
         ctx,
@@ -837,13 +872,11 @@ def test_forced_finalization_stops_services_before_model_and_binds_evidence(
             "artifact_outputs": "report.html is missing: " + ("x" * 9000),
         }]
 
+    captured = []
+
     def forced_model(_llm, messages, *_args, **_kwargs):
         order.append("model")
-        rendered = str(messages)
-        assert "SERVICE_FINALIZATION_EVIDENCE" in rendered
-        assert "artifact_output_failed" in rendered
-        assert "report.html is missing" in rendered
-        assert "OMISSION NOTE: truncated at 8000 chars" in rendered
+        captured.append(str(messages))
         return {"role": "assistant", "content": "Answer disclosing the missing report."}, 0.0
 
     monkeypatch.setattr(services_mod, "stop_task_services", stop_services)
@@ -857,6 +890,11 @@ def test_forced_finalization_stops_services_before_model_and_binds_evidence(
     )
 
     assert order == ["services", "model"]
+    assert "SERVICE_FINALIZATION_EVIDENCE" in captured[0]
+    assert "artifact_output_failed" in captured[0]
+    assert "report.html is missing: " + ("x" * 9000) in captured[0]
+    assert text == "Answer disclosing the missing report."
+    assert returned_trace["forced_finalization"]["source"] == "model"
     assert text == registry._ctx._delivery_candidate.full_text
     assert returned_trace["verification_events"][0]["kind"] == "services_stopped"
     assert len(returned_trace["verification_events"][0]["services"][0]["artifact_outputs"]) > 8000
@@ -963,9 +1001,11 @@ def test_production_budget_wrapup_propagates_budget_exceeded(tmp_path, monkeypat
     import ouroboros.usage_accounting as accounting
     from ouroboros import task_pacing
 
-    loop, _registry, ctx, trace = _forced_test_context(
+    loop, registry, ctx, trace = _forced_test_context(
         tmp_path, usage={"cost": 5.0},
     )
+    # The paid wrap-up at a reached ceiling is an explicit experiment profile's authored rail.
+    registry._ctx.task_contract = {**registry._ctx.task_contract, "budget_profile": {"cost_hard_stop_pct": 50}}
 
     def reject_dispatch(*_args, **_kwargs):
         raise accounting.BudgetExceeded(
@@ -989,9 +1029,11 @@ def test_wrapup_is_forced_while_real_ledger_admission_still_fits(tmp_path, monke
     from ouroboros import task_pacing
     import ouroboros.usage_accounting as accounting
 
-    loop, _registry, ctx, _trace = _forced_test_context(
+    loop, registry, ctx, _trace = _forced_test_context(
         tmp_path, usage={"cost": 1.0, "_context_prompt_estimate": 1000},
     )
+    # The last-fit rail is an explicit experiment profile's authored rail (#1128).
+    registry._ctx.task_contract = {**registry._ctx.task_contract, "budget_profile": {"cost_hard_stop_pct": 50}}
     scope = accounting.UsageScope(
         drive_root=tmp_path, task_id="parent1", root_task_id="parent1",
         global_limit_usd=1000.0, root_limit_usd=100.0,
@@ -1043,7 +1085,6 @@ def test_forced_owner_arrival_gets_one_complete_refresh(tmp_path, monkeypatch):
         "panel_id": "old-panel",
         "binding_hash": "old-binding",
     }
-    registry._ctx._task_acceptance_reviewed = True
     trace["review_runs"] = [{
         "authority": "host_root",
         "candidate_hash": old.content_sha256,
@@ -1077,26 +1118,21 @@ def test_forced_owner_arrival_gets_one_complete_refresh(tmp_path, monkeypatch):
         text.encode("utf-8")
     ).hexdigest()
     assert len(registry._ctx._owner_directives) == 1
-    assert registry._ctx._task_acceptance_reviewed is False
-    assert trace["review_runs"][0]["superseded_by_revision"] is True
     assert returned_trace["delivery_candidate"]["acceptance_binding"]["authoritative"] is False
 
 
-def test_forced_replacement_supersedes_accepted_pass_in_outcome_and_projection(
-    tmp_path, monkeypatch,
-):
+def test_a_forced_replacement_never_keeps_an_earlier_answers_result_review_current(tmp_path, monkeypatch):
+    """A result review speaks only for the answer it reviewed (``select_current_review_runs``):
+    a forced rail that delivers a NEW answer leaves the earlier answer's PASS superseded, so the
+    replacement the reviewers never saw is not reported as a passed review."""
     from ouroboros.outcomes import derive_loop_outcome
-    from ouroboros.review_substrate import compact_review_projection
+    from ouroboros.tools.review_result import _bind_review_run
 
     loop, registry, ctx, trace = _forced_test_context(tmp_path)
-    accepted = loop._replace_delivery_candidate(
-        registry,
-        ctx,
-        trace,
-        "Previously accepted complete answer.",
-        control="candidate",
-    )
-    prior_run = _bind_host_pass(loop, registry, trace, accepted)
+    loop._replace_delivery_candidate(registry, ctx, trace, "Previously reviewed complete answer.", control="candidate")
+    # The result review the delivery step bound to that earlier answer (its own subject sha).
+    prior_run = _bind_review_run(trace, {"record_id": "result-record-1", "verdict": {"aggregate": "PASS"}},
+                                 "a" * 64, "advisory")
     monkeypatch.setattr(
         loop,
         "call_llm_with_retry",
@@ -1114,18 +1150,8 @@ def test_forced_replacement_supersedes_accepted_pass_in_outcome_and_projection(
     )
 
     assert text == "Forced replacement answer."
-    assert prior_run["superseded_by_revision"] is True
-    assert prior_run["superseded_reason"] == "delivery_candidate_replaced"
-    assert prior_run["enforcement_impact"] == "requires_revision"
-    assert "panel_id" not in returned_trace["review_decision"]
-    assert "binding_hash" not in returned_trace["review_decision"]
-    assert returned_trace["review_decision"]["eligibility"] == (
-        "pending_delivery_acceptance"
-    )
-    assert returned_trace["delivery_candidate"]["acceptance_binding"][
-        "authoritative"
-    ] is False
-
+    assert returned_trace["delivery_candidate"]["acceptance_binding"]["authoritative"] is False
+    assert prior_run.get("superseded_by_revision")
     outcome = derive_loop_outcome(text, usage, returned_trace)
     review = outcome["outcome_axes"]["review"]
     assert review["status"] == "degraded"
@@ -1133,69 +1159,6 @@ def test_forced_replacement_supersedes_accepted_pass_in_outcome_and_projection(
     assert review["superseded_run_count"] == 1
     assert review["superseded_aggregate_signals"] == ["PASS"]
     assert outcome["outcome_axes"]["objective"]["status"] != "pass"
-    projection = compact_review_projection(returned_trace["review_runs"])
-    assert projection["panels"][0]["aggregate_signal"] == "PASS"
-    assert projection["panels"][0]["superseded"] is True
-    assert projection["panels"][0]["enforcement_impact"] == "requires_revision"
-
-
-def test_stale_preserve_supersedes_accepted_pass_in_outcome_and_projection(
-    tmp_path, monkeypatch,
-):
-    from ouroboros.outcomes import derive_loop_outcome
-    from ouroboros.review_substrate import compact_review_projection
-
-    loop, registry, ctx, trace = _forced_test_context(tmp_path)
-    accepted = loop._replace_delivery_candidate(
-        registry,
-        ctx,
-        trace,
-        "Accepted answer before newer evidence.",
-        control="candidate",
-    )
-    prior_run = _bind_host_pass(loop, registry, trace, accepted)
-    trace["tool_calls"].append({
-        "tool": "write_file",
-        "status": "ok",
-        "result": "new evidence",
-        "is_error": False,
-    })
-    monkeypatch.setattr(
-        loop,
-        "call_llm_with_retry",
-        lambda *_args, **_kwargs: (None, 0.0),
-    )
-
-    text, usage, returned_trace = loop._forced_final_answer(
-        ctx,
-        prompt="finalize",
-        fallback_text=accepted.full_text,
-        reason_code="provider_unavailable",
-    )
-
-    assert "STALE-EVIDENCE NOTICE" in usage["terminal_host_notice"]
-    assert prior_run["superseded_by_revision"] is True
-    assert prior_run["superseded_reason"] == (
-        "delivery_evidence_changed_after_host_acceptance"
-    )
-    assert prior_run["enforcement_impact"] == "requires_revision"
-    assert "panel_id" not in returned_trace["review_decision"]
-    assert "binding_hash" not in returned_trace["review_decision"]
-    binding = returned_trace["delivery_candidate"]["acceptance_binding"]
-    assert binding["authoritative"] is False
-    assert binding["stale_evidence"] is True
-
-    outcome = derive_loop_outcome(text, usage, returned_trace)
-    review = outcome["outcome_axes"]["review"]
-    assert review["status"] == "degraded"
-    assert review["run_count"] == 0
-    assert review["superseded_run_count"] == 1
-    assert review["superseded_aggregate_signals"] == ["PASS"]
-    assert outcome["outcome_axes"]["objective"]["status"] != "pass"
-    projection = compact_review_projection(returned_trace["review_runs"])
-    assert projection["panels"][0]["aggregate_signal"] == "PASS"
-    assert projection["panels"][0]["superseded"] is True
-    assert projection["panels"][0]["enforcement_impact"] == "requires_revision"
 
 
 def test_second_forced_owner_arrival_returns_exact_resume_fallback(tmp_path, monkeypatch):
@@ -1260,140 +1223,26 @@ def test_forced_owner_refresh_does_not_resend_unknown_provider_outcome(tmp_path,
     )
 
 
-def test_child_result_change_during_host_panel_supersedes_pass(tmp_path, monkeypatch):
-    from tests.test_loop_acceptance_gate import _seed_acceptance_root
-    _seed_acceptance_root(tmp_path, "parent1", SimpleNamespace())
-    import hashlib
-
+def test_a_child_result_that_changes_after_the_review_step_requires_a_complete_replacement(tmp_path, monkeypatch):
+    """Delivery evidence that moves while the delivery's result review runs (a child finishes
+    during that wait) holds the retained answer: a complete replacement is
+    required ("after the answer was retained"), and its exact bytes are reviewed at delivery in
+    turn before they are delivered."""
     import ouroboros.loop as loop
-    import ouroboros.review_substrate as review_substrate
-    from ouroboros.task_results import write_task_result
-    from ouroboros.tools.registry import ToolRegistry
-
-    _write_child(tmp_path)
-    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
-    registry._ctx.task_id = "parent1"
-    registry._ctx.drive_root = str(tmp_path)
-    registry._ctx.task_contract = {"expected_output": "A verified result"}
-    registry._ctx._task_acceptance_reviewed = False
-    registry._ctx.task_metadata = {
-        "budget_drive_root": str(tmp_path),
-        "root_task_id": "parent1",
-    }
-    clean = review_substrate.ReviewRunResult(
-        request={"surface": "task_acceptance", "policy": {"require_criterion_evidence": True}},
-        actors=[{
-            "signal": "PASS",
-            "slot_id": "host-1",
-            "parsed": {
-                "outcome_tier": "solved",
-                "completion_coach": "ship",
-                "criteria_used": [{
-                    "criterion": "owner request",
-                    "status": "supported",
-                    "evidence_refs": ["artifact:1"],
-                }],
-            },
-        }],
-        parsed_findings=[],
-        aggregate_signal="PASS",
-    )
-
-    def mutate_child(_review_ctx):
-        write_task_result(
-            tmp_path,
-            "child1",
-            "completed",
-            parent_task_id="parent1",
-            root_task_id="parent1",
-            delegation_role="subagent",
-            result="fact v2 replaces fact v1",
-            trace_summary="trace",
-            artifact_status="ready",
-            artifacts=[{"kind": "report", "name": "report.md", "sha256": "a" * 64}],
-        )
-        return clean
-
-    monkeypatch.setattr(loop, "get_task_review_mode", lambda: "auto")
-    monkeypatch.setattr(loop, "_execute_task_acceptance_panel", mutate_child)
-    trace = {"tool_calls": [], "reasoning_notes": []}
-    messages = [{"role": "system", "content": ""}, {"role": "user", "content": "goal"}]
-    answer = "Answer based on fact v1."
-
-    another_round = loop._run_task_acceptance_review_once(
-        tools=registry,
-        content=answer,
-        task_id="parent1",
-        task_type="task",
-        llm_trace=trace,
-        drive_root=tmp_path,
-        messages=messages,
-        emit_progress=lambda _text, *, incident=None: None,
-    )
-
-    assert another_round is True
-    assert registry._ctx._task_acceptance_reviewed is False
-    assert trace["review_runs"][0]["superseded_by_revision"] is True
-    # The unified subject includes material child-result evidence.
-    assert trace["review_runs"][0]["superseded_reason"] == (
-        "host_acceptance_subject_changed"
-    )
-    binding = loop._delivery_acceptance_binding(
-        registry, trace, hashlib.sha256(answer.encode("utf-8")).hexdigest(),
-    )
-    assert binding["acceptance_status"] == "unaccepted"
-    assert binding["authoritative"] is False
-    assert "TASK ACCEPTANCE REFRESH" in str(messages[-1]["content"])
-
-
-def test_child_result_change_after_host_panel_requires_replacement_and_fresh_panel(
-    tmp_path, monkeypatch,
-):
-    import ouroboros.loop as loop
-    import ouroboros.review_substrate as review_substrate
     from ouroboros.task_results import write_task_result
 
     _write_child(tmp_path)
     _loop, registry, ctx, trace = _forced_test_context(tmp_path)
     registry._ctx.is_direct_chat = False
-    registry._ctx._task_acceptance_reviewed = False
-    clean = review_substrate.ReviewRunResult(
-        request={"surface": "task_acceptance", "policy": {"require_criterion_evidence": True}},
-        actors=[{
-            "signal": "PASS",
-            "slot_id": "host-1",
-            "parsed": {
-                "outcome_tier": "solved",
-                "completion_coach": "ship",
-                "criteria_used": [{
-                    "criterion": "owner request",
-                    "status": "supported",
-                    "evidence_refs": ["artifact:1"],
-                }],
-            },
-        }],
-        parsed_findings=[],
-        aggregate_signal="PASS",
-    )
-    panel_calls = {"count": 0}
+    reviewed = []
 
-    def clean_panel(_review_ctx):
-        panel_calls["count"] += 1
-        return clean
-
-    monkeypatch.setattr(loop, "get_task_review_mode", lambda: "auto")
-    monkeypatch.setattr(loop, "_execute_task_acceptance_panel", clean_panel)
-    monkeypatch.setattr(loop, "_compute_subagent_handoff", lambda *_a, **_k: None)
-    monkeypatch.setattr(loop, "_maybe_enforce_child_absorption_gate", lambda *_a, **_k: None)
-    monkeypatch.setattr(loop, "_maybe_inject_finalization_nudges", lambda *_a, **_k: False)
-    monkeypatch.setattr(loop, "_finalize_task_services", lambda *_a, **_k: False)
-
-    original_project = loop._project_child_result_dispositions
     race = {"mutated": False}
 
-    def project_then_finish_child(round_ctx, llm_trace):
-        original_project(round_ctx, llm_trace)
-        if registry._ctx._task_acceptance_reviewed and not race["mutated"]:
+    def review_then_deliver(_ctx, content, _llm_trace, _hold):
+        reviewed.append(content)
+        if not race["mutated"]:
+            # The child finishes while the review runs. No shared child read of the finalization
+            # (``finalization_child_scope``) spans that wait, so the pass after it reads again.
             race["mutated"] = True
             write_task_result(
                 tmp_path,
@@ -1411,49 +1260,33 @@ def test_child_result_change_after_host_panel_requires_replacement_and_fresh_pan
                     "sha256": "b" * 64,
                 }],
             )
+        return False
 
-    monkeypatch.setattr(loop, "_project_child_result_dispositions", project_then_finish_child)
+    monkeypatch.setattr("ouroboros.tools.review_result.result_review_at_delivery", review_then_deliver)
+    monkeypatch.setattr(loop, "_compute_subagent_handoff", lambda *_a, **_k: None)
+    monkeypatch.setattr(loop, "_maybe_inject_finalization_nudges", lambda *_a, **_k: False)
+    monkeypatch.setattr(loop, "_finalize_task_services", lambda *_a, **_k: False)
 
-    first = loop._no_tool_final_answer(
-        "Answer based on child result v1.",
-        ctx,
-        trace,
-        registry,
-        queue.Queue(),
-        set(),
-        lambda _text: None,
-    )
+    first = loop._no_tool_final_answer("Answer based on child result v1.", ctx, trace, registry,
+                                       queue.Queue(), set(), lambda _text: None)
 
     assert first is None
-    assert panel_calls["count"] == 1
-    assert registry._ctx._task_acceptance_reviewed is False
-    assert trace["review_runs"][0]["superseded_by_revision"] is True
-    assert trace["review_runs"][0]["superseded_reason"] == (
-        "delivery_evidence_changed_after_host_acceptance"
-    )
+    assert reviewed == ["Answer based on child result v1."]
     assert registry._ctx._delivery_control_required is True
+    assert ("Delivery evidence changed after the answer was retained; a complete replacement answer is required."
+            in trace["reasoning_notes"])
 
-    second = loop._no_tool_final_answer(
-        json.dumps({
-            "delivery_control": "replace",
-            "full_answer": "Replacement answer incorporating late child result v2.",
-        }),
-        ctx,
-        trace,
-        registry,
-        queue.Queue(),
-        set(),
-        lambda _text: None,
-    )
+    answer = "Replacement answer incorporating late child result v2."
+    _select_completion(registry, ctx, trace, answer=answer)
+    second = loop._no_tool_final_answer(answer, ctx, trace, registry, queue.Queue(), set(),
+                                        lambda _text: None, explicit_candidate=True)
 
     assert second is not None
     text, _usage, returned_trace = second
-    assert text == "Replacement answer incorporating late child result v2."
-    assert panel_calls["count"] == 2
-    assert registry._ctx._task_acceptance_reviewed is True
-    binding = returned_trace["delivery_candidate"]["acceptance_binding"]
-    assert binding["authoritative"] is True
-    assert binding["acceptance_status"] == "pass"
+    assert text == answer
+    assert reviewed == ["Answer based on child result v1.", answer]
+    assert returned_trace["delivery_candidate"]["content_sha256"] == hashlib.sha256(answer.encode("utf-8")).hexdigest()
+    assert returned_trace["delivery_candidate"]["acceptance_binding"]["authoritative"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -1471,12 +1304,12 @@ def _arm_latch_with_candidate(loop, registry, limit_ctx, trace, text="Retained c
     return candidate
 
 
-def test_forced_round_limit_resolves_armed_replace_control(tmp_path, monkeypatch):
+def test_forced_round_limit_resolves_explicit_answer_request(tmp_path, monkeypatch):
     loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
     _arm_latch_with_candidate(loop, registry, limit_ctx, trace)
     control = json.dumps({
-        "delivery_control": "replace",
-        "full_answer": "Complete replacement answer for the owner.",
+        "action": "finish",
+        "answer": "Complete replacement answer for the owner.",
     })
     monkeypatch.setattr(
         loop, "call_llm_with_retry",
@@ -1492,13 +1325,13 @@ def test_forced_round_limit_resolves_armed_replace_control(tmp_path, monkeypatch
     assert usage["reason_code"] == "round_limit"
 
 
-def test_forced_finalization_resolves_armed_keep_to_retained_candidate(tmp_path, monkeypatch):
+def test_forced_finalization_resolves_explicit_retained_selector(tmp_path, monkeypatch):
     loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
-    _arm_latch_with_candidate(loop, registry, limit_ctx, trace)
+    candidate = _arm_latch_with_candidate(loop, registry, limit_ctx, trace)
     monkeypatch.setattr(
         loop, "call_llm_with_retry",
         lambda *_a, **_k: (
-            {"role": "assistant", "content": '{"delivery_control":"keep"}'}, 0.0,
+            {"role": "assistant", "content": json.dumps({"action": "finish", "answer_sha256": candidate.content_sha256})}, 0.0,
         ),
     )
 
@@ -1644,36 +1477,49 @@ def test_forced_finalization_passes_broken_json_through_when_latch_not_armed(
     assert text.startswith(broken)
 
 
-def test_nonforced_resolver_treats_unknown_verb_object_as_protocol_not_prose(tmp_path):
-    """The non-forced resolver's gap: an owner-revision round answered with an
-    unknown-verb protocol object previously returned it as FRESH prose (raw JSON
-    to the owner). It is control intent: the resolver keeps its repair semantics
-    (one repair round), never adopting the raw object as the answer."""
-    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
-    candidate = loop._replace_delivery_candidate(
-        registry, limit_ctx, trace, "Retained complete answer.", control="candidate",
-    )
-    candidate.finalization_control = "owner_revision_required"
-    registry._ctx._delivery_control_required = False
-    unknown_verb = json.dumps({"delivery_control": "finalize"})
+def test_nonforced_resolver_contains_unknown_legacy_control_in_a_migrated_episode(tmp_path):
+    loop, registry, ctx, trace = _forced_test_context(tmp_path)
+    candidate = _arm_latch_with_candidate(loop, registry, ctx, trace)
+    candidate.control_episode_seen = True
+    raw = json.dumps({"delivery_control": "finalize"})
+    for _ in range(3):
+        status, text = loop._resolve_delivery_control(raw, registry, ctx, trace)
+        assert status == "retry" and text == candidate.full_text
+        assert ctx.messages[-1]["role"] == "user"
+        assert ctx.messages[-2] == {"role": "assistant", "content": raw}
+        assert "latest whole held response" not in ctx.messages[-1]["content"]
+    assert candidate.degraded is False
+    assert "DELIVERY_CONTROL_REPAIR" not in str(ctx.messages)
 
-    status, text = loop._resolve_delivery_control(
-        unknown_verb, registry, limit_ctx, trace,
-    )
 
-    assert status == "retry"
-    assert text == ""
-    assert candidate.repair_attempted is True
-    assert "DELIVERY_CONTROL_REPAIR" in str(limit_ctx.messages[-1]["content"])
+def test_nonforced_resolver_selects_whole_held_prose_explicitly_after_legacy_control(tmp_path):
+    loop, registry, ctx, trace = _forced_test_context(tmp_path)
+    candidate = _arm_latch_with_candidate(loop, registry, ctx, trace)
+    candidate.control_episode_seen = True
+    loop._resolve_delivery_control('{"delivery_control":"finalize"}', registry, ctx, trace)
+    prose = "A short corrected answer."
+    assert loop._resolve_delivery_control(prose, registry, ctx, trace) == ("retry", candidate.full_text)
+    assert registry._ctx._delivery_candidate is candidate
+    _select_completion(registry, ctx, trace, answer_sha256=hashlib.sha256(prose.encode()).hexdigest())
+    assert registry._ctx._delivery_candidate.full_text == prose
+    assert trace["delivery_candidate"]["degraded"] is False
+    assert trace["delivery_candidate"]["acceptance_binding"]["authoritative"] is False
 
-    # Second failure after the one repair round degrades to the retained answer.
-    status2, text2 = loop._resolve_delivery_control(
-        unknown_verb, registry, limit_ctx, trace,
-    )
-    assert status2 == "degraded"
-    assert text2 == candidate.full_text
-    assert "delivery_control" not in text2
 
+def test_nonforced_duplicate_legacy_control_never_spends_a_repair_or_terminal_budget(tmp_path):
+    loop, registry, ctx, trace = _forced_test_context(tmp_path)
+    candidate = _arm_latch_with_candidate(loop, registry, ctx, trace)
+    candidate.control_episode_seen = True
+    raw = '{"delivery_control":"keep","delivery_control":"replace","full_answer":"Wrong answer"}'
+    for _ in range(4):
+        before = len(ctx.messages)
+        assert loop._resolve_delivery_control(raw, registry, ctx, trace) == ("retry", candidate.full_text)
+        assert len(ctx.messages) == before + 2
+        assert ctx.messages[-2] == {"role": "assistant", "content": raw}
+        assert ctx.messages[-1]["role"] == "user"
+    assert not candidate.degraded and not candidate.degraded_reason
+    _select_completion(registry, ctx, trace, answer_sha256=candidate.content_sha256)
+    assert registry._ctx._delivery_candidate.full_text == candidate.full_text
 
 # ---------------------------------------------------------------------------
 # D2c (custody-absorption sprint, owner Q4=A): protocol-intent containment.
@@ -1718,13 +1564,11 @@ def test_forced_finalization_contains_trailing_protocol_object_in_prose(
     )
 
 
-def test_forced_finalization_resolves_fenced_control_object(tmp_path, monkeypatch):
-    """A fenced protocol object is still the protocol object (shared
-    fence-strip normalization): a valid fenced keep resolves cleanly to the
-    retained candidate, no fence or raw JSON in the published text."""
+def test_forced_finalization_resolves_fenced_completion_request(tmp_path, monkeypatch):
+    """A fenced completion request selects exact retained bytes, never raw JSON."""
     loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
-    _arm_latch_with_candidate(loop, registry, limit_ctx, trace)
-    fenced = '```json\n{"delivery_control": "keep"}\n```'
+    candidate = _arm_latch_with_candidate(loop, registry, limit_ctx, trace)
+    fenced = '```json\n' + json.dumps({"action": "finish", "answer_sha256": candidate.content_sha256}) + '\n```'
     monkeypatch.setattr(
         loop, "call_llm_with_retry",
         lambda *_a, **_k: ({"role": "assistant", "content": fenced}, 0.0),
@@ -1786,36 +1630,16 @@ def test_forced_finalization_keeps_midprose_quotation_as_prose(tmp_path, monkeyp
     assert text.startswith(prose)
 
 
-def test_nonforced_resolver_contains_trailing_protocol_object_in_prose(tmp_path):
-    """Ordinary resolver, armed latch: prose+trailing protocol object is a
-    protocol attempt — one repair round (the rejected mixed response is
-    retained in the transcript, never destroyed; P1), then degraded-preserve
-    with no protocol JSON in the published text."""
-    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
-    candidate = _arm_latch_with_candidate(loop, registry, limit_ctx, trace)
-    mixed = (
-        "Prose half of a contradictory answer.\n"
-        + json.dumps({"delivery_control": "keep"})
-    )
-
-    status, text = loop._resolve_delivery_control(mixed, registry, limit_ctx, trace)
-
-    assert status == "retry"
-    assert text == ""
-    assert candidate.repair_attempted is True
-    assert any(
-        m.get("role") == "assistant" and m.get("content") == mixed
-        for m in limit_ctx.messages
-    )
-    assert "DELIVERY_CONTROL_REPAIR" in str(limit_ctx.messages[-1]["content"])
-
-    status2, text2 = loop._resolve_delivery_control(mixed, registry, limit_ctx, trace)
-
-    assert status2 == "degraded"
-    assert text2 == candidate.full_text
-    assert '{"delivery_control"' not in text2
-    assert candidate.finalization_control == "degraded_preserve"
-    assert candidate.degraded_reason == "invalid_delivery_control_after_repair"
+def test_nonforced_resolver_privately_holds_trailing_legacy_protocol_object(tmp_path):
+    loop, registry, ctx, trace = _forced_test_context(tmp_path)
+    candidate = _arm_latch_with_candidate(loop, registry, ctx, trace)
+    candidate.control_episode_seen = True
+    mixed = "Prose half of a contradictory answer.\n" + json.dumps({"delivery_control": "keep"})
+    for _ in range(2):
+        assert loop._resolve_delivery_control(mixed, registry, ctx, trace) == ("retry", candidate.full_text)
+        assert ctx.messages[-2]["content"] == mixed
+        assert "latest whole held response" not in ctx.messages[-1]["content"]
+    assert not candidate.degraded
 
 
 def test_forced_finalization_contains_trailing_fenced_protocol_object(
@@ -1848,25 +1672,16 @@ def test_forced_finalization_contains_trailing_fenced_protocol_object(
     assert candidate.degraded_reason == "delivery_control_degraded"
 
 
-def test_nonforced_resolver_contains_trailing_fenced_protocol_object(tmp_path):
-    """Ordinary resolver, armed latch: prose + trailing FENCED protocol object
-    is a protocol attempt — repair round, then degraded-preserve, protocol
-    JSON never published."""
-    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
-    candidate = _arm_latch_with_candidate(loop, registry, limit_ctx, trace)
-    mixed = (
-        "Prose half of a contradictory answer.\n```json\n"
-        + json.dumps({"delivery_control": "keep"})
-        + "\n```"
-    )
-
-    status, _text = loop._resolve_delivery_control(mixed, registry, limit_ctx, trace)
-    assert status == "retry"
-
-    status2, text2 = loop._resolve_delivery_control(mixed, registry, limit_ctx, trace)
-    assert status2 == "degraded"
-    assert text2 == candidate.full_text
-    assert '{"delivery_control"' not in text2
+def test_nonforced_resolver_privately_holds_trailing_fenced_legacy_protocol(tmp_path):
+    loop, registry, ctx, trace = _forced_test_context(tmp_path)
+    candidate = _arm_latch_with_candidate(loop, registry, ctx, trace)
+    candidate.control_episode_seen = True
+    mixed = 'Prose half of a contradictory answer.\n```json\n{"delivery_control":"keep"}\n```'
+    for _ in range(2):
+        assert loop._resolve_delivery_control(mixed, registry, ctx, trace) == ("retry", candidate.full_text)
+        assert ctx.messages[-2]["content"] == mixed
+        assert "latest whole held response" not in ctx.messages[-1]["content"]
+    assert not candidate.degraded
 
 
 def test_parse_body_survives_degenerate_nested_trailing_blob(tmp_path):
@@ -1879,61 +1694,25 @@ def test_parse_body_survives_degenerate_nested_trailing_blob(tmp_path):
     assert parsed is None and duplicate is False and embedded is False
 
 
-def test_nonforced_resolver_accepts_fenced_control_object(tmp_path):
-    """Ordinary resolver, armed latch: a valid FENCED keep resolves cleanly
-    after the shared fence-strip normalization."""
-    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
-    candidate = _arm_latch_with_candidate(loop, registry, limit_ctx, trace)
-    fenced = '```json\n{"delivery_control": "keep"}\n```'
-
-    status, text = loop._resolve_delivery_control(fenced, registry, limit_ctx, trace)
-
-    assert status == "resolved"
-    assert text == candidate.full_text
+def test_nonforced_fenced_legacy_control_is_inert_until_tool_selection(tmp_path):
+    loop, registry, ctx, trace = _forced_test_context(tmp_path)
+    candidate = _arm_latch_with_candidate(loop, registry, ctx, trace)
+    candidate.control_episode_seen = True
+    fenced = '```json\n{"delivery_control":"keep"}\n```'
+    assert loop._resolve_delivery_control(fenced, registry, ctx, trace) == ("retry", candidate.full_text)
+    assert registry._ctx._delivery_control_required is True
+    _select_completion(registry, ctx, trace, answer_sha256=candidate.content_sha256)
     assert registry._ctx._delivery_control_required is False
 
 
-def test_nonforced_resolver_hold_treats_midprose_quotation_as_prose(tmp_path):
-    """Under the absorption HOLD a mid-prose quotation of the literal is NOT
-    control intent: the reconsidered prose answer proceeds as fresh."""
-    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
-    candidate = loop._replace_delivery_candidate(
-        registry, limit_ctx, trace, "Retained complete answer.", control="candidate",
-    )
-    candidate.finalization_control = "child_absorption_or_revision_required"
-    registry._ctx._delivery_control_required = False
-    prose = (
-        'As noted, the loop can emit {"delivery_control": "keep"} in control '
-        "rounds; my reconsidered final answer stands on its own."
-    )
-
-    status, text = loop._resolve_delivery_control(prose, registry, limit_ctx, trace)
-
-    assert status == "fresh"
-    assert text == prose
-
-
-def test_nonforced_resolver_absorption_hold_escalates_typed_control(tmp_path):
-    """A typed keep cannot acknowledge the absorption action gate: parity
-    with the skill hold — the control attempt escalates to the existing
-    replace-required round (the absorption gate itself still forces
-    best_effort downstream regardless)."""
-    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
-    candidate = loop._replace_delivery_candidate(
-        registry, limit_ctx, trace, "Retained complete answer.", control="candidate",
-    )
-    candidate.finalization_control = "child_absorption_or_revision_required"
-    registry._ctx._delivery_control_required = False
-
-    status, text = loop._resolve_delivery_control(
-        '{"delivery_control":"keep"}', registry, limit_ctx, trace,
-    )
-
-    assert status == "retry"
-    assert text == ""
-    assert candidate.finalization_control == "skill_revision_required_repair_requested"
-    assert registry._ctx._delivery_control_required is True
-    assert "keep is NOT allowed" in str(limit_ctx.messages[-1]["content"])
+def test_nonforced_midprose_quotation_is_held_as_selectable_complete_prose(tmp_path):
+    loop, registry, ctx, trace = _forced_test_context(tmp_path)
+    candidate = loop._replace_delivery_candidate(registry, ctx, trace, "Retained complete answer.", control="candidate")
+    candidate.finalization_control = loop._SKILL_ACTION_HOLD_CONTROL
+    prose = 'As noted, the old loop emitted {"delivery_control":"keep"} in control rounds; this is explanatory prose.'
+    assert loop._resolve_delivery_control(prose, registry, ctx, trace) == ("retry", candidate.full_text)
+    assert registry._ctx._completion_held_sha256 == hashlib.sha256(prose.encode()).hexdigest()
+    assert ctx.messages[-2]["content"] == prose and ctx.messages[-1]["role"] == "user"
 
 
 def test_nonforced_resolver_passes_mixed_prose_json_when_latch_not_armed(tmp_path):
@@ -2001,231 +1780,14 @@ def test_salvage_predicate_keeps_mixed_answers_and_skips_pure_protocol():
     ) is False
 
 
-def test_children_unabsorbed_forced_path_never_leaks_protocol_json(tmp_path, monkeypatch):
-    """The saga leak: children_unabsorbed fired while the latch was armed and the
-    model's protocol JSON went RAW into the owner's chat and the durable result."""
-    _write_child(tmp_path, status="running")
-    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
-    _arm_latch_with_candidate(loop, registry, limit_ctx, trace)
-    registry._ctx._child_absorption_reminded = True
-    control = json.dumps({
-        "delivery_control": "replace",
-        "full_answer": "Integrated summary naming the unabsorbed child explicitly.",
-    })
-    monkeypatch.setattr(
-        loop, "call_llm_with_retry",
-        lambda *_a, **_k: ({"role": "assistant", "content": control}, 0.0),
-    )
-
-    result = loop._maybe_enforce_child_absorption_gate(
-        registry, limit_ctx, "", limit_ctx.messages, lambda _t: None, trace,
-    )
-
-    assert result is not None and result != "continue"
-    text, usage, _returned_trace = result
-    assert text.startswith("Integrated summary naming the unabsorbed child explicitly.")
-    assert "delivery_control" not in text
-    assert usage["reason_code"] == "children_unabsorbed"
-    assert registry._ctx._delivery_candidate.full_text == text
-
-
-# ---------------------------------------------------------------------------
-# Owner Q2A (slime saga): the forced children_unabsorbed rail must still run the
-# CONTENT acceptance review through the ordinary entry point (the incident task
-# finalized with zero review), the panel must see the undispositioned-children
-# process debt, and a requested improvement pass (which the forced rail cannot
-# grant) terminalizes honestly. The process outcome stays
-# best_effort/children_unabsorbed in every branch.
-
-
-def _acceptance_panel_result(*, aggregate, actors, findings=()):
-    import ouroboros.review_substrate as rs
-
-    return rs.ReviewRunResult(
-        request={"surface": "task_acceptance", "policy": {"min_successful_slots": 1}},
-        actors=list(actors),
-        parsed_findings=list(findings),
-        aggregate_signal=aggregate,
-    )
-
-
-def _forced_absorption_acceptance_context(tmp_path, monkeypatch, panel_result):
-    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
-    registry._ctx.is_direct_chat = False
-    registry._ctx._child_absorption_reminded = True
-    seen_evidence: dict = {}
-    panel_calls = {"count": 0}
-
-    def panel_probe(review_ctx):
-        panel_calls["count"] += 1
-        seen_evidence.update(review_ctx.evidence or {})
-        return panel_result
-
-    monkeypatch.setattr(loop, "get_task_review_mode", lambda: "auto")
-    monkeypatch.setattr(loop, "_execute_task_acceptance_panel", panel_probe)
-    monkeypatch.setattr(
-        loop, "call_llm_with_retry",
-        lambda *_a, **_k: (
-            {"role": "assistant", "content": "Best-effort final answer naming child1."},
-            0.0,
-        ),
-    )
-    return loop, registry, limit_ctx, trace, seen_evidence, panel_calls
-
-
-def test_forced_children_unabsorbed_rail_runs_acceptance_with_debt_evidence(
-    tmp_path, monkeypatch,
-):
-    """A quiescent-but-undispositioned subtree: the panel RUNS on the forced rail,
-    sees the undispositioned children (ids/statuses/hashes) in its evidence, and a
-    clean PASS lands as `accepted` while the process outcome stays
-    best_effort/children_unabsorbed."""
-    from ouroboros.outcomes import derive_loop_outcome
-    from ouroboros.tools.join_ledger import _child_result_sha256
-    from ouroboros.task_status import load_effective_task_result
-
-    _write_child(tmp_path)
-    panel = _acceptance_panel_result(
-        aggregate="PASS",
-        actors=[{
-            "slot_id": "s0", "signal": "PASS",
-            "parsed": {
-                "verdict": "PASS", "outcome_tier": "solved",
-                "criteria_used": [{
-                    "criterion": "owner request", "status": "supported",
-                    "evidence_refs": ["artifact:1"],
-                }],
-            },
-        }],
-    )
-    loop, registry, limit_ctx, trace, seen_evidence, panel_calls = (
-        _forced_absorption_acceptance_context(tmp_path, monkeypatch, panel)
-    )
-
-    result = loop._maybe_enforce_child_absorption_gate(
-        registry, limit_ctx, "", limit_ctx.messages, lambda _t: None, trace,
-    )
-
-    assert result is not None and result != "continue"
-    text, usage, returned_trace = result
-    assert usage["reason_code"] == "children_unabsorbed"
-    assert panel_calls["count"] == 1
-    debt = seen_evidence["undispositioned_children"]
-    assert [row["task_id"] for row in debt] == ["child1"]
-    assert debt[0]["status"] == "completed"
-    child = load_effective_task_result(tmp_path, "child1")
-    assert debt[0]["child_result_sha256"] == _child_result_sha256(child)
-    decision = returned_trace["acceptance_decision"]
-    assert decision["status"] == "accepted"
-    assert decision["reason"] == "clean_pass"
-    # The ctx stash is scoped to the forced run only.
-    assert registry._ctx._forced_undispositioned_children is None
-    outcome = derive_loop_outcome(text, usage, returned_trace)
-    assert outcome["outcome_axes"]["execution"]["status"] == "best_effort"
-    assert outcome["outcome_axes"]["execution"]["reason_code"] == "children_unabsorbed"
-
-
-def test_forced_rail_reads_current_child_state_across_the_forced_call(
-    tmp_path, monkeypatch,
-):
-    """D2b: a child flips running->completed ACROSS the forced model call.
-    The forced prompt lists the fresh pre-call truth (running), while the
-    acceptance debt is recomputed adjacent to the panel's own subtree read
-    (completed) — one packet, one moment, no two-status child — and the host
-    orphan note still names the undecided child."""
-    _write_child(tmp_path, status="running")
-    panel = _acceptance_panel_result(
-        aggregate="PASS",
-        actors=[{
-            "slot_id": "s0", "signal": "PASS",
-            "parsed": {
-                "verdict": "PASS", "outcome_tier": "solved",
-                "criteria_used": [{
-                    "criterion": "owner request", "status": "supported",
-                    "evidence_refs": ["artifact:1"],
-                }],
-            },
-        }],
-    )
-    loop, registry, limit_ctx, trace, seen_evidence, panel_calls = (
-        _forced_absorption_acceptance_context(tmp_path, monkeypatch, panel)
-    )
-    seen_requests = []
-
-    def flip_and_answer(_llm, request_messages, *_a, **_k):
-        seen_requests.append([dict(m) for m in request_messages])
-        _write_child(tmp_path, status="completed")
-        # The mocked answer deliberately does NOT name the child: the final
-        # "child1 in text" assertion below is satisfiable only by the host
-        # orphan note, so the note's presence is genuinely verified.
-        return (
-            {"role": "assistant", "content": "Best-effort final answer."},
-            0.0,
-        )
-
-    monkeypatch.setattr(loop, "call_llm_with_retry", flip_and_answer)
-
-    result = loop._maybe_enforce_child_absorption_gate(
-        registry, limit_ctx, "", limit_ctx.messages, lambda _t: None, trace,
-    )
-
-    assert result is not None and result != "continue"
-    text, usage, _returned_trace = result
-    assert usage["reason_code"] == "children_unabsorbed"
-    assert panel_calls["count"] == 1
-    forced_prompt = "\n".join(
-        str(m.get("content") or "") for m in seen_requests[0]
-    )
-    assert "child1 [running]" in forced_prompt
-    debt = seen_evidence["undispositioned_children"]
-    assert [row["task_id"] for row in debt] == ["child1"]
-    assert debt[0]["status"] == "completed"
-    subtree = {
-        str(row.get("task_id")): str(row.get("status"))
-        for row in seen_evidence.get("terminal_subtree_statuses", [])
-    }
-    assert subtree.get("child1") == "completed"
-    assert "child1" in usage["terminal_host_notice"]
-
-
-def test_post_tool_evidence_change_holds_while_absorption_gate_open(tmp_path):
-    """grok #9: a post-tool evidence change while undispositioned children
-    remain must HOLD the candidate again, not arm — arming would reintroduce
-    the conflicting-instruction round the absorption hold exists to prevent."""
-    _write_child(tmp_path, status="running")
-    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
-    candidate = loop._replace_delivery_candidate(
-        registry, limit_ctx, trace, "Retained complete answer.", control="candidate",
-    )
-    loop._hold_delivery_for_skill_action(
-        registry, trace, control="child_absorption_or_revision_required",
-    )
-    registry._ctx._owner_directives = ["fresh owner directive"]
-    before = len(limit_ctx.messages)
-
-    loop._prepare_post_tool_budget_context(
-        registry, limit_ctx, trace, "test-model", False, "medium",
-    )
-
-    assert registry._ctx._delivery_control_required is False
-    assert candidate.finalization_control == "child_absorption_or_revision_required"
-    assert all(
-        "[DELIVERY_FINALIZATION_CONTROL]" not in str(m.get("content") or "")
-        for m in limit_ctx.messages[before:]
-    )
-
-
 def test_post_tool_evidence_change_arms_after_children_dispositioned(tmp_path):
-    """Once every child is dispositioned the absorption gate is closed: the
-    same evidence-change seam escalates through the ordinary arm (the free
+    """A child decision recorded after the answer was retained changes the delivery
+    evidence: the evidence-change seam escalates through the ordinary arm (the free
     post-action escalation path)."""
     _write_child(tmp_path)
     loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
     candidate = loop._replace_delivery_candidate(
         registry, limit_ctx, trace, "Retained complete answer.", control="candidate",
-    )
-    loop._hold_delivery_for_skill_action(
-        registry, trace, control="child_absorption_or_revision_required",
     )
     _write_confirmed_disposition(
         tmp_path, disposition="integrated", rationale="absorbed the child result",
@@ -2243,72 +1805,27 @@ def test_post_tool_evidence_change_arms_after_children_dispositioned(tmp_path):
     )
 
 
-def test_forced_rail_terminalizes_a_requested_improvement_pass(tmp_path, monkeypatch):
-    """The panel asks for a revision pass, but the forced rail can never take
-    another model round: the dangling `revision_requested` is downgraded to the
-    honest terminal `finalized_unaccepted` with a typed reason."""
-    import ouroboros.task_pacing as task_pacing
-
-    _write_child(tmp_path)
-    panel = _acceptance_panel_result(
-        aggregate="FAIL",
-        actors=[{
-            "slot_id": "s0", "signal": "FAIL",
-            "parsed": {
-                "verdict": "FAIL", "outcome_tier": "blocked_with_evidence",
-                "completion_coach": "fix it", "dialogue_status": "continue_actionable",
-            },
-        }],
-        findings=[{
-            "slot_id": "s0", "severity": "critical", "item": "broken",
-            "recommendation": "fix the header",
-        }],
-    )
-    loop, registry, limit_ctx, trace, _seen_evidence, panel_calls = (
-        _forced_absorption_acceptance_context(tmp_path, monkeypatch, panel)
-    )
-    monkeypatch.setattr(
-        task_pacing, "improvement_pass_allowed", lambda *_a, **_k: (True, ""),
-    )
-
-    result = loop._maybe_enforce_child_absorption_gate(
-        registry, limit_ctx, "", limit_ctx.messages, lambda _t: None, trace,
-    )
-
-    assert result is not None and result != "continue"
-    _text, usage, returned_trace = result
-    assert usage["reason_code"] == "children_unabsorbed"
-    assert panel_calls["count"] == 1
-    decision = returned_trace["acceptance_decision"]
-    assert decision["status"] == "finalized_unaccepted"
-    assert decision["reason"] == "revision_unavailable_on_forced_rail"
-    assert registry._ctx._task_acceptance_reviewed is True
+# ---------------------------------------------------------------------------
+# An explicit unfinished stop with a running child is free of new review calls
+# and never cancels the child's independent work.
 
 
-def test_forced_rail_keeps_bypass_verdict_when_subtree_is_not_quiescent(
-    tmp_path, monkeypatch,
-):
-    """A still-RUNNING child means the panel structurally cannot bind stable
-    evidence (the voluntary path would WAIT, which the forced rail cannot):
-    the panel never runs and the typed acceptance-bypass verdict stamped by
-    the forced-finalization recorder stays as the terminal truth."""
+def test_explicit_stop_with_running_child_finishes_without_a_review_or_cancelling_it(tmp_path, monkeypatch):
+    from ouroboros.task_status import load_effective_task_result
+
     _write_child(tmp_path, status="running")
-    panel = _acceptance_panel_result(aggregate="PASS", actors=[])
-    loop, registry, limit_ctx, trace, _seen_evidence, panel_calls = (
-        _forced_absorption_acceptance_context(tmp_path, monkeypatch, panel)
-    )
-
-    result = loop._maybe_enforce_child_absorption_gate(
-        registry, limit_ctx, "", limit_ctx.messages, lambda _t: None, trace,
-    )
-
-    assert result is not None and result != "continue"
-    _text, usage, returned_trace = result
-    assert usage["reason_code"] == "children_unabsorbed"
-    assert panel_calls["count"] == 0
-    decision = returned_trace["acceptance_decision"]
-    assert decision["status"] == "finalized_unaccepted"
-    assert decision["reason"] == "acceptance_bypassed_children_unabsorbed"
+    loop, registry, ctx, trace = _forced_test_context(tmp_path)
+    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
+    monkeypatch.setattr(loop, "call_llm_with_retry", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("stop bought a model call")))
+    monkeypatch.setattr("ouroboros.tools.review_result.result_review_at_delivery",
+                        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("stop bought a review")))
+    answer = "Useful partial answer. The child is still running."
+    _select_completion(registry, ctx, trace, answer=answer, action="stop", rationale="Child results remain unfinished.")
+    result = loop._no_tool_final_answer(answer, ctx, trace, registry, queue.Queue(), set(), lambda _t: None, explicit_candidate=True)
+    assert result is not None and result[0] == answer
+    assert trace["task_completion"]["action"] == "stop"
+    assert load_effective_task_result(tmp_path, "child1")["status"] == "running"
+    assert "forced_finalization" not in trace
 
 
 def test_orphan_label_keeps_cancelled_lifecycle_and_terminal_result(monkeypatch, tmp_path):
@@ -2403,215 +1920,6 @@ def test_claimed_child_dispositions_reads_the_blackboard(tmp_path):
     assert claims == {"child1": ("integrated", "a" * 64)}
     # Fail-soft on junk context.
     assert loop._claimed_child_dispositions(SimpleNamespace()) == {}
-
-# ---------------------------------------------------------------------------
-# Typed acceptance-bypass records on forced rails (W2): every forced exit that
-# owed an acceptance panel stamps {finalized_unaccepted, acceptance_bypassed_<rail>}
-# through the COMMON terminal recorder, covering both the LLM-seam forced answer
-# and the no-spend budget fence path. Pure ledger writes: no panel, no fence, no
-# extra model round.
-
-
-def test_round_limit_stamps_typed_acceptance_bypass(tmp_path, monkeypatch):
-    loop, _registry, limit_ctx, _trace = _forced_test_context(tmp_path)
-    monkeypatch.setattr(
-        loop,
-        "call_llm_with_retry",
-        lambda *_args, **_kwargs: (
-            {"role": "assistant", "content": "Best answer before the round limit."},
-            0.0,
-        ),
-    )
-
-    _text, _usage, trace = loop._handle_round_limit(limit_ctx)
-
-    # Declared deliverable with no acceptance decision -> the panel was OWED.
-    assert trace["review_decision"] == {
-        "eligibility": "eligible",
-        "trigger": "bypassed_round_limit",
-    }
-    assert trace["acceptance_decision"]["status"] == "finalized_unaccepted"
-    assert trace["acceptance_decision"]["reason"] == "acceptance_bypassed_round_limit"
-    assert trace["acceptance_decision"]["source"] == "forced_finalization"
-
-
-def test_budget_fence_no_spend_path_stamps_typed_acceptance_bypass(tmp_path, monkeypatch):
-    """The physical budget fence (`_handle_budget_exceeded`) re-raises around the
-    LLM seam, so the stamp must ride the common recorder, not `_forced_final_answer`."""
-    import ouroboros.usage_accounting as accounting
-
-    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
-    loop._replace_delivery_candidate(
-        registry, limit_ctx, trace,
-        "Best answer retained before the budget rail.", control="candidate",
-    )
-    monkeypatch.setattr(
-        accounting,
-        "usage_breakdown",
-        lambda *_args, **_kwargs: {"physical_calls": 1, "integrity_degraded": False},
-    )
-    exit_ctx = loop._LoopExitContext(
-        tools=registry, drive_root=tmp_path, task_id="parent1", event_queue=None,
-        drive_logs=tmp_path / "logs", accumulated_usage=limit_ctx.accumulated_usage,
-        llm_trace=trace,
-    )
-
-    _text, _usage, returned_trace = loop._handle_budget_exceeded(
-        accounting.BudgetExceeded(
-            "root budget closed", limit_scope="root", root_task_id="parent1",
-        ),
-        exit_ctx,
-        limit_ctx=limit_ctx,
-    )
-
-    assert returned_trace["review_decision"] == {
-        "eligibility": "eligible",
-        "trigger": "bypassed_budget_exhausted",
-    }
-    decision = returned_trace["acceptance_decision"]
-    assert decision["status"] == "finalized_unaccepted"
-    assert decision["reason"] == "acceptance_bypassed_budget_exhausted"
-    assert decision["source"] == "forced_finalization"
-
-
-def test_forced_bypass_never_overwrites_an_existing_host_decision(tmp_path, monkeypatch):
-    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
-    candidate = loop._replace_delivery_candidate(
-        registry, limit_ctx, trace, "Accepted answer.", control="candidate",
-    )
-    _bind_host_pass(loop, registry, trace, candidate)
-    monkeypatch.setattr(
-        loop,
-        "call_llm_with_retry",
-        lambda *_args, **_kwargs: (
-            {"role": "assistant", "content": "Best answer before the round limit."},
-            0.0,
-        ),
-    )
-
-    _text, _usage, returned_trace = loop._handle_round_limit(limit_ctx)
-
-    # The prior host decision lane keeps authority (here the forced replacement
-    # superseded the PASS through the existing revision machinery); the bypass
-    # recorder never overwrites an existing decision with a bypass reason. The
-    # dangling revision request itself is closed, because this rail cannot take
-    # the improvement pass it promised.
-    decision = returned_trace["acceptance_decision"]
-    assert decision["status"] == "finalized_unaccepted"
-    assert decision.get("reason", "") != "acceptance_bypassed_round_limit"
-    assert decision.get("reason", "") == "revision_unavailable_on_forced_rail"
-    assert decision.get("source", "") == "forced_finalization"
-
-
-def test_forced_bypass_stamps_over_deferred_agent_stance(tmp_path, monkeypatch):
-    """A root task_acceptance_review DEFERRED to the host leaves a STATUS-LESS
-    agent-stance dict in acceptance_decision (`source` + `agent_disposition`/
-    `agent_rationale` — the P4.1 merge in `process_tool_results`). That is
-    evidence, not a host decision: a forced rail after it must still stamp
-    finalized_unaccepted with the typed rail reason (pre-fix the recorder
-    early-returned on ANY non-empty dict, so the bypass went unrecorded exactly
-    when the panel was still owed), and the agent stance is carried forward."""
-    from ouroboros.loop_tool_execution import process_tool_results
-
-    loop, _registry, limit_ctx, trace = _forced_test_context(tmp_path)
-    deferred_payload = json.dumps({
-        "status": "deferred_to_host_acceptance",
-        "authoritative": False,
-        "agent_decision": {
-            "disposition": "pass",
-            "rationale": "agent stance recorded before the host panel",
-            "source": "agent_task_acceptance_review_tool",
-        },
-    })
-    process_tool_results(
-        [{
-            "fn_name": "task_acceptance_review",
-            "is_error": False,
-            "result": deferred_payload,
-            "tool_call_id": "tc1",
-            "args_for_log": {},
-        }],
-        [],
-        trace,
-        lambda _msg: None,
-    )
-    # The production writer's exact shape: agent stance only, no canonical status.
-    assert trace["acceptance_decision"]["agent_disposition"] == "pass"
-    assert "status" not in trace["acceptance_decision"]
-    monkeypatch.setattr(
-        loop,
-        "call_llm_with_retry",
-        lambda *_args, **_kwargs: (
-            {"role": "assistant", "content": "Best answer before the round limit."},
-            0.0,
-        ),
-    )
-
-    _text, _usage, returned_trace = loop._handle_round_limit(limit_ctx)
-
-    assert returned_trace["review_decision"] == {
-        "eligibility": "eligible",
-        "trigger": "bypassed_round_limit",
-    }
-    decision = returned_trace["acceptance_decision"]
-    assert decision["status"] == "finalized_unaccepted"
-    assert decision["reason"] == "acceptance_bypassed_round_limit"
-    assert decision["source"] == "forced_finalization"
-    # Carried forward, never overwritten (the `_set_acceptance_decision` contract).
-    assert decision["agent_disposition"] == "pass"
-    assert decision["agent_rationale"] == "agent stance recorded before the host panel"
-
-
-def test_forced_bypass_records_not_eligible_for_child_tasks(tmp_path, monkeypatch):
-    loop, registry, limit_ctx, _trace = _forced_test_context(tmp_path)
-    registry._ctx.task_metadata = {
-        "budget_drive_root": str(tmp_path),
-        "root_task_id": "root0",
-        "parent_task_id": "root0",
-    }
-    registry._ctx.parent_task_id = "root0"
-    registry._ctx.root_task_id = "root0"
-    registry._ctx.delegation_role = "subagent"
-    monkeypatch.setattr(
-        loop,
-        "call_llm_with_retry",
-        lambda *_args, **_kwargs: (
-            {"role": "assistant", "content": "child best effort"},
-            0.0,
-        ),
-    )
-
-    _text, _usage, trace = loop._handle_round_limit(limit_ctx)
-
-    assert trace["review_decision"]["eligibility"] == "not_eligible"
-    assert trace["review_decision"]["trigger"] == "skipped_child_advisory"
-    assert "acceptance_decision" not in trace
-
-
-def test_forced_bypass_probe_failure_records_unknown_eligibility(tmp_path, monkeypatch):
-    loop, _registry, limit_ctx, _trace = _forced_test_context(tmp_path)
-    monkeypatch.setattr(
-        loop,
-        "call_llm_with_retry",
-        lambda *_args, **_kwargs: (
-            {"role": "assistant", "content": "best effort"},
-            0.0,
-        ),
-    )
-    monkeypatch.setattr(
-        loop,
-        "_task_acceptance_eligible",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("mid-round trace")),
-    )
-
-    _text, _usage, trace = loop._handle_round_limit(limit_ctx)
-
-    assert trace["review_decision"] == {
-        "eligibility": "unknown",
-        "trigger": "bypassed_round_limit",
-    }
-    assert "acceptance_decision" not in trace
-
 
 
 def test_forced_final_sends_the_round_tool_envelope(tmp_path, monkeypatch):
@@ -2779,3 +2087,57 @@ def test_orphan_note_names_failed_children_and_skips_rows_this_chat_already_has(
     assert "integrated recorded for an EARLIER result hash" in same_chat
     assert "kid-failed" not in same_chat
     assert _child_result_sha256(rows[0]) != "0" * 64
+
+
+@pytest.mark.parametrize("selection", ["answer", "retained_hash", "held_hash"])
+def test_forced_request_uses_explicit_completion_selection_without_tool_execution(tmp_path, monkeypatch, selection):
+    from ouroboros.loop_delivery import hold_completion_response
+
+    loop, registry, ctx, trace = _forced_test_context(tmp_path)
+    retained = _arm_latch_with_candidate(loop, registry, ctx, trace)
+    held = "A short correction."
+    hold_completion_response(held, registry, ctx, trace)
+    expected = retained.full_text if selection == "retained_hash" else held
+    request = {"action": "finish"}
+    request.update({"answer": held} if selection == "answer" else {
+        "answer_sha256": retained.content_sha256 if selection == "retained_hash" else hashlib.sha256(held.encode()).hexdigest()})
+    calls = []
+    monkeypatch.setattr(loop, "call_llm_with_retry", lambda *_a, **_k: (
+        calls.append(1) or {"role": "assistant", "content": json.dumps(request)}, 0.0))
+    text, usage, _trace = loop._handle_round_limit(ctx)
+    assert text == expected and calls == [1]
+    assert usage["reason_code"] == "round_limit" and trace["tool_calls"] == []
+    assert registry._ctx._delivery_candidate.full_text == expected
+
+
+@pytest.mark.parametrize("body", [
+    '{"action":"finish","action":"stop","answer":"Do not publish"}',
+    '{"action":"finish","answer":"First","answer":"Second"}',
+    '{"action":"finish","answer_sha256":"unoffered"}',
+])
+def test_forced_invalid_completion_request_preserves_answer_without_repair_call(tmp_path, monkeypatch, body):
+    loop, registry, ctx, trace = _forced_test_context(tmp_path)
+    retained = _arm_latch_with_candidate(loop, registry, ctx, trace)
+    calls = []
+    monkeypatch.setattr(loop, "call_llm_with_retry", lambda *_a, **_k: (
+        calls.append(1) or {"role": "assistant", "content": body}, 0.0))
+    text, usage, _trace = loop._handle_round_limit(ctx)
+    assert text.startswith(retained.full_text) and calls == [1]
+    assert registry._ctx._delivery_candidate.degraded is True
+    assert usage["reason_code"] == "round_limit" and trace["tool_calls"] == []
+    assert body not in text
+
+
+@pytest.mark.parametrize("body", [
+    '{"delivery_control":"keep"}',
+    '{"delivery_control":"replace","full_answer":"Unselected legacy replacement"}',
+])
+def test_forced_legacy_control_is_containment_only_and_cannot_select_replacement(tmp_path, monkeypatch, body):
+    loop, registry, ctx, trace = _forced_test_context(tmp_path)
+    retained = _arm_latch_with_candidate(loop, registry, ctx, trace)
+    monkeypatch.setattr(loop, "call_llm_with_retry", lambda *_a, **_k: ({"role": "assistant", "content": body}, 0.0))
+    text, usage, returned_trace = loop._handle_round_limit(ctx)
+    assert text == retained.full_text
+    assert "delivery_control" not in text and "Unselected legacy replacement" not in text
+    assert usage["reason_code"] == "round_limit"
+    assert returned_trace["delivery_candidate"]["acceptance_binding"]["authoritative"] is False

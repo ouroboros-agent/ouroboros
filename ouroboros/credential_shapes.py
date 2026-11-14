@@ -4,12 +4,9 @@ Single source for the credential-name dictionaries that previously lived as
 three inline copies (tool_access + two in tools/core).
 
 Consumers: MUTATION-side user_files gates (write/edit/shell targets), the
-Deliverables/output lexical guards, attachment-staging ingest, and the child
-(subagent) location-deny paths. The ROOT principal's READ authorization must
-NOT consult these shapes (capinv-447 / В23: the owner's root agent reads the
-owner's home in full; secret BYTES are masked at egress instead) — an
-import-boundary test pins that ``ouroboros.tool_access`` resolves root read
-decisions without importing this module.
+Deliverables/output lexical guards, attachment-staging ingest, and retained runtime-control command policy. File READ authorization does not
+consult these shapes: admitted file content is delivered unchanged. An import-
+boundary test pins that root read decisions do not import this module.
 """
 
 from __future__ import annotations
@@ -57,9 +54,9 @@ CREDENTIAL_FILE_NAMES = frozenset({
     "tokens.json",
 })
 
-# Names denied to restricted (read-only / acting) subagents on the repo/data
-# drives — the child location-deny vocabulary (tools/core.py).
-SUBAGENT_CREDENTIAL_FILE_NAMES = frozenset({
+# Runtime-control names retained by the command-policy target predicate.
+# These names do not filter file reads, searches or listings.
+RUNTIME_SECRET_FILE_NAMES = frozenset({
     ".env",
     ".netrc",
     "auth.json",

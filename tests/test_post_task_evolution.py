@@ -6,10 +6,12 @@ import json
 import pathlib
 import types
 
+import pytest
 
 import ouroboros.config as config
 import ouroboros.post_task_evolution as pte
 import supervisor.state as state
+from tests._usage_store_testing import ledger_rows
 
 
 # --- Budget refusal guard (red-team R2.1 / BIBLE P8) --------------------------
@@ -78,11 +80,10 @@ def test_budget_reset_never_rewrites_physical_attempt_ledger(tmp_path, monkeypat
         ),
         lambda: {"usage": {"prompt_tokens": 1, "completion_tokens": 1}},
     )
-    ledger = tmp_path / "state" / "usage_attempts.jsonl"
-    before = ledger.read_bytes()
+    before = ledger_rows(tmp_path)
 
     assert state.reset_per_task_budget(tmp_path, confirm_isolated=True) is True
-    assert ledger.read_bytes() == before
+    assert ledger_rows(tmp_path) == before
 
 
 # --- V4 config envelope -------------------------------------------------------
@@ -107,6 +108,8 @@ def test_envelope_enable_parsing(monkeypatch):
 
 def test_v5_eligibility_and_canonical():
     assert pte._eligible({"type": "task"}) is True
+    # Failure is useful input to the opt-in chooser, not a success prerequisite.
+    assert pte._eligible({"type": "task", "status": "failed", "success": False}) is True
     assert pte._eligible({"type": "evolution"}) is False
     assert pte._eligible({"type": "deep_self_review"}) is False
     assert pte._eligible({"type": "task", "delegation_role": "subagent"}) is False
@@ -127,14 +130,14 @@ def test_v5_every_n_counter(tmp_path):
 def test_v5_maybe_promote_off_returns_none(tmp_path, monkeypatch):
     monkeypatch.delenv("OUROBOROS_POST_TASK_EVOLUTION", raising=False)
     env = types.SimpleNamespace(drive_root=tmp_path)
-    assert pte.maybe_promote(env, {"type": "task", "id": "t1"}, {"reflection": "x"}) is None
+    assert pte.maybe_promote(env, {"type": "task", "id": "t1"}, None) is None
 
 
 def test_v5_maybe_promote_light_mode_returns_none(tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_POST_TASK_EVOLUTION", "true")
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
     env = types.SimpleNamespace(drive_root=tmp_path)
-    assert pte.maybe_promote(env, {"type": "task", "id": "t1"}, {"reflection": "x"}) is None
+    assert pte.maybe_promote(env, {"type": "task", "id": "t1"}, None) is None
 
 
 def test_v5_apply_pending_none_when_no_request(tmp_path, monkeypatch):
@@ -160,13 +163,13 @@ def test_v5_apply_pending_request_activates_gated_campaign(tmp_path, monkeypatch
     monkeypatch.setattr(
         lifecycle,
         "start_evolution_campaign",
-        lambda objective, source="": started.update(objective=objective, source=source) or {"id": "test"},
+        lambda objective, source="", **_kwargs: started.update(objective=objective, source=source) or {"id": "test"},
     )
-    monkeypatch.setattr(st, "load_state", lambda: {"owner_chat_id": 7})
+    monkeypatch.setattr(st, "load_state", lambda: {"owner_chat_id": 7, "evolution_mode_enabled": False, "evolution_owner_stopped": False})
     monkeypatch.setattr(st, "save_state", lambda s: saved.update(s))
 
-    def _fake_update_state(mutator):
-        live = {"owner_chat_id": 7}
+    def _fake_update_state(mutator, **_kwargs):
+        live = {"owner_chat_id": 7, "evolution_mode_enabled": False, "evolution_owner_stopped": False}
         mutator(live)
         saved.update(live)
         return live
@@ -199,12 +202,12 @@ def test_evolution_owner_stopped_blocks_post_task_rearm(tmp_path, monkeypatch):
     import supervisor.state as st
     monkeypatch.setattr(lifecycle, "evolution_block_reason", lambda: "")
     monkeypatch.setattr(lifecycle, "start_evolution_campaign",
-                        lambda objective, source="": started.update(objective=objective, source=source))
+                        lambda objective, source="", **_kwargs: started.update(objective=objective, source=source))
     # Owner EXPLICITLY stopped: flag set, evolution disabled, owner present.
     monkeypatch.setattr(st, "load_state",
                         lambda: {"owner_chat_id": 7, "evolution_owner_stopped": True, "evolution_mode_enabled": False})
 
-    def _fake_update_state(mutator):
+    def _fake_update_state(mutator, **_kwargs):
         live = {"owner_chat_id": 7, "evolution_owner_stopped": True}
         mutator(live)
         saved.update(live)
@@ -285,7 +288,7 @@ def test_agent_stop_on_top_of_an_owner_stop_keeps_the_owner_stop(tmp_path, monke
     (tmp_path / "state").mkdir(parents=True, exist_ok=True)
     captured = {}
 
-    def _fake_update_state(mutator):
+    def _fake_update_state(mutator, **_kwargs):
         live = {"owner_chat_id": 7, "evolution_owner_stopped": True}  # the owner's stop: no source
         mutator(live)
         captured.update(live)
@@ -320,7 +323,7 @@ def test_toggle_evolution_off_wires_owner_stop(tmp_path, monkeypatch):
     captured = {}
     calls = {"complete": [], "start": []}
 
-    def _fake_update_state(mutator):
+    def _fake_update_state(mutator, **_kwargs):
         live = {"owner_chat_id": 7}
         mutator(live)
         captured.update(live)
@@ -372,8 +375,8 @@ def test_toggle_evolution_on_clears_owner_stop(tmp_path, monkeypatch):
     captured = {}
     calls = {"complete": [], "start": []}
 
-    def _fake_update_state(mutator):
-        live = {"owner_chat_id": 7}
+    def _fake_update_state(mutator, **_kwargs):
+        live = {"owner_chat_id": 7, "evolution_mode_enabled": False, "evolution_owner_stopped": False}
         mutator(live)
         captured.update(live)
         return live
@@ -383,10 +386,10 @@ def test_toggle_evolution_on_clears_owner_stop(tmp_path, monkeypatch):
     monkeypatch.setattr(lifecycle, "complete_evolution_campaign",
                         lambda reason="", *, status="stopped": calls["complete"].append((reason, status)))
     monkeypatch.setattr(lifecycle, "start_evolution_campaign",
-                        lambda objective="", *, source="": calls["start"].append((objective, source)) or {"id": "test"})
+                        lambda objective="", *, source="", **_kwargs: calls["start"].append((objective, source)) or {"id": "test"})
 
     ctx = types.SimpleNamespace(
-        load_state=lambda: {"owner_chat_id": 7},
+        load_state=lambda: {"owner_chat_id": 7, "evolution_mode_enabled": False, "evolution_owner_stopped": False},
         send_with_budget=lambda cid, text, **kw: None,
     )
     _handle_toggle_evolution({"enabled": True, "objective": "improve X"}, ctx)
@@ -404,7 +407,7 @@ def test_toggle_evolution_start_failure_sends_owner_correction(monkeypatch):
     monkeypatch.setattr(evolution_lifecycle, "start_evolution_campaign", lambda *a, **k: {})
     sent = []
     ctx = types.SimpleNamespace(
-        load_state=lambda: {"owner_chat_id": 7, "evolution_mode_enabled": False},
+        load_state=lambda: {"owner_chat_id": 7, "evolution_mode_enabled": False, "evolution_owner_stopped": False},
         send_with_budget=lambda chat_id, text, **kw: sent.append((chat_id, text)),
     )
 
@@ -430,7 +433,7 @@ def test_apply_pending_request_atomic_recheck_aborts_on_raced_owner_stop(tmp_pat
     calls = {"start": [], "complete": []}
     monkeypatch.setattr(lifecycle, "evolution_block_reason", lambda: "")
     monkeypatch.setattr(lifecycle, "start_evolution_campaign",
-                        lambda objective, source="": calls["start"].append((objective, source)) or {"id": "test"})
+                        lambda objective, source="", **_kwargs: calls["start"].append((objective, source)) or {"id": "test"})
     monkeypatch.setattr(lifecycle, "complete_evolution_campaign",
                         lambda reason="", *, status="stopped": calls["complete"].append((reason, status)))
     # Snapshot passes the chokepoint (flag False, not yet enabled)...
@@ -438,7 +441,7 @@ def test_apply_pending_request_atomic_recheck_aborts_on_raced_owner_stop(tmp_pat
                         lambda: {"owner_chat_id": 7, "evolution_owner_stopped": False, "evolution_mode_enabled": False})
     saved = {}
 
-    def _fake_update_state(mutator):
+    def _fake_update_state(mutator, **_kwargs):
         # ...but by the time of the atomic update the owner stop has landed (raced True).
         live = {"owner_chat_id": 7, "evolution_owner_stopped": True}
         mutator(live)
@@ -470,17 +473,28 @@ def test_execute_panic_stop_wires_owner_stop(tmp_path, monkeypatch):
     calls = {"complete": [], "drop": []}
     monkeypatch.setattr(state, "load_state", lambda: {"evolution_mode_enabled": True, "post_task_autostop": True})
     monkeypatch.setattr(state, "save_state", lambda s: saved.update(s))
+
+    def _panic_update(mutator, **_kwargs):  # Panic writes FIELDS, bounded, after the kills (#1307)
+        live = {"evolution_mode_enabled": True, "post_task_autostop": True}
+        mutator(live)
+        saved.update(live)
+        return live
+
+    monkeypatch.setattr(state, "update_state", _panic_update)
+    monkeypatch.setattr(lifecycle, "record_evolution_stop_intent", lambda *a, **k: True)
     monkeypatch.setattr(lifecycle, "complete_evolution_campaign",
                         lambda reason="", *, status="stopped", cleanup_worktree=True:
                         calls["complete"].append((reason, status, cleanup_worktree)))
     monkeypatch.setattr(pte_mod, "drop_pending_request", lambda dr: calls["drop"].append(dr))
     # Neutralize destructive teardown: real process/port kills and the hard exit must not run.
+    # The native Panic door also visits retained multiprocessing children.
+    monkeypatch.setattr("multiprocessing.active_children", lambda: [])
     monkeypatch.setattr(platform_layer, "kill_process_on_port", lambda *a, **k: None)
     monkeypatch.setattr(platform_layer, "force_kill_pid", lambda *a, **k: None)
     import ouroboros.tools.shell as _shell
     import ouroboros.local_model as _lm
     monkeypatch.setattr(_shell, "kill_all_tracked_subprocesses", lambda *a, **k: None)
-    monkeypatch.setattr(_lm, "get_manager", lambda: types.SimpleNamespace(stop_server=lambda: None))
+    monkeypatch.setattr(_lm, "get_manager", lambda **_: types.SimpleNamespace(stop_server=lambda: None, panic_stop=lambda **_: []))
 
     class _StopPanic(Exception):
         pass
@@ -640,15 +654,15 @@ def _apply_with_request(tmp_path, monkeypatch, backlog_id):
     )
     monkeypatch.setattr(lifecycle, "_read_evolution_campaign", lambda: camp)
     monkeypatch.setattr(lifecycle, "_write_evolution_campaign", lambda c: camp.update(c))
-    monkeypatch.setattr(stt, "load_state", lambda: {"owner_chat_id": 7})
+    monkeypatch.setattr(stt, "load_state", lambda: {"owner_chat_id": 7, "evolution_mode_enabled": False, "evolution_owner_stopped": False})
     monkeypatch.setattr(stt, "save_state", lambda s: None)
 
-    def _fake_update_state(mutator):
+    def _fake_update_state(mutator, **_kwargs):
         # The REAL update_state reads the machine-resolved state file through its private
         # unlocked loader, so the load_state patch above never reaches it — on a machine whose
         # LIVE state carries evolution_owner_stopped=True the atomic re-check would then refuse
         # the enable and apply would return False for reasons outside this test's control.
-        live = {"owner_chat_id": 7}
+        live = {"owner_chat_id": 7, "evolution_mode_enabled": False, "evolution_owner_stopped": False}
         mutator(live)
         return live
 
@@ -657,24 +671,25 @@ def _apply_with_request(tmp_path, monkeypatch, backlog_id):
     return ok, camp
 
 
-def test_v5_apply_pending_stores_valid_backlog_link(tmp_path, monkeypatch):
-    # Exercises the campaign post_task_backlog_id link path (close-on-absorb relies on it).
-    from ouroboros.improvement_backlog import append_backlog_items
+def test_v5_apply_pending_keeps_the_named_backlog_entry_as_campaign_evidence(tmp_path, monkeypatch):
+    # The chooser's stated entry rides the campaign into its cycle-outcome history; the
+    # authored note is never parsed to validate it and never changed by it.
+    from ouroboros.knowledge import resolve_knowledge_address, write_knowledge_note
 
-    append_backlog_items(tmp_path, [{
-        "summary": "the promoted fix", "category": "c", "source": "s",
-        "evidence": "e", "fingerprint": "fp-7", "id": "ibl-7",
-    }])
-    ok, camp = _apply_with_request(tmp_path, monkeypatch, "ibl-7")
-    assert ok is True
-    assert camp.get("post_task_backlog_id") == "ibl-7"
+    address = resolve_knowledge_address(tmp_path, "improvement-backlog", "global")
+    assert write_knowledge_note(address, "## Make late work resumable\nFreeform prose, no item ids.").ok
+    before = address.path.read_bytes()
+    for named in ("Make late work resumable", "ibl-does-not-exist"):
+        ok, camp = _apply_with_request(tmp_path, monkeypatch, named)
+        assert ok is True
+        assert camp.get("post_task_backlog_id") == named  # evidence, not an admission decision
+    assert address.path.read_bytes() == before
 
 
-def test_v5_apply_pending_rejects_unknown_backlog_id(tmp_path, monkeypatch):
-    # A hallucinated/stale id must NOT be linked (it could later close an unrelated item).
-    ok, camp = _apply_with_request(tmp_path, monkeypatch, "ibl-does-not-exist")
+def test_v5_apply_pending_without_a_named_entry_links_nothing(tmp_path, monkeypatch):
+    ok, camp = _apply_with_request(tmp_path, monkeypatch, "")
     assert ok is True  # the objective still applies
-    assert "post_task_backlog_id" not in camp  # but no bogus link is stored
+    assert "post_task_backlog_id" not in camp
 
 
 def test_v5_apply_pending_blocked_in_light_mode(tmp_path, monkeypatch):
@@ -687,6 +702,48 @@ def test_v5_apply_pending_blocked_in_light_mode(tmp_path, monkeypatch):
     assert pte.apply_pending_request(tmp_path) is False
     # stale request dropped
     assert not (tmp_path / "state" / "post_task_evolution_request.json").exists()
+
+
+def test_project_global_promotion_uses_real_maybe_promote_without_project_scope(tmp_path, monkeypatch):
+    """The split Project root's canonical entry: the real chooser gate receives the run's exact
+    sealed final under a globalized view (no project scope, initial text or workspace), and the
+    only write is the chooser's own request — never the authored backlog."""
+    import ouroboros.agent_task_pipeline as pipeline
+
+    monkeypatch.setattr("ouroboros.config.get_post_task_evolution_enabled", lambda: True)
+    monkeypatch.setattr("ouroboros.config.get_runtime_mode", lambda: "pro")
+    monkeypatch.setattr("ouroboros.config.get_post_task_evolution_cadence", lambda: "every_n:1")
+    decided = []
+    monkeypatch.setattr(pte, "_decide_promotion", lambda _env, task, sealed, *_args, **_kwargs: decided.append(
+        (task, sealed)) or {"promote": True, "objective": "Improve Ouroboros workspace tool feedback",
+                            "requires_plan_review": True, "backlog_id": ""})
+    env = types.SimpleNamespace(drive_root=tmp_path, drive_path=lambda rel: tmp_path / rel)
+    sealed = {"final_result_text": "Deck shipped.", "artifact_manifest": [{"name": "deck.pdf", "size_bytes": 3,
+                                                                           "status": "present"}],
+              "completion_observations": {"status": "unavailable"}}
+
+    pipeline._run_global_backlog_promotion_only(
+        env, {"id": "task-project", "type": "task", "project_id": "proj-1", "text": "Project-specific request",
+              "workspace_root": "/tmp/project", "workspace_mode": "external",
+              "metadata": {"work_kind": "owner", "workspace_preflight": {"git": {"head": "abc"}}}},
+        sealed, object())
+
+    [(view, seen)] = decided
+    assert seen == sealed  # the run's recorded facts, whole
+    assert view == {"id": "task-project", "type": "task", "source": "project_scoped_global_improvement",
+                    "metadata": {"globalized_from_project_task": True, "work_kind": "owner"}}
+    req = json.loads((tmp_path / "state" / "post_task_evolution_request.json").read_text(encoding="utf-8"))
+    assert req["objective"] == "Improve Ouroboros workspace tool feedback" and req["origin_task_id"] == "task-project"
+    assert not (tmp_path / "memory" / "knowledge").exists()
+
+
+def test_task_facts_without_initial_text_names_no_reader():
+    """The chooser is tool-less: a view without the initial text (the split Project root's
+    globalized view) states it unavailable instead of naming a reader the chooser cannot call."""
+    facts = pte._task_facts({"id": "task-project"}, None)
+    assert facts.startswith("Initial text of the run: unavailable in this view.")
+    assert "get_task_result" not in facts
+    assert pte._task_facts({"id": "t", "text": "Do X"}, None).startswith("Initial text of the run (exact):\nDo X")
 
 
 def test_promotion_chooser_uses_main_model_slot(tmp_path, monkeypatch):
@@ -704,7 +761,7 @@ def test_promotion_chooser_uses_main_model_slot(tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_MODEL", "test-provider/main-model")
 
     env = types.SimpleNamespace(drive_root=str(tmp_path))
-    pte._decide_promotion(env, {"id": "t1"}, {"reflection": "r"}, object(), force=False)
+    pte._decide_promotion(env, {"id": "t1"}, None, object())
 
     assert calls.get("model") == "test-provider/main-model"
     assert calls.get("reasoning_effort") == "medium"
@@ -713,5 +770,21 @@ def test_promotion_chooser_uses_main_model_slot(tmp_path, monkeypatch):
     # Empty env falls back to the SETTINGS_DEFAULTS main-slot value.
     calls.clear()
     monkeypatch.setenv("OUROBOROS_MODEL", "")
-    pte._decide_promotion(env, {"id": "t2"}, {"reflection": "r"}, object(), force=False)
+    pte._decide_promotion(env, {"id": "t2"}, None, object())
     assert calls.get("model") == config.SETTINGS_DEFAULTS["OUROBOROS_MODEL"]
+
+
+@pytest.mark.parametrize("missing", ["evolution_owner_stopped", "evolution_mode_enabled", "owner_chat_id"])
+def test_apply_pending_preserves_request_while_control_is_unknown(tmp_path, monkeypatch, missing):
+    monkeypatch.setenv("OUROBOROS_POST_TASK_EVOLUTION", "true")
+    from supervisor import evolution_lifecycle, state
+    request = tmp_path / "state/post_task_evolution_request.json"
+    request.parent.mkdir()
+    request.write_text(json.dumps({"objective": "improve"}))
+    values = {"owner_chat_id": 7, "evolution_mode_enabled": False, "evolution_owner_stopped": False}
+    values.pop(missing)
+    monkeypatch.setattr(state, "load_state", lambda: values)
+    monkeypatch.setattr(evolution_lifecycle, "evolution_block_reason", lambda: "")
+    monkeypatch.setattr(evolution_lifecycle, "start_evolution_campaign", lambda *_a, **_k: pytest.fail("unknown cannot start"))
+    assert pte.apply_pending_request(tmp_path) is False
+    assert request.exists()

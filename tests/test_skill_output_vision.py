@@ -59,7 +59,7 @@ def test_skill_output_auto_attach_manual_read_and_vision_send(split_image, const
     assert len(blocks) == 1
     assert base64.b64decode(blocks[0]["image_url"]["url"].split(",", 1)[1]) == raw
     copied = Path(blocks[0]["_source_path"])
-    assert copied.is_relative_to(ctx.drive_root / "uploads" / "views")
+    assert copied.is_relative_to(ctx.budget_drive_root / "uploads" / "views")
     assert copied.read_bytes() == raw
     assert "now attached" in vision._view_image(ctx, str(shot))
     assert "now attached" in vision._view_image(ctx, str(copied))
@@ -71,7 +71,7 @@ def test_skill_output_auto_attach_manual_read_and_vision_send(split_image, const
     assert base64.b64decode(observed[0]["images"][0]["base64"]) == raw
 
 
-@pytest.mark.parametrize("relative", ["state/skills/myskill/grants.json", "settings.json", "projects/p1/shot.png"])
+@pytest.mark.parametrize("relative", ["state/skills/myskill/grants.json", "projects/p1/shot.png"])
 def test_image_root_admission_preserves_per_path_denials(split_image, relative):
     ctx, _shot, raw = split_image
     ctx.task_constraint = {"mode": "local_readonly_subagent"}
@@ -80,4 +80,19 @@ def test_image_root_admission_preserves_per_path_denials(split_image, relative):
     protected.write_bytes(raw)
     payload, error = vision._load_local_image_payload(ctx, str(protected))
     assert payload is None and error
+    assert not ctx.messages
+
+
+@pytest.mark.parametrize("constraint", [None, {"mode": "local_readonly_subagent"},
+                                          {"mode": "acting_subagent", "surface": "external_workspace"}])
+def test_image_reader_preserves_parent_visible_settings_path(split_image, constraint):
+    ctx, _shot, raw = split_image
+    ctx.task_constraint = constraint
+    if constraint is None:
+        ctx.drive_root = ctx.budget_drive_root  # The parent owns the canonical runtime drive.
+    source = ctx.budget_drive_root / "settings.json"
+    source.write_bytes(raw)
+    payload, error = vision._load_local_image_payload(ctx, str(source))
+    assert not error and payload["mime"] == "image/png"
+    assert base64.b64decode(payload["base64"]) == raw
     assert not ctx.messages

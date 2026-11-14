@@ -9,23 +9,27 @@ replaced only when no worker is reaping, and the exact claim assignment must see
 from __future__ import annotations
 
 import json
+
+import pytest
 from types import SimpleNamespace
 
 from tests._evolution_state_shared import (
     _CaptureQueue,
     _active_transaction,
 )
+from tests.worker_pool_support import affirm_ready
 
 
 def _assignment_case(tmp_path, monkeypatch, task_id="assign-evo"):
-    from supervisor import evolution_lifecycle, queue, state, workers
+    from supervisor import evolution_lifecycle, state, workers
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     monkeypatch.setattr(state, "TOTAL_BUDGET_LIMIT", 0.0)
     pending, running = [], {}
     monkeypatch.setattr(workers, "PENDING", pending)
     monkeypatch.setattr(workers, "RUNNING", running)
-    workers.init(tmp_path, tmp_path, 1)
+    workers.init(tmp_path, tmp_path)
     campaign = evolution_lifecycle.start_evolution_campaign("Improve", source="test")
     state.update_state(lambda live: live.update(
         evolution_mode_enabled=True,
@@ -40,10 +44,9 @@ def _assignment_case(tmp_path, monkeypatch, task_id="assign-evo"):
     }
     pending.append(task)
     inbox, events = _CaptureQueue(), _CaptureQueue()
-    worker = SimpleNamespace(wid=1, busy_task_id=None, reaping=False, in_q=inbox)
+    worker = affirm_ready(SimpleNamespace(wid=1, busy_task_id=None, reaping=False, in_q=inbox))
     monkeypatch.setattr(workers, "WORKERS", {1: worker})
     monkeypatch.setattr(workers, "get_event_q", lambda: events)
-    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": None)
     monkeypatch.setattr(evolution_lifecycle, "evolution_block_reason", lambda: "")
     return workers, task, tx, worker, inbox, events
 
@@ -79,6 +82,7 @@ def test_scheduler_refuses_active_campaign_without_source(tmp_path, monkeypatch)
     from supervisor import evolution_lifecycle, queue, state
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install (#1307)
     queue.init(tmp_path)
     queue.init_queue_refs([], {}, {"value": 0})
     campaign = evolution_lifecycle.start_evolution_campaign("Improve", source="test")
@@ -114,6 +118,7 @@ def test_scheduler_does_not_enqueue_when_transaction_attach_fails(tmp_path, monk
     from supervisor import evolution_lifecycle, queue, state
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install (#1307)
     queue.init(tmp_path)
     pending = []
     queue.init_queue_refs(pending, {}, {"value": 0})
@@ -134,6 +139,7 @@ def test_transaction_attach_rechecks_owner_stop_under_state_lock(tmp_path):
     from supervisor import evolution_lifecycle, queue, state
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install (#1307)
     queue.init(tmp_path)
     campaign = evolution_lifecycle.start_evolution_campaign("Improve", source="test")
     live = state.load_state()
@@ -152,6 +158,7 @@ def test_scheduler_replaces_uncommitted_transaction_lost_before_enqueue(tmp_path
     from supervisor import evolution_lifecycle, queue, state
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install (#1307)
     queue.init(tmp_path)
     pending = []
     queue.init_queue_refs(pending, {}, {"value": 0})
@@ -218,7 +225,6 @@ def test_timeout_marks_evolution_reaping_before_scheduler_can_replace_it(tmp_pat
     reaper_jobs = _CaptureQueue()
     monkeypatch.setattr(queue, "FINALIZATION_GRACE_SEC", 0)
     monkeypatch.setattr(queue, "get_task_idle_timeout_sec", lambda: 1)
-    monkeypatch.setattr(queue, "get_per_call_timeout_ceiling_sec", lambda: 1)
     monkeypatch.setattr(queue, "get_task_abs_ceiling_sec", lambda: 10)
     monkeypatch.setattr(queue, "_ensure_reaper_started", lambda: None)
     monkeypatch.setattr(queue, "_reap_queue", reaper_jobs)
@@ -318,3 +324,222 @@ def test_benchmark_seed_creates_campaign_before_enabling(tmp_path):
     assert campaign["status"] == "active"
     assert campaign["id"]
     assert state["evolution_mode_enabled"] is True
+
+
+@pytest.fixture
+def refused_evolution(tmp_path, monkeypatch):
+    """Real producer/admission/campaign, with only money, Git and chat isolated."""
+    from ouroboros import projects_registry
+    from supervisor import evolution_lifecycle as evo, git_ops, queue, state
+
+    state.init(tmp_path)
+    queue.init(tmp_path)
+    queue.init_queue_refs([], {}, {"value": 0})
+    monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(git_ops, "REPO_DIR", tmp_path / "repo")
+    monkeypatch.setitem(evo._STOP_LATCH, "stopped", False)
+    assert state.DRIVE_ROOT == queue.DRIVE_ROOT == git_ops.DRIVE_ROOT == tmp_path
+    state.save_state({"owner_chat_id": 1, "evolution_mode_enabled": True, "evolution_owner_stopped": False})
+    evo.start_evolution_campaign("Improve", source="owner")
+    bindings = projects_registry._bindings_path(tmp_path)
+    bindings.write_text("{broken", encoding="utf-8")
+    git = {"head": "initial-head", "branch": "ouroboros", "calls": []}
+
+    def capture(args):
+        git["calls"].append(args)
+        value = "" if "status" in args else git["branch"] if "--abbrev-ref" in args else git["head"]
+        return 0, value, ""
+
+    notices = []
+    monkeypatch.setattr(git_ops, "git_capture", capture)
+    monkeypatch.setattr(queue, "evolution_block_reason", lambda: "")
+    monkeypatch.setattr(queue, "budget_remaining", lambda *a, **k: 100000)
+    monkeypatch.setattr(queue, "build_evolution_task_text", lambda cycle: f"Improve cycle {cycle}")
+    monkeypatch.setattr(queue, "send_with_budget", lambda *a, **k: notices.append(a))
+    queue.enqueue_evolution_task_if_needed()
+    tx = evo._read_evolution_campaign()["active_transaction"]
+    assert tx["admission_refused"]["reason"] == "project_routing_fence_lookup_failed"
+    assert not queue.PENDING
+    return SimpleNamespace(root=tmp_path, bindings=bindings, git=git, notices=notices, tx=tx)
+
+
+def test_refused_evolution_retains_identity_history_and_campaign_bytes(refused_evolution):
+    from supervisor import evolution_lifecycle as evo, queue
+
+    path = refused_evolution.root / evo.EVOLUTION_CAMPAIGN_FILE
+    before, git_calls = path.read_bytes(), list(refused_evolution.git["calls"])
+    for _ in range(3):
+        queue.enqueue_evolution_task_if_needed()
+    assert path.read_bytes() == before
+    assert refused_evolution.git["calls"] == git_calls
+    assert not queue.PENDING
+    assert not refused_evolution.notices
+
+
+def test_refused_evolution_admits_once_with_fresh_base_and_cycle(refused_evolution):
+    from ouroboros.evolution_fingerprint import canonical_objective_fingerprint
+    from ouroboros.task_results import load_task_result
+    from supervisor import evolution_lifecycle as evo, queue, state
+
+    refused_evolution.git.update(head="intervening-commit", branch="new-branch")
+    state.update_state(lambda live: live.update(evolution_cycle=5))
+    refused_evolution.bindings.write_text('{"bindings": {}}', encoding="utf-8")
+    queue.enqueue_evolution_task_if_needed()
+    queue.enqueue_evolution_task_if_needed()
+    assert len(queue.PENDING) == 1
+    task = queue.PENDING[0]
+    tx = task["metadata"]["evolution_transaction"]
+    assert task["id"] == refused_evolution.tx["task_id"]
+    assert tx["transaction_id"] == refused_evolution.tx["transaction_id"]
+    assert (tx["base_head"], tx["base_branch"], tx["cycle"]) == ("intervening-commit", "new-branch", 6)
+    assert tx["objective_fp"] == canonical_objective_fingerprint("Improve")
+    assert "admission_refused" not in tx
+    campaign = evo._read_evolution_campaign()
+    assert campaign["active_transaction"] == tx
+    assert not campaign.get("transaction_history")
+    result = load_task_result(refused_evolution.root, task["id"], strict=True)
+    assert result["metadata"]["evolution_transaction"] == tx
+    assert state.load_state()["evolution_cycle"] == 6
+    evo._cleanup_worktree_after_cycle(tx, task["id"])
+    assert tx["cleanup_status"] == "already_clean"
+    assert not any("reset" in args or "stash" in args for args in refused_evolution.git["calls"])
+
+
+def test_definite_evolution_receipt_failure_reuses_same_claim(refused_evolution, monkeypatch):
+    from supervisor import evolution_lifecycle as evo, queue, task_admission
+
+    refused_evolution.bindings.write_text('{"bindings": {}}', encoding="utf-8")
+    real_write = task_admission.write_task_result
+    monkeypatch.setattr(task_admission, "write_task_result", lambda *a, **k: None)
+    for _ in range(3):
+        queue.enqueue_evolution_task_if_needed()
+        assert not queue.PENDING
+        campaign = evo._read_evolution_campaign()
+        assert not campaign.get("transaction_history")
+        assert campaign["active_transaction"]["transaction_id"] == refused_evolution.tx["transaction_id"]
+        assert campaign["active_transaction"]["admission_refused"]["reason"] == "scheduled_result_persist_failed"
+    monkeypatch.setattr(task_admission, "write_task_result", real_write)
+    queue.enqueue_evolution_task_if_needed()
+    assert len(queue.PENDING) == 1
+    assert queue.PENDING[0]["id"] == refused_evolution.tx["task_id"]
+
+
+def test_unknown_evolution_receipt_readback_retains_custody(refused_evolution, monkeypatch):
+    from supervisor import evolution_lifecycle as evo, queue, task_admission
+
+    refused_evolution.bindings.write_text('{"bindings": {}}', encoding="utf-8")
+    def unreadable(*args, **kwargs):
+        raise OSError("unreadable receipt")
+    monkeypatch.setattr(task_admission, "write_task_result", lambda *a, **k: None)
+    monkeypatch.setattr(task_admission, "load_task_result", unreadable)
+    queue.enqueue_evolution_task_if_needed()
+    assert len(queue.PENDING) == 1
+    tx = evo._read_evolution_campaign()["active_transaction"]
+    assert "admission_refused" not in tx
+    before = list(refused_evolution.git["calls"])
+    queue.enqueue_evolution_task_if_needed()
+    assert len(queue.PENDING) == 1 and refused_evolution.git["calls"] == before
+    # Lost queue state does not turn unknown custody into a reusable claim.
+    queue.PENDING.clear()
+    queue.enqueue_evolution_task_if_needed()
+    assert queue.PENDING[0]["id"] != refused_evolution.tx["task_id"]
+    assert evo._read_evolution_campaign()["transaction_history"][-1]["abandoned_reason"] == "dispatch_not_persisted"
+
+
+@pytest.mark.parametrize("control", ["stop", "budget", "paused"])
+def test_refused_evolution_respects_current_controls(refused_evolution, monkeypatch, control):
+    from supervisor import evolution_lifecycle as evo, queue
+
+    if control == "stop":
+        assert evo.record_evolution_stop_intent("owner")
+    elif control == "budget":
+        monkeypatch.setattr(queue, "budget_remaining", lambda *a, **k: 0)
+    else:
+        evo.pause_evolution_campaign("owner pause")
+    refused_evolution.bindings.write_text('{"bindings": {}}', encoding="utf-8")
+    before = list(refused_evolution.git["calls"])
+    queue.enqueue_evolution_task_if_needed()
+    assert not queue.PENDING
+    assert refused_evolution.git["calls"] == before
+    if control == "stop":
+        ended = evo.complete_evolution_campaign("owner stopped")
+        assert ended["transaction_history"][-1]["cleanup_status"] == "skipped_never_admitted"
+        assert refused_evolution.git["calls"] == before
+
+
+def test_evolution_starts_on_a_subscription_main_at_the_reached_global_limit(refused_evolution, monkeypatch):
+    """A reached global limit refuses paid admission only; the "budget" control above is a paid Main's."""
+    from supervisor import queue
+
+    monkeypatch.setenv("OUROBOROS_MODEL", "claudexor::codex=gpt-6-astra")
+    monkeypatch.setattr(queue, "budget_remaining", lambda *a, **k: 0)
+    refused_evolution.bindings.write_text('{"bindings": {}}', encoding="utf-8")
+    queue.enqueue_evolution_task_if_needed()
+    assert len(queue.PENDING) == 1
+
+
+@pytest.mark.parametrize("field,value", [("objective", "Different objective"), ("source", "owner_chat")])
+def test_refused_evolution_changed_campaign_does_not_reuse(refused_evolution, field, value):
+    from ouroboros.evolution_fingerprint import canonical_objective_fingerprint
+    from supervisor import evolution_lifecycle as evo, queue
+
+    campaign = evo._read_evolution_campaign()
+    campaign[field] = value
+    assert evo._write_evolution_campaign(campaign)
+    refused_evolution.bindings.write_text('{"bindings": {}}', encoding="utf-8")
+    queue.enqueue_evolution_task_if_needed()
+    assert len(queue.PENDING) == 1
+    task = queue.PENDING[0]
+    assert task["id"] != refused_evolution.tx["task_id"]
+    assert task["metadata"]["evolution_transaction"]["objective_fp"] == canonical_objective_fingerprint(campaign["objective"])
+
+
+@pytest.mark.parametrize("write_outcome", ["refused", "written_then_raised"])
+def test_evolution_refresh_write_failure_cannot_expose_stale_base(refused_evolution, monkeypatch, write_outcome):
+    from ouroboros.task_results import load_task_result
+    from supervisor import evolution_lifecycle as evo, queue
+
+    refused_evolution.bindings.write_text('{"bindings": {}}', encoding="utf-8")
+    refused_evolution.git["head"] = "newer-head"
+    original_write = evo._write_evolution_campaign
+    def fail_preparation(campaign, **kwargs):
+        if write_outcome == "written_then_raised":
+            original_write(campaign, **kwargs)
+            if not campaign["active_transaction"].get("admission_refused"):
+                raise OSError("write outcome unavailable")
+            return True
+        return False
+    monkeypatch.setattr(evo, "_write_evolution_campaign", fail_preparation)
+    queue.enqueue_evolution_task_if_needed()
+    assert not queue.PENDING
+    assert load_task_result(refused_evolution.root, refused_evolution.tx["task_id"], strict=True) is None
+    tx = evo._read_evolution_campaign()["active_transaction"]
+    assert tx["transaction_id"] == refused_evolution.tx["transaction_id"]
+    assert tx["admission_refused"]
+    monkeypatch.setattr(evo, "_write_evolution_campaign", original_write)
+    queue.enqueue_evolution_task_if_needed()
+    assert len(queue.PENDING) == 1
+    assert queue.PENDING[0]["id"] == refused_evolution.tx["task_id"]
+    assert queue.PENDING[0]["metadata"]["evolution_transaction"]["base_head"] == "newer-head"
+
+
+@pytest.mark.parametrize("change", ["stop", "objective"])
+def test_evolution_preparation_rechecks_control_before_receipt(refused_evolution, monkeypatch, change):
+    from ouroboros.task_results import load_task_result
+    from supervisor import evolution_lifecycle as evo, queue
+
+    refused_evolution.bindings.write_text('{"bindings": {}}', encoding="utf-8")
+    original_enqueue = queue.enqueue_task
+    def enqueue_then_control(*args, **kwargs):
+        admitted = original_enqueue(*args, **kwargs)
+        if change == "stop":
+            assert evo.record_evolution_stop_intent("owner")
+        else:
+            campaign = evo._read_evolution_campaign()
+            campaign["objective"] = "Changed before receipt"
+            assert evo._write_evolution_campaign(campaign)
+        return admitted
+    monkeypatch.setattr(queue, "enqueue_task", enqueue_then_control)
+    queue.enqueue_evolution_task_if_needed()
+    assert not queue.PENDING
+    assert load_task_result(refused_evolution.root, refused_evolution.tx["task_id"], strict=True) is None

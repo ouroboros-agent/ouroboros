@@ -1,10 +1,4 @@
-"""Tool API v2 access matrix.
-
-This is the single policy shape for LLM-visible tools: a profile asks to run an
-operation against a resource root and receives an allow/block decision. The
-legacy per-tool checks still provide defense-in-depth while the public API is
-migrated to neutral tool names.
-"""
+"""Tool API v2 access policy and historical facade surface (ARCHITECTURE §6)."""
 
 from __future__ import annotations
 
@@ -14,21 +8,21 @@ import re  # noqa: F401 — historical facade surface
 from dataclasses import dataclass  # noqa: F401 — historical facade surface
 from typing import Any, Iterable, Literal, Optional  # noqa: F401 — historical facade surface
 
-from ouroboros.artifacts import (delegated_capture_read_target,
-                                 task_artifact_dir_path, task_id_for_artifacts)
+from ouroboros.artifacts import delegated_capture_read_target, task_artifact_dir_path, task_id_for_artifacts
+from ouroboros.headless import task_state_dir
 from ouroboros.tool_capabilities import ACTING_SUBAGENT_MODE, LOCAL_READONLY_SUBAGENT_MODE  # noqa: F401 — historical facade surface
 from ouroboros.contracts.task_constraint import VALID_WRITE_SURFACES, normalize_task_constraint  # noqa: F401 — historical facade surface
 from ouroboros import deliverables_paths as _deliverables_paths
 from ouroboros.shell_parse import is_absolute_path_text
+from ouroboros.task_results import validate_task_id
 from ouroboros.utils import safe_relpath
+from ouroboros.tool_access_reads import scheduled_origin  # re-export the read-authority owner
 
 _deliverables_root_lexical = _deliverables_paths._deliverables_root_lexical
 _deliverables_root_lexical_alias = _deliverables_paths._deliverables_root_lexical_alias
 _lexical_path_is_relative_to_casefold = _deliverables_paths._lexical_path_is_relative_to_casefold
 
-# v7 D04 split: the owners below were extracted VERBATIM from this module
-# (see each leaf's header); re-exported here so historical imports and
-# monkeypatch targets keep working unchanged.
+# These owners preserve historical imports and monkeypatch targets unchanged.
 from ouroboros.tool_access_types import (  # noqa: F401 — re-exported moved surface
     Operation,
     ResolvedResourceBinding,
@@ -50,10 +44,8 @@ from ouroboros.tool_access_paths import (  # noqa: F401 — re-exported moved su
     _deliverables_root,
     _path_is_relative_to_casefold,
     _user_files_root,
-    canonical_data_root,
-    normalize_root,
-    normalize_root_relative,
-    normalize_runtime_data_path,
+    canonical_data_root, docker_process_alias_target,
+    normalize_root, normalize_root_relative, normalize_runtime_data_path,
     path_is_relative_to,
     paths_overlap_casefold,
     workspace_mode_block_reason,
@@ -62,7 +54,7 @@ from ouroboros.tool_access_roots import (  # noqa: F401 — re-exported moved su
     _is_subagent_ctx,
     _skill_payload_base,
     active_tool_profile,
-    binding_targets_system_repo,
+    binding_targets_system_repo, folderless_scratch_dir,
     is_external_workspace,
     load_bound_skill,
     predicted_subagent_profile,
@@ -78,22 +70,19 @@ from ouroboros.tool_access_user_files import (  # noqa: F401 — re-exported mov
 )
 
 
-# Deferral 1: orchestrator-visible READ-ONLY roots — durable subagent (genesis) projects
-# and the unnamed-deliverables container. Only ever granted {read,list,search}; NEVER
-# write/edit/shell/vcs (no mutation, no shell-cwd — deliberately absent from
-# resolve_shell_cwd candidates) and NEVER to acting/readonly subagents (a child must not
-# read sibling projects). operator_control is capped to read-only on these too.
-
 def summarize_subagent_profile(profile: ToolProfile, *, effective_lane: str = "") -> str:
     """Compact, human-readable summary of a subagent's EFFECTIVE tool profile
     (v6.57.0, 1.6): shell yes/no, writable roots, and model lane — derived from the
     _POLICY matrix (the same SSOT active_tool_profile resolves), so the parent sees
     at schedule time (and the child sees first line of its context) what the child
     CAN and CANNOT do. Prevents the wasted rounds where a prober child hit
-    workspace_blocked on run_script because neither side knew shell was off."""
+    workspace_blocked on run_script because neither side knew shell was off.
+    The second line names shared readable roots; the context supplies their
+    physical bindings, including the parent's inherited folders and runtime."""
     matrix = _POLICY.get(_effective_policy_profile(profile), {})
     shell_roots = sorted(root for root, ops in matrix.items() if "shell" in ops)
     write_roots = sorted(root for root, ops in matrix.items() if ops & {"write", "edit"})
+    read_roots = sorted(root for root, ops in matrix.items() if "read" in ops)
     has_shell = bool(shell_roots)
     bits = [
         f"profile={profile}",
@@ -103,7 +92,85 @@ def summarize_subagent_profile(profile: ToolProfile, *, effective_lane: str = ""
     lane = str(effective_lane or "").strip()
     if lane:
         bits.append(f"model_lane={lane}")
-    return "child capabilities — " + " · ".join(bits)
+    lineage = " (including inherited parent folders and runtime data)"
+    return (
+        "child capabilities — " + " · ".join(bits)
+        + f"\nreadable={', '.join(read_roots) or 'none'}{lineage}"
+        + f" · unreadable={', '.join(sorted(_ALL_ROOTS - set(read_roots))) or 'none'}"
+    )
+
+
+def lineage_task_ids(ctx: Any) -> tuple[str, ...]:
+    """Task ids whose ``task_drive``/``artifact_store`` this actor may READ: its own, its parent's
+    and its root's (own lineage fields, T4=A #1105), the ONE predecessor its contract names
+    (``task_contract.predecessor_authority.source.task_id``, one hop, #1232; a child carrying the
+    envelope reads it too) and the direct origin of a scheduled root (``scheduled_origin``, #1488)
+    — never a sibling's, nothing found by walking the disk, malformed ids dropped."""
+    meta, contract = (v if isinstance(v, dict) else {} for v in (
+        getattr(ctx, "task_metadata", None), getattr(ctx, "task_contract", None)))
+    authority = (contract or meta).get("predecessor_authority")
+    source = authority.get("source") if isinstance(authority, dict) else None
+    ids = [task_id_for_artifacts(ctx)]
+    for raw in (meta.get("parent_task_id"), meta.get("root_task_id"),
+                source.get("task_id") if isinstance(source, dict) else None, scheduled_origin(ctx)):
+        try:
+            ids.append(validate_task_id(raw))
+        except ValueError:
+            continue
+    return tuple(dict.fromkeys(ids))
+
+
+def _task_root_drives(ctx: Any) -> list[pathlib.Path]:
+    """The data drives a task's own task roots are enumerated on."""
+    meta = getattr(ctx, "task_metadata", {})
+    meta = meta if isinstance(meta, dict) else {}
+    values = (getattr(ctx, "drive_root", ""), *(meta.get(key) for key in (
+        "drive_root", "child_drive_root", "headless_child_drive_root")))
+    return list(dict.fromkeys(pathlib.Path(raw).resolve(strict=False) for raw in values if raw))
+
+
+def lineage_read_roots(ctx: Any, root: ResourceRoot) -> tuple[pathlib.Path, ...]:
+    """Enumerate only the same host-attested lineage containers used by native reads."""
+    if root not in {"task_drive", "artifact_store"} or not hasattr(ctx, "drive_root"):
+        return ()
+    canonical = canonical_data_root(ctx)
+    drives = [canonical] + [drive for drive in _task_root_drives(ctx) if drive != canonical]
+    task_ids = lineage_task_ids(ctx)
+    pairs = [(drive, task_id, False) for drive in drives for task_id in task_ids]
+    pairs += [(task_state_dir(canonical, task_id) / "data", task_id, True) for task_id in task_ids]
+    bases = []
+    for drive, task_id, headless in pairs:
+        lexical = (drive / "task_drives" / task_id if root == "task_drive"
+                   else task_artifact_dir_path(drive, task_id, create=False))
+        base = lexical.resolve(strict=False)
+        if (base == lexical or not headless) and base not in bases:
+            bases.append(base)
+    return tuple(bases)
+
+
+def lineage_read_base(ctx: Any, root: ResourceRoot, target: pathlib.Path) -> pathlib.Path | None:
+    """Containing lineage base for a READ; never a sibling or an external runtime root."""
+    candidate = pathlib.Path(target).resolve(strict=False)
+    return next((base for base in lineage_read_roots(ctx, root)
+                 if path_is_relative_to(candidate, base)), None)
+
+
+def _lineage_source_target(ctx: Any, root: ResourceRoot, target: pathlib.Path) -> pathlib.Path:
+    """A READ, through artifact_store or runtime_data, of a lineage task's SHA-named source handle with no
+    entry at the asked placement opens that task's own verified source (#2645: the writer kept it in the
+    canonical store while an execution-drive artifact_store was advertised). An existing entry, a denied
+    lookup and every other path stay as asked; dispatch then judges the opened target as for any read."""
+    from ouroboros.source_retention import retained_actor_source_read_target, source_handle_digest
+
+    base = lineage_read_base(ctx, "artifact_store", target) if root in {"artifact_store", "runtime_data"} else None
+    relative = target.relative_to(base).as_posix() if base is not None and base.name in lineage_task_ids(ctx) else ""
+    if not source_handle_digest(relative):
+        return target
+    try:
+        os.lstat(target)
+        return target
+    except FileNotFoundError:
+        return retained_actor_source_read_target(canonical_data_root(ctx), base.name, relative) or target
 
 
 def _effective_policy_profile(profile: ToolProfile) -> ToolProfile:
@@ -121,6 +188,12 @@ def _effective_policy_profile(profile: ToolProfile) -> ToolProfile:
     return profile
 
 
+def operation_roots(profile: ToolProfile, operation: Operation) -> str:
+    """The roots ``profile`` may ``operation`` — the one vocabulary every refusal names."""
+    matrix = _POLICY.get(_effective_policy_profile(profile), {})
+    return ", ".join(sorted(root for root, ops in matrix.items() if operation in ops)) or "(none)"
+
+
 def decide_tool_access(
     *,
     profile: ToolProfile,
@@ -131,10 +204,10 @@ def decide_tool_access(
     allowed = operation in _POLICY.get(effective_profile, {}).get(root, set())
     if allowed:
         return ToolAccessDecision(True, guard=f"{effective_profile}:{root}:{operation}")
-    allowed_roots = ", ".join(sorted(r for r, ops in _POLICY.get(effective_profile, {}).items() if operation in ops)) or "(none)"
     return ToolAccessDecision(
         False,
-        reason=f"profile={effective_profile} cannot {operation} root={root}. Roots your profile can {operation}: {allowed_roots}.",
+        reason=f"profile={effective_profile} cannot {operation} root={root}. "
+        f"Roots your profile can {operation}: {operation_roots(profile, operation)}.",
         guard=f"{effective_profile}:{root}:{operation}",
     )
 
@@ -209,15 +282,12 @@ def _process_root_candidates(
         ])
 
     if hasattr(ctx, "drive_root"):
-        _add_task_roots(pathlib.Path(ctx.drive_root).resolve(strict=False))
-        meta = getattr(ctx, "task_metadata", {})
-        meta = meta if isinstance(meta, dict) else {}
-        for key in ("drive_root", "child_drive_root", "headless_child_drive_root"):
-            if not meta.get(key):
-                continue
-            _add_task_roots(pathlib.Path(meta[key]).resolve(strict=False))
-    if hasattr(ctx, "drive_root"):
+        from ouroboros.tool_access_user_files import deliverables_process_roots
+
+        for drive in _task_root_drives(ctx):
+            _add_task_roots(drive)
         candidates.append(("user_files", resource_root_path(ctx, "user_files"), "user_files", ""))
+        candidates += [("user_files", root, "user_files", "") for root in deliverables_process_roots(ctx)]
     if include_skill:
         base, source, selected_name = _skill_payload_base(
             ctx,
@@ -260,11 +330,10 @@ def filesystem_affordance_map(ctx: Any, *, runtime_mode: str = "") -> dict[str, 
     plan inside the same envelope that the dispatcher later enforces.
     """
 
+    from ouroboros.tool_access_reads import inherited_read_roots
     profile = active_tool_profile(ctx)
     policy = _POLICY.get(_effective_policy_profile(profile), {})
-    # H2 (capinv-447): a root is writable iff a MUTATING operation is granted on
-    # it. Grouping "vcs" as write-like claimed writable roots for the read-only
-    # child profile (status/diff-only vcs), contradicting summarize_subagent_profile.
+    # Read-only VCS does not make a root writable.
     writable_roots = sorted(root for root, ops in policy.items() if ops & _WRITE_LIKE_OPS)
     readonly_roots = sorted(
         root for root, ops in policy.items()
@@ -294,6 +363,7 @@ def filesystem_affordance_map(ctx: Any, *, runtime_mode: str = "") -> dict[str, 
             continue
     result = {
         "profile": profile,
+        "inherited_read_bindings": [{"root": label, "path": str(base)} for label, base in inherited_read_roots(ctx)],
         "writable_roots": writable_roots,
         "readonly_roots": readonly_roots,
         "searchable_roots": sorted(root for root, ops in policy.items() if "search" in ops),
@@ -301,9 +371,9 @@ def filesystem_affordance_map(ctx: Any, *, runtime_mode: str = "") -> dict[str, 
         "invisible_roots": sorted(_ALL_ROOTS - set(policy)),
         "root_paths": root_paths,
         "default_shell_cwd": shell_roots[0][0] if shell_roots else "",
-        "allowed_shell_cwd_roots": [label for label, _root in shell_roots],
+        "allowed_shell_cwd_roots": list(dict.fromkeys(label for label, _root in shell_roots)),
         "default_service_cwd": service_roots[0][0] if service_roots else "",
-        "allowed_service_cwd_roots": [label for label, _root in service_roots],
+        "allowed_service_cwd_roots": list(dict.fromkeys(label for label, _root in service_roots)),
         "git_readonly_subcommands": git_readonly_subcommands,
         "light_gated_roots": sorted(light_gated_roots),
     }
@@ -331,25 +401,27 @@ def filesystem_affordance_map(ctx: Any, *, runtime_mode: str = "") -> dict[str, 
     return result
 
 
-def profile_readable_root_paths(ctx: Any) -> list[tuple[str, pathlib.Path]]:
-    """Project readable ``(label, path)`` pairs from the policy SSOT.
-
-    ``skill_payload`` needs selectors and is omitted; individual resolution is
-    fail-soft so one unavailable root cannot hide the rest.
-    """
+def profile_readable_root_paths(ctx: Any, *, operation: Operation = "read") -> list[tuple[str, pathlib.Path]]:
+    """Project the ``(label, path)`` pairs this profile may ``operation`` from the
+    policy SSOT. ``skill_payload`` needs selectors and is omitted; individual
+    resolution is fail-soft so one unavailable root cannot hide the rest."""
     out: list[tuple[str, pathlib.Path]] = []
     try:
         policy = _POLICY.get(_effective_policy_profile(active_tool_profile(ctx)), {})
     except Exception:
         return out
     for root, ops in sorted(policy.items()):
-        if "read" not in ops or root == "skill_payload":
+        if operation not in ops or root == "skill_payload":
             continue
         try:
             out.append((root, pathlib.Path(resource_root_path(ctx, root)).resolve(strict=False)))
         except Exception:
             continue
-    return out
+    if operation in _READ_OPS:
+        from ouroboros.tool_access_reads import inherited_read_roots
+        out.extend((label, base) for label, base in inherited_read_roots(ctx)
+                   if operation in policy.get(label, set()))
+    return list(dict.fromkeys(out))
 
 
 def shell_cwd_block_message(ctx: Any, cwd: str = "", *, operation: Operation = "shell", error: Exception | None = None) -> str:
@@ -410,11 +482,13 @@ def light_cognitive_or_root_redirect(tool_name: str, args: dict[str, Any]) -> st
             parts = pathlib.PurePosixPath(str(path_text or "").replace("\\", "/")).parts
             if len(parts) >= 2 and parts[0].lower() == "memory":
                 area = parts[1].lower()
-                if area.startswith("identity") or area.startswith("scratchpad") or area == "knowledge":
+                if (area.startswith("identity") or area.startswith("scratchpad") or area == "knowledge"
+                        or area == "world.md"):
                     return (
                         "⚠️ COGNITIVE_TOOL_REQUIRED: cognitive memory is not written via "
                         f"{tool_name!r}. Use the dedicated first-class tools (always available in "
-                        "light mode): update_identity for memory/identity.md, update_scratchpad for "
+                        "light mode): update_identity for memory/identity.md, update_world for "
+                        "memory/WORLD.md, update_scratchpad for "
                         "memory/scratchpad.md, knowledge_write for memory/knowledge/<topic>.md. They "
                         "apply the correct structure (journaling, timestamped blocks, index "
                         "maintenance). Read the current state before writing (Bible P12)."
@@ -434,8 +508,8 @@ def light_cognitive_or_root_redirect(tool_name: str, args: dict[str, Any]) -> st
                 continue
             return (
                 "⚠️ ROOT_REQUIRED_USER_FILES: an absolute home path "
-                f"({path_text!r}) was given but root defaulted to 'active_workspace'. "
-                "Pass root='user_files' to write under the owner's home, e.g. "
+                f"({path_text!r}) is outside root='active_workspace'. "
+                "Pass root='user_files' (or omit root) to write under the owner's home, e.g. "
                 "write_file(root='user_files', path='Desktop/file.html', content=...)."
             )
     return None
@@ -525,6 +599,8 @@ def _select_process_target(
         [(root / safe_relpath(text)).resolve(strict=False)
          for _label, root, _source, _name in candidate_records]
     )
+    if aliased := docker_process_alias_target(ctx, operation, text, candidate_records, physical_candidates[0]):
+        return _finish(*aliased)  # Identity mounts and unmapped host paths use normal roots below.
     for target in physical_candidates:
         for record in candidate_records:
             label, base, _source, _name = record
@@ -581,8 +657,10 @@ def _resolve_target_in_selected_base(
     base_path: pathlib.Path,
     path: str,
     operation: Operation,
+    alias: bool = True,
 ) -> pathlib.Path:
-    """Resolve one target inside an already-selected physical base."""
+    """Resolve one target inside an already-selected physical base; ``alias=False`` returns the address a READ
+    asked for, without the re-anchors that open a capture or source where its writer kept it."""
 
     if root == "user_files":
         return resolve_user_file_path(
@@ -591,7 +669,9 @@ def _resolve_target_in_selected_base(
             allow_protected_descendants=operation in {"list", "search"},
             operation=operation,
         )
-    resolved_base = pathlib.Path(base_path).resolve(strict=False)
+    from ouroboros.work_domain import settle  # a work root keeps its spelling: the container resolves it
+
+    resolved_base = settle(base_path)
     path_text = str(path or ".")
     if root == "runtime_data":
         path_text = normalize_runtime_data_path(resolved_base, path_text)
@@ -610,54 +690,58 @@ def _resolve_target_in_selected_base(
         # A foreign Windows absolute spelling has no native anchor on POSIX;
         # joining it to cwd would invent a different physical file.
         if candidate.anchor:
-            candidate = (resolved_base / candidate).resolve(strict=False)
+            candidate = settle(resolved_base / candidate)
             try:
                 path_text = candidate.relative_to(resolved_base).as_posix()
             except ValueError:
-                if root == "artifact_store" and operation in _READ_OPS:
-                    canonical = task_artifact_dir_path(
-                        canonical_data_root(ctx), task_id_for_artifacts(ctx), create=False,
-                    )
-                    try:
-                        relative = candidate.relative_to(canonical).as_posix()
-                    except ValueError:
-                        relative = ""
-                    if relative:
-                        anchored = delegated_capture_read_target(
-                            canonical_data_root(ctx), task_id_for_artifacts(ctx), relative, resolved_base,
-                        )
-                        if anchored is not None:
-                            return anchored
-                    else:
-                        # An ORPHAN's capture lives under ANOTHER task's prefix, so
-                        # `relative` is empty and control would fall straight to the
-                        # raise below. Read-only, prefix-confined, no new root: the
-                        # orphan disposition rule is the only authority consulted.
+                if operation in _READ_OPS:
+                    # READ aliases preserve inherited physical roots and orphan custody.
+                    from ouroboros.tool_access_reads import inherited_read_base
+                    if (lineage_read_base(ctx, root, candidate) is not None
+                            or inherited_read_base(ctx, root, candidate) is not None):
+                        return _lineage_source_target(ctx, root, candidate) if alias else candidate
+                    if root == "artifact_store":
                         from ouroboros.delegate_shared import orphan_capture_read_target
 
                         anchored = orphan_capture_read_target(ctx, candidate)
                         if anchored is not None:
-                            return anchored
+                            return anchored if alias else candidate
         if is_absolute_path_text(path_text):
             raise ValueError(
-                f"absolute path {path!r} is outside selected root={root} ({resolved_base}); "
-                "use a path inside that root or select the corresponding resource "
-                "(root='user_files' for authorized external files)"
+                f"absolute path {path!r} is outside selected root={root} ({resolved_base}). "
+                f"Roots your profile can {operation}: "
+                f"{operation_roots(active_tool_profile(ctx), operation)}."
             )
-    if root == "artifact_store" and operation in _READ_OPS:
-        # C1 delegated captures (CR1-2): written on the CANONICAL drive, read from
+    if root == "artifact_store" and operation in _READ_OPS and alias:
+        # Delegated captures and activity: written on the CANONICAL drive, read from
         # a CHILD drive_root — re-anchor (see `delegated_capture_read_target`).
         anchored = delegated_capture_read_target(
             canonical_data_root(ctx), task_id_for_artifacts(ctx),
             safe_relpath(path_text), resolved_base)
+        if anchored is not None and anchored.exists():
+            return anchored
+        if anchored is not None or not (resolved_base / safe_relpath(path_text)).exists():
+            from ouroboros.source_retention import retained_actor_source_read_target
+
+            retained = retained_actor_source_read_target(
+                canonical_data_root(ctx), task_id_for_artifacts(ctx), safe_relpath(path_text))
+            if retained is not None:
+                return retained
         if anchored is not None:
             return anchored
-    resolved = (resolved_base / safe_relpath(path_text)).resolve(strict=False)
+    resolved = settle(resolved_base / safe_relpath(path_text))
     try:
         resolved.relative_to(resolved_base)
     except ValueError as exc:
         raise ValueError(f"path escapes {resolved_base}") from exc
-    return resolved
+    return _lineage_source_target(ctx, root, resolved) if alias and root == "runtime_data" and operation in _READ_OPS else resolved
+
+
+def _settle(path: Any) -> pathlib.Path:
+    """A binding's path: resolved as before, except a work path, which keeps its spelling (``work_domain.settle``)."""
+    from ouroboros.work_domain import settle
+
+    return settle(path)
 
 
 def build_resolved_resource_binding(
@@ -685,8 +769,8 @@ def build_resolved_resource_binding(
             profile=active_tool_profile(ctx),
             root=selected_root,
             operation=operation,
-            base_path=pathlib.Path(base).resolve(strict=False),
-            target_path=pathlib.Path(target).resolve(strict=False),
+            base_path=_settle(base),
+            target_path=_settle(target),
             source=source,
             skill_name=selected_name,
             state_drive_root=canonical_data_root(ctx),
@@ -710,7 +794,7 @@ def build_resolved_resource_binding(
         normalized == "runtime_data" and operation in {"write", "edit"}
     ) or (
         normalized == "active_workspace" and operation == "edit" and not workspace_active
-        and project_room_lens_dir(ctx) is None
+        and project_room_lens_dir(ctx) is None and folderless_scratch_dir(ctx) is None
     )
     if legacy_data_form:
         from ouroboros.contracts.skill_payload_policy import (
@@ -802,30 +886,38 @@ def build_resolved_resource_binding(
         path=path,
         operation=operation,
     )
-    # An absolute user_files target may intentionally land in the configured
-    # Deliverables container outside the user's ordinary home.  The binding's
-    # physical base must follow that selected container; otherwise an exact
-    # Presence path-prefix check treats a valid deliverable as outside the
-    # binding merely because the default user_files home is a sibling.
+    asked = (_resolve_target_in_selected_base(ctx, root=normalized, base_path=base, path=path, operation=operation,
+                                              alias=False)
+             if operation in _READ_OPS and normalized in {"artifact_store", "runtime_data"} else target)
+    # The physical base follows the containing root; retain the selected default
+    # separately so policy sees the same exact file even across inherited roots.
     logical_base_path = None
+    container = None
     if normalized == "user_files":
         try:
             deliverables = _deliverables_root()
             if path_is_relative_to(target, deliverables) or _path_is_relative_to_casefold(target, deliverables):
-                logical_base_path = pathlib.Path(base).resolve(strict=False)
-                base = deliverables
+                container = deliverables
         except (OSError, TypeError, ValueError, RuntimeError):
             pass
+    elif operation in _READ_OPS and not path_is_relative_to(target, base):
+        from ouroboros.tool_access_reads import inherited_read_base
+        container = (lineage_read_base(ctx, normalized, target)
+                     or inherited_read_base(ctx, normalized, target))
+    if container is not None:
+        logical_base_path = _settle(base)
+        base = container
     return ResolvedResourceBinding(
         profile=profile,
         root=normalized,
         operation=operation,
-        base_path=pathlib.Path(base).resolve(strict=False),
+        base_path=_settle(base),
         target_path=target,
         source=source,
         skill_name=selected_name,
         state_drive_root=canonical_data_root(ctx),
         logical_base_path=logical_base_path,
+        requested_path=asked if asked != target else None,
     )
 def resolve_resource_path(
     ctx: Any,

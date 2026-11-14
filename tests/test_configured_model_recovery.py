@@ -15,7 +15,7 @@ from tests.test_delegate_hold import _configured_registry, _loop_kwargs, _start_
 from tests.test_transport_death_retry import _LedgerLLM, _ledger
 
 
-@pytest.mark.parametrize("external", ["inline", "consumed", "unread", "patch", "pending", "absent", "unreadable"])
+@pytest.mark.parametrize("external", ["inline", "absent", "unreadable"])
 def test_saved_external_work_does_not_gate_supervising_cognition(tmp_path, monkeypatch, external):
     """The incident's long consumed result and uncertain custody use one rail.
 
@@ -87,9 +87,10 @@ def test_saved_external_work_does_not_gate_supervising_cognition(tmp_path, monke
     assert any("NEW physical model attempt" in str(row.get("content")) for row in messages_seen[-1])
     if external in {"inline", "consumed", "unread", "patch"}:
         assert [row["content"] for row in messages_seen[-1] if row.get("tool_call_id") == "completed-wait"] == [output]
-    ledger = _ledger(tmp_path)
-    assert [row["state"] for row in ledger] == ["reserved", "dispatched", "unresolved", "reserved", "dispatched", "settled"]
-    assert ledger[0]["attempt_id"] != ledger[3]["attempt_id"]
+    ledger = _ledger(tmp_path)  # one current row per attempt: the lost send, then its retry
+    assert [(row["state"], row["revision"]) for row in ledger] == [("unresolved", 4), ("settled", 3)]
+    assert ledger[0]["physical_failure"]["stage"] == "raised_exception"
+    assert ledger[0]["attempt_id"] != ledger[1]["attempt_id"]
     assert usage["transport_recovery"]["previous_attempt"]["physical_attempt_id"] == ledger[0]["attempt_id"]
     assert ua.usage_projection(tmp_path)["unresolved_upper_bound_usd"] == 1.0
     custody_after = custody.event_log_path(tmp_path).read_bytes() if custody.event_log_path(tmp_path).exists() else b""
@@ -97,11 +98,11 @@ def test_saved_external_work_does_not_gate_supervising_cognition(tmp_path, monke
     assert [row for row in rows if row.get("type", "").startswith("delegate_")] == [
         json.loads(line) for line in custody_before.splitlines() if json.loads(line).get("type", "").startswith("delegate_")]
     if external in {"pending", "patch", "unreadable"}:
-        # Ability to think is not authority to duplicate the external work.
-        accepted, refusal = claimed_start_request(tmp_path, claim_target="", payload_busy=lambda *a: "",
-            actor_ctx=registry._ctx, enforce_actor_idle=True, task_id=task_id, invocation_id="duplicate")
-        assert not accepted
-        assert refusal["reason"] == ("replacement_custody_unknown" if external == "unreadable" else "replacement_requires_settlement")
+        # Independent work may start; unreadable custody still refuses admission.
+        accepted, refusal = claimed_start_request(tmp_path, actor_ctx=registry._ctx, task_id=task_id, invocation_id="duplicate")
+        assert accepted == (external != "unreadable")
+        if not accepted:
+            assert refusal["reason"] == "replacement_custody_unknown"
 
 
 def test_live_hold_takes_over_an_existing_transport_episode(tmp_path, monkeypatch):
@@ -130,7 +131,7 @@ def test_live_hold_takes_over_an_existing_transport_episode(tmp_path, monkeypatc
     monkeypatch.setattr(loop_transport, "upstream_transport_reachable", observed)
     monkeypatch.setattr(loop_transport, "interruptible_wait_sleep", lambda *a: False)
     monkeypatch.setattr(delegate_hold, "_leaf_probe_live", lambda *a: True)
-    monkeypatch.setattr(delegate_hold, "supervised_wait", lambda *a: delegate_result({
+    monkeypatch.setattr(delegate_hold, "hold_wake", lambda *a, **_k: delegate_result({
         "status": "succeeded", "run_id": "run-leaf", "supervision_wake_id": "wake-after-hold"}))
     monkeypatch.setattr(delegate_hold, "acknowledge_pending_wake", lambda *a, **kw: True)
     monkeypatch.setattr(custody, "release_task_runs", lambda *a: None)

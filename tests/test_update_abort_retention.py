@@ -1,0 +1,773 @@
+"""An update that stays in this process must return its stopped saved work.
+
+Exercise the update doors, retention, queue persistence, pool startup/readiness,
+and assignment themselves. Only process creation/termination and thread scheduling
+are simulated; a fake process emits the same readiness observation as its OS peer.
+"""
+from __future__ import annotations
+
+import json
+import queue as stdqueue
+import time
+from types import SimpleNamespace
+
+import pytest
+
+from ouroboros import working_checkpoint as wc
+from ouroboros.task_results import load_task_result, write_task_result
+from supervisor.events_budget import budget_hold_fact
+from tests._budget_pause_exact_helpers import _install_queue, _loop_ctx
+from tests.test_restart_retention import _pool_events, _queued
+from tests.test_restart_saved_work import _working_run
+
+
+
+class _Process:
+    def __init__(self, pid):
+        self.pid, self.alive, self.exitcode = pid, True, None
+
+    def is_alive(self):
+        return self.alive
+
+    def join(self, timeout=None):
+        pass
+
+    def terminate(self):
+        self.alive, self.exitcode = False, -15
+
+
+class _InlineThread:
+    def __init__(self, target, args=(), **kwargs):
+        self.target, self.args = target, args
+
+    def start(self):
+        self.target(*self.args)
+
+
+def _system(tmp_path, monkeypatch):
+    from ouroboros.gateway import control
+    from supervisor import git_ops, worker_pool_lifecycle, worker_process
+    from ouroboros.utils import append_jsonl
+
+    admission = worker_pool_lifecycle.admissible_starts  # this system grows its project slot on demand
+    queue, state, workers = _install_queue(tmp_path, monkeypatch)
+    monkeypatch.setattr(worker_pool_lifecycle, "admissible_starts", admission)
+    _pool_events(workers, monkeypatch)
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(git_ops, "REPO_DIR", repo)
+    monkeypatch.setattr(git_ops, "_git_dir", lambda: repo / ".git")
+    monkeypatch.setattr(workers, "REPO_DIR", repo)
+    monkeypatch.setattr(workers, "_WORKER_POOL_DISABLED_REASON", "")
+    monkeypatch.setattr(workers, "_repo_writer_gate_reason", "")
+    monkeypatch.setenv("OUROBOROS_MAX_WORKERS", str(1))
+    monkeypatch.setattr(workers, "mp", SimpleNamespace(get_context=lambda _method: SimpleNamespace(Queue=stdqueue.Queue)))
+    # The real spawn_workers caches that fake context in the global ``workers._CTX``, which the
+    # ``mp`` patch does not restore: the next test in this process that starts the real event bus
+    # would build its manager on it (no ``Process``) and every task_done publish would fail.
+    monkeypatch.setattr(workers, "_CTX", None)
+    monkeypatch.setattr(workers, "threading", SimpleNamespace(Thread=_InlineThread))
+    # A demand-grown project slot's readiness watcher is the lifecycle module's thread; inline too,
+    # so the slot the first assignment pass grows is ready for the second.
+    monkeypatch.setattr(worker_pool_lifecycle, "threading", SimpleNamespace(Thread=_InlineThread))
+    processes, launches = {}, []
+
+    def process(wid, commands):
+        proc = _Process(700000 + len(processes))
+        processes[proc.pid] = proc
+        return proc
+
+    def spawn(_ctx, wid, commands, _events, _repo, root):
+        proc = process(wid, commands)
+        if wid != 0:  # slot 0 is the conversation lane's spare (spawn_workers): not a project launch
+            launches.append(commands)
+        append_jsonl(root / "logs" / "events.jsonl", {
+            "type": "worker_ready", "worker_id": wid, "pid": proc.pid,
+            "process_birth": f"birth-{proc.pid}", "git_sha": "test-sha"})
+        return proc
+
+    # The parent measures the same birth its fake child reports (process ledger).
+    from ouroboros import process_custody
+    for name in ("process_start_time", "process_start_time_legacy"):
+        measured = getattr(process_custody, name)
+        monkeypatch.setattr(process_custody, name, lambda pid, measured=measured:
+                            f"birth-{pid}" if pid in processes else measured(pid))
+
+    for module in (workers, worker_pool_lifecycle):
+        monkeypatch.setattr(module, "kill_worker_tree", lambda pid, **_kw: processes[pid].terminate())
+    monkeypatch.setattr(worker_process, "spawn_worker_process", spawn)
+    # The pool boots with the conversation lane's spare only; project workers grow on demand
+    # (``reconcile_worker_capacity`` at the end of an assignment pass, sized by the residual
+    # demand). These tests call ``assign_tasks`` as the tick's dispatch: two passes, the first
+    # grows the project slot a pending row asks for, the second dispatches to it once ready.
+    assign = workers.assign_tasks
+
+    def assign_after_capacity():
+        grown = len(launches)
+        result = assign()
+        if len(launches) > grown:  # the pass grew a project slot for a pending row: dispatch to it once ready
+            result = assign()
+        return result
+
+    monkeypatch.setattr(workers, "assign_tasks", assign_after_capacity)
+
+    def saved(task_id="saved"):
+        admitted = queue.enqueue_task(_queued(task_id, root_task_id=task_id))
+        assert not admitted.get("_admission_blocked"), admitted
+        queue.PENDING.remove(admitted)
+        _working_run(tmp_path, workers, task_id)
+        workers.RUNNING[task_id]["task"] = dict(admitted)
+        wid = workers.RUNNING[task_id]["worker_id"]
+        commands = stdqueue.Queue()
+        workers.WORKERS[wid] = workers.Worker(wid, process(wid, commands), commands, busy_task_id=task_id)
+
+    return SimpleNamespace(queue=queue, state=state, workers=workers, control=control,
+                           processes=processes, launches=launches, saved=saved)
+
+
+def _assisted(system, monkeypatch):
+    """An already-restored checkout still owns its real durable rollback marker."""
+    from supervisor import git_ops, update_merge
+
+    tx = {"task_id": "resolver", "phase": "assisted_resolution", "pre_update_sha": "a" * 40,
+          "pre_update_branch": "ouroboros", "base_sha": "b" * 40, "target_sha": "c" * 40,
+          "stash_restored": True}
+    metadata = {"managed_update": {"authority_fingerprint": update_merge.assisted_authority_fingerprint(tx)}}
+    update_merge.write_update_tx(tx)
+    system.workers.close_repo_writer_admission(update_merge.assisted_writer_gate_reason(tx))
+
+    def git_capture(command, **_kw):
+        if command == ["git", "rev-parse", "--verify", "HEAD"]:
+            return 0, tx["pre_update_sha"], ""
+        if command == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+            return 0, tx["pre_update_branch"], ""
+        raise AssertionError(f"unexpected Git call: {command!r}")
+
+    monkeypatch.setattr(git_ops, "git_capture", git_capture)
+    return update_merge, tx, metadata
+
+
+def _assert_returned(system, root, task_id="saved"):
+    assert task_id not in system.workers.RUNNING, "aborted update stranded retained RUNNING"
+    [task] = [row for row in system.workers.PENDING if row["id"] == task_id]
+    assert task["_attempt"] == 2
+    assert budget_hold_fact(task) is None
+    ctx, _ = _loop_ctx(root, task_id, attempt=2)
+    frozen = wc.load_recovery(ctx, task["_working_recovery"])
+    assert frozen["working"]["boundary"] == "pre_effect"
+    return task
+
+
+def _scope_saved(system, root):
+    from ouroboros.projects_registry import create_project, project_scope_admission
+
+    folder = root / "prepared-project"
+    folder.mkdir()
+    create_project(root, "project", working_dir=str(folder))
+    task = system.workers.RUNNING["saved"]["task"]
+    task.update(project_id="project", workspace_root=str(folder),
+                _project_admission=project_scope_admission(root, project_id="project"))
+    write_task_result(root, "saved", "running", project_id="project", workspace_root=str(folder))
+    return task
+
+
+def test_gateway_abort_returns_saved_work_and_assigns_once(tmp_path, monkeypatch):
+    system = _system(tmp_path, monkeypatch)
+    system.saved()
+    assert system.control._quiesce_repo_writers("auto_merge") == []
+    assert system.workers.RUNNING["saved"]["retained_for_boot"] is True
+
+    system.control._respawn_workers_after_failed_update()
+
+    task = _assert_returned(system, tmp_path)
+    handoff = dict(task["_working_recovery"])
+    system.control._respawn_workers_after_failed_update()
+    assert _assert_returned(system, tmp_path)["_working_recovery"] == handoff
+    assert not system.launches  # the respawn gives the lane's spare; the project worker grows at assignment
+    system.workers.assign_tasks()
+    [commands] = system.launches
+    sent = commands.get_nowait()
+    assert sent["id"] == "saved" and sent["_attempt"] == 2
+    assert sent["_working_recovery"] == handoff
+    system.control._respawn_workers_after_failed_update()
+    system.workers.assign_tasks()
+    assert commands.empty() and not system.workers.PENDING
+    assert system.workers.RUNNING["saved"]["attempt"] == 2
+
+
+@pytest.mark.parametrize("door", ["watchdog", "resolver_release", "early_rollback"])
+def test_assisted_abort_doors_return_saved_work(tmp_path, monkeypatch, door):
+    system = _system(tmp_path, monkeypatch)
+    system.saved()
+    assert system.control._quiesce_repo_writers("assisted") == []
+    update_merge, _tx, metadata = _assisted(system, monkeypatch)
+    # The assisted resolver's startup is allowed during an ACTIVE update. It
+    # must not consume the saved tasks or release their project leases early.
+    assert system.workers.ensure_worker_pool_started(n=1, allow_disabled_restart=True)
+    system.workers.assign_tasks()
+    assert system.workers.RUNNING["saved"]["retained_for_boot"] is True
+    assert not system.workers.PENDING and all(commands.empty() for commands in system.launches)
+    if door == "watchdog":
+        result = update_merge.abort_orphaned_assisted_tx("resolver", metadata)
+        assert result["rolled_back"], result
+    elif door == "resolver_release":
+        # Worker rollback already cleared the tx; its done event releases the
+        # exact assisted latch owned by its immutable metadata.
+        assert update_merge.clear_update_tx()
+        assert update_merge.release_assisted_writer_gate_after_task(metadata)
+    else:
+        ok, message = update_merge.rollback_managed_update("early_abort")
+        assert ok, message
+    assert not system.workers.repo_writer_admission_closed()
+    _assert_returned(system, tmp_path)
+    system.workers.assign_tasks()
+    sent = system.launches[0].get_nowait()
+    assert sent["id"] == "saved" and sent["_attempt"] == 2
+    assert system.launches[0].empty()
+
+
+def test_unknown_old_process_is_not_recovered_by_the_retention_marker(tmp_path, monkeypatch):
+    from supervisor import worker_pool_lifecycle
+
+    system = _system(tmp_path, monkeypatch)
+    system.saved()
+    for module in (system.workers, worker_pool_lifecycle):
+        monkeypatch.setattr(module, "kill_worker_tree", lambda _pid, **_kw: None)
+    blockers = system.control._quiesce_repo_writers("auto_merge")
+    assert blockers and any(item.startswith("worker:") for item in blockers)
+    assert system.workers.RUNNING["saved"]["retained_for_boot"] is True
+    system.control._respawn_workers_after_failed_update()
+    assert not system.launches and not system.workers.PENDING
+    assert system.workers.repo_writer_admission_closed()
+
+
+@pytest.mark.parametrize("source_failure", ["corrupt", "missing", "unreadable"])
+def test_failed_source_conversion_releases_lease_but_remains_explicitly_held(tmp_path, monkeypatch, source_failure):
+    from ouroboros.project_lease import running_project_ids
+
+    system = _system(tmp_path, monkeypatch)
+    system.saved()
+    system.workers.RUNNING["saved"]["task"]["project_id"] = "saved-project"
+    assert running_project_ids(system.workers.RUNNING.values()) == {"saved-project"}
+    assert system.control._quiesce_repo_writers("auto_merge") == []
+    # Source bytes disappear after successful retention; no clean retry may
+    # replace the interrupted thought, even though its OS process is dead.
+    checkpoint = wc.checkpoint_path(tmp_path, "saved", 1)
+    if source_failure == "missing":
+        checkpoint.unlink()
+    elif source_failure == "corrupt":
+        checkpoint.write_text("corrupt")
+    else:
+        original_read = type(checkpoint).read_bytes
+        def read_bytes(path):
+            if path == checkpoint:
+                raise OSError("injected checkpoint disk failure")
+            return original_read(path)
+        monkeypatch.setattr(type(checkpoint), "read_bytes", read_bytes)
+    system.control._respawn_workers_after_failed_update()
+    assert "saved" not in system.workers.RUNNING
+    [held] = system.workers.PENDING
+    assert held["id"] == "saved" and budget_hold_fact(held)
+    from supervisor.budget_resume import newer_continuation_basis, resume_hold_requires_fence
+    assert newer_continuation_basis(held, tmp_path)
+    assert not resume_hold_requires_fence(held, tmp_path)
+    assert budget_hold_fact(held)["reason"] == "saved_work_hold"  # admission still owns the failed source
+    assert not running_project_ids(system.workers.RUNNING.values())
+    system.workers.assign_tasks()
+    assert all(commands.empty() for commands in system.launches)
+    before = json.dumps(held, sort_keys=True)
+    system.control._respawn_workers_after_failed_update()
+    assert json.dumps(system.workers.PENDING[0], sort_keys=True) == before
+
+
+@pytest.mark.parametrize("when", ["before_quiesce", "after_quiesce"])
+def test_owner_stop_is_never_returned_by_abort(tmp_path, monkeypatch, when):
+    from ouroboros.cancel_intents import request_cancel
+
+    system = _system(tmp_path, monkeypatch)
+    system.saved()
+    if when == "before_quiesce":
+        request_cancel(tmp_path, "saved", reason="owner stop", source="owner", requested_by="owner")
+    assert system.control._quiesce_repo_writers("auto_merge") == []
+    if when == "after_quiesce":
+        request_cancel(tmp_path, "saved", reason="owner stop", source="owner", requested_by="owner")
+    system.control._respawn_workers_after_failed_update()
+    system.workers.assign_tasks()
+    assert all(commands.empty() for commands in system.launches)
+    assert "saved" not in system.workers.RUNNING
+    assert load_task_result(tmp_path, "saved")["status"] in {"cancelled", "interrupted"}
+
+
+@pytest.mark.parametrize("when", ["before_quiesce", "after_quiesce"])
+def test_owner_pause_is_never_released_by_abort(tmp_path, monkeypatch, when):
+    from supervisor.owner_pause_control import request_owner_pause
+
+    system = _system(tmp_path, monkeypatch)
+    system.saved()
+    if when == "before_quiesce":
+        assert request_owner_pause("saved", request_id="pause-press")["ok"]
+    assert system.control._quiesce_repo_writers("auto_merge") == []
+    if when == "after_quiesce":
+        assert request_owner_pause("saved", request_id="pause-press")["ok"]
+    system.control._respawn_workers_after_failed_update()
+    system.workers.assign_tasks()
+    assert all(commands.empty() for commands in system.launches)
+    assert "saved" not in system.workers.RUNNING
+    assert any(row["id"] == "saved" for row in system.workers.PENDING)
+
+
+def test_failed_snapshot_never_opens_writers_and_retry_buys_one_successor(tmp_path, monkeypatch):
+    system = _system(tmp_path, monkeypatch)
+    system.saved()
+    assert system.control._quiesce_repo_writers("auto_merge") == []
+    original_write = system.queue.atomic_write_text
+
+    def fail_write(path, *args, **kwargs):
+        if path == system.queue.QUEUE_SNAPSHOT_PATH:
+            raise OSError("injected snapshot disk failure")
+        return original_write(path, *args, **kwargs)
+
+    monkeypatch.setattr(system.queue, "atomic_write_text", fail_write)
+    system.control._respawn_workers_after_failed_update()
+    assert system.workers.repo_writer_admission_closed()
+    assert not system.launches
+    monkeypatch.setattr(system.queue, "atomic_write_text", original_write)
+    system.control._respawn_workers_after_failed_update()
+    task = _assert_returned(system, tmp_path)
+    assert task["_attempt"] == 2 and not system.launches  # one successor; its project worker grows at assignment
+    assert any(worker.lane == "conversation" for worker in system.workers.WORKERS.values())  # the pool restarted
+
+
+@pytest.mark.parametrize("replacement", ["different_attempt", "different_object", "foreign_id"])
+def test_abort_only_returns_the_captured_attempt(tmp_path, monkeypatch, replacement):
+    system = _system(tmp_path, monkeypatch)
+    system.saved()
+    assert system.control._quiesce_repo_writers("auto_merge") == []
+    meta = system.workers.RUNNING["saved"]
+    if replacement == "different_attempt":
+        meta["attempt"] = meta["task"]["_attempt"] = 9
+    elif replacement == "different_object":
+        system.workers.RUNNING["saved"] = {**meta, "task": dict(meta["task"])}
+    else:
+        system.saved("foreign")
+        system.workers.RUNNING["foreign"]["retained_for_boot"] = True
+    system.control._respawn_workers_after_failed_update()
+    assert system.workers.repo_writer_admission_closed()
+    if replacement == "foreign_id":
+        assert "foreign" in system.workers.RUNNING
+        assert not any(row["id"] == "foreign" for row in system.workers.PENDING)
+    else:
+        assert "saved" in system.workers.RUNNING
+        assert not system.workers.PENDING
+
+
+def test_active_assisted_transaction_refuses_gateway_abort_recovery(tmp_path, monkeypatch):
+    system = _system(tmp_path, monkeypatch)
+    system.saved()
+    assert system.control._quiesce_repo_writers("assisted") == []
+    update_merge, _tx, metadata = _assisted(system, monkeypatch)
+    system.control._respawn_workers_after_failed_update()
+    assert system.workers.RUNNING["saved"]["retained_for_boot"] is True
+    assert not system.workers.PENDING and not system.launches
+    assert system.workers.repo_writer_admission_closed()
+    assert not update_merge.release_assisted_writer_gate_after_task(metadata)
+    assert update_merge.abort_orphaned_assisted_tx("resolver", {})["acted"] is False
+
+
+def test_the_same_update_can_still_return_saved_work_on_real_restart_restore(tmp_path, monkeypatch):
+    from ouroboros import delegate_recovery
+    from tests.test_restart_saved_work import _ack
+
+    system = _system(tmp_path, monkeypatch)
+    system.saved()
+    assert system.control._quiesce_repo_writers("auto_merge") == []
+    active = json.loads(delegate_recovery._active_restart_transaction_path(tmp_path).read_text())
+    _ack(tmp_path, active["transaction_id"])
+    system.workers.RUNNING.clear()
+    assert system.queue.restore_pending_from_snapshot() == 1
+    _assert_returned(system, tmp_path)
+    assert system.workers.ensure_worker_pool_started(allow_disabled_restart=True)
+    # Process-local admission disappears on an actual application restart.
+    system.workers.open_repo_writer_admission()
+    system.workers.assign_tasks()
+    assert system.launches[0].get_nowait()["id"] == "saved"
+
+
+def test_assisted_failed_snapshot_can_be_retried_by_the_real_release_hook(tmp_path, monkeypatch):
+    system = _system(tmp_path, monkeypatch)
+    system.saved()
+    assert system.control._quiesce_repo_writers("assisted") == []
+    update_merge, _tx, metadata = _assisted(system, monkeypatch)
+    original_write = system.queue.atomic_write_text
+
+    def fail_write(path, *args, **kwargs):
+        if path == system.queue.QUEUE_SNAPSHOT_PATH:
+            raise OSError("injected snapshot disk failure")
+        return original_write(path, *args, **kwargs)
+
+    monkeypatch.setattr(system.queue, "atomic_write_text", fail_write)
+    update_merge.abort_orphaned_assisted_tx("resolver", metadata)
+    assert not update_merge.active_update_tx(), "rollback cleared its real durable marker"
+    assert system.workers.repo_writer_admission_closed()
+    system.workers.assign_tasks()
+    assert all(commands.empty() for commands in system.launches)
+    monkeypatch.setattr(system.queue, "atomic_write_text", original_write)
+    assert update_merge.release_assisted_writer_gate_after_task(metadata)
+    _assert_returned(system, tmp_path)
+    system.control._respawn_workers_after_failed_update()
+    system.workers.assign_tasks()
+    assert len(system.launches) == 1
+    assert system.launches[0].get_nowait()["id"] == "saved"
+    assert system.launches[0].empty()
+
+
+@pytest.mark.parametrize("observation", ["alive", "unreadable"])
+def test_abort_rechecks_the_captured_process_after_successful_quiescence(tmp_path, monkeypatch, observation):
+    system = _system(tmp_path, monkeypatch)
+    system.saved()
+    [old] = system.processes.values()
+    assert system.control._quiesce_repo_writers("auto_merge") == []
+    if observation == "alive":
+        old.alive = True
+    else:
+        def unreadable():
+            raise OSError("process observation unavailable")
+        monkeypatch.setattr(old, "is_alive", unreadable)
+    system.control._respawn_workers_after_failed_update()
+    assert system.workers.repo_writer_admission_closed()
+    assert not system.launches and not system.workers.PENDING
+    assert system.workers.RUNNING["saved"]["retained_for_boot"] is True
+
+
+def test_active_assisted_pool_dispatches_only_its_authorized_resolver(tmp_path, monkeypatch):
+    """The update's own readiness proof starts the pool inside its marker window, where no project slot may grow
+    later: the resolver's project slot is started and proven there, and the authorized resolver runs on it."""
+    system = _system(tmp_path, monkeypatch)
+    system.saved()
+    assert system.control._quiesce_repo_writers("assisted") == []
+    update_merge, _tx, metadata = _assisted(system, monkeypatch)
+    for task_id in ("ordinary", "resolver"):
+        write_task_result(tmp_path, task_id, "scheduled", chat_id=0)
+        system.workers.PENDING.append(_queued(task_id, metadata=metadata if task_id == "resolver" else {}))
+    assert update_merge.ensure_assisted_resolver_ready("test-sha", timeout_sec=5)
+    system.workers.assign_tasks()
+    assert system.launches[0].get_nowait()["id"] == "resolver"
+    assert set(system.workers.RUNNING) == {"saved", "resolver"}
+    assert system.workers.RUNNING["saved"]["retained_for_boot"] is True
+    assert [row["id"] for row in system.workers.PENDING] == ["ordinary"]
+
+
+def test_the_resolver_readiness_proof_never_counts_the_conversation_lanes_spare(tmp_path, monkeypatch):
+    """The lane's spare imports the same clean tree and reports ready, but it carries conversation, never the
+    resolver: with the resolver's project child gone, the proof fails and the update unwinds before any marker."""
+    from supervisor import worker_process
+
+    system = _system(tmp_path, monkeypatch)
+    update_merge, _tx, _metadata = _assisted(system, monkeypatch)
+    spawn = worker_process.spawn_worker_process
+
+    def project_child_dies(ctx, wid, commands, events, repo, root):
+        proc = spawn(ctx, wid, commands, events, repo, root)
+        if wid != 0:
+            proc.terminate()
+        return proc
+
+    monkeypatch.setattr(worker_process, "spawn_worker_process", project_child_dies)
+    assert update_merge.ensure_assisted_resolver_ready("test-sha", timeout_sec=0.5) is False
+
+
+def test_a_boot_that_resumes_an_assisted_update_starts_its_resolver_a_project_slot(tmp_path, monkeypatch):
+    """Boot recovery enqueues the authorized resolver after the boot's whole-pool start, inside the marker window
+    the durable transaction keeps, where no project slot may grow: that start owes the resolver its project slot
+    (base's one boot worker was it), and the resolver runs on it."""
+    system = _system(tmp_path, monkeypatch)
+    update_merge, tx, _metadata = _assisted(system, monkeypatch)
+    tx.update(resolver_submitted_id="", owner_chat_id=0)
+    update_merge.write_update_tx(tx)
+    system.workers.spawn_workers()  # the boot's start (server.py), before boot recovery
+    assert update_merge.enqueue_assisted_resolution_task(tx) == "resolver"
+    system.workers.assign_tasks()
+    assert system.launches[0].get_nowait()["id"] == "resolver"
+    assert set(system.workers.RUNNING) == {"resolver"}
+
+
+def _spare_still_importing(system, monkeypatch, tmp_path):
+    """The start returns while the lane's spare (slot 0) still imports and its project slot is already ready: the
+    spare's ``worker_ready`` row comes later (``late``), and the readiness watcher, its own thread, has not run."""
+    from ouroboros.utils import append_jsonl
+    from supervisor import worker_process
+
+    spawn, late, watchers = worker_process.spawn_worker_process, [], []
+
+    def spawn_spare_slower(ctx, wid, commands, events, repo, root):
+        proc = spawn(ctx, wid, commands, events, repo, root if wid else tmp_path / "unreported")
+        if not wid:
+            late.append(lambda: append_jsonl(root / "logs" / "events.jsonl", {
+                "type": "worker_ready", "worker_id": 0, "pid": proc.pid,
+                "process_birth": f"birth-{proc.pid}", "git_sha": "test-sha"}))
+        return proc
+
+    monkeypatch.setattr(worker_process, "spawn_worker_process", spawn_spare_slower)
+    monkeypatch.setattr(system.workers, "threading", SimpleNamespace(
+        Thread=lambda target, args=(), **_kw: SimpleNamespace(start=lambda: watchers.append((target, args)))))
+    return late, watchers
+
+
+@pytest.mark.parametrize("spare", ["reports_later", "stops", "keeps_importing"])
+def test_the_resolver_proof_lands_no_marker_while_the_spare_still_imports(tmp_path, monkeypatch, spare):
+    """Reverse readiness order: the project slot is ready before the lane's spare. The proof returns only once the
+    spare reported its own row at this tree or stopped; a spare still importing fails it before any marker."""
+    from supervisor import update_candidate
+
+    system = _system(tmp_path, monkeypatch)
+    update_merge, _tx, _metadata = _assisted(system, monkeypatch)
+    late, _watchers = _spare_still_importing(system, monkeypatch, tmp_path)
+    clock, waited = [0.0], []
+
+    def sleep(seconds):
+        clock[0] += seconds
+        waited.append(seconds)
+        if spare == "reports_later" and late:
+            late.pop()()
+        elif spare == "stops":
+            system.workers.WORKERS[0].proc.terminate()
+
+    monkeypatch.setattr(update_candidate, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep))
+    assert update_merge.ensure_assisted_resolver_ready("test-sha", timeout_sec=0.5) is (spare != "keeps_importing")
+    assert waited  # the project slot's row alone never proved this start: only the spare's own row or stop does
+
+
+@pytest.mark.parametrize("child", ["spare_reports_soon", "spare_never_reports",
+                                   "project_dies"])
+def test_boot_recovery_resumes_once_every_child_imported_or_unwinds_for_the_owner(tmp_path, monkeypatch, child):
+    """The boot's start returns while the lane's spare still imports. Recovery re-materializes the conflicts only
+    once the readiness seam opened every child it started, the resolver's project slot among them, and waits as
+    long as that seam keeps a booting child (a slow one too). Otherwise it stops the children and rolls the update
+    back, and its note tells the owner what happened and what to do: never a stalled resolution."""
+    from supervisor import git_ops, update_candidate, worker_chat_lane
+    from supervisor.worker_pool_lifecycle import worker_ready
+
+    system = _system(tmp_path, monkeypatch)
+    update_merge, tx, _metadata = _assisted(system, monkeypatch)
+    tx.update(resolver_submitted_id="", owner_chat_id=0)
+    update_merge.write_update_tx(tx)
+    late, watchers = _spare_still_importing(system, monkeypatch, tmp_path)
+    system.workers.spawn_workers()  # the boot's start (server.py), before boot recovery
+    if child == "project_dies":
+        system.workers.WORKERS[1].proc.terminate()
+    clock, materialized = [0.0], []
+    reports_at = {"spare_reports_soon": 0.0, "spare_reports_after_90s": 120.0, "project_dies": 0.0}.get(child)
+
+    def sleep(_seconds):
+        clock[0] += 5.0
+        if reports_at is not None and clock[0] >= reports_at and late:
+            late.pop()()
+            for target, args in watchers:  # the readiness seam opens each slot on its own row
+                target(*args)
+
+    capture = git_ops.git_capture
+    monkeypatch.setattr(git_ops, "git_capture", lambda command, **kw: (
+        (0, "", "") if command == ["git", "status", "--porcelain"] else capture(command, **kw)))
+    monkeypatch.setattr(update_candidate, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep))
+    monkeypatch.setattr(update_merge, "_assisted_head_state", lambda _tx: "in_progress")
+    monkeypatch.setattr(update_merge, "_merge_head_sha", lambda: "")
+    monkeypatch.setattr(worker_chat_lane, "preload_owner_control_path", lambda: None)
+    monkeypatch.setattr(git_ops, "rescue_into_tx", lambda *_args, **_kw: {})
+    monkeypatch.setattr(update_merge, "materialize_assisted_merge_live", lambda *_args: materialized.append(
+        sorted(worker_ready(slot) for slot in system.workers.WORKERS.values())) or (True, "", "m0"))
+    result = update_merge._recover_assisted_on_boot(tx, True)
+    if child.startswith("spare_reports"):
+        assert materialized == [[True, True]] and result["resumed"] is True
+        return
+    assert not materialized and result["rolled_back"] is True and clock[0] >= 300.0  # the seam's ceiling
+    assert not any(proc.alive for proc in system.processes.values())  # stopped before the tree changed
+    assert "could not resume after the restart" in result["stash_note"]
+    assert "Apply the update again to retry" in result["stash_note"]
+    held = update_merge.active_update_tx()  # the boot rollback's custody for its restart, never a resolution
+    assert held["phase"] == "marker_cleanup_retry" and held["gate_blocked_reason"] == "rollback_restart_pending"
+
+
+def test_abort_preserves_an_existing_queue_hold_and_releases_the_project_lease(tmp_path, monkeypatch):
+    from ouroboros.project_lease import running_project_ids
+    from supervisor.events_budget import HOLD_OWNER_RESTART, hold_budget_row
+
+    system = _system(tmp_path, monkeypatch)
+    system.saved()
+    _scope_saved(system, tmp_path)
+    held = _queued("held", project_id="project")
+    write_task_result(tmp_path, "held", "scheduled", chat_id=0)
+    hold_budget_row(held, reason=HOLD_OWNER_RESTART, result_root=tmp_path)
+    hold = dict(budget_hold_fact(held))
+    system.workers.PENDING.append(held)
+    assert system.control._quiesce_repo_writers("auto_merge") == []
+    assert running_project_ids(system.workers.RUNNING.values()) == {"project"}
+    system.control._respawn_workers_after_failed_update()
+    assert not running_project_ids(system.workers.RUNNING.values())
+    assert budget_hold_fact(held) == hold
+    system.workers.assign_tasks()
+    assert system.launches[0].get_nowait()["id"] == "saved"
+    assert running_project_ids(system.workers.RUNNING.values()) == {"project"}
+    assert system.workers.PENDING == [held] and budget_hold_fact(held) == hold
+
+
+def test_a_deadline_elapsed_during_update_never_dispatches_a_successor(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+
+    system = _system(tmp_path, monkeypatch)
+    system.saved()
+    now = time.time()
+    system.workers.RUNNING["saved"]["task"]["deadline_at"] = datetime.fromtimestamp(now + 10, timezone.utc).isoformat()
+    assert system.control._quiesce_repo_writers("auto_merge") == []
+    monkeypatch.setattr(time, "time", lambda: now + 20)
+    system.control._respawn_workers_after_failed_update()
+    system.workers.assign_tasks()
+    assert all(commands.empty() for commands in system.launches)
+    assert "saved" not in system.workers.RUNNING
+
+
+def test_unreadable_money_after_abort_still_refuses_assignment(tmp_path, monkeypatch):
+    from ouroboros import usage_store
+
+    system = _system(tmp_path, monkeypatch)
+    system.saved()
+    assert system.control._quiesce_repo_writers("auto_merge") == []
+    ledger = tmp_path / usage_store.STORE_REL
+    # Enqueue created the SQLite authority. Fail only its OS connection leaf;
+    # no changed budget, journal replacement, gate stub or cache manipulation.
+    previous = ledger.read_bytes()
+    original_connect = usage_store.sqlite3.connect
+    def denied(database, *args, **kwargs):
+        if str(database).split("?")[0] == ledger.as_uri():
+            raise usage_store.sqlite3.OperationalError("injected money-store open failure")
+        return original_connect(database, *args, **kwargs)
+    from ouroboros import store
+
+    store.close_connections()  # a thread keeps its open handle; the next money read opens the file again
+    monkeypatch.setattr(usage_store.sqlite3, "connect", denied)
+    system.control._respawn_workers_after_failed_update()
+    _assert_returned(system, tmp_path)
+    system.workers.assign_tasks()
+    assert all(commands.empty() for commands in system.launches)
+    assert "saved" not in system.workers.RUNNING
+    assert ledger.read_bytes() == previous
+
+
+@pytest.mark.parametrize("failure", ["missing_basis", "missing_folder", "unreadable_registry"])
+def test_saved_project_recovery_revalidates_its_original_identity(tmp_path, monkeypatch, failure):
+    from ouroboros import projects_registry
+
+    system = _system(tmp_path, monkeypatch)
+    system.saved()
+    task = _scope_saved(system, tmp_path)
+    assert system.control._quiesce_repo_writers("auto_merge") == []
+    if failure == "missing_basis":
+        task.pop("_project_admission")
+    elif failure == "missing_folder":
+        (tmp_path / "prepared-project").rmdir()
+    else:
+        projects_registry._registry_path(tmp_path).write_text("{unreadable")
+    system.control._respawn_workers_after_failed_update()
+    system.workers.assign_tasks()
+    assert all(commands.empty() for commands in system.launches)
+    assert "saved" not in system.workers.RUNNING
+    [held] = [row for row in system.workers.PENDING if row["id"] == "saved"]
+    assert held.get("_project_admission_restore_hold") or held.get("_terminalization_retry")
+
+
+def test_a_child_never_outlives_a_parent_whose_saved_source_became_unreadable(tmp_path, monkeypatch):
+    system = _system(tmp_path, monkeypatch)
+    system.saved("parent")
+    system.saved("child")
+    child = system.workers.RUNNING["child"]["task"]
+    child.update(parent_task_id="parent", root_task_id="parent", delegation_role="subagent")
+    write_task_result(tmp_path, "child", "running", parent_task_id="parent", root_task_id="parent")
+    assert system.control._quiesce_repo_writers("auto_merge") == []
+    wc.checkpoint_path(tmp_path, "parent", 1).write_text("broken")
+    system.control._respawn_workers_after_failed_update()
+    system.workers.assign_tasks()
+    assert not system.workers.RUNNING
+    rows = {task["id"]: task for task in system.workers.PENDING}
+    assert set(rows) == {"parent", "child"}
+    assert all(budget_hold_fact(row) for row in rows.values())
+    assert all(commands.empty() for commands in system.launches)
+
+
+def test_abort_handoff_reaches_the_real_loop_without_replaying_unknown_effects(tmp_path, monkeypatch):
+    from ouroboros import delegate_custody, loop
+    from ouroboros.external_runs import observe_task_runs
+    from tests.test_context_fit_v664 import _plan
+    from tests.test_loop_transport_wait import _loop_kwargs
+    from tests.test_working_checkpoint import _registry
+
+    system = _system(tmp_path, monkeypatch)
+    system.saved()
+    original = _registry(tmp_path, monkeypatch, "saved", 1)
+    messages = _plan().messages_for("max") + [
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "done", "type": "function", "function": {"name": "save", "arguments": "{}"}},
+            {"id": "inflight", "type": "function", "function": {"name": "save", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "done", "content": "Saved object 42"}]
+    limit = SimpleNamespace(tools=original, messages=messages, llm_trace={"tool_calls": []},
+                            accumulated_usage={"cost": 3.0}, round_idx=7, tool_schemas=[],
+                            owner_msg_seen=set(), budget_tail="tool")
+    assert wc.save_round(limit, "pre_effect")
+    # A durable POST intent with no returned run id remains unknown. The loop
+    # reads actual custody; neither this test nor recovery marks it terminated.
+    assert delegate_custody.record_start_requested(
+        tmp_path, task_id="saved", root_task_id="saved", invocation_id="unknown-invocation",
+        route="test-route", request={"prompt": "external effect"})
+    before = observe_task_runs(tmp_path, "saved", request_stop=False)
+    assert before["runs"][0]["state"] == "stop_unknown"
+    assert system.control._quiesce_repo_writers("auto_merge") == []
+    system.control._respawn_workers_after_failed_update()
+    system.workers.assign_tasks()
+    sent = system.launches[0].get_nowait()
+    assert sent["_working_recovery"]["cause"] == "update_aborted"
+    assert observe_task_runs(tmp_path, "saved", request_stop=False)["runs"] == before["runs"]
+    registry = _registry(tmp_path, monkeypatch, "saved", 2)
+    registry._ctx.working_recovery = sent["_working_recovery"]
+    seen, effects, custody_at_model = [], [], []
+    monkeypatch.setattr("ouroboros.llm.LLMClient.chat", lambda *_a, **_k: pytest.fail("no paid provider call"))
+    monkeypatch.setattr(registry, "execute_result", lambda *_a, **_k: effects.append(True) or pytest.fail("no tool replay"))
+
+    class ModelReached(BaseException):
+        """Stop this test at the restored prompt, before ordinary task finalization."""
+
+    def provider_reply(call, _disposition, **_kwargs):
+        seen.extend(call.messages)
+        custody_at_model.extend(observe_task_runs(tmp_path, "saved", request_stop=False)["runs"])
+        raise ModelReached()
+
+    monkeypatch.setattr(loop, "_dispatch_round_model", provider_reply)
+    # Regression pin for issue #1772: the loop's exit release runs with a pending
+    # invocation on the task. It must attach only and replay nothing — the old
+    # ensure default downloaded, spawned and admitted a real engine under the
+    # worker-shared config.DATA_DIR, outliving the whole battery.
+    from ouroboros import claudexor_daemon, delegate_custody_reconcile
+
+    monkeypatch.setattr(claudexor_daemon, "ensure_owned_gateway",
+                        lambda **_k: pytest.fail("the loop exit admitted work through ensure_owned_gateway"))
+    replayed = []
+    monkeypatch.setattr(delegate_custody_reconcile, "_recover_pending_invocation",
+                        lambda *a, **k: replayed.append(a) or pytest.fail("the loop exit replayed a pending invocation"))
+    kwargs = _loop_kwargs(tmp_path, registry, [])
+    kwargs["task_id"] = "saved"
+    with pytest.raises(ModelReached):
+        loop.run_llm_loop(**kwargs)
+    assert not replayed
+    assert not claudexor_daemon.owned_daemon_provisioned(), "no engine home appeared at the shared root"
+    assert not (tmp_path / "claudexor").exists()
+    assert observe_task_runs(tmp_path, "saved", request_stop=False)["runs"] == before["runs"], \
+        "the unknown POST stays pending for the admitted sweep"
+    assert not effects
+    assert registry._ctx._accumulated_usage["cost"] == 3.0
+    assert any(row.get("content") == "Saved object 42" for row in seen)
+    unknown = next(row["content"] for row in seen if row.get("tool_call_id") == "inflight")
+    assert "UNKNOWN" in unknown and "NOT re-executed" in unknown
+    notice = next(str(row.get("content")) for row in seen
+                  if "continued from its working checkpoint" in str(row.get("content")))
+    assert "unknown-invocation: stop_unknown" in notice
+    assert "update was aborted before restart" in notice
+    assert custody_at_model == before["runs"]
+    assert not wc.checkpoint_path(tmp_path, "saved", 1).exists()

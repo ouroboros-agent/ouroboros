@@ -13,7 +13,8 @@ polling (``wait_until`` over ``ArtifactOracle`` readers), keyless throughout:
   fanout receipt in the parent's forked drive, quiescence (the child's terminal
   ``task_done`` precedes the parent's; the parent's terminal is clean, not the
   degraded ``children_unabsorbed`` path), the child result reaching the parent
-  verbatim (marker in the parent's durable ``wait_tasks`` tool row), the
+  verbatim (marker in the parent's next model request: its ``wait_tasks`` with no named
+  sleep_mode sleeps and owes the result to that request), the
   authoritative disposition row on the task-tree ledger, and the root cost rollup
   keys on the parent's terminal event.
 * S7 — CANCELLATION (single): a keepalive task is cancelled over the same HTTP
@@ -266,10 +267,9 @@ _CHILD_SHA_RE = re.compile(r"child_result_sha256[\"'=:\s]+([0-9a-f]{64})")
 
 
 def _s6_slot_binder(body: dict) -> str:
-    """Slot = wire model id × tool-bearing shape: the parent loop runs on
-    ``mock-model`` with tools, the supervisor's semantic-duplicate probe runs on the
-    light slot (same slug) WITHOUT tools, and the child runs on ``mock-child`` — so
-    every fixture ordinal is deterministic even while parent and child overlap."""
+    """Bind parent ``mock-model`` and child ``mock-child`` by model and request shape.
+    Tool-less calls keep a separate slot, so an unexpected auxiliary model request
+    is a fixture miss even while parent and child overlap."""
     return f"{body.get('model') or ''}|{'tools' if body.get('tools') else 'plain'}"
 
 
@@ -285,8 +285,8 @@ def _s6_dispose_step(body: dict) -> dict:
     text = body_text(body)
     ids = _CHILD_ID_RE.findall(text)
     shas = _CHILD_SHA_RE.findall(text)
-    if not ids or not shas:
-        return {"final": "E2E_SCRIPT_ERROR: missing child id or exact result hash for the disposition"}
+    if not ids or not shas or S6_CHILD_MARKER not in text:
+        return {"final": "E2E_SCRIPT_ERROR: missing child id, exact result hash or full result for the disposition"}
     return {"tool": "tree_note", "arguments": {
         "kind": "decision",
         "text": "Absorbed the scout child's listing into the final answer.",
@@ -301,8 +301,6 @@ S6_FIXTURE = {
         "objective": "List the repository root and report the entries you saw.",
         "expected_output": "A short list of repository root entries.",
     }},
-    # The supervisor's admission duplicate-probe (light slot, tool-less).
-    ("root", "mock-model|plain", 1): {"final": "No existing task duplicates this request."},
     ("root", "mock-model|tools", 2): _s6_wait_step,
     ("root", "mock-model|tools", 3): _s6_dispose_step,
     ("root", "mock-model|tools", 4): {"final": f"{S6_PARENT_MARKER}: child absorbed; done."},
@@ -312,7 +310,6 @@ S6_FIXTURE = {
 
 
 @pytest.mark.integration
-@pytest.mark.serial
 def test_s6_subagent_tree_lineage_quiescence_and_child_result_handoff(
         e2e_clone, tmp_path_factory):
     require_lane(LANE_MOCK)
@@ -368,14 +365,16 @@ def test_s6_subagent_tree_lineage_quiescence_and_child_result_handoff(
             fanouts = parent_drive.events("swarm_fanout")
             assert fanouts and fanouts[0].get("task_ids") == [child_id], fanouts
 
-            # The child's result reached the parent VERBATIM: the durable wait_tasks
-            # tool row in the parent drive carries the child marker.
+            # A wait_tasks with no named sleep_mode SLEEPS (owner Q2 = A): its call returns the sleep's receipt (or
+            # the result at once when the child had already settled), and the child's whole result reaches the
+            # parent's next model request either way, owed to it at the wake.
             wait_rows = [row for row in parent_drive.tools_rows()
                          if "wait_tasks" in str(row.get("tool") or row.get("name") or "")]
             assert wait_rows, "wait_tasks call missing from the parent tools log"
-            wait_blob = json.dumps(wait_rows)
-            assert child_id in wait_blob, wait_rows
-            assert S6_CHILD_MARKER in wait_blob, "child result text never reached the parent"
+            parent_text = "\n".join(body_text(body) for _kind, body in model.calls
+                                    if _s6_slot_binder(body) == "mock-model|tools")
+            assert child_id in parent_text, wait_rows
+            assert S6_CHILD_MARKER in parent_text, "child result text never reached the parent"
 
             # Quiescence: the child's terminal task_done precedes the parent's.
             def terminal_done_ids():
@@ -421,7 +420,6 @@ def test_s6_subagent_tree_lineage_quiescence_and_child_result_handoff(
 
 
 @pytest.mark.integration
-@pytest.mark.serial
 @pytest.mark.skipif(sys.platform != "linux", reason="/proc no-orphans scan is Linux-only")
 def test_s7_cancel_live_task_typed_terminal_owed_answer_and_no_strays(
         e2e_clone, tmp_path_factory):
@@ -484,7 +482,6 @@ S8_SCHEDULE_STEP = {"tool": "schedule_subagent", "arguments": {
 
 
 @pytest.mark.integration
-@pytest.mark.serial
 @pytest.mark.skipif(sys.platform != "linux", reason="/proc no-orphans scan is Linux-only")
 def test_s8_cascade_cancel_tears_down_subtree_without_orphans(
         e2e_clone, tmp_path_factory):
@@ -610,7 +607,6 @@ def _managed_install(root: pathlib.Path):
 
 
 @pytest.mark.integration
-@pytest.mark.serial
 def test_s9_managed_ff_update_applies_with_dirty_stash_and_honest_boot_finalize(
         tmp_path_factory, monkeypatch):
     require_lane(LANE_MOCK)
@@ -708,6 +704,7 @@ data = pathlib.Path(sys.argv[2])
 from supervisor import git_ops
 git_ops.init(clone, data, "")
 from supervisor.update_merge import (
+    UPDATE_TX_SCHEMA_VERSION,
     finalize_managed_update_on_boot,
     read_update_tx_strict,
     rollback_managed_update,
@@ -765,7 +762,7 @@ report["null_stamp"] = {
 
 # Phase B: FUTURE-schema marker -> typed newer-version refusal from BOTH the
 # rollback and the boot finalizer; the raw marker stays byte-identical.
-marker.write_text(json.dumps({"_schema_version": 2, "pre_update_sha": head0,
+marker.write_text(json.dumps({"_schema_version": UPDATE_TX_SCHEMA_VERSION + 1, "pre_update_sha": head0,
                               "phase": "pending_boot_smoke"}), encoding="utf-8")
 future_before = marker.read_bytes()
 ok, msg = rollback_managed_update("e2e_w2_future_probe")
@@ -822,7 +819,6 @@ print(json.dumps(report))
 
 
 @pytest.mark.integration
-@pytest.mark.serial
 def test_s10_rollback_typed_refusals_and_byte_for_byte_restore(tmp_path_factory):
     require_lane(LANE_MOCK)
     root = tmp_path_factory.mktemp("s10")

@@ -2,6 +2,29 @@
 
 This leaf owns request-shape adaptation, never provider/model/API choice. Learnable
 actions stay pending until exact success; task-local degraded-rung repairs never persist.
+Learned actions apply only to the current step's fields and dialect; inapplicable
+actions are skipped whole, preserving other learned actions and reactive recovery.
+
+Actions are ``set_value``, ``drop_field`` and ``replace_dialect``, at most
+``_MAX_COMPOSED_ACTIONS`` per call. A positive enum bound to the effort field needs no
+scalar echo: the retry value is the highest comparable lower tier, or the known minimum
+when every advertised tier is higher. Negative quotes prescribe nothing, a value
+rejection never drops its carrier, and the mandatory-reasoning floor and the
+unsupported-carrier drop remain. Only a normalized success bound to the exact settled
+physical capture teaches ``state/request_wire_compatibility.json`` (entries expire after
+14 days); unsettled attempts never teach. A returned response discloses
+``usage.request_wire`` after ``validate_wire_attempt_identity`` even when monetary
+settlement failed; ``request_wire_history`` is a bounded, ordered disclosure, while
+``usage_store.py`` / ``state/usage.sqlite`` owns money.
+
+The host's optional temperature hint (``LLMClient`` ``default_temperature``) keeps its origin
+on the route, never on the wire. After prior repairs decline, a complete allowed-temperature
+statement (``request_wire_temperature``) excluding the hint, or an unreadable statement beside
+recognized field-refusal evidence without recognized value evidence, may withdraw it.
+A withdrawal stays for the call's later rungs; its exact-success record replays only on hints,
+so an explicit value, equal or not, stays the caller's choice and a value refusal of it stays the
+provider's error. A send with no bound candidate withdraws the same way and teaches nothing.
+Omitting the field proves acceptance of the omission, not any numeric default.
 """
 
 from __future__ import annotations
@@ -11,13 +34,17 @@ import contextvars
 import copy
 import functools
 import inspect
+import re
 from dataclasses import dataclass, replace
 from typing import Any, Dict, Iterator, Mapping, Optional, Sequence, Tuple
 
 from ouroboros.openai_chat_custom import CustomToolProjectionError
 from ouroboros.request_wire_contract import (
+    CACHE_HINT_FIELDS,
+    HINT_WITHDRAWAL_REASON,
     NESTED_REASONING_FIELD,
     OPTIONAL_REQUEST_FIELDS,
+    OPTIONAL_SAMPLING_FIELDS,
     PendingWireAction,
     RequestWireProfile,
     apply_effort_action,
@@ -35,9 +62,11 @@ from ouroboros.request_wire_receipts import (
     WireCandidateSpec,
     bind_wire_candidate,
     bind_wire_compatibility_receipt,
+    cache_hint_holders,
     observe_wire_semantics,
 )
 from ouroboros.request_wire_resolution import resolve_wire_actions
+from ouroboros.request_wire_temperature import allowed_temperatures, structured_temperatures
 from ouroboros.usage_accounting import PhysicalAttemptCapture
 
 _MAX_COMPOSED_ACTIONS = 8
@@ -62,11 +91,17 @@ _CAPABILITY_REJECTION_MARKERS = (
     "no endpoints found",
 )
 _MANDATORY_MARKERS = ("mandatory", "cannot be disabled", "must be enabled")
+# A capability refusal whose object is the model's thinking refuses the standard effort field
+# without naming it (Ollama maps reasoning_effort to think: '"<model>" does not support thinking').
+_THINKING_REFUSAL = re.compile(r"\b(?:does not|doesn't|do not|don't)\s+support\s+(?:thinking|reasoning)\b"
+                               r"|\b(?:thinking|reasoning)\s+(?:is\s+)?(?:not\s+supported|unsupported)\b")
 _NON_COMPATIBILITY_4XX = frozenset({401, 402, 403, 408, 409, 425, 429})
+_NON_COMPATIBILITY_CODE_TOKENS = ("quota", "rate_limit", "billing", "auth", "context", "policy")
 _NON_REASONING_OPTIONAL_FIELDS = tuple(
     field for field in OPTIONAL_REQUEST_FIELDS
     if field not in {"reasoning_effort", "output_config", "thinking"}
 )
+_HINT_WITHDRAWAL = {"kind": "drop_field", "fields": ["temperature"], "reason_code": HINT_WITHDRAWAL_REASON}
 
 
 @dataclass(frozen=True)
@@ -84,6 +119,8 @@ class _WireCallState:
     settled: Optional[Tuple[_RegisteredCandidate, PhysicalAttemptCapture]] = None
     metadata_drop_fields: Tuple[str, ...] = ()
     disclosures: Tuple[Mapping[str, Any], ...] = ()
+    physical_payload: Optional[Mapping[str, Any]] = None
+    logical_payload_sha256: str = ""
 
 
 _WIRE_CALL_STATE: contextvars.ContextVar[_WireCallState] = contextvars.ContextVar(
@@ -128,9 +165,25 @@ def _safe_target(target: Mapping[str, Any]) -> Dict[str, Any]:
             "provider", "resolved_model", "usage_model", "base_url", "contract_headers",
             "processing_preference",
             "processing_native_origin",
+            "requested_reasoning_effort",
+            "temperature_hint",
         )
         if target.get(key) is not None
     }
+
+
+def resolve_temperature_hint(target: Dict[str, Any], temperature: Any, hint: Any) -> Any:
+    """The temperature this route sends, marking a host hint's origin: an explicit value wins and
+    carries no mark, and raw model operations defer to provider defaults."""
+    if temperature is not None or hint is None or target.get("provider") == "claudexor":
+        return temperature
+    target["temperature_hint"] = hint
+    return hint
+
+
+def _carries_temperature_hint(target: Mapping[str, Any], payload: Mapping[str, Any]) -> bool:
+    hint = target.get("temperature_hint")
+    return hint is not None and payload.get("temperature") == hint
 
 
 def register_wire_candidate(
@@ -138,6 +191,7 @@ def register_wire_candidate(
     *,
     source_payload: Mapping[str, Any],
     target: Mapping[str, Any],
+    logical_payload: Optional[Mapping[str, Any]] = None,
 ) -> None:
     """Register a factory-bound candidate (the Phase-2A custom seam)."""
     if not isinstance(candidate, WireCandidateManifest):
@@ -159,6 +213,9 @@ def register_wire_candidate(
         registered=(*kept, registered),
         current=registered,
         settled=None,
+        physical_payload=candidate.physical_payload(),
+        logical_payload_sha256=physical_candidate_sha256(
+            logical_payload if logical_payload is not None else source_payload),
     ))
 
 
@@ -208,9 +265,10 @@ def _candidate_spec_for_action(
         effort = apply_effort_action(effort, action)
     elif action.get("kind") == "drop_field":
         fields = set(action.get("fields") or ())
+        # A withdrawal composes after an earlier dropped carrier, whose payload states no effort.
         if fields & {
             "reasoning_effort", "thinking", "output_config", NESTED_REASONING_FIELD,
-        }:
+        } or (not effort and action.get("reason_code") == HINT_WITHDRAWAL_REASON):
             effort = "provider_default"
     return WireCandidateSpec(
         dialect,
@@ -326,6 +384,8 @@ def _first_durable_action(
             and action.get("from") != infer_tool_dialect(payload)
         ):
             continue
+        if action.get("reason_code") == HINT_WITHDRAWAL_REASON and not _carries_temperature_hint(target, payload):
+            continue
         identity = (profile.fingerprint, wire_action_identity(action))
         if identity not in seen:
             return WireAppliedAction(profile, action, "durable")
@@ -433,7 +493,6 @@ def _prepare_durable_candidate(
         return None
     source = copy.deepcopy(dict(payload))
     applications: list[WireAppliedAction] = []
-    seen = set()
 
     metadata_fields = tuple(
         field for field in _WIRE_CALL_STATE.get().metadata_drop_fields
@@ -446,7 +505,6 @@ def _prepare_durable_candidate(
             "reason_code": "provider_metadata_constraint",
         })
         applications.append(WireAppliedAction.pending(metadata))
-        seen.add((metadata.profile.fingerprint, wire_action_identity(metadata.action)))
 
     for _ in range(_MAX_COMPOSED_ACTIONS - len(applications)):
         candidate = _bind_with_applications(
@@ -457,16 +515,10 @@ def _prepare_durable_candidate(
             applications=applications,
         )
         current = candidate.physical_payload()
-        addition = None
-        for profile, action in _records_for_step(
-            target, current, api_surface, requested,
-        ):
-            identity = (profile.fingerprint, wire_action_identity(action))
-            if identity in seen:
-                continue
-            addition = WireAppliedAction(profile, action, "durable")
-            seen.add(identity)
-            break
+        addition = _first_durable_action(
+            target, current, api_surface, requested, applications,
+            allow_dialect=True,
+        )
         if addition is None:
             return candidate
         applications.append(addition)
@@ -479,11 +531,45 @@ def _prepare_durable_candidate(
     )
 
 
+def refresh_wire_clock(payload: Dict[str, Any], *, api_surface: str) -> Dict[str, Any]:
+    """Refresh a NEW physical candidate without losing its canonical recovery source.
+
+    Recognition precedes stamping: a projected custom-tool payload is not the
+    source from which its effort/dialect actions were derived. Rebuild through
+    the original factory and prove that only this call's clock changed. Same
+    invocation rejoins never enter this preparation seam.
+    """
+    from ouroboros.send_clock import split_clock_note, stamp_clock_note
+
+    digest = physical_candidate_sha256(payload)
+    registered = next((item for item in reversed(_WIRE_CALL_STATE.get().registered)
+                       if item.candidate.candidate_sha256 == digest), None)
+    if registered is None:
+        return stamp_clock_note(payload, blocks=api_surface == "messages")
+    source = stamp_clock_note(dict(registered.source_payload), blocks=api_surface == "messages")
+    if source == registered.source_payload:
+        return payload  # no Main policy, or the clock sample is byte-identical
+    prior = registered.candidate
+    refreshed = bind_wire_candidate(
+        target=registered.target, api_surface=prior.source_profile.api_surface,
+        source_payload=source, candidate_spec=prior.candidate_spec,
+        requested_effort=prior.requested_effort, ladder_ordinal=prior.ladder_ordinal,
+        applied_actions=prior.applied_actions,
+    )
+    physical = refreshed.physical_payload()
+    note, clock_free = split_clock_note(physical)
+    if note != split_clock_note(source)[0] or clock_free != split_clock_note(payload)[1]:
+        raise ValueError("clock refresh changed unrelated physical input")
+    register_wire_candidate(refreshed, source_payload=source, target=registered.target)
+    return physical
+
+
 def prepare_wire_payload_for_send(
     target: Mapping[str, Any],
     payload: Mapping[str, Any],
     *,
     api_surface: str,
+    logical_payload: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Apply frozen evidence and bind the exact payload immediately before send."""
     detached = copy.deepcopy(dict(payload))
@@ -495,7 +581,8 @@ def prepare_wire_payload_for_send(
         None,
     )
     if existing is not None:
-        _WIRE_CALL_STATE.set(replace(state, current=existing, settled=None))
+        register_wire_candidate(existing.candidate, source_payload=existing.source_payload,
+                                target=existing.target, logical_payload=logical_payload)
         return existing.candidate.physical_payload()
     try:
         candidate = (
@@ -527,9 +614,15 @@ def prepare_wire_payload_for_send(
         for field in state.metadata_drop_fields:
             if field in _NON_REASONING_OPTIONAL_FIELDS:
                 detached.pop(field, None)
-        _WIRE_CALL_STATE.set(replace(state, current=None, settled=None))
+        # Carrierless sends still own exact physical/logical identity. They can
+        # repair optional fields without learning a durable wire contract.
+        _WIRE_CALL_STATE.set(replace(state, current=None, settled=None,
+            physical_payload=copy.deepcopy(detached),
+            logical_payload_sha256=physical_candidate_sha256(
+                logical_payload if logical_payload is not None else payload)))
         return detached
-    register_wire_candidate(candidate, source_payload=detached, target=target)
+    register_wire_candidate(candidate, source_payload=detached, target=target,
+                            logical_payload=logical_payload)
     return candidate.physical_payload()
 
 
@@ -538,11 +631,23 @@ def current_wire_candidate() -> Optional[WireCandidateManifest]:
     return current.candidate if current is not None else None
 
 
+def registered_source_payload(payload: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
+    """The canonical source a registered wire form was bound from; None for any other payload.
+
+    A re-finalized wire form (a clock refresh, a same-invocation rejoin) is measured on
+    that source so the reply allowance stays a function of the source bytes and the
+    unchanged form keeps its registration (a projected dialect carries extra bytes).
+    """
+    digest = physical_candidate_sha256(payload)
+    return next((item.source_payload for item in reversed(_WIRE_CALL_STATE.get().registered)
+                 if item.candidate.candidate_sha256 == digest), None)
+
+
 def note_wire_send_succeeded(capture: Any) -> None:
     state = _WIRE_CALL_STATE.get()
     if state.current is None or not isinstance(capture, PhysicalAttemptCapture):
         return
-    if capture.candidate_raw_sha256 != state.current.candidate.candidate_sha256:
+    if getattr(capture, "candidate_raw_sha256", None) != state.current.candidate.candidate_sha256:
         return
     _WIRE_CALL_STATE.set(replace(state, settled=(state.current, capture)))
 
@@ -552,27 +657,112 @@ def note_wire_send_failed() -> None:
     _WIRE_CALL_STATE.set(replace(state, settled=None))
 
 
-def _status_and_message_from_exception(exc: BaseException) -> Tuple[Optional[int], str]:
-    response = getattr(exc, "response", None)
-    status = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
-    try:
-        status = int(status) if status is not None else None
-    except (TypeError, ValueError, OverflowError):
-        status = None
-    body = getattr(exc, "body", None)
+@dataclass(frozen=True)
+class _WireRejection:
+    status: Optional[int]
+    message: str
+    param: str = ""
+    code: str = ""
+    allowed: Tuple[str, ...] = ()
+    value_constraint: bool = False
+    rejected_value: Optional[str] = None
+    # OpenRouter's typed routing receipt (``error.metadata.failed_routing_step``): the step
+    # of the endpoint funnel that emptied the roster, e.g. "filter by parameters".
+    routing_step: str = ""
+    # None: a structured list not readable whole, which can state no exclusion (``structured_temperatures``).
+    allowed_numbers: Optional[Tuple[float, ...]] = ()
+    # The refusal's own parameter; ``param`` may instead be read from an enum clause's prose.
+    typed_param: str = ""
+
+
+def _wire_rejection(error: Any) -> _WireRejection:
+    """Keep structured constraints through exception/body projection alike.
+
+    Only the positive enum clause supplies alternatives: quotes elsewhere can
+    name rejected values. A structured parameter, when present, owns binding.
+    """
+    response = getattr(error, "response", None)
+    body = error if isinstance(error, Mapping) else getattr(error, "body", None)
     if body is None and response is not None and callable(getattr(response, "json", None)):
         try:
             body = response.json()
         except Exception:
             body = None
-    error = body.get("error") if isinstance(body, Mapping) else None
-    message = (
-        str(error.get("message") or "")
-        if isinstance(error, Mapping)
-        else str((body or {}).get("message") or "") if isinstance(body, Mapping)
-        else ""
-    )
-    return status, message or str(exc or "")
+    body = body if isinstance(body, Mapping) else {}
+    node = body.get("error") if isinstance(body.get("error"), Mapping) else body
+    status = (getattr(error, "status_code", None) or getattr(response, "status_code", None)
+              or body.get("status_code", body.get("status", body.get("code"))))
+    try:
+        status = int(status) if status is not None else None
+    except (TypeError, ValueError, OverflowError):
+        status = None
+    message = str(node.get("message") or str(error or "")).lower()
+    param = typed_param = str(node.get("param") or getattr(error, "param", "") or "").lower()
+    code = str(node.get("code") or getattr(error, "code", "") or "").lower()
+    metadata = node.get("metadata") if isinstance(node.get("metadata"), Mapping) else {}
+    routing_step = str(metadata.get("failed_routing_step") or "").strip().lower()
+    values = node.get("allowed_values", node.get("enum"))
+    allowed = tuple(v.lower() for v in values if isinstance(v, str)) if isinstance(values, list) else ()
+    value_constraint = isinstance(values, list)
+    numbers = structured_temperatures(values)
+    if not allowed:
+        clause = re.search(r"\b(?:expected|must be) one of\b|\b(?:allowed|supported) values\b|\binput should be\b", message)
+        if clause:
+            value_constraint = True
+            prefix = message[:clause.start()]
+            if re.search(r"\b(?:not|no|unsupported|disallowed)\s*$", prefix):
+                return _WireRejection(status, message, param, code, value_constraint=True,
+                                      allowed_numbers=numbers, typed_param=typed_param)
+            if not param:
+                fields = {*OPTIONAL_REQUEST_FIELDS, "reasoning", "reasoning.effort",
+                          "extra_body.reasoning", "extra_body.reasoning.effort", "output_config.effort", "thinking.type"}
+                named = re.findall(r"[a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)*", prefix)
+                param = next((name for name in reversed(named) if name in fields), "")
+            # Consume the list itself, stopping at prose (including a negative
+            # clause). This accepts quoted JSON/Zod enums and plain comma lists.
+            # Each item is quoted like its predecessor: a quoted 'or' stays a
+            # value and bare prose ends the list. A conjunction ("a, b, or c")
+            # joins only the last item of a comma list; what follows is prose.
+            tail = message[clause.end():].lstrip(" :[=({")
+            tail = re.sub(r"^(?:are|is)\b", "", tail).lstrip(" :[=({")
+            tokens, lead, final, piped, comma_list = [], "[\"']?", False, False, False
+            while match := re.match(rf"({lead})([a-z][a-z0-9_-]*)[\"']?", tail):
+                rest = tail[match.end():]
+                # A token named in an explicit refusal after the positive list
+                # is not itself an advertised option, even after a comma or
+                # the first conjunction ("low, high and xhigh is unsupported").
+                if re.match(
+                    r"\s*\(?\s*(?:(?:is|are)\s+not\s+(?:supported|allowed|available|permitted)\b"
+                    r"|(?:isn't|aren't)\s+(?:supported|allowed|available|permitted)\b"
+                    r"|not\s+(?:supported|allowed|available|permitted)\b"
+                    r"|(?:(?:is|are)\s+)?(?:unsupported|disallowed|unavailable|requires?)\b)", rest,
+                ):
+                    break
+                tokens.append(match.group(2))
+                tail = rest
+                lead = match.group(1) or lead
+                conjunction = not piped and re.match(rf"\s*,?\s*\b(?:or|and)\b\s*(?={lead}[a-z])", tail)
+                separator = conjunction or re.match(r"\s*[,|]\s*", tail)
+                if final or not separator:
+                    break
+                comma_list = comma_list or "," in separator.group()
+                final, piped = bool(conjunction and comma_list), piped or "|" in separator.group()
+                tail = tail[separator.end():]
+            if param and tokens:
+                allowed = tuple(tokens)
+    rejected = node.get("value")
+    if rejected is None:
+        from ouroboros.config import EFFORT_SCALE
+
+        scalar = re.search(r"\b(?:value|tier)\s+['\"]?([a-z][a-z0-9_-]*)", message)
+        rejected = scalar.group(1) if scalar and scalar.group(1) in EFFORT_SCALE else None
+    return _WireRejection(status, message, param, code, allowed, value_constraint,
+                          str(rejected).lower() if rejected is not None else None, routing_step, numbers, typed_param)
+
+
+def _status_and_message_from_exception(exc: BaseException) -> Tuple[Optional[int], str]:
+    evidence = _wire_rejection(exc)
+    return evidence.status, evidence.message
 
 
 def _context_overflow_evidence(error: Any) -> bool:
@@ -601,6 +791,8 @@ def _context_overflow_evidence(error: Any) -> bool:
 
 
 def _field_is_present(payload: Mapping[str, Any], field: str) -> bool:
+    if field in CACHE_HINT_FIELDS:
+        return bool(cache_hint_holders(payload, field))
     if field != NESTED_REASONING_FIELD:
         return field in payload
     extra = payload.get("extra_body")
@@ -646,12 +838,22 @@ def _value_evidence(message: str) -> bool:
     )
 
 
+def _value_implicated(evidence: "_WireRejection", low: str) -> bool:
+    """Recognized value evidence: typed constraints, legacy wording markers and explicit value codes."""
+    return bool(evidence.value_constraint or _value_evidence(low)
+                or evidence.code in {"invalid_value", "unsupported_value", "invalid_enum_value", "invalid_option"})
+
+
+def _field_drop(*fields: str) -> Dict[str, Any]:
+    return {"kind": "drop_field", "fields": list(fields), "reason_code": "provider_unsupported_field"}
+
+
 def _classify_action(
     registered: _RegisteredCandidate,
     *,
-    status_code: Optional[int],
-    message: str,
+    evidence: _WireRejection,
 ) -> Optional[PendingWireAction]:
+    status_code, message = evidence.status, evidence.message
     if (
         status_code is None
         or not 400 <= status_code < 500
@@ -659,37 +861,67 @@ def _classify_action(
     ):
         return None
     low = str(message or "").lower()
-    if not low or not any(marker in low for marker in (
+    if any(token in evidence.code for token in _NON_COMPATIBILITY_CODE_TOKENS):
+        return None
+    candidate = registered.candidate
+    profile = candidate.accepted_profile
+    payload = candidate.physical_payload()
+    hint = _named_cache_hint(payload, evidence, low)
+    if hint:  # before every value guard: a refused part echoes its marker as the refused value
+        return PendingWireAction(profile, _field_drop(hint))
+    thinking_refused = (profile.reasoning_carrier == "reasoning_effort" and not evidence.param
+                        and bool(_THINKING_REFUSAL.search(low)))
+    if not low or not (evidence.value_constraint or thinking_refused or any(marker in low for marker in (
         *_VALUE_REJECTION_MARKERS,
         *_CAPABILITY_REJECTION_MARKERS,
         *_MANDATORY_MARKERS,
-    )):
+    ))):
         return None
-    candidate = registered.candidate
-    payload = candidate.physical_payload()
-    profile = candidate.accepted_profile
     current_effort = payload_effort(payload)
+    if _parameter_filter_refusal(evidence):
+        # The typed refusal never falls through to the prose heuristics: the sampling knobs
+        # go, or the provider's error stands.
+        filtered = _parameter_filter_drop(payload, evidence)
+        return PendingWireAction(profile, filtered) if filtered is not None else None
+    # Rejecting the disabled carrier's native TYPE is not rejecting an effort
+    # tier. Preserve the bounded omission repair without dropping a valid
+    # carrier when only output_config.effort (or a scalar tier) was refused.
+    if (profile.provider == "anthropic" and profile.reasoning_carrier == "anthropic.disabled"
+            and evidence.param == "thinking.type" and evidence.allowed
+            and "disabled" not in evidence.allowed
+            and evidence.rejected_value in {None, "disabled"}):
+        return PendingWireAction(profile, _field_drop("thinking"))
     error_tokens = _error_tokens(low)
-    effort_implicated = any(
-        marker in low
-        for marker in ("reasoning_effort", "reasoning.effort", "reasoning", "effort", "thinking", "output_config")
-    )
+    value_path = {
+        "reasoning_effort": "reasoning_effort",
+        NESTED_REASONING_FIELD: "extra_body.reasoning.effort",
+        "anthropic.adaptive": "output_config.effort",
+        "anthropic.disabled": "thinking",
+    }.get(profile.reasoning_carrier, "")
+    aliases = {value_path, value_path.removeprefix("extra_body."),
+               value_path.removeprefix("extra_body.").split(".")[0]}
+    if value_path:
+        aliases.update({"reasoning", "effort"})
+    aliases.discard("")
+    named_paths = set(re.findall(r"[a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)*", low))
+    effort_implicated = evidence.param in aliases if evidence.param else bool(aliases & named_paths)
+    if effort_implicated and evidence.rejected_value is not None and evidence.rejected_value != current_effort:
+        return None
     named_effort_value = _names_exact_effort_value(low, current_effort)
-    value_implicated = _value_evidence(low)
+    value_implicated = _value_implicated(evidence, low)
     if (
         profile.provider == "anthropic"
         and profile.reasoning_carrier == "anthropic.disabled"
         and effort_implicated
+        and not value_implicated
+        and not any(marker in low for marker in _MANDATORY_MARKERS)
     ):
-        return PendingWireAction(profile, {
-            "kind": "drop_field",
-            "fields": ["thinking"],
-            "reason_code": "provider_unsupported_field",
-        })
+        return PendingWireAction(profile, _field_drop("thinking"))
     if (
         effort_implicated
         and current_effort in {"none", "minimal"}
         and any(marker in low for marker in _MANDATORY_MARKERS)
+        and not evidence.value_constraint
     ):
         return PendingWireAction(profile, {
             "kind": "set_value",
@@ -699,18 +931,22 @@ def _classify_action(
             "to": "low",
             "reason_code": "provider_required_reasoning",
         })
-    if effort_implicated and named_effort_value:
-        from ouroboros.config import EFFORT_SCALE, effort_one_step_down, effort_rank
-        # QUOTED tiers inside [low, current) prescribe — even a negatively-quoted one (accepted FP); prose walks one rung.
-        prescribed = [t for t in EFFORT_SCALE[effort_rank("low"):max(effort_rank(current_effort), 0)]
-                      if f"'{t}'" in low or f'"{t}"' in low]
-        next_effort = prescribed[-1] if prescribed else effort_one_step_down(current_effort)
-        if effort_rank(next_effort) >= effort_rank("low") and next_effort != current_effort:
-            value_path = {
-                "reasoning_effort": "reasoning_effort",
-                NESTED_REASONING_FIELD: "extra_body.reasoning.effort",
-                "anthropic.adaptive": "output_config.effort",
-            }.get(profile.reasoning_carrier, "")
+    if effort_implicated and (named_effort_value or evidence.allowed):
+        from ouroboros.config import effort_one_step_down, effort_rank
+        if current_effort in evidence.allowed:
+            return None  # This constraint does not reject the candidate's value.
+        # Any positively advertised reasoning tier is comparable, minimal
+        # included; "none" disables reasoning and unknown tokens have no rank.
+        supported = [t for t in evidence.allowed if effort_rank(t) >= effort_rank("minimal")]
+        prescribed = [t for t in supported if effort_rank(t) < effort_rank(current_effort)]
+        # A positive enum owns the minimum when every supported tier is higher;
+        # mandatory wording alone retains the legacy low-floor behavior above.
+        next_effort = (max(prescribed, key=effort_rank) if prescribed else
+                       min(supported, key=effort_rank) if supported else
+                       "" if evidence.allowed else effort_one_step_down(current_effort))
+        # An unadvertised prose walk still stops at low.
+        floor = "minimal" if supported else "low"
+        if effort_rank(next_effort) >= effort_rank(floor) and next_effort != current_effort:
             exact_profile = _profile(
                 registered.target,
                 payload,
@@ -734,36 +970,134 @@ def _classify_action(
     compact = low.replace(".", "_")
     for field in (*OPTIONAL_REQUEST_FIELDS, NESTED_REASONING_FIELD):
         aliases = {field, field.replace(".", "_"), field.split(".")[-1]}
-        implicated = (field in error_tokens if field in {"stream", "stream_options"}
-                      else any(alias in low or alias in compact for alias in aliases))
+        implicated = (evidence.param in aliases if evidence.param else
+                      field in error_tokens if field in {"stream", "stream_options"}
+                      else any(alias in low or alias in compact for alias in aliases)
+                      or (field == "reasoning_effort" and thinking_refused))
         if _field_is_present(payload, field) and implicated:
             if value_implicated or (
                 field != NESTED_REASONING_FIELD
                 and _names_exact_scalar_value(low, payload.get(field))
             ):
                 return None
+            if field == "temperature" and _allowed_temperatures(evidence) is not None:
+                continue  # Capability wording around a stated value: its field stays.
             named.append(field)
     if "stream" in named and "stream_options" in payload and "stream_options" not in named:
         named.append("stream_options")
     if not named:
+        hint_free = _field_less_hint_drop(payload, evidence, low)
+        return PendingWireAction(profile, hint_free) if hint_free is not None else None
+    return PendingWireAction(profile, _field_drop(*named))
+
+
+# A refusal of a request field, said of a cache hint the message or its path names.
+_HINT_REFUSAL_MARKERS = (*_CAPABILITY_REJECTION_MARKERS, *_VALUE_REJECTION_MARKERS, "unknown field", "extra_forbidden")
+# A request-schema validator's own wording: with no field of ours named it may still mean a marker.
+_SCHEMA_VALIDATION_MARKERS = ("extra inputs", "extra_forbidden", "input should be")
+
+
+def _named_cache_hint(payload: Mapping[str, Any], evidence: _WireRejection, low: str) -> str:
+    """The narrowest prompt-cache hint carrier a refusal names and the request carries, else "".
+
+    A ``ttl`` beside ``cache_control`` names only the ttl keys, a ``tools.N.cache_control`` path
+    only the tool markers, any other ``cache_control`` every marker. A drop that still fails
+    composes into the next one inside the same call; ``prompt_cache_key`` is an ordinary
+    optional field of the loop in ``_classify_action``.
+    """
+    named = f"{evidence.param} {low}"
+    if "cache_control" not in named or not any(marker in low for marker in _HINT_REFUSAL_MARKERS):
+        return ""
+    for field, implicated in (
+        ("cache_control.ttl", "ttl" in _error_tokens(named)),
+        ("tools.cache_control", re.search(r"\btools\W+(?:\d+\W+)?cache_control\b", named) is not None),
+        ("cache_control", True),
+    ):
+        if implicated and _field_is_present(payload, field):
+            return field
+    return ""
+
+
+def _field_less_hint_drop(payload: Mapping[str, Any], evidence: _WireRejection, low: str) -> Optional[Dict[str, Any]]:
+    """One marker-free retry for a schema-validation refusal that names no field of ours while
+    the request carries markers (a strict server refusing the one-part text list a marked row
+    became, say). Like every reactive drop it is learned only if that retry succeeds; when it
+    fails too, the markers are gone and the provider's own error stands."""
+    if (evidence.status in {400, 422} and any(marker in low for marker in _SCHEMA_VALIDATION_MARKERS)
+            and _field_is_present(payload, "cache_control")):
+        return _field_drop("cache_control")
+    return None
+
+
+def _parameter_filter_refusal(evidence: _WireRejection) -> bool:
+    """OpenRouter's field-less typed routing refusal: under ``provider.require_parameters``
+    it routes only to endpoints that accept EVERY requested parameter; when none is left it
+    answers HTTP 404 with the typed receipt ``error.metadata.failed_routing_step ==
+    "Filter by Parameters"`` and names no field."""
+    return evidence.status == 404 and evidence.routing_step == "filter by parameters" and not evidence.param
+
+
+def _parameter_filter_drop(payload: Mapping[str, Any], evidence: _WireRejection) -> Optional[Dict[str, Any]]:
+    """The drop the field-less typed routing refusal prescribes, or None.
+
+    The host sent the parameters, so the host knows which were optional HINTS: only the
+    sampling knobs (``temperature``, ``top_p``, ``top_k``) go — the common case is a reasoning
+    model whose endpoints take no ``temperature``. Reasoning, ``response_format`` and tools
+    shape the answer and are never dropped on this refusal; when it persists once the knobs
+    are gone the provider's typed error stands (an honest failure, nothing learned). A
+    rejection that names its parameter keeps the exact field logic of the classifier.
+    """
+    if not _parameter_filter_refusal(evidence):
         return None
-    return PendingWireAction(profile, {
-        "kind": "drop_field",
-        "fields": named,
-        "reason_code": "provider_unsupported_field",
-    })
+    sampling = [field for field in OPTIONAL_SAMPLING_FIELDS if _field_is_present(payload, field)]
+    if not sampling:
+        return None
+    return _field_drop(*sampling)
 
 
-def _plan_retry(status_code: Optional[int], message: str) -> Optional[Dict[str, Any]]:
+def _allowed_temperatures(evidence: _WireRejection) -> Optional[Tuple[Tuple[float, float], ...]]:
+    return allowed_temperatures(evidence.message, evidence.typed_param, evidence.allowed_numbers)
+
+
+def _refuses_hint(target: Mapping[str, Any], payload: Mapping[str, Any], evidence: _WireRejection) -> bool:
+    """Withdraw a carried hint excluded by a readable statement, or beside an unreadable statement classified
+    as a field refusal. This classification uses the bound repair's legacy wording markers plus typed value
+    constraints/codes, not arbitrary value language: ``invalid parameter: temperature can only be [0, 1; 0.2]``
+    still counts as a field refusal without such evidence. Explicit values have no hint to withdraw.
+    Carrierless legacy repair had weaker value guards; this hint path retains the bound repair's guards."""
+    if (evidence.status not in {400, 422} or any(token in evidence.code for token in _NON_COMPATIBILITY_CODE_TOKENS)
+            or not _carries_temperature_hint(target, payload)):
+        return False
+    spans = _allowed_temperatures(evidence)
+    if spans == ():
+        text = evidence.message.lower()
+        named = evidence.param == "temperature" if evidence.param else "temperature" in text
+        return (named and not _value_implicated(evidence, text)
+                and any(marker in text for marker in _CAPABILITY_REJECTION_MARKERS))
+    return bool(spans) and not any(low <= payload["temperature"] <= high for low, high in spans)
+
+
+def _classify_hint_refusal(
+    registered: _RegisteredCandidate,
+    *,
+    evidence: _WireRejection,
+) -> Optional[PendingWireAction]:
+    """Withdraw the host's hint a validation refusal excludes (``_refuses_hint``)."""
+    candidate = registered.candidate
+    if not _refuses_hint(registered.target, candidate.physical_payload(), evidence):
+        return None
+    return PendingWireAction(candidate.accepted_profile, _HINT_WITHDRAWAL)
+
+
+def _plan_retry(evidence: _WireRejection, classify: Any = _classify_action) -> Optional[Dict[str, Any]]:
     state = _WIRE_CALL_STATE.get()
     registered = state.current
     if registered is None:
         return None
     try:
-        pending = _classify_action(
+        pending = classify(
             registered,
-            status_code=status_code,
-            message=message,
+            evidence=evidence,
         )
         if pending is None:
             return None
@@ -836,6 +1170,7 @@ def _plan_direct_dialect_retry(
                 reason_code="provider_rejected_tool_dialect",
                 ordinal=2,
             )
+        candidate = _keep_hint_withdrawn(candidate, registered)
         register_wire_candidate(
             candidate,
             source_payload=registered.source_payload,
@@ -847,11 +1182,34 @@ def _plan_direct_dialect_retry(
         return None
 
 
+def _keep_hint_withdrawn(candidate: WireCandidateManifest, previous: _RegisteredCandidate) -> WireCandidateManifest:
+    """A rung rebuilt from the canonical source must not restore a hint this call withdrew."""
+    if ("temperature" not in candidate.physical_payload()
+            or not any(item.action.get("reason_code") == HINT_WITHDRAWAL_REASON
+                       for item in previous.candidate.applied_actions)):
+        return candidate
+    withdrawal = WireAppliedAction.reactive(
+        PendingWireAction(candidate.accepted_profile, _HINT_WITHDRAWAL), task_local=candidate.task_local,
+    )
+    return _bind_with_applications(
+        target=previous.target,
+        api_surface=candidate.source_profile.api_surface,
+        source_payload=previous.source_payload,
+        requested_effort=candidate.requested_effort,
+        applications=(*candidate.applied_actions, withdrawal),
+        fixed_spec=candidate.candidate_spec,
+        fixed_ordinal=candidate.ladder_ordinal,
+    )
+
+
 def plan_wire_retry_from_exception(exc: BaseException) -> Optional[Dict[str, Any]]:
     if _context_overflow_evidence(exc):
         return None
-    status, message = _status_and_message_from_exception(exc)
-    return _plan_retry(status, message)
+    capture = getattr(exc, "physical_attempt_capture", None)
+    candidate = current_wire_candidate()
+    if capture is not None and (candidate is None or getattr(capture, "candidate_raw_sha256", None) != candidate.candidate_sha256):
+        return None
+    return _plan_retry(_wire_rejection(exc))
 
 
 def plan_nonlearning_optional_retry(
@@ -891,13 +1249,20 @@ def plan_nonlearning_optional_retry(
         return None
     if _value_evidence(low):
         return None
-    named = [
-        field for field in _NON_REASONING_OPTIONAL_FIELDS
-        if field in payload and (
-            (field in _error_tokens(low)) if field in {"stream", "stream_options"}
-            else (field in low or field.replace("_", ".") in low)
-        )
-    ]
+    evidence = _wire_rejection(error)
+    if _parameter_filter_refusal(evidence):
+        filtered = _parameter_filter_drop(payload, evidence)
+        if filtered is None:
+            return None  # the typed refusal persists with no sampling knob left: the provider's error stands
+        named = [field for field in filtered["fields"] if field in payload]
+    else:
+        named = [
+            field for field in _NON_REASONING_OPTIONAL_FIELDS
+            if field in payload and (
+                (field in _error_tokens(low)) if field in {"stream", "stream_options"}
+                else (field in low or field.replace("_", ".") in low)
+            ) and not (field == "temperature" and _allowed_temperatures(evidence) is not None)
+        ]
     if "stream" in named and "stream_options" in payload and "stream_options" not in named:
         named.append("stream_options")
     if not named:
@@ -914,12 +1279,7 @@ def plan_wire_retry_from_body_error(error: Any) -> Optional[Dict[str, Any]]:
         return None
     if _context_overflow_evidence(error):
         return None
-    code = error.get("status_code", error.get("status", error.get("code")))
-    try:
-        status = int(code) if code is not None else None
-    except (TypeError, ValueError, OverflowError):
-        status = None
-    return _plan_retry(status, str(error.get("message") or ""))
+    return _plan_retry(_wire_rejection(error))
 
 
 def _processing_retry(payload: Mapping[str, Any], error: Any,
@@ -937,7 +1297,7 @@ def _processing_retry(payload: Mapping[str, Any], error: Any,
     if route.get("processing_native_origin") != "preference":
         return None
     current = registered.candidate.physical_payload() if registered is not None else copy.deepcopy(dict(payload))
-    if capture.candidate_raw_sha256 != physical_candidate_sha256(current):
+    if getattr(capture, "candidate_raw_sha256", None) != physical_candidate_sha256(current):
         return None
     if provider in {"openai", "openrouter"}:
         field, standard = "service_tier", "default"
@@ -977,7 +1337,19 @@ def plan_next_wire_retry(
     """One exception/body-parity entrypoint for the bounded transport drivers."""
     if getattr(error, "stream_incomplete", False):
         return None
-    processing = _processing_retry(payload, error, target)
+    state = _WIRE_CALL_STATE.get()
+    registered, physical = state.current, state.physical_payload
+    digest = physical_candidate_sha256(physical) if physical is not None else ""
+    if physical is not None and physical_candidate_sha256(payload) not in {
+        digest, state.logical_payload_sha256,
+        physical_candidate_sha256(registered.source_payload) if registered is not None else "",
+    }:
+        return None  # Only inputs bound by this attempt's preparation seam may recover it.
+    capture = getattr(error, "physical_attempt_capture", None)
+    if capture is not None and (not digest or getattr(capture, "candidate_raw_sha256", None) != digest):
+        return None
+    current = physical if physical is not None else payload
+    processing = _processing_retry(current, error, target)
     if processing is not None:
         return processing
     planned = (
@@ -994,11 +1366,20 @@ def plan_next_wire_retry(
     )
     if dialect_retry is not None:
         return dialect_retry
-    return plan_nonlearning_optional_retry(
-        payload,
+    overflow, evidence = _context_overflow_evidence(error), _wire_rejection(error)
+    hint_retry = None if overflow else _plan_retry(evidence, classify=_classify_hint_refusal)
+    if hint_retry is not None:
+        return hint_retry
+    repaired = plan_nonlearning_optional_retry(
+        current,
         error=error,
         body_error=body_error,
     )
+    if repaired is None and registered is None and target is not None and not overflow:
+        if _refuses_hint(target, current, evidence):
+            # No candidate binds this send, so nothing can be learned: its hint goes for this call only.
+            return {key: copy.deepcopy(value) for key, value in current.items() if key != "temperature"}
+    return repaired
 
 
 def finalize_wire_response(

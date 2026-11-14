@@ -156,7 +156,10 @@ def test_changed_child_result_reopens_and_old_hash_is_stale(tmp_path):
 
 
 def test_artifact_change_reopens_exact_hash_disposition(tmp_path):
-    from ouroboros.artifacts import task_artifact_dir_path
+    """Reads hash no files (TZ-1 A): the recorded artifact identity is what the
+    exact-hash disposition covers, so a published byte change reopens it while an
+    unrecorded file mutation leaves the pure read unchanged."""
+    from ouroboros.artifacts import artifact_record, task_artifact_dir_path
     from ouroboros.task_results import write_task_result
     from ouroboros.task_status import load_effective_task_result
     from ouroboros.tools.join_ledger import (
@@ -166,6 +169,10 @@ def test_artifact_change_reopens_exact_hash_disposition(tmp_path):
     from ouroboros.tools.task_tree import _tree_note
 
     child_id = "artifact-child"
+    artifact_dir = task_artifact_dir_path(tmp_path, child_id)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact_path = artifact_dir / "report.md"
+    artifact_path.write_text("version one\n", encoding="utf-8")
     write_task_result(
         tmp_path,
         child_id,
@@ -174,11 +181,8 @@ def test_artifact_change_reopens_exact_hash_disposition(tmp_path):
         root_task_id="parent1",
         delegation_role="subagent",
         result="artifact-backed result",
+        artifacts=[artifact_record(artifact_path)],
     )
-    artifact_dir = task_artifact_dir_path(tmp_path, child_id)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    artifact_path = artifact_dir / "report.md"
-    artifact_path.write_text("version one\n", encoding="utf-8")
     shown_hash = _child_result_sha256(load_effective_task_result(tmp_path, child_id))
     assert _tree_note(
         _parent_ctx(tmp_path),
@@ -191,6 +195,8 @@ def test_artifact_change_reopens_exact_hash_disposition(tmp_path):
     ) == "integrated"
 
     artifact_path.write_text("version two\n", encoding="utf-8")
+    assert _child_result_sha256(load_effective_task_result(tmp_path, child_id)) == shown_hash
+    write_task_result(tmp_path, child_id, "completed", artifacts=[artifact_record(artifact_path)])
     changed = load_effective_task_result(tmp_path, child_id)
     assert _child_result_sha256(changed) != shown_hash
     assert _current_child_result_disposition(changed) == ""
@@ -252,11 +258,11 @@ def test_malformed_disposition_names_every_violation_in_one_reply(tmp_path):
         "unknown key(s) supports_claims",
         "disposition must be one of",
         "child_result_sha256 must be the 64-char hex sha",
-        "at most 500 characters",
         "Correct example",
         "atomic no-op",
     ):
         assert fragment in result, fragment
+    assert "rationale" not in result and "500" not in result  # a long rationale is no violation
     assert tree_ledger_rows("parent1", data_root=tmp_path) == []
 
     # A valid payload with a MISSING rationale also gets the aggregated shape.
@@ -269,6 +275,10 @@ def test_malformed_disposition_names_every_violation_in_one_reply(tmp_path):
     )
     assert "tree_note text is required as the rationale" in no_reason
     assert "Correct example" in no_reason
+    # The same 501 characters with a valid payload are the rationale, recorded whole.
+    accepted = _tree_note(_parent_ctx(tmp_path), "decision", "x" * 501, payload=_payload("child1", "integrated", digest))
+    assert accepted.startswith("OK:")
+    assert [row["text"] for row in tree_ledger_rows("parent1", data_root=tmp_path)] == ["x" * 501]
 
 
 def test_ledger_append_renders_the_same_aggregated_violations(tmp_path):
@@ -651,7 +661,7 @@ def test_cancellation_wins_and_late_scratch_result_is_deleted(tmp_path):
         trace_summary="late trace",
     )
 
-    assert remove_subagent_task_drive(tmp_path, child_id) is True
+    assert remove_subagent_task_drive(tmp_path, child_id, live=lambda _task: False) is True
     assert not scratch.parent.exists()
     raw = load_task_result(tmp_path, child_id) or {}
     assert raw["status"] == STATUS_CANCELLED
@@ -696,6 +706,31 @@ def test_legacy_cancel_requested_latch_is_pending_not_handled(tmp_path):
     assert _child_disposition_state(
         load_effective_task_result(tmp_path, child_id)
     ) == "cancelled"
+
+
+def test_an_exact_decision_on_a_cancelled_childs_result_outranks_the_cancellation(tmp_path):
+    """A parent that integrated or discarded its cancelled child's exact retained result has decided it, while the
+    child stays cancelled; a deferral leaves the cancellation in force, and another revision is not decided."""
+    from ouroboros.loop import _child_disposition_state
+    from ouroboros.task_status import load_effective_task_result
+    from ouroboros.tools.join_ledger import _child_result_sha256
+    from ouroboros.tools.task_tree import _tree_note
+    from tests._store_shared import read_result, seed_result
+
+    _write_child(tmp_path, status="cancelled", parent_decision="cancelled")
+
+    def state():
+        return _child_disposition_state(load_effective_task_result(tmp_path, "child1"))
+
+    digest = _child_result_sha256(load_effective_task_result(tmp_path, "child1"))
+    for disposition, expected in (("deferred", "cancelled"), ("irrelevant", "irrelevant"),
+                                  ("integrated", "integrated")):
+        assert _tree_note(_parent_ctx(tmp_path), "decision", f"{disposition} after reading it",
+                          payload=_payload("child1", disposition, digest)).startswith("OK:")
+        assert state() == expected
+    assert load_effective_task_result(tmp_path, "child1")["status"] == "cancelled"
+    seed_result(tmp_path, "child1", {**read_result(tmp_path, "child1"), "result": "another revision"})
+    assert state() == "cancelled"
 
 
 def test_settled_cancel_blocks_custom_child_read_and_artifact_copy(

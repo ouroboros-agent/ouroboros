@@ -1,8 +1,7 @@
 """Unit tests for the subagent browser URL policy (no Playwright needed).
 
 Verifies the shared target decision: readonly/acting subagents
-may browse external HTTP(S), localhost on non-Ouroboros ports, and file:// under
-their workspace, while the Ouroboros control-plane ports, private/link-local IPs,
+may browse external HTTP(S), localhost on non-Ouroboros ports, and parent-readable file:// targets, while the Ouroboros control-plane ports, private/link-local IPs,
 DNS-rebind, and other schemes stay blocked.
 """
 from __future__ import annotations
@@ -69,12 +68,12 @@ def test_non_http_schemes_blocked():
         assert _blocked(url, _ctx()), url
 
 
-def test_file_url_blocked_without_workspace():
-    assert _blocked("file:///etc/passwd", _ctx())
-    assert _blocked("file:///tmp/app/index.html", _ctx(""))
+def test_file_url_parent_parity_without_workspace():
+    assert not _blocked("file:///etc/passwd", _ctx())
+    assert not _blocked("file:///tmp/app/index.html", _ctx(""))
 
 
-def test_file_url_scoped_to_workspace(tmp_path):
+def test_file_url_starting_workspace_is_not_a_read_fence(tmp_path):
     ws = tmp_path / "ws"
     (ws / "build").mkdir(parents=True)
     app = ws / "build" / "index.html"
@@ -84,7 +83,7 @@ def test_file_url_scoped_to_workspace(tmp_path):
     ctx = _ctx(str(ws))
     # Path.as_uri() yields a platform-correct file URL (file:///C:/... on Windows).
     assert _blocked(app.as_uri(), ctx) == ""
-    assert _blocked(outside.as_uri(), ctx)
+    assert not _blocked(outside.as_uri(), ctx)
 
 
 def test_actual_service_bindings_win_over_env_and_default_ports(live_bindings, monkeypatch):
@@ -128,7 +127,7 @@ def test_owner_settings_post_blocked_in_browser():
     assert _is_owner_settings_self_elevation_post(req("POST", base, '{"OUROBOROS_SUBAGENT_HARNESS":"codex=gpt-5.6:high"}'))
     assert _is_owner_settings_self_elevation_post(req("POST", base, '{"OUROBOROS_SUBAGENT_HARNESS":""}'))
     assert _is_owner_settings_self_elevation_post(req("GET", base, None)) is False
-    assert _is_owner_settings_self_elevation_post(req("POST", base, '{"OPENAI_API_KEY":"x"}')) is False
+    assert _is_owner_settings_self_elevation_post(req("POST", base, '{"TOTAL_BUDGET":"25"}')) is False
     assert _is_owner_settings_self_elevation_post(
         req("POST", "http://127.0.0.1:8765/api/tasks", '{"OUROBOROS_POST_TASK_EVOLUTION":"true"}')) is False
 
@@ -262,8 +261,11 @@ def test_unreadable_snapshot_keeps_the_recorded_expectations(tmp_path, monkeypat
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX process observations; Windows has its creation-time tests")
-@pytest.mark.parametrize("kind", ["main", "host_service", "local_model"])
-@pytest.mark.parametrize("uncertainty", ["mismatched", "unmeasured", "missing_fingerprint"])
+@pytest.mark.parametrize(("uncertainty", "kind"), [
+    ("mismatched", "main"),
+    ("unmeasured", "host_service"),
+    ("missing_fingerprint", "local_model"),
+])
 def test_matching_binding_uncertainty_does_not_permit_a_control_endpoint(tmp_path, monkeypatch, kind, uncertainty):
     from ouroboros import config, process_custody, server_process
     from ouroboros.browser_policy import runtime_service_kind

@@ -1,5 +1,6 @@
 """
-AST-based guard: platform-specific APIs must live in platform_layer.py only.
+AST-based guard: platform operations live in platform_layer.py; its private
+platform_win32_abi.py owns guarded native declarations.
 
 Scans all .py files under ouroboros/ and supervisor/ (plus server.py)
 for direct use of the following forbidden patterns:
@@ -7,11 +8,12 @@ for direct use of the following forbidden patterns:
   - Direct attribute access: os.kill, os.killpg, os.setsid, os.getpgid
   - Direct attribute access: signal.SIGKILL, signal.SIGTERM
 
-Note: subprocess flags (creationflags, start_new_session) and launcher.py
-are NOT covered by this guard — platform_layer.py provides
-subprocess_new_group_kwargs() and subprocess_hidden_kwargs() helpers,
-and caller code uses them (checked by code review, not by this AST guard).
-launcher.py is the immutable outer shell and is intentionally excluded.
+Console windows on Windows have their own two scans below: no process the
+launcher-process modules (launcher.py, ouroboros/launcher_*.py) start opens a
+console window, and no product code detaches a process from its console.
+Other subprocess flags (creationflags, start_new_session) are checked by code
+review: platform_layer.py provides subprocess_new_group_kwargs() and
+subprocess_hidden_kwargs(). launcher.py is excluded from the API scan above.
 
 Runs on every `make test` on all platforms.
 """
@@ -22,12 +24,14 @@ import sys
 from typing import List, Set
 
 import pytest
+from tests._source_scan import parse
 
 IS_WINDOWS_PLATFORM = sys.platform == "win32"
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
-# The ONE file allowed to contain platform-specific code
+# The only file exempt from operational API scanning. The declaration-only
+# Win32 substrate remains scanned and must not acquire process/lock operations.
 ALLOWED_FILE = REPO_ROOT / "ouroboros" / "platform_layer.py"
 
 # Directories to scan
@@ -88,7 +92,7 @@ def _scan_file(filepath: pathlib.Path) -> List[str]:
     violations = []
     try:
         source = filepath.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=str(filepath))
+        tree = parse(source, filename=str(filepath))
     except (SyntaxError, UnicodeDecodeError):
         return violations
 
@@ -170,6 +174,70 @@ def test_no_platform_specific_apis_outside_platform_layer():
         )
 
 
+# ── Console windows (Windows) ───────────────────────────────────────────
+
+# The packaged desktop launcher is the one Ouroboros process without a console. Windows gives each console
+# program it starts a window of its own unless the start asks for none; the server itself starts without one.
+# So a launcher-process module never lets a spawn open a console window: hidden flags, or the handoff's own
+# console choice (a terminal run keeps its terminal); only the handoff's POSIX branch replaces the process image.
+LAUNCHER_PROCESS_FILES = sorted([REPO_ROOT / "launcher.py", *(REPO_ROOT / "ouroboros").glob("launcher_*.py")])
+_SPAWNS = {"subprocess": {"run", "Popen", "call", "check_call", "check_output", "getoutput", "getstatusoutput"},
+           "asyncio": {"create_subprocess_exec", "create_subprocess_shell"}}
+_HIDDEN_HELPERS = {"merge_hidden_kwargs", "subprocess_hidden_kwargs", "inherited_console_kwargs"}
+_IMAGE_REPLACEMENT = {("ouroboros/launcher_bootstrap.py", "exec_source_launcher")}
+# A process started without a console to pass on (or given its own) gives every console grandchild a window;
+# no product spawn needs that. A deliberate exception names its file and reason here.
+CONSOLE_DETACHING_ALLOWLIST: dict = {}
+_CONSOLE_DETACHING = {"DETACHED_PROCESS", "CREATE_NEW_CONSOLE", "AllocConsole", "FreeConsole"}
+
+
+def _asks_for_hidden_window(call: ast.Call) -> bool:
+    for keyword in call.keywords:
+        value = keyword.value
+        if keyword.arg is None and isinstance(value, ast.Call) \
+                and (getattr(value.func, "id", None) or getattr(value.func, "attr", None)) in _HIDDEN_HELPERS:
+            return True
+        if keyword.arg == "creationflags" and "CREATE_NO_WINDOW" in ast.unparse(value):
+            return True
+    return False
+
+
+def test_launcher_process_spawns_open_no_console_window():
+    offenders = []
+    for path in LAUNCHER_PROCESS_FILES:
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        tree = parse(path.read_text(encoding="utf-8"))
+        replacing = {id(node) for function in ast.walk(tree) if isinstance(function, ast.FunctionDef)
+                     and (rel, function.name) in _IMAGE_REPLACEMENT for node in ast.walk(function)}
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)):
+                continue
+            module, name = node.func.value.id, node.func.attr
+            if name in _SPAWNS.get(module, ()) and not _asks_for_hidden_window(node):
+                offenders.append(f"{rel}:{node.lineno}: {module}.{name} without hidden-window flags")
+            if module == "os" and id(node) not in replacing and (
+                    name.startswith(("exec", "spawn", "posix_spawn")) or name in {"system", "popen", "startfile"}):
+                offenders.append(f"{rel}:{node.lineno}: os.{name}; the launcher replaces itself only through "
+                                 "launcher_bootstrap.exec_source_launcher")
+    assert not offenders, "\n".join(offenders)
+
+
+def test_no_product_code_detaches_a_process_from_its_console():
+    offenders = []
+    files = [*SCAN_FILES, REPO_ROOT / "launcher.py", *(path for base in SCAN_DIRS for path in base.rglob("*.py"))]
+    for path in sorted(set(files)):
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        if rel in CONSOLE_DETACHING_ALLOWLIST:
+            continue
+        for node in ast.walk(parse(path.read_text(encoding="utf-8"))):
+            name = (node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute)
+                    else node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None)
+            if name in _CONSOLE_DETACHING:
+                offenders.append(f"{rel}:{node.lineno}: {name}")
+    assert not offenders, "\n".join(offenders)
+
+
 def test_platform_layer_exports_core_symbols():
     """platform_layer.py must export the core cross-platform symbols."""
     from ouroboros.platform_layer import (
@@ -183,6 +251,16 @@ def test_platform_layer_exports_core_symbols():
     assert isinstance(IS_LINUX, bool)
     # Exactly one should be True (or none on exotic platforms)
     assert sum([IS_WINDOWS, IS_MACOS, IS_LINUX]) <= 1
+
+
+def test_win32_declarations_are_private_to_the_platform_layer():
+    for path in _collect_python_files():
+        tree = parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            modules = ([alias.name for alias in node.names] if isinstance(node, ast.Import)
+                       else [node.module or "", *(alias.name for alias in node.names)]
+                       if isinstance(node, ast.ImportFrom) else [])
+            assert all(name.split(".")[-1] != "platform_win32_abi" for name in modules), str(path)
 
 
 def test_normalize_repo_path_handles_windows_style_paths():
@@ -211,17 +289,16 @@ def test_normalize_repo_path_handles_windows_style_paths():
 
 
 @pytest.mark.skipif(not IS_WINDOWS_PLATFORM, reason="Windows-only")
-def test_win32_overlapped_class_cached():
-    """_win32_overlapped_class must return the same class object on every call.
+def test_win32_lock_and_unlock_share_the_same_overlapped_abi():
+    """Both APIs must accept the identical structure class, not just equal layouts.
 
-    ctypes rejects pointer arguments when the underlying Structure class differs
-    even if the layout is identical.  If lock creates one OVERLAPPED class and
-    unlock creates another, UnlockFileEx will raise ctypes.ArgumentError.
+    ctypes rejects pointer arguments for structurally equal but distinct classes.
+    The platform's one Windows ABI declaration owns both native signatures.
     """
-    from ouroboros.platform_layer import _win32_overlapped_class
-    cls1 = _win32_overlapped_class()
-    cls2 = _win32_overlapped_class()
-    assert cls1 is cls2, (
-        "_win32_overlapped_class() returned different class objects — "
-        "this will cause ctypes.ArgumentError in unlock path"
-    )
+    from ouroboros.platform_layer import _OVERLAPPED, _kernel32
+    from ouroboros import platform_win32_abi
+
+    assert _OVERLAPPED is platform_win32_abi._OVERLAPPED
+    assert _kernel32 is platform_win32_abi._kernel32
+    assert _kernel32.LockFileEx.argtypes[-1]._type_ is _OVERLAPPED
+    assert _kernel32.UnlockFileEx.argtypes[-1]._type_ is _OVERLAPPED

@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { bindLiveCardTimeline, buildTimelineItemHtml, selectionInside } from '../modules/chat_activity.js';
-import { createLiveCardTimelineRenderer } from '../modules/chat_render_batch.js';
+import { createLiveCardTimelineRenderer, createTimelineAnchors, updateLiveTimelineItem } from '../modules/chat_render_batch.js';
+import { historyStamps, mergeHistoricalTimelineItem } from '../modules/chat_history_replay.js';
 
 // A real tree (including text nodes), with explicit removal effects on focus.
 // The injected renderer builds JSON trees so this fixture needs no HTML parser.
@@ -52,25 +53,121 @@ class Node {
     }
     querySelector(selector) {
         const key = selector.match(/data-live-line-key="([^"]+)"/)?.[1];
-        return this.children.find((child) => child.dataset.liveLineKey === key);
+        return key ? this.children.find((child) => child.dataset.liveLineKey === key) : null;
     }
 }
 
 const text = (value) => ['#text', {}, value];
-function rendererFixture() {
+function rendererFixture(options = {}) {
     const doc = { activeElement: null, createElement: (name) => new Node(doc, [name]) };
     const timelineEl = new Node(doc, ['DIV']);
     doc.root = timelineEl;
     const record = { timelineEl, root: { dataset: { expanded: '1' } }, expandedLineKeys: new Set(), items: [] };
-    const build = (item) => JSON.stringify(['DIV', { 'data-live-line-key': item.lineKey }, [
+    const build = (item) => JSON.stringify(['DIV', { 'data-live-line-key': item.lineKey,
+        'data-expanded': record.expandedLineKeys.has(item.lineKey) ? '1' : '0' }, [
         ['DIV', { role: 'button', 'aria-expanded': String(record.expandedLineKeys.has(item.lineKey)) }, [
             ['SPAN', { class: 'title' }, [text(item.title || item.lineKey)]],
             ['SPAN', { class: 'time' }, [text(item.ts || '')]],
         ]],
         ['DIV', { class: 'body' }, [['P', {}, [text(item.body || 'Long narration')]]]],
     ]]);
-    const renderer = createLiveCardTimelineRenderer({ withStableViewport: (fn) => fn(), buildTimelineItemHtml: build });
+    const renderer = createLiveCardTimelineRenderer({ withStableViewport: (fn) => fn(), buildTimelineItemHtml: build, ...options });
     return { doc, record, ...renderer };
+}
+
+for (const kind of ['receipt', 'lifecycle', 'terminal', 'activity']) {
+test(`a live ${kind} retains its physical page and exact row through canonical adoption`, () => {
+    const evolving = kind !== 'activity';
+    const prefix = { receipt: 'cardrow|', lifecycle: 'subagent-lifecycle:', terminal: 'task_done|', activity: 'progress:' }[kind];
+    const summary = id => ({ headline: 'PR #7 merge: merged', body: 'Exact merge evidence. '.repeat(20),
+        phase: 'done', dedupeKey: `${prefix}${id}`,
+        ...(kind === 'receipt' ? { cardRowRevision: 3 } : {}), terminal: kind === 'terminal' });
+    const row = offset => ({ history_id: `chat:${offset}`,
+        history_position: { source: 'chat', offset }, ts: '2026-09-12T12:00:00Z' });
+    const live = rendererFixture();
+    for (const id of ['other-receipt', 'receipt']) updateLiveTimelineItem(live.record, summary(id), {
+        ts: '12:00', rawTs: row(41).ts, syntheticKey: summary(id).dedupeKey,
+        headline: summary(id).headline, inPlaceByKey: true,
+    });
+    const item = live.record.items[1], liveKey = item.lineKey;
+    // Component-only line disclosure state: production receipts expose card
+    // expansion, which the backend/browser regression exercises separately.
+    live.record.expandedLineKeys.add(liveKey);
+    live.renderLiveCardTimeline(live.record);
+
+    // Real renderer nodes, with deterministic feed geometry. A cold row changes
+    // both its DOM key and offset; an identical neighbour must not be restored.
+    const box = (top, height) => ({ top, bottom: top + height, left: 0, right: 600, width: 600, height });
+    const mount = (f, lineTops) => {
+        const messages = new Node(f.doc, ['DIV']);
+        const card = new Node(f.doc, ['DIV']);
+        f.doc.root = messages;
+        messages.appendChild(card); card.appendChild(f.record.timelineEl);
+        messages.scrollTop = 200;
+        messages.getBoundingClientRect = () => box(0, 400);
+        // Node's dataset is synthesized from attributes; task identity belongs
+        // to the card fixture, while the actual line datasets stay rendered.
+        Object.defineProperty(card, 'dataset', { value: { taskId: 'owner', expanded: '1' } });
+        card.classList = { contains: value => value === 'chat-live-card' };
+        card.matches = () => false;
+        card.getBoundingClientRect = () => box(-messages.scrollTop, 1200);
+        card.getClientRects = () => [card.getBoundingClientRect()];
+        card.querySelectorAll = () => f.record.timelineEl.children;
+        card.parentElement = messages;
+        f.record.timelineEl.parentElement = card;
+        for (const [index, line] of f.record.timelineEl.children.entries()) {
+            line.parentElement = f.record.timelineEl;
+            line.classList = { contains: value => value === 'chat-live-line' };
+            line.matches = selector => selector === '.chat-live-line';
+            line.closest = selector => selector === '.chat-live-card' ? card : null;
+            line.getBoundingClientRect = () => box(lineTops[index] - messages.scrollTop, 80);
+            line.getClientRects = () => [line.getBoundingClientRect()];
+        }
+        f.record.root = card; f.record.groupId = 'owner';
+        const anchors = createTimelineAnchors({ messagesDiv: messages,
+            liveCardRecords: new Map([['owner', f.record]]) });
+        return { messages, card, anchors };
+    };
+    const mounted = mount(live, [100, 220]);
+    const beforeReplay = mounted.anchors.serializeTimelineAnchor();
+
+    const mountedLine = live.record.timelineEl.lastElementChild;
+    const mountedHeader = mountedLine.firstElementChild;
+    mountedHeader.focus();
+    assert.equal(mergeHistoricalTimelineItem(live.record, summary('receipt'), row(41), '12:00'), true);
+    live.renderLiveCardTimeline(live.record);
+    assert.equal(live.record.items[1], item);
+    assert.equal(item.lineKey, liveKey);
+    assert.equal(item[evolving ? 'sourceHistoryId' : 'historyId'], 'chat:41');
+    assert.equal(item[evolving ? 'historyId' : 'sourceHistoryId'], undefined, 'immutable and evolving source identities remain distinct');
+    assert.equal(live.record.timelineEl.lastElementChild, mountedLine);
+    assert.equal(live.doc.activeElement, mountedHeader);
+    const saved = mounted.anchors.serializeTimelineAnchor();
+    assert.equal(saved.lineExpanded, true);
+    assert.equal(saved.offset, 20);
+    assert.equal(saved.lineHistoryId, evolving ? '' : 'chat:41');
+    assert.equal(saved.historyId, 'chat:41', 'the nested line must supply its own physical page, not a card-wide source');
+    mounted.card.remove();
+
+    // A rebuilt card (fresh DOM keys) finds the saved line by its row identity.
+    const cold = rendererFixture();
+    cold.record.groupId = 'owner';
+    for (const [id, offset] of [['other-receipt', 40], ['receipt', 41]]) {
+        mergeHistoricalTimelineItem(cold.record, summary(id), row(offset), '12:00');
+    }
+    cold.renderLiveCardTimeline(cold.record);
+    const coldItem = cold.record.items[1];
+    assert.notEqual(coldItem.lineKey, liveKey);
+    assert.equal(coldItem[evolving ? 'sourceHistoryId' : 'historyId'], 'chat:41');
+    const reopened = mount(cold, [280, 320]);
+    assert.equal(reopened.anchors.restoreVisibleTimelineAnchor(saved, { exact: true }), true);
+    assert.equal(reopened.messages.scrollTop, 300);
+    assert.equal(cold.record.timelineEl.lastElementChild.getBoundingClientRect().top, saved.offset);
+    assert.equal(reopened.anchors.serializeTimelineAnchor().historyId, 'chat:41');
+    assert.equal(reopened.anchors.serializeTimelineAnchor().lineLifecycleKey, evolving ? `${prefix}receipt` : '');
+    assert.equal(beforeReplay.lineLifecycleKey, evolving ? `${prefix}receipt` : '');
+    assert.equal(saved.lineLifecycleKey, evolving ? `${prefix}receipt` : '');
+});
 }
 
 test('older rows and timestamp patches preserve the mounted row, focused header and selected body', () => {
@@ -154,6 +251,20 @@ test('timeline markup uses a selectable accessible header and exact history attr
     assert.match(html, /aria-controls="chat-live-line-body-task-one"/);
     assert.match(html, /Title<\/strong><br>/);
     assert.match(html, /Body<\/strong><br>/);
+    // An evolving line is released with its current source row, so visibility
+    // protection must see it; that row may render elsewhere, so it is a locator.
+    const receipt = buildTimelineItemHtml({ lineKey: 'terminal-receipt', dedupeKey: 'cardrow|merge-receipt:r',
+        sourceHistoryId: 'progress:9', phase: 'result', headline: 'PR #7 merge: merged' }, { expandedLineKeys: new Set(), groupId: 'task' });
+    assert.match(receipt, /data-source-history-id="progress:9"/);
+    assert.doesNotMatch(receipt, /data-history-id/);
+    const live = buildTimelineItemHtml({ lineKey: 'live', phase: 'working', headline: 'Live only' }, { expandedLineKeys: new Set(), groupId: 'task' });
+    assert.doesNotMatch(live, /history-id/);
+});
+
+test('history stamps pair each row and source-only locator with its node', () => {
+    const row = { dataset: { historyId: 'progress:4' } }, terminal = { dataset: { sourceHistoryId: 'progress:4' } };
+    const root = { querySelectorAll: selector => ({ '[data-history-id]': [row], '[data-source-history-id]': [terminal] })[selector] };
+    assert.deepEqual(historyStamps(root), [['progress:4', row], ['progress:4', terminal]]);
 });
 
 test('selection crossing a header is protected even with both endpoints outside', () => {
@@ -187,4 +298,21 @@ test('delegated header activation respects selection, nested controls and one ke
     handlers.click({ ...event, target: link });
     handlers.keydown({ ...event, target: link, key: 'Enter' });
     assert.equal(calls, 3);
+});
+
+test('a line disclosure or late full output keeps a pinned timeline where it is; a new newest line is followed', () => {
+    const f = rendererFixture();
+    f.record.items = [{ lineKey: 'one' }, { lineKey: 'two' }];
+    f.renderLiveCardTimeline(f.record);
+    assert.equal(f.record.timelineEl.scrollTop, 40, 'a fresh timeline opens at its newest line');
+    f.record.timelineEl.scrollTop = 10; // still within the pinned band
+    f.record.expandedLineKeys.add('one');
+    assert.equal(f.renderLiveCardTimeline(f.record), true);
+    assert.equal(f.record.timelineEl.scrollTop, 10, 'expanding the line being read does not scroll it away');
+    f.record.items[0].body = 'The fetched full output';
+    assert.equal(f.renderLiveCardTimeline(f.record), true);
+    assert.equal(f.record.timelineEl.scrollTop, 10);
+    f.record.items.push({ lineKey: 'three' });
+    f.renderLiveCardTimeline(f.record);
+    assert.equal(f.record.timelineEl.scrollTop, 60, 'a new newest line is followed');
 });

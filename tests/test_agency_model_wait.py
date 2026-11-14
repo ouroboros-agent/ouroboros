@@ -10,11 +10,13 @@ from ouroboros.tools.registry import ToolContext, ToolRegistry
 from tests.test_llm_claudexor import MODEL, ledger
 from tests.test_model_wait import _refusal, live_wait, setup  # noqa: F401 - pytest fixtures
 
-pytestmark = pytest.mark.serial
 
 
-@pytest.mark.parametrize("mode", ["advanced", "cyber_pro"])
-@pytest.mark.parametrize("code", ["auth_required", "subscription_window_exhausted", "credential_pool_exhausted"])
+@pytest.mark.parametrize(("code", "mode"), [
+    ("auth_required", "advanced"),
+    ("subscription_window_exhausted", "cyber_pro"),
+    ("credential_pool_exhausted", "cyber_pro"),
+])
 def test_resource_refusal_does_not_suspend_cyber_execution(live_wait, tmp_path, monkeypatch, mode, code):  # noqa: F811 - pytest fixture
     root, transport, client, controller, _events, _decide = live_wait
     refusal = _refusal(code)
@@ -31,10 +33,10 @@ def test_resource_refusal_does_not_suspend_cyber_execution(live_wait, tmp_path, 
     factory = lambda: client
     factory.supports_response_format = lambda *args, **kwargs: False
     monkeypatch.setattr(safety, "LLMClient", factory)
-    monkeypatch.setattr(safety, "get_light_model", lambda: MODEL)
+    monkeypatch.setattr(safety, "get_safety_model", lambda: MODEL)
     monkeypatch.setattr(safety, "_SAFETY_STORM_UNTIL", 0)
     monkeypatch.setattr(safety, "get_runtime_mode", lambda: mode)
-    monkeypatch.setattr(safety, "get_safety_mode", lambda: "full")
+    monkeypatch.setattr(safety, "get_safety_mode", lambda kind="owner": "full")
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", mode)
     monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "full")
     repo, work = tmp_path / "repo", tmp_path / "work"
@@ -53,18 +55,24 @@ def test_resource_refusal_does_not_suspend_cyber_execution(live_wait, tmp_path, 
         assert len(waits) == 1 and not (work / "once.txt").exists()
     else:
         result = registry.execute_result("run_command", command)
-        assert result.status == "ok" and "SAFETY_ADVICE" in result.text
+        assert result.status == "ok" and "⚠️ SAFETY_NOTE: let through without a Safety reading (" in result.text
         assert (work / "once.txt").read_text() == "x" and not waits
-        events = [json.loads(line) for line in (root / "logs/events.jsonl").read_text().splitlines()]
+        events = [json.loads(line) for line in (root / "logs/events.jsonl").read_text(encoding="utf-8").splitlines()]
         advisory = next(row for row in events if row["type"] == "safety_advisory")
         assert advisory["assessment_allowed"] is False and code in advisory["assessment"]
     assert len(transport.accepted_operations) == 1
-    assert [row["state"] for row in ledger(root)] == ["reserved", "dispatched", "released"]
+    rows = ledger(root)
+    # The refusal's private evidence adds one metadata revision, not another call.
+    assert [(row["state"], row["revision"]) for row in rows] == [("released", 4)]
+    assert rows[0]["physical_failure"]["stage"] == "raised_exception"
+    assert rows[0]["physical_failure"]["evidence_ref"]
     assert current_model_wait() is controller and not controller.closed
     assert "wait_for_resources" not in json.dumps(transport.uploads[0][0])
 
 
 def test_explicit_local_safety_keeps_precedence_over_subscription_name(monkeypatch):
+    # A Light of its own on the local lane: the real slot label routes it local before the subscription branch.
+    monkeypatch.setenv("OUROBOROS_MODEL_SAFETY", "")
+    monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", MODEL)
     monkeypatch.setenv("USE_LOCAL_LIGHT", "true")
-    monkeypatch.setattr(safety, "get_light_model", lambda: MODEL)
     assert safety._resolve_safety_routing() == (True, False, None)

@@ -1,9 +1,13 @@
-/* Pure Widgets list helpers (no DOM): the per-card and whole-list change
-   signatures the page compares after every `GET /api/widgets`, and the keyed
-   patch plan it applies to the existing <article> nodes when the list changed.
+/* Widgets list seam (no DOM): the per-card and whole-list change signatures the
+   page compares after every `GET /api/widgets`, the keyed patch plan it applies
+   to the existing <article> nodes when the list changed, and the list READ
+   itself — its shared deadline, its sibling-abort policy and the controller
+   lifecycle navigation and disposal cancel through.
    Card order is deliberately NOT part of the list signature — `widget_order`
    is a separate, cheap fact the page applies through the masonry key order,
    never by moving or rebuilding nodes. */
+
+import { WIDGET_REQUEST_TIMEOUT_MS, withWidgetRequestTimeout } from './widget_job.js';
 
 export function widgetKey(tab) {
     return tab.key || `${tab.skill}:${tab.tab_id}`;
@@ -22,6 +26,12 @@ function stableStringify(value) {
     return JSON.stringify(value) ?? 'null';
 }
 
+/** The publication a mount is bound to: an ESM entry's file lease ends with its `generation`, while a classic
+ * frame follows `revision` alone, so a same-bytes republication or server restart keeps it running. */
+export function widgetPublication(tab) {
+    return tab?.render?.entry_type === 'module' ? String(tab.generation ?? '') : '';
+}
+
 /** Everything a card's mount consumes, plus the owning skill's `revision`. */
 export function widgetCardSignature(tab) {
     return stableStringify({
@@ -32,6 +42,7 @@ export function widgetCardSignature(tab) {
         ws_prefix: tab.ws_prefix ?? '',
         render: tab.render ?? null,
         revision: tab.revision ?? '',
+        generation: widgetPublication(tab),
     });
 }
 
@@ -52,4 +63,77 @@ export function planWidgetListPatch(previousTabs, nextTabs) {
         else if (before.get(key) !== widgetCardSignature(tab)) changed.push(key);
     }
     return { added, changed, removed: [...before.keys()].filter((key) => !after.has(key)) };
+}
+
+/**
+ * One Widgets-list read: the cards and the owner's card preferences under ONE
+ * abort controller and ONE deadline that spans headers AND body of both.
+ *
+ * Failure asymmetry is deliberate: the cards ARE the page, so a timeout or a
+ * list failure aborts its preferences sibling and surfaces; a preferences
+ * failure degrades to `null` and the last known order is kept. The deadline
+ * still covers a preferences-only stall, because `Promise.all` cannot settle
+ * until both sides do.
+ *
+ * Exported so the deadline is testable against a fake clock as the product
+ * composes it, rather than against a copy of it.
+ *
+ * @returns {Promise<[import('./api_types.js').WidgetsResponse, any]>}
+ */
+/**
+ * The cards list is authoritative for what may be STOPPED (a kept-running frame
+ * whose skill left the list), so a reply without an `ui_tabs` array is refused
+ * rather than read as "no cards": a truncated or foreign body must never
+ * dispose retained work.
+ */
+export function assertWidgetsList(data) {
+    if (!data || typeof data !== 'object' || !Array.isArray(data.ui_tabs)) {
+        const error = new Error('malformed widgets list response: ui_tabs is not an array');
+        error.code = 'WIDGET_LIST_MALFORMED';
+        throw error;
+    }
+    return data;
+}
+
+export function requestWidgetListPayload(client, controller, timeoutMs = WIDGET_REQUEST_TIMEOUT_MS) {
+    return withWidgetRequestTimeout((signal) => Promise.all([
+        client.widgets({ signal }).then(assertWidgetsList).catch((error) => {
+            controller.abort();
+            throw error;
+        }),
+        client.uiPreferences({ signal }).catch(() => null),
+    ]), controller, timeoutMs);
+}
+
+/** The cards alone, under the same deadline — the kept-running reconcile. */
+export function requestWidgetCards(client, controller, timeoutMs = WIDGET_REQUEST_TIMEOUT_MS) {
+    return withWidgetRequestTimeout((signal) => client.widgets({ signal }).then(assertWidgetsList), controller, timeoutMs);
+}
+
+/**
+ * The Widgets page's list-request lifecycle: one controller per read, tracked
+ * so navigation, disposal or page hide can cancel whatever is in flight.
+ *
+ * Owning it here keeps the page module from repeating the same
+ * create/track/finally/abort-all shape at four call sites, and makes the
+ * cancellation contract testable on its own.
+ */
+export function widgetListRequests() {
+    const controllers = new Set();
+    return {
+        async run(task) {
+            const controller = new AbortController();
+            controllers.add(controller);
+            try {
+                return await task(controller);
+            } finally {
+                controllers.delete(controller);
+            }
+        },
+        abortAll() {
+            controllers.forEach((controller) => controller.abort());
+            controllers.clear();
+        },
+        get size() { return controllers.size; },
+    };
 }

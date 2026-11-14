@@ -16,30 +16,41 @@ from tests._delegated_transport_shared import (
 )
 
 
+
+
 @pytest.mark.parametrize('selected,expected', [(None, 'workspace_write'), ('workspace_write', 'workspace_write'), ('full', 'full')])
-def test_selected_access_applies_only_to_mutating_assignments(selected, expected):
+def test_selected_access_drives_the_shape_and_write_authority_its_purpose(selected, expected):
+    """#1609: technical access decides the shape; write authority decides only whether
+    the private copy can ever be integrated (acting) or is evidence (investigation)."""
     kwargs = {} if selected is None else {'access': selected}
     assert subagents.delegated_run_shape(True, **kwargs) == subagents.DelegatedRunShape(expected, 'agent', 'live', True)
-    assert subagents.delegated_run_shape(False, **kwargs) == subagents.DelegatedRunShape('readonly', 'ask')
+    assert subagents.delegated_run_shape(False, **kwargs) == subagents.DelegatedRunShape(
+        expected, 'agent', 'live', True, investigation=True)
 
 
-def test_invalid_access_is_not_silently_widened():
+def test_explicit_readonly_stays_readonly_and_invalid_access_is_refused():
     with pytest.raises(ValueError, match='workspace_write or full'):
         subagents.delegated_run_shape(True, 'inherit_native')
-    assert subagents.delegated_run_shape(False, 'full').access == 'readonly'
+    with pytest.raises(ValueError, match='workspace_write or full'):
+        subagents.delegated_run_shape(False, 'inherit_native')
+    for acting in (True, False):
+        assert subagents.delegated_run_shape(acting, 'readonly') == subagents.DelegatedRunShape('readonly', 'ask')
 
 
 @pytest.fixture
 def full_run(tmp_path, monkeypatch):
     from ouroboros import claudexor_daemon
+    from ouroboros.gateways import claudexor_run_events
 
+    monkeypatch.setattr(claudexor_run_events, '_SUPPORT', {})
     monkeypatch.setenv('OUROBOROS_SUBAGENT_HARNESS', 'some-route=selected-model:max')
     monkeypatch.setenv('OUROBOROS_DATA_DIR', str(tmp_path / 'data'))
     monkeypatch.setenv('OUROBOROS_SUBAGENT_WORKTREE_ROOT', str(tmp_path / 'snapshots'))
     ctx = _delegating_ctx(tmp_path, acting=True)
     target = str(Path(ctx.workspace_root).resolve())
     facts = {'requests': [], 'trust_posts': [], 'allow': False, 'recorded': False,
-             'lost_start': False, 'fail_trust': False, 'selected_access': 'full'}
+             'lost_start': False, 'fail_trust': False, 'selected_access': 'full',
+             'terminal_reads': 0}
     state = {'repoRoot': target, 'path': '/fixture/trust/project.yaml',
              'allowFullAccess': False, 'accessDefault': 'workspace_write', 'testCommandGrantCount': 0}
 
@@ -61,6 +72,8 @@ def full_run(tmp_path, monkeypatch):
                                           'accessProfilesSupported': ['readonly', 'workspace_write', 'full']}]})
         if path == '/v2/quota':
             return httpx.Response(200, json={'snapshots': [], 'absences': []})
+        if path == '/v2/operations':
+            return httpx.Response(200, json={'operations': []})
         if path == '/v2/projects':
             return httpx.Response(200, json={'projects': [{'id': 'stable-project', 'root': target}]})
         if path == '/v2/trust':
@@ -84,6 +97,11 @@ def full_run(tmp_path, monkeypatch):
             if facts['lost_start']:
                 raise httpx.ReadTimeout('start response lost')
             return httpx.Response(200, json={'runId': 'full-run', 'runDir': str(tmp_path / 'run')})
+        if path == '/v2/runs/full-run' and request.method == 'GET':
+            facts['terminal_reads'] += 1
+            return httpx.Response(200, json={'lastSeq': 1, 'primaryOutput': 'Implemented the fixture.',
+                                          'summary': {'state': 'succeeded', 'effectiveAccess': 'full',
+                                                      'spendUsd': 0.0, 'spendEstimated': False}})
         raise AssertionError((request.method, path))
 
     def connect():
@@ -96,6 +114,7 @@ def full_run(tmp_path, monkeypatch):
 
 
 def test_full_start_http_contract_and_real_snapshot_capture(full_run):
+    from ouroboros import claudexor_daemon
     from ouroboros.tools.subagent_integration import _integrate_delegated_patch
 
     ctx, target, facts = full_run
@@ -112,6 +131,10 @@ def test_full_start_http_contract_and_real_snapshot_capture(full_run):
     assert 'ACCESS: full native process access is requested' in request['instructions']
     assert 'effective access is established by the run receipt' in request['instructions']
     assert 'private snapshot is not an OS sandbox' in request['instructions']
+    assert result['execution_root'] in request['instructions']
+    assert f"the private execution root for this run is {result['execution_root']}:" in request['instructions']
+    assert target in request['instructions']
+    assert 'read-only identity/reference' in request['instructions']
     assert request['instructions'].count('this line governs native process access') == 1
     assert 'OS-enforced boundary' not in result['note']
     assert facts['trust_posts'] == [{'repoRoot': target, 'allowFullAccess': True}]
@@ -121,12 +144,28 @@ def test_full_start_http_contract_and_real_snapshot_capture(full_run):
     assert not (Path(target) / 'native-result.py').exists()
     row = custody.replay(custody.custody_root(ctx))['full-run']
     assert row.access == 'full' and row.project_persistent and row.snapshot_id == key
+    assert row.execution_binding_fingerprint
+    # A process-local flag is not settlement: disposition refreshes durable custody.
     row.settled = True
     custody._CUSTODY['full-run'] = row
-    capture = delegate._capture_terminal_patch(ctx, row)
+    premature = _integrate_delegated_patch(ctx, 'full-run', 'apply', 'Not settled durably.')
+    assert 'INTEGRATE_DELEGATED_NOT_TERMINAL' in premature, premature
+    assert not (Path(target) / 'native-result.py').exists()
+    assert not custody.replay(custody.custody_root(ctx))['full-run'].settled
+    gateway = claudexor_daemon.ensure_owned_gateway()
+    try:
+        terminal = json.loads(delegate._read_run(ctx, 'full-run', gateway=gateway))
+    finally:
+        gateway.close()
+    assert terminal['status'] == 'terminal' and terminal['settlement']['settled']
+    assert terminal['primary_output'] == 'Implemented the fixture.' and facts['terminal_reads'] == 1
+    capture = terminal['workspace_capture']
     assert capture['status'] == 'ready_with_changes'
     assert capture['authority_target_root'] == target
     assert not (Path(target) / 'native-result.py').exists()
+    custody._CUSTODY.clear()  # Integration must also work after a worker loses its memo.
+    replayed = custody.replay(custody.custody_root(ctx))['full-run']
+    assert replayed.settled and replayed.terminal_state == 'succeeded' and replayed.patch_captured
     outcome = _integrate_delegated_patch(ctx, 'full-run', 'apply', 'Fixture verified.')
     assert '✅ Integrated' in outcome, outcome
     assert (Path(target) / 'native-result.py').read_text(encoding='utf-8') == 'result = 42\n'
@@ -267,7 +306,8 @@ def test_owner_http_save_projects_full_choice_into_task_start_snapshot(monkeypat
         'recommended_use': 'Implementation on this installation.', 'access': 'full',
     }]}
     with TestClient(app) as client:
-        response = client.post('/api/settings', json={SUBAGENTS_SETTING: config})
+        # A worker row, not a reviewer: the owner confirms the empty review pool.
+        response = client.post('/api/settings', json={SUBAGENTS_SETTING: config, 'allow_empty_review_pool': True})
         assert response.status_code == 200, response.text
         assert json.loads(json.loads(isolated_settings.read_text(encoding='utf-8'))[SUBAGENTS_SETTING])['items'][0]['access'] == 'full'
         start = apply_task_start_settings()
@@ -275,7 +315,56 @@ def test_owner_http_save_projects_full_choice_into_task_start_snapshot(monkeypat
         assert selected['access'] == 'full'
         assert json.loads(start.environ[SUBAGENTS_SETTING])['items'][0]['access'] == 'full'
         config['items'][0]['access'] = 'workspace_write'
-        response = client.post('/api/settings', json={SUBAGENTS_SETTING: config})
+        response = client.post('/api/settings', json={SUBAGENTS_SETTING: config, 'allow_empty_review_pool': True})
         assert response.status_code == 200
         assert selected['access'] == 'full'
         assert json.loads(start.environ[SUBAGENTS_SETTING])['items'][0]['access'] == 'full'
+
+
+@pytest.mark.parametrize("historical", [False, True])
+def test_retry_preserves_recorded_binding_evidence(full_run, monkeypatch, historical):
+    ctx, target, facts = full_run
+    facts["lost_start"] = True
+    with monkeypatch.context() as prior:
+        if historical:
+            prior.setattr(delegate, "execution_binding_fingerprint", lambda *args: "")
+            prior.setattr(delegate, "execution_binding_text", lambda *args, **kwargs: "")
+        initial = delegate_payload(delegate._delegate_start(ctx, "Exact original assignment."))
+    invocation = initial["pending_invocation_id"]
+    drive = custody.custody_root(ctx)
+    recorded = custody.invocation_record(drive, invocation)
+    fingerprint = recorded["execution_binding_fingerprint"]
+    assert bool(fingerprint) is not historical
+    original_request = facts["requests"][0]
+    facts["lost_start"] = False
+    result = delegate_payload(delegate._delegate_start(
+        ctx, "Exact original assignment.", retry_of=invocation))
+    assert result["status"] == "started", result
+    assert facts["requests"] == [original_request, original_request]
+    assert custody.invocation_record(drive, invocation)["execution_binding_fingerprint"] == fingerprint
+    assert custody.replay(drive)["full-run"].execution_binding_fingerprint == fingerprint
+
+
+def test_research_retry_keeps_investigation_purpose_and_exact_copy(full_run):
+    from ouroboros.contracts.task_constraint import TaskConstraint
+    from ouroboros.tools.delegate_integration import _resolve_retry_invocation
+    from ouroboros.delegate_registration_policy import candidate_apply_possible
+
+    ctx, target, facts = full_run
+    # Keep the same readable workspace, but the task has no candidate-write grant.
+    ctx.task_constraint = TaskConstraint(mode='local_readonly_subagent')
+    facts['lost_start'] = True
+    first = delegate_payload(delegate._delegate_start(ctx, 'Investigate the fixture.'))
+    token = first['pending_invocation_id']
+    body = facts['requests'][0]
+    binding, refusal = _resolve_retry_invocation(ctx, custody.custody_root(ctx), token, 'Investigate the fixture.')
+    assert refusal is None and binding.authority.investigation
+    assert binding.authority_source == 'investigation'
+    facts['lost_start'] = False
+    resumed = delegate_payload(delegate._delegate_start(ctx, 'Investigate the fixture.', retry_of=token))
+    assert resumed['status'] == 'started', resumed
+    assert facts['requests'] == [body, body]
+    assert 'evidence-only investigation' in resumed['note']
+    entry = custody.replay(custody.custody_root(ctx))['full-run']
+    assert entry.authority_source == 'investigation' and not candidate_apply_possible(entry)
+    assert entry.execution_root == body[0]['execution']['workspaceRoot']

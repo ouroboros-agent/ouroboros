@@ -49,7 +49,7 @@ def register(api):
     api.register_route("author-kit", author_kit, methods=("GET",))
     api.register_route("page", page, methods=("GET",))
     api.register_ui_tab("module", "Shared controls", render={
-        "kind": "module", "entry": "widget.js",
+        "kind": "module", "entry": "widget.js", "appearance": "host",
     })
     api.register_ui_tab("page", "Independent page", render={
         "kind": "iframe", "route": "page",

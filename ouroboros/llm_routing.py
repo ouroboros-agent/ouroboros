@@ -12,6 +12,7 @@ or capability-learning paths.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -20,15 +21,26 @@ from typing import Any, Dict, List, Optional, Tuple
 from ouroboros.request_wire_recovery import request_wire_scoped
 from ouroboros.model_wait import dispatch_deadline_remaining_sec
 from ouroboros.openrouter_attribution import OPENROUTER_APP_HEADERS
+from ouroboros.provider_connections import connection_rows, connection_values
 from ouroboros.provider_models import (
+    CONNECTIONS_KEY,
     DEEPSEEK_BASE_URL,
-    PROVIDER_PREFIXES,
+    RouteParts,
+    compatible_endpoint,
+    compatible_endpoint_configured,
+    resolve_zai_base_url,
     normalize_anthropic_model_id,
     normalize_model_identity,
     parse_claudexor_model,
+    parse_model_route,
     resolve_minimax_base_url,
 )
 from ouroboros.config import runtime_setting
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+# Asks OpenRouter to report its upstream attempts, so a router's final status
+# cannot hide the cause an upstream returned (the attribution headers stay their own SSOT).
+OPENROUTER_METADATA_HEADERS = {"X-OpenRouter-Metadata": "enabled"}
 
 
 _OR_PROVIDER_PRESETS = {
@@ -38,10 +50,11 @@ _OR_PROVIDER_PRESETS = {
 }
 
 
-def _resolve_or_provider() -> Dict[str, Any]:
-    """Resolve ``OUROBOROS_OR_PROVIDER`` (a preset name or a raw JSON object) into an
-    OpenRouter ``provider`` routing dict. Empty/unset/invalid -> ``{}`` (no routing)."""
-    raw = (runtime_setting("OUROBOROS_OR_PROVIDER") or "").strip()
+def _or_provider_value(raw: Any) -> Dict[str, Any]:
+    """One routing value: a preset name, raw JSON object text, or an object (copied)."""
+    if isinstance(raw, dict):
+        return copy.deepcopy(raw)
+    raw = str(raw or "").strip()
     if not raw:
         return {}
     preset = _OR_PROVIDER_PRESETS.get(raw.lower())
@@ -52,6 +65,140 @@ def _resolve_or_provider() -> Dict[str, Any]:
     except (ValueError, TypeError):
         return {}
     return dict(parsed) if isinstance(parsed, dict) else {}
+
+
+def _resolve_or_provider(connection_routing: Any = None) -> Dict[str, Any]:
+    """Resolve ``OUROBOROS_OR_PROVIDER`` (a preset name or a raw JSON object) into an
+    OpenRouter ``provider`` routing dict, with a connection's own ``provider_routing``
+    (same vocabulary) merged over it for that connection's requests only.
+    Empty/unset/invalid -> ``{}`` (no routing)."""
+    return {**_or_provider_value(runtime_setting("OUROBOROS_OR_PROVIDER")),
+            **_or_provider_value(connection_routing)}
+
+
+def _resolver_route(model: str) -> RouteParts:
+    """The route the resolver reads; a `` (local)`` display spelling keeps the remote
+    head it always resolved to, its suffix staying part of the model id."""
+    text = str(model or "").strip()
+    if not text.endswith(" (local)"):
+        return parse_model_route(text)
+    inner = parse_model_route(text[:-len(" (local)")])
+    return RouteParts(inner.kind, inner.connection, inner.model + " (local)", valid=inner.valid)
+
+
+def resolve_target(model: str, settings: Optional[Dict[str, Any]] = None, *,
+                   api_key_override: Optional[str] = None,
+                   openrouter_base_url: str = OPENROUTER_BASE_URL) -> Dict[str, Any]:
+    """The provider target for ``model``: provider, endpoint, credential and headers.
+
+    The route names its connection (``provider_models.parse_model_route``); the
+    built-in one reads its kind's flat settings, a named one its row, through the
+    same per-kind branch (``provider_connections.connection_values``, which refuses
+    an unknown, disabled or mismatched connection). ``settings`` is a request-local
+    mapping; without it the runtime view is read. Building a target builds no client.
+    """
+    explicit_settings = settings is not None
+
+    def configured(key: str, default: Any = "") -> Any:
+        if explicit_settings:
+            return settings.get(key, default)  # type: ignore[union-attr]
+        return runtime_setting(key, default)
+
+    route = _resolver_route(model)
+    provider, resolved_model = route.kind, route.model.strip()
+    if provider == "claudexor" and route.valid:
+        source, native_model = parse_claudexor_model(model)
+        return {
+            "provider": provider, "source": source, "resolved_model": native_model,
+            "usage_model": f"claudexor::{resolved_model}", "api_key": "", "default_headers": {},
+            # The daemon's address as route identity only; discovery never uses it, and each
+            # attempt states the model's real (remote) locality (llm_claudexor._accounted_request).
+            "base_url": "http://127.0.0.1", "supports_openrouter_extensions": False,
+            "supports_generation_cost": False, "connection": "",
+        }
+    get = connection_values(route, configured, connection_rows(configured(CONNECTIONS_KEY, None)))
+    if provider == "anthropic":
+        resolved_model = normalize_anthropic_model_id(resolved_model)
+    usage_model = (f"{provider}@{route.connection}::{resolved_model}" if route.connection
+                   else _ProviderRoutingMixin._qualified_model_name(provider, resolved_model))
+    return {"provider": provider, "resolved_model": resolved_model, "usage_model": usage_model,
+            **_kind_target(provider, get, route.connection, configured,
+                           api_key_override=None if explicit_settings else api_key_override,
+                           openrouter_base_url=OPENROUTER_BASE_URL if explicit_settings else openrouter_base_url),
+            "connection": route.connection}
+
+
+_DIRECT_LANE = {"supports_openrouter_extensions": False, "supports_generation_cost": False}
+
+
+def _kind_target(provider: str, get: Any, connection: str, configured: Any, *,
+                 api_key_override: Optional[str], openrouter_base_url: str) -> Dict[str, Any]:
+    """One kind's transport facts from its connection's fields (``get``)."""
+    if provider == "openai":
+        return {"api_key": get("api_key", ""), "base_url": "https://api.openai.com/v1", "default_headers": {},
+                **_DIRECT_LANE}
+    if provider == "anthropic":
+        return {"api_key": get("api_key", ""), "base_url": "https://api.anthropic.com/v1", "default_headers": {},
+                "contract_headers": {"anthropic-version": "2023-06-01"}, **_DIRECT_LANE}
+    if provider == "minimax":
+        # Request separate reasoning carriers and replay them unchanged
+        # on this direct lane so interleaved thinking survives tool calls.
+        return {"api_key": get("api_key", ""), "base_url": resolve_minimax_base_url(get("region", "")),
+                "default_headers": {}, "reasoning_split": True, **_DIRECT_LANE}
+    if provider == "deepseek":
+        # One official endpoint; no owner-configurable base URL (proxy/mirror setups
+        # belong to the openai-compatible slot). v4 thinks by default and carries
+        # reasoning_effort; the canonical scale is projected onto its low/high/max enum
+        # in _build_remote_kwargs. Tool-bearing requests MUST replay every previous
+        # assistant turn's reasoning_content (v4-pro enforces with a 400; "" is
+        # accepted for foreign turns — probed 2026-09-01).
+        return {"api_key": get("api_key", ""), "base_url": DEEPSEEK_BASE_URL, "default_headers": {},
+                "requires_reasoning_echo": True, **_DIRECT_LANE}
+    if provider == "zai":
+        # Plan-selected official endpoint (PAYG default; the Coding Plan endpoint is
+        # intended for supported tools only).
+        return {"api_key": get("api_key", ""), "base_url": resolve_zai_base_url(get("plan", "")),
+                "default_headers": {}, **_DIRECT_LANE}
+    if provider == "cloudru":
+        return {"api_key": get("api_key", ""),
+                "base_url": (get("base_url", "") or "").strip() or "https://foundation-models.api.cloud.ru/v1",
+                "default_headers": {}, **_DIRECT_LANE}
+    if provider == "gigachat":
+        # GigaChat is NOT OpenAI-compatible — the `gigachat` library owns the transport
+        # and auth: `api_key` holds the authorization key (base64 client_id:secret) for
+        # the OAuth flow, OR user/password for basic auth against an internal endpoint.
+        # base_url/scope/verify are carried for the `_chat_gigachat` path.
+        verify = get("verify_ssl_certs", "")
+        verify_raw = ("" if verify is None else str(verify)).strip().lower()
+        return {
+            "api_key": get("credentials", ""), "user": (get("user", "") or "").strip(),
+            "password": get("password", "") or "",
+            "base_url": (get("base_url", "") or "").strip() or "https://api.giga.chat/v1",
+            "scope": (get("scope", "") or "").strip() or "GIGACHAT_API_PERS",
+            "verify_ssl_certs": verify_raw not in ("0", "false", "no", "off"), "default_headers": {}, **_DIRECT_LANE,
+        }
+    if provider == "openai-compatible":
+        if connection:
+            api_key, base_url = str(get("api_key", "") or "").strip(), str(get("base_url", "") or "").strip()
+            keyless = not api_key
+        else:
+            # One pair on every path (request-local mapping and ambient settings alike):
+            # a dedicated endpoint never borrows the legacy OpenAI key.
+            def setting(key: str) -> str:
+                return str(configured(key, "") or "").strip()
+
+            api_key, base_url = compatible_endpoint(setting)
+            keyless = not api_key and compatible_endpoint_configured(setting)
+        # A pair configured without a key is the endpoint's no-auth setting; its
+        # transport sends no credential (net_transport.openai_client_class).
+        return {"api_key": api_key, "base_url": base_url, "keyless": keyless, "default_headers": {}, **_DIRECT_LANE}
+    return {
+        "api_key": get("api_key", "") if connection or api_key_override is None else api_key_override,
+        "base_url": openrouter_base_url,
+        "default_headers": {**OPENROUTER_APP_HEADERS, **OPENROUTER_METADATA_HEADERS},
+        "supports_openrouter_extensions": True, "supports_generation_cost": True,
+        "provider_routing": get("provider_routing", None) if connection else None,
+    }
 
 
 class _ProviderRoutingMixin:
@@ -168,7 +315,8 @@ class _ProviderRoutingMixin:
                 )
             finally:
                 try:
-                    _http_client.close()
+                    from ouroboros._usage_wait import close_after_model_send
+                    close_after_model_send(_http_client)
                 except Exception:
                     pass
 
@@ -208,7 +356,10 @@ class _ProviderRoutingMixin:
         system text block and dynamic evidence last.  Hash only that stable
         prefix plus the normalized model identity, so changing task evidence
         does not fragment the provider cache while different policies cannot
-        collide.  Routes without a leading system prefix simply opt out.
+        collide.  Routes without a leading system prefix simply opt out. For
+        the OpenAI family this prefix is also the whole OpenRouter session
+        identity (``_openrouter_session_identity``) and the block its send copy
+        keeps in the leading system message.
         """
         if not messages or str(messages[0].get("role") or "") != "system":
             return ""
@@ -255,10 +406,21 @@ class _ProviderRoutingMixin:
         model_id: str,
         messages: List[Dict[str, Any]],
     ) -> str:
-        """Conversation-stable OpenRouter affinity, bounded well below 256 chars."""
+        """Sticky OpenRouter affinity, bounded well below 256 chars.
+
+        Conversation-stable for every family but OpenAI's, whose public API reuses a
+        prompt cache only under one routing key and only for the whole leading system
+        section (measured 2026-09-25): there the session is one per model and governance
+        prefix, so a new task, child or wake is served the prefix its predecessors cached.
+        """
+        from ouroboros.llm_attempt import openai_family_model
+
         prefix_identity = cls._prompt_cache_identity(model_id, messages)
         if not prefix_identity:
             return ""
+        if openai_family_model(model_id):
+            digest = hashlib.sha256(f"{prefix_identity}\0openai-family".encode("utf-8")).hexdigest()[:32]
+            return f"ouroboros-session-{digest}"
         first_user: Any = ""
         for message in messages:
             if str(message.get("role") or "") == "user":
@@ -282,192 +444,28 @@ class _ProviderRoutingMixin:
 
     @staticmethod
     def _parse_provider_model(model: str) -> Tuple[str, str]:
-        model_name = str(model or "").strip()
-        for prefix, provider in PROVIDER_PREFIXES:
-            if model_name.startswith(prefix):
-                return provider, model_name[len(prefix):].strip()
-        return "openrouter", model_name
+        route = _resolver_route(model)
+        return route.kind, route.model.strip()
 
     @staticmethod
     def _qualified_model_name(provider: str, resolved_model: str) -> str:
         if provider == "openrouter":
             return resolved_model
-        if provider == "openai":
-            return f"openai/{resolved_model}"
-        if provider == "anthropic":
-            return f"anthropic/{resolved_model}"
-        if provider == "cloudru":
-            return f"cloudru/{resolved_model}"
-        if provider == "gigachat":
-            return f"gigachat/{resolved_model}"
-        if provider == "minimax":
-            return f"minimax/{resolved_model}"
-        if provider == "deepseek":
-            return f"deepseek/{resolved_model}"
         if provider == "claudexor":
             return f"claudexor::{resolved_model}"
-        return f"openai-compatible/{resolved_model}"
+        known = provider in {"openai", "anthropic", "cloudru", "gigachat", "minimax", "deepseek", "zai"}
+        return f"{provider if known else 'openai-compatible'}/{resolved_model}"
 
     def _resolve_remote_target(
         self,
         model: str,
         settings: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        explicit_settings = settings is not None
+        return resolve_target(model, settings, api_key_override=self._api_key_override,
+                              openrouter_base_url=self._base_url)
 
-        def configured(key: str, default: Any = "") -> Any:
-            if explicit_settings:
-                return settings.get(key, default)  # type: ignore[union-attr]
-            return runtime_setting(key, default)
-
-        provider, resolved_model = self._parse_provider_model(model)
-        usage_model = self._qualified_model_name(provider, resolved_model)
-
-        if provider == "claudexor":
-            source, native_model = parse_claudexor_model(model)
-            return {
-                "provider": provider, "source": source, "resolved_model": native_model,
-                "usage_model": usage_model, "api_key": "", "default_headers": {},
-                # A locality fact only; real daemon discovery never uses this URL.
-                "base_url": "http://127.0.0.1", "supports_openrouter_extensions": False,
-                "supports_generation_cost": False,
-            }
-
-        if provider == "openai":
-            return {
-                "provider": provider,
-                "resolved_model": resolved_model,
-                "usage_model": usage_model,
-                "api_key": configured("OPENAI_API_KEY", ""),
-                "base_url": "https://api.openai.com/v1",
-                "default_headers": {},
-                "supports_openrouter_extensions": False,
-                "supports_generation_cost": False,
-            }
-
-        if provider == "anthropic":
-            resolved_model = normalize_anthropic_model_id(resolved_model)
-            return {
-                "provider": provider,
-                "resolved_model": resolved_model,
-                "usage_model": self._qualified_model_name(provider, resolved_model),
-                "api_key": configured("ANTHROPIC_API_KEY", ""),
-                "base_url": "https://api.anthropic.com/v1",
-                "default_headers": {},
-                "contract_headers": {"anthropic-version": "2023-06-01"},
-                "supports_openrouter_extensions": False,
-                "supports_generation_cost": False,
-            }
-
-        if provider == "minimax":
-            return {
-                "provider": provider,
-                "resolved_model": resolved_model,
-                "usage_model": usage_model,
-                "api_key": configured("MINIMAX_API_KEY", ""),
-                "base_url": resolve_minimax_base_url(configured("MINIMAX_REGION", "")),
-                "default_headers": {},
-                "supports_openrouter_extensions": False,
-                "supports_generation_cost": False,
-            }
-
-        if provider == "deepseek":
-            return {
-                "provider": provider,
-                "resolved_model": resolved_model,
-                "usage_model": usage_model,
-                "api_key": configured("DEEPSEEK_API_KEY", ""),
-                # One official endpoint; no owner-configurable base URL
-                # (proxy/mirror setups belong to the openai-compatible slot).
-                "base_url": DEEPSEEK_BASE_URL,
-                "default_headers": {},
-                # v4 thinks by default and carries reasoning_effort; the
-                # canonical scale is projected onto its low/high/max enum in
-                # _build_remote_kwargs. Tool-bearing requests MUST replay every
-                # previous assistant turn's reasoning_content (v4-pro enforces
-                # with a 400; "" is accepted for foreign turns — probed 2026-09-01).
-                "requires_reasoning_echo": True,
-                "supports_openrouter_extensions": False,
-                "supports_generation_cost": False,
-            }
-
-        if provider == "cloudru":
-            return {
-                "provider": provider,
-                "resolved_model": resolved_model,
-                "usage_model": usage_model,
-                "api_key": configured("CLOUDRU_FOUNDATION_MODELS_API_KEY", ""),
-                "base_url": (
-                    configured("CLOUDRU_FOUNDATION_MODELS_BASE_URL", "") or ""
-                ).strip() or "https://foundation-models.api.cloud.ru/v1",
-                "default_headers": {},
-                "supports_openrouter_extensions": False,
-                "supports_generation_cost": False,
-            }
-
-        if provider == "gigachat":
-            # GigaChat is NOT OpenAI-compatible — the `gigachat` library owns
-            # the transport and auth. Everything is env-configurable: `api_key`
-            # holds the authorization key (base64 client_id:secret) for the OAuth
-            # flow, OR user/password for basic auth against an internal endpoint.
-            # base_url/scope/verify are carried for the `_chat_gigachat` path.
-            verify_raw = (configured("GIGACHAT_VERIFY_SSL_CERTS", "") or "").strip().lower()
-            return {
-                "provider": provider,
-                "resolved_model": resolved_model,
-                "usage_model": usage_model,
-                "api_key": configured("GIGACHAT_CREDENTIALS", ""),
-                "user": (configured("GIGACHAT_USER", "") or "").strip(),
-                "password": configured("GIGACHAT_PASSWORD", "") or "",
-                "base_url": (
-                    configured("GIGACHAT_BASE_URL", "") or ""
-                ).strip() or "https://api.giga.chat/v1",
-                "scope": (configured("GIGACHAT_SCOPE", "") or "").strip() or "GIGACHAT_API_PERS",
-                "verify_ssl_certs": verify_raw not in ("0", "false", "no", "off"),
-                "default_headers": {},
-                "supports_openrouter_extensions": False,
-                "supports_generation_cost": False,
-            }
-
-        if provider == "openai-compatible":
-            compatible_key = (configured("OPENAI_COMPATIBLE_API_KEY", "") or "").strip()
-            compatible_base_url = (configured("OPENAI_COMPATIBLE_BASE_URL", "") or "").strip()
-            legacy_base_url = (configured("OPENAI_BASE_URL", "") or "").strip()
-            legacy_key = (configured("OPENAI_API_KEY", "") or "").strip()
-            # A request-local mapping is authoritative as a PAIR: when its
-            # dedicated compatible endpoint is present, an explicitly empty
-            # compatible key must not be rehydrated from the legacy OpenAI key.
-            # Ordinary env-based chat keeps the historical per-field fallback.
-            if explicit_settings and compatible_base_url:
-                api_key = compatible_key
-                base_url = compatible_base_url
-            else:
-                api_key = compatible_key or legacy_key
-                base_url = compatible_base_url or legacy_base_url
-            return {
-                "provider": provider,
-                "resolved_model": resolved_model,
-                "usage_model": usage_model,
-                "api_key": api_key,
-                "base_url": base_url,
-                "default_headers": {},
-                "supports_openrouter_extensions": False,
-                "supports_generation_cost": False,
-            }
-
-        current_api_key = configured("OPENROUTER_API_KEY", "") if explicit_settings else self._api_key_override
-        if current_api_key is None:
-            current_api_key = runtime_setting("OPENROUTER_API_KEY", "")
-        return {
-            "provider": "openrouter",
-            "resolved_model": resolved_model,
-            "usage_model": usage_model,
-            "api_key": current_api_key,
-            "base_url": "https://openrouter.ai/api/v1" if explicit_settings else self._base_url,
-            "default_headers": dict(OPENROUTER_APP_HEADERS),
-            "supports_openrouter_extensions": True,
-            "supports_generation_cost": True,
-        }
+    # Non-chat provider facets share the same route, credential and header owner.
+    resolve_remote_target = _resolve_remote_target
 
     def _get_client(self):
         target = self._resolve_remote_target("openrouter::")
@@ -478,9 +476,7 @@ class _ProviderRoutingMixin:
         # The keepalive transport carries SDK-equivalent pool limits (an
         # explicit transport ignores the Client-level limits); on proxy-routed
         # installs the helper returns None and SDK defaults keep proxy mounts.
-        from openai import OpenAI
-
-        from ouroboros.net_transport import keepalive_http_client
+        from ouroboros.net_transport import keepalive_http_client, openai_client_class
 
         kwargs: Dict[str, Any] = {
             "api_key": str(target.get("api_key") or ""),
@@ -495,7 +491,7 @@ class _ProviderRoutingMixin:
             kwargs["base_url"] = base_url
         if headers:
             kwargs["default_headers"] = headers
-        return OpenAI(**kwargs)
+        return openai_client_class(target)(**kwargs)
 
     def _get_remote_client(self, target: Dict[str, Any]):
         base_url = str(target.get("base_url") or "")
@@ -503,22 +499,13 @@ class _ProviderRoutingMixin:
         headers = tuple(sorted(
             (str(k), str(v)) for k, v in dict(target.get("default_headers") or {}).items()
         ))
-        cache_key = (str(target.get("provider") or ""), base_url, api_key, headers)
+        from ouroboros.net_transport import extra_ca_bundle
+
+        cache_key = (str(target.get("provider") or ""), base_url, api_key, headers, extra_ca_bundle(),
+                     bool(target.get("keyless")))
         if cache_key not in self._remote_clients:
             self._remote_clients[cache_key] = self._new_remote_client(target)
         return self._remote_clients[cache_key]
-
-    def probe_oversized_context(
-        self, model: str, content: str, *,
-        base_url: str = "", max_output_tokens: int = 8, timeout: float = 20.0,
-        api_key: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        from ouroboros.llm_probe import probe_oversized_context
-
-        return probe_oversized_context(
-            self, model, content, base_url=base_url,
-            max_output_tokens=max_output_tokens, timeout=timeout, api_key=api_key,
-        )
 
     def probe_provider_readiness(
         self,
@@ -548,13 +535,14 @@ class _ProviderRoutingMixin:
         api_key = str(target.get("api_key") or "")
         headers_dict = dict(target.get("default_headers") or {})
         headers = tuple(sorted((str(k), str(v)) for k, v in headers_dict.items()))
-        cache_key = (str(target.get("provider") or ""), base_url, api_key, headers)
+        from ouroboros.net_transport import extra_ca_bundle
+
+        cache_key = (str(target.get("provider") or ""), base_url, api_key, headers, extra_ca_bundle(),
+                     bool(target.get("keyless")))
 
         client = self._async_remote_clients.get(cache_key)
         if client is None:
-            from openai import AsyncOpenAI
-
-            from ouroboros.net_transport import keepalive_http_client
+            from ouroboros.net_transport import keepalive_http_client, openai_client_class
 
             kwargs: Dict[str, Any] = {
                 "api_key": api_key,
@@ -567,7 +555,7 @@ class _ProviderRoutingMixin:
                 kwargs["base_url"] = base_url
             if headers_dict:
                 kwargs["default_headers"] = headers_dict
-            client = AsyncOpenAI(**kwargs)
+            client = openai_client_class(target, async_client=True)(**kwargs)
             self._async_remote_clients[cache_key] = client
         return client
 

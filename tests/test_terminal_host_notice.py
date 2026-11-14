@@ -1,5 +1,7 @@
 """Model answer identity and host disclosures through the real terminal consumers."""
 
+from tests import _dialogue as dialogue_test
+
 import asyncio
 from collections import deque
 import hashlib
@@ -11,6 +13,8 @@ import pytest
 
 from ouroboros import agent_task_pipeline as pipeline, loop
 from ouroboros.task_results import load_task_result, write_task_result
+from ouroboros.test_evidence import diagnostic_directory
+from tests._delivery_candidate_shared import write_child, write_confirmed_disposition_fixture
 from tests.test_delivery_forced_finalization import _bind_host_pass, _forced_test_context
 from tests.test_ui_smoke_playwright import direct_server_with_data as _direct_server_with_data
 
@@ -19,27 +23,30 @@ direct_server_with_data = _direct_server_with_data
 
 ANSWER = "Exact model answer: λ\n\nThe useful result."
 NOTICE = "Plan review remained open.\n\n⚠️ Deferred child result: child1."
+# The owner's incident decision, fed to the real producer
+# (ouroboros/owner_hurry.py plan_review_disclosure) rather than to a copied string.
+ADVISORY_PLAN_DECISION = {
+    "required": True, "status": "objections_open", "enforcement": "advisory", "allow": True,
+    "open_objections": [{"seat_id": "triad_a", "id": "o1", "text": "the bar is too low", "holds": True,
+                         "not_adjudicated": False, "ask_id": "a1", "revision": 1}],
+    "holding": ["triad_a:o1"], "pending_asks": [], "asks_dispatched": 1, "force_plan_met": True, "revision": 1,
+}
 
 
-@pytest.mark.parametrize("change", ["generation", "superseded", "replaced_panel"])
+@pytest.mark.parametrize("change", ["generation", "released"])
 def test_equal_evidence_fields_cannot_revive_changed_owner_authority(tmp_path, monkeypatch, change):
     _loop, tools, ctx, trace = _forced_test_context(tmp_path)
     old = loop._replace_delivery_candidate(tools, ctx, trace, ANSWER, control="candidate")
-    prior = _bind_host_pass(loop, tools, trace, old)
+    _bind_host_pass(loop, tools, trace, old)
     before = old.evidence_revision, old.evidence_fingerprint
     if change == "generation":
         tools._ctx._task_acceptance_owner_generation = 1
         tools._ctx.owner_message_admission_agent = SimpleNamespace(_owner_message_generation=2)
-    elif change == "superseded":
+    else:
         # The release notification follows real ingress; it is no longer a
         # declaration that the task's meaning changed by itself.
         tools._ctx._owner_directives = [{"content": "Use the newly supplied source."}]
-        loop._supersede_task_acceptance_for_owner_followup(tools._ctx, trace)
-    else:
-        prior["superseded_by_revision"] = True
-        trace["review_runs"].append({**prior, "superseded_by_revision": False,
-                                   "panel_id": "new-panel", "binding_hash": "new-binding", "aggregate_signal": "FAIL"})
-        trace["review_decision"].update(panel_id="new-panel", binding_hash="new-binding")
+        loop._release_for_owner_followup(tools._ctx, trace)
     assert loop._current_delivery_candidate(ctx, trace) is None
     assert (old.evidence_revision, old.evidence_fingerprint) == before
     monkeypatch.setattr(loop, "call_llm_with_retry", lambda *_a, **_kw: (None, 0.0))
@@ -50,7 +57,6 @@ def test_equal_evidence_fields_cannot_revive_changed_owner_authority(tmp_path, m
     assert text == ANSWER and current is not old
     assert current.acceptance_binding["authoritative"] is False
     assert current.acceptance_binding["stale_evidence"] is True
-    assert prior["superseded_by_revision"] is True
     assert "STALE-EVIDENCE NOTICE" in usage["terminal_host_notice"]
 
 
@@ -60,68 +66,103 @@ def test_normal_finalization_without_a_candidate_keeps_raw_answer(tmp_path, monk
     assert loop._live_delivery_candidate(ctx) is None
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
     monkeypatch.setattr(loop, "_maybe_inject_finalization_nudges", lambda *_a, **_kw: False)
-    monkeypatch.setattr(loop, "_force_plan_disclosure", lambda *_a, **_kw: NOTICE)
+    monkeypatch.setattr(loop, "_plan_gate_disclosure", lambda *_a, **_kw: NOTICE)
     text, usage, _trace = loop._no_tool_final_answer(answer, ctx, trace, tools, queue.Queue(), set(), lambda _t: None)
     assert text == answer and usage["terminal_host_notice"] == NOTICE
     assert NOTICE not in text
 
 
+def test_simultaneous_plan_and_deferred_limitations_stay_one_notice_beside_a_clean_answer(
+    tmp_path, monkeypatch,
+):
+    """Both incident facts at once on the NORMAL rail (ouroboros/loop_delivery.py).
+
+    The answer keeps its own bytes, the two host sentences compose ONE notice in
+    producer order, and the six typed fields every benchmark adapter republishes
+    (devtools/benchmarks/common/result_index.py) keep today's values. The single
+    ``degraded_reason`` slot holds the CHILD fact while the plan fact lives only
+    in the notice text; a commit that also carries the plan fact in typed state
+    must do so ADDITIVELY and leave this slot alone.
+
+    The disclosure is injected through ``_plan_gate_disclosure`` exactly as the
+    neighbouring tests do, so what is pinned here is the COMPOSITION and the
+    typed outcome, never the predicate that decides whether a review is open.
+    """
+    from ouroboros.outcomes import derive_loop_outcome
+    from ouroboros.owner_hurry import plan_review_disclosure
+
+    write_child(tmp_path)
+    write_confirmed_disposition_fixture(
+        tmp_path, disposition="deferred", rationale="defer until the next run",
+    )
+    plan_suffix = plan_review_disclosure(ADVISORY_PLAN_DECISION)
+    assert plan_suffix.strip(), "the advisory branch still produces a disclosure"
+
+    loop_mod, registry, ctx, trace = _forced_test_context(tmp_path)
+    monkeypatch.setattr(loop_mod, "_compute_subagent_handoff", lambda *_a, **_k: None)
+    monkeypatch.setattr(loop_mod, "_maybe_inject_finalization_nudges", lambda *_a, **_k: False)
+    monkeypatch.setattr(loop_mod, "_plan_gate_disclosure", lambda *_a, **_k: plan_suffix)
+    monkeypatch.setattr("ouroboros.tools.review_result.result_review_at_delivery", lambda *_a, **_kw: False)
+
+    result = loop_mod._no_tool_final_answer(
+        ANSWER, ctx, trace, registry, queue.Queue(), set(), lambda _text: None,
+    )
+    assert result is not None
+    text, usage, returned_trace = result
+
+    # The answer is the model's alone: benchmark scorers read these bytes.
+    assert text == ANSWER
+    notice = usage["terminal_host_notice"]
+    assert notice not in text
+    assert "Plan review" not in text and "DEFERRED CHILD RESULTS" not in text
+
+    # ONE notice: producer order (plan first), one blank-line join, prefix intact.
+    plan_part, separator, orphan_part = notice.partition("\n\n")
+    assert plan_part == plan_suffix.strip() and separator == "\n\n"
+    assert orphan_part.startswith("⚠️ DEFERRED CHILD RESULTS: child1")
+    assert notice.startswith("⚠️") and notice.count("DEFERRED CHILD RESULTS") == 1
+
+    # One degraded slot: the child fact wins while both facts are true.
+    candidate = registry._ctx._delivery_candidate
+    assert candidate.degraded is True
+    assert candidate.degraded_reason == "host_child_status_suffix"
+    assert candidate.model_text == ANSWER and candidate.full_text == ANSWER
+
+    outcome = derive_loop_outcome(text, usage, returned_trace)
+    assert outcome["degraded"] is True
+    assert outcome["degraded_reason"] == "host_child_status_suffix"
+    assert outcome["reason_code"] == "child_results_deferred"
+    execution = outcome["outcome_axes"]["execution"]
+    assert execution["status"] == "degraded"
+    assert execution["reason_code"] == "child_results_deferred"
+    assert execution["failure"]["deferred_count"] == 1
+    assert outcome["outcome_axes"]["objective"]["status"] == "best_effort"
+
+
 @pytest.mark.parametrize("verdict", ["FAIL", "PASS"])
-def test_host_notice_does_not_replace_or_supersede_an_unchanged_answer(tmp_path, monkeypatch, verdict):
-    import ouroboros.review_substrate as rs
+def test_a_delivery_warning_keeps_the_bound_result_reviews_assessment(tmp_path, monkeypatch, verdict):
+    """#533: a delivery warning (a degraded candidate beside its host notice) is a fact of its
+    own; it never erases the assessment of the result review bound to the delivered answer, in
+    the loop outcome, the stored task result and the terminal event alike."""
     from ouroboros.contracts.task_contract import build_task_contract
+    from ouroboros.outcomes import derive_loop_outcome, normalize_outcome_axes, public_task_result
+    from ouroboros.tools.review_result import _bind_review_run
 
     _loop, tools, ctx, trace = _forced_test_context(tmp_path)
     tools._ctx.task_contract = build_task_contract({"id": "parent1", "expected_output": "A report"})
     write_task_result(tmp_path, "parent1", "running", task_contract=tools._ctx.task_contract)
-    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "auto")
-    monkeypatch.setattr(rs, "triad_delivery_slots", lambda **_kw: [object()])
-    monkeypatch.setattr(loop, "_maybe_inject_finalization_nudges", lambda *_a, **_kw: False)
-    monkeypatch.setattr(loop, "_force_plan_disclosure", lambda *_a, **_kw: NOTICE)
-    subjects = []
-
-    def review(request, **_kwargs):
-        subjects.append(request.subject)
-        return rs.ReviewRunResult(
-            request={"surface": "task_acceptance", "policy": {"min_successful_slots": 1}},
-            actors=[{"slot_id": "s0", "signal": verdict, "parsed": {
-                "verdict": verdict, "outcome_tier": "solved" if verdict == "PASS" else "best_effort",
-                "criteria_used": [{"criterion": "report", "status": "supported", "evidence_refs": ["artifact:1"]}],
-            }}], parsed_findings=[], aggregate_signal=verdict,
-        )
-
-    monkeypatch.setattr(rs, "run_review_request", review)
-
-    def finalize():
-        result = loop._no_tool_final_answer(ANSWER, ctx, trace, tools, queue.Queue(), set(), lambda _t: None)
-        if result is not None:
-            assert result[0] == ANSWER
-            assert result[1]["terminal_host_notice"] == NOTICE
-        return result
-
-    first = finalize()
-    assert (first is None) is (verdict == "FAIL")  # A real FAIL still requests its ordinary improvement.
-    candidate = tools._ctx._delivery_candidate
-    assert finalize() is not None  # An unchanged answer reuses the verdict; its notice cannot demand a rewrite.
-    binding = dict(candidate.acceptance_binding)
-    assert finalize() is not None
-    assert subjects == [ANSWER]
-    assert tools._ctx._delivery_candidate is candidate
-    assert candidate.content_sha256 == hashlib.sha256(ANSWER.encode()).hexdigest()
-    assert candidate.revision == 1 and candidate.acceptance_binding == binding
-    assert not trace["review_runs"][0].get("superseded_by_revision")
-    assert trace["acceptance_decision"]["status"] == ("accepted" if verdict == "PASS" else "finalized_unaccepted")
-
-    # #533: transport/finalization warning must not erase the bound assessment.
-    from ouroboros.outcomes import derive_loop_outcome, normalize_outcome_axes, public_task_result
-    from ouroboros.task_results import load_task_result
+    loop._replace_delivery_candidate(tools, ctx, trace, ANSWER, control="candidate")
+    # The result review the delivery step bound to this answer (review_result.result_review_at_delivery).
+    findings = [{"severity": "critical", "item": "report", "reason": "the totals do not add up"}]
+    _bind_review_run(trace, {"record_id": "result-record-1", "verdict": {
+        "aggregate": verdict, "critical_findings": findings if verdict == "FAIL" else []}}, "b" * 64, "advisory")
 
     trace["delivery_candidate"].update(degraded=True, degraded_reason="advisory_plan_review_open")
     usage = {"terminal_host_notice": NOTICE}
     axes = derive_loop_outcome(ANSWER, usage, trace)["outcome_axes"]
     expected = "pass" if verdict == "PASS" else "fail"
     assert axes["objective"]["status"] == expected
-    assert axes["objective"]["source"] == "task_acceptance_review"
+    assert axes["objective"]["source"] == "result_review"
     assert axes["execution"]["status"] == "degraded"
     env = SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path)
     task = {"id": "parent1", "type": "task", "chat_id": 1, "text": "Produce a report",
@@ -129,20 +170,13 @@ def test_host_notice_does_not_replace_or_supersede_an_unchanged_answer(tmp_path,
     pipeline._store_task_result(env, task, ANSWER, usage, trace)
     stored = load_task_result(tmp_path, "parent1")
     assert stored["outcome_axes"]["objective"]["status"] == expected
-    assert normalize_outcome_axes(public_task_result(stored))["objective"]["source"] == "task_acceptance_review"
+    assert normalize_outcome_axes(public_task_result(stored))["objective"]["source"] == "result_review"
     pending = []
     pipeline.emit_task_results(env, None, None, pending, task, ANSWER, usage, trace,
                               start_time=0.0, drive_logs=tmp_path / "logs")
     terminal = next(row for row in pending if row["type"] == "task_done")
     assert terminal["outcome_axes"]["objective"]["status"] == expected
     assert load_task_result(tmp_path, "parent1")["outcome_axes"]["execution"]["status"] == "degraded"
-
-    # Real input changes still supersede the binding even when answer bytes match.
-    tools._ctx._owner_directives = [{"text": "Use the newly supplied source."}]
-    changed = loop._replace_delivery_candidate(tools, ctx, trace, ANSWER, control="candidate")
-    assert changed is not candidate and changed.revision > candidate.revision
-    assert changed.acceptance_binding["authoritative"] is False
-    assert trace["review_runs"][0]["superseded_by_revision"] is True
 
 
 def _emit_terminal(tmp_path, monkeypatch, *, direct=False, project=False, child=False, notice=NOTICE, answer=ANSWER):
@@ -241,11 +275,11 @@ def test_changed_notice_reopens_parent_disposition_and_automatic_handoff(tmp_pat
     assert loop._compute_subagent_handoff(tools, tmp_path, "parent1", "") == ""
 
 
-@pytest.mark.parametrize("mode", ["all_terminal", "any_terminal"])
-@pytest.mark.parametrize("answer", [ANSWER, ANSWER + "\n" + "model detail " * 1500, ""],
-                         ids=["short_answer", "long_answer", "no_answer"])
-@pytest.mark.parametrize("notice", [NOTICE, NOTICE + "\n" + "retained host evidence " * 1500 + "\nEND NOTICE"],
-                         ids=["short_notice", "long_notice"])
+@pytest.mark.parametrize(("notice", "answer", "mode"), [
+    pytest.param(NOTICE, ANSWER, "all_terminal", id='short_notice-short_answer-all_terminal'),
+    pytest.param(NOTICE, "", "all_terminal", id='short_notice-no_answer-all_terminal'),
+    pytest.param(NOTICE + "\n" + "retained host evidence " * 1500 + "\nEND NOTICE", ANSWER + "\n" + "model detail " * 1500, "any_terminal", id='long_notice-long_answer-any_terminal'),
+])
 def test_batch_wait_delivers_notice_before_current_hash_disposition(tmp_path, monkeypatch, mode, answer, notice):
     """The real batch reader must deliver the warning before disposition hides handoff."""
     from ouroboros.task_status import load_effective_task_result
@@ -302,6 +336,7 @@ def test_batch_wait_without_notice_keeps_the_original_projection(tmp_path, monke
         "child_result_sha256": _child_result_sha256(current),
         "outcome_axes": normalize_outcome_axes(current),
         "result": ANSWER, "trace_summary": current.get("trace_summary"),
+        "execution_observation": current["execution_observation"],
     }
     assert load_task_result(tmp_path, task["id"]) == stored
 
@@ -322,10 +357,34 @@ def test_child_notice_hash_extension_preserves_legacy_hash_and_telemetry_exclusi
     for row in (legacy, current):
         assert _child_result_sha256({**row, **telemetry}) == _child_result_sha256(row)
 
+    # An EMPTY key is not an absent key. ``set_terminal_host_notice``
+    # (ouroboros/task_finalization.py) POPS the key when the composed
+    # notice is blank, which is the only reason clean children keep the legacy
+    # hash asserted above. A writer that ALWAYS set the key would silently
+    # re-hash every clean child result and invalidate every parent's
+    # recorded disposition.
+    from ouroboros.task_finalization import set_terminal_host_notice
 
-@pytest.mark.parametrize("direct", [False, True])
-@pytest.mark.parametrize("project", [False, True])
-def test_notice_is_a_system_row_live_and_on_history_replay(tmp_path, monkeypatch, direct, project):
+    assert _child_result_sha256({**legacy, "terminal_host_notice": ""}) != _child_result_sha256(legacy)
+    blank = {"terminal_host_notice": "stale"}
+    set_terminal_host_notice(blank)
+    assert "terminal_host_notice" not in blank
+
+    # With an open delegated-custody audit the key is inserted from
+    # terminal_host_notice_text even when nothing was stored, so "drop the
+    # stored notice" is NOT by itself hash-preserving (join_ledger.py).
+    custody = {**legacy, "delegate_terminal_reconciliation": {
+        "audit_status": "ok", "open_run_ids": ["run-open"], "terminal_runs": [],
+        "pending_invocation_ids": [], "undisposed_patch_run_ids": []}}
+    assert _child_result_sha256(custody) != _child_result_sha256(legacy)
+    assert _child_result_sha256({**custody, "terminal_host_notice": NOTICE}) != _child_result_sha256(custody)
+
+
+@pytest.mark.parametrize(("project", "direct"), [(False, False), (True, True)])
+def test_a_host_notice_never_becomes_a_second_chat_row(tmp_path, monkeypatch, direct, project):
+    """One voice: the disclosure stays a typed field OF THE RESULT (replay reads it
+    from the stored row) and the chat carries the model's answer alone, live and on
+    history replay; the outbox owes exactly that one row."""
     from ouroboros.gateway.history import make_chat_history_endpoint
     from ouroboros.utils import append_jsonl
     from supervisor import events_chat_delivery as delivery, message_bus
@@ -333,12 +392,13 @@ def test_notice_is_a_system_row_live_and_on_history_replay(tmp_path, monkeypatch
 
     task, event = _emit_terminal(tmp_path, monkeypatch, direct=direct, project=project)
     assert event["text"] == event["log_text"] == ANSWER
+    assert "terminal_host_notice" not in event
     stored = load_task_result(tmp_path, task["id"])
     assert stored["result"] == ANSWER and stored["terminal_host_notice"] == NOTICE
     replay = build_completed_result_event(tmp_path, task, task["id"], stored)
-    assert replay["text"] == ANSWER and replay["terminal_host_notice"] == NOTICE
+    assert replay["text"] == ANSWER and "terminal_host_notice" not in replay
     assert replay["delivery_id"] == event["delivery_id"]
-    assert pending_deliveries(tmp_path)[0]["terminal_host_notice"] == NOTICE
+    assert "terminal_host_notice" not in pending_deliveries(tmp_path)[0]
 
     bridge = message_bus.LocalChatBridge({})
     frames = []
@@ -346,7 +406,6 @@ def test_notice_is_a_system_row_live_and_on_history_replay(tmp_path, monkeypatch
     monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
     monkeypatch.setattr(message_bus, "get_bridge", lambda: bridge)
     monkeypatch.setattr(message_bus, "load_state", lambda: {"owner_id": 7})
-    monkeypatch.setattr(message_bus, "_advance_project_visible_revision", lambda _chat: None)
     monkeypatch.setattr(message_bus, "publish_event", lambda *_a, **_kw: None)
     monkeypatch.setattr(delivery, "_DELIVERED_MESSAGE_IDS", deque(maxlen=256))
     ctx = SimpleNamespace(DRIVE_ROOT=tmp_path, RUNNING={}, append_jsonl=append_jsonl,
@@ -354,12 +413,82 @@ def test_notice_is_a_system_row_live_and_on_history_replay(tmp_path, monkeypatch
     delivery._handle_send_message(event, ctx)
     delivery._handle_send_message(event, ctx)
     chats = [row for row in frames if row.get("type") == "chat"]
-    assert [(row["role"], row["content"]) for row in chats] == [("assistant", ANSWER), ("system", NOTICE)]
+    assert [(row["role"], row["content"]) for row in chats] == [("assistant", ANSWER)]
     assert all(row["chat_id"] == task["chat_id"] for row in chats)
     response = asyncio.run(make_chat_history_endpoint(tmp_path)(SimpleNamespace(query_params={"chat_id": str(task["chat_id"])})))
     messages = json.loads(response.body)["messages"]
-    assert [(row["role"], row["text"]) for row in messages] == [("assistant", ANSWER), ("system", NOTICE)]
+    assert [(row["role"], row["text"]) for row in messages] == [("assistant", ANSWER)]
     assert pending_deliveries(tmp_path) == []
+
+
+def test_the_notice_field_survives_every_machine_reader_without_a_chat_row(tmp_path, monkeypatch, capsys):
+    """The do-not-break proof in one test: the stored field keeps its bytes and its
+    place in the child-result hash, every machine reader (public result, parent
+    reader, synthesis, CLI stderr) still receives it, and the chat carries ONE row."""
+    from ouroboros import cli
+    from ouroboros.gateway.tasks import api_task_get
+    from ouroboros.outcomes import public_task_result
+    from ouroboros.task_finalization import build_sealed_final_package, sealed_final_prompt_section
+    from ouroboros.tools.control_task_results import _get_task_result
+    from ouroboros.tools.join_ledger import _child_result_sha256
+    from ouroboros.utils import append_jsonl
+    from supervisor import events_chat_delivery as delivery, message_bus
+    from tests.test_child_result_disposition import _parent_ctx
+
+    task, event = _emit_terminal(tmp_path, monkeypatch, child=True)
+    stored = load_task_result(tmp_path, task["id"])
+    assert stored["terminal_host_notice"] == NOTICE and stored["result"] == ANSWER
+    without = {key: value for key, value in stored.items() if key != "terminal_host_notice"}
+    assert _child_result_sha256(stored) != _child_result_sha256(without)  # the field is hashed
+    assert public_task_result(stored)["terminal_host_notice"] == NOTICE
+    assert _get_task_result(_parent_ctx(tmp_path), task["id"]).endswith("[Host status]\n" + NOTICE)
+    assert NOTICE in sealed_final_prompt_section(build_sealed_final_package(stored, ANSWER))
+    response = asyncio.run(api_task_get(SimpleNamespace(
+        path_params={"task_id": task["id"]}, app=SimpleNamespace(state=SimpleNamespace(drive_root=tmp_path)),
+    )))
+    cli_row = {**json.loads(response.body), "cost_final": True, "cost_with_children_partial": False}
+    monkeypatch.setattr(cli, "_client", lambda *_a, **_kw: SimpleNamespace(
+        request=lambda *_a, **_kw: {"task_id": task["id"]}))
+    monkeypatch.setattr(cli, "_wait_task", lambda *_a, **_kw: cli_row)
+    assert cli.main(["run", "--no-stream", "Produce the report."]) == 0
+    assert capsys.readouterr().err == "[Host status]\n" + NOTICE + "\n"
+
+    bridge = message_bus.LocalChatBridge({})
+    frames = []
+    bridge._broadcast_fn = frames.append
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "get_bridge", lambda: bridge)
+    monkeypatch.setattr(message_bus, "load_state", lambda: {"owner_id": 7})
+    monkeypatch.setattr(message_bus, "publish_event", lambda *_a, **_kw: None)
+    monkeypatch.setattr(delivery, "_DELIVERED_MESSAGE_IDS", deque(maxlen=256))
+    delivery._handle_send_message(event, SimpleNamespace(
+        DRIVE_ROOT=tmp_path, RUNNING={}, append_jsonl=append_jsonl, send_with_budget=message_bus.send_with_budget))
+    chats = [row for row in frames if row.get("type") == "chat"]
+    assert [(row["role"], row["content"]) for row in chats] == [("assistant", ANSWER)]
+    rows = dialogue_test.log_rows(tmp_path / "logs" / "chat.jsonl")
+    assert [row["text"] for row in rows if not row.get("type")] == [ANSWER]
+
+
+def test_the_answer_delivery_id_ignores_every_host_disclosure(tmp_path):
+    """The outbox identity digests the CORE answer only
+    (supervisor/terminal_delivery.py build_completed_result_event). A host
+    disclosure that appears, changes or disappears must never re-mint it, or a
+    replay delivers the same answer a second time."""
+    from supervisor.terminal_delivery import build_completed_result_event, delivery_id_for
+
+    task = {"id": "id-root", "chat_id": 1}
+    expected = delivery_id_for("id-root", ANSWER)
+    for extra in (
+        {},
+        {"terminal_host_notice": NOTICE},
+        {"terminal_host_notice": NOTICE + "\n\nand more"},
+        {"terminal_host_notice": NOTICE, "terminal_origin": "model_final"},
+    ):
+        event = build_completed_result_event(
+            tmp_path, task, "id-root", {"result": ANSWER, **extra},
+        )
+        assert event is not None and event["delivery_id"] == expected, extra
+        assert event["text"] == ANSWER, extra
 
 
 def _open_delegated_custody(tmp_path, task_id):
@@ -394,7 +523,7 @@ def test_open_custody_is_its_own_card_row_live_and_on_history_replay(tmp_path, m
     custody = event["terminal_custody_notice"]
     row_id = event["delivery_id"] + ":custody_notice"
     assert event["text"] == ANSWER and "Open delegated execution: run-open." in custody
-    assert custody not in event["text"] and event.get("terminal_host_notice", "") == base
+    assert custody not in event["text"] and "terminal_host_notice" not in event
     assert event["progress_meta"]["task_phase"] == "finalizing"
     stored = load_task_result(tmp_path, task["id"])
     replay = build_completed_result_event(tmp_path, task, task["id"], stored)
@@ -407,7 +536,6 @@ def test_open_custody_is_its_own_card_row_live_and_on_history_replay(tmp_path, m
     monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
     monkeypatch.setattr(message_bus, "get_bridge", lambda: bridge)
     monkeypatch.setattr(message_bus, "load_state", lambda: {"owner_id": 7})
-    monkeypatch.setattr(message_bus, "_advance_project_visible_revision", lambda _chat: None)
     monkeypatch.setattr(message_bus, "publish_event", lambda *_a, **_kw: None)
     monkeypatch.setattr(delivery, "_DELIVERED_MESSAGE_IDS", deque(maxlen=256))
     owed_while_sending = []
@@ -421,7 +549,8 @@ def test_open_custody_is_its_own_card_row_live_and_on_history_replay(tmp_path, m
     delivery._handle_send_message(event, ctx)
     delivery._handle_send_message(event, ctx)
     assert row_id in owed_while_sending[0], "the custody row is owed before the answer is sent"
-    expected = [("assistant", ANSWER), *([("system", base)] if base else []), ("system", custody)]
+    # With or without a stored host notice the custody row is the ONLY extra row.
+    expected = [("assistant", ANSWER), ("system", custody)]
     chats = [row for row in frames if row.get("type") == "chat"]
     assert [(row["role"], row["content"]) for row in chats] == expected
     assert all(row["chat_id"] == task["chat_id"] for row in chats)
@@ -438,8 +567,8 @@ def test_open_custody_is_its_own_card_row_live_and_on_history_replay(tmp_path, m
     assert pending_deliveries(tmp_path) == []
 
 
-@pytest.mark.parametrize("outcome", ["message", "deferred", "silent", "tool_delivered"])
-def test_presence_delivers_host_notice_once_and_preserves_silence(tmp_path, monkeypatch, outcome):
+@pytest.mark.parametrize("outcome", ["message", "silent", "tool_delivered"])
+def test_presence_preserves_authored_speech_and_keeps_host_notice_in_task(tmp_path, monkeypatch, outcome):
     from ouroboros.presence_runner import PresenceTurnGate, run_presence_turn
     from tests.test_presence_runner import _admission, _event
 
@@ -463,32 +592,37 @@ def test_presence_delivers_host_notice_once_and_preserves_silence(tmp_path, monk
     assert run_presence_turn(**args) == first
     assert first.outcome == outcome
     assert load_task_result(tmp_path, first.task_id)["result"] == ANSWER
-    assert first.text == (ANSWER + "\n\n[Host status]\n" + NOTICE if outcome in {"message", "deferred"} else "")
+    assert first.text == (ANSWER if outcome in {"message", "deferred"} else "")
+    assert load_task_result(tmp_path, first.task_id)["terminal_host_notice"] == NOTICE
 
 
-def test_failed_notice_remains_owed_after_answer_delivery(tmp_path, monkeypatch):
+def test_a_failed_answer_send_stays_owed_and_owes_no_second_row(tmp_path, monkeypatch):
+    """The retry coverage the split used to carry: a failed FIRST send leaves exactly
+    one owed row (the answer, no role), the retry delivers it once, and no
+    notice row is ever owed or sent."""
     from ouroboros.utils import append_jsonl
     from supervisor import events_chat_delivery as delivery
     from supervisor.terminal_delivery import pending_deliveries
 
     _task, event = _emit_terminal(tmp_path, monkeypatch)
     sent = []
+    attempts = []
 
-    def fail_notice(_chat, text, **kwargs):
-        if kwargs.get("role") == "system":
+    def fail_first(_chat, text, **kwargs):
+        attempts.append(text)
+        if len(attempts) == 1:
             raise OSError("transport failed")
         sent.append(text)
 
     monkeypatch.setattr(delivery, "_DELIVERED_MESSAGE_IDS", deque(maxlen=256))
-    ctx = SimpleNamespace(DRIVE_ROOT=tmp_path, RUNNING={}, append_jsonl=append_jsonl, send_with_budget=fail_notice)
+    ctx = SimpleNamespace(DRIVE_ROOT=tmp_path, RUNNING={}, append_jsonl=append_jsonl, send_with_budget=fail_first)
     delivery._handle_send_message(event, ctx)
-    assert sent == [ANSWER]
+    assert sent == [] and attempts == [ANSWER]
     [owed] = pending_deliveries(tmp_path)
-    assert owed["text"] == NOTICE and owed["role"] == "system"
-    monkeypatch.setattr(delivery, "_DELIVERED_MESSAGE_IDS", deque(maxlen=256))
-    ctx.send_with_budget = lambda _chat, text, **_kw: sent.append(text)
+    assert owed["text"] == ANSWER and not owed.get("role")
+    assert "terminal_host_notice" not in owed
     delivery._handle_send_message(event, ctx)
-    assert sent == [ANSWER, NOTICE]
+    assert sent == [ANSWER] and attempts == [ANSWER, ANSWER]
     assert pending_deliveries(tmp_path) == []
 
 
@@ -528,8 +662,9 @@ def test_synthesis_keeps_notice_authorship_separate():
 
 
 @pytest.mark.ui_browser
-def test_browser_renders_model_answer_and_host_notice_separately(direct_server_with_data, monkeypatch):
-    """Real terminal producer, delivery writer, HTTP history and rendered SPA."""
+def test_browser_renders_the_model_answer_without_a_host_bubble(direct_server_with_data, monkeypatch):
+    """Real terminal producer, delivery writer, HTTP history and rendered SPA: the
+    answer bubble alone, live and after a reload; no System bubble carries the notice."""
     from playwright.sync_api import sync_playwright
     from ouroboros.utils import append_jsonl
     from supervisor import events_chat_delivery as delivery, message_bus
@@ -551,15 +686,13 @@ def test_browser_renders_model_answer_and_host_notice_separately(direct_server_w
             page = browser.new_page(viewport={"width": 1280, "height": 900})
             page.goto(direct_server_with_data["url"], wait_until="domcontentloaded")
             answer = page.locator(".chat-bubble.assistant").filter(has_text="Exact model answer")
-            notice = page.locator(".chat-bubble.system").filter(has_text="Plan review remained open")
             answer.wait_for(state="visible", timeout=15000)
-            notice.wait_for(state="visible", timeout=15000)
             assert "Plan review remained open" not in answer.inner_text()
-            assert "Exact model answer" not in notice.inner_text()
-            page.screenshot(path=str(data.parent / "terminal-host-notice.png"), full_page=True)
+            assert page.locator(".chat-bubble.system").count() == 0
+            page.screenshot(path=str(diagnostic_directory(data.parent, "terminal-host-notice", publish=True) / "terminal-host-notice.png"), full_page=True)
             page.reload(wait_until="domcontentloaded")
-            notice.wait_for(state="visible", timeout=15000)
-            assert answer.count() == notice.count() == 1
+            answer.wait_for(state="visible", timeout=15000)
+            assert answer.count() == 1 and page.locator(".chat-bubble.system").count() == 0
         finally:
             browser.close()
 
@@ -567,9 +700,9 @@ def test_browser_renders_model_answer_and_host_notice_separately(direct_server_w
 def test_a_custody_split_never_mints_a_task_independent_row_id(tmp_path, monkeypatch):
     """An answer that reaches the delivery seam without its owed id still yields a
     custody row keyed by the task's canonical identity; with no task at all the
-    custody text stays on the joined host notice instead of a bare
-    ``:custody_notice`` id the delivered registry would then suppress for every
-    later task."""
+    custody fact is still its own TYPED row, only without a delivery id (a bare
+    ``:custody_notice`` id would be suppressed by the delivered registry for every
+    later task), and no host-notice field rides either row."""
     from types import SimpleNamespace
 
     from supervisor import events_chat_delivery as ecd
@@ -591,6 +724,8 @@ def test_a_custody_split_never_mints_a_task_independent_row_id(tmp_path, monkeyp
     sent.clear()
     real({"type": "send_message", "chat_id": 1, "text": "the answer",
           "terminal_host_notice": "Budget stop retained.", "terminal_custody_notice": custody}, ctx)
-    (only,) = sent
-    assert "terminal_custody_notice" not in only
-    assert only["terminal_host_notice"] == "Budget stop retained.\n\n" + custody
+    answer, custody_row = sent
+    assert answer["text"] == "the answer" and "terminal_custody_notice" not in answer
+    assert custody_row["system_type"] == "custody_notice" and custody_row["text"] == custody
+    assert custody_row["role"] == "system" and "delivery_id" not in custody_row
+    assert "terminal_host_notice" not in answer and "terminal_host_notice" not in custody_row

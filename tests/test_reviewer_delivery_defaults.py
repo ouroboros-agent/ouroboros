@@ -1,0 +1,461 @@
+"""#1334 / #1116 / #1335: reviewer delivery defaults and the one-time notices.
+
+A pool row's saved ``delivery`` is the one ``retrieves`` fact every consumer
+reads (F8), the triad consumer hands a native row the compact work order rather
+than the assembled packet, a compatible-only install reviews on Main (the
+factory pool rows), and an upgraded install hears once, factually, about any
+finite task limit it still runs under. The pool's own delivery/order/quorum
+tests live in ``tests/test_review_pool.py``.
+"""
+
+from __future__ import annotations
+
+from tests import _dialogue as dialogue_test
+
+import asyncio
+import json
+from types import SimpleNamespace
+
+import pytest
+
+from ouroboros import reviewer_slot_config as rsc
+from tests.test_owner_settings_write_seam import isolated_settings  # noqa: F401  (fixture)
+
+
+@pytest.fixture
+def clean_env(monkeypatch):
+    for key in ("OUROBOROS_SUBAGENTS", "OUROBOROS_REVIEW_MODELS", "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+                "OPENAI_COMPATIBLE_BASE_URL", "OPENAI_BASE_URL", "OUROBOROS_MODEL", "OUROBOROS_MODEL_LIGHT",
+                "MINIMAX_API_KEY", "DEEPSEEK_API_KEY", "ZAI_API_KEY", "CLOUDRU_FOUNDATION_MODELS_API_KEY",
+                "GIGACHAT_CREDENTIALS", "USE_LOCAL_MAIN"):
+        monkeypatch.delenv(key, raising=False)
+    return monkeypatch
+
+
+# --- the saved delivery field --------------------------------------------------------
+
+
+def test_the_triad_multi_model_row_runs_its_native_delivery(monkeypatch, tmp_path):
+    """The commit/skill triad consumer hands a native row the compact work order
+    and the native episode — never the assembled packet messages."""
+    import ouroboros.review_substrate as rs
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.tools import review as review_module
+    from ouroboros.tools import review_multi_model as rmm
+
+    seen = []
+
+    def run(request, *, slots, **_kw):
+        seen.append((request, slots[0]))
+        return SimpleNamespace(actors=[{"slot_id": slots[0].slot_id, "status": "ok", "raw_text": "[]"}])
+
+    monkeypatch.setattr(rs, "run_review_request", run)
+    monkeypatch.setattr(review_module, "review_drive_root", lambda ctx: tmp_path)
+    plan = {"slot_ids": ["n"], "subagent_ids": [""], "retrieves": [True], "session_profiles": [""],
+            "efforts": [""], "session_targets": [""], "use_local": [False]}
+    asyncio.run(rmm._multi_model_review_async(
+        "content", "", ["m/one"], None, routes=[ReviewRouteKind.API_CHAT], row_plan=plan,
+        session_task="WORK ORDER", session_root="/repo"))
+    (request, slot), = seen
+    assert slot.native_retrieval and request.messages == [] and request.session_task.startswith("WORK ORDER")
+
+
+def test_a_pool_rows_delivery_is_native_unless_the_row_says_packet(monkeypatch, isolated_settings):  # noqa: F811
+    """The catalog's reading of delivery, through the owner's save and the pool's own
+    endpoint: an api row saved without ``delivery`` reads natively (the catalog
+    default — the lane reader's packet default does not carry over); a row saved
+    with ``delivery: packet`` packs the brief; a session row always reads (F8)."""
+    from starlette.testclient import TestClient
+
+    from ouroboros import server_maintenance
+    from ouroboros.gateway import settings as settings_mod
+    from tests.test_owner_settings_write_seam import _settings_app
+
+    catalog = {"enabled": True, "items": [
+        {"subagent_id": "bare", "recommended_use": "Reads the work itself.", "review_eligible": True,
+         "route": {"kind": "api_model", "target_id": "openai/gpt-5.6-sol"}},
+        {"subagent_id": "packed", "recommended_use": "Reads the brief.", "review_eligible": True,
+         "route": {"kind": "api_model", "target_id": "openai/gpt-5.6-luna"}, "delivery": "packet"},
+        {"subagent_id": "session", "recommended_use": "Reads the repository.", "review_eligible": True,
+         "route": {"kind": "agent_session", "target_id": "cursor=gpt-5.6-sol-xhigh"}},
+    ]}
+    saved = TestClient(_settings_app(monkeypatch, isolated_settings)).post(
+        "/api/settings", json={"OUROBOROS_SUBAGENTS": catalog})
+    assert saved.status_code == 200, saved.text
+    stored = json.loads(isolated_settings.read_text(encoding="utf-8"))["OUROBOROS_SUBAGENTS"]
+    assert "delivery" not in json.loads(stored)["items"][0], "an absent field stays absent on disk"
+
+    monkeypatch.setenv("OUROBOROS_SUBAGENTS", stored)  # the applied settings plane the pool reads
+    monkeypatch.setattr(rsc, "reviewer_slot_last_executions", lambda: {})
+    monkeypatch.setattr(server_maintenance, "review_pool_migration_records", lambda: {})
+    monkeypatch.setattr(settings_mod, "_review_pool_costs", lambda items: {})
+    body = json.loads(asyncio.run(settings_mod.api_review_pool(None)).body)
+    assert [(row["subagent_id"], row["delivery"]) for row in body["pool"]] == [
+        ("bare", "native"), ("packed", "packet"), ("session", "session")]
+    # The same fact on the rows every review surface runs.
+    assert [(slot.slot_id, slot.retrieves) for slot in rsc.review_pool_slots()] == [
+        ("bare", True), ("packed", False), ("session", True)]
+
+
+# --- #1116: an OpenAI-compatible-only install ------------------------------------------
+
+
+def test_a_compatible_only_install_reviews_on_main(clean_env):
+    from ouroboros.deep_self_review import deep_review_route
+    from ouroboros.subscription_install_presets import factory_review_rows
+
+    doc = {"OPENAI_COMPATIBLE_BASE_URL": "https://llm.example/v1", "OUROBOROS_MODEL": "openai-compatible::glm-5.3"}
+    for key, value in doc.items():
+        clean_env.setenv(key, value)
+    # The factory POOL is ONE seat on the one reachable model (owner Q5=A: copies of
+    # Main would multiply the cost without a second opinion; quorum 1 of 1); a
+    # configured catalog can select a different explicit panel.
+    assert [row["route"]["target_id"] for row in factory_review_rows(doc)] == ["openai-compatible::glm-5.3"]
+    # The deep self-review runs on Main too (decision 3A), on that route.
+    clean_env.setenv("OPENAI_COMPATIBLE_API_KEY", "test-only-key")
+    assert deep_review_route() == ("", "openai-compatible::glm-5.3")
+    from ouroboros.reviewer_slot_config import review_pool_slots
+    from tests.review_pool_rosters import set_review_pool
+
+    models = ["openai-compatible::a", "openai-compatible::b"]
+    set_review_pool(clean_env, models)
+    assert [slot.model for slot in review_pool_slots()] == models
+
+
+@pytest.mark.parametrize("other_key", ["OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_BASE_URL"])
+def test_another_remote_route_keeps_the_existing_defaults(clean_env, other_key):
+    """Whatever other access sits beside it — a router key, another direct key, the legacy
+    base — the factory follows the chosen compatible Main (owner 4A)."""
+    from ouroboros.subscription_install_presets import factory_review_rows
+
+    doc = {"OPENAI_COMPATIBLE_BASE_URL": "https://llm.example/v1", "OUROBOROS_MODEL": "openai-compatible::glm-5.3",
+           other_key: "x-key" if other_key != "OPENAI_BASE_URL" else "https://base.example"}
+    assert [row["route"]["target_id"] for row in factory_review_rows(doc)] == ["openai-compatible::glm-5.3"]
+
+
+# --- one-time notices (#1334, #1335) --------------------------------------------------
+
+
+@pytest.mark.parametrize(("document", "settings", "expected"), [
+    (None, {"OUROBOROS_MAX_ROUNDS": "unlimited", "OUROBOROS_TASK_ABS_CEILING_SEC": "unlimited"}, []),  # fresh
+    ({"OUROBOROS_MAX_ROUNDS": "unlimited", "OUROBOROS_TASK_ABS_CEILING_SEC": "unlimited"}, {}, []),
+    ({"OUROBOROS_MAX_ROUNDS": "abc", "OUROBOROS_TASK_ABS_CEILING_SEC": "unlimited"}, {"OUROBOROS_MAX_ROUNDS": 200},
+     [("OUROBOROS_MAX_ROUNDS", 200, "saved_invalid")]),
+    (None, {"OUROBOROS_MAX_ROUNDS": 120, "OUROBOROS_TASK_ABS_CEILING_SEC": "unlimited"},
+     [("OUROBOROS_MAX_ROUNDS", 120, "env")]),
+])
+def test_finite_bound_facts_name_only_what_the_document_and_env_show(document, settings, expected):
+    from ouroboros.upgrade_notices import optional_bound_facts, optional_bounds_notice
+
+    facts = optional_bound_facts(document, settings)
+    assert [(f["key"], f["value"], f["origin"]) for f in facts] == expected
+    text = optional_bounds_notice(facts)
+    assert bool(text) == bool(expected)
+    if expected:
+        assert "nothing was changed here" in text and "chose" not in text
+
+
+def test_the_classifier_ignores_the_process_environment_startup_projects_settings_into(monkeypatch):
+    from ouroboros.upgrade_notices import optional_bound_facts
+
+    # apply_settings_to_env has already exported the document default before the notice runs.
+    monkeypatch.setenv("OUROBOROS_MAX_ROUNDS", "200")
+    facts = optional_bound_facts({}, {"OUROBOROS_MAX_ROUNDS": 200, "OUROBOROS_TASK_ABS_CEILING_SEC": "unlimited"})
+    assert [(f["value"], f["origin"]) for f in facts] == [(200, "document_absent_key")]
+
+
+@pytest.mark.parametrize(("document", "launch_env", "expected", "origin", "raw"), [
+    ({"OUROBOROS_MAX_ROUNDS": None}, "77", 200, "saved_invalid", None),
+    ({"OUROBOROS_MAX_ROUNDS": 42}, "77", 42, "saved", 42),
+    (None, "77", 77, "env", 77),
+    ({"OUROBOROS_MAX_ROUNDS": "unlimited"}, "77", None, None, None),
+])
+def test_startup_notice_matches_loaded_runtime_bounds_and_raw_presence(
+        monkeypatch, tmp_path, document, launch_env, expected, origin, raw):
+    from ouroboros import config as cfg, upgrade_notices as notices
+    from ouroboros.settings_integrity import task_settings_scope, task_settings_snapshot
+    from supervisor import message_bus as bus, state as ss
+
+    lifetime = "OUROBOROS_TASK_ABS_CEILING_SEC"
+    rounds = "OUROBOROS_MAX_ROUNDS"
+    key = lifetime if (document and lifetime in document) or launch_env == "60" else rounds
+    other = rounds if key == lifetime else lifetime
+    path = tmp_path / "settings.json"
+    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(cfg, "SETTINGS_PATH", path)
+    for setting in cfg.SETTINGS_DEFAULTS:
+        monkeypatch.delenv(setting, raising=False)
+    if launch_env is not None:
+        monkeypatch.setenv(key, launch_env)
+    monkeypatch.setenv(other, "unlimited")
+    if document is not None:  # an install that already carries the consciousness level (no one-time copy)
+        path.write_text(json.dumps({other: "unlimited", "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE": "full", **document}),
+                        encoding="utf-8")
+    before = path.read_bytes() if path.exists() else None
+    for name, value in {"DRIVE_ROOT": tmp_path, "STATE_PATH": tmp_path / "state/state.json",
+                        "STATE_LAST_GOOD_PATH": tmp_path / "state/state.last_good.json",
+                        "STATE_LOCK_PATH": tmp_path / "locks/state.lock"}.items():
+        monkeypatch.setattr(ss, name, value)
+    monkeypatch.setattr(bus, "DATA_DIR", tmp_path)
+    from ouroboros.startup_migrations import prepare_startup_state
+    prepare_startup_state(tmp_path)
+    monkeypatch.setattr(bus, "get_bridge", lambda: None)
+    ss.save_state({"owner_chat_id": 7, "owner_id": 1})
+
+    settings = cfg.load_settings()
+    projected = {}
+    cfg.apply_settings_to_env(settings, environ=projected)
+    with task_settings_scope(task_settings_snapshot(settings, projected)):
+        effective = cfg.get_task_abs_ceiling_sec() if key == lifetime else cfg.get_max_rounds()
+        assert effective == expected
+        notices.startup_upgrade_notices(settings)
+        notices.startup_upgrade_notices(settings)
+    assert (path.read_bytes() if path.exists() else None) == before
+    facts = notices.optional_bound_facts(notices._raw_settings_document(), settings)
+    rows = [r for r in dialogue_test.log_rows(tmp_path / "logs/chat.jsonl")
+            if r.get("type") == "optional_bounds_notice"]
+    if expected is None:
+        assert facts == [] and rows == []
+        return
+    assert facts == [{"key": key, "value": effective, "origin": origin, "raw": raw}]
+    assert len(rows) == 1 and rows[0]["direction"] == "system"
+    text = rows[0]["text"]
+    assert f"= {effective} {'seconds' if key == lifetime else 'rounds'}" in text
+    assert ("key is absent" in text) == (origin == "document_absent_key")
+    assert ("finite fallback" in text) == (origin == "saved_invalid")
+    assert "runtime minimum" not in text  # an accepted value applies as written
+    assert "nothing was changed here" in text and "chose" not in text
+
+
+@pytest.fixture
+def notice_world(monkeypatch, tmp_path):
+    import supervisor.message_bus as bus
+    import supervisor.state as sstate
+    from ouroboros import upgrade_notices
+
+    monkeypatch.setattr(bus, "DATA_DIR", tmp_path)
+    from ouroboros.startup_migrations import prepare_startup_state
+    prepare_startup_state(tmp_path)
+    state = {"owner_chat_id": 7}
+    sent = []
+
+    def update(fn):
+        fn(state)
+
+    monkeypatch.setattr(sstate, "load_state", lambda: dict(state))
+    monkeypatch.setattr(sstate, "update_state", update)
+    monkeypatch.setattr(bus, "send_with_budget", lambda chat, text, **kw: sent.append((chat, text, kw)))
+    monkeypatch.setattr(upgrade_notices, "_raw_settings_document", lambda: {})
+    monkeypatch.delenv("OUROBOROS_MAX_ROUNDS", raising=False)
+    monkeypatch.delenv("OUROBOROS_TASK_ABS_CEILING_SEC", raising=False)
+    monkeypatch.delenv("OUROBOROS_REVIEW_ENFORCEMENT", raising=False)
+    return SimpleNamespace(state=state, sent=sent, notices=upgrade_notices)
+
+
+def test_an_upgraded_untouched_install_hears_each_notice_once(notice_world):
+    # Which reviewers run is the review-pool migration's own report
+    # (server_maintenance._startup_review_pool_notice), not an upgrade notice.
+    notice_world.notices.startup_upgrade_notices({})
+    assert [kw["system_type"] for _chat, _text, kw in notice_world.sent] == ["optional_bounds_notice",
+                                                                             "command_timeout_notice"]
+    assert all(kw["require_write"] and kw["role"] == "system" for _c, _t, kw in notice_world.sent)
+    assert "200 rounds" in notice_world.sent[0][1] and "21600 seconds" in notice_world.sent[0][1]
+    notice_world.notices.startup_upgrade_notices({})
+    assert len(notice_world.sent) == 2  # never repeated
+    assert "optional_bounds_notified" in notice_world.state and "command_timeout_notified" in notice_world.state
+    assert not hasattr(notice_world.notices, "REVIEWER_DEFAULT_NOTICE")
+
+
+@pytest.mark.parametrize("saved, shown", [(1800, "(1800 s by default; 1800 s in this install's settings)"),
+                                          (900, "(1800 s by default; 900 s in this install's settings)")])
+def test_every_install_that_ran_under_the_per_call_ceiling_hears_once_that_it_retired(notice_world, monkeypatch,
+                                                                                       saved, shown):
+    # The read seam strips the retired key, so the value shown is the document's; a configured value too.
+    monkeypatch.setattr(notice_world.notices, "_raw_settings_document",
+                        lambda: {"OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC": saved})
+    settings = {"OUROBOROS_TASK_IDLE_TIMEOUT_SEC": 900}
+    notice_world.notices.startup_upgrade_notices(settings)
+    notice_world.notices.startup_upgrade_notices(settings)
+    texts = [text for _chat, text, kw in notice_world.sent if kw["system_type"] == "command_timeout_notice"]
+    assert len(texts) == 1 and texts[0].startswith(f"⏱️ The separate per-call ceiling of earlier versions {shown} "
+                                                   "is retired. ")
+    assert "spent, or a timeout this platform cannot wait on, starts no command" in texts[0]
+    assert "await_messages wait lasts as long as it asks, within the deadline and Stop" in texts[0]
+    assert "flagged idle after Idle Timeout (900 s here) of silence" in texts[0]
+
+
+def test_the_retired_per_call_ceiling_has_no_getter_and_a_stored_value_is_stripped(tmp_path, monkeypatch):
+    """The last readers moved (commands 3A, await_messages B, silence A): a document that saved the
+    1800 default (nearly every install) loads without it, the env cannot bring it back, and the
+    retired-key notice names what replaced it."""
+    import json
+
+    from ouroboros import config, runtime_limits
+    from ouroboros.settings_defaults import RETIRED_SETTING_KEYS, RETIRED_SETTING_SUCCESSORS, retired_setting_keys_notice
+
+    key = "OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC"
+    assert key in RETIRED_SETTING_KEYS and key not in config.SETTINGS_DEFAULTS
+    assert not hasattr(config, "get_per_call_timeout_ceiling_sec")
+    assert not hasattr(runtime_limits, "get_per_call_timeout_ceiling_sec")
+    assert RETIRED_SETTING_SUCCESSORS[key] == ("OUROBOROS_TOOL_TIMEOUT_SEC", "OUROBOROS_TASK_IDLE_TIMEOUT_SEC")
+    assert f"{key} -> OUROBOROS_TOOL_TIMEOUT_SEC, OUROBOROS_TASK_IDLE_TIMEOUT_SEC" in retired_setting_keys_notice((key,))
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(json.dumps({key: 1800, "OUROBOROS_MAX_WORKERS": 7}), encoding="utf-8")
+    monkeypatch.setattr(config, "SETTINGS_PATH", settings_path)
+    monkeypatch.setenv(key, "30")
+    loaded = config.load_settings()
+    assert int(loaded["OUROBOROS_MAX_WORKERS"]) == 7 and key not in loaded
+
+
+def test_a_document_without_the_key_hears_only_what_is_true_on_a_fresh_install_too(notice_world, monkeypatch):
+    """Opus R1: an install that ran under the implicit 1800 s default need not have saved the key, so any settings
+    document still owes the notice (3A: every old install), and a fresh install hears it once its first document
+    exists. Its words therefore claim no ceiling of this install: they say what earlier versions did."""
+    monkeypatch.setattr(notice_world.notices, "_raw_settings_document", lambda: {"OUROBOROS_MAX_WORKERS": 5})
+    notice_world.notices.startup_upgrade_notices({})
+    [text] = [text for _chat, text, kw in notice_world.sent if kw["system_type"] == "command_timeout_notice"]
+    assert text.startswith("⏱️ The separate per-call ceiling of earlier versions (1800 s by default) is retired. ")
+    assert "this install" not in text and "on this install" not in text
+    assert "command_timeout_notified" in notice_world.state
+
+
+def test_an_install_that_never_ran_under_the_command_ceiling_hears_nothing(notice_world, monkeypatch):
+    monkeypatch.setattr(notice_world.notices, "_raw_settings_document", lambda: None)
+    notice_world.notices.startup_upgrade_notices({})
+    assert [kw["system_type"] for _chat, _text, kw in notice_world.sent] == []
+    assert "command_timeout_notified" not in notice_world.state
+
+
+def test_no_owner_chat_or_a_failed_write_leaves_the_notice_owed(notice_world, monkeypatch):
+    import supervisor.message_bus as bus
+
+    notice_world.state["owner_chat_id"] = 0
+    notice_world.notices.startup_upgrade_notices({})
+    assert notice_world.sent == [] and "optional_bounds_notified" not in notice_world.state
+    notice_world.state["owner_chat_id"] = 7
+    monkeypatch.setattr(bus, "send_with_budget", lambda *a, **k: (_ for _ in ()).throw(OSError("disk")))
+    notice_world.notices.startup_upgrade_notices({})
+    assert "optional_bounds_notified" not in notice_world.state
+
+
+@pytest.mark.parametrize("quality", ["unavailable", "recovered", "recovered_transient"])
+def test_notice_never_uses_unconfirmed_display_owner(notice_world, quality):
+    notice_world.state["_state_read"] = {"quality": quality, "source": "backup",
+                                         "unconfirmed": ["owner_chat_id"]}
+    notice_world.notices.startup_upgrade_notices({})
+    assert not notice_world.sent
+    assert "optional_bounds_notified" not in notice_world.state
+
+
+def test_notice_bookkeeping_preserves_recovered_control_uncertainty(monkeypatch, tmp_path):
+    from ouroboros import upgrade_notices as notices
+    from supervisor import message_bus as bus, state as ss
+
+    for name, path in {"DRIVE_ROOT": tmp_path, "STATE_PATH": tmp_path / "state/state.json",
+                       "STATE_LAST_GOOD_PATH": tmp_path / "state/state.last_good.json",
+                       "STATE_LOCK_PATH": tmp_path / "locks/state.lock"}.items():
+        monkeypatch.setattr(ss, name, path)
+    monkeypatch.setattr(bus, "DATA_DIR", tmp_path)
+    from ouroboros.startup_migrations import prepare_startup_state
+    prepare_startup_state(tmp_path)
+    monkeypatch.setattr(bus, "get_bridge", lambda: SimpleNamespace(send_message=lambda *a, **kw: None))
+    monkeypatch.setattr(notices, "_raw_settings_document", lambda: {})
+    ss.save_state({"owner_chat_id": 7, "owner_id": 1, "bg_consciousness_enabled": True})
+    ss.STATE_PATH.write_bytes(b'{broken')
+    before = ss.load_state()
+    assert ss.control_value(before, "owner_chat_id") == (True, 7)
+    assert ss.control_value(before, "bg_consciousness_enabled") == (False, None)
+    notices.startup_upgrade_notices({})
+    after = ss.load_state()
+    assert after[notices.OPTIONAL_BOUNDS_NOTICE_KEY]
+    assert ss.control_value(after, "bg_consciousness_enabled") == (False, None)
+    assert ss.control_value(after, "owner_chat_id") == (True, 7)
+
+
+@pytest.mark.parametrize("failure", ["chat_append", "state_marker", "bridge"])
+def test_notice_recovers_through_real_chat_and_state_writers(monkeypatch, tmp_path, failure):
+    from ouroboros import upgrade_notices as notices
+    from ouroboros import dialogue_store as ds
+    from supervisor import message_bus as bus, state as ss
+
+    for name, path in {"DRIVE_ROOT": tmp_path, "STATE_PATH": tmp_path / "state/state.json",
+                       "STATE_LAST_GOOD_PATH": tmp_path / "state/state.last_good.json",
+                       "STATE_LOCK_PATH": tmp_path / "locks/state.lock"}.items():
+        monkeypatch.setattr(ss, name, path)
+    monkeypatch.setattr(bus, "DATA_DIR", tmp_path)
+    from ouroboros.startup_migrations import prepare_startup_state
+    prepare_startup_state(tmp_path)
+    monkeypatch.setattr(notices, "_raw_settings_document", lambda: {"OUROBOROS_MAX_ROUNDS": 150,
+                        "OUROBOROS_TASK_ABS_CEILING_SEC": "unlimited"})
+    # Only the task-limits notice is owed here; the command-timeout notice already went.
+    ss.save_state({"owner_chat_id": 7, "owner_id": 1, notices.COMMAND_TIMEOUT_NOTICE_KEY: "already"})
+    real_update, real_append = ss.update_state, ds.append
+    delivered = []
+    failed = False
+
+    def fail_once(error=OSError):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise error("injected persistence/delivery failure")
+
+    def update(fn):
+        if failure == "state_marker":
+            fail_once()
+        return real_update(fn)
+
+    def append(*a, **kw):
+        if failure == "chat_append":
+            fail_once(ds.StoreError)
+        return real_append(*a, **kw)
+
+    def send(*a, **kw):
+        if failure == "bridge":
+            fail_once()
+        delivered.append(a)
+
+    monkeypatch.setattr(ss, "update_state", update)
+    monkeypatch.setattr(ds, "append", append)
+    monkeypatch.setattr(bus, "get_bridge", lambda: SimpleNamespace(send_message=send))
+    settings = {}
+    notices.startup_upgrade_notices(settings)
+    assert not ss.load_state().get(notices.OPTIONAL_BOUNDS_NOTICE_KEY)
+    notices.startup_upgrade_notices(settings)
+    notices.startup_upgrade_notices(settings)
+    assert ss.load_state()[notices.OPTIONAL_BOUNDS_NOTICE_KEY]
+    rows = [r for r in dialogue_test.log_rows(tmp_path / "logs/chat.jsonl") if r.get("type") == "optional_bounds_notice"]
+    assert len(rows) == 1 and "150 rounds" in rows[0]["text"]
+    # Durable web history is the owner delivery witness. External bridge loss
+    # does not erase that row or require another visible notice on restart.
+    assert len(delivered) == (0 if failure == "bridge" else 1)
+
+
+BLOCKING_GONE = (
+    "⚙️ This install had reviews set to Blocking. That setting is gone with this update: a reviewer's serious "
+    "finding, or a review that gave no answer, no longer stops Ouroboros. Outside Cyber Pro it still asks for a "
+    "review before changing its own code and reads the answer first; when it disagrees, it goes ahead and says "
+    "why. Each time it goes ahead over a serious finding or without an answer, the work card, the restart "
+    "message and the update description name it.")
+
+
+@pytest.mark.parametrize("where, value, environment, owed", [
+    ("document", "blocking", None, True), ("document", " Blocking ", None, True), ("absent", None, "blocking", True),
+    ("document", "", "blocking", True), ("document", "advisory", None, False), ("absent", None, "advisory", False),
+    ("document", "advisory", "blocking", False), ("document", "strictest", None, False), ("absent", None, None, False),
+    ("no_document", None, None, False), ("no_document", None, "blocking", True),
+])
+def test_an_install_that_had_blocking_hears_once_that_it_is_gone(notice_world, monkeypatch, where, value, environment,
+                                                                 owed):
+    """STEP4 7(iv) item 4: an install that ran with ``blocking`` hears one sentence once, marked, never again at the
+    next boot: its settings document said so, or it saved nothing there and its process environment did. A saved
+    choice outranked the environment, so an install that saved another value, or had none, hears nothing."""
+    document = None if where == "no_document" else {"OUROBOROS_REVIEW_ENFORCEMENT": value} if where == "document" else {}
+    monkeypatch.setattr(notice_world.notices, "_raw_settings_document", lambda: document)
+    if environment is not None:
+        monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", environment)
+    notice_world.notices.startup_upgrade_notices({})
+    notice_world.notices.startup_upgrade_notices({})
+    texts = [text for _chat, text, kw in notice_world.sent if kw["system_type"] == "review_enforcement_notice"]
+    assert texts == ([BLOCKING_GONE] if owed else [])
+    assert ("review_enforcement_notified" in notice_world.state) is owed
+    assert notice_world.notices.review_enforcement_notice({"OUROBOROS_REVIEW_ENFORCEMENT": "blocking"}, {}) == BLOCKING_GONE

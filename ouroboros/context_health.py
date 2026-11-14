@@ -11,14 +11,18 @@ monkeypatch ``context._STRAY_PROBE_CACHE``) keeps working unchanged.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import json
 import pathlib
 import re
 from collections import Counter
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
-from ouroboros.context_budget import SCRATCHPAD_BLOAT_WARN_CHARS
-from ouroboros.utils import iter_jsonl_objects, read_json_dict, read_text
+from ouroboros.jsonl_tail import cached_tail_objects
+from ouroboros.utils import read_json_dict, read_text
+from ouroboros.store import StoreError
+from ouroboros.context_timing import timed_section
 
 log = logging.getLogger(__name__)
 
@@ -38,8 +42,36 @@ def safe_read(path: pathlib.Path, fallback: str = "") -> str:
         return fallback
 
 
-def _iter_recent_jsonl(path: pathlib.Path, max_bytes: int = 256_000):
-    yield from iter_jsonl_objects(path, tail_bytes=max_bytes)
+# The tail of each log these checks read; a health line names it as its source.
+_RECENT_LOG_BYTES = 256_000
+
+
+def _iter_recent_jsonl(path: pathlib.Path, max_bytes: int = _RECENT_LOG_BYTES):
+    """The log's bounded tail, read once per file identity and shared with the Runtime section's body fact."""
+    yield from cached_tail_objects(path, max_bytes)
+
+
+def _host_work_line(receipts: List[Mapping[str, Any]]) -> str:
+    """What the running code's recent builds did past one pass, from their ``context_memory_view`` receipts: work repeated
+    on the same input (a ``<verb>_again`` above zero). A fact for the mind, and only when it is there: in a healthy state
+    nothing is added. The rows a capture read stay in the receipts and are no line: the tail is read whole on every
+    capture, stored or live, so that fact stood in the contexts whatever the host did."""
+    from ouroboros.transcript_prefix import _running_code
+
+    code = _running_code()
+    builds = [dict(receipt.get("work") or {}) for receipt in receipts if receipt.get("code") == code and receipt.get("work")]
+    repeats: Counter = Counter()
+    repeating = 0
+    for work in builds:
+        again = {verb[:-len("_again")]: n for verb, n in work.items() if verb.endswith("_again") and n}
+        repeats.update(again)
+        repeating += bool(again)
+    if not repeats:
+        return ""
+    return (f"INFO: HOST WORK BEYOND ONE PASS under the running code ({code if ' ' in code else code[:12]}) — "
+            f"{repeating} of {len(builds)} recent builds did work again on an input they already had "
+            f"({', '.join(f'{verb} {n:,}' for verb, n in repeats.most_common())}). "
+            "Receipts: logs/events.jsonl, context_memory_view, field work.")
 
 
 def _collect_log_analysis_checks(env: Any, checks: List[str]) -> None:
@@ -65,28 +97,24 @@ def _collect_log_analysis_checks(env: Any, checks: List[str]) -> None:
         dupes = {h: tids for h, tids in msg_hash_to_tasks.items() if len(tids) > 1}
         if dupes:
             checks.append(f"CRITICAL: DUPLICATE PROCESSING — {len(dupes)} message(s) appeared in multiple tasks: {', '.join(str(sorted(tids)) for tids in dupes.values())}")
-        else:
-            checks.append("OK: no duplicate message processing detected")
     except Exception:
         pass
 
-    try:
-        hit_rate = _compute_cache_hit_rate(env)
-        if hit_rate is not None:
-            if hit_rate < 0.30:
-                checks.append(f"WARNING: LOW CACHE HIT RATE — {hit_rate:.0%} cached. Context structure may be degrading prompt caching efficiency.")
-            elif hit_rate >= 0.50:
-                checks.append(f"OK: cache hit rate ({hit_rate:.0%})")
-            else:
-                checks.append(f"INFO: cache hit rate moderate ({hit_rate:.0%})")
+    try:  # who changed sent history under the running code; a provider's cache share is not a health verdict
+        from ouroboros.transcript_prefix import history_changes_line
+
+        line = history_changes_line(getattr(env, "budget_drive_root", None) or getattr(env, "drive_root", None))
+        if line:
+            checks.append(line)
     except Exception:
-        pass
+        log.debug("sent-history change fact unavailable", exc_info=True)
 
     try:
         events_path = env.drive_path("logs/events.jsonl")
         llm_error_models: Counter = Counter()
         local_overflow_models: Counter = Counter()
         remote_overflow_models: Counter = Counter()
+        view_receipts: List[Dict[str, Any]] = []
         for ev in _iter_recent_jsonl(events_path):
             evt_type = str(ev.get("type") or "")
             model = str(ev.get("model") or "unknown")
@@ -96,19 +124,21 @@ def _collect_log_analysis_checks(env: Any, checks: List[str]) -> None:
                 local_overflow_models[model] += 1
             elif evt_type == "remote_context_overflow":
                 remote_overflow_models[model] += 1
+            elif evt_type == "context_memory_view":
+                view_receipts.append(ev)
+        host_work = _host_work_line(view_receipts)
+        if host_work:
+            checks.append(host_work)
+        source = f"source: logs/events.jsonl, last {_RECENT_LOG_BYTES // 1000} KB"
         if llm_error_models:
             top = ", ".join(f"{model} x{count}" for model, count in llm_error_models.most_common(3))
-            checks.append(f"WARNING: PROVIDER/ROUTING ERRORS — {sum(llm_error_models.values())} recent failures ({top}). Reliability or failover may need attention.")
-        else:
-            checks.append("OK: no recent provider/routing errors")
+            checks.append(f"WARNING: PROVIDER/ROUTING ERRORS — {sum(llm_error_models.values())} recent failures ({top}); {source}.")
         if local_overflow_models:
             top = ", ".join(f"{model} x{count}" for model, count in local_overflow_models.most_common(3))
-            checks.append(f"WARNING: LOCAL CONTEXT OVERFLOW — {sum(local_overflow_models.values())} recent overflow event(s) ({top}). Local context may need more compaction or a larger window.")
-        else:
-            checks.append("OK: no recent local context overflows")
+            checks.append(f"WARNING: LOCAL CONTEXT OVERFLOW — {sum(local_overflow_models.values())} recent overflow event(s) ({top}); {source}.")
         if remote_overflow_models:
             top = ", ".join(f"{model} x{count}" for model, count in remote_overflow_models.most_common(3))
-            checks.append(f"WARNING: REMOTE CONTEXT OVERFLOW — {sum(remote_overflow_models.values())} recent provider context-window rejection(s) ({top}). Switch to low context mode or reduce the prompt footprint before retrying the same request.")
+            checks.append(f"WARNING: REMOTE CONTEXT OVERFLOW — {sum(remote_overflow_models.values())} recent provider context-window rejection(s) ({top}); {source}.")
     except Exception:
         pass
 
@@ -130,9 +160,9 @@ def _collect_log_analysis_checks(env: Any, checks: List[str]) -> None:
             if recent:
                 checks.append(
                     f"WARNING: RESCUE SNAPSHOT AVAILABLE — {', '.join(recent)}. "
-                    "Uncommitted changes were saved before last restart. "
-                    "Use read_file(root='runtime_data', path='archive/rescue/<dirname>/rescue_meta.json') "
-                    "and changes.diff to decide if recovery is needed."
+                    "Uncommitted changes were saved before last restart in "
+                    "read_file(root='runtime_data', path='archive/rescue/<dirname>/rescue_meta.json') "
+                    "and changes.diff beside it."
                 )
     except Exception:
         pass
@@ -170,13 +200,24 @@ def _stray_server_note(env: Any) -> str:
 
 
 def _plan_review_note(env: Any, task_id: str) -> str:
-    """Read this task's recorded wave; its timestamp is a snapshot, not a live lease."""
+    """This task's plan asks still awaiting answers (a snapshot, not a live lease); a
+    legacy v2 wave with pending custody keeps its own note."""
     if not task_id:
         return ""
     try:
+        from ouroboros import plan_record
         from ouroboros.task_results import current_plan_review_wave, load_plan_review_state
 
         root = getattr(env, "drive_root", None) or env.drive_path("state").parent
+        record = plan_record.load_plan_record(root, task_id)
+        pending = plan_record.pending_asks(record)
+        if pending:
+            seats = [str(p.get("seat_id") or "?") for ask in pending for p in ask.get("participants") or [] if p.get("status") == "pending"]
+            return (f"PLAN ASK OPEN: {', '.join(str(a.get('ask_id') or '?') for a in pending)} — "
+                    f"{len(seats)} participant(s) have not answered yet ({', '.join(seats)}); silence holds nothing. "
+                    "Answers arrive in the mailbox; plan_task() reads them.")
+        if plan_record.engaged(record):
+            return ""
         wave = current_plan_review_wave(load_plan_review_state(root, task_id)) or {}
         if wave.get("closed") or not wave.get("custody_pending"):
             return ""
@@ -187,94 +228,267 @@ def _plan_review_note(env: Any, task_id: str) -> str:
             f"{pending} reviewer slot(s) recorded pending at {wave.get('reviewed_at') or '?'}. "
             "Work may still be running or awaiting collection."
         )
-    except (OSError, ValueError, TimeoutError):
+    except (OSError, ValueError, TimeoutError, StoreError):
         log.warning("Unable to read plan-review health for %s", task_id, exc_info=True)
         return ""
 
 
-def _memory_health_lines(env: Any) -> List[str]:
-    """Own-memory maintenance signals: the two authored files and the dialogue pipeline.
+# "Who I am" and "where I am": each file, its publication journal, the tool that writes both and whether the
+# file's bytes are compared with its last record. The map's are not: the host rewrites its measured block at
+# every start without a journal row, so a difference there would speak of the host.
+_SELF_FILES = (("identity.md", "identity_journal.jsonl", "update_identity", True),
+               ("WORLD.md", "world_journal.jsonl", "update_world", False))
+# One journal record holds the whole old and new text and two previews. With either file at its context
+# budget (``context._SECTION_BUDGETS``: identity 80 000 chars, the map 16 000) and four bytes a character
+# a record stays under 700 KB: this tail holds one such record together with the line break before it.
+_SELF_JOURNAL_TAIL_BYTES = 1024 * 1024
+# Whether each self-file journal's last line parses, once per file identity: ``{path: (identity, parses)}``.
+_SELF_LAST_LINES: Dict[str, tuple] = {}
 
-    Health is where stale memory becomes visible, so a dialogue-consolidation run that
-    failed, or a nomination batch that was accepted and then not published, is named
-    here rather than left to a log nobody reads. Both lines are STATE read from
-    ``memory/dialogue_meta.json``; neither carries a timestamp, because this block is
-    rendered dynamically and the facts are latest-run facts, not events.
-    """
-    import time as _time
 
+def _last_line_parses(journal: pathlib.Path, info: Any) -> bool:
+    """Whether the journal's last non-empty line is a JSON object. An interrupted append leaves a torn last
+    line: the newest record is unknown, never the one before it. ``publish_memory_file`` starts its next row
+    on a line of its own (``ensure_record_boundary``), so the torn line stays behind that row; a writer
+    without the repair (the profiler's first fencing of the map) joins it into one line that does not parse.
+    Read back from the end within the journal's tail, once per file identity: a last line longer than the
+    tail holds no record the tail could show either."""
+    identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+    kept = _SELF_LAST_LINES.get(str(journal))
+    if kept is not None and kept[0] == identity:
+        return kept[1]
+    with journal.open("rb") as handle:
+        start = max(0, info.st_size - _SELF_JOURNAL_TAIL_BYTES)
+        handle.seek(start)
+        body = handle.read(info.st_size - start).rstrip()
+    last = body.rsplit(b"\n", 1)
+    try:
+        parses = (len(last) == 2 or start == 0) and isinstance(json.loads(last[-1]), dict) if body else True
+    except ValueError:
+        parses = False
+    _SELF_LAST_LINES[str(journal)] = (identity, parses)
+    return parses
+
+
+def _age_in_hours(seconds: float) -> str:
+    """An age in whole hours. These lines open the dynamic part of the request, where a text that moves
+    every minute ends the prefix a provider can reuse between two turns of one conversation; an age in
+    hours moves once an hour and still says what the fact is for."""
+    hours = max(0, int(seconds)) // 3600
+    if hours >= 24:
+        return f"{hours // 24} d {hours % 24} h ago"
+    return f"{hours} h ago" if hours else "less than an hour ago"
+
+
+def _focus_role(row: Mapping[str, Any]) -> str:
+    focus = row.get("focus")
+    return str(focus.get("role") or "") if isinstance(focus, dict) else ""
+
+
+def _last_self_update(journal: pathlib.Path, tool: str, compared: Optional[pathlib.Path] = None) -> str:
+    """What ``journal`` says about the mind's last ``tool`` call: the newest readable record of its tail
+    that is not the host's (``legacy_wrap``, role ``host``: the profiler's first fencing of the map), with
+    its age and the writing focus's role. No journal, or a journal read whole without such a record, is no
+    record. A tail that holds bytes but no record of the mind's (a record longer than the tail, lines that
+    do not parse), a last line that does not parse (``_last_line_parses``), or a newest record without a
+    date, is unreadable: unknown, never "no record" and never the record before it.
+    ``compared`` is the file the journal belongs to: when the dated record carries the hash it published
+    (``new_sha256``) and the file's bytes hash otherwise, the line says so, as a fact without a cause or an
+    author. A record without that hash, or bytes that cannot be read, add nothing."""
+    from ouroboros.deadline_utils import parse_deadline_ts, utc_now
+
+    try:
+        info = journal.stat()
+        size = info.st_size
+        rows = cached_tail_objects(journal, _SELF_JOURNAL_TAIL_BYTES)
+        torn = not _last_line_parses(journal, info)
+    except FileNotFoundError:
+        return f"no {tool} record"
+    except OSError:
+        return f"last {tool} record unreadable"
+    if torn:
+        return f"last {tool} record unreadable"
+    mine = [row for row in rows if row.get("source_type") != "legacy_wrap" and _focus_role(row) != "host"]
+    if not mine:
+        whole = size <= _SELF_JOURNAL_TAIL_BYTES and (bool(rows) or not size)
+        return f"no {tool} record" if whole else f"last {tool} record unreadable"
+    written = parse_deadline_ts(mine[-1].get("ts"))
+    if written is None:
+        return f"last {tool} record unreadable"
+    who, recorded = _focus_role(mine[-1]), mine[-1].get("new_sha256")
+    line = f"last {tool} {_age_in_hours((utc_now() - written).total_seconds())}" + (f" ({who})" if who else "")
+    if compared is not None and recorded and isinstance(recorded, str):
+        try:
+            if hashlib.sha256(compared.read_bytes()).hexdigest() != recorded:
+                line += "; the file differs from that record"
+        except OSError:
+            pass
+    return line
+
+
+def _self_update_lines(env: Any) -> List[str]:
+    """When the mind last published ``identity.md`` and ``WORLD.md``, one fact a file, from the journal its
+    tool appends (``memory_publication.publish_memory_file``) and never the file's mtime: a restore moves
+    the mtime, and the host rewrites the map's measured block at every start. Whether an age is long is the
+    mind's reading: no threshold stands in for that judgment, so a line carries no verdict and no advice.
+    ``identity.md`` is also compared with its last record (``_SELF_FILES``). An absent file is no fact."""
     lines: List[str] = []
-    try:
-        identity_path = env.drive_path("memory/identity.md")
-        if identity_path.exists():
-            age_hours = (_time.time() - identity_path.stat().st_mtime) / 3600
-            if age_hours > 8:
-                lines.append(f"WARNING: STALE IDENTITY — identity.md last updated {age_hours:.0f}h ago")
-            else:
-                lines.append("OK: identity.md recent")
-    except Exception:
-        pass
-    try:
-        identity_content = read_text(env.drive_path("memory/identity.md"))
-        if len(identity_content.strip()) < 200:
-            lines.append(f"WARNING: THIN IDENTITY — identity.md is only {len(identity_content)} chars. Cognitive decay signal.")
-    except Exception:
-        pass
-
-    try:
-        sp_len = len(read_text(env.drive_path("memory/scratchpad.md")).strip())
-        if sp_len < 50:
-            lines.append("WARNING: EMPTY SCRATCHPAD — scratchpad is nearly empty. Memory loss signal.")
-        elif sp_len > SCRATCHPAD_BLOAT_WARN_CHARS:
-            lines.append(f"WARNING: BLOATED SCRATCHPAD — {sp_len} chars. Extract durable insights to knowledge base.")
-        else:
-            lines.append(f"OK: scratchpad size ({sp_len} chars)")
-    except Exception:
-        pass
-
-    try:
-        meta = read_json_dict(env.drive_path("memory/dialogue_meta.json")) or {}
-        receipt = meta.get("last_unpublished_nominations")
-        if isinstance(receipt, dict) and int(receipt.get("failed") or 0) > 0:
-            # The recovery route is named because the reader may hold no read_file:
-            # an external-channel turn has the cognitive memory tools and nothing else.
-            lines.append(
-                f"WARNING: LAST DIALOGUE KNOWLEDGE PUBLICATION INCOMPLETE — {receipt.get('failed')} of "
-                f"{receipt.get('total')} nominations from the latest consolidation batch were not published "
-                f"(entry_id {receipt.get('entry_id')}); from the main chat, read_file(root='runtime_data', "
-                "path='memory/knowledge_history.jsonl') and publish what still holds"
-            )
-        error = meta.get("last_consolidation_error")
-        if isinstance(error, dict):
-            lines.append(
-                f"WARNING: LAST DIALOGUE CONSOLIDATION FAILED — kind={error.get('kind') or 'unknown'} "
-                f"at cursor {error.get('cursor_offset')}"
-            )
-    except Exception:
-        pass
+    for name, journal, tool, compare in _SELF_FILES:
+        try:
+            path = env.drive_path(f"memory/{name}")
+            if path.exists():
+                fact = _last_self_update(env.drive_path(f"memory/{journal}"), tool, path if compare else None)
+                lines.append(f"{name}: {fact}")
+        except Exception:
+            log.debug("Self-update fact unavailable for %s", name, exc_info=True)
     return lines
 
 
-def build_health_invariants(env: Any, task_id: str = "", active_root: str = "") -> str:
+def _unread_output_line(custody_root: Any, run: Any, task_id: str) -> str:
+    """The D7 NEVER-READ line for one settled, complete, unread staged output of the reader's own run.
+
+    Another task's runs fold into ``_foreign_work_line``; an unattributed reader (empty ``task_id``)
+    may be the owner and reads this line too. A retained (#1573) output names its exact canonical read
+    address; a legacy row keeps its task-drive wording byte for byte.
+    """
+    from ouroboros.delegate_output import staged_output_address
+
+    address = staged_output_address(custody_root, run) if run.output_source else {}
+    how = f"root='{address['root']}' at that path" if address else "root='task_drive'"
+    action = (
+        f"Read it with read_file {how} until the artifact is "
+        "covered end to end, or say plainly that the result was not "
+        "collected."
+    )
+    if getattr(run, "terminal_source", None) and not run.unread_disclosed:
+        return (f"INFO: DELEGATED RESULT AVAILABLE — run {run.run_id or '?'} has retained full output at "
+                f"{address.get('path') or run.output_artifact}, not yet read by its owner. "
+                "Body collection proves availability, not acceptance. " + action)
+    return (f"WARNING: DELEGATED RESULT NEVER READ — run {run.run_id or '?'} settled "
+            f"with its full output staged at {address.get('path') or run.output_artifact} and never read to "
+            f"EOF (owner task {run.task_id or '?'}). {action}")
+
+
+def _foreign_owner(run: Any, task_id: str) -> str:
+    """The run's owner task when this reader is ANOTHER task, else "" (its own run or an unattributed reader)."""
+    return str(run.task_id) if task_id and run.task_id and task_id != run.task_id else ""
+
+
+def _foreign_work_line(root: Any, foreign: Dict[str, Dict[str, List[str]]]) -> str:
+    """One line for all foreign obligations; the exact list uses the existing blob reader.
+
+    No seen-state: identical lists reuse content-addressed source bytes. If retention fails,
+    keep the list in the line rather than publishing an unreadable pointer.
+    """
+    from ouroboros.observability import write_blob
+
+    try:
+        ref = write_blob(root, foreign)
+        source = f"query_data(op='blob', sha256='{ref['sha256']}')"
+    except OSError:
+        source = "retention unavailable; exact list: " + json.dumps(foreign, ensure_ascii=False, sort_keys=True)
+    severity = "WARNING" if any(work["patches"] for work in foreign.values()) else "INFO"
+    return (f"{severity}: OTHER TASKS' DELEGATED WORK — full owner/run list (unread results, undisposed patches, "
+            f"'yours' = matching target geometry, not write authority): {source}. Only the owner acknowledges "
+            "results and decides patches while live; after it ends, a live top-level task may reject from any "
+            "root or apply to the original target when location and current write rights permit "
+            "(payloads need a fresh binding) "
+            "via integrate_delegated_patch.")
+
+
+# One line per own settled run, bounded like ``terminal_custody_notice``.
+_OWN_RUN_OUTCOME_LINES = 10
+
+
+def _own_run_outcome_lines(custody_root: Any, custody_state: Any, task_id: str,
+                           attempt_key: str) -> List[str]:
+    """The reader's OWN settled runs whose terminal payload its current transcript lacks.
+
+    #1573: a run the sweep settled while its owner was parked (or that it never
+    waited on) left no fact in the owner's context. From the ONE custody state the
+    other delegated-run checks already read: own (never a foreign or review-owned
+    run), settled terminal, recorded by a writer that also records the terminal
+    acknowledgement (``engine_locator`` is not None — before it, absence proved
+    nothing), not acknowledged in THIS attempt, and not already a D7 line. Facts and
+    locators only, never output text or a command. A retained payload is called
+    full only when its custody says ``output_complete``; an unverified engine
+    preview keeps its address but is named incomplete. The line leaves the next
+    fresh context build after the run's terminal wake is appended in this attempt.
+    """
+    if not task_id or not attempt_key or custody_state is None:
+        return []
+    from ouroboros.delegate_custody import TERMINAL_STATES, settled_output_unread
+    from ouroboros.delegate_output import staged_output_address
+
+    runs = sorted((run for run in custody_state.values()
+                   if run.task_id == task_id and run.settled and not run.review_owned
+                   and run.terminal_state in TERMINAL_STATES and run.engine_locator is not None
+                   and run.terminal_ack_attempt != attempt_key and not settled_output_unread(run)),
+                  key=lambda run: (run.settled_at, run.run_id), reverse=True)
+    lines = []
+    for run in runs[:_OWN_RUN_OUTCOME_LINES]:
+        locator = run.engine_locator or {}
+        primary = locator.get("primary_output") if isinstance(locator.get("primary_output"), dict) else {}
+        engine = [f"run folder {locator['run_dir']}"] if locator.get("run_dir") else []
+        if primary:
+            engine.append("primary output " + " ".join(str(part) for part in (
+                primary.get("kind"), primary.get("path"),
+                f"({primary['bytes']} bytes)" if "bytes" in primary else None,
+                "(truncated preview)" if primary.get("truncated") else None) if part))
+        address = staged_output_address(custody_root, run)
+        retained = ("retained full output" if run.output_complete else
+                    "retained INCOMPLETE payload (unverified engine preview, never acknowledgeable as read)")
+        lines.append(
+            f"INFO: OWN DELEGATED RUN ENDED — run {run.run_id} {run.terminal_state}"
+            + (f" ({run.terminal_reason})" if run.terminal_reason else "")
+            + (f" at {run.settled_at}" if run.settled_at else "")
+            + "; at context capture, no terminal-wake acknowledgement was recorded for this attempt"
+            + ("; engine-owned, may be reclaimed: " + "; ".join(engine) if engine else "")
+            + (f"; {retained}: read_file root='{address['root']}' path='{address['path']}'"
+               if address else "")
+            + ".")
+    if len(runs) > _OWN_RUN_OUTCOME_LINES:
+        lines.append(f"INFO: OWN DELEGATED RUNS ENDED — +{len(runs) - _OWN_RUN_OUTCOME_LINES} older "
+                     "settled runs also lacked this attempt's acknowledgement at context capture.")
+    return lines
+
+
+@timed_section("health")
+def build_health_invariants(env: Any, task_id: str = "", active_root: str = "",
+                            attempt_key: str = "") -> str:
     """Render the health-invariant WARNING block for one reader's context.
 
-    ``task_id`` names the READING task so delegated-run obligations can shape
-    their instruction clause by ownership: the obligations stay globally
-    visible (owner doctrine — a preserved-and-invisible result is how work
-    rots on disk), but only the OWNER task receives the call-shaped
-    instruction. A non-owner told to call ``integrate_delegated_patch`` gets
-    a structural ``run_not_owned`` refusal and an obligation it can never
-    discharge. Empty ``task_id`` (legacy callers)
-    keeps the call-shaped wording — an unattributed reader may be the owner.
+    Called once when a task's context is built (a task-start snapshot, not
+    refreshed per round).
+
+    ``task_id`` names the READING task so delegated-run obligations follow
+    ownership: they stay globally visible (owner doctrine D7 — a
+    preserved-and-invisible result is how work rots on disk), the OWNER task
+    receives each run's line with its call-shaped instruction, and another
+    task's runs fold into ONE line per owner task with their run ids, the
+    authority rule and a run's exact reader (owner decision Q3=A, 18.10.2026).
+    Empty ``task_id`` (legacy callers) keeps every line call-shaped — an
+    unattributed reader may be the owner.
 
     ``active_root`` names that reader's own active Git root, which this module
     cannot look up (it has no ``ctx``) and the caller already holds. One
-    comparison through the apply gate's own predicate then names the concrete
-    call for a FOREIGN obligation the reader's root already satisfies, instead
-    of leaving sixteen identical abstract rows. Empty keeps the static wording
-    byte-for-byte.
+    comparison through the apply gate's own predicate then names, inside the
+    owner's line, the concrete call for another task's patches the reader's
+    root already satisfies.
+
+    ``attempt_key`` is the reader's actual task attempt, normalized exactly as the
+    supervision acknowledgement records it; with ``task_id`` it names the reader's
+    OWN settled runs whose terminal payload this attempt's transcript never took
+    (``_own_run_outcome_lines``). Empty renders none of those lines.
     """
     checks: List[str] = []
+    try:
+        from ouroboros.claudexor_exit_facts import health_line
+        engine_exit = health_line(env.drive_path("logs/supervisor.jsonl").parent.parent)
+        if engine_exit:
+            checks.append(engine_exit)
+    except Exception:
+        log.debug("Engine exit observation unavailable", exc_info=True)
 
     try:
         from ouroboros.tools.release_sync import (
@@ -325,34 +539,24 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "") 
             pass
         if desync_parts:
             checks.append(f"CRITICAL: VERSION DESYNC — VERSION={ver_file}, {', '.join(desync_parts)}")
-        elif ver_file:
-            checks.append(f"OK: version sync ({ver_file})")
     except Exception:
         pass
 
-    try:
-        state_data = read_json_dict(env.drive_path("state/state.json")) or {}
-        from ouroboros.usage_accounting import usage_breakdown
+    # The drift check saved its own like-for-like pair and baseline (supervisor.state._apply_openrouter_ground_truth):
+    # the line says the two changes since that baseline, the ones its percentage compares (as /status prints them),
+    # with no usage-store read on a context build.
+    state_data = read_json_dict(env.drive_path("state/state.json")) or {}
+    if state_data.get("budget_drift_alert"):
+        try:
+            ledger = state_data.get("openrouter_checked_ledger_settled_usd", state_data.get("openrouter_ledger_settled_usd"))
+            ledger_since = float(ledger) - float(state_data["session_openrouter_settled_snapshot"])
+            key_since = float(state_data["openrouter_total_usd"]) - float(state_data["session_total_snapshot"])
+            checks.append(f"WARNING: BUDGET DRIFT {float(state_data['budget_drift_pct']):.1f}% — since its baseline the "
+                          f"ledger counted ${ledger_since:.2f} of OpenRouter spend, the key's usage grew ${key_since:.2f}")
+        except (KeyError, TypeError, ValueError):
+            checks.append("WARNING: BUDGET DRIFT — the saved drift figures are unreadable (state/state.json)")
 
-        accounted = float(usage_breakdown(env.drive_root).get("accounted_usd") or 0.0)
-        if state_data.get("budget_drift_alert"):
-            checks.append(f"WARNING: BUDGET DRIFT {state_data.get('budget_drift_pct', 0):.1f}% — tracked=${accounted:.2f} vs OpenRouter=${state_data.get('openrouter_total_usd', 0):.2f}")
-        else:
-            checks.append("OK: budget drift within tolerance")
-    except Exception:
-        checks.append("WARNING: COST ACCOUNTING UNAVAILABLE — budget drift check skipped")
-
-    try:
-        from supervisor.state import per_task_cost_summary
-        costly = [t for t in per_task_cost_summary(5) if t["cost"] > 5.0]
-        for t in costly:
-            checks.append(f"WARNING: HIGH-COST TASK — task_id={t['task_id']} cost=${t['cost']:.2f} rounds={t['rounds']}")
-        if not costly:
-            checks.append("OK: no high-cost tasks (>$5)")
-    except Exception:
-        checks.append("WARNING: COST ACCOUNTING UNAVAILABLE — high-cost task check skipped")
-
-    checks.extend(_memory_health_lines(env))
+    checks.extend(_self_update_lines(env))
 
     # state/crash_report.json retired (CPL4-C9, owner 2A): its writer — the
     # crash-rollback path — no longer exists in this tree, so the reader and
@@ -376,57 +580,66 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "") 
     plan_note = _plan_review_note(env, task_id)
     if plan_note:
         checks.append(plan_note)
-    # Both delegated-run obligations below read the SAME rotated custody chain,
-    # so one traversal serves both instead of a full replay each (I18). A failed
-    # read leaves the state None and each block replays for itself exactly as
-    # before, under its own fail-soft arm.
-    custody_root = None
+    # The three delegated-run blocks below share ONE selected custody read of the rows
+    # they can name (``health_runs``: own, held, maybe-unread), so a build decodes neither
+    # every settled run nor each block's own copy (I18); their predicates and order
+    # decide. A read that fails is said as such, with the addressed reader, and those
+    # blocks are skipped: each would otherwise replay every row for itself, and an empty
+    # replay proves no absence of obligations. Containment faults keep their own read.
+    custody_root = getattr(env, "drive_root", None) or env.drive_path("state").parent
     custody_state = None
+    custody_gap = ""
     try:
-        from ouroboros.delegate_custody import replay as replay_custody
+        from ouroboros.delegate_custody_current import health_runs
 
-        custody_root = getattr(env, "drive_root", None) or env.drive_path("state").parent
-        custody_state = replay_custody(custody_root)
-    except Exception:
-        custody_state = None
+        custody_state = health_runs(custody_root, task_id)
+    except Exception as exc:
+        log.debug("Selected custody read failed", exc_info=True)
+        custody_gap = f"{type(exc).__name__}: {str(exc)[:200]}"
+    if custody_gap:
+        checks.append(
+            f"WARNING: CUSTODY UNAVAILABLE — the delegated-run obligations could not be read ({custody_gap}); "
+            "nothing here proves their absence. Read them with query_data(op='sql', db='current', "
+            "query=\"SELECT run_id, task_id, state FROM custody_runs WHERE state='held' OR output_unread=1\")."
+        )
+
+    foreign: Dict[str, Dict[str, List[str]]] = {}  # exact source for one line covering all foreign owners
+
+    def foreign_work(owner: str) -> Dict[str, List[str]]:
+        return foreign.setdefault(owner, {"unread": [], "patches": [], "yours": []})
 
     try:
         from ouroboros.delegate_custody import settled_unread_outputs
 
-        for run in settled_unread_outputs(custody_root, custody_state):
+        for run in settled_unread_outputs(custody_root, custody_state) if not custody_gap else ():
             # Owner doctrine D7, made load-bearing: a delegated result that was paid for
             # and never read to EOF is the launched-never-collected class. Not CRITICAL —
             # nothing is live and nothing is mutating — but it stays visible until the
             # read happens, which is the whole difference between a disclosure and a fact
             # someone acts on. It clears itself the moment the acknowledgement lands.
-            # The instruction clause is ownership-aware: the staged artifact lives
-            # under the OWNER's task drive and the read acknowledgement only
-            # credits the owner, so telling a foreign task to read it mints an
-            # obligation it structurally cannot discharge.
-            if task_id and run.task_id and task_id != run.task_id:
-                action = (
-                    f"Only its owner task {run.task_id} can read and acknowledge it; "
-                    f"note the gap honestly instead of attempting the read here."
-                )
+            owner = _foreign_owner(run, task_id)
+            if owner:
+                foreign_work(owner)["unread"].append(str(run.run_id or "?"))
             else:
-                action = (
-                    "Read it with read_file root='task_drive' until the artifact is "
-                    "covered end to end, or say plainly that the result was not "
-                    "collected."
-                )
-            checks.append(
-                f"WARNING: DELEGATED RESULT NEVER READ — run {run.run_id or '?'} settled "
-                f"with its full output staged at {run.output_artifact} and never read to "
-                f"EOF (owner task {run.task_id or '?'}). {action}"
-            )
+                checks.append(_unread_output_line(custody_root, run, task_id))
+    except Exception:
+        pass
+
+    try:
+        checks.extend(_own_run_outcome_lines(custody_root, custody_state, task_id, attempt_key))
     except Exception:
         pass
 
     try:
         from ouroboros.delegate_custody import undisposed_patches
-        from ouroboros.delegate_shared import orphan_apply_target_ok
+        from ouroboros.config import get_subagent_projects_root
+        from ouroboros.launch_roots import WorkRootUnavailable
 
-        for run in undisposed_patches(custody_root, custody_state):
+        try:
+            projects_root = pathlib.Path(get_subagent_projects_root()).expanduser().resolve()
+        except WorkRootUnavailable:  # undecided: no folder is "yours" through it; every warning still shows
+            projects_root = None
+        for run in undisposed_patches(custody_root, custody_state) if not custody_gap else ():
             # C1: a settled mutating run's work lives in its private snapshot (and its
             # captured patch, once one exists) until someone explicitly applies or
             # rejects it. The GC preserves the material, but preserved-and-invisible is
@@ -441,44 +654,30 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "") 
                     f"settled with its changes captured from a private snapshot of "
                     f"{run.target_root or '?'}"
                 )
-                persist_clause = "The snapshot and patch persist until that disposition."
+                persist_clause = "The saved patch and its pinned commits persist until that disposition."
             else:
                 state_clause = (
                     f"settled with its work preserved in its private snapshot of "
                     f"{run.target_root or '?'} (no patch captured yet — "
-                    f"integrate_delegated_patch captures it at disposition)"
+                    f"integrate_delegated_patch captures it at disposition and returns it for inspection "
+                    f"before any apply)"
                 )
                 persist_clause = "The snapshot persists until that disposition."
-            # Ownership-aware instruction: a foreign reader is told WHO must act
-            # instead of being handed a call that structurally refuses. The
-            # wording is STATIC — stating the rule costs no per-orphan
-            # task_result read, and the tool itself is the authority on whether
-            # this particular caller may dispose this particular run.
-            if task_id and run.task_id and task_id != run.task_id:
-                decide_clause = (
-                    f"Only its owner task {run.task_id} can decide it while that task "
-                    f"is live; once that task is terminal, a live top-level task may dispose it: "
-                    f"apply requires the caller's active Git root or fresh payload binding to equal "
-                    f"the run's recorded target, while reject requires only terminality and reject "
-                    f"may release it even from a different active root; the disposition row records "
-                    f"who acted (a live-owner foreign call is still refused as run_not_owned)."
-                )
-                # One comparison over the root the caller already holds, through the
-                # SAME predicate the apply gate uses: when this reader's own active
-                # root already satisfies the recorded target, the abstract rule alone
-                # left it guessing (sixteen such rows in one prompt). No per-orphan
-                # task_result read is added, and the tool re-verifies every guard.
-                if active_root and orphan_apply_target_ok(run.target_root, active_root):
-                    decide_clause += (
-                        f" Your own active root already satisfies that target, so once the owner "
-                        f"is terminal the call is integrate_delegated_patch(run_id='{run.run_id}', "
-                        f"decision='apply'|'reject')."
-                    )
-            else:
-                decide_clause = (
-                    f"decide with integrate_delegated_patch(run_id='{run.run_id}', "
-                    f"decision='apply'|'reject')."
-                )
+            # Keep target-match facts in the retained list; the apply tool re-verifies every guard.
+            owner = _foreign_owner(run, task_id)
+            if owner:
+                foreign_work(owner)["patches"].append(str(run.run_id or "?"))
+                if active_root and str(run.target_root or "").strip():
+                    target = pathlib.Path(run.target_root).expanduser().resolve()
+                    active = pathlib.Path(active_root).expanduser().resolve()
+                    if target == active or (target.is_relative_to(active) and projects_root is not None
+                                            and active.is_relative_to(projects_root)):
+                        foreign_work(owner)["yours"].append(str(run.run_id))
+                continue
+            decide_clause = (
+                f"decide with integrate_delegated_patch(run_id='{run.run_id}', "
+                f"decision='apply'|'reject')."
+            )
             checks.append(
                 f"WARNING: DELEGATED PATCH AWAITS DISPOSITION — run {run.run_id or '?'} "
                 f"(owner task {run.task_id or '?'}) {state_clause} and no apply/reject "
@@ -487,6 +686,8 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "") 
             )
     except Exception:
         pass
+    if foreign:
+        checks.append(_foreign_work_line(getattr(env, "budget_drive_root", None) or custody_root, foreign))
 
     try:
         from ouroboros.delegate_custody import open_containment_faults
@@ -511,46 +712,7 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "") 
     except Exception:
         pass
 
-    try:
-        # Probe body lives beside the other live-reused startup checks
-        # (the check_stray_server_processes pattern); thresholds are the
-        # justified constants in ouroboros/context_budget.py.
-        from ouroboros.agent_startup_checks import hot_store_growth_notes
-
-        checks.extend(hot_store_growth_notes(env))
-    except Exception:
-        pass
-
     _collect_log_analysis_checks(env, checks)
     if not checks:
         return ""
     return "## Health Invariants\n\n" + "\n".join(f"- {check}" for check in checks)
-
-
-def _compute_cache_hit_rate(env: Any) -> Optional[float]:
-    total_prompt = total_cached = reported = 0
-    try:
-        for ev in _iter_recent_jsonl(env.drive_path("logs/events.jsonl")):
-            if ev.get("type") != "llm_round":
-                continue
-            usage = ev.get("usage", ev)
-            pt = int(usage.get("prompt_tokens", 0))
-            # An absent key and an explicit null both mean the round measured
-            # nothing, so it joins NEITHER side of the ratio; only a number is
-            # a report, and an explicit 0 is a real measured miss.
-            cached = usage.get("cached_tokens")
-            if pt > 0 and cached is not None:
-                total_prompt += pt
-                total_cached += int(cached or 0)
-                reported += 1
-    except Exception:
-        return None
-    # Nobody reporting a cache is not a cache that missed: without the key the
-    # share is UNKNOWN, and the arithmetic zero below would render that absence
-    # as an honest 0% and send the owner hunting a caching regression no round
-    # ever measured. The window is the REPORTING rounds for the same reason: on
-    # an install whose providers are mixed, charging a silent round's prompt to
-    # the denominator understates the share the measuring rounds actually saw.
-    if reported < 5 or total_prompt == 0:
-        return None
-    return total_cached / total_prompt

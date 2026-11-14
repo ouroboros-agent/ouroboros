@@ -17,6 +17,7 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
+from ouroboros.gateway import task_archive
 from ouroboros.gateway.tasks import (
     api_task_artifact,
 )
@@ -37,6 +38,16 @@ from tests._headless_cli_shared import (  # noqa: F401  (autouse fixture applies
     _init_repo_with_file,
     _managed_worker_pool_available,
 )
+
+
+def _assert_file_response(response, content: bytes) -> None:
+    # Owner-approved #1297: platforms without confined opens return a typed 503.
+    if task_archive.CONFINED:
+        assert response.status_code == 200
+        assert response.content == content
+    else:
+        assert response.status_code == 503
+        assert response.json()["reason_code"] == "artifact_unavailable"
 
 
 def test_copy_child_result_cannot_overwrite_finalized_accounting(tmp_path):
@@ -158,6 +169,7 @@ def test_effective_result_preserves_workspace_artifact_status_with_child_drive(t
         }),
         encoding="utf-8",
     )
+    captured_ledger = ledger_path.read_bytes()
     write_task_result(
         parent,
         task_id,
@@ -184,8 +196,9 @@ def test_effective_result_preserves_workspace_artifact_status_with_child_drive(t
     assert effective["artifact_status"] == ARTIFACT_STATUS_READY_WITH_CHANGES
     assert not effective.get("artifact_error")
     assert effective["artifact_bundle"]["status"] == ARTIFACT_STATUS_READY_WITH_CHANGES
-    refreshed_ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-    assert refreshed_ledger["outcome_axes"]["artifacts"]["status"] == ARTIFACT_STATUS_READY_WITH_CHANGES
+    # The ledger file stays its dated capture, "finalizing" word included (#2472): the current
+    # status is the row's bundle above, never a rewrite of published bytes.
+    assert ledger_path.read_bytes() == captured_ledger
 
     copied = copy_child_task_result(parent, {"id": task_id, "workspace_root": str(repo), "drive_root": str(child)})
     assert copied is not None
@@ -370,11 +383,35 @@ def test_effective_result_preserves_workspace_patch_kind_with_child_drive(tmp_pa
     assert client.paths == [f"/api/tasks/{task_id}/artifacts/workspace.patch"]
 
 
+def test_repeated_directory_capture_keeps_its_registered_output_store(tmp_path):
+    from hashlib import sha256
+    from ouroboros.artifacts import copy_file_to_task_artifacts
+    from ouroboros.headless import current_workspace_manifest
+    from ouroboros.task_results import load_task_result
+    data, folder = tmp_path / "data", tmp_path / "folder"
+    data.mkdir(); folder.mkdir()
+    task = {"id": "direct-folder", "workspace_root": str(folder), "workspace_mode": "external"}
+    ctx = SimpleNamespace(drive_root=data, task_id=task["id"])
+    write_task_result(data, task["id"], "completed", workspace_root=str(folder), workspace_mode="external")
+    for content in (b"first direct output", b"updated direct output"):
+        path = folder / "output.txt"
+        path.write_bytes(content)
+        assert copy_file_to_task_artifacts(ctx, path, kind="user_file")
+        finalize_task_artifacts(data, task)
+        result = load_task_result(data, task["id"])
+        source = current_workspace_manifest(data, task["id"], result)
+        assert source == task_artifacts_dir(data, task["id"]) / "workspace_patch.json"
+        manifest = json.loads(source.read_bytes())
+        assert manifest["capture_kind"] == "directory_direct" and manifest["apply_state"] == "already_applied"
+        assert any(row["sha256"] == sha256(content).hexdigest() for row in manifest["registered_outputs"])
+        assert result["artifact_status"] == result["artifact_bundle"]["status"] == "ready"
+
+
 def test_task_artifact_endpoint_serves_only_declared_artifacts(tmp_path):
     data = tmp_path / "data"
     artifact_dir = task_artifacts_dir(data, "task-artifact")
     patch_path = artifact_dir / "workspace.patch"
-    patch_path.write_text("diff --git a/a b/a\n", encoding="utf-8")
+    patch_path.write_bytes(b"diff --git a/a b/a\n")  # exact LF bytes on every platform
     write_task_result(
         data,
         "task-artifact",
@@ -386,7 +423,7 @@ def test_task_artifact_endpoint_serves_only_declared_artifacts(tmp_path):
     app.state.drive_root = data
     client = TestClient(app)
 
-    assert client.get("/api/tasks/task-artifact/artifacts/workspace.patch").text.startswith("diff --git")
+    _assert_file_response(client.get("/api/tasks/task-artifact/artifacts/workspace.patch"), b"diff --git a/a b/a\n")
     assert client.get("/api/tasks/task-artifact/artifacts/missing.patch").status_code == 404
     assert client.get("/api/tasks/task-artifact/artifacts/bad%5Cname").status_code == 400
 
@@ -415,15 +452,15 @@ def test_task_artifact_endpoint_serves_manifest_artifact_after_status_repair(tmp
 
     response = TestClient(app).get("/api/tasks/orphaned/artifacts/report.html")
 
-    assert response.status_code == 200
-    assert response.text == "<h1>ok</h1>"
+    _assert_file_response(response, b"<h1>ok</h1>")
 
 
-def test_task_artifact_endpoint_rebases_child_drive_artifact_after_status_repair(tmp_path):
+def test_task_artifact_endpoint_serves_child_drive_artifact_read_only_after_status_repair(tmp_path):
     from ouroboros.artifacts import collect_task_artifact_records, copy_file_to_task_artifacts
 
     data = tmp_path / "data"
-    child = tmp_path / "child"
+    # The task's OWN headless drive (host layout); a drive merely named by the row is no authority.
+    child = data / "state" / "headless_tasks" / "childart" / "data"
     source_dir = tmp_path / "Desktop"
     source_dir.mkdir()
     source = source_dir / "report.html"
@@ -456,10 +493,9 @@ def test_task_artifact_endpoint_rebases_child_drive_artifact_after_status_repair
 
     response = TestClient(app).get("/api/tasks/childart/artifacts/report.html")
 
-    parent_artifact = task_artifacts_dir(data, "childart", create=False) / "report.html"
-    assert response.status_code == 200
-    assert response.text == "<h1>child</h1>"
-    assert parent_artifact.read_text(encoding="utf-8") == "<h1>child</h1>"
+    # The own child store is read when supported; neither outcome copies or creates it.
+    _assert_file_response(response, b"<h1>child</h1>")
+    assert not task_artifacts_dir(data, "childart", create=False).exists()
 
 
 def test_task_artifact_endpoint_rejects_metadata_name_path_mismatch(tmp_path):
@@ -517,7 +553,7 @@ def test_startup_prune_removes_only_old_terminal_child_drives(tmp_path):
     os.utime(pending_dir, (old, old))
     os.utime(fresh_timestamp_dir, (old, old))
 
-    report = prune_headless_task_drives(data, retention_days=7, now=now)
+    report = prune_headless_task_drives(data, retention_days=7, now=now, live=lambda _task: False)
 
     assert [item["task_id"] for item in report["pruned"]] == ["oldterminal"]
     assert not terminal_dir.exists()
@@ -527,7 +563,7 @@ def test_startup_prune_removes_only_old_terminal_child_drives(tmp_path):
     assert any(item["task_id"] == "freshresult" and item["reason"] == "younger_than_retention" for item in report["skipped"])
 
 
-def test_startup_prune_uses_effective_terminal_status(tmp_path):
+def test_prune_settles_only_durably_terminal_rows_never_a_projection(tmp_path):
     data = tmp_path / "data"
     task_drive = data / "task_drives" / "stalerun"
     child_dir = data / "state" / "headless_tasks" / "stalechild"
@@ -559,8 +595,18 @@ def test_startup_prune_uses_effective_terminal_status(tmp_path):
     os.utime(task_drive, (old, old))
     os.utime(child_dir, (old, old))
 
-    direct_report = prune_task_drives(data, retention_days=7, now=now)
-    child_report = prune_headless_task_drives(data, retention_days=7, now=now)
+    # A projection is not custody: only the DURABLE row settles a drive (TZ-1 A).
+    direct_report = prune_task_drives(data, retention_days=7, now=now, live=lambda _task: False)
+    child_report = prune_headless_task_drives(data, retention_days=7, now=now, live=lambda _task: False)
+    assert [item["reason"] for item in direct_report["skipped"]] == ["task_not_terminal"]
+    assert [item["reason"] for item in child_report["skipped"]] == ["parent_not_terminal"]
+    assert task_drive.exists() and child_dir.exists()
+
+    from ouroboros.task_status import reconcile_orphaned_running_tasks
+
+    assert reconcile_orphaned_running_tasks(data) == 2  # the reconciler persists what the projection says
+    direct_report = prune_task_drives(data, retention_days=7, now=now, live=lambda _task: False)
+    child_report = prune_headless_task_drives(data, retention_days=7, now=now, live=lambda _task: False)
 
     assert [item["task_id"] for item in direct_report["pruned"]] == ["stalerun"]
     assert [item["task_id"] for item in child_report["pruned"]] == ["stalechild"]
@@ -588,7 +634,7 @@ def test_startup_prune_removes_only_old_terminal_task_scratch(tmp_path):
     os.utime(old_pending, (old, old))
     os.utime(fresh_terminal, (old, old))
 
-    report = prune_task_drives(data, retention_days=7, now=now)
+    report = prune_task_drives(data, retention_days=7, now=now, live=lambda _task: False)
 
     assert [item["task_id"] for item in report["pruned"]] == ["oldterminal"]
     assert not old_terminal.exists()
@@ -653,8 +699,7 @@ def test_task_artifact_endpoint_serves_exact_chat_media_without_task_result(tmp_
     client = TestClient(app)
 
     response = client.get(f"/api/tasks/ephemeral1/artifacts/{stored['name']}")
-    assert response.status_code == 200
-    assert response.content == b"photo-bytes"
+    _assert_file_response(response, b"photo-bytes")
     assert collect_task_artifact_records(data, "ephemeral1") == []
 
     assert client.get("/api/tasks/ephemeral1/artifacts/chat-media-bad.png").status_code == 404

@@ -14,7 +14,6 @@ import pytest
 
 # This suite executes real shell subprocesses through ``_run_shell``; keep it
 # in the dedicated serial pytest lane so xdist workers cannot crash or race it.
-pytestmark = pytest.mark.serial
 
 from ouroboros.tool_access import (
     active_tool_profile,
@@ -23,14 +22,15 @@ from ouroboros.tool_access import (
     resolve_shell_cwd,
     user_files_path_block_reason,
 )
-from ouroboros.presence_authority import build_presence_capability_ceiling, presence_ceiling_payload
-from ouroboros.presence_capabilities import (
+from ouroboros.presence_authority import presence_ceiling_payload
+from tests.frozen_presence_authority import build_presence_capability_ceiling
+from tests.frozen_presence_capabilities import (
     PresenceProfileResolution,
     PresenceResourceTarget,
     PresenceSelection,
     PresenceToolTarget,
 )
-from ouroboros.presence_runtime import ResolvedPresenceRuntime
+from tests.frozen_presence_runtime import ResolvedPresenceRuntime
 from ouroboros.tools.registry import ToolContext, ToolRegistry
 from tests._typed_guard_shared import _shell_guard_text
 
@@ -116,7 +116,7 @@ def test_subagent_inherits_active_external_workspace_when_metadata_missing(tmp_p
 def test_root_config_mutations_preserve_enumerated_credentials_without_dotdir_default_deny(tmp_path):
     """Root configuration access is broad; named stores/leaves keep their fences.
 
-    Root reads remain location-authorized with secret-byte masking at egress.
+    Root reads remain location-authorized and preserve file content.
     Unlisted dotted directories are explicitly not a blanket credential fence.
     """
     home = tmp_path / "_home"
@@ -162,7 +162,7 @@ def test_block_reason_protects_runtime_and_credentials_even_in_external(tmp_path
     # A credential-shaped NAME outside a credential location no longer refuses
     # mutation either: the fence is the location (~/.ssh, ~/.aws, ...) and the
     # exact credential leaves, never the suffix. Root reads stay location-only
-    # (capinv-447 / В23=A — bytes are masked at egress instead).
+    # and admitted content is delivered unchanged.
     assert user_files_path_block_reason(ext, tmp_path / "scratch" / "id_rsa.pem") == ""
     assert user_files_path_block_reason(ext, tmp_path / "scratch" / "id_rsa.pem", operation="read") == ""
 
@@ -386,7 +386,7 @@ def test_external_workspace_deliverables_guard_maps_executor_paths(tmp_path, mon
     from ouroboros.tools.shell import _run_shell
     from ouroboros.workspace_executor import ExecutorResult, executor_ref_from_ctx, map_backend_path
 
-    def fake_execute(fake_ctx, fake_cmd, _cwd, _timeout_sec, env_overlay=None):
+    def fake_execute(fake_ctx, fake_cmd, _cwd, _timeout_sec, env_overlay=None, stop=None):
         destination = map_backend_path(
             executor_ref_from_ctx(fake_ctx),
             fake_cmd[-1],

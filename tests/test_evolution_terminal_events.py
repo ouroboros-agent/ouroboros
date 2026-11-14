@@ -365,6 +365,7 @@ def test_rejected_terminal_does_not_consume_global_evolution_state(tmp_path, mon
     from supervisor.events import _handle_evolution_task_done
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     state.update_state(lambda live: live.update(
         evolution_mode_enabled=True,
         post_task_autostop=True,

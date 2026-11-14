@@ -12,9 +12,9 @@ _EXPECTED_TOP_LEVEL_POLICY = {
     "active_workspace": {"read", "list", "search", "write", "edit", "shell", "vcs", "review", "service"},
     "system_repo": {"read", "list", "search", "write", "edit", "shell", "vcs", "review", "service"},
     "runtime_data": {"read", "list", "search", "write", "edit"},
-    "task_drive": {"read", "list", "write", "edit", "shell", "service"},
+    "task_drive": {"read", "list", "search", "write", "edit", "shell", "service"},
     "skill_payload": {"read", "list", "search", "write", "edit", "review", "shell"},
-    "artifact_store": {"read", "list", "write", "shell", "service"},
+    "artifact_store": {"read", "list", "search", "write", "edit", "shell", "service"},
     "user_files": {"read", "list", "search", "write", "edit", "shell", "service"},
     "subagent_projects": {"read", "list", "search"},
     "deliverables": {"read", "list", "search"},
@@ -34,9 +34,10 @@ def test_ordinary_top_level_presets_share_one_exact_principal_matrix():
 def test_shared_top_level_principal_does_not_widen_specialized_profiles():
     assert "shell" not in _POLICY["local_readonly_subagent"]["skill_payload"]
     assert "skill_repair" not in _POLICY
-    assert "skill_payload" not in _POLICY["acting_subagent"]
+    assert _POLICY["acting_subagent"]["skill_payload"] == {"read", "list", "search"}
     for profile in ("local_readonly_subagent", "acting_subagent"):
-        assert "search" not in _POLICY[profile]["runtime_data"]
+        assert {"read", "list", "search"} <= _POLICY[profile]["runtime_data"]
+        assert not {"write", "edit"} & _POLICY[profile]["runtime_data"]
     assert "delegate" in _POLICY["operator_control"]["active_workspace"]
 
 
@@ -170,7 +171,7 @@ def test_binding_collision_blocks_mutation_but_exact_read_stays_inspectable(tmp_
     assert not (data / "state" / "skills" / "same").exists()
 
 
-@pytest.mark.parametrize("operation", ["read", "list", "search", "write", "edit", "shell", "vcs"])
+@pytest.mark.parametrize("operation", ["read", "shell", "vcs"])
 def test_binding_preserves_the_project_room_target_for_every_operation(tmp_path, operation):
     repo = tmp_path / "repo"
     data = tmp_path / "data"

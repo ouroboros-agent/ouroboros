@@ -5,10 +5,11 @@ Covers:
 - drain_all_pending() empties PENDING and returns tasks
 - kill_workers() writes failure results for RUNNING + PENDING tasks
 """
-import json
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+from tests._store_shared import read_result, result_exists, seed_result
 
 
 
@@ -27,10 +28,9 @@ def test_write_failure_result_creates_correct_json(tmp_path):
     finally:
         workers.DRIVE_ROOT = orig
 
-    result_file = tmp_path / "task_results" / "abc123.json"
-    assert result_file.exists()
+    assert result_exists(tmp_path, "abc123")
 
-    data = json.loads(result_file.read_text(encoding="utf-8"))
+    data = read_result(tmp_path, "abc123")
     assert data["task_id"] == "abc123"
     assert data["status"] == "failed"
     assert isinstance(data["result"], str) and len(data["result"]) > 0
@@ -49,14 +49,12 @@ def test_write_failure_result_does_not_overwrite_existing(tmp_path):
         results_dir = tmp_path / "task_results"
         results_dir.mkdir(parents=True, exist_ok=True)
         existing = {"_schema_version": 1, "task_id": "xyz789", "status": "completed", "result": "Success!"}
-        (results_dir / "xyz789.json").write_text(
-            json.dumps(existing, ensure_ascii=False), encoding="utf-8"
-        )
+        seed_result(tmp_path, "xyz789", existing)
         workers._write_failure_result("xyz789")
     finally:
         workers.DRIVE_ROOT = orig
 
-    data = json.loads((results_dir / "xyz789.json").read_text(encoding="utf-8"))
+    data = read_result(tmp_path, "xyz789")
     assert data["status"] == "completed", "Existing result was overwritten!"
     assert data["result"] == "Success!"
 
@@ -179,11 +177,9 @@ def test_kill_workers_writes_failure_for_running_and_pending(tmp_path):
         queue.RUNNING = orig_q_running
         workers._WORKER_POOL_DISABLED_REASON = orig_disabled
 
-    results_dir = tmp_path / "task_results"
     for tid in ("run1", "run2", "pend1", "pend2"):
-        path = results_dir / f"{tid}.json"
-        assert path.exists(), f"Missing failure result for {tid}"
-        data = json.loads(path.read_text(encoding="utf-8"))
+        assert result_exists(tmp_path, tid), f"Missing failure result for {tid}"
+        data = read_result(tmp_path, tid)
         assert data["status"] == "failed"
         assert data["task_id"] == tid
 
@@ -487,9 +483,95 @@ def test_kill_workers_can_record_owner_restart_cancellation(tmp_path):
         queue.RUNNING = orig_q_running
 
     for tid in ("run1", "pend1"):
-        data = json.loads((tmp_path / "task_results" / f"{tid}.json").read_text(encoding="utf-8"))
+        data = read_result(tmp_path, tid)
         assert data["status"] == "cancelled"
         assert data["result"] == "Owner restart stopped this task before process restart."
+
+
+def test_owner_restart_teardown_keeps_the_recorded_cancel_origin_and_invents_none(tmp_path):
+    """#1317: Restart mints its intent, then kills the pool. The pool's terminal
+    write carries THAT recorded origin (the custody helper's fields), so the
+    owner line names the recorded cause instead of repeating the status word; a
+    row with no intent gets no origin. The full stated reason stays durable."""
+    import supervisor.queue as queue
+    import supervisor.workers as workers
+    from ouroboros.cancel_intents import request_cancel
+    from ouroboros.project_dialogue import _completion_verdict
+
+    orig = (workers.DRIVE_ROOT, dict(workers.WORKERS), dict(workers.RUNNING), list(workers.PENDING),
+            queue.DRIVE_ROOT, queue.PENDING, queue.RUNNING)
+    workers.DRIVE_ROOT = tmp_path
+    queue.DRIVE_ROOT = tmp_path
+    workers.WORKERS.clear()
+    workers.RUNNING.clear()
+    workers.RUNNING["run1"] = {"task": {"id": "run1", "type": "task"}, "worker_id": 0}
+    workers.PENDING[:] = [{"id": "pend1", "type": "task"}]
+    queue.PENDING = workers.PENDING
+    long_reason = "Owner restart " + "because the migration plan changed " * 20
+    request_cancel(tmp_path, "run1", reason=long_reason, source="owner_restart", requested_by="owner",
+                   requested_stop_policy="immediate", allow_settled_target=True)
+    try:
+        with mock.patch.object(queue, "persist_queue_snapshot"):
+            workers.kill_workers(terminal_status="cancelled",
+                                 result_reason="Owner restart stopped this task before process restart.")
+    finally:
+        workers.DRIVE_ROOT = orig[0]
+        workers.WORKERS.clear()
+        workers.WORKERS.update(orig[1])
+        workers.RUNNING.clear()
+        workers.RUNNING.update(orig[2])
+        workers.PENDING[:] = orig[3]
+        queue.DRIVE_ROOT, queue.PENDING, queue.RUNNING = orig[4], orig[5], orig[6]
+
+    run = read_result(tmp_path, "run1")
+    assert run["status"] == "cancelled"
+    assert run["cancel_origin"]["source"] == "owner_restart" and run["cancel_origin"]["requested_by"] == "owner"
+    assert run["cancel_origin"]["reason"] == " ".join(long_reason.split()) and len(run["cancel_origin"]["reason"]) > 500
+    line = _completion_verdict(run, {})
+    # Reason text other than the producer's own label is shown (as a preview).
+    assert line.startswith("Stopped by the Restart command · Owner restart because")
+    assert "owner_restart" not in line and "cancelled" not in line.lower()
+    assert "(preview; the full reason is kept with the task)" in line
+    pend = read_result(tmp_path, "pend1")
+    assert pend["status"] == "cancelled" and "cancel_origin" not in pend
+
+
+def test_the_real_restart_producer_reaches_the_owner_line_as_one_sentence(tmp_path, monkeypatch):
+    """#1317 end to end: ``server_restart._stop_owned_work`` mints its intent and
+    kills the real pool; the running row's result carries that origin and the
+    owner line is the Restart sentence alone -- not the raw source, not the
+    producer's own label repeated beside it."""
+    import supervisor.queue as queue
+    import supervisor.workers as workers
+    from ouroboros import delegate_custody, server_restart
+    from ouroboros.project_dialogue import _completion_verdict
+
+    monkeypatch.setattr(server_restart, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(delegate_custody, "reconcile_orphaned_runs", lambda *_a, **_kw: None)
+    monkeypatch.setattr(server_restart, "_stop_owned_daemon", lambda _label: None)
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda *_a, **_kw: None)
+    saved =(dict(workers.WORKERS), dict(workers.RUNNING), list(workers.PENDING))
+    workers.WORKERS.clear()
+    workers.RUNNING.clear()
+    workers.RUNNING["run1"] = {"task": {"id": "run1", "type": "task"}, "worker_id": 0}
+    workers.PENDING[:] = []
+    try:
+        ctx = SimpleNamespace(RUNNING=workers.RUNNING, kill_workers=workers.kill_workers)
+        assert server_restart._stop_owned_work(ctx) == ["run1"]
+    finally:
+        workers.WORKERS.clear()
+        workers.WORKERS.update(saved[0])
+        workers.RUNNING.clear()
+        workers.RUNNING.update(saved[1])
+        workers.PENDING[:] = saved[2]
+
+    run = read_result(tmp_path, "run1")
+    assert run["status"] == "cancelled"
+    assert {key: run["cancel_origin"].get(key) for key in ("source", "reason", "requested_by")} == {
+        "source": "owner_restart", "reason": "Owner restart", "requested_by": "owner"}
+    assert _completion_verdict(run, {}) == "Stopped by the Restart command."
 
 
 def test_managed_update_preserves_pending_tasks_for_the_new_process(tmp_path):
@@ -520,7 +602,7 @@ def test_managed_update_preserves_pending_tasks_for_the_new_process(tmp_path):
             )
         assert survivors == []
         assert [task["id"] for task in workers.PENDING] == ["queued-after-update"]
-        assert not (tmp_path / "task_results" / "queued-after-update.json").exists()
+        assert not result_exists(tmp_path, "queued-after-update")
     finally:
         workers.DRIVE_ROOT = orig_drive
         workers.WORKERS.clear()
@@ -566,7 +648,7 @@ def test_managed_update_drops_children_of_interrupted_roots(tmp_path, monkeypatc
         with mock.patch.object(queue, "persist_queue_snapshot"):
             workers.kill_workers_for_update(result_reason="Managed update")
         assert [task["id"] for task in workers.PENDING] == ["independent"]
-        child = json.loads((tmp_path / "task_results" / "child-1.json").read_text())
+        child = read_result(tmp_path, "child-1")
         assert child["status"] == "cancelled"
     finally:
         workers.DRIVE_ROOT = orig_drive

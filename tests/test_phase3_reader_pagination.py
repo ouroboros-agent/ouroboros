@@ -1,5 +1,3 @@
-import json
-import os
 import pathlib
 import re
 from types import SimpleNamespace
@@ -9,7 +7,6 @@ from ouroboros.tools.project_journal import (
     _journal_read,
     journal_tail_digest,
 )
-from ouroboros.tools.recent_tasks import _handle_recent_tasks
 from ouroboros.tools.task_tree import _tree_read
 from ouroboros.utils import append_jsonl
 
@@ -34,11 +31,12 @@ def _journal_rows(root, project_id: str, count: int) -> None:
 def test_journal_read_pages_205_rows_and_digest_pointer_is_executable(tmp_path, monkeypatch):
     monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path)
     _journal_rows(tmp_path, "mine", 205)
+    _journal_rows(tmp_path, "other", 205)
     ctx = SimpleNamespace(
         drive_root=tmp_path / "fork",
         budget_drive_root=str(tmp_path),
         project_id="mine",
-        task_metadata={"budget_drive_root": str(tmp_path)},
+        task_metadata={"budget_drive_root": str(tmp_path), "root_task_id": "root"},
     )
 
     first = _journal_read(ctx, "other", limit=200)
@@ -258,82 +256,3 @@ def test_runtime_tree_digest_uses_same_canonical_root_as_tree_read(tmp_path):
 
     assert "canonical-passive-row" in rendered
     assert "coverage partial: 1 unreadable task-tree row" in rendered
-
-
-def _write_task(root, index: int, *, project_id: str = "mine") -> None:
-    path = root / "task_results" / f"task-{index:03d}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({
-        "task_id": f"task-{index:03d}",
-        "ts": f"2026-08-21T00:{index // 60:02d}:{index % 60:02d}Z",
-        "status": "completed",
-        "description": f"task {index}",
-        "result": f"result {index}",
-        "project_id": project_id,
-    }), encoding="utf-8")
-    os.utime(path, ns=(index + 1, index + 1))
-
-
-def test_recent_tasks_pages_364_and_finds_21st_without_known_id(tmp_path):
-    canonical = tmp_path / "canonical"
-    for index in range(364):
-        _write_task(canonical, index)
-    ctx = SimpleNamespace(
-        drive_root=tmp_path / "fork",
-        budget_drive_root=str(canonical),
-        project_id="mine",
-        task_metadata={"budget_drive_root": str(canonical)},
-    )
-
-    first = json.loads(_handle_recent_tasks(ctx, limit=20))
-    assert first["total"] == 364
-    assert first["remaining"] == 344
-    assert first["tasks"][0]["task_id"] == "task-363"
-    second = json.loads(_handle_recent_tasks(
-        ctx, limit=20, offset=20, snapshot=first["snapshot"],
-    ))
-    assert second["tasks"][0]["task_id"] == "task-343"
-    assert second["remaining"] == 324
-
-    seen = first["tasks"] + second["tasks"]
-    assert seen[20]["task_id"] == "task-343"
-def test_recent_tasks_refuses_append_between_pages(tmp_path):
-    canonical = tmp_path / "canonical"
-    for index in range(3):
-        _write_task(canonical, index)
-    ctx = SimpleNamespace(drive_root=tmp_path / "fork", budget_drive_root=str(canonical))
-    first = json.loads(_handle_recent_tasks(ctx, limit=2))
-    _write_task(canonical, 3)
-
-    changed = json.loads(_handle_recent_tasks(
-        ctx, limit=2, offset=2, snapshot=first["snapshot"],
-    ))
-    assert changed["error"]["code"] == "RECENT_TASKS_SNAPSHOT_CHANGED"
-    assert changed["tasks"] == []
-
-
-def test_recent_tasks_next_replays_result_and_trace_query_flags(tmp_path):
-    canonical = tmp_path / "canonical"
-    for index in range(3):
-        _write_task(canonical, index)
-        path = canonical / "task_results" / f"task-{index:03d}.json"
-        data = json.loads(path.read_text(encoding="utf-8"))
-        data["trace_summary"] = f"trace {index}"
-        path.write_text(json.dumps(data), encoding="utf-8")
-        os.utime(path, ns=(index + 1, index + 1))
-    ctx = SimpleNamespace(drive_root=tmp_path / "fork", budget_drive_root=str(canonical))
-
-    first = json.loads(_handle_recent_tasks(
-        ctx, limit=1, include_results=True, include_traces=True,
-    ))
-    assert first["next"] == {
-        "limit": 1,
-        "offset": 1,
-        "snapshot": first["snapshot"],
-        "include_results": True,
-        "include_traces": True,
-    }
-    second = json.loads(_handle_recent_tasks(ctx, **first["next"]))
-    assert "error" not in second
-    assert second["tasks"][0]["result"] == "result 1"
-    assert second["tasks"][0]["trace_summary"] == "trace 1"

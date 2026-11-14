@@ -2,8 +2,13 @@
 
 import base64
 import json
+import os
+import pathlib
 
 import pytest
+
+from ouroboros.artifacts import store_chat_media_bytes
+from tests.ui_console_errors import record_console_errors, record_failed_loads, unexpected_console_errors
 
 
 def run_media_delivery_smoke(direct_server_with_data):
@@ -14,20 +19,19 @@ def run_media_delivery_smoke(direct_server_with_data):
     data_dir = direct_server_with_data["data_dir"]
     logs = data_dir / "logs"
     logs.mkdir(parents=True, exist_ok=True)
-    digest_a, digest_b, digest_c = "a" * 64, "b" * 64, "c" * 64
     silent_wav = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA="
     pixel_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    other_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGO44GAAAAMkAUFPzMdxAAAAAElFTkSuQmCC"
     settings_path = data_dir / "settings.json"
     settings = json.loads(settings_path.read_text(encoding="utf-8"))
     settings["OUROBOROS_FILE_BROWSER_DEFAULT"] = str(data_dir)
     settings_path.write_text(json.dumps(settings), encoding="utf-8")
     (data_dir / "briefing.wav").write_bytes(base64.b64decode(silent_wav))
-    for task_id, digest in (
-        ("gallery-a", digest_a), ("gallery-a", digest_b), ("gallery-b", digest_c),
-    ):
-        media_dir = data_dir / "task_results" / "artifacts" / task_id / "chat_media"
-        media_dir.mkdir(parents=True, exist_ok=True)
-        (media_dir / f"chat-media-{digest}.png").write_bytes(base64.b64decode(pixel_png))
+    # Chat media is content-addressed: the server serves a chat-media file only when its bytes
+    # hash to the digest its name carries, so seed it through the one production writer.
+    seeds = (("gallery-a", pixel_png), ("gallery-a", other_png), ("gallery-b", pixel_png))
+    stored = [store_chat_media_bytes(data_dir, task_id, base64.b64decode(png), "image/png") for task_id, png in seeds]
+    photo_urls = [f"/api/tasks/{task_id}/artifacts/{record['name']}" for (task_id, _png), record in zip(seeds, stored)]
     rows = [
         {"ts": "2026-08-30T00:00:00Z", "direction": "out", "chat_id": 1,
          "user_id": 7, "type": "document", "text": "audio", "caption": "audio",
@@ -39,16 +43,13 @@ def run_media_delivery_smoke(direct_server_with_data):
          "download_url": "/api/files/download?path=report.pdf", "task_id": "files-replay"},
         {"ts": "2026-08-30T00:00:02Z", "direction": "out", "chat_id": 1,
          "user_id": 7, "type": "photo", "text": "one", "caption": "one",
-         "mime": "image/png", "task_id": "gallery-a",
-         "download_url": f"/api/tasks/gallery-a/artifacts/chat-media-{digest_a}.png"},
+         "mime": "image/png", "task_id": "gallery-a", "download_url": photo_urls[0]},
         {"ts": "2026-08-30T00:00:03Z", "direction": "out", "chat_id": 1,
          "user_id": 7, "type": "photo", "text": "two", "caption": "two",
-         "mime": "image/png", "task_id": "gallery-a",
-         "download_url": f"/api/tasks/gallery-a/artifacts/chat-media-{digest_b}.png"},
+         "mime": "image/png", "task_id": "gallery-a", "download_url": photo_urls[1]},
         {"ts": "2026-08-30T00:00:04Z", "direction": "out", "chat_id": 1,
          "user_id": 7, "type": "photo", "text": "parallel", "caption": "parallel",
-         "mime": "image/png", "task_id": "gallery-b",
-         "download_url": f"/api/tasks/gallery-b/artifacts/chat-media-{digest_c}.png"},
+         "mime": "image/png", "task_id": "gallery-b", "download_url": photo_urls[2]},
         {"ts": "2026-08-30T00:00:05Z", "direction": "out", "chat_id": 1,
          "user_id": 7, "type": "links", "text": "References", "title": "References",
          "task_id": "links-replay", "actions": [
@@ -74,12 +75,8 @@ def run_media_delivery_smoke(direct_server_with_data):
             browser = pw.chromium.launch(headless=True)
             page = browser.new_page(viewport={"width": 1440, "height": 1000})
             try:
-                console_errors = []
-                page.on(
-                    "console",
-                    lambda message: console_errors.append(message.text)
-                    if message.type == "error" else None,
-                )
+                console_errors = record_console_errors(page, page_errors=False)
+                failed_loads = record_failed_loads(page)
                 page.add_init_script("""(() => {
                     const NativeWebSocket = window.WebSocket;
                     window.__mediaTestSockets = [];
@@ -106,6 +103,24 @@ def run_media_delivery_smoke(direct_server_with_data):
                 assert page.locator('.chat-links-message .chat-link-button').count() == 1
                 assert page.locator('.chat-link-button').first.get_attribute("rel") == "noopener noreferrer"
                 assert page.locator('.chat-message-copy').count() >= 1
+                # Each durable photo is bytes the browser decoded, served through the verified
+                # content-addressed route, not an <img> shell whose load failed.
+                page.wait_for_function("""urls => urls.every((url) => {
+                    const img = document.querySelector(`img.chat-photo[src="${url}"]`);
+                    return img && img.complete;
+                })""", arg=photo_urls, timeout=10_000)
+                served = page.evaluate("""urls => Promise.all(urls.map(async (url) => {
+                    const response = await fetch(url);
+                    return {width: document.querySelector(`img.chat-photo[src="${url}"]`).naturalWidth,
+                        status: response.status, identity: response.headers.get('x-ouroboros-artifact-identity'),
+                        sha256: response.headers.get('x-ouroboros-artifact-sha256')};
+                }))""", photo_urls)
+                assert served == [{"width": 1, "status": 200, "identity": "verified", "sha256": record["sha256"]}
+                                  for record in stored], served
+                evidence = pathlib.Path(os.environ.get("OUROBOROS_UI_EVIDENCE_DIR", str(data_dir.parent)))
+                evidence.mkdir(parents=True, exist_ok=True)
+                page.locator('.chat-bubble.is-multiple').first.scroll_into_view_if_needed()
+                page.screenshot(path=str(evidence / "structured-media-durable-photos.png"), animations="disabled")
 
                 page.evaluate("""() => {
                     const messages = document.querySelector('#chat-messages');
@@ -131,12 +146,23 @@ def run_media_delivery_smoke(direct_server_with_data):
                 assert page.locator(
                     '[data-media-group="assistant:photos:live-ws-photo"] .chat-photo'
                 ).count() == 1
-                followed = page.evaluate("""() => {
+                # The photo's load reflows the feed a frame later, and the followed feed re-pins then.
+                page.wait_for_function("""() => {
                     const messages = document.querySelector('#chat-messages');
-                    return messages.scrollHeight - messages.scrollTop - messages.clientHeight;
-                }""")
-                assert followed <= 6, followed
+                    const photo = document.querySelector('[data-media-group="assistant:photos:live-ws-photo"] .chat-photo');
+                    return photo.complete && messages.scrollHeight - messages.scrollTop - messages.clientHeight <= 6;
+                }""", timeout=10_000)
 
+                # Only a reader's gesture ends following (chat_reading_position.js); a programmatic
+                # scroll alone leaves a later layout free to re-pin the feed. The reader turns back
+                # with the wheel, then the test places them exactly 300 px above the newest message.
+                page.evaluate("""() => document.querySelector('#chat-messages').addEventListener(
+                    'wheel', () => { window.__turnedBack = true; }, {once: true, passive: true})""")
+                feed = page.locator('#chat-messages').bounding_box()
+                page.mouse.move(feed["x"] + feed["width"] / 2, feed["y"] + feed["height"] / 2)
+                page.mouse.wheel(0, -120)
+                page.wait_for_function("() => window.__turnedBack", timeout=10_000)
+                page.evaluate("() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))")
                 away = page.evaluate("""() => {
                     const messages = document.querySelector('#chat-messages');
                     messages.scrollTop = Math.max(0, messages.scrollHeight - messages.clientHeight - 300);
@@ -221,12 +247,15 @@ def run_media_delivery_smoke(direct_server_with_data):
                         window.__blobDownload = true;
                         return originalCreate.call(URL, blob);
                     };
+                    // A live text file opens the reader; its Download is the card's own blob path.
                     const liveCard = [...document.querySelectorAll('.chat-file-card')].find((node) => node.innerText.includes('live.txt'));
                     liveCard.click();
                     window.pywebview = undefined;
-                    [...document.querySelectorAll('.chat-file-dialog')].at(-1)
-                        .querySelector('[data-file-action="download"]').click();
+                    const reader = document.querySelector('dialog.document-reader[open]');
+                    reader.querySelector('[data-reader-action="download"]').click();
                     await new Promise((resolve) => setTimeout(resolve, 20));
+                    const readerText = reader.querySelector('.document-reader-source')?.textContent;
+                    reader.querySelector('[data-reader-action="close"]').click();
                     URL.createObjectURL = originalCreate;
                     return {
                         audio: document.querySelectorAll('.chat-media-player.is-audio').length,
@@ -238,13 +267,14 @@ def run_media_delivery_smoke(direct_server_with_data):
                         liveLinks: [...document.querySelectorAll('.chat-links-title')]
                             .find((node) => node.textContent === 'Live links')?.parentElement.querySelectorAll('a').length,
                         bridge: window.__bridgeDownload === true, blob: window.__blobDownload === true,
-                        copied: window.__copied,
+                        copied: window.__copied, readerText, readerClosed: !document.querySelector('dialog.document-reader'),
                     };
                 }""")
                 assert result == {
                     "audio": 2, "speed": 1.5, "fullscreen": True,
                     "liveGroups": 2, "liveGalleryItems": 2, "liveLinks": 1,
                     "bridge": True, "blob": True, "copied": "raw **message** text",
+                    "readerText": "hello", "readerClosed": True,
                 }
                 # V-4 regression pins. The chat bubble's `white-space: pre-wrap`
                 # used to be inherited by structural card markup, so every
@@ -331,7 +361,7 @@ def run_media_delivery_smoke(direct_server_with_data):
                 }, computed
 
                 page.wait_for_timeout(100)
-                assert console_errors == []
+                assert unexpected_console_errors(console_errors, failed_loads) == []
             finally:
                 browser.close()
     except PlaywrightError as exc:

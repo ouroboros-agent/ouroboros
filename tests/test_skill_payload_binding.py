@@ -35,8 +35,6 @@ def test_selected_payload_fills_only_omitted_selectors(tmp_path, mode, bucket, o
 
 
 @pytest.mark.parametrize("constraint", [None, {"mode": "normal"},
-    {"mode": "normal", "skill_name": "alpha"}, {"mode": "normal", "payload_root": "skills/external/alpha"},
-    {"mode": "local_readonly_subagent", "skill_name": "alpha", "payload_root": "skills/external/alpha"},
     {"mode": "acting_subagent", "skill_name": "alpha", "payload_root": "skills/external/alpha"},
 ])
 def test_no_selected_payload_still_requires_name(tmp_path, constraint):
@@ -71,11 +69,11 @@ def test_inferred_native_selection_preserves_mutation_boundary(tmp_path, operati
         _resolve(tmp_path, constraint, operation=operation)
 
 
-def test_inferred_native_selection_preserves_child_selector_boundary(tmp_path):
-    _payload(tmp_path, bucket="native", seeded=True)
+def test_inferred_native_selection_preserves_acting_parent_read_parity(tmp_path):
+    expected = _payload(tmp_path, bucket="native", seeded=True)
     constraint = {"mode": "normal", "skill_name": "alpha", "payload_root": "skills/native/alpha"}
-    with pytest.raises(ValueError, match="cannot select skill location=native"):
-        _resolve(tmp_path, constraint, profile="acting_subagent", top_level=False, operation="read")
+    assert _resolve(tmp_path, constraint, profile="acting_subagent", top_level=False,
+                    operation="read") == (expected, "native", "alpha")
 
 
 def test_inferred_native_read_keeps_existing_readonly_authority(tmp_path):

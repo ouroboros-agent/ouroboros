@@ -10,8 +10,27 @@ from __future__ import annotations
 
 import copy
 import json
+from collections.abc import Iterable
+from types import MappingProxyType
 from hashlib import sha256
 from typing import Any, Dict, Mapping, Optional, Tuple
+
+
+TOOL_NAME_ALIASES = MappingProxyType({
+    "promote_chat_to_task": "start_task",
+    "ensure_project_scope": "move_to_project",
+    "steer_task": "tell_task",
+})
+
+
+def canonical_tool_name(name: str) -> str:
+    """Resolve a saved name without registering a retired callable alias."""
+    return TOOL_NAME_ALIASES.get(name, name)
+
+
+def expand_disabled_tool_names(names: Iterable[str]) -> list[str]:
+    """Retain saved restrictions and withhold their successors as well."""
+    return list(dict.fromkeys(name for old in names for name in (old, canonical_tool_name(old))))
 
 
 _BOOLEAN_RESOURCE_NAMES = frozenset({
@@ -72,7 +91,7 @@ def normalize_disabled_tools(value: Any) -> list[str]:
         name = str(item or "").strip()
         if name and name not in seen:
             seen.append(name)
-    return seen
+    return expand_disabled_tool_names(seen)
 
 
 def normalize_bool(value: Any) -> bool:
@@ -116,8 +135,51 @@ def normalize_attachment_manifest(value: Any) -> list[Dict[str, Any]]:
         row["status"] = status if status in {"staged", "rejected"} else "rejected"
         row["reason"] = str(row.get("reason") or "")
         row["label"] = str(row.get("label") or f"attachment {index + 1}")
+        receipts = normalize_engine_import_receipts(item.get("engine_imports"), row)
+        if receipts:  # additive: a row without receipts keeps its historical shape
+            row["engine_imports"] = receipts
         rows.append(row)
     return rows
+
+
+def normalize_engine_import_receipts(value: Any, row: Mapping[str, Any]) -> list[Dict[str, Any]]:
+    """Store-bound document import receipts bound to exactly ROW's bytes and semantics.
+
+    A receipt carries one observed engine import across tasks, including finished or gapped keys
+    (``ouroboros.delegate_documents``): the store id, the saved key and exact request,
+    the resource id when observed, and any non-ready state. Its request must
+    declare ROW's bytes and the same kind (``file``),
+    MIME and file name the row would declare; anything else is dropped, so a copied row
+    never selects a resource admitted as other bytes or under another MIME or name. A managed
+    import keeps its ``lifetime: "managed"`` (bound into the key: every replay resends it; any
+    other value drops the receipt) and the task that owes its release (``owner_task_id``); a
+    holder of the receipt only replays it and owes no release of its own. Ordered newest first,
+    valid receipts select one state per store before the eight-store bound applies.
+    """
+    content = {"sizeBytes": row.get("size"), "sha256": f"sha256:{row.get('sha256')}"}
+    semantics = {"kind": "file", "mime": row.get("mime"), "name": str(row.get("relpath") or "").rsplit("/", 1)[-1]}
+    receipts: Dict[str, Dict[str, Any]] = {}
+    for item in value if isinstance(value, list) else []:
+        request = item.get("request") if isinstance(item, Mapping) else None
+        state = item.get("state", "ready") if isinstance(item, Mapping) else None
+        if (isinstance(request, Mapping) and request.get("content") == content
+                and request.get("expectedStoreId") == item.get("store_id")
+                and all(isinstance(item.get(name), str) and item[name] for name in ("store_id", "import_key"))
+                and isinstance(state, str)
+                and state in {"ready", "send_possible", "gap", "damaged", "cancelled", "conflict", "rejected", "released"}
+                and ((isinstance(item.get("resource_id"), str) and item["resource_id"])
+                     or ("resource_id" not in item and state != "ready"))
+                and all(request.get(name) == expected for name, expected in semantics.items())
+                and isinstance(request.get("source", ""), str) and request.get("lifetime", "managed") == "managed"):
+            owner = item.get("owner_task_id")
+            receipts.setdefault(item["store_id"], {"store_id": item["store_id"], "import_key": item["import_key"],
+                             **({"resource_id": item["resource_id"]} if item.get("resource_id") else {}),
+                             **({"state": state} if state != "ready" else {}),
+                             "request": {name: copy.deepcopy(request[name]) for name in
+                                         ("expectedStoreId", "kind", "mime", "name", "source", "lifetime", "content")
+                                         if name in request},
+                             **({"owner_task_id": owner} if isinstance(owner, str) and owner else {})})
+    return list(receipts.values())[:8]
 
 
 def _opt_nonneg_int(value: Any) -> Any:
@@ -204,12 +266,13 @@ def _opt_pct(value: Any) -> Any:
 
 
 def _opt_cost_hard_stop_pct(value: Any) -> Any:
-    """Like ``_opt_pct`` but FAIL-SAFE for the one percentage whose 0 is the
-    maximally-permissive setting (0 = NO in-task cost stop). A malformed value
-    must NOT silently collapse to 0 and disable the safety stop: a negative
-    number, a non-numeric, or a ``0 < v < 1`` fraction (a likely fraction-vs-
-    percent mix-up, e.g. 0.5 meaning "half") maps to None — the historical 50%
-    default — not to 0. An explicit 0 / 0.0 / "0" is honored verbatim."""
+    """Like ``_opt_pct`` but never collapsing to 0 for the one percentage whose 0
+    is an explicit bench contract (0 = NO in-task cost stop). A negative number,
+    a non-numeric, or a ``0 < v < 1`` fraction (a likely fraction-vs-percent
+    mix-up, e.g. 0.5 meaning "half") maps to None — no explicit percentage, the
+    same as an absent one — not to 0. An explicit 0 / 0.0 / "0" is honored
+    verbatim. The accepted-input contract is unchanged since v6.56.0; only the
+    meaning of None changed (owner 2026-10-07): it is no longer a 50% stop."""
     if value is None or (isinstance(value, str) and not value.strip()):
         return None
     try:
@@ -235,17 +298,20 @@ def normalize_budget_profile(value: Any) -> Dict[str, Any]:
     adaptive (passes stop early when the remaining window can no longer fit a
     review comfortably).
 
-    ``cost_hard_stop_pct`` (v6.56.0, additive): the in-task cost hard-stop as a
-    percentage of the budget remaining at task start. None -> the historical
-    default (50: the global component of the stop is half the remaining
-    budget). 0 -> NO in-task cost stop at all — the deadline/rounds axes and the
-    global between-task budget gate remain the only bounds, and cost milestones
-    become informational against the start snapshot. The ceiling is resolved in
-    ``task_pacing.resolve_cost_ceiling`` (typed; 0 maps to the ``disabled``
-    state, never a $0 ceiling; a per-task root cap contributes a second
-    min-component). A MALFORMED value (negative / non-numeric / a ``0<v<1``
-    fraction) maps to None (the 50% default), NOT to 0 — it must not silently
-    disable the stop (see ``_opt_cost_hard_stop_pct``).
+    ``cost_hard_stop_pct`` (v6.56.0, additive): an EXPLICIT experiment's
+    in-task cost stop as a percentage of the budget remaining at task start.
+    None -> no explicit percentage: an ordinary task has no early cost stop of
+    the host's own (owner 2026-10-07, #1128 — formerly the historical 50%
+    default); only the real limits refuse new calls once known spend reaches
+    them, every model call at the root and group limits and paid calls at the
+    global one, and a producer's allowance (a consciousness wake) still stops
+    at its actual value. A positive value keeps the authored math
+    (that share of the starting wallet, min the per-task cap minus a planning
+    margin). 0 -> NO in-task cost stop at all (bench contract). The ceiling is
+    resolved in ``task_pacing.resolve_cost_ceiling`` (typed; 0 and None map to
+    ``disabled``, never a $0 ceiling). A MALFORMED value (negative /
+    non-numeric / a ``0<v<1`` fraction) maps to None like an absent one, never
+    to 0 (see ``_opt_cost_hard_stop_pct``).
     """
     v = value if isinstance(value, Mapping) else {}
     policy = str(v.get("improvement_policy") or "").strip().lower()
@@ -293,6 +359,19 @@ def answer_protocol_active(ctx: Any) -> bool:
         if isinstance(source, Mapping):
             contract = source.get("task_contract") if isinstance(source.get("task_contract"), Mapping) else source
             if str((contract or {}).get("answer_protocol") or "").strip() == "final_answer_line":
+                return True
+    return False
+
+
+def review_answer_required(ctx: Any) -> bool:
+    """True when the running ctx's task contract carries ``review_answer`` (owner, 8 Nov 2026): the whole final
+    answer is a deliverable the task-review Required floor reviews even when no file was produced. Written by its
+    admission caller (an API body, ``start_task(review_answer=true)``, a runner) and carried by Continue; a plain
+    request in prose stays the mind's own call of review_change, never a host reading of words."""
+    for source in (getattr(ctx, "task_contract", None), getattr(ctx, "task_metadata", None)):
+        if isinstance(source, Mapping):
+            contract = source.get("task_contract") if isinstance(source.get("task_contract"), Mapping) else source
+            if normalize_bool((contract or {}).get("review_answer")):
                 return True
     return False
 
@@ -353,8 +432,9 @@ def effective_acceptance_claims(
     Ingress-contract claims win (adapter/gateway/parent-authored — already in the
     built contract); the CLOSED plan wave's frozen claims apply ONLY when ingress
     is empty. PURE: no I/O and no contract mutation — the running task contract is
-    never rebuilt mid-task; plan-frozen claims live in ``plan_review_state``
-    (``task_results.closed_plan_review_wave``) and are resolved at READ time.
+    never rebuilt mid-task; plan-selected claims live in the plan record (the latest
+    revision's ``done_when``) or, for an earlier-schema task, in a closed wave read by
+    ``plan_record.import_legacy_v2`` / the acceptance binder, and are resolved at READ time.
     Returns ``(claims, source)`` with source ``ingress_contract`` |
     ``plan_review`` | ``""`` (no claims anywhere)."""
     task = task if isinstance(task, Mapping) else {}
@@ -459,6 +539,22 @@ def normalize_resource_policy(value: Any) -> Dict[str, Any]:
         if raw is not None:
             out[str(key)] = raw
     return out
+
+
+def normalize_input_sources(value: Any) -> str:
+    """An explicit source selection is closed; malformed selections never become shared."""
+    if not isinstance(value, str) or value not in {"shared", "declared"}:
+        raise ValueError("input_sources must be shared or declared")
+    return value
+
+
+def task_input_sources(task: Mapping[str, Any]) -> str:
+    """Read the persisted selection at every composition boundary; absence stays shared."""
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), Mapping) else {}
+    for source in (task.get("task_contract"), metadata.get("task_contract"), task, metadata):
+        if isinstance(source, Mapping) and "input_sources" in source:
+            return normalize_input_sources(source["input_sources"])
+    return "shared"
 
 
 def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
@@ -619,6 +715,16 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
             else (task.get("answer_protocol") or metadata.get("answer_protocol"))
         ),
     }
+    # Additive only: ordinary contracts keep their exact historical shape/hashes.
+    for source in (merged, task, metadata):
+        if "input_sources" in source:
+            contract["input_sources"] = normalize_input_sources(source["input_sources"])
+            break
+    if any(normalize_bool(source.get("review_answer")) for source in (merged, task, metadata)):
+        contract["review_answer"] = True  # task review Required reviews the whole final answer (``review_answer_required``)
+    # The task's own direct handbook answer, from its contract alone: a legacy top-level value keeps its Max meaning.
+    if isinstance(merged.get("context_requires_development"), bool):
+        contract["context_requires_development"] = merged["context_requires_development"]
     attachment_ref = merged.get("attachment_manifest_ref", task.get("attachment_manifest_ref"))
     if attachment_ref is not None:
         if not isinstance(attachment_ref, Mapping):
@@ -834,4 +940,4 @@ def attach_task_contract(task: Dict[str, Any]) -> Dict[str, Any]:
     return task
 
 
-__all__ = ["answer_protocol_active", "attach_task_contract", "build_task_contract", "effective_acceptance_claims", "normalize_acceptance_claims", "normalize_allowed_resources", "normalize_allowed_origins", "normalize_browser_origin", "normalize_answer_protocol", "normalize_attachment_manifest", "normalize_bool", "normalize_budget_profile", "normalize_delegation_budget", "normalize_depth_provenance", "normalize_disabled_tools", "normalize_resource_policy"]
+__all__ = ["answer_protocol_active", "attach_task_contract", "build_task_contract", "effective_acceptance_claims", "normalize_acceptance_claims", "normalize_allowed_resources", "normalize_allowed_origins", "normalize_browser_origin", "normalize_answer_protocol", "normalize_attachment_manifest", "normalize_bool", "normalize_budget_profile", "normalize_delegation_budget", "normalize_depth_provenance", "normalize_disabled_tools", "normalize_engine_import_receipts", "normalize_input_sources", "normalize_resource_policy", "review_answer_required", "task_input_sources"]

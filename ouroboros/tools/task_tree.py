@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from ouroboros.tools.registry import ToolContext, ToolEntry
+from ouroboros.tools.tool_result import completed_local_read
 
 
 def tree_root_id(ctx: ToolContext) -> str:
@@ -57,6 +58,7 @@ def _tree_note(
     )
 
 
+@completed_local_read
 def _tree_read(
     ctx: ToolContext,
     limit: int = 40,
@@ -108,7 +110,8 @@ def get_tools() -> List[ToolEntry]:
         ToolEntry("tree_note", {
             "name": "tree_note",
             "description": (
-                "Append a coordination entry to the SHARED task-tree ledger (the swarm "
+                "Post a coordination entry, a beacon to your parent, or a child-result decision to the "
+                "SHARED task-tree ledger (the swarm "
                 "blackboard, scoped to root_task_id — visible to the parent and all "
                 "siblings/descendants of THIS task tree). Use it to publish the shared "
                 "frame BEFORE fanning out interdependent children and to coordinate while "
@@ -138,8 +141,7 @@ def get_tools() -> List[ToolEntry]:
                         "delegation_constraint. For a parent "
                         "decision about a direct child result, set type=child_result_disposition, "
                         "child_task_id, disposition, and the exact SHA-256 shown by child evidence; "
-                        "tree_note text is the rationale (<=500 chars for a "
-                        "child_result_disposition). To disposition MANY children in one call, "
+                        "tree_note text is the rationale. To disposition MANY children in one call, "
                         "set type=child_result_disposition and a children array of "
                         "{child_task_id, disposition, child_result_sha256} entries (one shared "
                         "rationale; each entry is validated exactly like the single form)."

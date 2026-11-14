@@ -1,166 +1,266 @@
 # 4. Server API Endpoints
 
-This chapter is the endpoint registry: every mounted browser, CLI and Host Service route beside the handler that owns it, plus the non-loopback authentication gate, the file-root confinement rule and the WebSocket protocol the browser actually speaks. It exists as a test-checked mirror of the executable route collector, so a route added, renamed or removed in code cannot quietly disappear from the map.
+Browser/CLI routes: `gateway/router.py`; Host Service: §12. Tests check this table in both directions. Shapes: `GET /api/contract`.
 
-If `OUROBOROS_NETWORK_PASSWORD` is configured, non-loopback HTTP and WebSocket access requires authentication; loopback clients bypass the gate, and `/api/health` plus the middleware-owned login/logout paths stay reachable. Browser sessions use a server-keyed, expiring HttpOnly HMAC cookie; `Secure` is set only under TLS so a plain-HTTP LAN session does not enter a login loop. An unauthenticated WebSocket is closed with code 4401 before `ws_endpoint` accepts it. With no configured password, non-loopback access remains open by explicit operator choice.
+`NetworkAuthGate` runs `browser_boundary.py` first on every request and handshake, loopback included: another site's or an opaque page gets 403 (WebSocket 4403); passive files pass (limits: DEPLOYMENT). `OUROBOROS_NETWORK_PASSWORD` gates non-loopback access with an expiring HMAC session cookie; a refused socket closes pre-accept (4401). Public routes (the widget bridge too), proxies, the cookie, sign-in and 401 handling: CLIENT_CONTRACT §3; DEPLOYMENT. Without a password, remote access stays open by operator choice. Widget lease reads take only their lease (§3) and authenticate nothing else.
 
-The executable browser/CLI route SSOT is `ouroboros/gateway/router.py`; file-browser routes are contributed by `gateway/files.py::file_browser_routes()`. `gateway/contracts.py` is the frozen descriptive envelope and endpoint index mirrored by `web/modules/api_types.js` and parity tests; its `TypedDict` classes perform no runtime JSON validation. The loopback Host Service is a separate token-authenticated app assembled by `gateway/host_service.py::create_host_service_app`, not another public owner API.
+`server_web.ServedUI` applies `OUROBOROS_UI_DIR` (§7) once per generation for `/`, `/static/*` and optional directory pages `onboarding.html` and `auth/index.html`. The same record reaches the outer auth gate, the builtin index's response-only owner marker and `StateResponse.served_ui` (source, not asset digest). Builtin `/onboarding/static/*` and the author kit remain independent. Selection and fallback, whole pages, `?builtin=1` recovery, the `/auth/*` bundle, topology and client-owned releases: CLIENT_CONTRACT §2–4.
 
-Every `/api/files/*` operation resolves its requested path and refuses the operation when that resolution leaves the configured file root. In-root symlinks remain usable; out-of-root symlinks may be listed with `is_symlink: true` but cannot be read, written, downloaded, deleted, or traversed. The backend check is authoritative regardless of browser path presentation.
+Files routes: `gateway/files.py::file_browser_routes()` (envelopes/parity: §11). `gateway/host_service.py::create_host_service_app` builds the separate token-authenticated loopback Host Service, not a public owner API (§12).
 
-| Method | Path | Handler |
+`/api/files/*` resolves paths inside the configured root. In-root symlinks work; outside links may be listed (`is_symlink: true`), never read, written, downloaded, deleted or traversed. Chat downloads (`?upload=<id>`) instead use `chat_uploads.open_upload` inside `data/uploads`, independently of the Files root.
+
+| Method | Path | Note |
 |---|---|---|
-| GET | `/` | `server.index_page` |
-| GET | `/api/health` | `gateway.state.api_health` |
-| GET | `/api/state` | `gateway.state.api_state` |
-| GET | `/api/extensions` | `gateway.extensions.api_extensions_index` (unique rows additionally carry `content_hash`, `published` (validated receipt object or null), `published_malformed`; identity-collision rows carry `identity_collision: true` and omit the receipt fields; a hub row's display hints `official_hub_verified`/`owner_attestable` are matched against the fresh display-plane catalog memo and are `null` without one — this GET never fetches the catalog) |
-| POST | `/api/skills/{skill}/publish-preflight` | `gateway.skill_publish.api_skill_publish_preflight` |
-| GET | `/api/extensions/{skill}/manifest` | `gateway.extensions.api_extension_manifest` |
-| GET | `/api/extensions/{skill}/module/{entry:path}` | `gateway.extensions.api_extension_module` (live-registration authorization, reviewed `.js`/`.mjs` siblings from captured texts, `Access-Control-Allow-Origin: *` on every answer) |
-| GET | `/api/widgets` | `gateway.widgets.api_widgets` (passive projection of the loader's live UI tabs via `extension_loader.live_widget_projection`; `Cache-Control: no-store`) |
-| GET | `/api/extensions/{skill}/settings_section` | `gateway.extensions.api_extension_settings_section` |
-| ANY | `/api/extensions/{skill}/{rest:path}` | `gateway.extensions.api_extension_dispatch` |
-| GET | `/api/skills/daemons` | `gateway.extensions.api_skill_daemons` |
-| POST | `/api/skills/{skill}/toggle` | `gateway.extensions.api_skill_toggle` |
-| POST | `/api/skills/{skill}/delete` | `gateway.extensions.api_skill_delete` |
-| GET | `/api/skills/lifecycle-queue` | `gateway.extensions.api_skill_lifecycle_queue` |
-| POST | `/api/skills/{skill}/review` | `gateway.extensions.api_skill_review` |
-| GET | `/api/skills/{skill}/review-history/{job_id}` | `gateway.extensions.api_skill_review_history_detail` (bounded lazy detail from a fixed tail window of `review_history.jsonl`; missing job 404, outside-window honestly unavailable; slot/attempt usage joins from the physical-attempt ledger) |
-| POST | `/api/owner/skills/{skill}/attest-review` | `gateway.extensions.api_owner_skill_attest_review` (OWNER-ONLY skip of the LLM review; the deterministic preflight floor still runs, 409 on failure; routes through `run_skill_review_lifecycle` for the post-pass reconcile) |
-| POST | `/api/skills/{skill}/grants` | `gateway.extensions.api_skill_grants` |
-| POST | `/api/skills/{skill}/reconcile` | `gateway.extensions.api_skill_reconcile` |
-| GET | `/api/marketplace/clawhub/search` | `gateway.marketplace.api_marketplace_search` |
-| GET | `/api/marketplace/clawhub/installed` | `gateway.marketplace.api_marketplace_installed` |
-| GET | `/api/marketplace/clawhub/info/{slug:path}` | `gateway.marketplace.api_marketplace_info` |
-| GET | `/api/marketplace/clawhub/preview/{slug:path}` | `gateway.marketplace.api_marketplace_preview` |
-| POST | `/api/marketplace/clawhub/install` | `gateway.marketplace.api_marketplace_install` |
-| POST | `/api/marketplace/clawhub/update/{name}` | `gateway.marketplace.api_marketplace_update` |
-| POST | `/api/marketplace/clawhub/uninstall/{name}` | `gateway.marketplace.api_marketplace_uninstall` |
-| GET | `/api/marketplace/ouroboroshub/catalog` | `gateway.marketplace.api_ouroboroshub_catalog` |
-| GET | `/api/marketplace/ouroboroshub/installed` | `gateway.marketplace.api_ouroboroshub_installed` |
-| GET | `/api/marketplace/ouroboroshub/preview/{slug:path}` | `gateway.marketplace.api_ouroboroshub_preview` |
-| POST | `/api/marketplace/ouroboroshub/install` | `gateway.marketplace.api_ouroboroshub_install` (also the adopt transport: `{adopt: true, expected_content_hash}` replaces an external same-name occupant with the sha256-verified catalog payload; adopt forces `auto_review`, conflicts with `overwrite`, typed 400/409/502 codes ride the lifecycle payload) |
-| POST | `/api/marketplace/ouroboroshub/update/{name}` | `gateway.marketplace.api_ouroboroshub_update` |
-| POST | `/api/marketplace/ouroboroshub/uninstall/{name}` | `gateway.marketplace.api_ouroboroshub_uninstall` |
-| POST | `/api/marketplace/ouroboroshub/publication/{name}/clear` | `gateway.marketplace.api_ouroboroshub_clear_publication` (compares the displayed receipt and clears only local waiting state) |
-| GET | `/api/files/list` | `gateway.files.api_files_list` |
-| GET | `/api/files/read` | `gateway.files.api_files_read` |
-| GET | `/api/files/content` | `gateway.files.api_files_content` |
-| GET | `/api/files/download` | `gateway.files.api_files_download` |
-| POST | `/api/files/upload` | `gateway.files.api_files_upload` |
-| POST | `/api/files/mkdir` | `gateway.files.api_files_mkdir` |
-| POST | `/api/files/write` | `gateway.files.api_files_write` |
-| POST | `/api/files/delete` | `gateway.files.api_files_delete` |
-| POST | `/api/files/transfer` | `gateway.files.api_files_transfer` |
-| GET | `/onboarding` | `gateway.onboarding_host.onboarding_page` |
-| GET | `/api/onboarding` | `gateway.settings.api_onboarding` |
-| POST | `/api/onboarding/complete` | `gateway.onboarding.api_onboarding_complete` |
-| POST | `/api/onboarding/subagents/preview` | `gateway.onboarding.api_onboarding_subagents_preview` |
-| GET | `/api/settings` | `gateway.settings.api_settings_get` |
-| POST | `/api/settings` | `gateway.settings.api_settings_post` |
-| GET | `/api/reviewer-slots` | `gateway.settings.api_reviewer_slots` |
-| GET | `/api/claudexor/status` | `gateway.claudexor_accounts.api_claudexor_status` |
-| POST | `/api/claudexor/quota/refresh` | `gateway.claudexor_quota.api_claudexor_quota_refresh` |
-| POST | `/api/claudexor/wake` | `gateway.claudexor_accounts.api_claudexor_wake` |
-| POST | `/api/claudexor/login` | `gateway.claudexor_accounts.api_claudexor_login` |
-| GET | `/api/claudexor/login/{job_id}` | `gateway.claudexor_accounts.api_claudexor_login_job` |
-| DELETE | `/api/claudexor/login/{job_id}` | `gateway.claudexor_accounts.api_claudexor_login_job` |
-| POST | `/api/claudexor/login/{job_id}/input` | `gateway.claudexor_accounts.api_claudexor_login_job` |
-| POST | `/api/claudexor/login/{job_id}/reconcile` | `gateway.claudexor_accounts.api_claudexor_login_job_reconcile` |
-| DELETE | `/api/claudexor/credential-profiles/{harness}/{profile_id}` | `gateway.claudexor_accounts.api_claudexor_credential_profile` |
-| PATCH | `/api/claudexor/credential-profiles/{harness}/{profile_id}` | `gateway.claudexor_accounts.api_claudexor_credential_profile` |
-| POST | `/api/owner/runtime-mode` | `gateway.settings.api_owner_runtime_mode` |
-| POST | `/api/owner/auto-grant` | `gateway.settings.api_owner_auto_grant` |
-| POST | `/api/owner/context-mode` | `gateway.settings.api_owner_context_mode` |
-| POST | `/api/owner/safety-mode` | `gateway.settings.api_owner_safety_mode` |
-| POST | `/api/owner/skills/{skill}/presence-runtime` | `gateway.presence_settings.api_owner_skill_presence_runtime` |
-| POST | `/api/owner/capability-ack` | `gateway.settings.api_acknowledge_capability` |
-| GET | `/api/ui/preferences` | `gateway.ui_preferences.api_ui_preferences_get` |
-| POST | `/api/ui/preferences` | `gateway.ui_preferences.api_ui_preferences_post` |
-| GET | `/api/model-catalog` | `gateway.models.api_model_catalog` |
-| POST | `/api/openai-compatible/models` | `gateway.models.api_openai_compatible_models` |
-| POST | `/api/providers/test` | `gateway.models.api_provider_test` |
-| POST | `/api/tasks` | `gateway.tasks.api_tasks_create` |
-| GET | `/api/tasks` | `gateway.tasks.api_tasks_list` |
-| GET | `/api/tasks/{task_id}` | `gateway.tasks.api_task_get` |
-| GET | `/api/tasks/{task_id}/events` | `gateway.tasks.api_task_events` (legacy integer rank) |
-| POST | `/api/tasks/{task_id}/events` | `gateway.tasks.api_task_events` (read-only v2 cursor) |
-| GET | `/api/tasks/{task_id}/artifacts/{name}` | `gateway.tasks.api_task_artifact` |
-| POST | `/api/tasks/{task_id}/cancel` | `gateway.tasks.api_task_cancel` |
-| POST | `/api/tasks/{task_id}/hurry` | `gateway.tasks.api_task_hurry` |
-| POST | `/api/tasks/{task_id}/resume` | `gateway.tasks.api_task_resume` |
-| POST | `/api/decisions` | `gateway.tasks.api_decision_answer` |
-| GET | `/api/schedules` | `gateway.schedules.api_schedules_list` |
-| POST | `/api/schedules` | `gateway.schedules.api_schedules_upsert` |
-| DELETE | `/api/schedules/{schedule_id}` | `gateway.schedules.api_schedules_delete` |
-| POST | `/api/command` | `gateway.control.api_command` |
-| POST | `/api/reset` | `gateway.control.api_reset` |
-| GET | `/api/git/log` | `gateway.control.api_git_log` |
-| POST | `/api/git/rollback` | `gateway.control.api_git_rollback` |
-| POST | `/api/git/promote` | `gateway.control.api_git_promote` |
-| GET | `/api/update/status` | `gateway.control.api_update_status` |
-| POST | `/api/update/check` | `gateway.control.api_update_check` |
-| POST | `/api/update/preflight` | `gateway.control.api_update_preflight` |
-| POST | `/api/update/apply` | `gateway.control.api_update_apply` |
-| GET | `/api/cost-breakdown` | `gateway.history.make_cost_breakdown_endpoint` (the router's import path; the factory body and `_ACCOUNTING_SUMMARY_FIELDS` live in `gateway.cost_breakdown`) |
-| GET | `/api/evolution-data` | `gateway.control.api_evolution_data` |
-| GET | `/api/projects` | `gateway.projects.api_projects_list` |
-| POST | `/api/projects` | `gateway.projects.api_projects_create` |
-| POST | `/api/projects/from-task` | `gateway.projects.api_project_from_task` |
-| POST | `/api/projects/{project_id}/update` | `gateway.projects.api_project_update` |
-| POST | `/api/projects/{project_id}/delete` | `gateway.projects.api_project_delete` |
-| GET | `/api/fs/dirs` | `gateway.projects.api_fs_dirs` |
-| GET | `/api/chat/history` | `gateway.history.make_chat_history_endpoint` |
-| GET | `/api/logs/{name}` | `gateway.logs.api_logs_tail` |
-| POST | `/api/chat/upload` | `gateway.files.api_chat_upload` |
-| DELETE | `/api/chat/upload` | `gateway.files.api_chat_upload_delete` |
-| POST | `/api/local-model/start` | `gateway.models.api_local_model_start` |
-| POST | `/api/local-model/stop` | `gateway.models.api_local_model_stop` |
-| GET | `/api/local-model/status` | `gateway.models.api_local_model_status` |
-| POST | `/api/local-model/test` | `gateway.models.api_local_model_test` |
-| POST | `/api/local-model/install-runtime` | `gateway.models.api_local_model_install_runtime` |
-| GET | `/api/mcp/status` | `gateway.mcp.api_mcp_status` |
-| POST | `/api/mcp/refresh` | `gateway.mcp.api_mcp_refresh` |
-| POST | `/api/mcp/test` | `gateway.mcp.api_mcp_test` |
-| WS | `/ws` | `gateway.ws.ws_endpoint` |
-| STATIC | `/static/*` | `server.NoCacheStaticFiles` |
-| GET | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/identity` | `gateway.host_service._api_identity` |
-| GET | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/tools/schemas` | `gateway.host_service._api_tool_schemas` |
-| POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/chat/allocate-internal` | `gateway.host_service._api_allocate_internal` |
-| POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/chat/inject` | `gateway.host_service._api_chat_inject` |
-| GET | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/chat/operations/{operation_ref:path}` | `gateway.host_service._api_chat_operation` (the calling skill's own accepted message: pending, running with its task or turn, the durable answer, or the terminal task status) |
-| POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/chat/cancel` | `gateway.host_service._api_chat_cancel` (the existing cancellation owner on work that message started; a typed outcome, never a cancellation that did not happen) |
-| POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/chat/decision` | `gateway.host_service._api_chat_decision` (the `task_decision.answer_decision` ingress relayed for a transport skill) |
-| POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/presence/turn` | `gateway.host_service._api_presence_turn` |
-| POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/presence/delivery` | `gateway.host_service._api_presence_delivery` |
-| GET | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/presence/work/{work_ref}` | `gateway.host_service._api_presence_work` |
-| POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/ui/ws-message` | `gateway.host_service._api_ws_message` |
-| WS | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/events` | `gateway.host_service._ws_events` |
+| GET | `/` | |
+| GET | `/api/health` | 200 during boot too; the `boot` document: §2 Boot order |
+| GET | `/api/contract` | |
+| GET | `/api/state` | |
+| GET | `/api/consciousness` | the consciousness panel: status, spend by cause, places and recent wakes (read-only) |
+| GET | `/api/extensions` | installed-skill projection; never fetches |
+| POST | `/api/skills/{skill}/publish-preflight` | |
+| GET | `/api/extensions/{skill}/manifest` | |
+| GET | `/api/extensions/{skill}/module/{entry:path}` | reviewed `.js`/`.mjs` from captured texts; `Access-Control-Allow-Origin: *` |
+| GET | `/api/extensions/{skill}/ui/{revision}/{path:path}` | captured page-module files of the live revision |
+| GET | `/api/widgets` | live UI tabs and pinned cards, passive; `Cache-Control: no-store` |
+| POST | `/api/widgets/fault` | bounded widget fault |
+| GET | `/api/widget-bridge.js` | route-page frame bridge, public |
+| POST | `/api/widgets/asset-leases` | parent opens a file or route lease; re-establishes route leases only |
+| POST | `/api/widgets/asset-leases/{op}` | parent renews/revokes its lease |
+| GET | `/api/extensions/{skill}/settings_section` | |
+| ANY | `/api/extensions/{skill}/{rest:path}` | extension dispatch (§13) |
+| GET | `/api/skills/daemons` | |
+| POST | `/api/skills/{skill}/toggle` | |
+| POST | `/api/skills/{skill}/delete` | |
+| GET | `/api/skills/lifecycle-queue` | |
+| POST | `/api/skills/{skill}/review` | |
+| GET | `/api/skills/{skill}/review-history/{job_id}` | the skill's ledger record, else a legacy `review_history.jsonl` tail |
+| POST | `/api/owner/skills/{skill}/attest-review` | owner-only skip of the LLM review; deterministic preflight still runs |
+| POST | `/api/skills/{skill}/grants` | |
+| POST | `/api/skills/{skill}/reconcile` | |
+| GET | `/api/marketplace/clawhub/search` | |
+| GET | `/api/marketplace/clawhub/installed` | |
+| GET | `/api/marketplace/ouroboroshub/installed` | frozen hub listing |
+| GET | `/api/marketplace/clawhub/info/{slug:path}` | |
+| GET | `/api/marketplace/clawhub/preview/{slug:path}` | |
+| POST | `/api/marketplace/clawhub/install` | |
+| POST | `/api/marketplace/clawhub/update/{name}` | |
+| POST | `/api/marketplace/clawhub/uninstall/{name}` | |
+| POST | `/api/skills/{skill}/publication/clear` | |
+| GET | `/api/skill-sources` | |
+| POST | `/api/skill-sources` | |
+| POST | `/api/skill-sources/my-skills` | |
+| POST | `/api/skill-sources/probe` | |
+| POST | `/api/skill-sources/{source_id}` | |
+| POST | `/api/skill-sources/{source_id}/remove` | |
+| POST | `/api/skill-sources/{source_id}/refresh` | |
+| GET | `/api/skill-catalog` | |
+| GET | `/api/skill-catalog/search` | |
+| GET | `/api/skill-catalog/item/{source_id}/{name}` | |
+| POST | `/api/skill-catalog/install` | |
+| POST | `/api/skills/{skill}/update` | |
+| POST | `/api/skills/{skill}/uninstall` | |
+| GET | `/api/onboarding/starter-skills` | |
+| GET | `/api/files/list` | |
+| GET | `/api/files/read` | |
+| GET | `/api/files/content` | |
+| GET | `/api/files/download` | `upload`: a chat attachment, separate authority (above) |
+| POST | `/api/files/upload` | |
+| POST | `/api/files/mkdir` | |
+| POST | `/api/files/write` | |
+| POST | `/api/files/delete` | |
+| POST | `/api/files/transfer` | |
+| GET | `/onboarding` | |
+| GET | `/api/onboarding` | |
+| GET | `/api/onboarding/bootstrap` | |
+| POST | `/api/onboarding/complete` | |
+| GET | `/api/onboarding/complete` | |
+| POST | `/api/onboarding/subagents/preview` | |
+| GET | `/api/settings` | effects, tokens (§7) |
+| POST | `/api/settings` | origin, conditions, receipt (§7) |
+| POST | `/api/settings/secret` | |
+| GET | `/api/review-pool` | |
+| GET | `/api/claudexor/status` | `last_exit`/`memory` (§9), resource-catalog evidence (§3); never wakes |
+| POST | `/api/claudexor/quota/refresh` | full or exact account (§3) |
+| POST | `/api/claudexor/account-resets` | exact request (§3) |
+| GET | `/api/claudexor/account-resets/{operation_id}` | receipt inspection (§3) |
+| POST | `/api/claudexor/wake` | |
+| GET | `/api/claudexor/restart` | passive preview of what ends (§3) |
+| POST | `/api/claudexor/restart` | preview `{token}`: stop, then the ordinary start |
+| GET | `/api/claudexor/maintenance/harnesses` | selection/newest/actions/receipt; `checkLatest` reads vendor HTTPS |
+| POST | `/api/claudexor/maintenance/operations` | 202 latest/exact handle; same-key rejoin; refusal covers this attempt (§6) |
+| GET | `/api/claudexor/maintenance/operations/{operation_id}` | retained engine facts |
+| POST | `/api/claudexor/maintenance/operations/{operation_id}/cancel` | acknowledgement does not prove termination |
+| POST | `/api/claudexor/login` | |
+| GET | `/api/claudexor/login/{job_id}` | |
+| DELETE | `/api/claudexor/login/{job_id}` | |
+| POST | `/api/claudexor/login/{job_id}/input` | |
+| POST | `/api/claudexor/login/{job_id}/reconcile` | |
+| DELETE | `/api/claudexor/credential-profiles/{harness}/{profile_id}` | |
+| PATCH | `/api/claudexor/credential-profiles/{harness}/{profile_id}` | |
+| POST | `/api/owner/runtime-mode` | |
+| POST | `/api/owner/auto-grant` | |
+| POST | `/api/owner/context-mode` | |
+| POST | `/api/owner/effort-range` | |
+| POST | `/api/owner/subagents-mode` | `{mode, project_id?}` → `{ok, project_id, subagents_mode, cognition}` (§7) |
+| POST | `/api/owner/chat-model` | |
+| POST | `/api/owner/safety-mode` | |
+| POST | `/api/owner/safety-model` | |
+| POST | `/api/owner/safety-rules` | |
+| GET | `/api/places` | place records, circles and installed connector declarations |
+| POST | `/api/places` | connect a place |
+| POST | `/api/places/{place_id}` | atomic owner-authored choices |
+| GET | `/api/places/{place_id}/rooms` | captured canonical conversation rooms (§12) |
+| DELETE | `/api/places/{place_id}` | disconnect, retaining room history |
+| POST | `/api/circles` | |
+| POST | `/api/circles/{circle_id}` | |
+| DELETE | `/api/circles/{circle_id}` | |
+| POST | `/api/owner/capability-ack` | |
+| GET | `/api/ui/contributions` | live skill controls, speech providers, offers |
+| GET | `/api/ui/preferences` | |
+| POST | `/api/ui/preferences` | |
+| POST | `/api/ui/holds` | |
+| GET | `/api/ui/i18n` | interface language and translation memory; a read never starts generation |
+| POST | `/api/ui/i18n/language` | writes `OUROBOROS_UI_LANGUAGE`; broadcasts `ui_language_changed` |
+| POST | `/api/ui/i18n/missing` | |
+| POST | `/api/ui/i18n/import` | |
+| GET | `/api/ui/i18n/export` | |
+| POST | `/api/ui/i18n/regenerate` | drops generated entries; owner and imported ones stay |
+| GET | `/api/desktop/autostart` | |
+| POST | `/api/desktop/autostart` | host-OS state, `owner_audit`, no settings mirror |
+| GET | `/api/desktop/background` | |
+| POST | `/api/desktop/background` | persists `OUROBOROS_DESKTOP_KEEP_RUNNING`; `owner_audit` |
+| GET | `/api/model-catalog` | |
+| POST | `/api/openai-compatible/models` | |
+| POST | `/api/providers/test` | |
+| POST | `/api/tasks` | |
+| GET | `/api/tasks` | |
+| GET | `/api/tasks/{task_id}` | |
+| GET | `/api/tasks/{task_id}/reviews` | paged; gaps |
+| GET | `/api/tasks/{task_id}/reviews/skill/{job_id}` | saved detail |
+| GET | `/api/tasks/{task_id}/reviews/{record_id}/{seat_id}` | saved source; no paths |
+| GET | `/api/tasks/{task_id}/events` | integer rank |
+| POST | `/api/tasks/{task_id}/events` | read-only v2 cursor (§3 history/SSE v2) |
+| GET | `/api/tasks/{task_id}/artifacts/{name}` | own stores: POSIX no-follow/Windows NT relative handles; admission before child-store metadata; SVG `sandbox` CSP + `nosniff` (`gateway/task_archive.py`) |
+| POST | `/api/tasks/{task_id}/cancel` | (§5 Stop policy and hurry) |
+| POST | `/api/tasks/{task_id}/hurry` | (§5 Stop policy and hurry) |
+| POST | `/api/tasks/{task_id}/model` | `ouroboros/gateway/task_model.py`: durable root primary; set/follow/return/wait/keep |
+| POST | `/api/tasks/{task_id}/pause` | (§6 Owner Pause of a whole tree) |
+| POST | `/api/tasks/{task_id}/owner-keep` | `OwnerKeepRequest`; keep or release exactly this task's materials |
+| POST | `/api/tasks/{task_id}/continue` | (§6 Continue after interruption or an unfinished author stop) |
+| POST | `/api/tasks/{task_id}/resume` | |
+| POST | `/api/call/open` | admits a live call as an ordinary room turn when Calls (beta) is on (§13 Live Conversation) |
+| POST | `/api/decisions` | |
+| POST | `/api/decisions/secret` | |
+| GET | `/api/cards/{card_id}` | a living card's current body and presses |
+| GET | `/api/cards/{card_id}/app` | app HTML as `text/plain`, `nosniff`, `no-store` |
+| POST | `/api/cards/{card_id}/pin` | keep a component card on Widgets |
+| DELETE | `/api/cards/{card_id}/pin` | |
+| GET | `/api/schedules` | |
+| POST | `/api/schedules` | |
+| POST | `/api/schedules/{schedule_id}/action` | explicit action and reason (§5 Schedules and follow-ups) |
+| DELETE | `/api/schedules/{schedule_id}` | |
+| POST | `/api/command` | |
+| POST | `/api/reset` | |
+| GET | `/api/git/log` | |
+| POST | `/api/git/rollback` | |
+| POST | `/api/git/promote` | |
+| GET | `/api/update/status` | passive, no network or prose |
+| POST | `/api/update/check` | |
+| POST | `/api/update/preflight` | |
+| POST | `/api/update/description` | |
+| POST | `/api/update/apply` | |
+| GET | `/api/cost-breakdown` | |
+| GET | `/api/storage` | passive; `?count=` omits a held count |
+| POST | `/api/storage/measure` | start/join child count |
+| POST | `/api/storage/measure/cancel` | stop child; saved count stays |
+| POST | `/api/storage/free/preview` | pure preview; 202, start/join |
+| POST | `/api/storage/free` | `StorageFreeRequest`: exact pool `items`, `groups`, or `manual` ids of `view=manual` with `accept_loss: true`; 202, `started`/`reason` |
+| GET | `/api/storage/free/items` | `StorageFreeItemsResponse`: one `view=` page: `pool`, `excluded`, `manual` or `outcomes` |
+| GET | `/api/services/kept` | `KeptServicesResponse` (§9) |
+| POST | `/api/services/kept/{launch_id}/stop` | `reason`; one launch, fresh outcome |
+| POST | `/api/storage/free/cancel` | stop preview/run; freed stays freed |
+| GET | `/api/evolution-data` | |
+| GET | `/api/projects` | 200 rows; `all=1` all; `id` (active/deleting) or `chat_id` (active): one room (missing → none; unreadable → error) |
+| POST | `/api/projects` | |
+| POST | `/api/projects/from-task` | |
+| POST | `/api/projects/{project_id}/update` | |
+| POST | `/api/projects/{project_id}/delete` | |
+| GET | `/api/fs/dirs` | |
+| GET | `/api/chat/history` | |
+| GET | `/api/logs/{name}` | |
+| GET | `/api/logs/{name}/raw` | |
+| POST | `/api/chat/upload` | |
+| DELETE | `/api/chat/upload` | pending uploads only, else 409 |
+| POST | `/api/local-model/start` | |
+| POST | `/api/local-model/stop` | |
+| GET | `/api/local-model/status` | |
+| POST | `/api/local-model/test` | |
+| POST | `/api/local-model/install-runtime` | |
+| GET | `/api/mcp/status` | Read-only listing facts |
+| POST | `/api/mcp/refresh` | Lists and publishes |
+| POST | `/api/mcp/sign-in` | Sign-in steps |
+| POST | `/api/mcp/test` | Draft probe, unpublished |
+| POST | `/api/mcp/import/preview` | |
+| WS | `/ws` | |
+| WS | `/ws/call/{call_id}` | one admitted call's audio and frames (`call_protocol.py`) |
+| STATIC | `/static/*` | |
+| STATIC | `/onboarding/static/*` | |
+| STATIC | `/auth/*` | selected public login assets |
+| GET | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/identity` | |
+| POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/call/open` | Presence call admission (§12) |
+| WS | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/call/{call_id}/peer` | granted meeting peer (§12) |
+| GET | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/tools/schemas` | |
+| POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/chat/allocate-internal` | |
+| POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/chat/inject` | |
+| GET | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/chat/operations/{operation_ref:path}` | the calling skill's own accepted message, pending through terminal |
+| POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/chat/cancel` | the existing cancellation owner; a typed outcome |
+| POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/chat/decision` | `task_decision.answer_decision` relayed for a transport skill |
+| POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/ui/language` | the same `ui_i18n.choose_language` writer as `/api/ui/i18n/language` |
+| GET | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/presence/place` | current place state for an authenticated connector |
+| POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/presence/turn` | capture before attention |
+| POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/presence/delivery` | |
+| POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/presence/history` | |
+| GET | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/presence/work/{work_ref}` | |
+| POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/presence/work/{work_ref}` | retains transport queue observations |
+| POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/ui/ws-message` | |
+| POST | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/notify` | `notify_owner` grant: one signed `skill_notice` System row, no model turn |
+| WS | `127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}/events` | |
 
-Rationale: `server.py` owns process startup/lifespan/static mounting, while `gateway/*` owns browser-facing HTTP/WS contracts; this keeps UI and runtime coupling explicit and testable.
+Update-status, log-tail and schedule-list reads run off the event loop.
+
+`/api/state` adds `current_questions`/`main_attention` and the work projection (`works`, `rooms`), each with completeness and typed gaps (§3); `active_chat_activities` stays root-only. GET neither scans chat nor writes; requests share one display publication, rebuilt only when its revision moved (`gateway/state_publication.py`), never an authority; actions reuse `/api/decisions` and task endpoints.
 
 ### WebSocket protocol
 
-`/ws` is the live browser delivery channel, not a durable state owner: queue, task, Project, review, skill, settings, cost, and update modules persist their own truth, and REST/history endpoints reconstruct it after reload or disconnection. `gateway/contracts.py` describes the frozen envelope shapes and message-type index for Python/JavaScript parity; `gateway/ws.py` performs the actual transport checks — incoming text must decode to a JSON object, extension types must parse as an owned namespace, and built-in `chat` or `command` frames must carry a non-empty payload before entering the message bridge. The authentication middleware above governs socket admission; the public socket never receives the Host Service token or the owned Claudexor daemon token.
+`/ws` delivers live browser events; the queue, task, Project, review, skill, settings, cost and update owners persist the truth a reconnecting client rebuilds through REST and history. `gateway/ws.py` admits JSON objects, owned extension namespaces, `command` text, `chat` text/attachments. Chat acceptance (row → queue → echo) runs off the ASGI loop through `gateway._helpers.run_sync_to_completion`. Each socket chains its chats in receive order without awaiting them, so Panic and Restart stay responsive behind a held chat (§5 Bridge intake and commands); disconnect waits for received chats to settle (`settle_to_completion`). Authentication above governs admission; public sockets never carry Host Service or owned-daemon tokens.
 
-The browser constructs one socket for the whole SPA. Feature modules subscribe before connection, and the initial complete Project chat-id set is fetched before the first open so an early Project frame cannot be mistaken for Main traffic. `ws.on(type, listener)` stores listeners in insertion-ordered sets and returns a disposer; emission uses a listener snapshot, so a listener added during dispatch does not receive the current frame and disposing one listener cannot skip its neighbor. Every decoded frame first reaches the generic `message` event and then its type-specific event, which lets Widgets consume reviewed namespaced events without duplicating the socket.
+Feature modules subscribe, and the complete Project chat-id set is fetched, before the first open, so an early Project frame cannot pass for Main traffic. Every decoded frame reaches the generic `message` event and then its type-specific event, so Widgets consume reviewed namespaced events.
 
-A browser `chat` frame contains the owner text and may add `sender_session_id`, `client_message_id`, `force_plan`, uploaded attachment references, `chat_id`, `project_id`, and `client_surface` — raw sending-surface observables measured at SEND time because the pywebview bridge appears asynchronously after load. The gateway normalizes that payload through `client_surface.normalize_client_surface`, stamps host `received_at`, and persists it on the canonical inbound row — distinct from the `transport` dict (transport is chat-scoped reply routing; the surface fact is per-message provenance). The fact is assembled at its PRODUCER, never inferred at render (the per-producer stamp catalog and closed-key bound: `ouroboros/client_surface.py`); synthetic A2A chats stamp no owner surface (machine traffic never wears one); machine producers stamp nothing (`client_surface` is a reserved schedule-template key rejected at admission); promotion/steering CARRY the originating owner turn's fact. The loop injects a surface note only when sending-surface identity changes within an attempt (viewport excluded — a resize is not a device change). Absence is an honest gap. The client generates a message id when absent and uses it to reconcile its pending bubble, the echoed canonical user row, routing annotations, and mailbox retries; a successful browser `send()` means only that the current socket accepted the frame, not that a task was durably admitted.
+#### WebSocket chat
 
-Ordinary frames sent while disconnected enter a process-local queue capped at 100 entries (oldest dropped), flushed in order after reconnect and lost on page reload — not a second durable outbox. Attachment messages deliberately set `queue:false`: uploads occur immediately before send, so retaining only the socket frame would leave unowned temporary files; on socket loss Chat refuses the message, cleans uploaded temporaries best-effort, and retains the staged files for explicit retry.
+A browser `chat` frame carries owner text and/or uploaded attachment references, optionally with `sender_session_id`, `client_message_id`, `chat_id`, `project_id` and `client_surface`: raw sending-surface facts measured at send (the pywebview bridge appears asynchronously after load). The gateway normalizes surface facts (`client_surface.normalize_client_surface`), stamps host `received_at` at receipt, and every transport passes one common enqueue (`LocalChatBridge.enqueue_local_message`). The surface fact is per-message provenance, distinct from the chat-scoped `transport` reply route, assembled at its producer, never inferred at render, carried from the originating owner turn by promotion or steering (`client_surface.py`).
 
-For a chat frame, the gateway validates uploaded filenames as basenames confined under the upload root, exposes the first eligible bounded image as native image content, forwards the complete validated attachment set as task-staging metadata, and calls the local message bridge with the exact thread, Project, sender-session, client-message, and planning facts. The web owner identity is fixed: `chat_id` selects a thread and cannot mint an external owner identity. If the bridge is not initialized, the socket returns a visible typed System row (`initialization_notice`) rather than accepting the message silently.
+Acceptance is idempotent on `client_message_id`: a same-id frame rejoins the accepted row if words and ordered attachment content match, else is refused; the `ingress_accepted` echo and history carry the row's durable dispatch fact (`ingress_pending`: owed, performed once by a retry or the next bus init; `ingress_dispatched`: entered here); row and uploads are kept (`supervisor/message_ingress.py`). Unreadable chat history is unknown: the frame is refused with the `initialization_notice` before anything is claimed or written.
 
-A built-in `command` frame carries a slash command and enters the same bridge with rebroadcast disabled; runtime command routing, owner authorization, queue authority, and typed outcomes remain outside the socket module. Main header controls therefore reuse the ordinary command contract for Restart, Panic, review, evolution, and background consciousness; Panic is sent only after the shared dialog returns the strict confirmed boolean. The socket does not infer intent from command-looking prose.
+Frames sent while disconnected wait in a bounded process-local queue (oldest dropped), flushed after reconnect and lost on reload: no second durable outbox. Attachment messages set `queue:false` (uploads happen just before the send; a retained frame would leave unowned temporaries); on socket loss Chat refuses the message, cleans those and keeps the staged files for an explicit retry. Once the socket took a frame — every owner message, a bare slash command excepted; a queued one once written — `chat_attachments.createUnconfirmedSends` keeps it (with its `reply_to`) by id in tab sessionStorage across reloads until that id's echo or history row settles it; an unsettled frame offers "Send again" (same frame and id, never automatic) and "Discard".
 
-Built-in outbound envelopes: `chat`, `photo`, `video`, `document`, `typing`, `log`, `heartbeat`, `extension_lifecycle`, `message_annotation`, `projects_changed`, `task_named`, `update_status_ready`, and `update_progress_changed`. The latter only invalidates the process-local update observation; it is never boot-completion proof. Chat progress may carry task lineage, role, requested/effective model lane, delegated route, terminal execution evidence, review projection, cancellation eligibility, outcome axes, artifact references, and nullable cost/finality fields — additive presentation facts; consumers must not infer a missing execution receipt, cost, or task result from the absence of one optional field.
+Off-loop acceptance confines attachment specs to upload-root basenames bound to measured `size`/`sha256`, so bytes swapped under the path afterwards are rejected rather than staged; model pixels come only from staged files. The web owner identity is fixed: `chat_id` selects a thread and cannot mint an external owner identity.
 
-Thread routing is explicit. Project chat, typing, media, and log frames carry `chat_id`; a Project panel consumes its own thread, while Main admits Project question mirrors and the two host-stamped Project lifecycle rows (`project_started`, `project_completion_summary`). `projects_changed` carries a new chat id so every tab can extend its fan-out set before fetching the registry; when even that ordering loses the race, the server-stamped `project_thread` marker on the frame itself keeps Main from adopting it — set once at the message-bus broadcast choke from the registry (a membership lens, never a numeric range, so external transport ids such as Telegram stay unstamped) and enforced by Main's fan-out gate (`chat_activity.mainThreadAccepts`). Task-scoped LOG events acquire their final chat id at supervisor ingress: worker diagnostics carry only their own `task_id`, and `supervisor/log_addressing.py::address_task_event` stamps the audience from host-attested truth (the precedence chain lives in its docstring; an explicit event chat_id of 0 is the hidden partition, `HIDDEN_CHAT_ID`, never "missing"); direct turns carry their chat BY VALUE, stamped at the producer, because the registry entry dies with the turn while queued events drain later. Addressing is honest — an A2A row keeps its true audience, suppressed only at the broadcast choke (`push_log`) so machine traffic never reaches the browser; the same addressing runs in the server-process append sink and at every supervisor handler owning a suppressed type's explicit push, and a genuinely unaddressable event keeps the legacy chat-0 frame. `message_annotation` updates one canonical owner message without creating another bubble — a refused routing act's frame and its replayed annotation carry the host's `cause` sentence (the machine `reason` stays on the durable row), and the picker's 409 `dispatch_rejected` body carries `cause` beside `reason`; `task_named` updates a card only where that task already exists. Media/document consumers validate MIME, base64, and download-route shapes before building browser URLs.
+A `command` frame routes through the bridge without rebroadcast; authorization, queue authority and outcomes remain outside the socket module. Panic bypasses the queue on the existing connection (§9); other header controls keep ordinary command routing. Prose never implies a command (BIBLE P5).
 
-Extension WebSocket traffic is structurally namespaced by `extension_loader.extension_surface_name()` so an extension cannot shadow a built-in type. On each incoming extension frame the gateway resolves the owning skill and reconciles whether its extension is still desired, reviewed, granted, enabled, and live. A missing or failed handler returns a visible log frame. Out-of-process handlers execute in their extension child off the event loop; in-process handlers first record the required execution/cost disclosure. A non-`None` result returns as `<request-type>.reply`; exceptions become typed error log frames rather than terminating the socket loop.
+#### Frame addressing
 
-Server broadcasts snapshot the connected-client list and send to all clients concurrently, so one slow or half-open browser cannot head-of-line-block delivery to every other tab. Failed sends remove only the dead clients and append a durable `broadcast_partial_failure` event; the original domain event stays owned by its durable producer. Restart shutdown closes remaining clients best-effort with code 1012 so they enter the ordinary reconnect path.
+Outbound envelope types are the members of `gateway.contracts.WS_MESSAGE_TYPES` other than the inbound `command`. `update_progress_changed` invalidates the update observation, never proving boot completion. Chat progress carries additive presentation facts (`ChatOutbound` in `GET /api/contract`); consumers must not infer a missing receipt, cost or result from an absent optional field.
 
-The browser reconnects with bounded exponential delay, shows the reconnect overlay, and resets the delay after a successful open; a watchdog closes an apparently open connection after 45 seconds without any inbound frame, so heartbeat traffic proves stream liveness rather than task progress. One served-SHA decision (`ws.js decide()`: keep / reload-changed / reload-unknown) governs both recovery paths so a transient drop cannot destroy in-page state: a changed or no-longer-provable SHA reloads (a restarted server must not keep old JavaScript or CSS alive in PyWebView), an unchanged SHA keeps the page and its queued outbound messages, and an unversioned `/api/state` stays on keep when no non-empty SHA was ever remembered — the owner-selected default under uncertainty, accepting possibly-stale assets as the disclosed tradeoff. A non-OK or failed post-open read is no answer: it never reloads, and the read repeats with a growing pause until the server answers or that socket is gone, because a server seconds into its life can answer 500. While the socket stays down, delayed recovery probes consult `/api/state` without adopting the served SHA; a 200 whose body is not a parseable object counts as a failed probe, probes are single-flight and generation-scoped per disconnect episode, and after several consecutive healthy probes with the socket still down, one forced reload per episode remains as the fuse for a stale browser runtime.
+Project chat, typing, media and log frames carry `chat_id`; each Project panel consumes its own thread and frames naming it in `also_rooms`, Main only what §3 shows there. `projects_changed` carries the new chat id so every tab extends its fan-out before fetching the registry; if that still loses the race, the server-stamped `project_thread` marker keeps Main from adopting the frame (`chat_activity.mainThreadAccepts`). The message-bus broadcast choke sets that marker once from the registry (a membership lens, not a numeric range), so external transport ids such as Telegram stay unstamped. Task-scoped log events get their audience at supervisor ingress: `supervisor/log_addressing.py::address_task_event` stamps host-attested truth (explicit chat_id 0 is `HIDDEN_CHAT_ID`, never missing), and conversation turns carry their chat by value: their row ends with the turn while queued events drain later. `message_annotation` updates one canonical owner message without a second bubble; `task_named` updates a card only where that task exists.
 
-Each Chat instance handles `open` by resynchronizing archive-aware durable history and `close` by withdrawing online/accounting presentation; reconnect deduplication covers overlap between live frames and REST replay, Logs merges the same way, and large history parsing runs off the server event loop. Delivery is live plus replay, not a promise that every transient frame is persisted: durable chat rows, task results, queue snapshots, Project revisions, review ledgers, cost ledgers, and lifecycle state remain the recovery authorities.
+Extension WebSocket traffic is namespaced by `extension_loader.extension_surface_name()`, so an extension cannot shadow a built-in type. Each incoming extension frame resolves its owning skill and rechecks that the extension is still desired, reviewed, granted, enabled and live; out-of-process handlers run in their extension child off the event loop. A missing or failed handler never ends the socket loop (replies and error frames: CLIENT_CONTRACT §5).
+
+Each socket has one writer and outbox (`ws._Connection`), so a slow or half-open browser delays only itself; a broadcast is encoded once, for open sockets only, one loop wake per burst (`ws.py`). A failed send retires its socket and writes `broadcast_partial_failure` off the loop; the domain event stays owned by its durable producer.
+
+#### Reconnect and recovery
+
+The browser reconnects with bounded exponential delay; a watchdog closes a silent seemingly-open socket. One served-page decision (`ws.js decideServedPage`) governs the post-open read and the socket-down probe, so a transient drop keeps in-page state. The core attests only pages it serves: without `served_ui` (an older core), or for its marked page while it serves builtin, `decide()` reloads on a changed or unprovable SHA and keeps the page and its queued frames on an unchanged one or an unversioned `/api/state` with no remembered SHA (possibly stale assets); the marked page reloads once after a restart applied a directory or `none`; an unmarked page owns its refresh and only reconnects. A failed/non-OK read never reloads (a seconds-old server can answer 500). Four healthy probes reload only a page that connected, once per disconnect episode; an attempt failing after one is `serverAnswersWhileDown`: an observation, not a cause.
+
+Each Chat instance handles `open` by resynchronizing durable history (a reconnect adds no feed row) and `close` by withdrawing online and accounting presentation; deduplication covers the overlap between live frames and REST replay, and large history parsing runs off the server event loop. Not every transient frame is persisted: durable chat rows, task results, queue snapshots, Project revisions, review/cost ledgers and lifecycle state remain the recovery authorities.

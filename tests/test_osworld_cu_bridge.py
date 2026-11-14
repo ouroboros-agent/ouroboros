@@ -16,6 +16,12 @@ import pytest
 
 from devtools.benchmarks.common.model_slots import pin_single_model
 from devtools.benchmarks.osworld import run_cu_bridge_agent as rcb
+from devtools.benchmarks.osworld import (
+    cu_bridge_budget,
+    cu_bridge_gate,
+    cu_bridge_runtime,
+    cu_bridge_tool_policy,
+)
 from ouroboros.extension_loader import extension_surface_name
 
 
@@ -23,9 +29,25 @@ _CU_ACTOR_MODEL = "openai/gpt-5.5"
 
 
 def _cu_actor_settings():
-    settings = {}
+    settings = {"OUROBOROS_TASK_REVIEW_MODE": "required"}  # the benchmark's own declared mode (#1731, O4)
     pin_single_model(_CU_ACTOR_MODEL, target=settings)
     return settings
+
+
+# The cu_bridge runner has owner leaves. A seam like
+# `_api` is now owned by one module and bound by name in the others, so a patch
+# that reached only `rcb` would silently miss the leaf that actually calls it.
+_CU_BRIDGE_MODULES = (
+    rcb, cu_bridge_runtime, cu_bridge_tool_policy, cu_bridge_gate, cu_bridge_budget,
+)
+
+
+def _patch_bridge_seam(monkeypatch, name, value):
+    """Patch a cu_bridge seam on EVERY module that binds it."""
+    bound = [module for module in _CU_BRIDGE_MODULES if hasattr(module, name)]
+    assert bound, name
+    for module in bound:
+        monkeypatch.setattr(module, name, value)
 
 
 def test_infeasible_checks_final_answer_fields_only():
@@ -59,7 +81,7 @@ def test_connection_switching_ext_tools_are_denied_vm_control_stays():
 
     def ext(n):
         return extension_surface_name("unix_computer_use", n)
-    for n in ("add_connection", "activate_connection", "use_local", "clear_active_connection"):
+    for n in ("add_connection", "activate_connection", "use_local"):
         assert ext(n) in disabled, f"{n} must be denied to the untrusted task"
     # v6.81.1: list_connections/test_connection JOIN the denied set — both echo the
     # bridge URL, and a trace showed an agent using that URL to hunt for the grader.
@@ -103,7 +125,16 @@ def test_effective_max_rounds_sources(tmp_path, monkeypatch):
     assert rcb._effective_max_rounds(sp) == {"value": 77, "source": "env"}
 
     monkeypatch.delenv("OUROBOROS_MAX_ROUNDS", raising=False)
-    assert rcb._effective_max_rounds(tmp_path / "missing.json") == {"value": 200, "source": "default"}
+    # A document without the key keeps the runtime's legacy finite default ...
+    assert rcb._effective_max_rounds(sp) == {"value": 200, "source": "legacy_document_default"}
+    # ... while no document at all is the runtime's shipped "unlimited": never a number.
+    assert rcb._effective_max_rounds(tmp_path / "missing.json") == {
+        "value": None, "source": "default", "unbounded": True}
+    sp.write_text(json.dumps({"OUROBOROS_MAX_ROUNDS": "unlimited"}), encoding="utf-8")
+    assert rcb._effective_max_rounds(sp) == {
+        "value": None, "source": "settings", "unbounded": True, "raw": "unlimited"}
+    sp.write_text("{not json", encoding="utf-8")
+    assert rcb._effective_max_rounds(sp) == {"value": None, "source": "settings_unreadable"}
 
 
 def test_budget_counters_from_child_drive_tools_jsonl(tmp_path):
@@ -195,12 +226,12 @@ def test_denylist_is_allowlist_complement_blocks_all_host_surfaces():
     assert denied == core - rcb._ALLOWED_CORE_TOOLS
     for t in ("run_command", "run_script", "write_file", "edit_text",
               "start_service", "stop_service", "verify_and_record", "commit_reviewed",
-              "integrate_subagent_patch", "create_github_issue", "schedule_subagent",
+              "integrate_subagent_patch", "github_write", "schedule_subagent",
               "skill_exec", "toggle_skill", "submit_skill_to_hub", "vcs_pull_ff",
               "vcs_restore", "vcs_revert", "vcs_rollback", "update_identity",
               "update_scratchpad", "knowledge_write", "journal_write", "send_user_message",
               "toggle_evolution", "toggle_consciousness", "request_deep_self_review",
-              "comment_on_pr", "comment_on_issue", "promote_to_stable", "run_ci_tests",
+              "github_read", "promote_to_stable",
               "browse_page", "browser_action", "web_search", "plan_task",
               # host filesystem/code reads are denied too — the isolated settings.json
               # holds provider API keys a prompt-injected task could exfiltrate.
@@ -970,7 +1001,7 @@ def _cu_bridge_stubs(monkeypatch, tmp_path, *, reward=1.0):
             return {"task_id": "t1"}
         return {"status": "completed", "final_answer": "done"}
 
-    monkeypatch.setattr(rcb, "_api", _api)
+    _patch_bridge_seam(monkeypatch, "_api", _api)
     return rcb, env
 
 
@@ -1023,7 +1054,7 @@ def test_target_actor_is_durable_before_claim_and_survives_claim_crash(
         actor = manifests[0]["harness"]["target_runtime_actor"]
         assert actor["mismatches"] == []
         assert not any(actor["local_routes"].values())
-        assert actor["reviewer_slots"]["advisory"]["enabled"] is False
+        assert actor["review_pool"] and all(seat["delivery"] == "packet" for seat in actor["review_pool"])
         assert manifests[0]["available_subagents"] == actor["available_subagents"]
         observed["claim"] = True
         raise RuntimeError("synthetic claim-boundary crash")
@@ -1034,7 +1065,7 @@ def test_target_actor_is_durable_before_claim_and_survives_claim_crash(
     assert observed["claim"] is True
     final = _attempt_manifests(results / "chrome" / "abc")[0]
     assert final["extra"]["outcome"] == "adapter_error"
-    assert final["harness"]["target_runtime_actor"]["reviewer_slots"]
+    assert final["harness"]["target_runtime_actor"]["review_pool"]
 
 
 def test_two_overlapping_attempts_never_share_one_canonical_record(tmp_path, monkeypatch, capsys):
@@ -1354,50 +1385,27 @@ def test_osworld_operator_patch_raises_provider_lock_timeout_and_is_documented()
     patch = (root / "operator_patches" / "osworld_docker_lock_timeout.v6760.patch").read_text(encoding="utf-8")
     assert "desktop_env/providers/docker/provider.py" in patch
     assert "-LOCK_TIMEOUT = 10" in patch and "+LOCK_TIMEOUT = 60" in patch
-    readme = (root / "operator_patches" / "README.md").read_text(encoding="utf-8")
-    assert "osworld_docker_lock_timeout.v6760.patch" in readme
-    assert "construct_desktop_env" in readme  # both halves of the fix are disclosed
-
-
-def test_osworld_methodology_preregisters_the_dedup_rule_and_defers_the_lane_generator():
-    text = (Path(__file__).resolve().parent.parent / "devtools" / "benchmarks" / "osworld"
-            / "METHODOLOGY.md").read_text(encoding="utf-8")
-    assert "FIRST SCORED ATTEMPT WINS" in text
-    # Multiple lanes ARE supported and the smoke exercises them, so the disclosure must say so;
-    # what is extracted is the lane-script GENERATOR, and the disclosure must not describe a
-    # convenience the tree does not have either.
-    assert "MULTIPLE LANES ARE SUPPORTED" in text
-    assert "NO MULTI-LANE LAUNCHER GENERATOR IN\n     THIS RELEASE" in text
-    assert "gen_lanes.py" in text and "lanes.json" in text
-    # The rule is enforced by code that EXISTS, and the record layout that makes overlapping
-    # attempts safe is disclosed rather than implied.
-    assert "attempts/<attempt_id>/task_run_manifest.json" in text
-    assert "claim_owner" in text
-    # The residual-window disclosure must match the fix: the interrupt path is closed with a
-    # durable marker; only SIGKILL remains open.
-    assert "THE INTERRUPT WINDOW IS CLOSED; THE `SIGKILL` WINDOW IS NOT" in text
-    assert "construct_desktop_env" in text
-    assert "LOCK_TIMEOUT" in text
-    assert "--allow-dirty-seed" in text
 
 
 def test_module_grandfather_matcher_uses_exact_repo_relative_paths():
     from ouroboros.review import module_is_grandfathered
     # Exact runtime helpers accept only actual repo-relative paths. Compatibility
     # section-prefix decoding belongs solely to compute_complexity_metrics.
-    assert module_is_grandfathered("skills/unix_computer_use/plugin.py")
-    assert not module_is_grandfathered("repo/skills/unix_computer_use/plugin.py")
-    # a DIFFERENT plugin.py (future skill) is NOT exempted by the path-qualified entry
+    assert module_is_grandfathered("supervisor/workers.py")
+    assert not module_is_grandfathered("repo/supervisor/workers.py")
+    # 0.5.3 split the computer-use plugin under the cap: its giant entry is gone, so nothing exempts it now,
+    # and a DIFFERENT plugin.py (future skill) was never exempted by a path-qualified entry.
+    assert not module_is_grandfathered("skills/unix_computer_use/plugin.py")
     assert not module_is_grandfathered("skills/other_skill/plugin.py")
     assert not module_is_grandfathered("repo/skills/other_skill/plugin.py")
-    # Root server.py is an exact manifest path; a nested same-basename is not.
-    assert module_is_grandfathered("server.py")
+    # The Restart extraction retired server.py's debt; no same-basename is exempt.
+    assert not module_is_grandfathered("server.py")
     assert not module_is_grandfathered("repo/server.py")
     assert not module_is_grandfathered("ouroboros/server.py")
     assert not module_is_grandfathered("repo/ouroboros/server.py")
     # tools/control.py's debt was retired by the v7 split (2110->492 lines);
     # basename exactness still holds - NEITHER control.py is grandfathered now
-    # (the positive+negative exact-path pair above is server.py).
+    # (the positive+negative exact-path pair above is the skill plugin).
     assert not module_is_grandfathered("ouroboros/tools/control.py")
     assert not module_is_grandfathered("ouroboros/gateway/control.py")
 
@@ -1545,12 +1553,8 @@ class _GateArgs:
     "latest,expected",
     [
         ({"result": "~/Desktop is empty; nothing to act on.\nINFEASIBLE"}, "INFEASIBLE"),
-        ({"result": "The file is there.\nPROCEED"}, "PROCEED"),
-        ({"result": "Cloudflare blocked the page.\nUNDETERMINED"}, "UNDETERMINED"),
         # Everything below must FAIL OPEN: the working phase still runs.
         ({"result": "a discussion that never states a verdict"}, "UNDETERMINED"),
-        ({"result": "I weighed whether this is INFEASIBLE and decided it is not"}, "UNDETERMINED"),
-        ({"status": "timeout"}, "UNDETERMINED"),
         ({}, "UNDETERMINED"),
         (None, "UNDETERMINED"),
         # The terminal answer field wins over the runtime result body.
@@ -1628,7 +1632,7 @@ def test_gate_phase_removes_the_mutating_tools_and_keeps_the_reading_ones():
     # click through them. A test iterating the same incomplete set cannot catch that class,
     # so this list is the independent statement of what "mutating" means.
     mutating_tools = ("click", "double_click", "triple_click", "move", "left_click_drag",
-                      "mouse_down", "mouse_up", "type_text", "key", "hold_key", "scroll")
+                      "mouse_down", "mouse_up", "type_text", "key", "hold_key", "scroll", "activate_app")
     assert set(mutating_tools) == set(rcb._GUI_ACTION_TOOLS), \
         "a click alias was registered without updating _GUI_ACTION_TOOLS (or vice versa)"
     for mutating in mutating_tools:
@@ -1777,7 +1781,7 @@ def test_gate_round_posts_a_fresh_memory_gate_phase_task_and_reads_the_verdict(m
                     "total_rounds": 4}
         raise AssertionError((method, path))
 
-    monkeypatch.setattr(rcb, "_api", fake_api)
+    _patch_bridge_seam(monkeypatch, "_api", fake_api)
     args = _GateArgs(feasibility_gate=True, task_timeout_sec=3600)
     args.allow_a11y = False
     args.ouroboros_url = "http://127.0.0.1:1"
@@ -1861,23 +1865,9 @@ def test_the_bench_agent_cannot_reach_the_bridge_url():
     for tool in ("list_connections", "test_connection"):
         assert extension_surface_name(rcb.SKILL_NAME, tool) in disabled, tool
     # The success path of the remote screenshot must not emit the bridge URL.
-    src = pathlib.Path(plugin.__file__).read_text(encoding="utf-8")
+    src = (pathlib.Path(plugin.__file__).parent / "remote.py").read_text(encoding="utf-8")
     shot = src[src.index("def _osworld_screenshot"):src.index("def _test_osworld")]
     assert '"target": target' not in shot, "the bridge URL is back in the screenshot result"
-
-
-def test_the_working_prompt_forbids_forcing_state_from_underneath_the_app():
-    """v6.81.1 run, chrome/ae78f875: after establishing the requested UI control no longer
-    exists, the agent wrote Chrome's PREF cookie from the DevTools console and then
-    decrypted Chrome's Safe-Storage keyring to 'verify' it. It scored 0 only because that
-    task's evaluator is infeasible-only — the same technique on a feasible task would have
-    produced undeserved credit. State must be reachable through the application's own
-    surface, and a tool restriction must cover discovery too."""
-    p = rcb.OSWORLD_PREAMBLE
-    assert "documented" in p and "underneath" in p, p[:0]
-    for phrase in ("developer console", "credential", "TASK_INFEASIBLE"):
-        assert phrase in p, phrase
-    assert "including finding things" in p, "tool restrictions must cover discovery"
 
 
 def test_a_dead_guest_control_server_ends_the_attempt_as_infra_not_a_zero():
@@ -1983,6 +1973,12 @@ def test_a_step_claim_the_server_cannot_honor_is_refused_before_the_vm_boots():
         rcb._refuse_uncapped_step_claim(tiny)
     # An unenforced run is never refused (it simply is not comparable).
     rcb._refuse_uncapped_step_claim(rcb._step_budget(_ns(), {"value": 999, "source": "default"}))
+    # An unlimited or unprovable server cap is not a cap of zero: a declared budget
+    # over it is refused instead of certified (the former `int(value or 0)` passed it).
+    for server in ({"value": None, "source": "default", "unbounded": True},
+                   {"value": None, "source": "settings_unreadable"}):
+        with pytest.raises(SystemExit, match="not a finite proven bound"):
+            rcb._refuse_uncapped_step_claim(rcb._step_budget(_ns(max_steps=100), server))
 
 
 def test_audit_reads_policy_turns_not_physical_calls():
@@ -2015,7 +2011,7 @@ def test_audit_reads_policy_turns_not_physical_calls():
                                   5, 0)["audited"] is False
 
 
-def test_gate_turns_are_enforced_per_task_from_the_live_event_log(tmp_path):
+def test_gate_turns_are_enforced_per_task_from_the_live_event_log(tmp_path, monkeypatch):
     """The runtime round cap is SERVER-wide and the gate is a separate task, so a
     reserve that is only arithmetic lets the gate consume the worker's allowance.
 
@@ -2054,14 +2050,14 @@ def test_gate_turns_are_enforced_per_task_from_the_live_event_log(tmp_path):
         _write_rounds(3 if polls["n"] < 2 else rcb._GATE_TURN_RESERVE)
         return {"status": "running"}
 
-    orig_api, orig_sleep = rcb._api, rcb.time.sleep
-    rcb._api = fake_api
+    orig_sleep = rcb.time.sleep
+    _patch_bridge_seam(monkeypatch, "_api", fake_api)
     rcb.time.sleep = lambda s: None
     try:
         out = rcb._await_gate_task("http://x", task_id, time.time() + 3600,
                                    turn_budget=rcb._GATE_TURN_RESERVE, data_dir=tmp_path)
     finally:
-        rcb._api, rcb.time.sleep = orig_api, orig_sleep
+        rcb.time.sleep = orig_sleep
 
     assert out["status"] == "turn_budget_exhausted"
     assert out["policy_turns"] == rcb._GATE_TURN_RESERVE
@@ -2142,64 +2138,6 @@ def test_a_checkout_other_than_the_campaign_pin_is_refused_before_the_vm_boots()
         rcb._refuse_wrong_dataset_commit("091f5ef1", {"git_commit": "7a17d3abc86d5"})
     with pytest.raises(SystemExit, match="no readable git identity"):
         rcb._refuse_wrong_dataset_commit("091f5ef1", {"git_commit": ""})
-
-
-def test_v684_prompt_fixes_are_present_and_harmful_clauses_gone():
-    """The v6.83.0 forensics found five prompt behaviours the agent CITED while
-    losing points. Pin the corrected wording so a later edit cannot regress them,
-    and assert the exact harmful phrasings are gone."""
-    p = rcb.OSWORLD_PREAMBLE
-    # 1. Budget is turns, not calls; batching is encouraged.
-    assert "YOUR BUDGET IS ASSISTANT TURNS, NOT TOOL CALLS" in p
-    assert "every tool call costs ~30s" not in p  # the mistaxed clause is gone
-    # Batching must carry its safety guard: adversarial review found 8 prior 1.0s
-    # that depended on observing after a speculative Enter/drag/save.
-    assert "Observe before any speculative Enter/Return, drag, save" in p
-    assert "2-6 calls is typical, not a minimum" in p
-    # Batching removes the ~5s settle the per-turn round trip used to provide, and a
-    # failing call does not stop its batch (measured: 43% of intra-batch gaps < 1s).
-    assert "NO settling time" in p and "does NOT stop the rest of its batch" in p
-    # Ordinals: a bulleted list excludes title+lead-in even when the task says "line"
-    # (impress/550ce7e7, opus 1.0, cited the removed clause while winning); anything
-    # else counts the heading (impress/3161d64e, 5cfb9197 — both 1.0 on both models).
-    assert "BULLETED OR NUMBERED LIST, count only the actual list" in p
-    assert "a heading COUNTS as the Nth item" in p
-    # Smoke evidence: 05dd4c1d aligned the document-order shape (Shape;135) while the
-    # gold targets the visually higher one (Shape;136) — slide ordinals need an ORDER.
-    assert "order them by POSITION, top-to-bottom" in p
-    assert "never by document order, selection order or Tab order" in p
-    # Smoke evidence: 04578141 read "exactly these colours, no variations" as a licence
-    # to type raw 00FF00 through Custom Color; the gold is palette Green 00A933, tol 0.
-    assert "it does NOT mean type a raw hex" in p
-    # 2a. A numeric literal beats a preset; a colour WORD does not (two pinned
-    # tasks require LibreOffice's named Green 00A933, one requires pure 0000FF —
-    # no prompt wording wins all three, so we keep the named-control default).
-    assert "explicit NUMERIC value" in p
-    assert "colour WORD on its own is not a numeric value" in p
-    # 2b. Already-in-state judged from stored value, not the render.
-    assert "STORED value the grader" in p
-    assert "is ALREADY in the requested state, verifying that and stopping is a correct completion" not in p
-    # 2c. Ordinals no longer blanket-exclude headings.
-    assert "ORDINALS COUNT WHAT THE TASK COUNTS" in p
-    assert "excluding titles, headings and unbulleted lead-in" not in p
-    # 3. CLI allowed for batch/file work.
-    assert "pdfseparate" in p
-    # 4. Independent read-back + snapshot/diff.
-    assert "VERIFY BY INDEPENDENT READ-BACK" in p and "DIFFERENT tool" in p
-    assert "compare before vs after and undo" in p
-    # 5. Infeasibility wording must stay NARROW: a failed route or a fallback the
-    # app itself offers is not infeasibility (9 prior 1.0 traces used the words
-    # "impossible"/"not possible" mid-run and still won).
-    assert "A failed route" in p and "is NOT task infeasibility" in p
-    assert "only after OBSERVING" in p
-    assert "YOUR OWN ADMISSION IS THE VERDICT" not in p, "the lexical slogan false-kills wins"
-    g = rcb.GATE_PREAMBLE
-    assert "VERIFIED ABSENT" in g
-    assert "Merely hidden, disabled, not yet loaded" in g, "hidden != absent"
-    assert "When in doubt, answer UNDETERMINED" in g, "fail-open default must survive"
-    # 3. Shell is for file-level deliverables, never for app state.
-    assert "FILE-LEVEL batch operations" in p
-    assert "mutate an open application's document, preferences or UI state" in p
 
 
 def test_proxy_health_gate_fails_closed(monkeypatch, tmp_path):

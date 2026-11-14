@@ -5,6 +5,9 @@ deep_self_review.py)."""
 
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass
+from typing import Any, Callable, Mapping
 
 from ouroboros.model_slots import ResolvedModelTarget, parse_fallback_chain
 from ouroboros.settings_defaults import OPENROUTER_DEFAULTS, OPENROUTER_REVIEW_DEFAULTS, SETTINGS_DEFAULTS  # noqa: F401
@@ -34,6 +37,24 @@ def resolve_minimax_base_url(region: str = "") -> str:
 # the fingerprint is already unique per provider+model).
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 
+# Z.ai (Zhipu / GLM) serves one OpenAI-compatible API surface on two plans that
+# share the same key: pay-as-you-go and the subscription Coding Plan. The plan
+# selects the endpoint (analogous to MiniMax regions); the PAYG endpoint is the
+# default because the Coding Plan endpoint is officially intended for supported
+# coding tools only.
+ZAI_PLAN_ENDPOINTS: dict[str, str] = {
+    "payg": "https://api.z.ai/api/paas/v4",
+    "coding": "https://api.z.ai/api/coding/paas/v4",
+}
+ZAI_DEFAULT_PLAN = "payg"
+
+
+def resolve_zai_base_url(plan: str = "") -> str:
+    """Return the configured Z.ai OpenAI-compatible endpoint for the plan."""
+    selected = str(plan or "").strip().lower() or ZAI_DEFAULT_PLAN
+    return ZAI_PLAN_ENDPOINTS.get(selected, ZAI_PLAN_ENDPOINTS[ZAI_DEFAULT_PLAN])
+
+
 # DeepSeek's Chat Completions ``reasoning_effort`` enum is low/high/max
 # (medium/xhigh are documented aliases of high) and thinking is switched off by
 # ``thinking.type=disabled``, not by an effort value. This is the wire dialect
@@ -54,70 +75,132 @@ def normalize_deepseek_reasoning_effort(value: str) -> str:
     return DEEPSEEK_REASONING_EFFORT_ALIASES.get(normalized, normalized)
 
 
-# Direct-provider prefix → canonical provider name. Un-prefixed models route
-# through OpenRouter. Order matters only for readability; prefixes are disjoint.
-PROVIDER_PREFIXES: tuple[tuple[str, str], ...] = (
-    ("claudexor::", "claudexor"),
-    ("openai::", "openai"),
-    ("anthropic::", "anthropic"),
-    ("minimax::", "minimax"),
-    ("cloudru::", "cloudru"),
-    ("gigachat::", "gigachat"),
-    ("deepseek::", "deepseek"),
-    ("openai-compatible::", "openai-compatible"),
-    ("openrouter::", "openrouter"),
-)
+# Z.ai (GLM) serves the same Chat Completions ``reasoning_effort`` shape but a
+# DIFFERENT enum mapping than DeepSeek — do not reuse the DeepSeek table. The
+# provider has exactly three tiers (low | high | max); ``medium`` does not
+# exist, thinking cannot be disabled (``thinking={"type":"disabled"}`` answers
+# 400 code 1210 "please use low, high or max" on PAYG), and an ABSENT
+# parameter is served at MAX — so a silently dropped tier means every call
+# runs (and bills) at max. Projection of the canonical scale, measured live
+# 2026-09-21 on the Coding Plan endpoint: none/minimal/low -> low,
+# medium/high -> high, xhigh/ultra -> max.
+ZAI_REASONING_EFFORT_ALIASES = {
+    "none": "low",
+    "minimal": "low",
+    "low": "low",
+    "medium": "high",
+    "high": "high",
+    "xhigh": "max",
+    "max": "max",
+    "ultra": "max",
+}
 
-# Primary credential env var per provider (single-key providers).
+
+def normalize_zai_reasoning_effort(value: str) -> str:
+    """Project one canonical effort tier onto Z.ai's Chat wire enum.
+
+    Every canonical tier maps to a concrete provider tier; unlike DeepSeek
+    there is no "off" arm — GLM reasoning cannot be disabled, so an unmapped
+    value still resolves to a tier rather than being dropped (a dropped tier
+    is served at max).
+    """
+    normalized = str(value or "").strip().lower()
+    return ZAI_REASONING_EFFORT_ALIASES.get(normalized, "low")
+
+
+# MiniMax's global/China OpenAI docs (2026-11-01; no live send) list five tiers
+# for this exact model, default to max and reject none. Other models keep their
+# requested tier. Evidence and re-check policy: DEVELOPMENT "External facts".
+MINIMAX_FLASH_MODEL = "MiniMax-M3.1-Flash"
+MINIMAX_FLASH_EFFORT_ALIASES = {"none": "low", "minimal": "low", "ultra": "max"}
+
+
+def normalize_minimax_reasoning_effort(model: str, value: str) -> str:
+    """Project one canonical tier for one exact direct MiniMax model."""
+    return MINIMAX_FLASH_EFFORT_ALIASES.get(value, value) if model == MINIMAX_FLASH_MODEL else value
+
+
+@dataclass(frozen=True)
+class KindSpec:
+    """One API connection kind: its label, its fields in order as ``(row_field,
+    flat_setting_key, secret)``, and the field groups that make a connection of it
+    usable (any ONE group whose every field is set)."""
+
+    label: str
+    fields: tuple[tuple[str, str, bool], ...]
+    ready: tuple[tuple[str, ...], ...] = (("api_key",),)
+
+    def flat_key(self, row_field: str) -> str:
+        return next((flat for field, flat, _secret in self.fields if field == row_field), "")
+
+
+# The kind table, SSOT for every credential table below. A kind's BUILT-IN connection
+# reads these flat settings; a named connection (``OUROBOROS_CONNECTIONS``,
+# ``provider_connections``) carries the same fields as one row. Order is the
+# owner-facing order (OpenRouter first: an unprefixed model id routes through it).
+PROVIDER_KINDS: dict[str, KindSpec] = {
+    "openrouter": KindSpec("OpenRouter", (("api_key", "OPENROUTER_API_KEY", True),)),
+    "openai": KindSpec("OpenAI", (("api_key", "OPENAI_API_KEY", True),)),
+    "anthropic": KindSpec("Anthropic", (("api_key", "ANTHROPIC_API_KEY", True),)),
+    "deepseek": KindSpec("DeepSeek", (("api_key", "DEEPSEEK_API_KEY", True),)),
+    "zai": KindSpec("Z.ai (GLM)", (("api_key", "ZAI_API_KEY", True), ("plan", "ZAI_PLAN", False))),
+    "minimax": KindSpec("MiniMax", (("api_key", "MINIMAX_API_KEY", True), ("region", "MINIMAX_REGION", False))),
+    "cloudru": KindSpec("Cloud.ru Foundation Models", (
+        ("api_key", "CLOUDRU_FOUNDATION_MODELS_API_KEY", True),
+        ("base_url", "CLOUDRU_FOUNDATION_MODELS_BASE_URL", False))),
+    "gigachat": KindSpec("GigaChat", (
+        ("credentials", "GIGACHAT_CREDENTIALS", True), ("user", "GIGACHAT_USER", False),
+        ("password", "GIGACHAT_PASSWORD", True), ("base_url", "GIGACHAT_BASE_URL", False),
+        ("scope", "GIGACHAT_SCOPE", False), ("verify_ssl_certs", "GIGACHAT_VERIFY_SSL_CERTS", False)),
+        ready=(("credentials",), ("user", "password"))),
+    # An empty key is a keyless endpoint; the endpoint itself is what configures it.
+    "openai-compatible": KindSpec("OpenAI-compatible endpoint", (
+        ("api_key", "OPENAI_COMPATIBLE_API_KEY", True),
+        ("base_url", "OPENAI_COMPATIBLE_BASE_URL", False)), ready=(("base_url",),)),
+}
+# The extra connections, one JSON list (secrets masked by row identity, never exported to env).
+CONNECTIONS_KEY = "OUROBOROS_CONNECTIONS"
+# The built-in OpenAI-compatible connection also honours the legacy pair (``compatible_endpoint``).
+_LEGACY_COMPATIBLE_KEYS = ("OPENAI_API_KEY", "OPENAI_BASE_URL")
+# Every kind a route head may name: the API kinds plus the owned subscription engine.
+ROUTE_KINDS: tuple[str, ...] = ("claudexor", *PROVIDER_KINDS)
+
+# Direct-provider prefix → canonical provider name. Un-prefixed models route
+# through OpenRouter; prefixes are disjoint.
+PROVIDER_PREFIXES: tuple[tuple[str, str], ...] = tuple((f"{kind}::", kind) for kind in ROUTE_KINDS)
+
+# Primary credential setting per provider (single-key providers).
 PROVIDER_ENV_KEYS: dict[str, str] = {
-    "openai": "OPENAI_API_KEY",
-    "anthropic": "ANTHROPIC_API_KEY",
-    "minimax": "MINIMAX_API_KEY",
-    "cloudru": "CLOUDRU_FOUNDATION_MODELS_API_KEY",
-    "deepseek": "DEEPSEEK_API_KEY",
-    "openrouter": "OPENROUTER_API_KEY",
+    kind: spec.fields[0][1] for kind, spec in PROVIDER_KINDS.items() if spec.ready == (("api_key",),)
 }
 
 # Settings whose content-bound grant lets an external skill bypass the core LLM
 # transport and incur model spend.  This belongs with the provider/credential
 # registry, not in the frozen PluginAPI contract.
 MODEL_PROVIDER_CREDENTIAL_KEYS: frozenset[str] = frozenset({
-    *PROVIDER_ENV_KEYS.values(),
-    "OPENAI_COMPATIBLE_API_KEY",
-    "GIGACHAT_CREDENTIALS",
-    "GIGACHAT_PASSWORD",
+    *(flat for spec in PROVIDER_KINDS.values() for _field, flat, secret in spec.fields if secret),
+    CONNECTIONS_KEY,
 })
 
-# EVERY env/settings key ``llm.LLM._resolve_remote_target`` reads for a provider, GROUPED so
-# a credential and the fields it is useless without travel together or not at all (GigaChat
-# needs CREDENTIALS *or* USER+PASSWORD plus its endpoint/scope; Cloud.ru's key is meaningless
-# against the wrong base_url; the openai-compatible lane legitimately falls back to the legacy
-# OPENAI_* pair).  Deriving a per-run credential set from anything but this table is guessing:
-# `anthropic/claude-sonnet-4.6` is an OPENROUTER model id, only `anthropic::…` is direct.
+# EVERY flat settings key the built-in connection of a kind reads, GROUPED so a credential
+# and the fields it is useless without travel together or not at all (GigaChat needs
+# CREDENTIALS *or* USER+PASSWORD plus its endpoint/scope; Cloud.ru's key is meaningless
+# against the wrong base_url; the openai-compatible lane legitimately falls back to the
+# legacy OPENAI_* pair).  Deriving a per-run credential set from anything but this table is
+# guessing: `anthropic/claude-sonnet-4.6` is an OPENROUTER model id, only `anthropic::…` is direct.
 PROVIDER_CREDENTIAL_GROUPS: dict[str, tuple[str, ...]] = {
-    "openrouter": ("OPENROUTER_API_KEY",),
-    "openai": ("OPENAI_API_KEY",),
-    "anthropic": ("ANTHROPIC_API_KEY",),
-    "minimax": ("MINIMAX_API_KEY", "MINIMAX_REGION"),
-    "cloudru": ("CLOUDRU_FOUNDATION_MODELS_API_KEY", "CLOUDRU_FOUNDATION_MODELS_BASE_URL"),
-    "deepseek": ("DEEPSEEK_API_KEY",),
-    "gigachat": (
-        "GIGACHAT_CREDENTIALS", "GIGACHAT_PASSWORD", "GIGACHAT_USER",
-        "GIGACHAT_BASE_URL", "GIGACHAT_SCOPE", "GIGACHAT_VERIFY_SSL_CERTS",
-    ),
-    "openai-compatible": (
-        "OPENAI_COMPATIBLE_API_KEY", "OPENAI_COMPATIBLE_BASE_URL",
-        "OPENAI_API_KEY", "OPENAI_BASE_URL",
-    ),
+    **{kind: tuple(flat for _field, flat, _secret in spec.fields)
+       + (_LEGACY_COMPATIBLE_KEYS if kind == "openai-compatible" else ())
+       for kind, spec in PROVIDER_KINDS.items()},
     "local": (),
     # The owned engine holds credentials; no control token reaches model settings/env.
     "claudexor": (),
 }
 
 # Active settings keys that hold a ROUTED model identity (prefix -> provider via
-# provider_for_model). Heavy is a bounded migration/history input, not a live
-# route selector; keeping the split here prevents new consumers (including
-# Provider Test) from accidentally resurrecting it.
+# provider_for_model). Heavy and the retired review scalars are migration/history
+# inputs, not live route selectors; the active set keeps consumers (including
+# Provider Test) from accidentally resurrecting them.
 # Superset of the live slots; a key absent from settings still declares whatever
 # ``config.SETTINGS_DEFAULTS`` will hand the runtime, which is why declared_model_settings()
 # fills the defaults in rather than treating "unset" as "unused".
@@ -125,9 +208,7 @@ ACTIVE_MODEL_SETTING_KEYS: tuple[str, ...] = (
     "OUROBOROS_MODEL", "OUROBOROS_MODEL_LIGHT",
     "OUROBOROS_MODEL_VISION", "OUROBOROS_MODEL_CONSCIOUSNESS",
     "OUROBOROS_MODEL_FALLBACKS", "OUROBOROS_MODEL_FALLBACK",
-    "OUROBOROS_MODEL_DEEP_SELF_REVIEW", "OUROBOROS_WEBSEARCH_MODEL",
-    "OUROBOROS_REVIEW_MODELS", "OUROBOROS_SCOPE_REVIEW_MODELS",
-    "OUROBOROS_SCOPE_REVIEW_MODEL",
+    "OUROBOROS_WEBSEARCH_MODEL", "OUROBOROS_MODEL_SAFETY",
 )
 LEGACY_MODEL_SETTING_KEYS: tuple[str, ...] = ("OUROBOROS_MODEL_HEAVY",)
 # Compatibility import name. Its meaning is now explicitly the active set.
@@ -136,19 +217,68 @@ MODEL_SETTING_KEYS = ACTIVE_MODEL_SETTING_KEYS
 # Settings keys whose value is a Claude Agent SDK / Claude Code model NAME (``opus[1m]``),
 # NOT a routed model identity: they carry no provider prefix, so provider_for_model would
 # mis-route them to OpenRouter.  Their transport is the Anthropic SDK subprocess, which
-# authenticates with ANTHROPIC_API_KEY (the Claude runtime gateways:
-# tools/claude_advisory_review.py), so a non-empty value DECLARES the anthropic provider.
+# authenticates with ANTHROPIC_API_KEY, so a non-empty value DECLARES the anthropic provider.
+
+
+_CONNECTION_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
+# Reserved for a kind's built-in connection: ``K@default::m`` is ``K::m``.
+BUILTIN_CONNECTION = "default"
+
+
+@dataclass(frozen=True)
+class RouteParts:
+    """One model route string read by the route grammar (``parse_model_route``)."""
+
+    kind: str
+    connection: str
+    model: str
+    local: bool = False
+    valid: bool = True
+
+
+def parse_model_route(value: Any) -> RouteParts:
+    """The ONE route grammar; pure, it reads no settings.
+
+    A bare id is OpenRouter's, ``kind::model`` a kind's built-in connection,
+    ``kind@name::model`` a named API connection (``@default`` is the built-in one),
+    ``claudexor::source=model`` the subscription engine, a trailing `` (local)`` the
+    local lane. A ``claudexor@`` head (Claudexor keeps its own account axis) or a
+    malformed name is ``valid=False``; an unknown head stays an opaque OpenRouter id.
+    The model part is returned as written."""
+    text = str(value or "").strip()
+    if text.endswith(" (local)"):
+        return RouteParts("local", "", text[:-len(" (local)")], local=True)
+    head, separator, model = text.partition("::")
+    kind, at, name = head.partition("@")
+    if not separator or kind not in ROUTE_KINDS:
+        return RouteParts("openrouter", "", text)
+    if not at:
+        return RouteParts(kind, "", model)
+    if kind not in PROVIDER_KINDS or not _CONNECTION_NAME.fullmatch(name):
+        return RouteParts(kind, name, model, valid=False)
+    return RouteParts(kind, "" if name == BUILTIN_CONNECTION else name, model)
+
+
+def connection_id(kind: str, name: str = "") -> str:
+    """The picker source id of a connection: ``kind`` for the built-in, ``kind@name`` otherwise."""
+    return f"{kind}@{name}" if name else kind
 
 
 def provider_for_model(model: str) -> str:
     """Return the execution provider for a model id (``local`` for local lanes)."""
-    name = str(model or "").strip()
-    if name.endswith(" (local)"):
-        return "local"
-    for prefix, provider in PROVIDER_PREFIXES:
-        if name.startswith(prefix):
-            return provider
-    return "openrouter"
+    return parse_model_route(model).kind
+
+
+# Physical per-request ceilings on tool schemas, by execution provider; a provider
+# absent here has no known ceiling. OpenAI's own API refuses a longer `tools` array
+# (400 array_above_max_length); the same models through OpenRouter accepted 129
+# (provider canary, CI run 37204372307, 2026-10-04).
+PROVIDER_TOOL_SCHEMA_LIMITS: dict[str, int] = {"openai": 128}
+
+
+def tool_schema_limit(model: str, *, use_local: bool = False) -> int | None:
+    """The route's ceiling on tool schemas in one request, or None when none is known."""
+    return None if use_local else PROVIDER_TOOL_SCHEMA_LIMITS.get(provider_for_model(model))
 
 
 def parse_claudexor_model(model: str) -> tuple[str, str]:
@@ -186,11 +316,13 @@ def resolve_model_target(
     )
 
 
-def fallback_candidate_targets(active_model: str = "") -> tuple[ResolvedModelTarget, ...]:
+def fallback_candidate_targets(active_model: str = "", *, preserve_slots: bool = False) -> tuple[ResolvedModelTarget, ...]:
     """The cross-model fallback candidate ladder as typed targets (ABI-4).
 
     Same membership and order as ``model_slots.get_fallback_models`` — a typed
-    view over the ONE chain SSOT, not a second resolver. Effort stays the ""
+    view over the ONE chain SSOT, not a second resolver. ``preserve_slots`` keeps
+    repeated model ids so callers can compare their distinct configured account bindings.
+    Effort stays the ""
     sentinel: the ladder resolves destinations, the dispatching round owns the
     active effort. ``provider_route`` stays the ``""`` sentinel DELIBERATELY:
     the chain's local-vs-remote dispatch lane is the loop's single global
@@ -198,65 +330,74 @@ def fallback_candidate_targets(active_model: str = "") -> tuple[ResolvedModelTar
     through the ABI-4 sweep), so a per-candidate route here would be a
     fabricated fact no dispatcher consumes.
     """
-    from ouroboros.model_slots import get_fallback_models
+    from ouroboros.model_slots import get_fallback_models, parse_fallback_chain
 
     return tuple(
         ResolvedModelTarget(model_id=model, provider_route="")
-        for model in get_fallback_models(active_model)
+        for model in (parse_fallback_chain() if preserve_slots else get_fallback_models(active_model))
     )
 
 
+# The dedicated compatible pair and the legacy pair the built-in connection falls back to.
+COMPATIBLE_LEGACY_PAIR = {"OPENAI_COMPATIBLE_API_KEY": "OPENAI_API_KEY", "OPENAI_COMPATIBLE_BASE_URL": "OPENAI_BASE_URL"}
+
+
+def compatible_endpoint(value: Callable[[str], str]) -> tuple[str, str]:
+    """``(api_key, base_url)`` of the OpenAI-compatible lane, one pair on every path.
+
+    A dedicated ``OPENAI_COMPATIBLE_BASE_URL`` travels only with its own key (blank = an
+    endpoint without auth); without it the legacy ``OPENAI_BASE_URL`` travels only with
+    ``OPENAI_API_KEY``. Neither pair borrows the other's key. ``value`` reads one stripped setting."""
+    if base := value("OPENAI_COMPATIBLE_BASE_URL"):
+        return value("OPENAI_COMPATIBLE_API_KEY"), base
+    return value("OPENAI_API_KEY"), value("OPENAI_BASE_URL")
+
+
+def compatible_endpoint_configured(value: Callable[[str], str]) -> bool:
+    """Readiness of that pair: the dedicated endpoint (its key optional), or the legacy endpoint
+    with its key. A dedicated key without its endpoint configures nothing."""
+    key, base = compatible_endpoint(value)
+    return bool(base and (key or value("OPENAI_COMPATIBLE_BASE_URL")))
+
+
+def _route_has_credentials(route: RouteParts, settings: Mapping[str, Any] | None) -> bool:
+    """Whether ``route``'s connection can serve: enabled, with its credential/endpoint."""
+    if route.kind == "claudexor":
+        return route.valid  # A selected engine route needs no API key in Ouroboros.
+    if route.kind == "local":
+        return settings is None or bool(str(settings.get("LOCAL_MODEL_SOURCE") or "").strip())
+    from ouroboros.provider_connections import connection_configured, settings_view
+
+    return connection_configured(route, *settings_view(settings))
+
+
 def provider_has_credentials(provider: str) -> bool:
-    """Whether a route is configured; a managed engine's live readiness is separate."""
-    if provider == "claudexor":
-        return True  # A selected engine route needs no API key in Ouroboros.
-    if provider == "local":
-        return True
-    if provider == "openai-compatible":
-        compat = str(runtime_setting("OPENAI_COMPATIBLE_API_KEY", "") or "").strip()
-        legacy_key = str(runtime_setting("OPENAI_API_KEY", "") or "").strip()
-        legacy_base = str(runtime_setting("OPENAI_BASE_URL", "") or "").strip()
-        return bool(compat or (legacy_key and legacy_base))
-    if provider == "gigachat":
-        creds = str(runtime_setting("GIGACHAT_CREDENTIALS", "") or "").strip()
-        user = str(runtime_setting("GIGACHAT_USER", "") or "").strip()
-        password = str(runtime_setting("GIGACHAT_PASSWORD", "") or "").strip()
-        return bool(creds or (user and password))
-    env_key = PROVIDER_ENV_KEYS.get(provider, "OPENROUTER_API_KEY")
-    return bool(str(runtime_setting(env_key, "") or "").strip())
+    """Whether a kind's built-in connection is configured (unknown kinds read OpenRouter's);
+    a managed engine's live readiness is separate."""
+    kind = provider if provider in ROUTE_KINDS or provider == "local" else "openrouter"
+    return _route_has_credentials(RouteParts(kind, "", ""), None)
 
 
 def provider_has_credentials_in_settings(provider: str, settings: dict) -> bool:
     """Mapping-based twin used by pure config/default compilers (no ambient env)."""
-    def get(key: str) -> str:
-        return str((settings or {}).get(key, "") or "").strip()
-
-    if provider == "claudexor":
-        return True  # Selection declares the route; never persist a synthetic healthy bit.
-
-    if provider == "local":
-        return bool(get("LOCAL_MODEL_SOURCE"))
-    if provider == "openai-compatible":
-        return bool(
-            get("OPENAI_COMPATIBLE_BASE_URL")
-            or (get("OPENAI_API_KEY") and get("OPENAI_BASE_URL"))
-        )
-    if provider == "gigachat":
-        return bool(
-            get("GIGACHAT_CREDENTIALS")
-            or (get("GIGACHAT_USER") and get("GIGACHAT_PASSWORD"))
-        )
-    env_key = PROVIDER_ENV_KEYS.get(provider, "OPENROUTER_API_KEY")
-    return bool(get(env_key))
+    kind = provider if provider in ROUTE_KINDS or provider == "local" else "openrouter"
+    return _route_has_credentials(RouteParts(kind, "", ""), settings or {})
 
 
 def model_has_credentials_in_settings(model: str, settings: dict) -> bool:
-    return provider_has_credentials_in_settings(provider_for_model(model), settings)
+    return _route_has_credentials(parse_model_route(model), settings or {})
 
 
 def model_has_credentials(model: str) -> bool:
-    """Return True when the model's provider has usable credentials configured."""
-    return provider_has_credentials(provider_for_model(model))
+    """Return True when the connection the model names has usable credentials configured."""
+    return _route_has_credentials(parse_model_route(model), None)
+
+
+def any_api_connection_configured(settings: Mapping[str, Any] | None = None) -> bool:
+    """Whether any API connection, built-in or named, is enabled with its credential/endpoint."""
+    from ouroboros.provider_connections import configured_connections
+
+    return bool(configured_connections(settings))
 
 
 def local_only_review_route_env() -> bool:
@@ -264,13 +405,7 @@ def local_only_review_route_env() -> bool:
     local_main = str(runtime_setting("USE_LOCAL_MAIN", "") or "").strip().lower()
     if local_main not in {"1", "true", "yes", "on"}:
         return False
-    return not any(
-        provider_has_credentials(provider)
-        for provider in (
-            "openrouter", "openai", "anthropic", "minimax", "cloudru", "gigachat",
-            "deepseek", "openai-compatible",
-        )
-    )
+    return not any_api_connection_configured()
 
 
 def review_model_uses_local(model: str) -> bool:
@@ -286,7 +421,7 @@ def resolve_credentialed_model(default_model: str) -> str:
     if model_has_credentials(default_model):
         return default_model
     # LIGHT/MAIN are single-model slots; FALLBACKS is a comma chain expanded via the
-    # shared SSOT parser (which also honors the legacy singular OUROBOROS_MODEL_FALLBACK)
+    # shared SSOT parser (the live Fallbacks slot, route_choice)
     # instead of testing the whole comma-string as one broken model id. Empty Light
     # (default -> Main) simply contributes nothing here.
     candidates: list[str] = []
@@ -361,6 +496,25 @@ def credential_keys_for_providers(providers) -> tuple[str, ...]:
 ALL_PROVIDER_CREDENTIAL_KEYS: frozenset[str] = frozenset(
     key for group in PROVIDER_CREDENTIAL_GROUPS.values() for key in group
 )
+# Every setting a route's credential or endpoint is read from: the flat keys of the
+# built-in connections (legacy compatible pair included) and the named connections.
+ROUTE_CREDENTIAL_SETTING_KEYS: frozenset[str] = ALL_PROVIDER_CREDENTIAL_KEYS | {CONNECTIONS_KEY}
+
+
+def _search_route_models(settings: dict) -> list[str]:
+    """Routed spellings, in route order, of the legs the configured built-in search of ``settings``
+    sends its choice on, whatever their local readiness: every leg of the saved model (its named
+    connection kept); where the Source's recommendations are the choice instead (blank or unapplied
+    Model, or a saved one no transport serves, which a call naming its own model meets), every
+    recommended leg. Auto's other-model fallback behind a saved model is no part of that choice."""
+    from ouroboros.search_routes import resolve_web_search_route
+
+    route = resolve_web_search_route(settings=settings)
+    if route.get("error"):
+        route = resolve_web_search_route(settings=settings, model="")
+    legs = [leg for leg in route["legs"] + route["unavailable"] if leg["source"] != "ddgs"]
+    chosen = [leg for leg in legs if leg["model_source"] == "selection"] or legs
+    return [f"{connection_id(leg['source'], leg.get('connection', ''))}::{leg['model']}" for leg in chosen]
 
 
 def provider_credential_plan(
@@ -375,10 +529,18 @@ def provider_credential_plan(
     at all) the plan is the FULL credential universe, because a benchmark that dies on a
     missing key at hour six is worse than one that carries a spare.  The optional
     ``include_claude_sdk_defaults`` switch is RETIRED (no-op): the Claude-SDK transport and
-    its dedicated model slots are gone, so both values produce the same plan."""
+    its dedicated model slots are gone, so both values produce the same plan. The web search
+    Model is planned as the routes its configured search sends (``_search_route_models``),
+    never by reading its value as a chat route."""
+    from ouroboros.model_slots import MODEL_ROLE_SETTINGS
+
     declared = declared_model_settings(settings)
-    providers = providers_for_declared_models(declared)
+    search_key = MODEL_ROLE_SETTINGS["websearch"]
+    chat = {key: value for key, value in declared.items() if key != search_key}
+    providers = providers_for_declared_models({**chat, search_key: ",".join(_search_route_models(settings or {}))})
     planned = credential_keys_for_providers(providers)
+    if any(parse_model_route(model).connection for models in providers.values() for model in models):
+        planned += (CONNECTIONS_KEY,)  # a named connection travels as its row, not as flat keys
     fail_open = not planned
     if fail_open:
         planned = tuple(sorted(ALL_PROVIDER_CREDENTIAL_KEYS))
@@ -432,12 +594,26 @@ GIGACHAT_DIRECT_DEFAULTS = {
 MINIMAX_DIRECT_DEFAULTS = {
     "main": "minimax::MiniMax-M3",
     "heavy": "minimax::MiniMax-M3",
-    "light": "minimax::MiniMax-M2.7",
-    "fallback": "minimax::MiniMax-M2.7",
+    "light": "minimax::MiniMax-M3.1-Flash",
+    "fallback": "minimax::MiniMax-M3.1-Flash",
     # NO deep_self_review default: MiniMax documents M3 as "up to 1M tokens" with a
     # GUARANTEED minimum of 512K (platform.minimax.io, 2026-08). Deep review sizes
     # against a firm 1M window, so the guaranteed floor decides — the slot follows
     # the Cloud.ru/GigaChat clear-instead-of-fill path; owners can opt in manually.
+}
+
+ZAI_DIRECT_DEFAULTS = {
+    "main": "zai::glm-5.3",
+    "heavy": "",
+    "light": "zai::glm-5.3-flash",
+    # Image input per docs.z.ai/guides/vlm/glm-5.3-flash.md (read 2026-10-08; glm-5.3
+    # is text-only). A contributor probe (2026-10-06) covered the Coding Plan endpoint
+    # only; pay-as-you-go rests on the docs. A new install's wizard proposes it; a
+    # saved Vision choice, empty included, stays as saved.
+    "vision": "zai::glm-5.3-flash",
+    "fallback": "zai::glm-5.3-flash",
+    # No deep_review default: the route publishes no window metadata and no live
+    # measurement exists, so the slot follows the MiniMax clear-instead-of-fill path.
 }
 
 DEEPSEEK_DIRECT_DEFAULTS = {
@@ -453,19 +629,19 @@ DEEPSEEK_DIRECT_DEFAULTS = {
     # sizing remains evidence-driven; a missing window measurement does not
     # remove review authority (see ARCHITECTURE §7).
     "deep_self_review": "deepseek::deepseek-v4-pro",
-    # No vision default: deepseek-v4-flash-vision-exp is experimental; it is
-    # recognized by supports_vision() for explicit owner selection only.
+    # No vision default: deepseek-v4-flash-vision-exp is experimental and is
+    # for explicit owner selection only.
 }
 
 ANTHROPIC_DIRECT_DEFAULTS = {
-    "main": "anthropic::claude-opus-5",
+    "main": "anthropic::claude-opus-5-5",
     "heavy": "",
     "light": "anthropic::claude-sonnet-5",
     "fallback": "anthropic::claude-sonnet-5",
     # Deep self-review is a real slot with a SHIPPED default; without a
     # per-provider value a direct-only install keeps an unreachable
     # OpenRouter-form id it has no credential for (v6.82.0).
-    "deep_self_review": "anthropic::claude-opus-5",
+    "deep_self_review": "anthropic::claude-opus-5-5",
 }
 
 DIRECT_PROVIDER_DEFAULTS = {
@@ -475,28 +651,23 @@ DIRECT_PROVIDER_DEFAULTS = {
     "gigachat": GIGACHAT_DIRECT_DEFAULTS,
     "minimax": MINIMAX_DIRECT_DEFAULTS,
     "deepseek": DEEPSEEK_DIRECT_DEFAULTS,
+    "zai": ZAI_DIRECT_DEFAULTS,
 }
 
-# Review panels are declared as provider ROLE sequences, then compiled against
-# the owner's current provider-prefixed Main/Light values. This keeps explicit
-# custom models useful while making the shipped single-provider policy obvious:
-# OpenAI and Anthropic run their strongest Main model three independent times.
-# The older MiniMax mixed panel is preserved because that profile was not part of
-# this policy change.
+# Review panels are declared as provider ROLE sequences, one seat per role, then
+# compiled against the owner's current provider-prefixed Main/Light values. This
+# keeps explicit custom models useful while making the shipped single-provider
+# policy obvious: a provider reviews on its strongest Main ONCE (owner Q5=A —
+# copies of one model would each pay a run and add no second opinion), and
+# MiniMax keeps its mixed panel of two models.
 DIRECT_PROVIDER_REVIEW_ROLES = {
-    "openai": ("main", "main", "main"),
-    "anthropic": ("main", "main", "main"),
-    "cloudru": ("main", "main", "main"),
-    "gigachat": ("main", "main", "main"),
+    "openai": ("main",),
+    "anthropic": ("main",),
+    "cloudru": ("main",),
+    "gigachat": ("main",),
     "minimax": ("main", "light", "light"),
-    # Strongest-main ×3 policy (same as OpenAI/Anthropic): an exclusive
-    # DeepSeek install reviews with three independent thinking v4-pro calls.
-    "deepseek": ("main", "main", "main"),
-}
-
-DIRECT_PROVIDER_SCOPE_DEFAULTS = {
-    provider: defaults["main"]
-    for provider, defaults in DIRECT_PROVIDER_DEFAULTS.items()
+    "deepseek": ("main",),
+    "zai": ("main",),
 }
 
 _ANTHROPIC_MODEL_ALIASES = {
@@ -504,6 +675,7 @@ _ANTHROPIC_MODEL_ALIASES = {
     "claude-opus-4.7": "claude-opus-4-7",
     "claude-opus-4.8": "claude-opus-4-8",
     "claude-sonnet-4.6": "claude-sonnet-4-6",
+    "claude-opus-5.5": "claude-opus-5-5",
 }
 
 
@@ -542,75 +714,199 @@ def migrate_model_value(provider: str, value: str) -> str:
         if text.startswith("deepseek/"):
             return f"deepseek::{text[len('deepseek/'):]}"
         return text
+    if provider == "zai":
+        if text.startswith("zai/"):
+            return f"zai::{text[len('zai/'):]}"
+        return text
     return text
+
+
+def legacy_openai_base(settings: Mapping[str, Any] | None = None) -> bool:
+    """Whether the legacy compatible base URL is set: the built-in OpenAI key then belongs
+    to that endpoint (``compatible_endpoint``), so it is not official OpenAI access."""
+    read = runtime_setting if settings is None else settings.get
+    return bool(str(read("OPENAI_BASE_URL", "") or "").strip())
+
+
+def configured_kinds(settings: Mapping[str, Any] | None = None) -> set[str]:
+    """API kinds with at least one enabled connection, built-in or named, that can serve."""
+    from ouroboros.provider_connections import configured_connections
+
+    return {kind for kind, _name in configured_connections(settings)}
+
+
+def exclusive_direct_kind(settings: Mapping[str, Any] | None = None) -> str:
+    """The one direct provider an install reaches, else '' (``settings`` None = this process's view).
+
+    OpenRouter, an OpenAI-compatible endpoint or the legacy base URL each mean the
+    router-style defaults stay; among the direct providers one is returned only when
+    exactly one is configured."""
+    kinds = configured_kinds(settings)
+    if {"openrouter", "openai-compatible"} & kinds or legacy_openai_base(settings):
+        return ""
+    direct = [kind for kind in PROVIDER_KINDS if kind in kinds and kind in DIRECT_PROVIDER_DEFAULTS]
+    return direct[0] if len(direct) == 1 else ""
+
+
+def proposal_connection(kind: str, settings: Mapping[str, Any] | None = None) -> str | None:
+    """The connection of ``kind`` an automatic proposal names (#2969): '' — the built-in one —
+    when it serves or none of the kind does, else the only named one that serves; None when
+    several named ones serve and the built-in does not: the owner chooses, nothing is guessed."""
+    from ouroboros.provider_connections import configured_connections
+
+    names = [name for served, name in configured_connections(settings) if served == kind]
+    if not names or "" in names:
+        return ""
+    return names[0] if len(names) == 1 else None
+
+
+def route_on_connection(model: str, kind: str, name: str) -> str:
+    """A route of ``kind``'s built-in connection (``openai::m``, a bare OpenRouter id) spelled on
+    its named connection ``name`` (``openai@name::m``); any other route, or ``name`` '', as written."""
+    route = parse_model_route(model)
+    if not name or route.kind != kind or route.connection or not route.valid:
+        return model
+    return f"{connection_id(kind, name)}::{route.model}"
+
+
+# The settings whose presence decides whether a built-in connection is configured (and
+# the named connections): credentials by presence only, never their values.
+READINESS_SETTING_KEYS: frozenset[str] = frozenset({
+    *(spec.flat_key(field) for spec in PROVIDER_KINDS.values() for group in spec.ready for field in group),
+    *_LEGACY_COMPATIBLE_KEYS,
+})
+
+
+def compatible_only_main_model(settings: Mapping[str, Any]) -> str:
+    """Main's exact OpenAI-compatible route when such endpoints are the install's ONLY
+    remote access, else ''.
+
+    #1116: the shipped reviewer defaults are OpenRouter ids such an install cannot
+    reach, and the direct-provider remap deliberately excludes the compatible
+    endpoint. Review defaults then use the one model this install demonstrably
+    pays for — never a guessed id from another provider (less diversity, disclosed).
+    """
+    if configured_kinds(settings) != {"openai-compatible"} or legacy_openai_base(settings):
+        return ""
+    main = str(settings.get("OUROBOROS_MODEL") or "").strip()
+    return main if parse_model_route(main).kind == "openai-compatible" else ""
+
+
+# A built-in connection's endpoint as Capability Evidence fingerprints it, byte for byte
+# what stored window evidence and owner acknowledgements were filed under: none for the
+# fixed-endpoint kinds, the saved endpoint for these, the region/plan endpoint for MiniMax/Z.ai.
+_FINGERPRINT_ENDPOINT_FIELD = {"openai-compatible": "base_url", "cloudru": "base_url", "gigachat": "base_url"}
+
+
+def capability_base_url(model: str, settings: Mapping[str, Any] | None = None) -> str:
+    """The base URL Capability Evidence fingerprints ``model``'s route by — not always
+    the dispatch URL. Built-in OpenAI keeps the legacy base URL it always used; a named
+    connection reads the same field from its row; one that cannot serve has none."""
+    from ouroboros.llm_attempt import ConnectionUnavailable
+    from ouroboros.provider_connections import connection_values, settings_view
+
+    route = parse_model_route(model)
+    if route.kind not in PROVIDER_KINDS:
+        return ""
+    read, rows = settings_view(settings)
+    try:
+        get = connection_values(route, read, rows)
+    except ConnectionUnavailable:
+        return ""
+    if route.kind == "minimax":
+        return resolve_minimax_base_url(get("region") or "")
+    if route.kind == "zai":
+        return resolve_zai_base_url(get("plan") or "")
+    if route.kind == "openai":
+        return "" if route.connection else str(read("OPENAI_BASE_URL", "") or "")
+    field = _FINGERPRINT_ENDPOINT_FIELD.get(route.kind)
+    return str(get(field) or "") if field else ""
+
+
+_KIND_CHOICES = {("minimax", "region"): (MINIMAX_REGION_ENDPOINTS, "global_en or cn_zh"),
+                 ("zai", "plan"): (ZAI_PLAN_ENDPOINTS, "payg or coding")}
+
+
+def choice_error(kind: str, field: str, value: Any) -> str:
+    """Why ``value`` is not one of a kind field's closed choices (MiniMax region, Z.ai plan), or ''."""
+    choices = _KIND_CHOICES.get((kind, field))
+    text = str(value or "").strip().lower()
+    return f"must be {choices[1]}" if choices and text and text not in choices[0] else ""
+
+
+def normalize_builtin_choices(settings: dict) -> str:
+    """Lower-case the built-in connections' closed choices in place; the first invalid one's message, else ''."""
+    for kind, field in _KIND_CHOICES:
+        key = PROVIDER_KINDS[kind].flat_key(field)
+        if error := choice_error(kind, field, settings.get(key)):
+            return f"{key} {error}."
+        settings[key] = str(settings.get(key) or "").strip().lower()
+    return ""
 
 
 def compute_direct_review_models_fallback(
     provider: str,
     main_model: str,
     light_model: str = "",
-    *,
-    review_runs: int = 3,
 ) -> list[str]:
     """Compile a direct-provider review panel from declarative role names."""
+    return [model for _role, model in compute_direct_review_seats(provider, main_model, light_model)]
+
+
+def compute_direct_review_seats(
+    provider: str,
+    main_model: str,
+    light_model: str = "",
+) -> list[tuple[str, str]]:
+    """The same panel as ``(role, model)`` seats, one per declared role: ``role`` is the owner slot a
+    seat runs (``main``, or ``light`` for a Light of this provider), '' where the provider's shipped
+    Light stands in, on Main's connection (a named Main's key pays for its whole panel)."""
     if provider not in DIRECT_PROVIDER_DEFAULTS:
         return []
-    provider_prefix = f"{provider}::"
+
+    def of_provider(model: str) -> bool:
+        route = parse_model_route(model)
+        return route.valid and route.kind == provider
+
     main = migrate_model_value(provider, main_model)
-    if not main.startswith(provider_prefix):
+    if not of_provider(main):
         return []
     light = migrate_model_value(provider, light_model) if light_model else ""
-    default_light = migrate_model_value(provider, DIRECT_PROVIDER_DEFAULTS[provider].get("light", ""))
-    light_slot = light if light.startswith(provider_prefix) else default_light
-    role_models = {"main": main, "light": light_slot or main}
+    default_light = route_on_connection(migrate_model_value(provider, DIRECT_PROVIDER_DEFAULTS[provider].get(
+        "light", "")), provider, parse_model_route(main).connection)
+    seats = {"main": ("main", main), "light": ("light", light) if of_provider(light)
+             else ("", default_light) if default_light else ("main", main)}
     roles = DIRECT_PROVIDER_REVIEW_ROLES.get(provider, ("main", "light", "light"))
-    compiled = [role_models.get(role, main) for role in roles]
-    count = max(1, int(review_runs or 3))
-    return [compiled[index % len(compiled)] for index in range(count)]
+    return [seats.get(role, seats["main"]) for role in roles]
 
 
-# Conservative static vision map by normalized id/prefix. The OpenRouter
-# /models overlay (llm.py) refines this at runtime; static knowledge only
-# covers families whose vision support is long-established.
-_VISION_MODEL_PREFIXES: tuple[str, ...] = (
-    "openai/gpt-5", "openai/gpt-4o", "openai/gpt-4.1", "openai/o3", "openai/o4",
-    "google/gemini-", "anthropic/claude-",
-    "x-ai/grok-4", "x-ai/grok-3",
-    "qwen/qwen-vl", "qwen/qwen2.5-vl", "qwen/qwen3-vl",
-    "mistralai/pixtral", "meta-llama/llama-4", "meta-llama/llama-3.2-90b-vision",
-    "openai/gpt-5.5",
-    # Narrow on purpose: only the dedicated vision variant. Plain deepseek
-    # chat/v4 ids stay non-vision (pinned by tests), and this slash-form
-    # normalized id also names a real OpenRouter vendor namespace — the
-    # OpenRouter /models overlay may refine exact ids either way.
-    "deepseek/deepseek-v4-flash-vision",
-)
+def image_input_from_modalities(value: Any) -> bool | None:
+    """Image input stated by one input-modality list: True/False, or None when it says nothing.
 
-# Runtime overlay: model_id → bool, fed from OpenRouter /models
-# architecture.input_modalities by llm.py (same lifecycle as its
-# supported-parameters cache).
-_VISION_OVERLAY: dict = {}
-
-
-def update_vision_overlay(model_id: str, supports: bool) -> None:
-    normalized = normalize_model_identity(model_id)
-    if normalized:
-        _VISION_OVERLAY[normalized] = bool(supports)
+    Only a non-empty list of non-blank strings is a statement. A missing, null or empty
+    list, another shape, or one item that is not a non-blank string leaves it unknown:
+    the valid remainder of ``["text", 42]`` or ``["text", ""]`` is not a complete list
+    that omits images.
+    """
+    if isinstance(value, list) and value and all(isinstance(item, str) and item.strip() for item in value):
+        return "image" in {item.strip().lower() for item in value}
+    return None
 
 
 def supports_vision(model_id: str, *, model_role: str = "",
                     model_account_override: str | None = None) -> bool | None:
-    """Image capability; None means unavailable subscription metadata, not blindness.
+    """Image input of the exact route: True, False, or None when nothing sourced says.
 
-    Subscription metadata belongs to this call's role/account, never the global
-    model-id overlay. Image senders preserve input when that fact is unknown;
-    the actual call can start the engine and return its normal typed refusal.
-    Metadata discovery itself must not start it or buy a model generation.
+    A Claudexor route answers from the input modalities in the catalog of this
+    call's role/account (``image_input_from_modalities``), never
+    a global overlay; an API route answers from the fresh route-scoped catalog
+    record (``vision_routing.route_image_input``). A model's name is not
+    evidence, so every other case is None: image senders preserve input when the
+    fact is unknown and the actual call returns the route's own answer. Our own
+    lanes that cannot carry bytes (local, GigaChat) are the send policy's
+    transport fact, decided by lane, not a model fact. Metadata discovery never
+    starts an engine or buys a model generation.
     """
-    # Local lanes have no vision regardless of family name; check the RAW id —
-    # normalize_model_identity strips the " (local)" suffix.
-    if str(model_id or "").strip().endswith(" (local)"):
-        return False
     if provider_for_model(model_id) == "claudexor":
         from ouroboros.gateways.claudexor import ClaudexorUnavailable
         from ouroboros.llm import LLMClient
@@ -631,14 +927,10 @@ def supports_vision(model_id: str, *, model_role: str = "",
         if catalog.get("source") != source or (account and catalog.get("credentialProfileId") != account):
             return None
         item = next((row for row in catalog.get("models", []) if row.get("id") == native_model), {})
-        modalities = item.get("inputModalities")
-        return "image" in modalities if isinstance(modalities, list) and modalities else None
-    normalized = normalize_model_identity(model_id)
-    if not normalized:
-        return False
-    if normalized in _VISION_OVERLAY:
-        return _VISION_OVERLAY[normalized]
-    return normalized.startswith(_VISION_MODEL_PREFIXES)
+        return image_input_from_modalities(item.get("inputModalities"))
+    from ouroboros.vision_routing import route_image_input
+
+    return route_image_input(model_id).verdict
 
 
 # NOTE (v6.33.0): the static per-model context-window table was REMOVED. It
@@ -650,23 +942,22 @@ def supports_vision(model_id: str, *, model_role: str = "",
 
 
 def normalize_model_identity(model: str) -> str:
+    """One model identity across route spellings: ``kind[@name]::m`` -> ``kind/m``, an
+    OpenRouter id as itself (``openrouter::`` folded). A connection name says which key
+    pays, not which model answers, so it is dropped — except for OpenAI-compatible
+    connections, which are different servers that must never share learned facts."""
     text = str(model or "").strip()
     if text.endswith(" (local)"):
         text = text[:-8]
-    if text.startswith("openai::"):
-        return f"openai/{text[len('openai::'):]}"
-    if text.startswith("openai-compatible::"):
-        return f"openai-compatible/{text[len('openai-compatible::'):]}"
-    if text.startswith("cloudru::"):
-        return f"cloudru/{text[len('cloudru::'):]}"
-    if text.startswith("gigachat::"):
-        return f"gigachat/{text[len('gigachat::'):]}"
-    if text.startswith("minimax::"):
-        return f"minimax/{text[len('minimax::'):]}"
-    if text.startswith("deepseek::"):
-        return f"deepseek/{text[len('deepseek::'):]}"
-    if text.startswith("anthropic::"):
-        return f"anthropic/{normalize_anthropic_model_id(text[len('anthropic::'):])}"
-    if text.startswith("anthropic/"):
-        return f"anthropic/{normalize_anthropic_model_id(text[len('anthropic/'):])}"
-    return text
+    route = parse_model_route(text)
+    if not route.valid or route.kind == "claudexor":
+        return text
+    native = route.model
+    if route.kind == "openrouter":
+        if not native.startswith("anthropic/"):
+            return native
+        route, native = RouteParts("anthropic", "", ""), native[len("anthropic/"):]
+    if route.kind == "anthropic":
+        native = normalize_anthropic_model_id(native)
+    keep_name = route.kind == "openai-compatible" and route.connection
+    return f"{connection_id(route.kind, route.connection) if keep_name else route.kind}/{native}"

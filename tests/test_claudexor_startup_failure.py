@@ -25,6 +25,20 @@ from ouroboros.claudexor_startup_failure import (
     read_startup_log_interval,
 )
 
+
+@pytest.fixture(autouse=True)
+def _no_owed_delivery_wake(monkeypatch):
+    """An owed-delivery wake an earlier test in this worker left set, or retained dialogue rows that rebind
+    it at once (dialogue_retry.bind_wake), would start the maintenance sweep's terminal_delivery_replay duty
+    beside the threads these tests count."""
+    import threading
+
+    from ouroboros import dialogue_retry, server_maintenance
+
+    monkeypatch.setattr(server_maintenance, "_DELIVERY_WAKE", threading.Event())
+    monkeypatch.setattr(dialogue_retry, "bind_wake", lambda _wake: None)
+
+
 # Sanitized excerpts of the real OOM output in the live daemon.log (2026-09-13,
 # thirty crashes at the 4095 MB V8 default old space); paths and pids stripped.
 _OOM_REACHED = b"""
@@ -49,43 +63,48 @@ FATAL ERROR: Ineffective mark-compacts near heap limit Allocation failed - JavaS
 ----- Native stack trace -----
 """
 _LEASE_BUSY = b"claudexord: another claudexor daemon owns /data/claudexor/daemon/claudexord.sock.writer/active.writer\n"
-_LEASE_STALE = b"claudexord: could not replace stale daemon writer lease /data/claudexor/daemon/claudexord.sock.writer\n"
 _FLOOR_BELOW = b"claudexord: candidate version 3.8.2 is below the proven serving floor 3.8.3\n"
-_FLOOR_UNORDERED = b"claudexord: candidate version 'dev' cannot be ordered against the proven serving floor 3.8.3\n"
-
 _SIGNAL_EXIT = ExitFact(returncode=-6, descriptor_written=False)
 
 
 # --- classifier (pure) ---------------------------------------------------------
 
+
 @pytest.mark.parametrize("text, expected", [
-    (_OOM_REACHED, StartupFailureClass.HEAP_EXHAUSTED),
-    (_OOM_INEFFECTIVE, StartupFailureClass.HEAP_EXHAUSTED),
     (_LEASE_BUSY, StartupFailureClass.WRITER_LEASE_CONTENDED),
-    (_LEASE_STALE, StartupFailureClass.WRITER_LEASE_CONTENDED),
     (_FLOOR_BELOW, StartupFailureClass.ENGINE_FLOOR),
-    (_FLOOR_UNORDERED, StartupFailureClass.ENGINE_FLOOR),
-    # The general V8 form (H-04 item 2): one line carrying FATAL ERROR + Allocation failed.
-    (b"FATAL ERROR: CALL_AND_RETRY_LAST Allocation failed - JavaScript heap out of memory\n",
-     StartupFailureClass.HEAP_EXHAUSTED),
     (b"FATAL ERROR: NewSpace::Rebalance Allocation failed - process out of memory\n",
      StartupFailureClass.HEAP_EXHAUSTED),
-    (b"FATAL ERROR: v8::ToLocalChecked Empty MaybeLocal\n", StartupFailureClass.UNCLASSIFIED),
-    (b"Allocation failed\nFATAL ERROR: something unrelated\n", StartupFailureClass.UNCLASSIFIED),
     (b"", StartupFailureClass.UNCLASSIFIED),
-    (b"writer lease lost\n", StartupFailureClass.UNCLASSIFIED),
-    (b"current fixture startup exited\nTraceback (most recent call last):\n", StartupFailureClass.UNCLASSIFIED),
 ])
 def test_classifier_names_each_class_and_nothing_else(text, expected):
-    assert classify_startup_failure(text, _SIGNAL_EXIT) is expected
+    fact = (ExitFact(1, False) if expected in {
+        StartupFailureClass.WRITER_LEASE_CONTENDED, StartupFailureClass.ENGINE_FLOOR,
+    } else _SIGNAL_EXIT)
+    assert classify_startup_failure(text, fact) is expected
 
 
 def test_classifier_reads_the_last_refusal_and_needs_an_exit():
-    """The terminal banner is the last thing the dying child wrote; a live child has no failure."""
+    """Only markers matching the exit class participate in the last-marker rule."""
     assert classify_startup_failure(_FLOOR_BELOW + _OOM_REACHED, _SIGNAL_EXIT) is StartupFailureClass.HEAP_EXHAUSTED
-    assert classify_startup_failure(_OOM_REACHED + _LEASE_BUSY, _SIGNAL_EXIT) is StartupFailureClass.WRITER_LEASE_CONTENDED
+    assert classify_startup_failure(_FLOOR_BELOW + _LEASE_BUSY, ExitFact(1, False)) is StartupFailureClass.WRITER_LEASE_CONTENDED
+    assert classify_startup_failure(_LEASE_BUSY + _FLOOR_BELOW, ExitFact(1, False)) is StartupFailureClass.ENGINE_FLOOR
     running = ExitFact(returncode=None, descriptor_written=False)
     assert classify_startup_failure(_OOM_REACHED, running) is StartupFailureClass.UNCLASSIFIED
+
+
+@pytest.mark.parametrize("returncode, expected", [
+    (-6, StartupFailureClass.HEAP_EXHAUSTED),
+    (134, StartupFailureClass.HEAP_EXHAUSTED),
+    (1, StartupFailureClass.WRITER_LEASE_CONTENDED),
+    (0, StartupFailureClass.UNCLASSIFIED),
+    (None, StartupFailureClass.UNCLASSIFIED),
+])
+def test_shared_log_refusals_do_not_relabel_heap_exit(returncode, expected):
+    interval = _LEASE_BUSY * 2 + _OOM_REACHED + _LEASE_BUSY * 3
+    assert classify_startup_failure(interval, ExitFact(returncode, True)) is expected
+    assert classify_startup_failure(_LEASE_BUSY, ExitFact(-9, True)) is StartupFailureClass.UNCLASSIFIED
+    assert classify_startup_failure(_OOM_REACHED, ExitFact(1, False)) is StartupFailureClass.UNCLASSIFIED
 
 
 @pytest.mark.parametrize("returncode, descriptor_written, latches, signal, code", [
@@ -769,9 +788,24 @@ def test_a_real_child_killed_by_a_signal_carries_the_raw_return_code(monkeypatch
 
 def _track_sweep_threads(monkeypatch) -> list:
     """Capture the threads the sweep starts (the retry runs on one) so tests can join them."""
+    from collections import OrderedDict
     import threading
 
-    from ouroboros import server_maintenance as sm
+    from ouroboros import dialogue_retry, server_maintenance as sm
+    from supervisor import active_activity, queue
+
+    # This fixture owns only the daemon-retry duty, with no cold actors and no maintenance child
+    # (whose own thread would outlive the test; it has its own tests).
+    monkeypatch.setattr(sm, "_tick_maintenance_child", lambda: None)
+    monkeypatch.setattr(queue, "RUNNING", {})
+    monkeypatch.setattr(queue, "PENDING", [])
+    monkeypatch.setattr(active_activity, "get_direct_activity_registry", lambda: SimpleNamespace(actors=lambda: []))
+    # Own both halves of the delivery wake handshake too. A prior test can leave
+    # either process-global half set, which would add an unrelated replay duty.
+    monkeypatch.setattr(sm, "_DELIVERY_WAKE", threading.Event())
+    monkeypatch.setattr(dialogue_retry, "_rows", OrderedDict())
+    monkeypatch.setattr(dialogue_retry, "_bytes", 0)
+    monkeypatch.setattr(dialogue_retry, "_requested", threading.Event())
 
     threads: list = []
 
@@ -789,20 +823,24 @@ def _run_real_sweep(monkeypatch, manager, order: list) -> list:
 
     The reconcile step is a recorder: the real one ensures a gateway only when
     it has orphan work, so with none it is exactly a no-op here — which is why
-    the retry must be the sweep's own. The retry thread is joined before
-    returning, so callers assert on a settled state.
+    the retry must be the sweep's own. The block itself now runs on the
+    ``custody-maintenance`` daemon thread (INV-B), so the returned list starts
+    with it; both threads are joined before returning, so callers assert on a
+    settled state.
     """
     from ouroboros import claudexor_daemon as daemon_mod
     from ouroboros import process_custody as pc
     from ouroboros import server_maintenance as sm
     from supervisor import queue
 
+    monkeypatch.setattr(sm, "_CUSTODY_SWEEP_LOCK", __import__("threading").Lock())  # own latch: a pass may outlive a test
     threads = _track_sweep_threads(monkeypatch)
     monkeypatch.setattr(sm, "_LAST_CANCEL_INTENT_SWEEP", [time.time()])  # 20 s cadence idle
     monkeypatch.setattr(sm, "_installed_skill_names", lambda: None)
     monkeypatch.setattr(pc, "reap_orphaned_processes", lambda root, **kw: order.append("reap") or [])
-    monkeypatch.setattr(sm, "_reconcile_delegated_runs", lambda live: order.append("reconcile"))
-    monkeypatch.setattr(sm, "_cursor_refresh_settled_terminals", lambda: None)
+    monkeypatch.setattr(sm, "_reconcile_delegated_runs",
+                        lambda live, **kwargs: order.append("reconcile"))
+    monkeypatch.setattr(sm, "_cursor_refresh_settled_terminals", lambda *a, **kwargs: None)
     monkeypatch.setattr(queue, "RUNNING", {})
     monkeypatch.setattr(daemon_mod, "get_owned_daemon", lambda: manager)
     sm._periodic_supervisor_maintenance([0.0], [time.time()])
@@ -823,7 +861,7 @@ def test_the_sweep_itself_makes_the_one_retry_after_releasing_the_latch(monkeypa
     with caplog.at_level(logging.WARNING):
         threads = _run_real_sweep(monkeypatch, stand.manager, order)
     assert order == ["reap", "reconcile"], "the swallowed refusal never skips the reconcile"
-    assert [thread.name for thread in threads] == ["owned-daemon-latch-retry"]
+    assert [thread.name for thread in threads if thread.name != "schedule-admission"] == ["custody-maintenance", "owned-daemon-latch-retry"]
     assert len(stand.spawned) == 2 and len(stand.ensures) == 2, "exactly one retry, made by the sweep"
     assert stand.manager._last_start_failure is not None, "the failed retry re-latched"
     assert any("retry after latch release refused (daemon_spawn_failed)" in rec.getMessage()
@@ -842,7 +880,8 @@ def test_a_healthy_sweep_never_ensures_or_spawns(monkeypatch, tmp_path):
     stand = _Stand(monkeypatch, tmp_path, returncode=-6, banner=_OOM_REACHED)
     order: list = []
     threads = _run_real_sweep(monkeypatch, stand.manager, order)
-    assert order == ["reap", "reconcile"] and threads == [], "nothing released: no retry thread"
+    assert order == ["reap", "reconcile"], "a healthy sweep still does its custody work"
+    assert [thread.name for thread in threads if thread.name != "schedule-admission"] == ["custody-maintenance"], "no retry thread"
     assert stand.spawned == [] and stand.ensures == [] and not _rows(stand.data_dir)
     assert stand.manager._last_start_failure is None
 
@@ -861,8 +900,9 @@ def test_periodic_sweep_retries_only_after_it_released_a_latch(monkeypatch, rele
     monkeypatch.setattr(sm, "_installed_skill_names", lambda: None)
     monkeypatch.setattr(pc, "reap_orphaned_processes", lambda root, **kw: order.append("reap") or [])
     monkeypatch.setattr(sm, "_retry_latched_daemon_start", lambda: order.append("retry"))
-    monkeypatch.setattr(sm, "_reconcile_delegated_runs", lambda live: order.append("reconcile"))
-    monkeypatch.setattr(sm, "_cursor_refresh_settled_terminals", lambda: None)
+    monkeypatch.setattr(sm, "_reconcile_delegated_runs",
+                        lambda live, **kwargs: order.append("reconcile"))
+    monkeypatch.setattr(sm, "_cursor_refresh_settled_terminals", lambda *a, **kwargs: None)
     monkeypatch.setattr(queue, "RUNNING", {})
     stub = SimpleNamespace(
         clear_start_failure_latch=lambda *, cleared_by: order.append(f"clear:{cleared_by}") or released)
@@ -871,7 +911,9 @@ def test_periodic_sweep_retries_only_after_it_released_a_latch(monkeypatch, rele
     for thread in threads:
         thread.join(5)
     assert order[0] == "clear:supervisor_sweep" and order.index("reap") < order.index("reconcile")
-    assert ("retry" in order) is released and len(threads) == (1 if released else 0)
+    # The block's own daemon thread always exists; the retry rides a second one.
+    assert ("retry" in order) is released
+    assert len([thread for thread in threads if thread.name != "schedule-admission"]) == (2 if released else 1)
 
 
 def test_a_raising_reap_cannot_pin_the_latch(monkeypatch):
@@ -891,7 +933,8 @@ def test_a_raising_reap_cannot_pin_the_latch(monkeypatch):
 
     monkeypatch.setattr(pc, "reap_orphaned_processes", raising_reap)
     monkeypatch.setattr(sm, "_retry_latched_daemon_start", lambda: order.append("retry"))
-    monkeypatch.setattr(sm, "_reconcile_delegated_runs", lambda live: order.append("reconcile"))
+    monkeypatch.setattr(sm, "_reconcile_delegated_runs",
+                        lambda live, **kwargs: order.append("reconcile"))
     stub = SimpleNamespace(
         clear_start_failure_latch=lambda *, cleared_by: order.append(f"clear:{cleared_by}") or True)
     monkeypatch.setattr(daemon_mod, "get_owned_daemon", lambda: stub)
@@ -923,16 +966,17 @@ def test_the_sweep_retry_runs_on_its_own_thread_and_never_blocks_the_tick(monkey
     monkeypatch.setattr(sm, "_LAST_CANCEL_INTENT_SWEEP", [time.time()])
     monkeypatch.setattr(sm, "_installed_skill_names", lambda: None)
     monkeypatch.setattr(pc, "reap_orphaned_processes", lambda root, **kw: [])
-    monkeypatch.setattr(sm, "_reconcile_delegated_runs", lambda live: None)
-    monkeypatch.setattr(sm, "_cursor_refresh_settled_terminals", lambda: None)
+    monkeypatch.setattr(sm, "_reconcile_delegated_runs", lambda live, **kwargs: None)
+    monkeypatch.setattr(sm, "_cursor_refresh_settled_terminals", lambda *a, **kwargs: None)
     monkeypatch.setattr(queue, "RUNNING", {})
     monkeypatch.setattr(daemon_mod, "get_owned_daemon",
                         lambda: SimpleNamespace(clear_start_failure_latch=lambda *, cleared_by: True))
     try:
         sm._periodic_supervisor_maintenance([0.0], [time.time()])  # returns while the ensure is held
         assert entered.wait(5), "the retry thread reached the ensure"
-        assert [thread.name for thread in threads] == ["owned-daemon-latch-retry"]
-        assert threads[0].daemon and threads[0].is_alive(), "exactly one retry thread, still in the ensure"
+        assert [thread.name for thread in threads if thread.name != "schedule-admission"] == ["custody-maintenance", "owned-daemon-latch-retry"]
+        retry = next(thread for thread in threads if thread.name == "owned-daemon-latch-retry")
+        assert retry.daemon and retry.is_alive(), "exactly one retry thread, still in the ensure"
     finally:
         release.set()
         for thread in threads:

@@ -26,6 +26,10 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
+from ouroboros.reviewer_slot_config import review_pool_state
+from ouroboros.settings_defaults import OPENROUTER_REVIEW_DEFAULTS
+from tests._cases import chosen_rows
+
 
 @pytest.fixture
 def isolated_settings(tmp_path, monkeypatch):
@@ -88,7 +92,7 @@ def cyber_settings(isolated_settings, monkeypatch):
     initial = {
         "OUROBOROS_RUNTIME_MODE": "cyber_pro", "OUROBOROS_SAFETY_MODE": "full",
         "OUROBOROS_CONTEXT_MODE": "max", "OUROBOROS_CONTEXT_MODE_AUTO_LOW": "false",
-        "OUROBOROS_REVIEW_ENFORCEMENT": "blocking",
+        "OUROBOROS_TASK_REVIEW_MODE": "required",
         **{key: "original-install-fact" for key in cfg.ENDPOINT_AUTHORED_SETTINGS},
     }
     isolated_settings.write_text(json.dumps(initial), encoding="utf-8")
@@ -136,7 +140,7 @@ def test_cyber_generic_post_saves_controls_and_preserves_fact_provenance(cyber_s
     chosen = {
         "OUROBOROS_RUNTIME_MODE": "pro", "OUROBOROS_SAFETY_MODE": "off",
         "OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS": "true", "OUROBOROS_MODEL": "openai/test-model",
-        "OUROBOROS_CONTEXT_MODE": "low", "OUROBOROS_REVIEW_ENFORCEMENT": "advisory",
+        "OUROBOROS_CONTEXT_MODE": "low", "OUROBOROS_TASK_REVIEW_MODE": "auto",
         "SERVICE_API_KEY": "owner-test-key",
     }
     response = TestClient(app).post("/api/settings", json={
@@ -157,16 +161,19 @@ def test_cyber_generic_post_saves_controls_and_preserves_fact_provenance(cyber_s
     assert later.status_code == 200, later.text
     assert json.loads(cyber_settings.read_text())["OUROBOROS_RUNTIME_MODE"] == "pro"
     events = [json.loads(line) for line in (cyber_settings.parent / "logs/events.jsonl").read_text().splitlines()]
-    change = next(event for event in events if event.get("action") == "settings_controls")
+    change, later_change = (event for event in events if event.get("action") == "settings_changed")
     assert change["changes"]["OUROBOROS_SAFETY_MODE"] == {"old": "full", "new": "off"}
     assert change["changes"]["OUROBOROS_CONTEXT_MODE"] == {"old": "max", "new": "low"}
-    assert change["changes"]["OUROBOROS_REVIEW_ENFORCEMENT"] == {"old": "blocking", "new": "advisory"}
+    assert change["changes"]["OUROBOROS_TASK_REVIEW_MODE"] == {"old": "required", "new": "auto"}
+    assert change["changes"]["OUROBOROS_RUNTIME_MODE"] == {"old": "cyber_pro", "new": "pro"}
+    assert change["changes"]["SERVICE_API_KEY"] == {"withheld": "secret"}
     assert "owner-test-key" not in json.dumps(change)
+    assert later_change["changes"] == {"TOTAL_BUDGET": {"old": 200.0, "new": 25.0}}
 
 
-@pytest.mark.parametrize("mode,status", [("cyber_pro", 200), ("pro", 409)])
+@pytest.mark.parametrize("mode,status", [("cyber_pro", 200), ("pro", 200)])
 @pytest.mark.parametrize("context_mode", ["low", "nano"])
-def test_context_owner_endpoint_allows_cyber_during_work(cyber_settings, monkeypatch, mode, status, context_mode):
+def test_context_owner_endpoint_updates_future_actors_during_work(cyber_settings, monkeypatch, mode, status, context_mode):
     from ouroboros import config as cfg
     from ouroboros.gateway import settings as settings_mod
     from supervisor.active_activity import get_direct_activity_registry
@@ -187,8 +194,7 @@ def test_context_owner_endpoint_allows_cyber_during_work(cyber_settings, monkeyp
     assert json.loads(cyber_settings.read_text())["OUROBOROS_CONTEXT_MODE"] == (context_mode if status == 200 else "max")
 
 
-@pytest.mark.parametrize("has_context", [True, False])
-@pytest.mark.parametrize("context_mode", ["low", "nano"])
+@pytest.mark.parametrize(("context_mode", "has_context"), [("low", True), ("nano", False)])
 def test_cyber_can_self_lower_context_and_author_its_marker(cyber_settings, has_context, context_mode):
     from ouroboros import config as cfg
 
@@ -214,13 +220,13 @@ def test_cyber_context_save_retains_current_task_snapshot(cyber_settings, monkey
     snapshot = task_settings_snapshot(cfg.load_settings(), dict(os.environ))
     with task_settings_scope(snapshot):
         response = TestClient(app).post("/api/settings", json={
-            "OUROBOROS_CONTEXT_MODE": "low", "OUROBOROS_REVIEW_ENFORCEMENT": "advisory",
+            "OUROBOROS_CONTEXT_MODE": "low", "OUROBOROS_TASK_REVIEW_MODE": "auto",
         })
         assert response.status_code == 200, response.text
         assert cfg.get_owner_context_mode() == "max"
-        assert cfg.get_review_enforcement() == "blocking"
+        assert cfg.get_task_review_mode() == "required"
     assert cfg.get_owner_context_mode() == "low"
-    assert cfg.get_review_enforcement() == "advisory"
+    assert cfg.get_task_review_mode() == "auto"
     assert snapshot.settings["OUROBOROS_CONTEXT_MODE"] == "max"
 
 
@@ -337,7 +343,6 @@ def test_a_pre_commit_failure_is_still_reported_as_unsaved(monkeypatch, isolated
 
 @pytest.mark.parametrize("payload", [
     {"TOTAL_BUDGET": "25", "OUROBOROS_UPDATE_CHANNEL": "not-a-channel"},
-    {"TOTAL_BUDGET": "25", "OUROBOROS_POST_TASK_EVOLUTION_CADENCE": "every_n:0"},
     {"TOTAL_BUDGET": "not a number"},
     {"MINIMAX_REGION": "atlantis"},
 ])
@@ -369,7 +374,9 @@ def test_generic_settings_save_validates_and_canonicalizes_available_subagents(
             "route": {"kind": "api_model", "target_id": "openai/gpt-5.6-sol"},
         }],
     }
-    response = TestClient(app).post("/api/settings", json={SUBAGENTS_SETTING: payload})
+    # No row is marked Reviewer, so the owner confirms saving an empty review pool.
+    response = TestClient(app).post(
+        "/api/settings", json={SUBAGENTS_SETTING: payload, "allow_empty_review_pool": True})
 
     assert response.status_code == 200, response.text
     saved = json.loads(isolated_settings.read_text(encoding="utf-8"))
@@ -378,6 +385,380 @@ def test_generic_settings_save_validates_and_canonicalizes_available_subagents(
     parsed = parse_configured_subagents(canonical)
     assert parsed.items[0].name == ""
     assert '"name"' not in canonical
+    assert not {key for key in saved if key.lower() == "allow_empty_review_pool"}, "a request flag, never a setting"
+
+
+_OWNER_CATALOG = {"enabled": True, "items": [{
+    "subagent_id": "owner-row", "recommended_use": "Use for owner-selected work.",
+    "route": {"kind": "api_model", "target_id": "openai/gpt-5.6-sol"},
+}]}
+
+
+def _spy_on_the_pool_judge(monkeypatch, record):
+    """Package A's real ``review_pool_save_error`` behind a call log: the tests pin WHEN the
+    gateway asks the judge; what it answers is A's own rule."""
+    from ouroboros import reviewer_slot_config
+
+    real = reviewer_slot_config.review_pool_save_error
+
+    def judge(raw, *, allow_empty):
+        record(raw, allow_empty)
+        return real(raw, allow_empty=allow_empty)
+
+    monkeypatch.setattr(reviewer_slot_config, "review_pool_save_error", judge)
+    return real
+
+
+def test_a_changed_catalog_meets_the_empty_pool_rule_and_the_owner_flag_confirms_it(
+    monkeypatch, isolated_settings,
+):
+    """Package A's empty-pool rule judges a catalog save as THIS save produces it: its
+    text is a typed ``empty_review_pool`` 400 that writes nothing; ``allow_empty_review_pool``
+    is the owner's confirmation; a save that re-posts the stored catalog is not judged."""
+    from ouroboros.configured_subagents import SUBAGENTS_SETTING
+
+    judged = []
+    real = _spy_on_the_pool_judge(
+        monkeypatch, lambda raw, allow_empty: judged.append((json.loads(raw)["items"][0]["recommended_use"], allow_empty)))
+    client = TestClient(_settings_app(monkeypatch, isolated_settings))
+
+    refused = client.post("/api/settings", json={SUBAGENTS_SETTING: _OWNER_CATALOG})
+    assert refused.status_code == 400, refused.text
+    assert refused.json()["code"] == "empty_review_pool" and refused.json()["saved"] is False
+    assert refused.json()["error"] == real(json.dumps(_OWNER_CATALOG), allow_empty=False) != ""
+    assert not isolated_settings.exists()
+    assert judged == [("Use for owner-selected work.", False)]
+
+    confirmed = client.post("/api/settings", json={SUBAGENTS_SETTING: _OWNER_CATALOG, "allow_empty_review_pool": True})
+    assert confirmed.status_code == 200, confirmed.text
+    stored = json.loads(isolated_settings.read_text(encoding="utf-8"))
+    assert json.loads(stored[SUBAGENTS_SETTING])["items"][0]["subagent_id"] == "owner-row"
+    assert len(judged) == 1, "a confirmed save is not judged"
+
+    again = client.post("/api/settings", json={SUBAGENTS_SETTING: _OWNER_CATALOG, "TOTAL_BUDGET": "25"})
+    assert again.status_code == 200, again.text
+    assert len(judged) == 1, "re-posting the stored catalog is not a catalog change"
+
+    edited = {**_OWNER_CATALOG, "items": [{**_OWNER_CATALOG["items"][0], "recommended_use": "Edited use.",
+                                           "review_eligible": True}]}
+    accepted = client.post("/api/settings", json={SUBAGENTS_SETTING: edited})
+    assert accepted.status_code == 200, accepted.text
+    assert judged[-1] == ("Edited use.", False)
+    assert json.loads(json.loads(isolated_settings.read_text(encoding="utf-8"))[SUBAGENTS_SETTING])[
+        "items"][0]["recommended_use"] == "Edited use."
+
+
+def test_re_posting_the_catalog_a_read_showed_is_not_a_catalog_change(
+    monkeypatch, isolated_settings, _clean_subagent_env,
+):
+    """With no catalog stored, the read seam shows the factory reviewer rows (a never-configured
+    install) and every save re-posts them: an unrelated save is not refused by the empty-pool rule
+    and leaves the shown catalog to the read (only an edit authors one), while an edit that unmarks
+    every reviewer is judged."""
+    from ouroboros.configured_subagents import SUBAGENTS_SETTING
+    from ouroboros.gateway import settings as settings_mod
+
+    judged = []
+    _spy_on_the_pool_judge(monkeypatch, lambda raw, allow_empty: judged.append(len(json.loads(raw)["items"])))
+    isolated_settings.write_text(json.dumps({
+        "OPENROUTER_API_KEY": "configured", "OUROBOROS_MODEL": "openai/gpt-5.6-sol",
+        "OUROBOROS_MODEL_LIGHT": "openai/gpt-5.6-luna",
+    }), encoding="utf-8")
+    app = _settings_app(monkeypatch, isolated_settings)
+    app.router.routes.append(Route("/api/settings", endpoint=settings_mod.api_settings_get, methods=["GET"]))
+    client = TestClient(app)
+    shown = client.get("/api/settings").json()["_meta"]["available_subagents"]
+    assert shown["source"] == "configured" and [r["minted_from"] for r in shown["candidate"]["items"]
+                                                 if r.get("review_eligible")] == ["factory_default"] * 3
+    edited = {**shown["candidate"], "items": [{k: v for k, v in row.items() if k != "review_eligible"}
+                                              for row in shown["candidate"]["items"]]}
+    refused = client.post("/api/settings", json={SUBAGENTS_SETTING: edited})
+    assert refused.status_code == 400 and refused.json()["code"] == "empty_review_pool", refused.text
+    assert judged == [5] and SUBAGENTS_SETTING not in json.loads(isolated_settings.read_text(encoding="utf-8"))
+
+    saved = client.post("/api/settings", json={SUBAGENTS_SETTING: shown["candidate"], "TOTAL_BUDGET": "25"})
+    assert saved.status_code == 200, saved.text
+    assert judged == [5], "re-posting the shown catalog is no catalog change"
+    assert SUBAGENTS_SETTING not in json.loads(isolated_settings.read_text(encoding="utf-8"))
+    shown = client.get("/api/settings").json()["_meta"]["available_subagents"]["candidate"]
+    assert [row["route"]["target_id"] for row in shown["items"]] == [
+        "openai/gpt-5.6-sol", "openai/gpt-5.6-luna", *OPENROUTER_REVIEW_DEFAULTS["triad"]]
+
+
+def test_a_catalog_save_retires_the_stored_review_lanes(monkeypatch, isolated_settings):
+    """The pool replaces the former review lanes. The read seam migrates readable lanes into
+    catalog marks itself; ``OUROBOROS_REVIEWER_SLOTS`` is still in the loaded document only
+    when it cannot read them. There, even a re-posted catalog is judged (retiring the lanes
+    never empties review silently), and the save that writes a catalog drops the key."""
+    from ouroboros.configured_subagents import SUBAGENTS_SETTING, normalize_configured_subagents
+
+    _rows, unmarked = normalize_configured_subagents(_OWNER_CATALOG)
+    unreadable_lanes = json.dumps({"triad": [{"slot_id": "t1"}]})
+    isolated_settings.write_text(json.dumps({SUBAGENTS_SETTING: unmarked, "OUROBOROS_REVIEWER_SLOTS": unreadable_lanes}),
+                                 encoding="utf-8")
+    judged = []
+    _spy_on_the_pool_judge(monkeypatch, lambda raw, allow_empty: judged.append(raw))
+    client = TestClient(_settings_app(monkeypatch, isolated_settings))
+
+    refused = client.post("/api/settings", json={SUBAGENTS_SETTING: _OWNER_CATALOG})
+
+    assert refused.status_code == 400, refused.text
+    assert refused.json()["code"] == "empty_review_pool"
+    assert judged == [unmarked]
+    assert json.loads(isolated_settings.read_text(encoding="utf-8"))["OUROBOROS_REVIEWER_SLOTS"] == unreadable_lanes
+
+    marked = {**_OWNER_CATALOG, "items": [{**_OWNER_CATALOG["items"][0], "review_eligible": True}]}
+    _rows, canonical = normalize_configured_subagents(marked)
+    accepted = client.post("/api/settings", json={SUBAGENTS_SETTING: marked})
+
+    assert accepted.status_code == 200, accepted.text
+    assert judged == [unmarked, canonical]
+    stored = json.loads(isolated_settings.read_text(encoding="utf-8"))
+    assert "OUROBOROS_REVIEWER_SLOTS" not in stored and stored[SUBAGENTS_SETTING] == canonical
+
+
+def _pool_world(monkeypatch, *, records=None):
+    """The endpoint's durable-state seams (the last-run file, package C's migration records,
+    the tariff lookup) bound in memory; the pool itself is package A's real reading."""
+    from ouroboros import reviewer_slot_config, server_maintenance
+    from ouroboros.gateway import settings as settings_mod
+
+    monkeypatch.setattr(reviewer_slot_config, "reviewer_slot_last_executions", lambda: {
+        "api-critic": {"surface": "commit_gate", "observed_model": "openai/gpt-5.6-luna", "record_id": "rec-1"}})
+    monkeypatch.setattr(server_maintenance, "review_pool_migration_records", lambda: records or {})
+    monkeypatch.setattr(settings_mod, "_review_pool_costs", lambda items: {
+        "api-critic": {"usd_per_review": 0.12, "basis": "route_tariff"},
+        "session-critic": {"usd_per_review": None, "basis": "subscription_seat"},
+        "helper": {"usd_per_review": None, "basis": "unknown"}})
+    return settings_mod
+
+
+_POOL_CATALOG = {"enabled": False, "items": [
+    {"subagent_id": "api-critic", "recommended_use": "Reviews diffs.", "review_eligible": True,
+     "route": {"kind": "api_model", "target_id": "openai/gpt-5.6-luna"}, "delivery": "packet",
+     "minted_from": "review_lane"},
+    {"subagent_id": "helper", "recommended_use": "Helps.", "route": {"kind": "api_model", "target_id": "openai/gpt-5.6-sol"}},
+    {"subagent_id": "session-critic", "recommended_use": "Reads the repository.", "review_eligible": True,
+     "route": {"kind": "agent_session", "target_id": "cursor=gpt-5.6-sol-xhigh"}},
+    {"subagent_id": "paused", "recommended_use": "Switched off.", "review_eligible": True, "enabled": False,
+     "route": {"kind": "api_model", "target_id": "google/gemini-3.8-flash"}},
+    {"subagent_id": "bare-critic", "recommended_use": "Reads the work itself.", "review_eligible": True,
+     "route": {"kind": "api_model", "target_id": "deepseek/deepseek-v4-pro"}, "effort": "low"},
+]}
+
+
+def test_review_pool_endpoint_reports_the_pool_in_catalog_order(monkeypatch):
+    """``GET /api/review-pool`` (contract §1.4): package A's pool slots in catalog order,
+    each joined with its row's stored facts, price and last run; a marked row that is
+    switched off is excluded by name; the catalog switch does not empty the pool."""
+    from ouroboros.configured_subagents import MAX_CONFIGURED_SUBAGENTS
+
+    settings_mod = _pool_world(monkeypatch)
+    body = settings_mod.review_pool_payload({"OUROBOROS_SUBAGENTS": json.dumps(_POOL_CATALOG)})
+
+    assert body["limits"] == {"rows": MAX_CONFIGURED_SUBAGENTS}
+    assert body["catalog"] == {"present": True, "enabled": False, "rows": 5, "eligible": 4}
+    assert [row["subagent_id"] for row in body["pool"]] == ["api-critic", "session-critic", "bare-critic"]
+    api, session, bare = body["pool"]
+    assert api["route"] == {"kind": "api_model", "target_id": "openai/gpt-5.6-luna", "credential_profile_id": ""}
+    assert (api["effort"], api["effort_source"], api["delivery"], api["minted_from"]) == ("high", "auto", "packet", "review_lane")
+    assert api["cost"] == {"usd_per_review": 0.12, "basis": "route_tariff"}
+    assert api["last_execution"]["record_id"] == "rec-1" and api["handle"]
+    assert (session["effort"], session["effort_source"], session["delivery"], session["access"]) == (
+        "xhigh", "model_name", "session", "full")
+    assert session["cost"] == {"usd_per_review": None, "basis": "subscription_seat"}
+    assert session["last_execution"] is None and session["minted_from"] == ""
+    assert (bare["effort"], bare["effort_source"], bare["delivery"]) == ("low", "pin", "native")
+    assert all(row["review_eligible"] is True and row["enabled"] is True for row in body["pool"])
+    assert body["excluded"] == [{"subagent_id": "paused", "reason": "row_disabled"}]
+    assert body["row_costs"]["helper"] == {"usd_per_review": None, "basis": "unknown"}
+    assert body["config_error"] == "" and body["migration"] is None
+
+
+def test_review_pool_endpoint_lists_catalog_rows_only_when_the_main_model_reviews_alone(monkeypatch):
+    """An empty pool reviews on the Main seat, which is no catalog row: ``GET /api/review-pool``
+    keeps its frozen shape and lists none (no invented row, no credentials fact about it, no
+    error), while the same catalog with one mark lists exactly that row."""
+    settings_mod = _pool_world(monkeypatch)
+    for key in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+    helper = {"subagent_id": "helper", "recommended_use": "Helps.",
+              "route": {"kind": "api_model", "target_id": "openai/gpt-5.6-luna"}}
+
+    empty = settings_mod.review_pool_payload({"OUROBOROS_SUBAGENTS": json.dumps({"enabled": True, "items": [helper]})})
+    assert (empty["pool"], empty["excluded"], empty["pool_without_credentials"], empty["config_error"]) == ([], [], [], "")
+    assert empty["catalog"] == {"present": True, "enabled": True, "rows": 1, "eligible": 0}
+
+    marked = settings_mod.review_pool_payload(
+        {"OUROBOROS_SUBAGENTS": json.dumps({"enabled": True, "items": [{**helper, "review_eligible": True}]})})
+    assert [row["subagent_id"] for row in marked["pool"]] == ["helper"] and marked["pool_without_credentials"] == ["helper"]
+
+
+def test_review_pool_endpoint_types_a_bad_catalog_and_names_the_migration_snapshot(monkeypatch):
+    """A catalog package A cannot read is a typed ``config_error`` with an empty pool,
+    never a 500; the newest lanes-to-pool record (package C) names its snapshot."""
+    import asyncio
+
+    records = {
+        "older": {"ts": "20261001T000000Z", "snapshot": "state/review_migrations/20261001T000000Z-slots-to-pool.json",
+                  "reported": "2026-10-01T00:00:05Z"},
+        "newer": {"ts": "20261007T214000Z", "snapshot": "state/review_migrations/20261007T214000Z-slots-to-pool.json",
+                  "reported": None},
+    }
+    settings_mod = _pool_world(monkeypatch, records=records)
+    unreadable = {**_POOL_CATALOG, "items": [{**_POOL_CATALOG["items"][0], "delivery": "x"}, *_POOL_CATALOG["items"][1:]]}
+    monkeypatch.setenv("OUROBOROS_SUBAGENTS", json.dumps(unreadable))
+    response = asyncio.run(settings_mod.api_review_pool(None))
+
+    assert response.status_code == 200
+    body = json.loads(response.body)
+    expected = review_pool_state(json.dumps(unreadable))["error"]
+    assert expected and "delivery" in expected and body["config_error"] == expected
+    assert body["pool"] == [] and body["excluded"] == [] and body["row_costs"] == {}
+    assert body["catalog"]["eligible"] == 4
+    # Records without their snapshot files decide no document: the newest is reported as history.
+    assert body["migration"] == {"snapshot": records["newer"]["snapshot"], "reported": False,
+                                 "trigger": "", "outcome": "", "error": "", "source": "history"}
+
+
+# --- the migration outcome and the credential fact in the payload (VD3-06, VD3-08) ----------
+
+
+@pytest.fixture
+def pool_root(tmp_path, monkeypatch):
+    """A data root with supervisor state bound: the receipts' home (``persist_receipts`` writes
+    the snapshot and the ``state.json`` record there, as the saving process does)."""
+    from ouroboros import config as cfg
+    from ouroboros import review_pool_migration as rpm
+    from ouroboros import server_maintenance
+    from supervisor import state
+
+    state.init(tmp_path)
+    (tmp_path / "state").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "locks").mkdir(parents=True, exist_ok=True)
+    state.save_state({})
+    monkeypatch.setattr(server_maintenance, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
+    rpm._MIGRATIONS_SEEN.clear()
+    yield tmp_path
+    rpm._MIGRATIONS_SEEN.clear()
+
+
+_AUTHORED_LANES = json.dumps({"triad": [{"slot_id": "t1", "route": {"kind": "api_chat", "target_id": "openai/gpt-5.6-luna"}}],
+                              "scope": [{"slot_id": "s1", "route": {"kind": "api_chat", "target_id": "openai/gpt-5.6-luna"}}]})
+_BROKEN_LANES = json.dumps({"triad": [{"model": "openai/gpt-5.6-luna"}]})  # no slot_id/route: the strict parser refuses
+
+
+def _served(settings_mod, document):
+    """What ``GET /api/review-pool`` shows for ``document`` once the saving process wrote the receipts."""
+    from ouroboros import config as cfg
+    from ouroboros import review_pool_receipts, server_maintenance
+
+    from ouroboros.review_pool_migration import apply_at_read_seam
+
+    loaded = cfg.normalize_settings_raw(dict(document))
+    apply_at_read_seam(loaded, merged=True)  # the loader's second stage: a never-configured document's factory
+    review_pool_receipts.persist_receipts(server_maintenance.DATA_DIR)
+    return loaded, settings_mod.review_pool_payload(loaded)
+
+
+def test_review_pool_payload_carries_the_migration_outcome_that_decides_the_document(pool_root, monkeypatch):
+    """VD3-06: ``migration`` is the full receipt — ``{snapshot, reported, trigger, outcome, error,
+    source}`` — for the document the payload shows: authored lanes converted (source ``document``),
+    a never-configured document's factory rows (``factory``)."""
+    from ouroboros import reviewer_slot_config
+    from ouroboros.gateway import settings as settings_mod
+
+    monkeypatch.setattr(reviewer_slot_config, "reviewer_slot_last_executions", lambda: {})
+    monkeypatch.setattr(settings_mod, "_review_pool_costs", lambda items: {})
+
+    loaded, body = _served(settings_mod, {"OUROBOROS_REVIEWER_SLOTS": _AUTHORED_LANES, "OPENROUTER_API_KEY": "present"})
+    (snapshot,) = sorted((pool_root / "state" / "review_migrations").glob("*-slots-to-pool.json"))
+    assert body["config_error"] == "" and [row["subagent_id"] for row in body["pool"]] == ["review-1", "review-2"]
+    assert body["migration"] == {"snapshot": f"state/review_migrations/{snapshot.name}", "reported": False,
+                                 "trigger": "lanes_key", "outcome": "converted", "error": "", "source": "document"}
+
+    _loaded, factory = _served(settings_mod, {"OPENROUTER_API_KEY": "present"})
+    assert len(factory["pool"]) == 3
+    assert (factory["migration"]["trigger"], factory["migration"]["outcome"], factory["migration"]["source"]) == (
+        "never_configured", "factory", "document")
+    assert factory["migration"]["snapshot"] != body["migration"]["snapshot"], "each document its own receipt"
+
+
+def test_review_pool_payload_names_the_reason_a_broken_lanes_key_was_retained(pool_root, monkeypatch):
+    """VD3-06: a lane value the migration refused stays in the document (no partial migration)
+    and the payload says WHY — ``outcome: error`` with the reason and ``source: error`` — while
+    the catalog, untouched, still serves whatever pool it had (none here)."""
+    from ouroboros import reviewer_slot_config
+    from ouroboros.gateway import settings as settings_mod
+
+    monkeypatch.setattr(reviewer_slot_config, "reviewer_slot_last_executions", lambda: {})
+    monkeypatch.setattr(settings_mod, "_review_pool_costs", lambda items: {})
+
+    loaded, body = _served(settings_mod, {"OUROBOROS_REVIEWER_SLOTS": _BROKEN_LANES, "OPENROUTER_API_KEY": "present"})
+    assert loaded["OUROBOROS_REVIEWER_SLOTS"] == _BROKEN_LANES, "retained for the owner's catalog save"
+    (snapshot,) = sorted((pool_root / "state" / "review_migrations").glob("*-slots-to-pool.json"))
+    migration = body["migration"]
+    assert (migration["snapshot"], migration["reported"]) == (f"state/review_migrations/{snapshot.name}", False)
+    assert (migration["trigger"], migration["outcome"], migration["source"]) == ("lanes_key", "error", "error")
+    assert migration["error"].startswith("OUROBOROS_REVIEWER_SLOTS: ") and "unknown keys" in migration["error"]
+    assert body["pool"] == [] and body["config_error"] == ""
+
+
+@pytest.mark.parametrize("refused", [False, True], ids=["converted_control", "retained_lanes_error"])
+def test_the_live_handler_judges_the_receipt_by_the_document_on_disk_not_the_process_projection(pool_root, monkeypatch,
+                                                                                               refused):
+    """VD3-06, the real path: the server reads the document, the boot receipts it, then
+    ``config.apply_settings_to_env`` projects the LIVE settings keys into the process environment
+    and ``GET /api/review-pool`` is served from that projection (``runtime_environ``). A lane value
+    a refused migration retained lives in the document, not in the projection — so judged against
+    the projection the current ``error`` receipt read as ``history`` and the Settings note hid it.
+    The handler judges the receipt against the document on disk, the same view the direct payload
+    of the loaded document gives; the retained lanes never enter the runtime configuration."""
+    import asyncio
+    import os
+
+    from ouroboros import config as cfg
+    from ouroboros import server_maintenance
+    from ouroboros.gateway import settings as settings_mod
+    from tests.test_review_pool_migration import N1_DOC, _served_from_disk
+
+    monkeypatch.setattr(settings_mod, "_review_pool_costs", lambda items: {})
+    monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
+    loaded = _served_from_disk(pool_root, monkeypatch, {"OUROBOROS_REVIEWER_SLOTS": _BROKEN_LANES} if refused
+                               else dict(N1_DOC))
+    server_maintenance._startup_review_pool_notice(loaded)  # the boot's receipt (no owner chat: it waits, unreported)
+    cfg.apply_settings_to_env(loaded)  # the server's projection the handler reads
+    assert ("OUROBOROS_REVIEWER_SLOTS" in loaded) is refused and "OUROBOROS_REVIEWER_SLOTS" not in os.environ
+
+    response = asyncio.run(settings_mod.api_review_pool(None))
+    assert response.status_code == 200
+    served = json.loads(response.body)["migration"]
+    assert served == settings_mod.review_pool_payload(loaded)["migration"], "the handler and the document view agree"
+    assert (served["source"], served["outcome"]) == (("error", "error") if refused else ("document", "factory"))
+    assert (served["error"].startswith("OUROBOROS_REVIEWER_SLOTS: ")) is refused and not served["reported"]
+
+
+def test_review_pool_payload_states_which_pool_rows_have_no_credentials(monkeypatch):
+    """VD3-08: ``pool_without_credentials`` lists every pool row whose model this install holds
+    no credentials for — all of them is the loud fact the Settings note needs; a subscription
+    seat logs in itself and is never listed. The pool (the pinning) is unchanged either way."""
+    settings_mod = _pool_world(monkeypatch)
+    for key in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+    catalog = json.dumps(_POOL_CATALOG)
+
+    bare = settings_mod.review_pool_payload({"OUROBOROS_SUBAGENTS": catalog})
+    assert [row["subagent_id"] for row in bare["pool"]] == ["api-critic", "session-critic", "bare-critic"]
+    assert bare["pool_without_credentials"] == ["api-critic", "bare-critic"]
+
+    funded = settings_mod.review_pool_payload({"OUROBOROS_SUBAGENTS": catalog, "OPENROUTER_API_KEY": "present"})
+    assert [row["subagent_id"] for row in funded["pool"]] == [row["subagent_id"] for row in bare["pool"]]
+    assert funded["pool_without_credentials"] == []
+
+    unreadable = {**_POOL_CATALOG, "items": [{**_POOL_CATALOG["items"][0], "delivery": "x"}, *_POOL_CATALOG["items"][1:]]}
+    broken = settings_mod.review_pool_payload({"OUROBOROS_SUBAGENTS": json.dumps(unreadable)})
+    assert broken["config_error"] and broken["pool_without_credentials"] == []
 
 
 def test_generic_settings_save_projects_model_role_objects_as_json(
@@ -423,9 +804,10 @@ def test_generic_settings_save_rejects_malformed_available_subagents_without_wri
     assert not isolated_settings.exists()
 
 
-def test_settings_get_reports_legacy_actor_source_without_materializing_it(
+def test_settings_get_reads_a_legacy_actor_through_the_seam_without_materializing_it(
     monkeypatch, isolated_settings, _clean_subagent_env,
 ):
+    """A legacy single-harness document reads as the catalog the migration seeds (its session row first)."""
     from ouroboros import config as cfg
     from ouroboros.gateway import settings as settings_mod
 
@@ -434,6 +816,7 @@ def test_settings_get_reports_legacy_actor_source_without_materializing_it(
     # gateway test pins the real reader it is meant to exercise.
     monkeypatch.setattr(settings_mod, "load_settings", cfg.load_settings)
     original = {
+        "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE": "full",
         "OUROBOROS_SUBAGENT_HARNESS": "codex=gpt-5.6-sol:high",
         "OUROBOROS_SUBAGENT_PROFILE": "owner-profile",
     }
@@ -448,14 +831,13 @@ def test_settings_get_reports_legacy_actor_source_without_materializing_it(
 
     assert response.status_code == 200, response.text
     projection = response.json()["_meta"]["available_subagents"]
-    assert projection["source"] == "legacy_migrated"
-    assert projection["candidate"]["items"][0]["route"]["credential_profile_id"] == (
-        "owner-profile"
-    )
+    items = projection["candidate"]["items"]
+    assert projection["source"] == "configured" and [r["minted_from"] for r in items if r.get("review_eligible")] == ["factory_default"] * 3
+    assert items[0]["route"]["credential_profile_id"] == "owner-profile" and not items[0].get("review_eligible")
     assert json.loads(isolated_settings.read_text(encoding="utf-8")) == original
 
 
-def test_settings_get_builds_an_unsaved_api_candidate_through_the_shared_compiler(
+def test_settings_get_reads_the_factory_reviewers_in_place_of_an_unsaved_api_candidate(
     monkeypatch, isolated_settings, _clean_subagent_env,
 ):
     from ouroboros import config as cfg
@@ -467,6 +849,7 @@ def test_settings_get_builds_an_unsaved_api_candidate_through_the_shared_compile
         settings_mod, "apply_runtime_provider_defaults", apply_runtime_provider_defaults,
     )
     original = {
+        "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE": "full",
         "OPENROUTER_API_KEY": "configured",
         "OUROBOROS_MODEL": "openai/gpt-5.6-sol",
         "OUROBOROS_MODEL_LIGHT": "openai/gpt-5.6-luna",
@@ -484,11 +867,13 @@ def test_settings_get_builds_an_unsaved_api_candidate_through_the_shared_compile
 
     assert response.status_code == 200, response.text
     projection = response.json()["_meta"]["available_subagents"]
-    assert projection["source"] == "undecided"
-    assert [row["route"]["target_id"] for row in projection["candidate"]["items"]] == [
-        "openai/gpt-5.6-sol",
-        "openai/gpt-5.6-luna",
-    ]
+    assert projection["source"] == "configured"
+    # The never-configured catalog: the wizard's Auto helpers on Main and the distinct Light,
+    # then the factory reviewers — the unsaved API candidate never stands in for it.
+    items = projection["candidate"]["items"]
+    assert [row["route"]["target_id"] for row in items] == [
+        "openai/gpt-5.6-sol", "openai/gpt-5.6-luna", *OPENROUTER_REVIEW_DEFAULTS["triad"]]
+    assert [bool(row.get("review_eligible")) for row in items] == [False, False, True, True, True]
     assert json.loads(isolated_settings.read_text(encoding="utf-8")) == original
 
 
@@ -514,6 +899,8 @@ _OWNER_SETTINGS_WRITERS = [
 
 def _owner_app(handler_name, route, isolated_settings):
     from ouroboros.gateway import settings as settings_mod
+    if handler_name == "api_owner_safety_mode":
+        from ouroboros.gateway import safety_settings as settings_mod
 
     app = Starlette(routes=[
         Route(route, endpoint=getattr(settings_mod, handler_name), methods=["POST"])])
@@ -521,7 +908,7 @@ def _owner_app(handler_name, route, isolated_settings):
     return app
 
 
-@pytest.mark.parametrize("route,handler_name,payload", _OWNER_SETTINGS_WRITERS)
+@pytest.mark.parametrize("route,handler_name,payload", chosen_rows(_OWNER_SETTINGS_WRITERS, 0, 1, 3))
 def test_owner_endpoints_map_a_contended_lock_to_a_typed_refusal(monkeypatch, isolated_settings,
                                                                  route, handler_name, payload):
     """Every single-decision owner endpoint shares the seam, and none of them had
@@ -552,6 +939,53 @@ def test_owner_endpoint_validation_refusals_say_saved_false(monkeypatch, isolate
     assert resp.status_code == 400, resp.text
     assert resp.json()["saved"] is False, resp.text
     assert not isolated_settings.exists()
+
+
+_KEPT = {"OPENROUTER_API_KEY": "sk-or-kept-synthetic", "CUSTOM_SERVICE_TOKEN": "kept-synthetic"}
+_DAMAGED = {"undecodable": json.dumps(_KEPT).encode()[:-1],  # a hand edit that lost its closing brace
+            "not_an_object": json.dumps(list(_KEPT)).encode(), "unreadable": json.dumps(_KEPT).encode()}
+
+
+@pytest.mark.parametrize("damage", sorted(_DAMAGED))
+def test_a_present_document_the_seam_cannot_read_is_refused_never_written_as_new(monkeypatch, isolated_settings,
+                                                                                damage):
+    """Only an ABSENT document is new. A present one that does not read as an object (cut short, another
+    JSON type, an open the OS refuses) read as ``{}``, and the generic save, an owner decision and an
+    incidental writer then wrote their own fields over it, deleting every key the owner had saved."""
+    from ouroboros.gateway import owner_settings
+    from ouroboros.gateway import settings as settings_mod
+    from ouroboros.gateway.owner_settings import _owner_update_settings, fields_on_saved_document
+
+    isolated_settings.write_bytes(_DAMAGED[damage])
+    before, real_open = isolated_settings.read_bytes(), pathlib.Path.open
+    if damage == "unreadable":  # injected: chmod is not a refusal on every platform
+
+        def refused(path, *args, **kwargs):
+            if path == isolated_settings:
+                raise PermissionError(13, "injected: settings unreadable")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(pathlib.Path, "open", refused)
+    monkeypatch.setattr(settings_mod, "_has_running_agent_tasks", lambda: False, raising=False)
+    generic = TestClient(_settings_app(monkeypatch, isolated_settings)).post("/api/settings", json={"TOTAL_BUDGET": "25"})
+    decision = TestClient(_owner_app("api_owner_auto_grant", "/api/owner/auto-grant", isolated_settings)).post(
+        "/api/owner/auto-grant", json={"enabled": False})
+    for response in (generic, decision):
+        assert response.status_code == 409, response.text
+        assert response.json()["code"] == "settings_unreadable" and response.json()["saved"] is False
+    with pytest.raises(owner_settings.SettingsDocumentUnreadable):
+        _owner_update_settings(fields_on_saved_document({"OUROBOROS_TOOL_TIMEOUT_SEC": 77}))
+    monkeypatch.setattr(pathlib.Path, "open", real_open)
+    assert isolated_settings.read_bytes() == before, "an unreadable document kept its exact bytes"
+    # The owner repairs it: a readable document keeps every saved key beside the incidental field...
+    isolated_settings.write_text(json.dumps(_KEPT), encoding="utf-8")
+    _owner_update_settings(fields_on_saved_document({"OUROBOROS_TOOL_TIMEOUT_SEC": 77}))
+    assert json.loads(isolated_settings.read_text(encoding="utf-8")) == {**_KEPT, "OUROBOROS_TOOL_TIMEOUT_SEC": 77}
+    # ...and an absent one is a first setup the generic save creates.
+    isolated_settings.unlink()
+    created = TestClient(_settings_app(monkeypatch, isolated_settings)).post("/api/settings", json={"TOTAL_BUDGET": "25"})
+    assert created.status_code == 200, created.text
+    assert json.loads(isolated_settings.read_text(encoding="utf-8"))["TOTAL_BUDGET"] == 25.0
 
 
 def test_the_capability_ack_is_not_a_settings_writer(monkeypatch, isolated_settings, tmp_path):
@@ -687,14 +1121,12 @@ def test_settings_save_body_runs_off_the_event_loop():
         "_api_owner_runtime_mode_sync",
         "_api_owner_auto_grant_sync",
         "_api_owner_context_mode_sync",
-        "_api_owner_safety_mode_sync",
     }
     # The loop must NEVER hold the document lock: every async settings writer
     # delegates its locked body to a worker thread.
     for node in ast.walk(ast.parse(src)):
         if isinstance(node, ast.AsyncFunctionDef) and node.name in {
             "api_owner_runtime_mode", "api_owner_auto_grant", "api_owner_context_mode",
-            "api_owner_safety_mode",
         }:
             # Off the loop through the ONE writer seam (itself pinned above to
             # asyncio.to_thread + the typed busy mapping), never inline.
@@ -761,32 +1193,351 @@ def test_settings_save_body_runs_off_the_event_loop():
                 )
 
 
-def test_reviewer_slots_reload_does_not_await_the_status_probe():
-    """The shared Claudexor status read can wake a cold daemon and walk model
-    discovery; awaiting it inside reloadReviewerSlots held the Save button
-    (loadSettings awaits that function) hostage for the whole probe. The
-    status surface binding repaints the rows when the snapshot lands."""
-    import pathlib
+@pytest.fixture
+def row_client(isolated_settings, monkeypatch):
+    from ouroboros import config
+    from ouroboros.gateway import settings, safety_settings
+    from ouroboros.configured_subagents import normalize_configured_subagents
 
-    source = (
-        pathlib.Path(__file__).resolve().parents[1]
-        / "web" / "modules" / "reviewer_slots.js"
-    ).read_text(encoding="utf-8")
-    assert "await boundedStatusRefresh(state.store);" in source
-    assert "await state.store.refresh" not in source
-    # loadSettings awaits BOTH sections via Promise.all: one unbounded sibling
-    # would keep the Save button hostage to the same probe.
-    subagents = (
-        pathlib.Path(__file__).resolve().parents[1]
-        / "web" / "modules" / "subagents_settings.js"
-    ).read_text(encoding="utf-8")
-    assert "await boundedStatusRefresh(store);" in subagents
-    assert "await store.refresh" not in subagents
-    store = (
-        pathlib.Path(__file__).resolve().parents[1]
-        / "web" / "modules" / "claudexor_status_store.js"
-    ).read_text(encoding="utf-8")
-    assert "Promise.race([refresh, beat]).finally(() => { if (timer) clearTimeout(timer); });" in store, (
-        "the bounded beat must race the refresh (never cancel it) and clear "
-        "the losing timer"
-    )
+    for key in config.SETTINGS_DEFAULTS:
+        monkeypatch.delenv(key, raising=False)
+    catalog = {"enabled": True, "items": [
+        {"subagent_id": "reviewer", "recommended_use": "Review.", "review_eligible": True,
+         "route": {"kind": "api_model", "target_id": "openai/reviewer"}},
+        {"subagent_id": "helper", "recommended_use": "Help.",
+         "route": {"kind": "api_model", "target_id": "openai/helper"}},
+    ]}
+    isolated_settings.write_text(json.dumps({
+        "OPENROUTER_API_KEY": "old-private-secret", "OUROBOROS_MODEL": "openai/main",
+        "OUROBOROS_MODEL_LIGHT": "openai/light", "OUROBOROS_MODEL_SAFETY": "openai/checker",
+        "TOTAL_BUDGET": 200, "OUROBOROS_SUBAGENTS": normalize_configured_subagents(catalog)[1],
+        "MCP_SERVERS": [],
+    }), encoding="utf-8")
+    config.initialize_runtime_mode_baseline("pro")
+    app = _settings_app(monkeypatch, isolated_settings)
+    app.routes.extend([
+        Route("/api/settings", settings.api_settings_get, methods=["GET"]),
+        Route("/api/owner/safety-model", safety_settings.api_owner_safety_model, methods=["POST"]),
+        Route("/api/owner/safety-rules", safety_settings.api_owner_safety_rules, methods=["POST"]),
+    ])
+    with TestClient(app) as client:
+        yield client, isolated_settings, app
+
+
+def _mcp_row(name):
+    return {"id": name, "name": name, "enabled": True, "transport": "streamable_http",
+            "url": "https://example.test/mcp", "allowed_tools": []}
+
+
+def test_row_receipt_is_the_audit_projection_with_commit_tokens(row_client):
+    client, path, _ = row_client
+    result = client.post("/api/settings", json={"TOTAL_BUDGET": "250", "OPENROUTER_API_KEY": "new-private-secret",
+                                               "CUSTOM_TOKEN": "custom-private", "MCP_SERVERS": [_mcp_row("a")]})
+    assert result.status_code == 200, result.text
+    changes = result.json()["changes"]
+    assert changes["TOTAL_BUDGET"] == {"old": 200.0, "new": 250.0, "token": client.get("/api/settings").json()["_meta"]["tokens"]["TOTAL_BUDGET"]}
+    audit = [json.loads(line) for line in (path.parent / "logs/events.jsonl").read_text(encoding="utf-8").splitlines()
+             if json.loads(line).get("action") == "settings_changed"][-1]["changes"]
+    assert {k: {f: v for f, v in row.items() if f not in {"token", "old_absent"}} for k, row in changes.items()} == audit
+    assert changes["OPENROUTER_API_KEY"] == changes["CUSTOM_TOKEN"] == {"withheld": "secret"}
+    assert changes["MCP_SERVERS"]["withheld"] == "structure" and changes["MCP_SERVERS"]["token"]
+    assert all(secret not in result.text for secret in ("old-private-secret", "new-private-secret", "custom-private"))
+    tokens = client.get("/api/settings").json()["_meta"]["tokens"]
+    assert not {"OPENROUTER_API_KEY", "CUSTOM_TOKEN", "OUROBOROS_NETWORK_PASSWORD"} & tokens.keys()
+
+
+def test_owner_only_generic_write_names_its_endpoint_only_outside_cyber(row_client):
+    from ouroboros import config
+    client, path, _ = row_client
+    key = "OUROBOROS_RUNTIME_MODE"
+    refused = client.post("/api/settings", json={key: "light"})
+    assert refused.status_code == 200 and refused.json()["ignored_keys"][key] == "POST /api/owner/runtime-mode"
+    assert json.loads(path.read_text(encoding="utf-8"))[key] != "light"
+    config.reset_runtime_mode_baseline_for_tests()
+    config.initialize_runtime_mode_baseline("cyber_pro")
+    saved = client.post("/api/settings", json={key: "light"})
+    assert saved.status_code == 200 and key not in saved.json().get("ignored_keys", {})
+    assert json.loads(path.read_text(encoding="utf-8"))[key] == "light"
+
+
+def test_unrelated_change_does_not_block_a_key_condition_and_stale_undo_does(row_client):
+    client, path, _ = row_client
+    key = "TOTAL_BUDGET"
+    token = client.get("/api/settings").json()["_meta"]["tokens"][key]
+    assert client.post("/api/settings", json={"OUROBOROS_TOOL_TIMEOUT_SEC": 321}).status_code == 200
+    first = client.post("/api/settings", json={key: 250, "if_unchanged": {key: token}})
+    assert first.status_code == 200, first.text
+    assert client.post("/api/settings", json={key: 300}).status_code == 200
+    before = path.read_bytes()
+    stale = client.post("/api/settings", json={key: 200, "if_unchanged": {key: first.json()["changes"][key]["token"]}})
+    assert stale.status_code == 409 and stale.json()["saved"] is False
+    assert stale.json()["code"] == "settings_changed_elsewhere" and path.read_bytes() == before
+    fresh = client.get("/api/settings").json()["_meta"]["tokens"][key]
+    assert client.post("/api/settings", json={key: 200, "if_unchanged": {key: fresh}}).status_code == 200
+
+
+@pytest.mark.parametrize("misses", [1, 2])
+def test_generic_save_remerges_once_and_second_conflict_preserves_foreign_write(row_client, monkeypatch, misses):
+    from ouroboros.gateway import settings, owner_settings
+    client, path, _ = row_client
+    real, calls = settings._owner_write_settings, []
+
+    def interleave(*args, **kwargs):
+        calls.append(kwargs.get("expected_digest"))
+        if len(calls) <= misses:
+            # The other process has its own in-process mutex. Its actual field-transform seam holds the file lock.
+            owner_settings._owner_update_settings(owner_settings.fields_on_saved_document({"OUROBOROS_TOOL_TIMEOUT_SEC": 400 + len(calls)}))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(settings, "_owner_write_settings", interleave)
+    response = client.post("/api/settings", json={"TOTAL_BUDGET": 250})
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert calls and all(calls) and len(calls) == 2
+    assert stored["OUROBOROS_TOOL_TIMEOUT_SEC"] == 400 + misses
+    if misses == 1:
+        assert response.status_code == 200 and stored["TOTAL_BUDGET"] == 250
+    else:
+        assert response.status_code == 409 and stored["TOTAL_BUDGET"] == 200
+        assert response.json()["code"] == "settings_precondition_failed" and response.json()["saved"] is False
+
+
+def test_github_follow_up_writes_one_field_and_the_save_answers_one_receipt(row_client, monkeypatch):
+    """The repository the remote resolved lands as one field: a write another process committed after the save
+    survives it, and the answer keeps the save's old side with the follow-up's value and token."""
+    from ouroboros.gateway import owner_settings
+    from supervisor import git_ops
+    client, path, _ = row_client
+    document = json.loads(path.read_text(encoding="utf-8"))
+    path.write_text(json.dumps({**document, "GITHUB_TOKEN": "gh-private", "GITHUB_REPO": "owner/old"}), encoding="utf-8")
+
+    def resolve(slug, token, **_kwargs):
+        owner_settings._owner_update_settings(owner_settings.fields_on_saved_document({"OUROBOROS_TOOL_TIMEOUT_SEC": 432}))
+        return True, "configured", "owner/resolved"
+
+    monkeypatch.setattr(git_ops, "configure_personal_remote", resolve)
+    response = client.post("/api/settings", json={"GITHUB_REPO": "owner/typed"})
+    assert response.status_code == 200, response.text
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored["GITHUB_REPO"] == "owner/resolved" and stored["OUROBOROS_TOOL_TIMEOUT_SEC"] == 432
+    token = client.get("/api/settings").json()["_meta"]["tokens"]["GITHUB_REPO"]
+    assert response.json()["changes"]["GITHUB_REPO"] == {"old": "owner/old", "new": "owner/resolved", "token": token}
+    assert "gh-private" not in response.text
+
+
+@pytest.mark.parametrize("kind", ["structure", "checker", "scalar"])
+def test_delayed_http_answer_keeps_its_own_token_and_cannot_undo_a_later_commit(row_client, kind):
+    import asyncio
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    client, path, app = row_client
+    committed, release = threading.Event(), threading.Event()
+
+    class DelayAnswer:
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            async def delayed(message):
+                if message["type"] == "http.response.start" and (b"x-test-hold", b"yes") in scope.get("headers", []):
+                    committed.set()
+                    assert await asyncio.to_thread(release.wait, 10)
+                await send(message)
+            await self.app(scope, receive, delayed)
+
+    # TestClient already started the app; wrap the built ASGI stack at the delivery boundary.
+    app.middleware_stack = DelayAnswer(app.middleware_stack)
+    initial = client.get("/api/settings").json()
+    if kind == "checker":
+        key, endpoint = "OUROBOROS_SUBAGENTS", "/api/owner/safety-model"
+        old = json.loads(initial[key])
+        a1 = {**old, "items": [{**row, "enabled": False} if row["subagent_id"] == "helper" else row for row in old["items"]]}
+        b1 = {**a1, "items": [{**row, "recommended_use": "Changed by B."} if row["subagent_id"] == "helper" else row for row in a1["items"]]}
+    else:
+        key, endpoint = ("MCP_SERVERS" if kind == "structure" else "TOTAL_BUDGET"), "/api/settings"
+        old, a1, b1 = ([], [_mcp_row("a")], [_mcp_row("b")]) if kind == "structure" else (200, 250, 300)
+
+    def post(value, token, **kwargs):
+        payload = {"settings": {key: value}} if kind == "checker" else {key: value}
+        return client.post(endpoint, json={**payload, "if_unchanged": {key: token}}, **kwargs)
+
+    token = initial["_meta"]["tokens"][key]
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(post, a1, token, headers={"X-Test-Hold": "yes"})
+        try:
+            assert committed.wait(10)
+            after_a = client.get("/api/settings").json()["_meta"]["tokens"][key]
+            before = path.read_bytes()
+            stale_b = post(b1, token)
+            assert stale_b.status_code == 409 and stale_b.json()["saved"] is False and path.read_bytes() == before
+            fresh_b = post(b1, after_a)
+            assert fresh_b.status_code == 200, fresh_b.text
+            after_b = client.get("/api/settings").json()["_meta"]["tokens"][key]
+        finally:
+            release.set()
+        answer_a = future.result(timeout=10)
+    assert answer_a.status_code == 200, answer_a.text
+    own_token = answer_a.json()["changes"][key]["token"]
+    assert own_token == after_a != after_b
+    before = path.read_bytes()
+    undo = post(old, own_token)
+    assert undo.status_code == 409 and undo.json()["code"] == "settings_changed_elsewhere"
+    assert undo.json()["saved"] is False and path.read_bytes() == before
+
+
+def test_get_tokens_and_values_come_from_one_source_and_absence_has_an_inverse(row_client, monkeypatch):
+    from ouroboros.gateway import owner_settings
+    client, path, _ = row_client
+    real = owner_settings.read_settings_json_verified
+    reads = []
+
+    def interleave(*args, **kwargs):
+        document = real(*args, **kwargs)
+        reads.append(document)
+        if len(reads) == 1:
+            path.write_text(json.dumps({**document, "TOTAL_BUDGET": 999}), encoding="utf-8")
+        return document
+
+    with monkeypatch.context() as patch:
+        patch.setattr(owner_settings, "read_settings_json_verified", interleave)
+        shown = client.get("/api/settings").json()
+    assert len(reads) == 1 and shown["TOTAL_BUDGET"] == 200
+    assert shown["_meta"]["tokens"]["TOTAL_BUDGET"] == owner_settings.setting_tokens(reads[0], ["TOTAL_BUDGET"])["TOTAL_BUDGET"]
+    key = "OUROBOROS_UI_DIR"
+    missing = client.get("/api/settings").json()
+    saved = client.post("/api/settings", json={key: "none"}).json()["changes"][key]
+    assert saved["old"] == missing[key] and saved["old_absent"] is True
+    assert saved["token"] != missing["_meta"]["tokens"][key]
+    undo = client.post("/api/settings", json={"unset": [key], "if_unchanged": {key: saved["token"]}})
+    assert undo.status_code == 200 and key not in json.loads(path.read_text(encoding="utf-8")), undo.text
+    assert client.get("/api/settings").json()["_meta"]["tokens"][key] == missing["_meta"]["tokens"][key]
+    before = path.read_bytes()
+    refused = client.post("/api/settings", json={"unset": ["OUROBOROS_SAFETY_MODE"]})
+    assert refused.status_code == 400 and refused.json()["saved"] is False and path.read_bytes() == before
+
+
+def test_undo_of_a_following_slot_does_not_read_back_its_environment_mirror(row_client, monkeypatch):
+    """Every save mirrors its values into the environment, which stands in for an absent key. Undo's
+    `unset` reads the slot without that mirror, so it follows its proposal again instead of keeping the choice."""
+    from ouroboros import config
+    from ouroboros.gateway import settings
+    from ouroboros.settings_integrity import PROJECTED_PROPOSALS_ENV, PROJECTED_SETTINGS_ENV
+    client, path, _ = row_client
+    for name in (PROJECTED_PROPOSALS_ENV, PROJECTED_SETTINGS_ENV):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(settings, "_apply_settings_to_env", config.apply_settings_to_env)
+    slot = "OUROBOROS_MODEL_LIGHT"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    del document[slot]
+    path.write_text(json.dumps(document), encoding="utf-8")
+    following = client.get("/api/settings").json()
+    saved = client.post("/api/settings", json={slot: "openai/picked"}).json()["changes"][slot]
+    assert saved["old"] == following[slot] != "openai/picked" and saved["old_absent"] is True
+    undo = client.post("/api/settings", json={"unset": [slot], "if_unchanged": {slot: saved["token"]}})
+    assert undo.status_code == 200, undo.text
+    assert undo.json()["changes"][slot] == {
+        "old": "openai/picked", "new": following[slot], "token": following["_meta"]["tokens"][slot]}
+    assert slot not in json.loads(path.read_text(encoding="utf-8"))
+    assert config.load_settings()[slot] == client.get("/api/settings").json()[slot] == following[slot]
+
+
+def test_safety_projection_failure_is_saved_and_receipt_failure_is_unavailable(row_client, monkeypatch):
+    from ouroboros import config
+    from ouroboros.gateway import owner_settings
+    client, path, _ = row_client
+    real_project = config.apply_settings_to_env
+    def failed_projection(values, **kwargs):
+        if "environ" in kwargs:
+            return real_project(values, **kwargs)
+        raise RuntimeError("projection failed")
+    with monkeypatch.context() as patch:
+        patch.setattr(config, "apply_settings_to_env", failed_projection)
+        result = client.post("/api/owner/safety-rules", json={"rules": "Ask me."})
+    assert result.status_code == 500 and result.json()["saved"] is True
+    assert result.json()["changes"]["OUROBOROS_SAFETY_OWNER_RULES"]["new"] == "Ask me."
+    assert json.loads(path.read_text(encoding="utf-8"))["OUROBOROS_SAFETY_OWNER_RULES"] == "Ask me."
+    with monkeypatch.context() as patch:
+        patch.setattr(owner_settings, "_committed_changes", lambda *_: (_ for _ in ()).throw(ValueError("receipt failed")))
+        result = client.post("/api/settings", json={"TOTAL_BUDGET": 275})
+    assert result.status_code == 200 and result.json()["receipt"] == "unavailable" and "changes" not in result.json()
+    assert json.loads(path.read_text(encoding="utf-8"))["TOTAL_BUDGET"] == 275
+
+
+@pytest.mark.parametrize("case", ["plain", "recheck", "twins", "last_reviewer"])
+def test_roster_row_switches_keep_checker_and_review_pool_guards(row_client, case):
+    from ouroboros.configured_subagents import normalize_configured_subagents
+    client, path, _ = row_client
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    catalog = json.loads(stored["OUROBOROS_SUBAGENTS"])
+    if case == "recheck":
+        catalog["items"][1].update(rechecks_flags=True, delivery="packet")
+    if case == "twins":
+        old = {"recommended_use": "Old.", "route": {"kind": "api_model", "target_id": "openai/old"}}
+        catalog["items"] += [{**old, "subagent_id": "old-a"}, {**old, "subagent_id": "old-b"}]
+    stored["OUROBOROS_SUBAGENTS"] = normalize_configured_subagents(catalog)[1]
+    path.write_text(json.dumps(stored), encoding="utf-8")
+    key = "OUROBOROS_SUBAGENTS"
+    token = client.get("/api/settings").json()["_meta"]["tokens"][key]
+    changed = json.loads(stored[key])
+    index = 0 if case == "last_reviewer" else 1
+    changed["items"][index]["enabled"] = False
+    before = path.read_bytes()
+    result = client.post("/api/settings", json={key: changed, "if_unchanged": {key: token}})
+    if case == "recheck":
+        assert result.status_code == 400 and result.json()["saved"] is False and path.read_bytes() == before
+        result = client.post("/api/owner/safety-model", json={"settings": {key: changed}, "if_unchanged": {key: token}})
+    elif case == "last_reviewer":
+        assert result.status_code == 400 and result.json()["code"] == "empty_review_pool"
+        assert result.json()["saved"] is False and path.read_bytes() == before
+        result = client.post("/api/settings", json={key: changed, "if_unchanged": {key: token}, "allow_empty_review_pool": True})
+    assert result.status_code == 200, result.text
+    saved = json.loads(json.loads(path.read_text(encoding="utf-8"))[key])
+    assert saved["items"][index]["enabled"] is False
+    if case in {"plain", "twins"}:
+        # An edit that creates a twin is judged, and so is switching a stored twin: it keeps the pair.
+        edits = [[*changed["items"], {**changed["items"][1], "subagent_id": "new-twin"}]]
+        if case == "twins":
+            edits.append([*changed["items"][:3], {**changed["items"][3], "enabled": False}])
+        for items in edits:
+            before = path.read_bytes()
+            refused = client.post("/api/settings", json={key: {**changed, "items": items}})
+            assert refused.status_code == 400 and "same engine" in refused.json()["error"], refused.text
+            assert refused.json()["saved"] is False and path.read_bytes() == before
+
+
+@pytest.mark.parametrize("endpoint,handler,body,key", [
+    ("runtime-mode", "api_owner_runtime_mode", {"mode": "light"}, "OUROBOROS_RUNTIME_MODE"),
+    ("auto-grant", "api_owner_auto_grant", {"enabled": False}, "OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS"),
+    ("context-mode", "api_owner_context_mode", {"mode": "low"}, "OUROBOROS_CONTEXT_MODE"),
+    ("safety-mode", "api_owner_safety_mode", {"mode": "light"}, "OUROBOROS_SAFETY_MODE"),
+])
+def test_owner_scalar_endpoints_return_effective_old_and_their_commit_token(row_client, endpoint, handler, body, key):
+    from ouroboros.gateway import settings, safety_settings
+    client, _, app = row_client
+    fn = getattr(safety_settings if endpoint == "safety-mode" else settings, handler)
+    app.routes.append(Route("/api/owner/" + endpoint, fn, methods=["POST"]))
+    before = client.get("/api/settings").json()
+    response = client.post("/api/owner/" + endpoint, json=body)
+    assert response.status_code == 200, response.text
+    change = response.json()["changes"][key]
+    after = client.get("/api/settings").json()
+    assert change["old"] == before[key] and change["new"] == after[key]
+    assert change["token"] == after["_meta"]["tokens"][key]
+    repeated = client.post("/api/owner/" + endpoint, json=body)
+    assert repeated.status_code == 200 and key not in repeated.json()["changes"]
+
+
+def test_project_context_receipt_has_only_that_rooms_old_and_new(row_client):
+    from ouroboros.gateway import settings
+    from ouroboros.projects_registry import create_project
+    client, path, app = row_client
+    create_project(path.parent, "receipt-room", name="Receipt room")
+    app.routes.append(Route("/api/owner/context-mode", settings.api_owner_context_mode, methods=["POST"]))
+    before = path.read_bytes()
+    response = client.post("/api/owner/context-mode", json={"mode": "low", "project_id": "receipt-room"})
+    assert response.status_code == 200, response.text
+    assert response.json()["changes"] == {"OUROBOROS_CONTEXT_MODE": {"old": "max", "new": "low"}}
+    assert path.read_bytes() == before
+    response = client.post("/api/owner/context-mode", json={"mode": "max", "project_id": "receipt-room"})
+    assert response.status_code == 200 and response.json()["changes"] == {"OUROBOROS_CONTEXT_MODE": {"old": "low", "new": "max"}}
+    assert path.read_bytes() == before

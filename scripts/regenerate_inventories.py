@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regenerate the three CPL-2 gen/verify inventories (plan §7.2).
+"""Regenerate the generated inventories (the three CPL-2 gen/verify ones, plan §7.2, and the UI one).
 
 Each inventory is a generated document whose staleness turns CI red
 (``tests/test_generated_inventories.py`` pins byte-identity against a fresh
@@ -24,6 +24,11 @@ in-memory regeneration, plus the resolution invariants below):
    declared "this binding exists for compatibility" convention, per the
    reference FACADE_CONSUMERS method), with its leaves, name counts and
    domain from ``ouroboros/domains.toml``.
+
+4. ``docs/inventories/UI_CONTROL_TEXT_INVENTORY.md`` — the fixed control text of the web UI sorted
+   by text, and every ``ouro:*`` CustomEvent with the modules that raise it, so that the siblings
+   of a new control appear next to it in the diff (builder and rationale:
+   ``scripts/ui_control_inventory.py``; staleness is its only red).
 
 Convention follows the ratchet/domain-manifest pairs: generator in scripts/,
 deterministic output (no timestamps, no HEAD SHAs), verify test in tests/.
@@ -54,6 +59,8 @@ from ouroboros.reference_books import (  # noqa: E402
     read_book_section,
 )
 
+from scripts.ui_control_inventory import UI_CONTROLS_OUT, build_ui_control_inventory  # noqa: E402
+
 OUT_DIR = REPO_ROOT / "docs" / "inventories"
 FROZEN_OUT = OUT_DIR / "FROZEN_CONTRACTS_INVENTORY.md"
 LAYOUT_OUT = OUT_DIR / "DATA_LAYOUT_INVENTORY.md"
@@ -65,9 +72,19 @@ _CODE_SPAN = re.compile(r"`([^`]+)`")
 
 
 def _tracked_all() -> set[str]:
-    out = subprocess.run(["git", "ls-files"], cwd=REPO_ROOT,
-                         capture_output=True, text=True, check=True).stdout
-    return set(out.split())
+    """The candidate's files: tracked, or untracked and not ignored, and present on disk.
+
+    The commit gate stages a candidate and unstages it after a red, and Ouroboros cannot stage by
+    hand, so an inventory must read the same staged or not; a clean checkout reads its tracked files.
+    """
+    out = subprocess.run(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+                         cwd=REPO_ROOT, capture_output=True, check=True).stdout
+    return {p for p in out.decode("utf-8", "surrogateescape").split("\0") if p and (REPO_ROOT / p).is_file()}
+
+
+def _candidate_population() -> list[str]:
+    """The candidate's runtime modules, read the way ``_tracked_all`` reads files."""
+    return sorted(p for p in tracked_population(REPO_ROOT, untracked=True) if (REPO_ROOT / p).is_file())
 
 
 def _split_row(line: str) -> list[str]:
@@ -173,7 +190,7 @@ def build_frozen_inventory(book: ReferenceBook | None = None) -> tuple[str, list
         findings.append(f"frozen: §11.1 references missing file: {span}")
         return "MISSING"
 
-    contracts_pkg = sorted(p for p in tracked_population(REPO_ROOT)
+    contracts_pkg = sorted(p for p in _candidate_population()
                            if p.startswith("ouroboros/contracts/")
                            and not p.endswith("__init__.py"))
     referenced = set()
@@ -271,8 +288,7 @@ def build_layout_inventory(book: ReferenceBook | None = None) -> tuple[str, list
             tracked_dirs.add("/".join(parts[:i]))
 
     runtime_blob = "\n".join(
-        (REPO_ROOT / p).read_text(encoding="utf-8", errors="replace")
-        for p in sorted(tracked_population(REPO_ROOT)))
+        (REPO_ROOT / p).read_text(encoding="utf-8", errors="replace") for p in _candidate_population())
 
     findings: list[str] = []
     rows: list[tuple[str, str, str]] = []
@@ -425,6 +441,7 @@ BUILDERS = {
     FROZEN_OUT: build_frozen_inventory,
     LAYOUT_OUT: build_layout_inventory,
     FACADE_OUT: build_facade_inventory,
+    UI_CONTROLS_OUT: build_ui_control_inventory,
 }
 
 
@@ -451,7 +468,7 @@ def main(argv: list[str] | None = None) -> int:
                 stale.append(str(rel))
         else:
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(rendered, encoding="utf-8")
+            out_path.write_text(rendered, encoding="utf-8", newline="\n")  # the repository's LF, on Windows too
             print(f"wrote {rel}")
 
     for f in all_findings:

@@ -13,9 +13,10 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Optional
 
+from ouroboros.model_concurrency import limit_physical_send
+
 from ouroboros.usage_accounting import (
     UsageScope,
-    current_usage_scope,
     physical_attempt_limit,
     usage_scope,
 )
@@ -54,96 +55,17 @@ def _accounted_send(
     request = _attempt_request(target, final_candidate, source=source)
     return _execute_candidate(
         request,
-        lambda: send(final_candidate),
+        limit_physical_send(target, lambda: send(final_candidate)),
         _candidate_before_dispatch(final_candidate, request),
     )
 
 
-def probe_oversized_context(
-    client,
-    model: str,
-    content: str,
-    *,
-    base_url: str = "",
-    max_output_tokens: int = 8,
-    timeout: float = 20.0,
-    api_key: Optional[str] = None,
-) -> dict[str, Any]:
-    """Compatibility implementation for the generative context-window probe."""
-    try:
-        target = client._resolve_remote_target(model)
-        if str(base_url or "").strip():
-            target = {**target, "base_url": str(base_url).strip()}
-        if api_key is not None:
-            target = {**target, "api_key": api_key}
-        remote = client._get_remote_client(target)
-        resolved_model = str(target.get("resolved_model") or model.split("::")[-1])
-        provider = str(target.get("provider") or "")
-    except Exception as exc:  # pragma: no cover - setup failure -> fail-closed
-        return {
-            "ok": False,
-            "status_code": None,
-            "body": f"probe setup failed: {type(exc).__name__}",
-            "echoed_text": "",
-            "usage_prompt": 0,
-        }
-
-    cap = (
-        {"max_completion_tokens": max_output_tokens}
-        if provider == "openai"
-        else {"max_tokens": max_output_tokens}
-    )
-    candidate = {
-        "model": resolved_model,
-        "messages": [{"role": "user", "content": content}],
-        "temperature": 0,
-        **cap,
-    }
-
-    def dispatch() -> Any:
-        return _accounted_send(
-            target,
-            candidate,
-            lambda payload: remote.with_options(timeout=timeout).chat.completions.create(**payload),
-            source="capability_probe",
-        )
-
-    try:
-        if current_usage_scope() is None:
-            with usage_scope(UsageScope(
-                task_id="system:capability_probe",
-                root_task_id="system:capability_probe",
-                category="capability_probe",
-                source="capability_probe",
-            )):
-                response = dispatch()
-        else:
-            response = dispatch()
-        echoed, usage_prompt = "", 0
-        try:
-            echoed = str(response.choices[0].message.content or "")
-            usage_prompt = int(getattr(getattr(response, "usage", None), "prompt_tokens", 0) or 0)
-        except Exception:
-            pass
-        return {
-            "ok": True,
-            "status_code": 200,
-            "body": "",
-            "echoed_text": echoed,
-            "usage_prompt": usage_prompt,
-        }
-    except Exception as exc:
-        status = getattr(exc, "status_code", None) or getattr(
-            getattr(exc, "response", None), "status_code", None
-        )
-        body = str(getattr(exc, "message", "") or getattr(exc, "body", "") or str(exc))
-        return {
-            "ok": False,
-            "status_code": status if isinstance(status, int) else None,
-            "body": body,
-            "echoed_text": "",
-            "usage_prompt": 0,
-        }
+def accounted_one_shot(target: dict[str, Any], candidate: dict[str, Any], send, *, source: str) -> Any:
+    """One accounted provider-test send attributed to ``system:<source>``; at most one physical attempt."""
+    task_id = f"system:{source}"
+    with usage_scope(UsageScope(task_id=task_id, root_task_id=task_id, category="provider_test",
+                                non_task_operation=True, source=source)), physical_attempt_limit(1):
+        return _accounted_send(target, candidate, send, source=source)
 
 
 def _plain(value: Any) -> Any:
@@ -208,6 +130,10 @@ def controlled_probe_error(exc: BaseException) -> dict[str, Any]:
     """Map typed transport facts to one bounded, provider-neutral reason."""
     status, code, error_type = _error_facts(exc)
     credit_codes = {
+        # Z.ai answers plan exhaustion as HTTP 429 code 1113 "Insufficient
+        # balance" (billing, not rate limiting; a Coding Plan key on the
+        # pay-as-you-go endpoint lands here too).
+        "1113",
         "billing_hard_limit_reached",
         "credit_balance_too_low",
         "credits_exhausted",
@@ -252,7 +178,11 @@ def controlled_probe_error(exc: BaseException) -> dict[str, Any]:
             connect_types += (openai.APIConnectionError,)
         except Exception:  # pragma: no cover - dependency is shipped
             pass
-        if isinstance(exc, timeout_types):
+        from ouroboros.net_transport import ExtraCaBundleError
+
+        if isinstance(exc, ExtraCaBundleError):
+            reason = str(exc)  # the owner's trust bundle, not the provider, is what failed
+        elif isinstance(exc, timeout_types):
             reason = "Timed out"
         elif isinstance(exc, connect_types):
             reason = "Could not reach provider"
@@ -269,11 +199,10 @@ def controlled_probe_error(exc: BaseException) -> dict[str, Any]:
 def _probe_candidate(target: Mapping[str, Any]) -> dict[str, Any]:
     provider = str(target.get("provider") or "")
     model = str(target.get("resolved_model") or "")
-    token_key = (
-        "max_completion_tokens"
-        if provider == "openai" and model.startswith(("gpt-5", "o1", "o3", "o4"))
-        else "max_tokens"
-    )
+    # The send path's provider-wide rule (``_build_remote_kwargs``): official direct
+    # OpenAI Chat takes the current completion-token carrier for every model; a model
+    # name is not evidence of which carrier a route accepts.
+    token_key = "max_completion_tokens" if provider == "openai" else "max_tokens"
     candidate: dict[str, Any] = {
         "model": model,
         "messages": [{"role": "user", "content": PROVIDER_TEST_PROMPT}],
@@ -325,7 +254,7 @@ def probe_provider_readiness(
 
         if provider in {
             "openrouter", "openai", "openai-compatible", "minimax", "cloudru",
-            "deepseek",
+            "deepseek", "zai",
         }:
             remote_client = client._new_remote_client(target)
 
@@ -347,8 +276,10 @@ def probe_provider_readiness(
 
             def send_anthropic(payload):
                 from ouroboros.llm_attempt import processing_contract_headers
+                from ouroboros.net_transport import requests_verify_kwargs
                 response = requests.post(
                     url, headers={**headers, **processing_contract_headers(target, payload)}, json=payload, timeout=float(timeout),
+                    **requests_verify_kwargs(),
                 )
                 response.raise_for_status()
                 return response
@@ -371,15 +302,7 @@ def probe_provider_readiness(
         else:
             raise ValueError("unsupported provider route")
 
-        with usage_scope(UsageScope(
-            task_id="system:provider_test",
-            root_task_id="system:provider_test",
-            category="provider_test",
-            source="provider_test",
-        )), physical_attempt_limit(1):
-            response = _accounted_send(
-                target, candidate, dispatch, source="provider_test",
-            )
+        response = accounted_one_shot(target, candidate, dispatch, source="provider_test")
         if not _valid_completion_envelope(response, provider):
             raise ProbeEnvelopeError("provider returned no completion envelope")
         return {
@@ -401,8 +324,8 @@ def probe_provider_readiness(
 __all__ = [
     "PROVIDER_TEST_MAX_TOKENS",
     "PROVIDER_TEST_PROMPT",
+    "accounted_one_shot",
     "controlled_probe_error",
-    "probe_oversized_context",
     "probe_provider_readiness",
 ]
 
@@ -419,7 +342,7 @@ def upstream_transport_reachable(llm: Any, model: str, *, timeout: float,
     from ouroboros.transport_custody import is_loopback_base_url
     try:
         if provider_for_model(model) == "claudexor":
-            from ouroboros.llm_claudexor import model_catalog
+            from ouroboros.llm_claudexor import catalog_admits_model, model_catalog
             from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, model_role_option
             source, native_model = parse_claudexor_model(model)
             account = (model_role_option(MODEL_ACCOUNTS_KEY, model_role)
@@ -442,7 +365,7 @@ def upstream_transport_reachable(llm: Any, model: str, *, timeout: float,
                     and (not account or catalog.get("credentialProfileId") == account)
                     and (not effective.get("accountFingerprint")
                          or catalog.get("accountFingerprint") == effective["accountFingerprint"])
-                    and any(item.get("id") == native_model for item in catalog.get("models", []))):
+                    and catalog_admits_model(catalog, native_model)):
                 return {"kind": "upstream_catalog", "source": source,
                         "observed_at": catalog["observedAt"], "provenance": catalog["provenance"],
                         "credential_profile_id": catalog.get("credentialProfileId"),
@@ -456,7 +379,8 @@ def upstream_transport_reachable(llm: Any, model: str, *, timeout: float,
         # Metadata carries no cognitive in-flight lease. Reuse the ordinary
         # connection allowance for every HEAD phase, not the LLM read window.
         timeout = min(float(timeout), float(llm._no_proxy_timeout(timeout).connect))
-        with httpx.Client(trust_env=False, timeout=timeout, follow_redirects=False) as client:
+        from ouroboros.net_transport import verify_kwargs
+        with httpx.Client(trust_env=False, timeout=timeout, follow_redirects=False, **verify_kwargs()) as client:
             response = client.head(url)
         # An upstream HTTP refusal still proves connectivity. A gateway/server
         # outage does not. This says nothing about the old generation's outcome.

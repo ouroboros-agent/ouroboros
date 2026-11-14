@@ -76,7 +76,9 @@ def _reviewed_skill(skill_dir: pathlib.Path, drive_root: pathlib.Path):
     return loaded
 
 
-def test_reducer_matches_loader_canonical_inventory_order(tmp_path):
+def test_snapshot_identity_is_the_release_digest_of_the_canonical_inventory(tmp_path):
+    from ouroboros.skill_identity import release_declaration, release_digest_from_file_digests
+
     skill_dir = _write_skill(tmp_path / "skills" / "demo")
     (skill_dir / "payload.bin").write_bytes(b"payload")
     manual = []
@@ -85,13 +87,19 @@ def test_reducer_matches_loader_canonical_inventory_order(tmp_path):
             rel = path.relative_to(skill_dir).as_posix()
             manual.append((rel, hashlib.sha256(path.read_bytes()).digest()))
 
+    # The loader's content hash is the release digest: these files plus the manifest's declaration.
+    declaration = release_declaration(skill_dir)
+    assert declaration == [{"kind": "pip", "package": "example-package"}]
+    assert release_digest_from_file_digests(manual, declaration) == compute_content_hash(skill_dir)
+    # The version-1 reducer survives only to recognize records made before the release digest.
     historical = hashlib.sha256()
     for rel, file_digest in manual:
         historical.update(rel.encode("utf-8"))
         historical.update(b"\0")
         historical.update(file_digest)
-    assert reduce_skill_content_hash(manual) == historical.hexdigest()
-    assert reduce_skill_content_hash(manual) == compute_content_hash(skill_dir)
+    assert reduce_skill_content_hash(manual) == historical.hexdigest() != compute_content_hash(skill_dir)
+    loaded = load_skill(skill_dir, tmp_path)
+    assert capture_skill_publish_candidate(loaded).content_hash == compute_content_hash(skill_dir)
 
 
 def test_snapshot_hash_parity_and_full_public_control_views(tmp_path):
@@ -131,38 +139,41 @@ def test_snapshot_hash_parity_and_full_public_control_views(tmp_path):
         snapshot.skill = "other"  # type: ignore[misc]
 
 
-def test_environment_template_roundtrips_import_list_review_and_publish(tmp_path, monkeypatch):
+@pytest.mark.parametrize("name", [".env.example", "credentials.json", "id_rsa"])
+def test_environment_file_roundtrips_import_list_review_and_publish(tmp_path, monkeypatch, name):
     from ouroboros.marketplace.fetcher import stage
-    from ouroboros.skill_review_packs import _build_skill_file_packs
+    from ouroboros.skill_review_packs import frozen_payload_files, payload_pack
     from ouroboros.tools.registry import ToolContext
     from ouroboros.tools.skill_exec import _handle_list_skills
     from ouroboros.tools.review_file_pack import build_touched_file_pack
 
     drive = tmp_path / "drive"
     payload = _write_skill(drive / "skills" / "external" / "demo")
-    template = payload / ".env.example"
+    template = payload / name
     content = b"APP_NAME=example\nAPI_TOKEN=\n"
     template.write_bytes(content)
     loaded = _reviewed_skill(payload, drive)
     monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", "")
-    summary = json.loads(_handle_list_skills(ToolContext(repo_dir=tmp_path, drive_root=drive)))
-    row = next(item for item in summary["skills"] if item["name"] == "demo")
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=drive)
+    assert [row["name"] for row in json.loads(_handle_list_skills(ctx))["skills"]] == ["demo"]
+    row = json.loads(_handle_list_skills(ctx, name="demo"))["skills"][0]
     assert not row["load_error"] and row["content_hash"] == loaded.content_hash
-    packs = _build_skill_file_packs(payload, expected_content_hash=loaded.content_hash)
-    assert "### .env.example" in "\n".join(packs)
-    assert content.decode() in "\n".join(packs)
-    touched, omitted = build_touched_file_pack(payload, [".env.example"])
-    assert not omitted and "APP_NAME=example" in touched
+    pack = payload_pack(frozen_payload_files(payload))
+    assert f"### {name}\n" in pack
+    assert content.decode() in pack
+    if name == ".env.example":  # the generic commit-review file pack keeps its own policy
+        touched, omitted = build_touched_file_pack(payload, [name])
+        assert not omitted and "APP_NAME=example" in touched
     snapshot = capture_skill_publish_snapshot(loaded)
-    assert snapshot.file(".env.example").content == content
-    assert ".env.example" in {item.path for item in snapshot.public_files}
+    assert snapshot.file(name).content == content
+    assert name in {item.path for item in snapshot.public_files}
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, "w") as packed:
         for item in snapshot.public_files:
             packed.writestr(item.path, item.content)
     staged = stage(archive.getvalue(), slug="demo", version="1.2.3")
     try:
-        assert (staged.staging_dir / ".env.example").read_bytes() == content
+        assert (staged.staging_dir / name).read_bytes() == content
         assert compute_content_hash(staged.staging_dir) == snapshot.content_hash
     finally:
         staged.cleanup()
@@ -310,17 +321,15 @@ def test_snapshot_oversized_public_stream_reads_only_remaining_plus_one(tmp_path
     assert returned[0] < payload_size
 
 
-def test_snapshot_fails_closed_on_sensitive_or_unreadable_payload(tmp_path, monkeypatch):
+def test_snapshot_captures_credential_like_names_and_fails_closed_on_unreadable_payload(tmp_path, monkeypatch):
     drive_root = tmp_path / "drive"
-    sensitive = _write_skill(drive_root / "skills" / "external" / "sensitive")
-    (sensitive / ".env").write_bytes(b"fixture")
-    loaded = load_skill(sensitive, drive_root)
-    assert loaded is not None and loaded.load_error
-    loaded.load_error = ""
-    loaded.review = SkillReviewState(status="clean", content_hash="irrelevant")
-    with pytest.raises(SkillPublishSnapshotError) as caught:
-        capture_skill_publish_snapshot(loaded)
-    assert caught.value.reason_code == "snapshot_payload_unreadable"
+    named = _write_skill(drive_root / "skills" / "external" / "named")
+    (named / ".env").write_bytes(b"fixture")
+    loaded = _reviewed_skill(named, drive_root)
+    assert not loaded.load_error
+    snapshot = capture_skill_publish_snapshot(loaded)
+    assert snapshot.file(".env").content == b"fixture"
+    assert ".env" in {item.path for item in snapshot.public_files}
 
     unreadable = _write_skill(drive_root / "skills" / "external" / "unreadable")
     payload = unreadable / "payload.txt"

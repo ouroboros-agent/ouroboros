@@ -4,14 +4,17 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from types import SimpleNamespace
 
 import pytest
 from starlette.requests import Request
 
+from ouroboros import dialogue_import, dialogue_store as ds
 from ouroboros.gateway.task_events import _TaskEventCursorFollower, api_task_events, iter_task_events
-from ouroboros.gateway.task_list_scan import raw_result_facts
 from ouroboros.task_results import write_task_result
+
+FILE_SOURCES = ("events", "tools", "supervisor")  # the logs that stay rotated files
 
 
 def seed(root, task_id="root"):
@@ -21,8 +24,13 @@ def seed(root, task_id="root"):
 
 
 def append(root, text, *, source="progress", task_id="root", **fields):
+    """One row: a dialogue stream's row is stored (its coordinate is the store's), a file log's
+    row is appended to the live file; both answer the row's length (the next position)."""
+    row = {"task_id": task_id, "content": text, **fields}
+    if source in ds.STREAMS:
+        return ds.append(root, source, row).length
     path = root / "logs" / f"{source}.jsonl"
-    raw = (json.dumps({"task_id": task_id, "content": text, **fields}) + "\n").encode()
+    raw = (json.dumps(row) + "\n").encode()
     with path.open("ab") as handle:
         handle.write(raw)
     return len(raw)
@@ -55,6 +63,47 @@ def content(events):
     return [row["data"]["content"] for row in events if row.get("data", {}).get("content")]
 
 
+class _AfterAppendClock:
+    """The ``time`` the v2 stream reads: its monotonic clock stands still until a read pass that
+    began after the test's append has run to its end, then passes any deadline. ``HANG_SEC`` of
+    real time passes it all the same, so a stream that never makes that pass still ends."""
+
+    HANG_SEC = 30.0
+
+    def __init__(self) -> None:
+        self.started = time.monotonic()
+        self.appended = False
+        self.read_after_append = False
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+    def monotonic(self) -> float:
+        if self.read_after_append or time.monotonic() - self.started > self.HANG_SEC:
+            return self.started + 10**6
+        return self.started
+
+
+@pytest.fixture()
+def after_append_clock(monkeypatch):
+    """A stream deadline driven by its reads: the test sets ``appended`` once its row is stored, and the
+    first read pass that began after that and ran to its end releases the clock."""
+    from ouroboros.gateway import task_events
+
+    clock = _AfterAppendClock()
+    real_read = task_events._TaskEventCursorFollower.read_events
+
+    def read_events(follower):
+        began_after_append = clock.appended
+        yield from real_read(follower)
+        if began_after_append:
+            clock.read_after_append = True
+
+    monkeypatch.setattr(task_events, "time", clock)
+    monkeypatch.setattr(task_events._TaskEventCursorFollower, "read_events", read_events)
+    return clock
+
+
 def test_reconnect_resumes_after_exact_row_and_keeps_backdated_append(tmp_path):
     root = seed(tmp_path / "data")
     first_bytes = append(root, "first", ts="2026-01-01T00:02:00Z")
@@ -73,8 +122,11 @@ def test_reconnect_resumes_after_exact_row_and_keeps_backdated_append(tmp_path):
     assert first[1]["event_id"] == resumed[0]["event_id"]
 
 
-@pytest.mark.parametrize("source", ["progress", "chat", "events", "tools", "supervisor"])
-def test_every_source_survives_two_rotations_and_legacy_replay(tmp_path, source):
+@pytest.mark.parametrize("source", ["progress", "chat", "supervisor"])
+def test_every_source_resumes_exactly_and_legacy_replay_sees_everything(tmp_path, source):
+    """A file log survives two rotations between reads; a dialogue stream has no rotation, its
+    rows are stored at their coordinates. Either way the resumed stream delivers exactly the
+    rows after the cursor and the legacy replay every row."""
     root = seed(tmp_path / "data")
     append(root, "first", source=source)
     initial = stream(root)
@@ -82,8 +134,9 @@ def test_every_source_survives_two_rotations_and_legacy_replay(tmp_path, source)
     live = root / "logs" / f"{source}.jsonl"
     for index in [1, 2]:
         append(root, f"before-{index}", source=source)
-        os.replace(live, root / "archive" / f"{source}_20260101T00000{index}.jsonl")
-        live.touch()
+        if source in FILE_SOURCES:
+            os.replace(live, root / "archive" / f"{source}_20260101T00000{index}.jsonl")
+            live.touch()
     append(root, "last", source=source)
     resumed = stream(root, initial[-1]["cursor"])
     assert content(resumed) == ["before-1", "before-2", "last"]
@@ -108,14 +161,60 @@ def test_late_child_and_changed_existing_lineage_replay_disclosed_view(tmp_path)
     assert next(r for r in resumed if r.get("data", {}).get("content") == "parent")["event_id"] == first[0]["event_id"]
 
 
-def test_live_partial_waits_but_immutable_partial_discloses_and_advances(tmp_path):
+def test_a_row_written_to_both_planes_streams_once_and_a_drive_only_row_still_streams(tmp_path):
+    """REPLICA_RULE: a child's model error is in its drive and the canonical log; the v2 stream delivers it
+    once on a connection by its natural key, while an older error only the drive holds still streams."""
     root = seed(tmp_path / "data")
-    path = root / "logs" / "progress.jsonl"
+    child = tmp_path / "child"
+    (child / "logs").mkdir(parents=True)
+    write_task_result(root, "child", "running", delegation_role="subagent", parent_task_id="root",
+                      child_drive_root=str(child))
+    error = dict(source="events", task_id="child", type="llm_api_error", ts="2026-01-01T00:00:01Z")
+    append(child, "drive only", llm_call_id="c0", **error)
+    append(child, "replicated", llm_call_id="c1", **error)
+    append(root, "replicated", llm_call_id="c1", **error)
+    events = stream(root)
+    assert sorted(row["data"]["llm_call_id"] for row in events if row.get("type") == "llm_api_error") == ["c0", "c1"]
+
+
+def test_a_pass_that_skips_a_replica_acknowledges_it_before_the_stream_idles(tmp_path, after_append_clock):
+    """The replica lands after the drive copy was delivered; the pass that skips it sends a cursor checkpoint,
+    so a cut in the idle window that follows resumes past the replica instead of delivering it again. The
+    deadline waits for that pass (``after_append_clock``), so a slow first pass cannot spend it."""
+    clock = after_append_clock
+    root = seed(tmp_path / "data")
+    child = tmp_path / "child"
+    (child / "logs").mkdir(parents=True)
+    write_task_result(root, "child", "running", delegation_role="subagent", parent_task_id="root",
+                      child_drive_root=str(child))
+    error = dict(source="events", task_id="child", type="llm_api_error", ts="2026-01-01T00:00:01Z", llm_call_id="c1")
+    append(child, "drive copy", **error)
+    frames = []
+
+    def on_event(frame):
+        frames.append(frame)
+        if frame.get("type") == "task_result" and not clock.appended:
+            append(root, "replica", **error)  # after the first pass, before the second
+            clock.appended = True
+
+    stream(root, wait=2, on_event=on_event)
+    assert clock.read_after_append, f"no read pass after the append ended within {clock.HANG_SEC} s"
+    assert frames[-1]["type"] == "cursor_checkpoint"  # the deadline's
+    resumed = stream(root, frames[-2]["cursor"])  # a cut just before the deadline checkpoint
+    errors = [frame for frame in frames + resumed if frame.get("type") == "llm_api_error"]
+    assert [frame["data"]["content"] for frame in errors] == ["drive copy"], errors
+
+
+def test_live_partial_waits_but_immutable_partial_discloses_and_advances(tmp_path):
+    """The file logs (tools here): an unfinished live line waits for its writer; a torn line in an
+    immutable archive is disclosed once and stepped over."""
+    root = seed(tmp_path / "data")
+    path = root / "logs" / "tools.jsonl"
     partial = json.dumps({"task_id": "root", "content": "partial"}).encode()
     path.write_bytes(partial)
     first = stream(root)
     assert content(first) == []
-    assert first[-1]["cursor"]["positions"][str(root)]["progress"] == 0
+    assert first[-1]["cursor"]["positions"][str(root)]["tools"] == 0
     with path.open("ab") as handle:
         handle.write(b"\n")
     second = stream(root, first[-1]["cursor"])
@@ -123,20 +222,48 @@ def test_live_partial_waits_but_immutable_partial_discloses_and_advances(tmp_pat
     with path.open("ab") as handle:
         handle.write(b'{"torn":')
     (root / "archive").mkdir()
-    os.replace(path, root / "archive" / "progress_20260101T000001.jsonl")
+    os.replace(path, root / "archive" / "tools_20260101T000001.jsonl")
     path.touch()
-    append(root, "after")
+    append(root, "after", source="tools")
     third = stream(root, second[-1]["cursor"])
     assert [r["reason"] for r in third if r["type"] == "history_gap"] == ["invalid_archive_line"]
     assert content(third) == ["after"]
     assert content(stream(root, third[-1]["cursor"])) == []
 
 
-def test_shortened_chain_refuses_without_reset(tmp_path):
+def test_a_line_the_import_could_not_store_is_disclosed_at_its_coordinate_and_stepped_over(tmp_path):
+    """A dialogue stream has no unfinished line: a torn archive line is a skipped interval the
+    import recorded with its exact bytes. The stream names it once (``invalid_archive_line``),
+    advances past it and delivers the rows around it at their coordinates; a reconnect never
+    sees it again."""
     root = seed(tmp_path / "data")
-    append(root, "first")
+    (root / "archive").mkdir()
+    torn = root / "archive" / "progress_20250101T000001.jsonl"
+    torn.write_bytes(json.dumps({"task_id": "root", "content": "before"}).encode() + b"\n" + b'{"torn":' + b"\n")
+    assert dialogue_import.run_dialogue_import(root)["state"] == "done"  # the next boot plans and imports it
+    after_size = append(root, "after")
+    first = stream(root)
+    assert [r["reason"] for r in first if r["type"] == "history_gap"] == ["invalid_archive_line"]
+    assert content(first) == ["before", "after"]
+    gap = next(r for r in first if r["type"] == "history_gap")
+    assert json.loads(gap["event_id"]) == [str(root), "progress", torn.stat().st_size - len(b'{"torn":\n')]
+    assert gap["cursor"]["positions"][str(root)]["progress"] == torn.stat().st_size, "the gap's exact end"
+    assert first[-1]["cursor"]["positions"][str(root)]["progress"] == torn.stat().st_size + after_size
+    assert content(stream(root, first[-1]["cursor"])) == []
+    assert not any(r["type"] == "history_gap" for r in stream(root, first[-1]["cursor"]))
+
+
+@pytest.mark.parametrize("source", ["tools", "progress"])
+def test_shortened_chain_refuses_without_reset(tmp_path, source):
+    """A file chain shorter than the cursor's position, or a dialogue position beyond the stream's
+    end (another installation's cursor): refused as ``cursor_unavailable``, never reset."""
+    root = seed(tmp_path / "data")
+    append(root, "first", source=source)
     cursor = stream(root)[-1]["cursor"]
-    (root / "logs" / "progress.jsonl").write_bytes(b"")
+    if source == "tools":
+        (root / "logs" / "tools.jsonl").write_bytes(b"")
+    else:
+        cursor["positions"][str(root)]["progress"] += 1000
     events = stream(root, cursor)
     assert len(events) == 1 and events[0]["type"] == "error"
     assert events[0]["reason"] == "cursor_unavailable"
@@ -154,16 +281,21 @@ def test_unreadable_chain_is_explicit(tmp_path, monkeypatch):
     assert events[-1]["reason"] == "cursor_unavailable"
 
 
-def test_checkpoint_advances_unmatched_bytes_without_progress_or_sequence(tmp_path):
+def test_checkpoint_advances_unmatched_bytes_without_progress_or_sequence(tmp_path, after_append_clock):
+    """The deadline checkpoint steps over an unrelated append without delivering it. The deadline
+    waits for a read pass that began after the append (``after_append_clock``), so a slow first pass
+    cannot spend it before any read could see the row."""
+    clock = after_append_clock
     root = seed(tmp_path / "data")
     first = stream(root)
-    appended = False
+
     def after_initial(event):
-        nonlocal appended
-        if event["type"] == "task_result" and not appended:
+        if event["type"] == "task_result" and not clock.appended:
             append(root, "unrelated", task_id="other")
-            appended = True
+            clock.appended = True
+
     events = stream(root, first[-1]["cursor"], wait=1, on_event=after_initial)
+    assert clock.read_after_append, f"no read pass after the append ended within {clock.HANG_SEC} s"
     assert content(events) == []
     assert events[-1]["type"] == "cursor_checkpoint"
     assert events[-1]["seq"] == events[0]["seq"]
@@ -178,6 +310,7 @@ def test_terminal_snapshot_materializes_once_and_legacy_ts_never_bounds_history(
     (root / "archive" / "progress_20250101T000001.jsonl").write_text(
         json.dumps({"task_id": "root", "content": "early"}) + "\n", encoding="utf-8")
     write_task_result(root, "root", "completed", ts="2026-01-01T00:00:00Z", result="done")
+    assert dialogue_import.run_dialogue_import(root)["state"] == "done"
     real = tasks.load_effective_task_result
     materialized = []
     def read(*args, **kwargs):
@@ -191,46 +324,27 @@ def test_terminal_snapshot_materializes_once_and_legacy_ts_never_bounds_history(
     assert content(iter_task_events(root, "root")) == ["early"]
 
 
-def test_result_memo_reconnect_and_same_size_rewrite_invalidation(tmp_path, monkeypatch):
-    from ouroboros.gateway import tasks
+def test_lineage_discovery_reads_typed_facts_and_sees_a_changed_lineage(tmp_path, monkeypatch):
+    """Discovery selects children from the store's typed columns: no body is decoded, and a
+    row whose lineage changes is seen on the next refresh; a deleted row leaves the view."""
+    from ouroboros import task_store
+    from ouroboros.task_store import delete_document
+
     root = seed(tmp_path / "data")
     write_task_result(root, "child", "running", delegation_role="subagent", parent_task_id="aaaa")
-    reads = []
-    real = tasks.read_json_dict
-    monkeypatch.setattr(tasks, "read_json_dict", lambda path: reads.append(path.name) or real(path))
-    stream(root)
-    reads.clear()
-    stream(root)
-    assert reads == []
-    path = root / "task_results" / "child.json"
-    before = path.stat()
-    from ouroboros.utils import write_bytes_atomic
-
-    # Production writes atomically replace the file. Windows ctime is creation
-    # time, so an in-place write with restored mtime cannot test that contract.
-    write_bytes_atomic(path, path.read_bytes().replace(b'"aaaa"', b'"root"'))
-    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    monkeypatch.setattr(task_store, "_decode", lambda *a, **kw: pytest.fail("lineage discovery decoded a body"))
     follower = _TaskEventCursorFollower(root, "root", {"v": 2, "seq": 0, "view": "", "positions": {}})
     follower.refresh_view()
-    assert "child" in follower.task_filter_ids
-    assert reads == ["child.json"]
-
-
-def test_result_memo_drops_deleted_and_never_caches_torn_or_changed_read(tmp_path):
-    root = seed(tmp_path / "data")
-    path = root / "task_results" / "child.json"
-    path.write_text('{"torn":', encoding="utf-8")
-    rows, errors = raw_result_facts(path.parent)
-    assert "child.json" in errors and "child.json" not in rows
-    path.unlink()
+    assert "child" not in follower.task_filter_ids
     write_task_result(root, "child", "running", delegation_role="subagent", parent_task_id="root")
-    rows, errors = raw_result_facts(path.parent)
-    assert rows["child.json"]["parent_task_id"] == "root" and not errors
-    path.unlink()
-    assert "child.json" not in raw_result_facts(path.parent)[0]
+    follower.refresh_view()
+    assert "child" in follower.task_filter_ids
+    delete_document(root, "child")
+    follower.refresh_view()
+    assert "child" not in follower.task_filter_ids
 
 
-def test_main_dialogue_uses_tail_and_preserves_original_ids(tmp_path, monkeypatch):
+def test_main_dialogue_reads_the_stores_newest_rows_and_preserves_original_ids(tmp_path, monkeypatch):
     from ouroboros.gateway import _helpers
     from ouroboros.server_routing_context import _main_routing_manifest
     root = seed(tmp_path / "data")
@@ -241,18 +355,15 @@ def test_main_dialogue_uses_tail_and_preserves_original_ids(tmp_path, monkeypatc
                 "chat_id": 0, "client_message_id": f"m{index}", "task_id": "original"}) + "\n")
     (root / "archive").mkdir()
     (root / "archive" / "chat_20250101T000001.jsonl").write_text('{"text":"archive"}\n', encoding="utf-8")
-    real = _helpers.iter_jsonl_objects
+    assert dialogue_import.run_dialogue_import(root)["state"] == "done"
     reads = []
-    def read(path, *args, **kwargs):
-        reads.append((path, kwargs.get("tail_bytes")))
-        return real(path, *args, **kwargs)
-    monkeypatch.setattr(_helpers, "iter_jsonl_objects", read)
+    monkeypatch.setattr(_helpers, "iter_jsonl_objects", lambda path, *a, **k: reads.append(path) or iter(()))
     ctx = SimpleNamespace(DRIVE_ROOT=root, RUNNING={}, PENDING=[])
     manifest = _main_routing_manifest(ctx)
     dialogue = manifest["recent_canonical_dialogue"]
     assert len(dialogue) == 20 and dialogue[0]["client_message_id"] == "m3980"
     assert dialogue[-1]["chat_id"] == 0 and dialogue[-1]["task_id"] == "original"
-    assert len(reads) == 1 and reads[0][1] is not None
+    assert reads == [], "the newest rows are one addressed read of the store, never a file tail"
     assert manifest["omissions"]["dialogue_rows"] is None
 
 
@@ -279,6 +390,7 @@ def test_creation_floor_counts_skipped_bytes_without_opening_old_archives(tmp_pa
     old = (json.dumps({'task_id': 'root', 'content': 'before-creation'}) + '\n').encode()
     old_path = root / 'archive' / 'progress_20250101T000001.jsonl'
     old_path.write_bytes(old)
+    dialogue_import.cutover(root)  # the next boot plans the segment; the import job has not run
     recent_size = append(root, 'recent')
     real = pathlib.Path.open
     def opened(path, *args, **kwargs):
@@ -295,13 +407,13 @@ def test_creation_floor_counts_skipped_bytes_without_opening_old_archives(tmp_pa
 def test_stream_closes_chain_handles_before_network_yield_and_disconnect(tmp_path, monkeypatch):
     import pathlib
     root = seed(tmp_path / 'data')
-    append(root, 'first')
-    append(root, 'second')
+    append(root, 'first', source='tools')
+    append(root, 'second', source='tools')
     handles = []
     real = pathlib.Path.open
     def opened(path, *args, **kwargs):
         handle = real(path, *args, **kwargs)
-        if path.name == 'progress.jsonl':
+        if path.name == 'tools.jsonl':
             handles.append(handle)
         return handle
     monkeypatch.setattr(pathlib.Path, 'open', opened)
@@ -314,7 +426,9 @@ def test_stream_closes_chain_handles_before_network_yield_and_disconnect(tmp_pat
     assert handles and all(handle.closed for handle in handles)
 
 
-def test_main_dialogue_preserves_two_archive_horizon(tmp_path):
+def test_main_dialogue_reaches_every_imported_archive_row(tmp_path):
+    """The file tail stopped at two archives; the store answers the newest rows of the whole
+    stream once the archive is imported (and says "still importing" before)."""
     from ouroboros.server_routing_context import _main_routing_manifest
     root = seed(tmp_path / 'data')
     (root / 'archive').mkdir()
@@ -323,9 +437,16 @@ def test_main_dialogue_preserves_two_archive_horizon(tmp_path):
             json.dumps({'text': f'archive-{index}', 'client_message_id': f'm{index}', 'chat_id': -5}) + '\n',
             encoding='utf-8')
     (root / 'logs' / 'chat.jsonl').write_text('{"text": ""}\n', encoding='utf-8')
-    rows = _main_routing_manifest(SimpleNamespace(DRIVE_ROOT=root, RUNNING={}, PENDING=[]))['recent_canonical_dialogue']
-    assert [row['client_message_id'] for row in rows] == ['m2', 'm3']
-    assert [row['chat_id'] for row in rows] == [-5, -5]
+    ctx = SimpleNamespace(DRIVE_ROOT=root, RUNNING={}, PENDING=[])
+    importing = _main_routing_manifest(ctx)
+    assert importing['recent_canonical_dialogue'] == []
+    assert importing['omissions']['dialogue_gaps'] == ['history is still importing']
+    assert dialogue_import.run_dialogue_import(root)['state'] == 'done'
+    manifest = _main_routing_manifest(ctx)
+    rows = manifest['recent_canonical_dialogue']
+    assert [row['client_message_id'] for row in rows] == ['m1', 'm2', 'm3']
+    assert [row['chat_id'] for row in rows] == [-5, -5, -5]
+    assert manifest['omissions']['dialogue_gaps'] == []
 
 
 def test_reconnect_gets_fresh_terminal_result_without_replaying_consumed_logs(tmp_path, monkeypatch):
@@ -351,48 +472,37 @@ def test_reconnect_gets_fresh_terminal_result_without_replaying_consumed_logs(tm
 
 
 @pytest.mark.parametrize("schema", [None, 999])
-def test_refused_result_facts_are_cached_until_the_file_changes(tmp_path, monkeypatch, schema):
-    from ouroboros.gateway import tasks
-
-    root = seed(tmp_path / "data")
-    path = root / "task_results" / "child.json"
-    raw = {"task_id": "child", "status": "running", "parent_task_id": "root"}
+def test_a_refused_legacy_result_file_never_reaches_the_lineage(tmp_path, schema):
+    """A file the importer refuses (unstamped, or a future schema) is not a row: discovery
+    never lists it, the strict reader and create-only writer refuse the occupied identity,
+    and the bytes stay where the importer left them."""
+    from ouroboros.task_results import load_task_result
+    path = tmp_path / "data" / "task_results" / "child.json"
+    path.parent.mkdir(parents=True)
+    raw = {"task_id": "child", "status": "running", "parent_task_id": "root", "delegation_role": "subagent"}
     if schema is not None:
         raw["_schema_version"] = schema
-    path.write_text(json.dumps(raw), encoding="utf-8")
-    reads = []
-    reader = tasks.read_json_dict
-    monkeypatch.setattr(tasks, "read_json_dict", lambda p: reads.append(p.name) or reader(p))
+    path.write_text(json.dumps(raw), encoding="utf-8")  # before the first touch: the import judges it
+    root = seed(tmp_path / "data")
     follower = _TaskEventCursorFollower(root, "root", {"v": 2, "seq": 0, "view": "", "positions": {}})
     for _ in range(3):
         follower.refresh_view()
         assert "child" not in follower.task_filter_ids
-    assert reads.count("child.json") == 1
-    path.unlink()
+    assert load_task_result(root, "child") is None
+    with pytest.raises(ValueError, match="authority is unreadable or invalid"):
+        load_task_result(root, "child", strict=True)
+    with pytest.raises(ValueError, match="authority is unreadable or invalid"):
+        write_task_result(root, "child", "running", create_only=True)
+    kept = path if path.exists() else next((root / "task_results" / "quarantine").glob("child*.json"))
+    assert json.loads(kept.read_text(encoding="utf-8")) == raw
     write_task_result(root, "child", "running", parent_task_id="root", delegation_role="subagent")
     follower.refresh_view()
     assert "child" in follower.task_filter_ids
-    assert reads.count("child.json") == 2
 
 
-def test_result_facts_cannot_admit_an_invalid_schema(tmp_path):
-    from ouroboros.task_results import load_task_result
-    root = seed(tmp_path / 'data')
-    path = root / 'task_results' / 'child.json'
-    raw = {'_schema_version': 999, 'task_id': 'child', 'status': 'running',
-           'delegation_role': 'subagent', 'parent_task_id': 'root'}
-    path.write_text(json.dumps(raw), encoding='utf-8')
-    rows, _ = raw_result_facts(path.parent)
-    assert rows['child.json']['schema_refusal'] == 'future_schema'
-    follower = _TaskEventCursorFollower(root, 'root', {'v': 2, 'seq': 0, 'view': '', 'positions': {}})
-    follower.refresh_view()
-    assert 'child' not in follower.task_filter_ids
-    with pytest.raises(ValueError, match='future_schema'):
-        load_task_result(root, 'child', strict=True)
-    assert json.loads(path.read_text()) == raw
-
-
-def test_many_archives_use_bounded_handles_and_consumed_prefix_is_not_opened(tmp_path, monkeypatch):
+def test_many_imported_archives_are_read_from_the_store_and_never_opened(tmp_path, monkeypatch):
+    """Three hundred imported segments: the stream reads their rows by coordinate out of the store
+    (no archive file is opened, no handle held) and a checkpoint resumes exactly after them."""
     import pathlib
 
     root = seed(tmp_path / "data")
@@ -401,34 +511,27 @@ def test_many_archives_use_bounded_handles_and_consumed_prefix_is_not_opened(tmp
     raw = b'{"task_id":"root","content":"archived"}\n'
     for index in range(300):
         (archive / f"progress_20260101T{index:06}.jsonl").write_bytes(raw)
+    assert dialogue_import.run_dialogue_import(root)["state"] == "done"  # the next boot plans and imports them
     append(root, "live")
-    handles, opened_archives = [], []
+    opened = []
     real = pathlib.Path.open
-    peak = 0
 
-    def opened(path, *args, **kwargs):
-        nonlocal peak
-        handle = real(path, *args, **kwargs)
+    def opening(path, *args, **kwargs):
         if path.parent == archive or path == root / "logs" / "progress.jsonl":
-            handles.append(handle)
-            peak = max(peak, sum(not item.closed for item in handles))
-            if path.parent == archive:
-                opened_archives.append(path.name)
-        return handle
+            opened.append(path.name)
+        return real(path, *args, **kwargs)
 
-    monkeypatch.setattr(pathlib.Path, "open", opened)
+    monkeypatch.setattr(pathlib.Path, "open", opening)
     follower = _TaskEventCursorFollower(root, "root", {"v": 2, "seq": 0, "view": "", "positions": {}})
     follower.refresh_view()
     rows = list(follower.read_events())
-    assert len(rows) == 301 and peak <= 2
-    assert all(handle.closed for handle in handles)
+    assert len(rows) == 301 and opened == []
     checkpoint = rows[-2]["cursor"]
     assert checkpoint["positions"][str(root)]["progress"] == len(raw) * 300
-    opened_archives.clear()
     resumed = _TaskEventCursorFollower(root, "root", checkpoint)
     resumed.refresh_view()
     assert content(list(resumed.read_events())) == ["live"]
-    assert opened_archives == []
+    assert opened == []
 
 
 def test_chain_default_retains_the_whole_ordered_handle_list(tmp_path):
@@ -447,7 +550,9 @@ def test_chain_default_retains_the_whole_ordered_handle_list(tmp_path):
     assert all(handle.closed for _path, handle in handles)
 
 
-def test_rotation_between_bounded_reads_keeps_each_event_cursor(tmp_path):
+def test_an_append_between_bounded_reads_keeps_each_event_cursor(tmp_path):
+    """A pass pins the stream's end when it begins: a row stored while the pass is yielding waits
+    for the next pass, and every event's cursor names exactly the row it followed."""
     root = seed(tmp_path / "data")
     row_size = append(root, "x" * 40000)
     append(root, "y" * 40000)
@@ -457,16 +562,12 @@ def test_rotation_between_bounded_reads_keeps_each_event_cursor(tmp_path):
     rows = follower.read_events()
     first = next(rows)
     assert first["cursor"]["positions"][str(root)]["progress"] == row_size
-    (root / "archive").mkdir()
-    live = root / "logs" / "progress.jsonl"
-    os.replace(live, root / "archive" / "progress_20260101T000001.jsonl")
-    live.touch()
-    append(root, "after-rotation")
+    append(root, "after the pin")
     rest = list(rows)
     assert content(rest) == ["y" * 40000, "third"]
     assert [row["seq"] for row in [first, *rest]] == [1, 2, 3]
-    assert content(list(follower.read_events())) == ["after-rotation"]
-    assert content(stream(root, rest[0]["cursor"])) == ["third", "after-rotation"]
+    assert content(list(follower.read_events())) == ["after the pin"]
+    assert content(stream(root, rest[0]["cursor"])) == ["third", "after the pin"]
 
 
 @pytest.mark.parametrize("rotate", [False, True])
@@ -483,10 +584,10 @@ def test_one_pass_finishes_and_visits_other_sources_during_continuous_append(tmp
             assert event["source"] == source, "a growing progress source starved the next source"
             if source == "progress":
                 append(root, "next pass")
-                if rotate:
+                if rotate:  # the file log visited next rotates under the pass
                     (root / "archive").mkdir()
-                    live = root / "logs" / "progress.jsonl"
-                    os.replace(live, root / "archive" / "progress_20260101T000001.jsonl")
+                    live = root / "logs" / "tools.jsonl"
+                    os.replace(live, root / "archive" / "tools_20260101T000001.jsonl")
                     live.touch()
         assert next(rows, None) is None
         assert follower.positions[str(root)]["progress"] == first_size
@@ -522,30 +623,33 @@ def test_unmatched_appends_cannot_extend_the_same_pass(tmp_path, monkeypatch):
 
     root = seed(tmp_path / "data")
     first_size = append(root, "first")
-    append(root, "tool", source="tools")
+    tool_size = append(root, "tool", source="tools")
     real = task_events.jsonl_chain_handles
-    progress_reads = 0
+    tools_reads = 0
     @contextmanager
     def append_after_snapshot(path, **kwargs):
-        nonlocal progress_reads
+        nonlocal tools_reads
         with real(path, **kwargs) as selection:
-            if path.name == "progress.jsonl":
-                progress_reads += 1
-                assert progress_reads <= 2, "unmatched writes kept reopening the same source"
-                append(root, "foreign", task_id="another-task")
+            if path.name == "tools.jsonl":
+                tools_reads += 1
+                assert tools_reads <= 2, "unmatched writes kept reopening the same source"
+                append(root, "foreign", source="tools", task_id="another-task")
             yield selection
     monkeypatch.setattr(task_events, "jsonl_chain_handles", append_after_snapshot)
     events = stream(root)
     assert content(events) == ["first", "tool"]
     assert events[-1]["type"] == "cursor_checkpoint"
     assert events[-1]["cursor"]["positions"][str(root)]["progress"] == first_size
+    assert events[-1]["cursor"]["positions"][str(root)]["tools"] == tool_size
 
 
 def test_partial_at_pinned_eof_waits_if_completed_then_rotated_between_batches(tmp_path):
+    """The file logs (tools here): a line unfinished at the pass's pinned end is never a gap; it
+    is read whole by the next pass, from the archive its rotation moved it to."""
     root = seed(tmp_path / "data")
-    complete_size = append(root, "x" * 40000) + append(root, "y" * 40000)
-    append(root, "tool", source="tools")
-    live = root / "logs" / "progress.jsonl"
+    append(root, "x" * 40000)
+    complete_size = append(root, "a" * 40000, source="tools") + append(root, "b" * 40000, source="tools")
+    live = root / "logs" / "tools.jsonl"
     complete = json.dumps({"task_id": "root", "content": "completed later"}).encode() + b"\n"
     with live.open("ab") as handle:
         handle.write(complete[:-3])
@@ -553,23 +657,21 @@ def test_partial_at_pinned_eof_waits_if_completed_then_rotated_between_batches(t
     follower.refresh_view()
     rows = follower.read_events()
     first = next(rows)
+    second = next(rows)
     with live.open("ab") as handle:
         handle.write(complete[-3:])
     (root / "archive").mkdir()
-    os.replace(live, root / "archive" / "progress_20260101T000001.jsonl")
+    os.replace(live, root / "archive" / "tools_20260101T000001.jsonl")
     live.touch()
     rest = list(rows)
-    assert content([first, *rest]) == ["x" * 40000, "y" * 40000, "tool"]
+    assert content([first, second, *rest]) == ["x" * 40000, "a" * 40000, "b" * 40000]
     assert all(row["type"] != "history_gap" for row in rest)
-    assert follower.positions[str(root)]["progress"] == complete_size
+    assert follower.positions[str(root)]["tools"] == complete_size
     assert content(list(follower.read_events())) == ["completed later"]
 
 
 @pytest.mark.parametrize("fields", [
-    {"v": 1}, {"wait": True}, {"wait": "5"},
-    {"cursor": {"v": 2, "seq": True, "view": "x", "positions": {}}},
-    {"cursor": {"v": 2, "seq": 1, "view": 3, "positions": {}}},
-    {"cursor": {"v": 2, "seq": 1, "view": "x"}},
+    {"v": 1}, {"wait": True}, {"cursor": {"v": 2, "seq": 1, "view": "x"}},
 ])
 def test_post_uses_existing_ingress_schema(tmp_path, monkeypatch, fields):
     from ouroboros.gateway import task_events
@@ -600,31 +702,229 @@ def test_post_keeps_gateway_additive_unknown_fields(tmp_path):
     asyncio.run(consume())
 
 
-def test_unreadable_results_are_disclosed_without_an_empty_view(tmp_path, monkeypatch, caplog):
-    import pathlib
-    from ouroboros.gateway import task_list_scan
+def test_an_unavailable_store_is_disclosed_without_an_empty_view(tmp_path, monkeypatch):
+    from ouroboros import task_store
+    from ouroboros.gateway import task_events
     from ouroboros.server_routing_context import _main_routing_manifest
+    from ouroboros.store import StoreBusy
 
     root = seed(tmp_path / "data")
+    write_task_result(root, "child", "running", delegation_role="subagent", parent_task_id="root")
     cursor = stream(root)[-1]["cursor"]
-    real = os.scandir
-    def scandir(path):
-        if pathlib.Path(path) == root / "task_results":
-            raise PermissionError("result directory denied")
-        return real(path)
-    monkeypatch.setattr(os, "scandir", scandir)
-    assert task_list_scan._raw_sorted_result_names(root / "task_results") == ([], [])
-    assert "Task-result directory is unreadable" in caplog.text
+
+    def busy(*args, **kwargs):
+        raise StoreBusy("current store busy")
+
+    monkeypatch.setattr(task_events, "task_facts", busy)
+    monkeypatch.setattr(task_store, "task_facts", busy)
+    monkeypatch.setattr(task_store, "newest_root_ids", busy)
     manifest = _main_routing_manifest(SimpleNamespace(DRIVE_ROOT=root, RUNNING={}, PENDING=[]))
     assert manifest["omissions"]["final_results"] is None
-    assert "result_directory_unreadable" in manifest["omissions"]["final_results_error"]
+    assert "result_store_unreadable" in manifest["omissions"]["final_results_error"]
     events = stream(root, cursor)
-    assert [row["type"] for row in events] == ["error"]
-    assert events[0]["cursor"]["positions"] == cursor["positions"]
-    async def legacy():
-        req = request(root)
-        req.scope["method"] = "GET"
-        req.scope["query_string"] = b"wait=0"
-        response = await api_task_events(req)
-        return [frame async for frame in response.body_iterator]
-    assert '"reason": "history_unavailable"' in asyncio.run(legacy())[0]
+    gaps = [row for row in events if row["type"] == "history_gap"]
+    assert gaps and gaps[0]["reason"] == "lineage_incomplete" and gaps[0]["data"]["store_unavailable"] is True
+    monkeypatch.undo()
+    follower = _TaskEventCursorFollower(root, "root", {"v": 2, "seq": 0, "view": "", "positions": {}})
+    follower.refresh_view()
+    assert "child" in follower.task_filter_ids
+
+
+def _row(text, task_id="root"):
+    return (json.dumps({"task_id": task_id, "content": text}) + "\n").encode()
+
+
+class _ReadClock:
+    """The ``time`` the v2 stream reads: its monotonic clock moves only as the stream reads, ``step`` seconds per
+    bounded read (one entry into ``jsonl_chain_handles`` for a file chain, one ``probe_rows`` page for a dialogue
+    stream), so a slice or a spent budget falls at an exact read whatever the machine's speed."""
+
+    def __init__(self, step: float) -> None:
+        self.now, self.step = 1000.0, step
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+@pytest.fixture()
+def read_clock(monkeypatch):
+    """Reads that take time: three seconds per bounded read unless the test sets another ``step``."""
+    from contextlib import contextmanager
+    from ouroboros.gateway import task_events
+
+    clock = _ReadClock(3.0)
+    real_chain, real_probe = task_events.jsonl_chain_handles, ds.probe_rows
+
+    @contextmanager
+    def chain(path, **kwargs):
+        clock.now += clock.step
+        with real_chain(path, **kwargs) as handles:
+            yield handles
+
+    def probe(*args, **kwargs):
+        clock.now += clock.step
+        return real_probe(*args, **kwargs)
+
+    monkeypatch.setattr(task_events, "time", clock)
+    monkeypatch.setattr(task_events, "jsonl_chain_handles", chain)
+    monkeypatch.setattr(ds, "probe_rows", probe)
+    return clock
+
+
+def follow(root, *, wait, between=None, limit=40):
+    """The CLI's loop over the route: each request resumes from its last frame's cursor until a terminal result."""
+    requests, cursor = [], None
+    while len(requests) < limit:
+        frames = stream(root, cursor, wait)
+        requests.append(frames)
+        cursor = frames[-1]["cursor"]
+        if frames[-1]["type"] == "task_result" and frames[-1]["data"]["status"] == "completed":
+            return requests
+        if between:
+            between(len(requests))
+    pytest.fail(f"no terminal result in {limit} requests")
+
+
+def test_a_long_scan_of_other_tasks_rows_checkpoints_each_slice_and_stops_at_its_budget(tmp_path, read_clock):
+    """#808: a finished task none of whose rows lie among megabytes of other tasks' rows. The pass sends a
+    checkpoint at a row boundary after a slice without a frame, and at its spent budget ends the request with one
+    and no result; the resumed requests reach the end, and only the one whose pass reached it says the result."""
+    root = seed(tmp_path / "data")
+    write_task_result(root, "root", "completed", result="done")
+    data = _row("x" * 1000, task_id="other") * 1500  # about two dozen bounded reads
+    (root / "logs" / "tools.jsonl").write_bytes(data)
+    requests = follow(root, wait=30)
+    first = requests[0]
+    assert [frame["type"] for frame in first] == ["cursor_checkpoint"] * 3  # two slices, then the spent budget
+    assert {frame["seq"] for frame in first} == {0} and {frame["event_id"] for frame in first} == {""}
+    frames = [frame for got in requests for frame in got]
+    positions = [frame["cursor"]["positions"][str(root)]["tools"] for frame in frames]
+    assert positions == sorted(positions) and 0 < positions[0] and positions[-1] == len(data)
+    assert all(data[:position].endswith(b"\n") for position in positions)
+    assert len(requests) >= 3
+    assert not any(frame["type"] == "task_result" for got in requests[:-1] for frame in got)
+    assert content(frames) == []
+    assert requests[-1][-1]["data"]["result"] == "done"
+
+
+def test_a_cut_pass_resumes_to_every_row_once_with_its_gap_late_row_and_escaped_identity(tmp_path, read_clock):
+    """The budget cuts the pass many times across two archives and the live file. Every row of the task arrives
+    once and in chain order: one whose identity is spelled with a JSON escape, one written after the task ended
+    while the reader was still behind (a terminal cutoff would drop it), and the malformed archive line disclosed
+    once at its coordinate. A pass without a budget and the legacy replay agree."""
+    root = seed(tmp_path / "data")
+    write_task_result(root, "root", "completed", result="done")
+    filler = _row("y" * 1000, task_id="other") * 150
+    escaped = b'{"task_id": "ro\\u006ft", "content": "escaped"}\n'  # the JSON spelling of "root"
+    (root / "archive").mkdir()
+    (root / "archive" / "tools_20260101T000001.jsonl").write_bytes(
+        filler + _row("a") + filler + b'{"torn":\n' + escaped + filler)
+    (root / "archive" / "tools_20260101T000002.jsonl").write_bytes(filler + _row("b"))
+    (root / "logs" / "tools.jsonl").write_bytes(filler + _row("c") + filler)
+
+    def late(requests_made):
+        if requests_made == 2:
+            append(root, "late", source="tools")
+
+    requests = follow(root, wait=0, between=late)
+    frames = [frame for got in requests for frame in got]
+    expected = ["a", "escaped", "b", "c", "late"]
+    assert len(requests) >= 4, "the budget cut the pass"
+    assert content(frames) == expected
+    rows = [frame for frame in frames if frame.get("data", {}).get("content")]
+    assert len({frame["event_id"] for frame in rows}) == len(rows)
+    gaps = [frame for frame in frames if frame["type"] == "history_gap"]
+    assert [gap["reason"] for gap in gaps] == ["invalid_archive_line"]
+    assert json.loads(gaps[0]["event_id"]) == [str(root), "tools", len(filler + _row("a") + filler)]
+    whole = _TaskEventCursorFollower(root, "root", {"v": 2, "seq": 0, "view": "", "positions": {}})
+    whole.refresh_view()
+    assert content(list(whole.read_events())) == expected
+    assert whole.positions == requests[-1][-1]["cursor"]["positions"]
+    assert content(iter_task_events(root, "root")) == expected
+
+
+def test_a_cut_between_dialogue_pages_resumes_after_the_page_with_its_import_gap_once(tmp_path, read_clock):
+    """A dialogue stream read in pages, every page a spent budget: each request ends after one page and the next
+    resumes after that page's last row; the rows and the line the import skipped each arrive once, in order."""
+    read_clock.step = 11.0
+    root = seed(tmp_path / "data")
+    write_task_result(root, "root", "completed", result="done")
+    (root / "archive").mkdir()
+    lines = [_row(f"r{index}") for index in range(450)]
+    lines.insert(250, b'{"torn":\n')
+    (root / "archive" / "progress_20250101T000001.jsonl").write_bytes(b"".join(lines))
+    assert dialogue_import.run_dialogue_import(root)["state"] == "done"
+    append(root, "live")
+    requests = follow(root, wait=0)
+    frames = [frame for got in requests for frame in got]
+    for index, got in enumerate(requests[:2]):  # one page each, then the spent budget's checkpoint
+        assert content(got) == [f"r{row}" for row in range(200 * index, 200 * index + 200)]
+        assert got[-1]["type"] == "cursor_checkpoint"
+    assert [frame["type"] for frame in requests[1]].count("history_gap") == 1
+    assert content(frames) == [f"r{index}" for index in range(450)] + ["live"]
+    assert [frame["reason"] for frame in frames if frame["type"] == "history_gap"] == ["invalid_archive_line"]
+    assert requests[-1][-1]["type"] == "task_result"
+
+
+def test_the_cli_follows_cut_passes_and_a_dropped_connection_over_tcp(tmp_path, read_clock, capsys):
+    """The real ``tasks watch`` against the real route table on an owned loopback port: the server's budget cuts
+    the pass, and the first response breaks off mid-stream (the server closes it before its third frame, which
+    http.client reads as the body's end). The CLI resumes from the last event it consumed and prints every row
+    once, then the terminal result; it neither ends early nor fails. Faked: the read clock and the broken
+    response; route, stores, HTTP and client are real. A read timeout or reset is the CLI tests' transport."""
+    import socket
+    import threading
+
+    import uvicorn
+    from starlette.applications import Starlette
+
+    from ouroboros import cli
+    from ouroboros.gateway.router import collect_routes
+
+    root = seed(tmp_path / "data")
+    write_task_result(root, "root", "completed", result="done")
+    filler = _row("z" * 1000, task_id="other") * 600
+    (root / "logs" / "tools.jsonl").write_bytes(_row("a") + filler + _row("b") + filler + filler + _row("c"))
+    app = Starlette(routes=collect_routes(data_dir=root))
+    app.state.drive_root = root
+    responses = []
+
+    async def network(scope, receive, send):
+        if scope["type"] != "http" or not scope["path"].endswith("/events"):
+            return await app(scope, receive, send)
+        frames = []
+        responses.append(frames)
+
+        async def deliver(message):
+            if message["type"] == "http.response.body" and message.get("body"):
+                frames.append(message["body"])
+                if len(responses) == 1 and len(frames) > 2:
+                    raise ConnectionResetError("the test network dropped the first response")
+            await send(message)
+
+        await app(scope, receive, deliver)
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        server = uvicorn.Server(uvicorn.Config(network, lifespan="off", loop="asyncio", log_level="critical"))
+        thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
+        thread.start()
+        try:
+            started = time.monotonic()
+            while not server.started and thread.is_alive() and time.monotonic() - started < 5:
+                time.sleep(0.01)
+            assert server.started
+            url = f"http://127.0.0.1:{sock.getsockname()[1]}"
+            code = cli.main(["--url", url, "tasks", "watch", "root", "--jsonl"])
+        finally:
+            server.should_exit = True
+            thread.join(timeout=5)
+    assert not thread.is_alive(), "the owned server must stop"
+    printed = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert code == 0
+    assert content(printed) == ["a", "b", "c"]
+    assert printed[-1]["type"] == "task_result" and printed[-1]["data"]["status"] == "completed"
+    assert len(responses[0]) == 3 and len(responses) >= 3  # the dropped response, then the cut passes

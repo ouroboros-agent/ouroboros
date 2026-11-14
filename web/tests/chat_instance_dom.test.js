@@ -29,7 +29,7 @@ test('createChatInstance renders a real assistant bubble without senderLabel sha
     };
     let generation = 0;
     const stateSnapshots = {
-        begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+        begin: () => ({ generation: ++generation, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
         isCurrent: () => true,
         apply() {},
     };
@@ -123,7 +123,7 @@ test('first task-bound review hydrates a progress-created owner once and reconci
     };
     let generation = 0;
     const stateSnapshots = {
-        begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+        begin: () => ({ generation: ++generation, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
         isCurrent: () => true,
         apply() {},
     };
@@ -347,7 +347,7 @@ test('review-only reconnect anchors stay inert until task truth arrives', async 
     };
     let generation = 0;
     const stateSnapshots = {
-        begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+        begin: () => ({ generation: ++generation, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
         isCurrent: () => true,
         apply() {},
     };
@@ -389,7 +389,8 @@ test('review-only reconnect anchors stay inert until task truth arrives', async 
             assert.equal(ownerCard.querySelector('[data-live-review-summary]')?.textContent, 'Reviews 1');
             assert.equal(ownerCard.querySelector('[data-live-phase]')?.hidden, true, owner);
             assert.equal(ownerCard.querySelector('[data-live-title]')?.textContent, 'Reviews');
-            assert.equal(ownerCard.querySelector('[data-live-typing]')?.style.display, 'none');
+            // The chip's mark is the card's one activity indicator, and the inert chip is hidden.
+            assert.equal(ownerCard.querySelector('[data-live-typing]'), null);
         }
         assert.equal(card('review-running')?.querySelector('[data-live-phase]')?.hidden, false);
         assert.equal(card('review-running')?.querySelector('[data-live-phase]')?.textContent, 'Working');
@@ -476,7 +477,7 @@ test('Plan invalidation applies terminal task detail to its review-created owner
     };
     let generation = 0;
     const stateSnapshots = {
-        begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+        begin: () => ({ generation: ++generation, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
         isCurrent: () => true, apply() {},
     };
     let instance;
@@ -538,7 +539,7 @@ test('source-incomplete typed review lifecycle is consumed in history, live chat
     };
     let generation = 0;
     const stateSnapshots = {
-        begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+        begin: () => ({ generation: ++generation, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
         isCurrent: () => true, apply() {},
     };
     let instance;
@@ -586,7 +587,7 @@ test('terminal task-bound review lifecycle resyncs canonical verdict without rec
     };
     let generation = 0;
     const stateSnapshots = {
-        begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+        begin: () => ({ generation: ++generation, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
         isCurrent: () => true,
         apply() {},
     };
@@ -613,7 +614,8 @@ test('terminal task-bound review lifecycle resyncs canonical verdict without rec
         const owner = messages.children.find((node) => node.dataset.taskId === 'live-review');
         assert.ok(owner, 'source-complete lifecycle attaches to its owner card');
         const reviewHost = owner.querySelector('[data-live-reviews-host]');
-        assert.match(reviewHost?.innerHTML || '', /running/);
+        // A live run reads as work in progress (the moving mark beside its words), never a verdict.
+        assert.match(reviewHost?.innerHTML || '', /data-tone="working"><span class="status-mark"[^>]*data-shape="moving"[\s\S]*?in progress/);
         const initialHistoryCalls = calls.filter((url) => url.startsWith('/api/chat/history')).length;
         historyRows = [{
             chat_id: 2, role: 'system', system_type: 'skill_review',
@@ -652,7 +654,7 @@ test('duplicate lifecycle pointer never mints a task and enriches only an existi
     };
     let generation = 0;
     const stateSnapshots = {
-        begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+        begin: () => ({ generation: ++generation, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
         isCurrent: () => true, apply() {},
     };
     const pointer = {
@@ -752,7 +754,7 @@ test('history replay keeps one duplicate lifecycle acknowledgement without a tas
     };
     let generation = 0;
     const stateSnapshots = {
-        begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+        begin: () => ({ generation: ++generation, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
         isCurrent: () => true, apply() {},
     };
     let instance;
@@ -799,7 +801,7 @@ test('history replay keeps an ownerless duplicate acknowledgement without a task
     };
     let generation = 0;
     const stateSnapshots = {
-        begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+        begin: () => ({ generation: ++generation, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
         isCurrent: () => true, apply() {},
     };
     let instance;
@@ -847,7 +849,7 @@ test('an alias-free subagent terminal keeps the honest amount, live and on reloa
     };
     let generation = 0;
     const stateSnapshots = {
-        begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+        begin: () => ({ generation: ++generation, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
         isCurrent: () => true,
         apply() {},
     };
@@ -963,7 +965,7 @@ test('a stopped direct turn replays its persisted terminal word, never a blanket
         const ws = { on() { return () => {}; }, isConnected: () => true, send() {} };
         let generation = 0;
         const stateSnapshots = {
-            begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+            begin: () => ({ generation: ++generation, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
             isCurrent: () => true, apply() {},
         };
         let instance;
@@ -1035,7 +1037,7 @@ test('history rebuild keeps a lineage-known branch nested, never appended top-le
     };
     let generation = 0;
     const stateSnapshots = {
-        begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+        begin: () => ({ generation: ++generation, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
         isCurrent: () => true, apply() {},
     };
     let instance;
@@ -1066,6 +1068,18 @@ test('history rebuild keeps a lineage-known branch nested, never appended top-le
         assert.equal(scout.parentNode?.dataset?.subagentsFor, 'grandchild-infra-lens');
         assert.equal(codeLens.dataset.parentTaskId, 'prev-root');
         assert.equal(infra.dataset.parentTaskId, 'code-lens');
+        // Details opens under the card's own lines: the children follow its facts and notes and earlier episodes
+        // follow the children, in the template's order, so pressing Details moves no node. (How short a card that
+        // holds children keeps what it opens is style.css's, measured in a browser.)
+        const placement = (card) => {
+            const kids = card.children, at = (pick) => kids.findIndex(pick);
+            return [at((n) => Object.hasOwn(n.dataset, 'liveTimeline')), at((n) => n.dataset.subagentsFor === card.dataset.taskId),
+                at((n) => Object.hasOwn(n.dataset, 'liveEpisodeHistory'))];
+        };
+        for (const card of [root, codeLens, infra]) {
+            const [notes, children, episodes] = placement(card);
+            assert.deepEqual([children - notes, episodes - children], [1, 1], `${card.dataset.taskId}: notes, children, earlier episodes`);
+        }
         // A reconnect replays the same window again: still nested, no duplicates.
         handlers.get('open')({ previouslyConnected: true });
         await new Promise((resolve) => setTimeout(resolve, 25));
@@ -1091,7 +1105,7 @@ test('a direct turn renders tool work as an activity block and needs host author
     };
     let generation = 0;
     const stateSnapshots = {
-        begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+        begin: () => ({ generation: ++generation, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
         isCurrent: () => true, apply() {},
     };
     let instance;
@@ -1114,7 +1128,10 @@ test('a direct turn renders tool work as an activity block and needs host author
         const card = walkCard(messages, 'eph-1');
         assert.ok(card, 'real tool work reveals the activity block');
         assert.ok(convertButton(card), 'a working direct turn is offered conversion in Main');
-        assert.equal(card.querySelector('[data-live-title]').textContent, 'Working...', 'the running placeholder title');
+        assert.equal(card.querySelector('[data-live-phase]').textContent, 'Thinking', 'the chip preserves the census phase when the card mounts later');
+        const mark = card.querySelector('[data-live-phase]').firstElementChild;
+        assert.deepEqual([mark.dataset.shape, mark.dataset.hue, mark.hidden], ['moving', 'ink', false]);
+        assert.equal(card.querySelector('[data-live-title]').textContent, '', 'no title repeats the chip (#1369)');
         assert.equal(card.querySelector('[data-cancel-run]'), null, 'no host cancelable marker: no Cancel');
         handlers.get('chat')({
             chat_id: 1, role: 'assistant', is_progress: true,
@@ -1192,7 +1209,7 @@ test(`history replay of a direct turn preserves ${execution}`, async () => {
     };
     let generation = 0;
     const stateSnapshots = {
-        begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+        begin: () => ({ generation: ++generation, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
         isCurrent: () => true, apply() {},
     };
     let instance;
@@ -1253,7 +1270,7 @@ test('a terminal root settles its still-open child card from the child result (#
     };
     let generation = 0;
     const stateSnapshots = {
-        begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+        begin: () => ({ generation: ++generation, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
         isCurrent: () => true, apply() {},
     };
     let instance;
@@ -1321,7 +1338,7 @@ for (const order of ['final-first', 'done-first', 'cold']) {
         let instance;
         try {
             instance = createChatInstance({ ws, state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
-                updateUnreadBadge() {}, stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }),
+                updateUnreadBadge() {}, stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
                     isCurrent: () => true, apply() {} }, chatId: 1, idPrefix: 'chat', mountEl: mount });
             if (order === 'cold') await instance.refreshHistory({ revision: 1 });
             else {
@@ -1336,8 +1353,14 @@ for (const order of ['final-first', 'done-first', 'cold']) {
             assert.equal(card.dataset.finished, '1');
             assert.equal(card.querySelector('[data-live-title]').textContent, 'Task activity');
             assert.match(card.querySelector('[data-live-meta]').innerHTML, /2 tool calls/);
-            assert.match(card.querySelector('[data-live-meta]').innerHTML, /model-b/);
-            if (card.dataset.expanded !== '1') card.querySelector('[data-live-summary-button]').listeners.get('click')[0]({ detail: 0 });
+            // The compact line names the model the solve response reported; the details keep the route and request.
+            assert.match(card.querySelector('[data-live-meta]').innerHTML, />model-b-provider</);
+            assert.equal(card.querySelector('[data-live-counters]'), null);
+            assert.doesNotMatch(card.querySelector('[data-live-meta]').innerHTML, /rounds/);
+            assert.match(card.querySelector('[data-live-facts]').innerHTML, /<dt>Rounds<\/dt><dd>2 · usable solve responses<\/dd>/);
+            assert.match(card.querySelector('[data-live-facts]').innerHTML,
+                /<dt>Last solve response<\/dt><dd>model-b-provider \(initial request: model-a\) · provider · route: provider\/model-b<\/dd>/);
+            if (card.dataset.expanded !== '1') card.querySelector('[data-live-disclosure]').listeners.get('click')[0]({ detail: 0 });
             const nodes = (node) => [node, ...node.children.flatMap(nodes)];
             const notes = nodes(card).filter((n) => n.classList.contains('chat-live-line') && n.classList.contains('done'));
             assert.equal(notes.length, 1);
@@ -1360,7 +1383,7 @@ for (const source of ['missing', 'failed-read']) {
         let instance;
         try {
             instance = createChatInstance({ ws, state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
-                updateUnreadBadge() {}, stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }),
+                updateUnreadBadge() {}, stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
                     isCurrent: () => true, apply() {} }, chatId: 1, idPrefix: 'chat', mountEl: mount });
             listActivity(instance, 'old-root', 1);
             handlers.get('chat')({ chat_id: 1, task_id: 'old-root', role: 'assistant', is_progress: true,
@@ -1396,7 +1419,7 @@ test('native terminal replay retains the actual narration as title', async () =>
     let instance;
     try {
         instance = createChatInstance({ ws, state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
-            updateUnreadBadge() {}, stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }),
+            updateUnreadBadge() {}, stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
                 isCurrent: () => true, apply() {} }, chatId: 1, idPrefix: 'chat', mountEl: mount });
         await instance.refreshHistory({ revision: 1 });
         const card = walkCard(globalThis.document.byId.get('chat-messages'), 'native-title');
@@ -1425,7 +1448,7 @@ test('a late acceptance settlement row without a placement fact never rewrites t
     let instance;
     try {
         instance = createChatInstance({ ws, state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
-            updateUnreadBadge() {}, stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }),
+            updateUnreadBadge() {}, stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
                 isCurrent: () => true, apply() {} }, chatId: 1, idPrefix: 'chat', mountEl: mount });
         await instance.refreshHistory({ revision: 1 });
         const messages = globalThis.document.byId.get('chat-messages');
@@ -1455,4 +1478,157 @@ test('a late acceptance settlement row without a placement fact never rewrites t
         assert.equal(added.length, systemBefore + 1, 'exactly one new System row');
         assert.match(added[added.length - 1].innerHTML, /Reviewers later passed this answer/);
     } finally { instance?.destroy(); restoreDom(prior); }
+});
+
+// ---------------------------------------------------------------------------
+// A5: a parent card comes only from the parent's own evidence in this room; a
+// child whose parent has none stays visible on its own and nests later.
+// ---------------------------------------------------------------------------
+const CHILD_ROW = {
+    chat_id: 2, role: 'system', is_progress: true, system_type: 'subagent_terminal_notice', narration: false,
+    task_id: 'kid-x', subagent_task_id: 'kid-x', parent_task_id: 'par-x', root_task_id: 'par-x',
+    delegation_role: 'subagent', subagent_event: 'cancelled', task_terminal_status: 'cancelled',
+    content: 'Stopped by Ouroboros', text: 'Stopped by Ouroboros', ts: '2026-10-14T12:10:20Z',
+    history_id: 'progress:120', history_position: { source: 'progress', offset: 120 },
+};
+const PARENT_CARRIER = {
+    chat_id: 2, role: 'system', system_type: 'task_evidence', is_progress: false, narration: false, text: '',
+    task_id: 'par-x', ts: '2026-10-14T12:10:20Z', task_terminal_status: 'cancelled', outcome_phase: 'cancelled',
+    outcome_final: true, outcome_axes: { lifecycle: { status: 'cancelled' } },
+    tool_evidence: { observations: [], coverage: { shown: 0, matched: 0 } },
+};
+
+function a5Instance(pages) {
+    let page = 0;
+    const { prior, mount } = installDom(async (url) => {
+        if (!String(url).startsWith('/api/chat/history')) return { ok: true, json: async () => ({ active_direct_turns: [] }) };
+        const rows = pages[Math.min(page, pages.length - 1)];
+        page += 1;
+        return { ok: true, json: async () => ({ messages: rows, window: { complete: true } }) };
+    });
+    const handlers = new Map();
+    const ws = { on(type, fn) { handlers.set(type, fn); return () => handlers.delete(type); }, isConnected: () => true, send() {} };
+    let generation = 0;
+    const stateSnapshots = {
+        begin: () => ({ generation: ++generation, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
+        isCurrent: () => true, apply() {},
+    };
+    const instance = createChatInstance({
+        ws, state: { activePage: 'chat', projectChatIds: new Set([2]), unreadCount: 0 }, updateUnreadBadge() {},
+        stateSnapshots, chatId: 2, idPrefix: 'chat', mountEl: mount, asPanel: true,
+    });
+    const messages = () => globalThis.document.byId.get('chat-messages');
+    const topCards = () => messages().children.filter((n) => n.classList.contains('chat-live-card')).map((n) => n.dataset.taskId);
+    return { instance, handlers, prior, messages, topCards };
+}
+
+test('a child of a foreign or unknown parent is its own visible card, never a parent shell (A5)', async () => {
+    const { instance, handlers, prior, messages, topCards } = a5Instance([[CHILD_ROW]]);
+    try {
+        await instance.refreshHistory({ revision: 1 });
+        assert.deepEqual(topCards(), ['kid-x'], 'the child renders at the top level');
+        assert.equal(walkCard(messages(), 'par-x'), null, 'no card is minted from a bare parent_task_id');
+        const child = walkCard(messages(), 'kid-x');
+        assert.equal(child.dataset.finished, '1');
+        assert.equal(child.querySelector('[data-live-phase]')?.dataset.phase, 'cancelled');
+        // Live-frame parity: the same lineage on a live frame mints no parent either.
+        handlers.get('chat')({ ...CHILD_ROW, task_id: 'kid-y', subagent_task_id: 'kid-y', parent_task_id: 'par-y',
+            root_task_id: 'par-y', history_id: undefined, history_position: undefined, ts: '2026-10-14T12:11:00Z' });
+        assert.equal(walkCard(messages(), 'par-y'), null);
+        assert.ok(walkCard(messages(), 'kid-y'), 'the live child is visible');
+        assert.deepEqual(topCards(), ['kid-x', 'kid-y']);
+    } finally { instance.destroy(); restoreDom(prior); }
+});
+
+test('an in-room parent with a terminal carrier is a finished card with the child nested (A5)', async () => {
+    const { instance, prior, messages, topCards } = a5Instance([[CHILD_ROW, PARENT_CARRIER]]);
+    try {
+        await instance.refreshHistory({ revision: 1 });
+        assert.deepEqual(topCards(), ['par-x'], 'the parent is the one top-level card');
+        const parent = walkCard(messages(), 'par-x');
+        assert.equal(parent.dataset.finished, '1', 'the carrier finished the parent');
+        assert.equal(parent.querySelector('[data-live-phase]')?.dataset.phase, 'cancelled', 'its real phase, not Done');
+        assert.notEqual(parent.dataset.inert, '1', 'not Activity unconfirmed');
+        assert.equal(walkCard(messages(), 'kid-x').parentNode?.dataset?.subagentsFor, 'par-x');
+    } finally { instance.destroy(); restoreDom(prior); }
+});
+
+test('an in-room parent whose carrier has no terminal stays unconfirmed, never Done (A5)', async () => {
+    const carrier = { ...PARENT_CARRIER, task_terminal_status: undefined, outcome_phase: undefined, outcome_final: undefined,
+        outcome_axes: undefined, task_phase: 'unfinished' };
+    const { instance, prior, messages } = a5Instance([[CHILD_ROW, carrier]]);
+    try {
+        await instance.refreshHistory({ revision: 1 });
+        const parent = walkCard(messages(), 'par-x');
+        assert.ok(parent, 'the carrier is the parent\'s own evidence');
+        assert.notEqual(parent.dataset.finished, '1');
+        assert.equal(parent.dataset.inert, '1', 'liveness unconfirmed in this room');
+        assert.match(parent.querySelector('[data-live-meta]')?.innerHTML || '', /Activity unconfirmed/,
+            'the summary row says so, never a blank card');
+        assert.equal(walkCard(messages(), 'kid-x').parentNode?.dataset?.subagentsFor, 'par-x');
+    } finally { instance.destroy(); restoreDom(prior); }
+});
+
+test('a parent whose evidence arrives later re-nests its child, keeping the node (A5)', async () => {
+    const parentRow = { chat_id: 2, role: 'system', is_progress: true, system_type: 'host_progress', task_id: 'par-x',
+        content: 'Parent planning', text: 'Parent planning', narration: false, ts: '2026-10-14T12:00:00Z',
+        history_id: 'progress:100', history_position: { source: 'progress', offset: 100 } };
+    const { instance, prior, messages, topCards } = a5Instance([[CHILD_ROW], [CHILD_ROW, parentRow]]);
+    try {
+        await instance.refreshHistory({ revision: 1 });
+        const child = walkCard(messages(), 'kid-x');
+        assert.deepEqual(topCards(), ['kid-x']);
+        await instance.refreshHistory({ revision: 2 });
+        assert.deepEqual(topCards(), ['par-x'], 'the parent\'s own row mints its card');
+        assert.equal(walkCard(messages(), 'kid-x'), child, 'the child keeps its node identity');
+        assert.equal(child.parentNode?.dataset?.subagentsFor, 'par-x', 'and nests under the parent');
+    } finally { instance.destroy(); restoreDom(prior); }
+});
+
+// #2801: answer first. The root's final is saved before its result is stored; a reload in between replays the
+// final with its own status while the saved result still runs. Shapes are the real server's (isolated witness).
+test('an answer saved before its result is stored replays as Finalizing…, never a finished Done (#2801)', async () => {
+    const replay = async (finalRow, progressPhase) => {
+        const rows = [
+            { chat_id: 2, role: 'assistant', is_progress: true, system_type: 'model_narration', content: 'still working',
+                ts: '2026-11-09T06:13:59Z', task_id: 'early', task_phase: progressPhase },
+            { chat_id: 2, role: 'assistant', content: 'Witness answer.', text: 'Witness answer.',
+                ts: '2026-11-09T06:14:02Z', task_id: 'early', ...finalRow },
+        ];
+        const { prior, mount } = installDom(async (url) => (String(url).startsWith('/api/chat/history')
+            ? { ok: true, json: async () => ({ messages: rows }) }
+            : { ok: true, json: async () => ({ active_direct_turns: [] }) }));
+        const ws = { on() { return () => {}; }, isConnected: () => true, send() {} };
+        let generation = 0;
+        const stateSnapshots = {
+            begin: () => ({ generation: ++generation, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
+            isCurrent: () => true, apply() {},
+        };
+        let instance;
+        try {
+            instance = createChatInstance({
+                ws, state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
+                updateUnreadBadge() {}, stateSnapshots, chatId: 2, idPrefix: 'chat', mountEl: mount, asPanel: true,
+            });
+            await instance.refreshHistory({ revision: 1 });
+            await new Promise((resolve) => setTimeout(resolve, 25));
+            const card = globalThis.document.byId.get('chat-messages').children.find((node) =>
+                node.classList.contains('chat-live-card') && node.dataset.taskId === 'early');
+            assert.ok(card, 'the replayed final row minted its task card');
+            const chip = card.querySelector('[data-live-phase]');
+            return { finished: card.dataset.finished, label: chip?.getAttribute('aria-label') || chip?.textContent || '' };
+        } finally {
+            instance?.destroy();
+            restoreDom(prior);
+        }
+    };
+    // The server's projection now: the saved nonterminal result refutes the final's own word; the card holds.
+    const held = await replay({ task_phase: 'finalizing', outcome_final: false }, 'finalizing');
+    assert.equal(held.finished, '0');
+    assert.match(held.label, /Finalizing/);
+    assert.doesNotMatch(held.label, /Done/, 'an outcome no store has answered is not said');
+    // Control: a settled final still closes its card with its word.
+    const settled = await replay({ task_terminal_status: 'completed', outcome_final: true }, undefined);
+    assert.equal(settled.finished, '1');
+    assert.match(settled.label, /Done/);
 });

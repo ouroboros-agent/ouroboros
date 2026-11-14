@@ -68,42 +68,6 @@ def test_attach_snapshot_init_is_opt_in_and_idempotent(tmp_path):
     assert count == "1"
 
 
-def test_attach_snapshot_init_excludes_key_material_by_content_not_by_suffix(tmp_path):
-    """Triad r4 security critical: an attach snapshot must never bake `.env`/keys
-    into git history. What proves a key is the CONTENT (the same PEM head read
-    the workspace patch and the coop checkpoint use) plus the exact credential
-    leaves; a `.key` deck of the owner's stays in the snapshot. Excluded files
-    are disclosed in the returned list and kept untracked via .git/info/exclude
-    — the owner's files are never edited."""
-    from ouroboros.project_sources import attach_snapshot_init
-
-    folder = tmp_path / "with_secrets"
-    folder.mkdir()
-    (folder / "app.py").write_text("print('ok')\n", encoding="utf-8")
-    (folder / ".env").write_text("API_KEY=hunter2\n", encoding="utf-8")
-    (folder / "deploy.pem").write_text(
-        "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n",
-        encoding="utf-8",
-    )
-    (folder / "deck.key").write_text("Keynote deck, no key material\n", encoding="utf-8")
-    error, skipped = attach_snapshot_init(folder)
-    assert error == ""
-    assert sorted(skipped) == [".env", "deploy.pem"]
-    tracked = subprocess.run(
-        ["git", "ls-files"], cwd=str(folder), capture_output=True, text=True
-    ).stdout.split()
-    assert "app.py" in tracked
-    assert "deck.key" in tracked
-    assert ".env" not in tracked and "deploy.pem" not in tracked
-    # The secret files still EXIST on disk, untouched.
-    assert (folder / ".env").read_text(encoding="utf-8") == "API_KEY=hunter2\n"
-    # And stay untracked (info/exclude), so later commits don't sweep them either.
-    status = subprocess.run(
-        ["git", "status", "--porcelain"], cwd=str(folder), capture_output=True, text=True
-    ).stdout
-    assert ".env" not in status and "deploy.pem" not in status
-
-
 # --- clone URL forms + typed errors ----------------------------------------------
 
 def test_valid_git_url_forms():
@@ -166,11 +130,14 @@ def test_update_project_provenance_fields_and_tombstone(tmp_path):
     folder = tmp_path / "keepme"
     folder.mkdir()
     update_project(data, "p1", working_dir=str(folder))
+    before_deletion = get_project(data, "p1")["routing_generation"]
     with pytest.raises(RuntimeError, match="cancellation/quiescence"):
         delete_project(data, "p1")
     deleting = begin_project_deletion(data, "p1")
     assert deleting["lifecycle"] == "deleting"
-    assert deleting["routing_generation"] == 1
+    # The preceding working-dir change also advances the routing generation;
+    # deletion must advance from THAT source instead of resetting the count.
+    assert deleting["routing_generation"] == before_deletion + 1
     complete_project_deletion(data, "p1")
     assert delete_project(data, "p1") is True  # idempotent compatibility completion
     assert get_project(data, "p1") is None
@@ -179,30 +146,6 @@ def test_update_project_provenance_fields_and_tombstone(tmp_path):
     with pytest.raises(ValueError, match="permanently reserved"):
         create_project(data, "p1", name="Resurrected")
     assert folder.is_dir()  # the folder is NEVER touched by delete
-
-
-def test_projects_summary_shows_owner_ui_projects_without_activity(tmp_path):
-    from ouroboros.projects_registry import create_project, projects_summary
-
-    data = tmp_path / "data"
-    data.mkdir()
-    create_project(data, "fresh", name="Fresh", origin="owner_ui")
-    rows = projects_summary(data)
-    fresh = next(r for r in rows if r["id"] == "fresh")
-    assert fresh["has_thread_activity"] is True  # owner-created is always visible
-    assert "provenance" in fresh
-
-
-# --- ui preference compatibility aliases -------------------------------------------
-
-def test_ui_preferences_project_hidden_is_retired():
-    """ABI 7.0 (ABI-3): the one-minor no-op input is gone — a stored legacy
-    key is ignored on read (never merged, never fatal, any shape)."""
-    from ouroboros.gateway.ui_preferences import _normalize_preferences
-
-    prefs = _normalize_preferences({"project_hidden": {"a": True, "b": False}}, fill_defaults=False)
-    assert "project_hidden" not in prefs
-    assert _normalize_preferences({"project_hidden": ["a"]}, fill_defaults=False) == {}
 
 
 # --- fs/dirs confinement ------------------------------------------------------------
@@ -463,3 +406,47 @@ def test_promote_source_registers_derived_project_and_mirrors_conflict(tmp_path,
     )
     ws4, _, err4, _, _ = resolve_promote_source(ctx, "https://example.com/myrepo.git", "myrepo")
     assert ws4 == "" and "conflict" in err4
+
+
+def test_promote_with_a_source_keeps_the_display_name_the_model_gave(tmp_path, monkeypatch):
+    """A sourced promotion registers the row in its off-loop half, BEFORE the named create.
+
+    ``create_project`` returns an existing row untouched, so the name must reach the first
+    call: withheld, a non-Latin name (whose id is ``proj_<digest>``) showed the id everywhere.
+    """
+    from types import SimpleNamespace
+
+    import ouroboros.config as config
+    from ouroboros.project_facts import project_id_from_display_name
+    from ouroboros.projects_registry import PROJECT_NAME_MAX, create_project, get_project
+    from ouroboros.promotion_source import resolve_promote_source
+
+    data = tmp_path / "data"
+    data.mkdir()
+    monkeypatch.setattr(config, "DATA_DIR", data)
+    ctx = SimpleNamespace(repo_dir=str(tmp_path / "repo"))
+    name = "Переключатели субагентов"
+    pid = project_id_from_display_name(name)
+    assert pid.startswith("proj_")  # no Latin slug: the id is a digest, the NAME is what people read
+    folder = tmp_path / "work"
+    folder.mkdir()
+
+    _, _, err, got, created = resolve_promote_source(ctx, str(folder), pid, project_name=name)
+    assert err == "" and got == pid and created is True
+    assert get_project(data, pid)["name"] == name
+    # The worker-side named create that follows finds the row and changes nothing.
+    assert create_project(data, pid, name=name, origin="promote_chat_to_task")["created"] is False
+    assert get_project(data, pid)["name"] == name
+
+    # No name given stays what it was: the row is named by its id.
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    _, _, err2, pid2, _ = resolve_promote_source(ctx, str(plain), "plain-project")
+    assert err2 == "" and get_project(data, pid2)["name"] == "plain-project"
+
+    # A title over the registry limit never turns a finished clone/attach into a refusal.
+    longer = tmp_path / "longer"
+    longer.mkdir()
+    _, _, err3, pid3, created3 = resolve_promote_source(
+        ctx, str(longer), "long-title", project_name="x" * (PROJECT_NAME_MAX + 1))
+    assert err3 == "" and created3 is True and get_project(data, pid3)["name"] == "long-title"

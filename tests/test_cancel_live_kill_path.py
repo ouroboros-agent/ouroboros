@@ -20,7 +20,7 @@ from ouroboros.task_results import (
     write_task_result,
 )
 
-from tests._cancel_intents_shared import _CaptureQueue, _LiveProc, _live_split_drive_task, _seed_llm_response
+from tests._cancel_intents_shared import _CaptureQueue, _LiveProc, _live_split_drive_task, _seed_llm_response, settled_off_loop
 from tests._cancel_intents_shared import (  # noqa: F401  (autouse fixture applies on import)
     _reap_spawned_live_procs,
 )
@@ -33,7 +33,6 @@ from tests._cancel_intents_shared import qenv as _qenv
 qenv = _qenv
 
 
-@pytest.mark.serial
 def test_e2e_tool_cancel_kills_live_worker_and_settles_with_cost(qenv, monkeypatch):
     """tool cancel → durable intent → custody kills a LIVE worker process →
     post-kill copy runs → settled cancelled result with reconstructed cost and
@@ -77,14 +76,17 @@ def test_e2e_tool_cancel_kills_live_worker_and_settles_with_cost(qenv, monkeypat
     assert stored["parent_decision"] == "cancelled"          # stamped at OUTCOME
     assert stored.get("cost_accounting_status") == "available"  # reconstructed
     assert ci.active_intent(qenv.drive, task_id) is None
-    assert not child_drive.exists(), "cancelled subagent drive is cleaned up"
+    assert not settled_off_loop(qenv.drive, task_id, child_drive), "unretained call history still owns the drive"
     # task_done carries the reconstructed accounting — never a fabricated final $0
     # (an empty ledger reconstructs to a CONFIRMED zero, which is fine).
     (done,) = done_events
     assert done["status"] == STATUS_CANCELLED
     assert done["cost_accounting_status"] == "available"
+    from ouroboros.headless import retry_child_task_refs
 
-@pytest.mark.serial
+    retry_child_task_refs(qenv.drive, child_drive, task_id)
+    assert settled_off_loop(qenv.drive, task_id, child_drive), "background retention releases the cancelled drive"
+
 def test_e2e_child_finishing_before_the_kill_keeps_its_completed_result(qenv, monkeypatch):
     """The race the incident erased: the child wrote its COMPLETED result on the
     split child drive before the kill — custody copies it back, publishes it,
@@ -131,7 +133,6 @@ def test_e2e_child_finishing_before_the_kill_keeps_its_completed_result(qenv, mo
     assert done["accounted_upper_bound_usd"] == 0.42
     assert "cost_usd" not in done
 
-@pytest.mark.serial
 def test_kill_path_registers_the_owed_answer_before_the_intent_settles(qenv, monkeypatch):
     """GR2-4 crash order: the owner's terminal answer is durably OWED before the
     intent settles — a crash between the two replays instead of losing both the
@@ -176,7 +177,6 @@ def test_kill_path_registers_the_owed_answer_before_the_intent_settles(qenv, mon
     )
 
 
-@pytest.mark.serial
 @pytest.mark.skipif(
     sys.platform == "win32",
     reason="the os.kill(pid, 0) liveness probe is not non-mutating on Windows "

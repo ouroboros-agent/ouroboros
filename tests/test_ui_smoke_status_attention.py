@@ -4,6 +4,8 @@ import json
 
 import pytest
 
+from tests.ui_chat_viewport_smoke import _OBSERVE_STATE_READS, _wait_state_reads_quiescent, wait_drawer_closed
+
 pytest_plugins = ("tests.test_ui_smoke_playwright",)
 
 
@@ -24,6 +26,7 @@ def test_task_status_stays_factual_in_main_and_project_chat(
     from playwright.sync_api import sync_playwright
 
     from ouroboros.projects_registry import create_project
+    from ouroboros.task_results import write_task_result
 
     url = direct_server_with_data["url"]
     data_dir = direct_server_with_data["data_dir"]
@@ -62,6 +65,9 @@ def test_task_status_stays_factual_in_main_and_project_chat(
         )
 
     def emit_progress(page, chat_id, task_id, content):
+        # A later real census/detail refresh must find this synthetic task.
+        # Socket-only rows otherwise become correctly "Outcome unavailable".
+        write_task_result(data_dir, task_id, "running", chat_id=chat_id)
         emit(page, {
             "type": "chat",
             "role": "assistant",
@@ -76,6 +82,10 @@ def test_task_status_stays_factual_in_main_and_project_chat(
         lifecycle = "cancelled" if status == "cancelled" else "completed"
         execution = "failed" if status == "failed" else "ok"
         objective = "fail" if status == "failed" else "pass"
+        write_task_result(data_dir, task_id, status, chat_id=chat_id, outcome_axes={
+            "lifecycle": {"status": lifecycle}, "execution": {"status": execution},
+            "objective": {"status": objective},
+        })
         emit(page, {
             "type": "log",
             "chat_id": chat_id,
@@ -197,6 +207,15 @@ def test_task_status_stays_factual_in_main_and_project_chat(
             assert card["phaseScroll"] <= card["phaseClient"] + 1, geometry
             assert card["titleScroll"] <= card["titleClient"] + 1, geometry
 
+    def room_status(page, status_selector):
+        # A room says its status once, in its bar's one status control right after
+        # the title (DESIGN "Room work status"), in Main and a Project alike. The
+        # cards stay in the chat column; the word is never read from two places.
+        status = page.locator(status_selector)
+        assert status.count() == 1, status_selector
+        assert status.evaluate("n => n.closest('.rw-trigger') !== null"), status_selector
+        return status
+
     def run_thread_flow(
         page,
         scope,
@@ -272,19 +291,23 @@ def test_task_status_stays_factual_in_main_and_project_chat(
         assert card_visual_state(parent) == parent_visual_before_child_failure
         assert "error" not in child.get_attribute("class").split()
 
+        # The room says the server's room (DESIGN "Room work status"). These
+        # frames exist only on the test socket, so the server holds no work
+        # here: the room stays Online while the cards say each outcome, and a
+        # child's failure never turns it to Attention.
         page.wait_for_function(
-            "selector => document.querySelector(selector)?.textContent === 'Working...'",
-            arg=f"{scope_selector} {status_selector}",
+            "selector => document.querySelector(selector)?.textContent === 'Online'",
+            arg=status_selector,
             timeout=30_000,
         )
-        assert "Attention" not in scope.locator(status_selector).inner_text()
+        assert "Attention" not in room_status(page, status_selector).inner_text()
         assert page.locator("#toast-stack .toast").count() == 0
         assert page.locator('[data-nav-page="chat"] .unread-badge').count() == 0
 
-        child_summary = child.locator(":scope > [data-live-summary-button]")
+        child_disclosure = child.locator(":scope > [data-live-summary-button] [data-live-disclosure]")
         assert child.get_attribute("data-expanded") == "0"
-        child_summary.focus()
-        child_summary.press("Enter")
+        child_disclosure.focus()
+        child_disclosure.press("Enter")
         assert child.get_attribute("data-expanded") == "1"
         child_line_toggle = child.locator(
             ":scope > [data-live-timeline] [data-live-line-toggle]"
@@ -296,9 +319,9 @@ def test_task_status_stays_factual_in_main_and_project_chat(
         child_timeline = child.locator(":scope > [data-live-timeline]").inner_text()
         assert "The selected tool route was unavailable; the parent can continue." in child_timeline
         assert "Reason:" not in child_timeline
-        assert "delegated_route_unavailable" not in child_summary.inner_text()
+        assert "delegated_route_unavailable" not in child.locator(":scope > [data-live-summary-button]").inner_text()
         child_line_toggle.press("Space")
-        child_summary.press("Space")
+        child_disclosure.press("Space")
         assert child.get_attribute("data-expanded") == "0"
 
         emit_task_done(page, chat_id, continuing_root, "completed")
@@ -310,7 +333,7 @@ def test_task_status_stays_factual_in_main_and_project_chat(
         assert_phase_accessibility(child, "Subagent", "Failed")
         page.wait_for_function(
             "selector => document.querySelector(selector)?.textContent === 'Online'",
-            arg=f"{scope_selector} {status_selector}",
+            arg=status_selector,
             timeout=30_000,
         )
 
@@ -324,14 +347,28 @@ def test_task_status_stays_factual_in_main_and_project_chat(
         assert failed.get_attribute("data-finished") == "1"
         assert phase_text(failed) == "Failed"
         assert_phase_accessibility(failed, "Task", "Failed")
+        # Unknown causes have an honest sentence; their exact recorded code remains
+        # accessible by keyboard in the terminal details (#2125).
+        assert failed.locator(
+            ":scope > [data-live-summary-button] [data-live-activity]"
+        ).inner_text() == "The recorded reason has no description yet."
         assert "provider_route_failed" not in failed.locator(
-            ":scope > [data-live-summary-button]"
+            ":scope > [data-live-summary-button] [data-live-title]"
         ).inner_text()
+        disclosure = failed.locator(":scope > [data-live-summary-button] [data-live-disclosure]")
+        disclosure.focus()
+        disclosure.press("Enter")
+        assert failed.get_attribute("data-expanded") == "1"
+        reason = failed.locator(":scope > [data-live-timeline] .chat-live-line-body").last
+        reason.wait_for(state="visible")
+        assert "Recorded reason: provider_route_failed" in reason.inner_text()
+        disclosure.press("Space")
+        assert failed.get_attribute("data-expanded") == "0"
 
-        status = scope.locator(status_selector)
+        status = room_status(page, status_selector)
         page.wait_for_function(
             "selector => document.querySelector(selector)?.textContent === 'Online'",
-            arg=f"{scope_selector} {status_selector}",
+            arg=status_selector,
             timeout=30_000,
         )
         assert status.inner_text() == "Online"
@@ -358,6 +395,7 @@ def test_task_status_stays_factual_in_main_and_project_chat(
             page = browser.new_page(viewport={"width": width, "height": height})
             try:
                 page.add_init_script(f"({capture_socket})()")
+                page.add_init_script(f"({_OBSERVE_STATE_READS})()")
                 # The initial rebuildAll replay wipes and rebuilds the feed
                 # from durable history (chat.js syncHistory). Frames emitted
                 # on the test socket exist nowhere durable, so one emitted
@@ -379,12 +417,17 @@ def test_task_status_stays_factual_in_main_and_project_chat(
                 page.evaluate(
                     "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
                 )
+                # The frames below exist only on the test socket. Let the
+                # socket-open census land before emitting them: a complete
+                # census whose request starts after a frame concludes that card
+                # by absence, exactly as it would a task the queue really lost.
+                _wait_state_reads_quiescent(page)
 
                 run_thread_flow(
                     page,
                     page.locator("#page-chat"),
                     "#page-chat",
-                    "#chat-status",
+                    "#page-chat .chat-page-header .rw-trigger #chat-status",
                     1,
                     "main",
                 )
@@ -414,21 +457,30 @@ def test_task_status_stays_factual_in_main_and_project_chat(
                 page.wait_for_selector("#project-panel:not([hidden])", timeout=30_000)
                 project_scope = page.locator("#project-panel .chat-instance-panel")
                 project_scope.wait_for(state="visible", timeout=30_000)
+                # On a phone the arriving room stays inert until the drawer handoff settles.
+                if width <= 640:
+                    wait_drawer_closed(page)
                 page.evaluate(
                     "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
                 )
+                # The panel's own hydrating census read (forced on mount) may
+                # start behind an in-flight page read; let it land before the
+                # panel's synthetic frames, for the same reason as in Main.
+                _wait_state_reads_quiescent(page)
                 run_thread_flow(
                     page,
                     project_scope,
                     "#project-panel .chat-instance-panel",
-                    f"#pchat-{project['id']}-status",
+                    f"#project-panel .project-panel-bar .rw-trigger #pchat-{project['id']}-status",
                     project_chat_id,
                     "project",
                 )
 
                 assert page.locator("#toast-stack .toast").count() == 0
                 assert page.locator('[data-nav-page="chat"] .unread-badge').count() == 0
-                assert project_row.locator(".nav-unread-dot").count() == 0
+                # A card update creates no unread: neither the row's unread fact nor a crimson status mark.
+                assert project_row.get_attribute("data-unread") is None
+                assert project_row.locator('.status-mark[data-hue="unread"]').count() == 0
             finally:
                 browser.close()
     except PlaywrightError as exc:
@@ -441,7 +493,12 @@ def test_task_status_stays_factual_in_main_and_project_chat(
 def test_history_replay_keeps_finalizing_and_finishes_bare_final(
     direct_server_with_data,
 ):
-    """Open summaries stay live; a keyed final without summary falls back to Done."""
+    """Open summaries stay live; a keyed final without summary falls back to Done.
+
+    #1110: a finalizing task whose lifecycle already settled paints that KNOWN
+    outcome as the chip and holds "Finalizing…" as the secondary fact — the card
+    stays unfinished until the settled task_done lands.
+    """
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import sync_playwright
@@ -503,9 +560,15 @@ def test_history_replay_keeps_finalizing_and_finishes_bare_final(
                 done_card.wait_for(state="visible", timeout=10_000)
 
                 assert open_card.get_attribute("data-finished") == "0"
-                assert open_card.locator(".chat-live-phase").inner_text().strip() == "Finalizing…"
+                assert open_card.locator(".chat-live-phase").inner_text().strip() == "Done"
+                # The hold is the SECONDARY fact beside the outcome; the chip's accessible
+                # name states both (task_phase_chip.setLiveCardPhase). This replay card has
+                # no work rows, so its chip is hidden and the visible secondary is proven by
+                # tests/test_ui_failed_finalizing_browser.py on a real card with work.
+                assert open_card.locator(".chat-live-phase").get_attribute("aria-label") == "Task status: Done, Finalizing…"
                 assert done_card.get_attribute("data-finished") == "1"
                 assert done_card.locator(".chat-live-phase").inner_text().strip() == "Done"
+                assert "Finalizing" not in (done_card.locator(".chat-live-phase").get_attribute("aria-label") or "")
             finally:
                 browser.close()
     except PlaywrightError as exc:

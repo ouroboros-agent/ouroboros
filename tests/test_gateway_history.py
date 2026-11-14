@@ -4,7 +4,53 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import pytest
+
+from ouroboros import dialogue_import
 from ouroboros.gateway.history import make_chat_history_endpoint
+from tests._store_shared import seed_result
+
+
+@pytest.mark.parametrize("summary", ["Проверка завершена.", "Проверка завершена.\n\n42 строки в /tmp/result.csv. Следующий шаг за владельцем.", ""])
+def test_completion_gist_is_short_on_cards_room_rows_and_live_frames(tmp_path, summary):
+    from ouroboros.gateway.ws import _encode
+    from ouroboros.task_results import load_task_result
+    from tests._wake_summary_shared import seed_wake
+    from tests.test_task_list_selection import client_for
+
+    title = "Authored title. Keep both sentences."
+    stored = seed_wake(tmp_path, title=title, suggested_name=title, wake_summary=summary)
+    task_id = stored["task_id"]
+    logs = tmp_path / "logs"
+    logs.mkdir(exist_ok=True)
+    terminal = {"direction": "out", "chat_id": 1,
+                "ts": stored["ts"], "task_id": task_id, "text": "Done", "wake_summary": summary,
+                "task_terminal_status": "completed", "suggested_name": title}
+    (logs / "chat.jsonl").write_text(json.dumps(terminal) + "\n", encoding="utf-8")
+    response = asyncio.run(make_chat_history_endpoint(tmp_path)(SimpleNamespace(query_params={"chat_id": "1"})))
+    room_row = next(row for row in json.loads(response.body)["messages"] if row.get("task_id") == task_id)
+    client = client_for(tmp_path)
+    detail = client.get("/api/tasks/" + task_id)
+    assert detail.status_code == 200
+    listed = client.get("/api/tasks").json()["tasks"]
+    card = next(row for row in listed if row["task_id"] == task_id)
+    chat = json.loads(_encode({**terminal, "type": "chat"}))
+    log = json.loads(_encode({"type": "log", "data": {**terminal, "type": "task_done"}}))["data"]
+    for row in (room_row, detail.json(), card, chat, log):
+        assert row.get("wake_summary", "") == ("Проверка завершена." if summary else "")
+    for row in (detail.json(), card, chat, log):
+        assert row["suggested_name"] == title
+    assert load_task_result(tmp_path, task_id)["wake_summary"] == terminal["wake_summary"] == summary
+
+
+def test_schedule_gists_shorten_listed_rows_and_leave_other_answers_as_they_are():
+    from ouroboros.gateway.completion_gist import short_schedule_gists
+    assert short_schedule_gists({"available": False}) == {"available": False}  # an unavailable reader's answer
+    rows = {"available": True, "tasks": [{"id": "s1", "last_outcome": {"line": "Done. 42 rows in /tmp/r.csv."}},
+                                         {"id": "s2", "last_outcome": {"line": "Host notice. Detail.", "notice": True}}]}
+    shown = short_schedule_gists(rows)
+    assert shown["tasks"][0]["last_outcome"]["line"] == "Done." and shown["tasks"][1] == rows["tasks"][1]
+    assert rows["tasks"][0]["last_outcome"]["line"] == "Done. 42 rows in /tmp/r.csv."  # the cached outcome stays whole
 
 
 def test_chat_history_preserves_subagent_lane_group_metadata(tmp_path):
@@ -240,6 +286,7 @@ def test_chat_history_backfills_from_rotated_archive(tmp_path):
     )
     (logs / "progress.jsonl").write_text("", encoding="utf-8")
 
+    assert dialogue_import.run_dialogue_import(tmp_path)["state"] == "done"
     endpoint = make_chat_history_endpoint(tmp_path)
     response = asyncio.run(endpoint(SimpleNamespace(query_params={"limit": "50"})))
     payload = json.loads(response.body.decode("utf-8"))["messages"]
@@ -287,7 +334,7 @@ def test_history_gap_metadata_keeps_reader_failures_fail_soft(tmp_path, monkeypa
     def fail(*_args, **_kwargs):
         raise RuntimeError("synthetic reader failure")
 
-    monkeypatch.setattr(history, "_read_chat_history_entries", fail)
+    monkeypatch.setattr(history, "_recent_entries", fail)
     rows, quota, gaps = history._collect_chat_rows(
         tmp_path / "chat.jsonl",
         tmp_path / "archive",
@@ -299,7 +346,7 @@ def test_history_gap_metadata_keeps_reader_failures_fail_soft(tmp_path, monkeypa
 
     assert rows == []
     assert quota == 0
-    assert gaps == set()
+    assert gaps == {"projection_failed"}, "fail-soft, yet disclosed: the missing rows are no clean window"
 
 
 def test_history_gap_metadata_keeps_legacy_reader_call_shape(tmp_path, monkeypatch):
@@ -313,10 +360,10 @@ def test_history_gap_metadata_keeps_legacy_reader_call_shape(tmp_path, monkeypat
         "ts": "2026-08-21T18:01:00Z",
     }
 
-    def legacy(_live, _archive, _want, _predicate):
+    def legacy(_root, _stream, _want, _predicate):
         return [row]
 
-    monkeypatch.setattr(history, "_read_chat_history_entries", legacy)
+    monkeypatch.setattr(history, "_recent_entries", legacy)
     rows, quota = history._collect_chat_rows(
         tmp_path / "chat.jsonl",
         tmp_path / "archive",
@@ -382,6 +429,7 @@ def test_progress_history_backfills_from_rotated_archive(tmp_path):
     )
     (logs / "chat.jsonl").write_text("", encoding="utf-8")
 
+    assert dialogue_import.run_dialogue_import(tmp_path)["state"] == "done"
     endpoint = make_chat_history_endpoint(tmp_path)
     response = asyncio.run(endpoint(SimpleNamespace(query_params={"n_progress": "10"})))
     payload = json.loads(response.body.decode("utf-8"))["messages"]
@@ -464,17 +512,14 @@ def test_history_annotation_after_quota_resolves_in_window_card(tmp_path):
     )
     results = tmp_path / "task_results"
     results.mkdir()
-    (results / "windowed.json").write_text(
-        json.dumps({
+    seed_result(tmp_path, "windowed", {
             "_schema_version": 1,
             "task_id": "windowed",
             "status": "completed",
             "cost_usd": 0.42,
             "cost_final": True,
             "reason_code": "",
-        }),
-        encoding="utf-8",
-    )
+        })
 
     endpoint = make_chat_history_endpoint(tmp_path)
     response = asyncio.run(
@@ -550,6 +595,7 @@ def test_chat_history_backfill_quota_is_thread_aware(tmp_path):
     )
     (logs / "progress.jsonl").write_text("", encoding="utf-8")
 
+    assert dialogue_import.run_dialogue_import(tmp_path)["state"] == "done"
     endpoint = make_chat_history_endpoint(tmp_path)
     # want=2 (< the 4 unrelated live rows): old quota would stop before reading
     # the archive; thread-aware quota reads it because 0 live rows match `pc`.
@@ -720,10 +766,7 @@ def test_chat_history_settled_result_overrides_pre_final_summary_finality(tmp_pa
     (logs / "progress.jsonl").write_text("", encoding="utf-8")
     results = tmp_path / "task_results"
     results.mkdir()
-    (results / "settled-summary.json").write_text(
-        json.dumps({"_schema_version": 1, "task_id": "settled-summary", "status": "completed"}),
-        encoding="utf-8",
-    )
+    seed_result(tmp_path, "settled-summary", {"_schema_version": 1, "task_id": "settled-summary", "status": "completed"})
 
     endpoint = make_chat_history_endpoint(tmp_path)
     response = asyncio.run(endpoint(SimpleNamespace(query_params={"limit": "10"})))
@@ -732,6 +775,80 @@ def test_chat_history_settled_result_overrides_pre_final_summary_finality(tmp_pa
     rec = next(item for item in payload if item.get("task_id") == "settled-summary")
     assert rec["outcome_phase"] == "done"
     assert rec["outcome_final"] is True
+
+
+def test_chat_history_replays_the_rows_current_custody_debt_beside_its_raw_history(tmp_path):
+    """#1583: a summary written while a debt was open replays with the row's CURRENT list, so a
+    healed older stamp reads Done while its raw reason and axes stay as written."""
+    stamp = "delegated_custody_unreconciled"
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    rows = [{"ts": "2026-10-06T00:00:52Z", "direction": "system", "type": "task_summary", "task_id": task_id,
+             "chat_id": 1, "text": "Summary written at the terminal.", "reason_code": stamp,
+             "delegated_runs_unreconciled": ["run-1"], "outcome_phase": "warn", "outcome_final": True}
+            for task_id in ("healed", "owed")]
+    (logs / "chat.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    (logs / "progress.jsonl").write_text("", encoding="utf-8")
+    axes = {"execution": {"status": "ok", "reason_code": "final_message"},
+            "objective": {"status": "not_evaluated", "source": "none", "warning": stamp, "warnings": [stamp]}}
+    for task_id, debt in (("healed", []), ("owed", ["run-1"])):
+        seed_result(tmp_path, task_id, {"_schema_version": 1, "task_id": task_id, "status": "completed",
+                                        "reason_code": stamp, "outcome_axes": axes,
+                                        "delegated_runs_unreconciled": debt})
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    response = asyncio.run(endpoint(SimpleNamespace(query_params={"limit": "10"})))
+    replayed = {item["task_id"]: item for item in json.loads(response.body.decode("utf-8"))["messages"]
+                if item.get("task_id") in {"healed", "owed"}}
+    assert replayed["healed"]["delegated_runs_unreconciled"] == [] and replayed["healed"]["outcome_phase"] == "done"
+    assert replayed["owed"]["delegated_runs_unreconciled"] == ["run-1"] and replayed["owed"]["outcome_phase"] == "warn"
+    for record in replayed.values():
+        assert record["reason_code"] == stamp and record["outcome_axes"]["objective"]["warning"] == stamp
+
+
+def test_chat_history_never_turns_a_legacy_stamp_into_its_execution_cause(tmp_path):
+    """R1 QA (consumer evidence ``synthetic-stamp-no-cause``): a stored older failed row with the stamp,
+    no typed execution cause and a known-empty list replays with no execution reason, so neither
+    reader names a debt; Continue still refuses for the unrecorded cause. Without a list the same
+    failed row refuses alike, and an older finished row (``synthetic-debt-unknown``) keeps its
+    warning: no list is no proof of reconciliation."""
+    stamp = "delegated_custody_unreconciled"
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "chat.jsonl").write_text("".join(json.dumps({
+        "ts": "2026-10-06T00:00:52Z", "direction": "system", "type": "task_summary", "task_id": task_id,
+        "chat_id": 1, "text": "Summary written at the terminal.", "outcome_phase": "warn", "outcome_final": True,
+    }) + "\n" for task_id in ("legacy", "no-list", "finished-no-list")), encoding="utf-8")
+    (logs / "progress.jsonl").write_text("", encoding="utf-8")
+    failed_axes = {"execution": {"status": "failed"}, "lifecycle": {"status": "failed"},
+                   "objective": {"warning": stamp, "warnings": [stamp]}}
+    for task_id, debt in (("legacy", {"delegated_runs_unreconciled": []}), ("no-list", {})):
+        seed_result(tmp_path, task_id, {
+            "_schema_version": 1, "task_id": task_id, "status": "failed", "reason_code": stamp,
+            "delegation_role": "root", "root_task_id": task_id, "outcome_axes": failed_axes, **debt})
+    seed_result(tmp_path, "finished-no-list", {
+        "_schema_version": 1, "task_id": "finished-no-list", "status": "completed", "reason_code": stamp,
+        "delegation_role": "root", "root_task_id": "finished-no-list",
+        "outcome_axes": {"execution": {"status": "ok", "reason_code": "final_message"}, "lifecycle": {"status": "completed"},
+                         "objective": {"source": "author_acceptance", "status": "pass", "warning": stamp,
+                                       "warnings": [stamp]}}})
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    response = asyncio.run(endpoint(SimpleNamespace(query_params={"limit": "10"})))
+    replayed = {item["task_id"]: item for item in json.loads(response.body.decode("utf-8"))["messages"]
+                if item.get("task_id") in {"legacy", "no-list", "finished-no-list"}}
+    assert set(replayed) == {"legacy", "no-list", "finished-no-list"}, replayed
+    record = replayed["legacy"]
+    assert record["outcome_axes"]["execution"].get("reason_code", "") != stamp
+    assert record["outcome_phase"] == "error" and record["delegated_runs_unreconciled"] == []
+    assert record["reason_code"] == stamp and record["outcome_axes"]["objective"]["warning"] == stamp
+    assert record["continuation_offer"] == {"eligible": False, "cause": stamp, "refusal": "interruption_cause_unrecorded"}
+    unlisted = replayed["no-list"]
+    assert unlisted["outcome_axes"]["execution"].get("reason_code", "") != stamp
+    assert unlisted["outcome_phase"] == "error" and unlisted["continuation_offer"] == record["continuation_offer"]
+    finished = replayed["finished-no-list"]
+    assert finished["outcome_axes"]["execution"]["reason_code"] == "final_message"
+    assert finished["outcome_phase"] == "warn", "no list is no proof of reconciliation"
 
 
 def test_chat_history_attaches_terminal_cost_truth_from_task_result(tmp_path):
@@ -753,8 +870,7 @@ def test_chat_history_attaches_terminal_cost_truth_from_task_result(tmp_path):
     )
     results = tmp_path / "task_results"
     results.mkdir()
-    (results / "cost-terminal.json").write_text(
-        json.dumps({
+    seed_result(tmp_path, "cost-terminal", {
             "_schema_version": 1,
             "task_id": "cost-terminal",
             "status": "completed",
@@ -763,9 +879,7 @@ def test_chat_history_attaches_terminal_cost_truth_from_task_result(tmp_path):
             "cost_final": True,
             "cost_usd_with_children": 2.75,
             "cost_with_children_partial": False,
-        }),
-        encoding="utf-8",
-    )
+        })
 
     endpoint = make_chat_history_endpoint(tmp_path)
     response = asyncio.run(endpoint(SimpleNamespace(query_params={"limit": "10"})))
@@ -806,8 +920,7 @@ def test_chat_history_terminal_cost_truth_overrides_row_embedded_snapshot(tmp_pa
     (logs / "progress.jsonl").write_text("", encoding="utf-8")
     results = tmp_path / "task_results"
     results.mkdir()
-    (results / "cost-override.json").write_text(
-        json.dumps({
+    seed_result(tmp_path, "cost-override", {
             "_schema_version": 1,
             "task_id": "cost-override",
             "status": "completed",
@@ -816,9 +929,7 @@ def test_chat_history_terminal_cost_truth_overrides_row_embedded_snapshot(tmp_pa
             "cost_final": True,
             "cost_usd_with_children": 2.5,
             "cost_with_children_partial": False,
-        }),
-        encoding="utf-8",
-    )
+        })
 
     endpoint = make_chat_history_endpoint(tmp_path)
     response = asyncio.run(endpoint(SimpleNamespace(query_params={"limit": "10"})))
@@ -1071,7 +1182,9 @@ def test_chat_history_replays_the_live_subtree_ceiling_for_a_running_root(tmp_pa
 
     seen_roots = []
 
-    def _projection(_drive, *, root_task_id=""):
+    def _breakdown(_drive, *, root_task_id="", allow_stale=False, custody_root=None, include_custody=False):
+        # The live-root projection's one read: stale-allowed, with custody coverage.
+        assert allow_stale is True and include_custody is True
         seen_roots.append(root_task_id)
         if root_task_id == "root-empty":
             return {"attempt_counts": {"metadata_only": 1}, "subscription_sessions": 0}
@@ -1081,7 +1194,7 @@ def test_chat_history_replays_the_live_subtree_ceiling_for_a_running_root(tmp_pa
             "attempt_counts": {"resolved": 4}, "subscription_sessions": 0,
         }
 
-    monkeypatch.setattr(usage_accounting, "usage_projection", _projection)
+    monkeypatch.setattr(usage_accounting, "usage_breakdown", _breakdown)
     logs = tmp_path / "logs"
     logs.mkdir()
     (logs / "chat.jsonl").write_text("", encoding="utf-8")
@@ -1106,9 +1219,9 @@ def test_chat_history_replays_the_live_subtree_ceiling_for_a_running_root(tmp_pa
         ("root-empty", "running", {}),
         ("root-done", "completed", {"accounted_upper_bound_usd": 0.42, "cost_final": True}),
     ):
-        (results / f"{task_id}.json").write_text(json.dumps({
+        seed_result(tmp_path, task_id, {
             "_schema_version": 1, "task_id": task_id, "status": status, "metadata": {}, **extra,
-        }), encoding="utf-8")
+        })
 
     endpoint = make_chat_history_endpoint(tmp_path)
     response = asyncio.run(endpoint(SimpleNamespace(query_params={"limit": "50"})))
@@ -1193,3 +1306,23 @@ def test_chat_history_replays_an_admission_notice_without_terminal_truth(tmp_pat
     assert rec["text"] == "Аудит · Not started: the working folder can't be used"
     assert "task_terminal_status" not in rec
     assert "outcome_final" not in rec
+
+
+def test_history_preserves_relay_sender_target_summary_quotes_and_row_identity(tmp_path):
+    """The deck receives every saved relay field, including unknown senders and the stamped receiver, unchanged."""
+    from ouroboros import dialogue_store as ds
+    from ouroboros.chat_references import projection_fields
+    relay = {'relay_id': 'deck-note', 'summary': 'Check both browser engines',
+             'sender': {'name': 'Verification', 'chat_id': 42, 'task_id': 'sender-task'},
+             'target': {'task_id': 'receiver-task', 'title': 'Compare both engines'},
+             'quotes': [{'text': 'Keep my words available', 'source': {'chat_id': 1, 'label': 'Main'}},
+                        {'text': '', 'attachments': [{'name': 'instructions.txt'}], 'source': {'chat_id': 1}}]}
+    row = {'chat_id': 1, 'ts': '2026-10-22T11:00:00Z', 'direction': 'out',
+           'type': 'relay_entry', 'text': 'Full note as written', 'relay': relay}
+    ds.append(tmp_path, 'chat', row, feed=True)
+    endpoint = make_chat_history_endpoint(tmp_path)
+    response = asyncio.run(endpoint(SimpleNamespace(query_params={'limit': '10'})))
+    note = next(item for item in json.loads(response.body)['messages'] if item.get('relay'))
+    assert note['relay'] == relay
+    assert note['row_address'] == projection_fields(row)['row_address']
+    assert note['text'] == row['text']

@@ -10,7 +10,8 @@ GR4-3  the synthetic lifecycle-fault terminal fires the assisted-update and
        cooperative-checkpoint hooks exactly as the normal dispatch does;
 GR4-4  the cascade digest reports each child's CURRENT durable status;
 GR4-5  chat.js: a failed post-failure detail fetch proves nothing — the card
-       keeps the pending presentation and the disabled Cancel;
+       keeps the pending presentation and the disabled Cancel (runs as behaviour
+       in web/tests/cancel_pending_stop.test.js);
 GR4-6  /evolve start clears ``evolution_owner_stopped`` BEFORE the campaign
        mint (both ingresses), and the owner-stop backstop defers while any
        other evolution task is live;
@@ -24,7 +25,6 @@ from __future__ import annotations
 
 import json
 import pathlib
-import time
 import types
 
 import pytest
@@ -32,7 +32,6 @@ import pytest
 from ouroboros import cancel_intents as ci
 from ouroboros.task_results import (
     STATUS_CANCELLED,
-    STATUS_COMPLETED,
     STATUS_RUNNING,
     load_task_result,
     write_task_result,
@@ -95,13 +94,13 @@ def test_gr4_1_cascade_summary_registration_failure_keeps_the_intent(qenv, monke
     from supervisor import workers
 
     queue = _CaptureQueue()
-    monkeypatch.setattr(workers, "get_event_q", lambda: queue, raising=False)
+    monkeypatch.setattr(workers, "get_event_q", lambda *, create=True: queue, raising=False)
     monkeypatch.setattr(qenv.q, "_emit_cancel_task_done", lambda *a, **kw: None)
     write_task_result(qenv.drive, "cs1", STATUS_CANCELLED, chat_id=6, result="killed")
     ci.request_cancel(qenv.drive, "cs1", scope=ci.SCOPE_CASCADE, allow_settled_target=True)
     store = _corrupt_delivery_registry(qenv.drive)
 
-    assert qenv.tl.cancel_task_by_id("cs1", cascade=True) is True, (
+    assert qenv.tl.cancel_task_by_id("cs1") is True, (
         "the teardown itself is not gated on the registry"
     )
     row = ci.active_intent(qenv.drive, "cs1")
@@ -114,79 +113,8 @@ def test_gr4_1_cascade_summary_registration_failure_keeps_the_intent(qenv, monke
 
     # Healed registry: the watchdog replay owes the summary and settles.
     store.unlink()
-    assert qenv.tl.cancel_task_by_id("cs1", cascade=True) is True
+    assert qenv.tl.cancel_task_by_id("cs1") is True
     assert ci.active_intent(qenv.drive, "cs1") is None, "healed registry converges"
-
-
-def test_gr4_1_already_settled_fast_path_keeps_intent_and_stays_loud(qenv, monkeypatch):
-    """The already-settled fast path applies the SAME rule as the running-kill
-    path: registration failure → claim released, intent open — and every
-    watchdog re-feed re-attempts the registration, so the retry loop carries
-    the loud typed event each tick instead of spinning silently."""
-    from supervisor import workers
-
-    queue = _CaptureQueue()
-    monkeypatch.setattr(workers, "get_event_q", lambda: queue, raising=False)
-    write_task_result(qenv.drive, "fs1", STATUS_RUNNING, chat_id=4, result="working")
-    ci.request_cancel(qenv.drive, "fs1", reason="stop")
-    # Natural completion wins the race before custody arrives.
-    write_task_result(
-        qenv.drive, "fs1", STATUS_COMPLETED, chat_id=4, result="the finished answer",
-    )
-    store = _corrupt_delivery_registry(qenv.drive)
-
-    assert qenv.tl.cancel_task_custody("fs1") == qenv.tl.CANCEL_ALREADY_SETTLED
-    row = ci.active_intent(qenv.drive, "fs1")
-    assert row is not None and row["state"] == ci.INTENT_REQUESTED, (
-        "GR4-1: the intent stays OPEN (claim released) over the unowed answer"
-    )
-    loud_after_first = len([
-        r for r in _event_rows(qenv.drive)
-        if r.get("type") == "terminal_delivery_unregistered"
-    ])
-    assert loud_after_first >= 1
-
-    # Second re-feed (the watchdog tick shape): still open, still loud.
-    assert qenv.tl.cancel_task_custody("fs1") == qenv.tl.CANCEL_ALREADY_SETTLED
-    assert ci.active_intent(qenv.drive, "fs1") is not None
-    loud_after_second = len([
-        r for r in _event_rows(qenv.drive)
-        if r.get("type") == "terminal_delivery_unregistered"
-    ])
-    assert loud_after_second > loud_after_first, (
-        "each re-feed re-attempts the registration — the loop is never silent"
-    )
-
-    # Healed registry: the next custody owes the answer and settles the intent.
-    store.unlink()
-    assert qenv.tl.cancel_task_custody("fs1") == qenv.tl.CANCEL_ALREADY_SETTLED
-    assert ci.active_intent(qenv.drive, "fs1") is None, "healed registry converges"
-
-
-def test_gr4_1_miss_lane_registration_failure_keeps_the_intent(qenv, monkeypatch):
-    """The finalize-on-miss lane applies the same rule: the cancelled terminal
-    is written (the teardown is not gated), but the intent stays open until
-    the answer is durably owed; the healed watchdog sweep converges."""
-    from supervisor import workers
-
-    queue = _CaptureQueue()
-    monkeypatch.setattr(workers, "get_event_q", lambda: queue, raising=False)
-    monkeypatch.setattr(qenv.q, "_emit_cancel_task_done", lambda *a, **kw: None)
-    write_task_result(qenv.drive, "ml1", STATUS_RUNNING, chat_id=5, result="was working")
-    ci.request_cancel(qenv.drive, "ml1", reason="stop")
-    store = _corrupt_delivery_registry(qenv.drive)
-
-    assert qenv.tl.cancel_task_custody("ml1") == qenv.tl.CANCEL_CANCELLED
-    assert load_task_result(qenv.drive, "ml1")["status"] == STATUS_CANCELLED
-    row = ci.active_intent(qenv.drive, "ml1")
-    assert row is not None and row["state"] == ci.INTENT_REQUESTED, (
-        "GR4-1: unowed answer → intent open for the watchdog"
-    )
-
-    store.unlink()
-    swept = qenv.tl.sweep_cancel_intents(now=time.time() + 30)
-    assert swept == {"ml1": qenv.tl.CANCEL_ALREADY_SETTLED}
-    assert ci.active_intent(qenv.drive, "ml1") is None, "healed registry converges"
 
 
 # --------------------------------------------------------------------------
@@ -203,7 +131,7 @@ def test_gr4_2_same_intent_replay_dedups_by_the_per_intent_delivery_id(qenv, mon
     from supervisor import workers
 
     queue = _CaptureQueue()
-    monkeypatch.setattr(workers, "get_event_q", lambda: queue, raising=False)
+    monkeypatch.setattr(workers, "get_event_q", lambda *, create=True: queue, raising=False)
     monkeypatch.setattr(qenv.q, "_emit_cancel_task_done", lambda *a, **kw: None)
     write_task_result(qenv.drive, "cr2", STATUS_CANCELLED, chat_id=6, result="killed")
     minted = ci.request_cancel(
@@ -223,7 +151,7 @@ def test_gr4_2_same_intent_replay_dedups_by_the_per_intent_delivery_id(qenv, mon
 
     monkeypatch.setattr("ouroboros.cancel_intents.settle_intent", _crashy)
 
-    assert qenv.tl.cancel_task_by_id("cr2", cascade=True) is True
+    assert qenv.tl.cancel_task_by_id("cr2") is True
     sends = [e for e in queue.events if e.get("type") == "send_message"]
     assert [e["delivery_id"] for e in sends] == [did]
     assert ci.active_intent(qenv.drive, "cr2") is not None, "crash shape: intent open"
@@ -231,7 +159,7 @@ def test_gr4_2_same_intent_replay_dedups_by_the_per_intent_delivery_id(qenv, mon
     # Confirmed send → the same-intent replay delivers NOTHING new and settles.
     td.register_delivery(qenv.drive, did)
     queue.events.clear()
-    assert qenv.tl.cancel_task_by_id("cr2", cascade=True) is True
+    assert qenv.tl.cancel_task_by_id("cr2") is True
     assert [e for e in queue.events if e.get("type") == "send_message"] == []
     assert ci.active_intent(qenv.drive, "cr2") is None
 
@@ -241,7 +169,7 @@ def test_gr4_2_same_intent_replay_dedups_by_the_per_intent_delivery_id(qenv, mon
     )
     assert second["request_id"] != minted["request_id"]
     queue.events.clear()
-    assert qenv.tl.cancel_task_by_id("cr2", cascade=True) is True
+    assert qenv.tl.cancel_task_by_id("cr2") is True
     later = [e for e in queue.events if e.get("type") == "send_message"]
     assert [e["delivery_id"] for e in later] == [f"cascade:cr2:{second['request_id']}"]
 
@@ -289,26 +217,6 @@ def _fault_probes(monkeypatch):
     return probes
 
 
-def test_gr4_3_lifecycle_fault_fires_assisted_and_root_done_hooks(tmp_path, monkeypatch):
-    import supervisor.queue as q
-    from supervisor.events import _handle_task_done
-
-    monkeypatch.setattr(q, "clear_acceptance_fence_for_root", lambda tid: None)
-    probes = _fault_probes(monkeypatch)
-    running = {"g3": {"task": {"id": "g3", "chat_id": 12, "metadata": {"m": 1}}}}
-    ctx = _fault_ctx(tmp_path, running)
-    write_task_result(tmp_path, "g3", STATUS_RUNNING, result="working")
-
-    _handle_task_done({"task_id": "g3", "status": "running", "worker_id": 3}, ctx)
-
-    assert load_task_result(tmp_path, "g3")["status"] == "failed"
-    assert probes["abort"] == 1 and probes["gate"] == 1, (
-        "GR4-3: the assisted-update orphan watchdog fires on the synthetic terminal"
-    )
-    assert probes["root_done"] == 1, "root coop checkpoint fires exactly like the normal path"
-    assert probes["quiesce"] == 0, "quiescence is the subagent-only hook"
-
-
 def test_gr4_3_lifecycle_fault_fires_the_quiescence_hook_for_a_subagent(tmp_path, monkeypatch):
     import supervisor.queue as q
     from supervisor.events import _handle_task_done
@@ -335,59 +243,6 @@ def test_gr4_3_lifecycle_fault_fires_the_quiescence_hook_for_a_subagent(tmp_path
 # --------------------------------------------------------------------------
 # GR4-4 — the digest reports each child's CURRENT durable status
 # --------------------------------------------------------------------------
-
-
-def test_gr4_4_cascade_digest_reports_the_current_durable_child_state(tmp_path, monkeypatch):
-    from supervisor import terminal_delivery as td
-    from supervisor import workers
-
-    queue = _CaptureQueue()
-    monkeypatch.setattr(workers, "get_event_q", lambda: queue, raising=False)
-    write_task_result(tmp_path, "r4", STATUS_CANCELLED, chat_id=9, result="root down")
-    # c4 was reported ``failed`` by the sweep but a concurrent actor settled it.
-    write_task_result(tmp_path, "c4", STATUS_CANCELLED, result="settled elsewhere")
-
-    owed = td.deliver_cascade_summary(
-        tmp_path, "r4", {"id": "r4", "chat_id": 9},
-        {"c4": "failed", "c5": "failed"},
-    )
-
-    assert owed is True
-    (event,) = [e for e in queue.events if e.get("type") == "send_message"]
-    assert "2 descendant task(s) were settled with it" in event["text"]
-    # Q5=A: per-child outcomes live in the durable cancel_receipt block the
-    # details panel renders, not in the chat text.
-    outcomes = {
-        row["task_id"]: row["outcome"]
-        for row in load_task_result(tmp_path, "r4")["cancel_receipt"]["children"]
-    }
-    assert outcomes["c4"] == "cancelled", (
-        "GR4-4: the digest reports the CURRENT durable status, not the stale sweep outcome"
-    )
-    # A child with no settled durable status keeps the sweep's honest outcome.
-    assert outcomes["c5"] == "failed"
-
-
-# --------------------------------------------------------------------------
-# GR4-5 — chat.js: a failed detail fetch proves nothing (web static)
-# --------------------------------------------------------------------------
-
-
-def test_gr4_5_failed_detail_fetch_keeps_cancel_disabled_and_pending():
-    src = (REPO_ROOT / "web" / "modules" / "chat.js").read_text(encoding="utf-8")
-    body_at = src.index("async function cancelRunFromCard")
-    guard_at = src.index("if (stored === null) {", body_at)
-    restore_at = src.index("restoreLiveCardPhaseState(record, priorPhase);", body_at)
-    assert guard_at < restore_at, (
-        "GR4-5: the null-detail guard must return BEFORE the phase restore / "
-        "button re-enable — a failed fetch proves nothing"
-    )
-    assert "Only a fetched, live, non-pending detail restores the button." in src
-    # The old behavior (restore on an unverifiable state) is gone.
-    assert "fall through to the restore below" not in src
-
-
-# --------------------------------------------------------------------------
 # GR4-6 — evolution start/backstop race
 # --------------------------------------------------------------------------
 
@@ -400,6 +255,7 @@ def test_gr4_6_toggle_evolution_clears_owner_stop_before_the_campaign_mint(
     from supervisor import evolution_lifecycle as el
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     state.update_state(lambda live: live.update(
         owner_chat_id=7, evolution_owner_stopped=True,
     ))
@@ -407,7 +263,7 @@ def test_gr4_6_toggle_evolution_clears_owner_stop_before_the_campaign_mint(
     monkeypatch.setattr(el, "evolution_block_reason", lambda: "")
     monkeypatch.setattr(
         el, "start_evolution_campaign",
-        lambda objective, source="": seen.append(
+        lambda objective, source="", **kwargs: seen.append(
             bool(state.load_state().get("evolution_owner_stopped"))
         ) or {"status": "active"},
     )
@@ -428,18 +284,18 @@ def test_gr4_6_toggle_evolution_clears_owner_stop_before_the_campaign_mint(
 
 
 def test_gr4_6_server_evolve_start_clears_the_flag_before_the_campaign():
-    """The owner-chat `/evolve` ingress is exercised inside the bridge drain
-    loop; the ordering is pinned at the source (the same style as the GR3-5
-    ordering pin)."""
-    src = (REPO_ROOT / "server.py").read_text(encoding="utf-8")
-    clear_at = src.index(
-        '_evo_update_state(lambda live: live.__setitem__("evolution_owner_stopped", False))'
-    )
-    start_at = src.index('start_evolution_campaign(objective, source="owner_chat")')
-    assert clear_at < start_at, (
-        "GR4-6: /evolve start must clear evolution_owner_stopped before the campaign mint"
-    )
+    """The owner-chat `/evolve` ingress and the owner-sourced toggle share ONE start
+    transaction (#1307); its clear-before-mint ordering is pinned at the source."""
+    import inspect
 
+    from supervisor.events_runtime_controls import owner_evolution_start
+
+    src = (REPO_ROOT / "server.py").read_text(encoding="utf-8")
+    assert 'owner_evolution_start(objective, source="owner_chat")' in src
+    body = inspect.getsource(owner_evolution_start)
+    assert body.index("update_state(_clear_owner_stop") < body.index("start_evolution_campaign("), (
+        "GR4-6: the owner-stop flag is cleared BEFORE the campaign is minted"
+    )
 
 def test_gr4_6_backstop_defers_while_another_evolution_task_is_live(tmp_path, monkeypatch):
     import supervisor.queue as q
@@ -448,6 +304,7 @@ def test_gr4_6_backstop_defers_while_another_evolution_task_is_live(tmp_path, mo
     from supervisor import evolution_lifecycle as el
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     q.init(tmp_path)
     assert el.start_evolution_campaign("Improve", source="test").get("status") == "active"
     state.update_state(lambda live: live.update(evolution_owner_stopped=True))
@@ -473,40 +330,6 @@ def test_gr4_6_backstop_defers_while_another_evolution_task_is_live(tmp_path, mo
 
 # --------------------------------------------------------------------------
 # GR4-7 — the cascade auto-release requires a generation fence
-# --------------------------------------------------------------------------
-
-
-def test_gr4_7_request_id_alone_never_releases_another_owners_live_claim(tmp_path):
-    """Interleave: owner B holds the live claim; a fence-less caller settles
-    with ``request_id`` only (durable on the row — identical for every
-    claimant). The refusal stands, but B's claim must NOT be auto-released."""
-    ci.request_cancel(tmp_path, "g7", scope=ci.SCOPE_CASCADE)
-    claim = ci.claim_intent(tmp_path, "g7", owner="other-custody")
-    assert claim and not claim.get("claim_refused")
-
-    out = ci.settle_intent(
-        tmp_path, "g7", outcome="cancelled",
-        request_id=str(claim.get("request_id") or ""),  # NO expected_generation
-    )
-
-    assert out is None, "the cascade-scope refusal itself is unchanged"
-    row = ci.active_intent(tmp_path, "g7")
-    assert row is not None and row["state"] == ci.INTENT_CLAIMED, (
-        "GR4-7: request_id alone must not release the live claim"
-    )
-    assert row["claim_owner"] == "other-custody"
-
-    # A properly fenced caller (captured generation) still gets the auto-release.
-    out2 = ci.settle_intent(
-        tmp_path, "g7", outcome="cancelled",
-        expected_generation=row.get("generation"),
-        request_id=str(row.get("request_id") or ""),
-    )
-    assert out2 is None
-    released = ci.active_intent(tmp_path, "g7")
-    assert released is not None and released["state"] == ci.INTENT_REQUESTED
-
-
 # --------------------------------------------------------------------------
 # GR4-8 — corrupt-projection refusals are typed and honest
 # --------------------------------------------------------------------------

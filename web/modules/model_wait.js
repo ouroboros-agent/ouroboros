@@ -1,22 +1,33 @@
 // Task-local subscription recovery. The host owns waits, revisions and the
 // application of an action; this view only preserves and presents those facts.
-import { fetchJson, jsonPost } from './api_client.js';
+import { APP_SETTINGS_ORIGIN, fetchJson, jsonPost } from './api_client.js';
 import { claudexorStatus } from './claudexor_status_store.js';
 import { startLogin } from './harness_accounts.js';
 import { createModelRolesEditor, MODEL_ACCOUNTS_KEY, modelRolesHost, parseModelSource } from './model_roles.js';
-import { API_PROVIDER_CREDENTIAL_KEYS } from './route_editor_primitives.js';
+import { API_PROVIDER_CREDENTIAL_KEYS, apiProviderLabel, PROCESSING_PREFERENCE_KEY } from './route_editor_primitives.js';
+import { adoptConnectionLabels, connectionLabel, routeConnectionId } from './connection_labels.js';
 import { desiredLiveCardPhase, setLiveCardPhase } from './task_phase_chip.js';
 import { taskDoneIsTerminal } from './log_events.js';
 
-/** Only the provider credential fields; no other setting reaches the picker draft. */
+/** Only the provider credential fields and the connection list; no other setting reaches the picker draft. */
 function providerCredentials(settings = {}) {
-    return Object.fromEntries(API_PROVIDER_CREDENTIAL_KEYS
-        .filter((key) => key in settings).map((key) => [key, settings[key]]));
+    return { ...Object.fromEntries(API_PROVIDER_CREDENTIAL_KEYS
+        .filter((key) => key in settings).map((key) => [key, settings[key]])),
+    _meta: { connections: settings?._meta?.connections } };
+}
+
+/** What the picker's role editor loads: the provider credentials, the waiting route's model and account, and the
+ *  processing tier its call pays (captured before the wait; a row from before that field takes the default). The tier
+ *  only tells the editor whether a catalog price is the one paid: with showContext:false it never saves a tier. */
+export function pickerDocument(settings = {}, row = {}) {
+    return { ...providerCredentials(settings), model: row.model, [MODEL_ACCOUNTS_KEY]: { main: row.credential_profile_id || '' },
+        [PROCESSING_PREFERENCE_KEY]: String(row.processing_preference ?? settings?.[PROCESSING_PREFERENCE_KEY] ?? '') };
 }
 
 export function modelWaitRoleLabel(role = '') {
-    const labels = { main: 'Main', light: 'Light', vision: 'Vision', consciousness: 'Background consciousness',
-        deep_review: 'Deep self-review', websearch: 'Web search' };
+    // `lead` is a work on a model of its own (its room's, or one the owner gave it): no Settings slot (CLIENT_CONTRACT §5).
+    const labels = { main: 'Main', light: 'Light', vision: 'Vision', consciousness: 'Consciousness',
+        safety: 'Safety Supervisor', deep_review: 'Deep self-review', websearch: 'Web search', lead: 'This work\'s model' };
     if (labels[role]) return labels[role];
     const [kind, ...identity] = String(role).split(':');
     const suffix = identity.join(':');
@@ -26,13 +37,25 @@ export function modelWaitRoleLabel(role = '') {
     return String(role || 'Model');
 }
 
+/** A wait's reason as its row names it; `observesAccess` false: the host cannot watch that route's access return.
+ *  A work's card says a fallback's cause in the same words (card_model.js). */
+export function modelWaitReasonLabel(reason, observesAccess = true) {
+    return reason === 'connection_unavailable' ? 'Key unavailable' : !observesAccess ? 'Waiting for provider access'
+        : reason === 'auth_quota' ? 'Waiting for access' : reason === 'unavailable' ? 'Waiting for an account'
+            : reason === 'auth' ? 'Sign-in required' : 'Waiting for quota';
+}
+
+/** Host wait reasons: `unavailable` is an engine-dated pool refusal, neither quota nor sign-in;
+ *  `connection_unavailable`: the API key the route names is turned off or removed in Accounts. */
+export const MODEL_WAIT_REASONS = ['quota', 'auth', 'auth_quota', 'unavailable', 'connection_unavailable'];
+
 /** A late snapshot cannot rewind a row or reopen a resolved wait episode. */
 export function mergeModelWaits(previous = {}, incoming = {}) {
     const result = { ...previous };
     for (const [id, row] of Object.entries(incoming || {})) {
         if (!row || row.wait_id !== id || !Number.isInteger(row.revision) || row.revision < 1
             || !Number.isInteger(row.task_attempt) || row.task_attempt < 1
-            || !['waiting', 'resolved'].includes(row.state) || !['quota', 'auth', 'auth_quota'].includes(row.reason)) continue;
+            || !['waiting', 'resolved'].includes(row.state) || !MODEL_WAIT_REASONS.includes(row.reason)) continue;
         const prior = result[id];
         if (prior && (prior.revision > row.revision || prior.state === 'resolved')) continue;
         if (prior?.revision === row.revision) {
@@ -50,10 +73,12 @@ export function mergeModelWaits(previous = {}, incoming = {}) {
 }
 
 export function activeModelWaits(waits = {}, finished = false, currentAttempt = 0) {
-    if (finished) return [];
     const rows = Object.values(waits);
     const attempt = currentAttempt || Math.max(0, ...rows.map((row) => row.task_attempt));
-    return rows.filter((row) => row.state === 'waiting' && row.task_attempt === attempt);
+    return rows.filter((row) => row.state === 'waiting' && row.task_attempt === attempt
+        && (!finished || (row.review_operation?.owner_id
+            && row.review_operation.owner_id === row.model_wait_owner_id
+            && row.review_operation.retry_key && row.review_operation.slot_id)));
 }
 
 export function modelWaitAction(taskId, row, action, fields, requestId) {
@@ -71,8 +96,21 @@ export function modelWaitAction(taskId, row, action, fields, requestId) {
     return body;
 }
 
+/** The card's own decision POST declares the app (api_client.APP_SETTINGS_ORIGIN): a model it saves in Settings is
+ *  recorded like the Settings page's own Save, without a row in Main. */
+export const sendModelWaitDecision = (body) => jsonPost('/api/decisions', body,
+    { rejectOkFalse: true, headers: APP_SETTINGS_ORIGIN });
+
 const requestIdentity = () => globalThis.crypto?.randomUUID?.()
     || `model-wait-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+/** A requested Settings save that did not land, told once its wait resolved; '' otherwise. */
+export function unsavedPersistenceNotice(row, outcome) {
+    if (!outcome || outcome.saved === true || row?.state !== 'resolved') return '';
+    const applied = Boolean(outcome.request_id) && row.applied_request_id === outcome.request_id;
+    return `${modelWaitRoleLabel(row.role)}: ${applied ? 'model change applied' : 'model wait ended'}; `
+        + (outcome.saved === null ? 'whether it was saved in Settings is unconfirmed.' : 'it was not saved in Settings.');
+}
 
 export function isModelWaitReference(value) {
     return value?.type === 'task_model_wait' || value?.system_type === 'task_model_wait';
@@ -84,8 +122,9 @@ export function isModelWaitReference(value) {
  * No polling, timer, login job or task lifecycle is owned by this component.
  */
 export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn(),
-    onChange = () => {}, openSettings = () => {}, login = startLogin,
-    read = fetchJson, send = (body) => jsonPost('/api/decisions', body, { rejectOkFalse: true }),
+    onChange = () => {}, openSettings = () => {}, login = startLogin, notify = () => {},
+    includeWait = () => true,
+    read = fetchJson, send = sendModelWaitDecision,
     store = claudexorStatus, doc = () => document } = {}) {
     const tasks = new Map();
     const getDoc = typeof doc === 'function' ? doc : () => doc;
@@ -94,15 +133,18 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
     let settingsPromise = null;
     const readAbort = new AbortController();
 
-    function syncPhase(taskId, waiting) {
+    // `waiting`: an admitted wait of the task's current attempt is open; `ownerAction`: one of them needs the owner
+    // (the host's own revision-bound `requires_owner_action`, never read from its words).
+    function syncPhase(taskId, { waiting, ownerAction = false }) {
         const record = getRecord(taskId, false);
         if (record && !record.finished) {
             record.modelWaiting = waiting;
+            record.modelOwnerAction = waiting && ownerAction;
             record.root.dataset.modelWaiting = waiting ? '1' : '0';
             // A block without work carries no title placeholder while it waits: the chrome
             // follows the work it stands on, never the lane (and no lane is always shown).
             const phase = desiredLiveCardPhase(record);
-            setLiveCardPhase(record, phase.phase, phase.text, phase.className);
+            setLiveCardPhase(record, phase.phase, phase.text, phase.className, phase.secondary);
         }
         onChange(taskId, waiting);
     }
@@ -128,29 +170,53 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
         const node = view.node;
         const pending = view.sending || isPending(row);
         const mixed = row.reason === 'auth_quota';
+        const pool = row.reason === 'unavailable';
+        const keyOff = row.reason === 'connection_unavailable';
         const quota = row.reason === 'quota' || mixed;
+        const observesAccess = row.availability_observation !== 'unavailable';
+        const timed = (quota || pool) && observesAccess;
         node.querySelector('[data-wait-role]').textContent = modelWaitRoleLabel(row.role);
-        node.querySelector('[data-wait-reason]').textContent = mixed ? 'Waiting for access'
-            : row.reason === 'auth' ? 'Sign-in required' : 'Waiting for quota';
+        node.querySelector('[data-wait-reason]').textContent = modelWaitReasonLabel(row.reason, observesAccess);
+        // Amber only while the wait needs the owner (the host's revision-bound fact); a wait that goes on by itself is a
+        // quiet tray with a neutral sentence (docs/DESIGN.md "Status marks").
+        const owner = row.requires_owner_action === true;
+        if (node.dataset.owner !== (owner ? '1' : '0')) node.dataset.owner = owner ? '1' : '0';
+        node.querySelector('[data-wait-reason]').dataset.tone = owner ? 'warn' : 'neutral';
         const model = parseModelSource(row.model).model || row.model;
-        node.querySelector('[data-wait-model]').textContent = `${model || 'Model'} · ${row.credential_profile_id ? `Account: ${row.credential_profile_id}` : 'Auto rotation'}`;
+        const key = routeConnectionId(row.model);
+        node.querySelector('[data-wait-model]').textContent = `${model || 'Model'} · ${keyOff
+            ? (key ? connectionLabel(key) : apiProviderLabel(parseModelSource(row.model).source))
+            : !observesAccess ? 'Configured API access' : row.credential_profile_id ? `Account: ${row.credential_profile_id}` : 'Auto rotation'}`;
         const reset = row.reset_at ? new Date(row.reset_at) : null;
-        node.querySelector('[data-wait-reset]').textContent = (mixed
-            ? 'Some accounts need sign-in; others are waiting for quota. ' : '') + (quota
-            ? (reset && Number.isFinite(reset.getTime()) ? `Quota resets ${reset.toLocaleString()}.` : 'Quota reset time is not known.') : '');
+        const known = reset && Number.isFinite(reset.getTime());
+        // The organization's Supervisor (deployment_policy, projected on every served row) is never switched here:
+        // no branch offers another model or a key its Accounts row cannot turn back on.
+        const managed = row.managed === true;
+        node.querySelector('[data-wait-reset]').textContent = ((keyOff
+            ? (managed ? 'This API key is turned off or removed in Accounts. Retry once it is back, or stop.'
+                : 'This API key is turned off or removed in Accounts. Turn it back on, choose another model, or stop.') : !observesAccess
+            ? `Automatic access checks are unavailable. Retry after access is restored, ${managed ? '' : 'choose another model, '}or stop.` : (mixed
+            ? 'Some accounts need sign-in; others are waiting for quota. ' : '') + (pool
+            ? `No account can serve this model now. ${known ? `The engine reported a reset at ${reset.toLocaleString()}; availability is unconfirmed.` : 'The reset time is not known.'}`
+            : quota ? (known ? `Quota resets ${reset.toLocaleString()}.` : 'Quota reset time is not known.') : ''))
+            + (managed ? ' Your organization sets this model; only its administrator changes it.' : '')).trim();
+        node.querySelector('[data-wait-change]').hidden = managed;
+        if (managed) node.querySelector('[data-wait-picker]').hidden = true;
         const automatic = node.querySelector('[data-wait-auto]');
-        automatic.parentElement.hidden = !quota;
-        node.querySelector('[data-wait-auto-label]').textContent = mixed
+        automatic.parentElement.hidden = !timed;
+        node.querySelector('[data-wait-auto-label]').textContent = mixed || pool
             ? 'Continue automatically when access is restored' : 'Continue automatically when quota resets';
         const requested = view.sending ? view.lastRequest : row.pending_action;
         automatic.checked = pending && requested?.action === 'auto_continue'
             ? requested.auto_continue : row.auto_continue !== false;
         const auth = node.querySelector('[data-wait-login]');
-        auth.hidden = row.reason !== 'auth';
-        node.querySelector('[data-wait-settings]').textContent = mixed ? 'Accounts' : 'Settings';
+        auth.hidden = row.reason !== 'auth' || !observesAccess;
+        node.querySelector('[data-wait-settings]').textContent = mixed || keyOff ? 'Accounts' : 'Settings';
+        const saved = view.persisted?.saved;
         node.querySelector('[data-wait-notice]').textContent = view.error
             || (view.sending ? 'Sending your choice…' : isPending(row)
-                ? `${view.saved === true ? 'Settings saved. ' : view.saved === null ? 'Settings save is unconfirmed. ' : ''}Request accepted; waiting for the task to apply it.` : '');
+                ? `${saved === true ? 'Settings saved. ' : saved === null ? 'Settings save is unconfirmed. '
+                    : saved === false ? 'Settings were not saved. ' : ''}Request accepted; waiting for the task to apply it.` : '');
         node.querySelector('[data-wait-notice]').dataset.tone = view.error ? 'warn' : 'neutral';
         node.querySelector('[data-wait-repeat]').hidden = !view.error || !view.lastRequest;
         node.querySelectorAll('button, input, select').forEach((el) => { el.disabled = pending; });
@@ -160,37 +226,50 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
         node.querySelector('[data-wait-apply]').disabled = pending || !view.editor;
         const taskOnlyLocal = view.editor && row.role.startsWith('fallback:')
             && view.editor.collect().USE_LOCAL_MAIN !== view.sharedFallbackLocal;
+        // A work's own model is no role of Settings: saving it there is not offered (owner 10.11).
+        const ownModel = row.role === 'lead';
         const persist = node.querySelector('[data-wait-persist]');
-        persist.disabled = pending || taskOnlyLocal;
-        if (taskOnlyLocal) persist.checked = false;
-        node.querySelector('[data-wait-scope]').textContent = taskOnlyLocal
+        node.querySelector('[data-wait-persist-offer]').hidden = ownModel;
+        persist.disabled = pending || taskOnlyLocal || ownModel;
+        if (taskOnlyLocal || ownModel) persist.checked = false;
+        node.querySelector('[data-wait-scope]').textContent = ownModel
+            ? 'This changes this work\'s model only; a room\'s own model is set in its composer.' : taskOnlyLocal
             ? 'Local applies to all fallbacks in Settings. This change is task-only; edit Models for a permanent change.'
-            : 'This role changes until the task ends.';
+            : row.review_operation ? 'This role changes for this review operation.' : 'This role changes until the task ends.';
+    }
+
+    // A row leaving because it resolved still owes its requested Settings outcome; disposal does not.
+    function tellUnsaved(view, row) {
+        const notice = unsavedPersistenceNotice(row, view.persisted);
+        if (notice) { view.persisted = null; notify(notice, 'warn'); }
     }
 
     function paint(taskId) {
         if (destroyed) return false;
         const task = tasks.get(taskId);
         if (!task) return false;
-        const active = activeModelWaits(task.waits, task.finished, task.attempt);
-        if (!active.length) { clearViews(task); syncPhase(taskId, false); return true; }
-        const record = getRecord(taskId);
-        if (!record?.root || record.finished) { clearViews(task); return false; }
-        if (task.host?.parentElement !== record.root) {
+        const record = getRecord(taskId, false);
+        const active = activeModelWaits(task.waits, task.finished || record?.finished, task.attempt)
+            .filter(row => includeWait(taskId, row));
+        const activeIds = new Set(active.map((row) => row.wait_id));
+        for (const [id, view] of task.views) if (!activeIds.has(id)) tellUnsaved(view, task.waits[id]);
+        if (!active.length) { clearViews(task); syncPhase(taskId, { waiting: false }); return true; }
+        const card = record || getRecord(taskId);
+        if (!card?.root) { clearViews(task); return false; }
+        if (task.host?.parentElement !== card.root) {
             if (!task.host) {
                 task.host = getDoc().createElement('section');
                 task.host.className = 'model-waits';
                 task.host.setAttribute('aria-label', 'Subscription access');
                 task.host.innerHTML = '<div data-wait-rows></div><div class="model-wait-footnote" data-wait-slot></div>';
             }
-            record.timelineEl.before(task.host);
+            card.timelineEl.before(task.host);
             const focused = task.focused;
             task.focused = null;
             if (focused) requestAnimationFrame(() => {
                 if (!destroyed && focused.isConnected && getDoc().activeElement === getDoc().body) focused.focus({ preventScroll: true });
             });
         }
-        const activeIds = new Set(active.map((row) => row.wait_id));
         for (const [id, view] of task.views) {
             if (activeIds.has(id)) continue;
             view.editor?.destroy(); view.node.remove(); task.views.delete(id);
@@ -207,7 +286,7 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
         task.host.querySelector('[data-wait-slot]').textContent = active.some((row) => row.worker_slot_held === true)
             ? 'This task keeps its worker slot. Queued tasks may wait. Completed steps are kept.'
             : 'Completed steps are kept. Continuation is available while Ouroboros remains running.';
-        syncPhase(taskId, true);
+        syncPhase(taskId, { waiting: true, ownerAction: active.some((row) => row.requires_owner_action === true) });
         return true;
     }
 
@@ -219,7 +298,6 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
             ...Object.values(next).map((row) => row.task_attempt));
         const attemptChanged = nextAttempt > task.attempt;
         if (attemptChanged) { task.attempt = nextAttempt; task.finished = false; }
-        if (task.finished) return false;
         if (!attemptChanged && task.host?.isConnected && Object.keys(next).every((id) => next[id] === task.waits[id])) return false;
         task.waits = next;
         return onDomWrite(() => paint(taskId));
@@ -232,6 +310,10 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
         try { body = retry ? view.lastRequest : modelWaitAction(taskId, view.row, action, fields, requestIdentity()); }
         catch (error) { view.error = error.message; onDomWrite(() => paint(taskId)); return; }
         view.lastRequest = body;
+        if (!retry) view.persisted = null;
+        const persisted = (saved) => {
+            if (body.persist_role === true) view.persisted = { request_id: body.request_id, saved: typeof saved === 'boolean' ? saved : null };
+        };
         view.sending = true;
         view.error = '';
         onDomWrite(() => paint(taskId));
@@ -239,23 +321,26 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
             const answer = await send(body);
             if (destroyed) return;
             if (answer?.ok !== true || !answer.wait) throw new Error('The request was not confirmed. Check the task state before retrying.');
-            view.saved = answer.saved;
+            persisted(answer.saved);
             adopt(taskId, { [answer.wait.wait_id]: answer.wait });
         } catch (error) {
             if (destroyed) return;
             const latest = error?.body?.wait || error?.payload?.wait;
+            const failure = error?.body || error?.payload || {};
+            persisted(failure.saved);
             if (latest) {
                 // A failed mailbox delivery retains the accepted action. Only
                 // its exact request can retry; a conflicting/stale one is gone.
-                const failure = error?.body || error?.payload || {};
                 if (!['mailbox_write_failed', 'model_wait_decision_failed'].includes(failure.reason_code)
                     || latest.pending_action?.request_id !== body.request_id) view.lastRequest = null;
-                view.saved = failure.saved;
                 adopt(taskId, { [latest.wait_id]: latest });
             }
             view.error = String(error?.message || error);
         } finally {
             view.sending = false;
+            const task = destroyed ? null : tasks.get(taskId);
+            // Its row may have resolved, and left the card, before this answer arrived.
+            if (task && task.views.get(view.row.wait_id) !== view) tellUnsaved(view, task.waits[view.row.wait_id]);
             if (!destroyed) onDomWrite(() => paint(taskId));
         }
     }
@@ -270,6 +355,7 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
                 settingsPromise = null; throw error;
             });
             const settings = await settingsPromise;
+            adoptConnectionLabels(settings?._meta?.connections);
             if (destroyed || !view.node.isConnected || view.row.state !== 'waiting') return;
             const id = view.editorId;
             onDomWrite(() => {
@@ -278,9 +364,8 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
                     onChange: () => onDomWrite(() => paint(taskId)) });
                 // The picker offers the same configured API providers as Models,
                 // so the wait panel needs this document's credential fields too.
-                view.editor.load({ ...providerCredentials(settings), model: view.row.model,
-                    [MODEL_ACCOUNTS_KEY]: { main: view.row.credential_profile_id || '' } },
-                { providerProfiles: settings?._meta?.setup_contract?.providerProfiles || {}, modelSlots: [
+                view.editor.load(pickerDocument(settings, view.row),
+                { providerProfiles:settings?._meta?.setup_contract?.providerProfiles || {}, modelSlots: [
                     { slot: 'main', settingKey: 'model', inputId: `${id}-model`, settingsToggleId: `${id}-local`, label: modelWaitRoleLabel(view.row.role) },
                 ] });
                 view.editor.mount();
@@ -301,8 +386,8 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
         node.dataset.waitId = row.wait_id;
         const editorId = `model-wait-editor-${++serial}-${requestIdentity()}`;
         const view = { node, row, editorId, editor: null, sending: false, loading: false,
-            error: '', saved: false, lastRequest: null };
-        node.innerHTML = `<div class="model-wait-heading"><strong data-wait-role></strong><span class="ui-status" data-tone="warn" data-wait-reason></span></div>
+            error: '', persisted: null, lastRequest: null };
+        node.innerHTML = `<div class="model-wait-heading"><strong data-wait-role></strong><span class="ui-status" data-tone="neutral" data-wait-reason></span></div>
             <div class="model-wait-meta" data-wait-model></div><div class="model-wait-meta" data-wait-reset></div>
             <label class="model-wait-auto"><input class="ui-checkbox" type="checkbox" data-wait-auto> <span data-wait-auto-label></span></label>
             <div class="model-wait-actions"><button class="btn btn-default" type="button" data-wait-change>Change model or account</button>
@@ -310,7 +395,7 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
                 <button class="btn btn-default" type="button" data-wait-retry>Try again</button>
                 <button class="btn btn-default" type="button" data-wait-settings>Settings</button></div>
             <div class="model-wait-picker" data-wait-picker hidden>${modelRolesHost(editorId)}
-                <label class="model-wait-auto"><input class="ui-checkbox" type="checkbox" data-wait-persist> Also save this role in Settings</label>
+                <label class="model-wait-auto" data-wait-persist-offer><input class="ui-checkbox" type="checkbox" data-wait-persist> Also save this role in Settings</label>
                 <div class="model-wait-actions"><button class="btn btn-default" type="button" data-wait-apply disabled>Apply to this task</button>
                     <span class="model-wait-meta" data-wait-scope></span></div></div>
             <div class="model-wait-notice ui-status" data-wait-notice role="status" aria-live="polite"></div>
@@ -320,10 +405,12 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
         });
         node.querySelector('[data-wait-retry]').addEventListener('click', () => { void submit(taskId, view, 'retry'); });
         node.querySelector('[data-wait-repeat]').addEventListener('click', () => { void submit(taskId, view, '', {}, true); });
-        node.querySelector('[data-wait-settings]').addEventListener('click', () => { void openSettings('providers'); });
+        node.querySelector('[data-wait-settings]').addEventListener('click', () => { void openSettings('accounts'); });
         node.querySelector('[data-wait-login]').addEventListener('click', async () => {
-            if (await openSettings('providers') === false) return;
-            if (view.row.credential_harness && view.row.credential_profile_id) {
+            // The sign-in card lives on the provider's own page, so that page is the one opened.
+            const harness = view.row.credential_harness && view.row.credential_profile_id ? view.row.credential_harness : '';
+            if (await openSettings(harness ? `accounts/${encodeURIComponent(harness)}` : 'accounts') === false) return;
+            if (harness) {
                 await login(view.row.credential_harness, view.row.credential_profile_id);
             }
         });
@@ -343,12 +430,14 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
 
     return {
         adopt,
+        refresh(taskId) { return onDomWrite(() => paint(taskId)); },
         observe(taskId, value) {
             const attempt = Number.isInteger(value?.task_attempt) ? value.task_attempt : 0;
             if (attempt && attempt < (tasks.get(taskId)?.attempt || 0)) return false;
             if (taskId && taskDoneIsTerminal(value)) {
-                if (value?.model_waits || isModelWaitReference(value)) taskEntry(taskId);
-                this.finish(taskId); return false;
+                const changed = adopt(taskId, value?.model_waits || (isModelWaitReference(value) && value.wait_id
+                    ? { [value.wait_id]: value } : {}), attempt);
+                this.finish(taskId); return changed;
             }
             if (value?.model_waits) return adopt(taskId, value.model_waits, attempt);
             if (isModelWaitReference(value) && value.wait_id) return adopt(taskId, { [value.wait_id]: value }, attempt);

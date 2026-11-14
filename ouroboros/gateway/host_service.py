@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import functools
 import hmac
 import json
 import logging
@@ -22,18 +25,19 @@ from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from ouroboros.contracts.chat_id_policy import A2A_CHAT_ID_MAX, A2A_CHAT_ID_MIN, is_a2a_chat_id
+from ouroboros.deployment_extensions import trust_gap
 from ouroboros.event_bus import get_global_event_bus
 from ouroboros.config import WS_RELAY_BURST, WS_RELAY_REFILL_PER_SEC
 from ouroboros.gateway._helpers import run_sync_to_completion
-from ouroboros.gateway.files import store_chat_upload
+from ouroboros.server_control import dispatch_accepted_restart
+from ouroboros import chat_uploads
+from ouroboros.chat_uploads import store_upload
 from ouroboros.presence_delivery import (
-    DELIVERY_VERSION, PresenceDeliveryConflict, PresenceDeliveryRecorder,
-    delivery_reporting_version,
+    DELIVERY_VERSION, PresenceDeliveryRecorder,
 )
 from ouroboros.skill_loader import (
     find_skill,
     grant_status_for_skill,
-    load_enabled,
 )
 from ouroboros.utils import append_jsonl, atomic_write_json, read_json_dict, utc_now_iso
 
@@ -43,11 +47,11 @@ _json_error = lambda message, status=500: JSONResponse({"ok": False, "error": me
 DEFAULT_HOST_SERVICE_HOST = "127.0.0.1"
 DEFAULT_HOST_SERVICE_PORT = 8767
 AUTH_TOKEN_FILENAME = "auth_token.json"
+# /identity advertises POST /notify for side-effect-free compatibility checks.
+NOTIFY_VERSION = 1
 
-# The out-of-process WS progress relay (``POST /ui/ws-message``) is the one
-# token-bucket lane: a 60-message burst reserve that refills one message per
-# second (owner decision 2026-09-06: a burst must not silence a widget for the
-# rest of a minute). Every other Host Service lane keeps the sliding window.
+# Owner decision 2026-09-06: a burst must not silence a widget. WS relay alone
+# uses a 60-message token bucket refilling at 1/s; other lanes keep sliding windows.
 
 
 class HostServiceAuthError(Exception):
@@ -198,12 +202,34 @@ class HostServiceContext:
         self.bridge_getter = bridge_getter or self._default_bridge
         self.tool_schemas_getter = tool_schemas_getter or self._default_tool_schemas
         self.ws_broadcaster_getter = ws_broadcaster_getter or self._default_ws_broadcaster
-        self.presence_runner = presence_runner or self._default_presence_runner
+        self.presence_runner = presence_runner
         self.rate_limiter = _RateLimiter(on_burst_end=self._ws_relay_burst_ended)
         self._inflight: Dict[str, int] = defaultdict(int)
         self._inflight_lock = threading.Lock()
+        # Auth and pre-turn Presence reads may both precede turn reservation.
+        # Bound their combined occupancy of the shared default executor; queued
+        # requests hold no thread, and physical completion returns the permit.
+        self._auth_capacity = threading.BoundedSemaphore(2)
         self._counter_lock = threading.Lock()
         self.presence_deliveries = PresenceDeliveryRecorder(self.data_dir)
+        from ouroboros.presence_runner import PresenceTurnExecutions
+
+        self.presence_turns = PresenceTurnExecutions()
+
+    def _runner(self) -> Optional[Callable[..., Any]]:
+        return self._presence_runner
+
+    def _bind_runner(self, runner: Optional[Callable[..., Any]]) -> None:
+        from ouroboros.presence_carrier import set_presence_runner
+
+        self._presence_runner = runner
+        set_presence_runner(self.data_dir, runner)
+
+    # The runner a test injects for the carrier's body (``presence_carrier.carry_presence_turn`` reads it for this
+    # Host's root); the Host itself runs no turn body: every body is a conversation-lane carrier's (1A). An injected
+    # runner supplies its own repo/drive/factory, as the retired unarmed seam's runner did. Assigned at construction
+    # or later, it reaches the carrier the same way; None restores the module's own runner.
+    presence_runner = property(_runner, _bind_runner)
 
     def _ws_relay_burst_ended(self, key: str, dropped: int, duration_sec: float) -> None:
         """Report one aggregated WS relay refusal burst: a warning plus one
@@ -249,23 +275,15 @@ class HostServiceContext:
 
         return broadcast_ws_sync
 
-    def _default_presence_runner(self, **kwargs: Any) -> Any:
-        from ouroboros.presence_runner import run_presence_turn
-        from supervisor.workers import REPO_DIR, get_event_q
+    async def admit_presence_gate(self, conversation_key: str, *, wait: bool = True) -> Any:
+        """Coroutine admission into the configured presence gate; the lease the turn runs under."""
+        from ouroboros.presence_runner import admit_configured_gate
 
-        return run_presence_turn(
-            repo_dir=pathlib.Path(REPO_DIR),
-            drive_root=self.data_dir,
-            event_queue=get_event_q(),
-            **kwargs,
-        )
+        return await admit_configured_gate(self.data_dir, conversation_key, wait=wait)
 
     @property
     def skills_state_dir(self) -> pathlib.Path:
         return self.data_dir / "state" / "skills"
-
-    def authenticate_token(self, raw_token: str) -> str:
-        return self.authenticate_token_payload(raw_token)[0]
 
     def authenticate_token_payload(self, raw_token: str) -> tuple[str, Dict[str, Any]]:
         token = str(raw_token or "").strip()
@@ -289,9 +307,11 @@ class HostServiceContext:
         if loaded is None:
             raise HostServiceAuthError(f"skill {skill_name!r} is not installed")
         if not loaded.review.gate_for(loaded.content_hash)["executable_review"]:
-            raise HostServiceAuthError(f"skill {skill_name!r} does not have a fresh executable review")
-        if not load_enabled(self.data_dir, skill_name):
+            raise HostServiceAuthError(f"skill {skill_name!r} has no current executable review authority")
+        if not loaded.enabled:  # the effective switch (``deployment_extensions``), as the loader reads it
             raise HostServiceAuthError(f"skill {skill_name!r} is disabled")
+        if loaded.manifest.is_extension() and trust_gap(loaded.name, loaded.skill_dir, loaded.content_hash):
+            raise HostServiceAuthError(f"skill {skill_name!r} is not code this deployment's service runs")
         if str(token_payload.get("content_hash") or "") != str(loaded.content_hash or ""):
             raise HostServiceAuthError(f"skill {skill_name!r} token is stale")
 
@@ -345,6 +365,40 @@ class HostServiceContext:
             return chat_id
 
 
+async def _bounded_host_read(ctx: HostServiceContext, operation: Callable[[], Any]) -> Any:
+    """Keep pre-reservation disk work off-loop without filling the shared executor."""
+    while not ctx._auth_capacity.acquire(blocking=False):
+        await asyncio.sleep(0.01)
+    try:
+        work = asyncio.get_running_loop().run_in_executor(None, operation)
+    except BaseException:
+        ctx._auth_capacity.release()
+        raise
+    # A disconnected caller must not release a permit while its worker still runs.
+    work.add_done_callback(lambda _done: ctx._auth_capacity.release())
+    return await asyncio.shield(work)
+
+
+async def _authenticated(
+    ctx: HostServiceContext, raw_token: str, permission: str = "",
+) -> tuple[str, Dict[str, Any]]:
+    """Resolve the request's skill (and one grant) off the event loop.
+
+    Token discovery reads every registered skill's token, review, enablement and grants
+    from disk; inline, one slow walk stalled every request on the loop the owner's API
+    shares. It is short read-only work, so the default executor serves it: Presence turns
+    no longer wait there (``presence_runner.PresenceTurnExecutions``).
+    """
+
+    def resolve() -> tuple[str, Dict[str, Any]]:
+        skill_name, token_payload = ctx.authenticate_token_payload(raw_token)
+        if permission:
+            ctx.require_permission(skill_name, token_payload, permission)
+        return skill_name, token_payload
+
+    return await _bounded_host_read(ctx, resolve)
+
+
 def _token_from_websocket(websocket: WebSocket) -> str:
     header = websocket.headers.get("x-skill-token", "")
     if header:
@@ -357,12 +411,7 @@ def _token_from_websocket(websocket: WebSocket) -> str:
     return ""
 
 
-async def _api_identity(request: Request) -> JSONResponse:
-    ctx: HostServiceContext = request.app.state.host_service_context
-    try:
-        ctx.authenticate_token(request.headers.get("x-skill-token", ""))
-    except HostServiceAuthError as exc:
-        return _json_error(str(exc), 403)
+def _identity_facts(ctx: HostServiceContext) -> tuple[str, str]:
     identity_path = ctx.data_dir / "memory" / "identity.md"
     name = "Ouroboros"
     description = ""
@@ -378,35 +427,63 @@ async def _api_identity(request: Request) -> JSONResponse:
                     break
     except Exception:
         log.debug("Failed to read identity for host service", exc_info=True)
+    return name, description
+
+
+async def _api_identity(request: Request) -> JSONResponse:
+    ctx: HostServiceContext = request.app.state.host_service_context
+    try:
+        await _authenticated(ctx, request.headers.get("x-skill-token", ""))
+    except HostServiceAuthError as exc:
+        return _json_error(str(exc), 403)
+    name, description = await asyncio.to_thread(_identity_facts, ctx)
+    from ouroboros.places import WAKE_FACTS
+    from ouroboros.presence_continuation import CONTINUATION_VERSION, CONTINUATION_VERSIONS
+    from ouroboros.presence_history import HISTORY_IMPORT_VERSION, SOURCE_ORDER_VERSION
+    from ouroboros.presence_owner_contact import MAIN_CONTACT_VERSION
+    from ouroboros.presence_recovery import WORK_OUTPUT_VERSION
+    from ouroboros.place_guard import PLACE_BINDING_VERSION
+
     return JSONResponse({"ok": True, "name": name, "description": description,
-                         "presence_delivery_version": DELIVERY_VERSION})
+                         "presence_delivery_version": DELIVERY_VERSION, "places_version": 1,
+                         "presence_continuation_version": CONTINUATION_VERSION,
+                         "presence_continuation_versions": list(CONTINUATION_VERSIONS),
+                         "presence_main_contact_version": MAIN_CONTACT_VERSION,
+                         "presence_work_output_version": WORK_OUTPUT_VERSION,
+                         "presence_history_import_version": HISTORY_IMPORT_VERSION,
+                         "presence_source_order_version": SOURCE_ORDER_VERSION,
+                         "presence_wake_facts": list(WAKE_FACTS),
+                         "presence_wake_signals": 1,
+                         "presence_explicit_completion": 1,
+                         "presence_reaction_context": 1,
+                         "presence_identity": 1,
+                         "presence_place_binding_version": PLACE_BINDING_VERSION,
+                         "notify_version": NOTIFY_VERSION})
 
 
 async def _api_tool_schemas(request: Request) -> JSONResponse:
     ctx: HostServiceContext = request.app.state.host_service_context
     try:
-        skill_name = ctx.authenticate_token(request.headers.get("x-skill-token", ""))
+        skill_name, _token_payload = await _authenticated(ctx, request.headers.get("x-skill-token", ""))
     except HostServiceAuthError as exc:
         return _json_error(str(exc), 403)
     if not ctx.rate_limiter.allow(f"{skill_name}:tools"):
         return _json_error("rate limit exceeded", 429)
-    schemas = ctx.tool_schemas_getter()
+    schemas = await asyncio.to_thread(ctx.tool_schemas_getter)
     return JSONResponse({"ok": True, "tools": schemas})
 
 
 async def _api_allocate_internal(request: Request) -> JSONResponse:
     ctx: HostServiceContext = request.app.state.host_service_context
     try:
-        skill_name, token_payload = ctx.authenticate_token_payload(request.headers.get("x-skill-token", ""))
-    except HostServiceAuthError as exc:
-        return _json_error(str(exc), 403)
-    try:
-        ctx.require_permission(skill_name, token_payload, "inject_chat")
+        skill_name, _token_payload = await _authenticated(ctx, request.headers.get("x-skill-token", ""), "inject_chat")
     except HostServiceAuthError as exc:
         return _json_error(str(exc), 403)
     try:
         payload = await request.json()
-        chat_id = ctx.allocate_internal_chat_id(skill_name, str(payload.get("range_name") or "a2a"))
+        chat_id = await run_sync_to_completion(
+            ctx.allocate_internal_chat_id, skill_name, str(payload.get("range_name") or "a2a"),
+        )
     except Exception as exc:
         return _json_error(str(exc), 400)
     return JSONResponse({"ok": True, "chat_id": chat_id})
@@ -425,13 +502,27 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
     """
     ctx: HostServiceContext = request.app.state.host_service_context
     try:
-        skill_name, token_payload = ctx.authenticate_token_payload(request.headers.get("x-skill-token", ""))
+        skill_name, _token_payload = await _authenticated(ctx, request.headers.get("x-skill-token", ""), "inject_chat")
     except HostServiceAuthError as exc:
         return _json_error(str(exc), 403)
     try:
-        ctx.require_permission(skill_name, token_payload, "inject_chat")
-    except HostServiceAuthError as exc:
-        return _json_error(str(exc), 403)
+        payload = await request.json()
+        panic_text = str(payload.get("text") or payload.get("image_caption") or "")
+        is_panic = panic_text.strip().lower().startswith("/panic")
+        from ouroboros.panic_source import source_evidence
+        from ouroboros.server_control import request_panic
+        if is_panic and request_panic(
+            ctx.bridge_getter(), panic_text, source=f"skill:{skill_name}",
+            user_id=int(payload.get("user_id") or 0), chat_id=int(payload.get("chat_id") or 0),
+            evidence=source_evidence(request, "telegram" if skill_name == "telegram" else "host_service", skill_name=skill_name),
+        ):
+            return JSONResponse({"ok": True, "status": "accepted"}, status_code=202)
+        if is_panic:
+            return _json_error("Panic emergency owner unavailable or sender not authorized.", 503)
+    except json.JSONDecodeError:
+        return _json_error("invalid json", 400)
+    except Exception as exc:
+        return _json_error(str(exc), 500)
     if not ctx.rate_limiter.allow(f"{skill_name}:inject"):
         return _json_error("rate limit exceeded", 429)
     if not ctx._enter_inflight(skill_name):
@@ -439,11 +530,16 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
     subscription_id = ""
     pending_uploads = ExitStack()
     try:
-        payload = await request.json()
+        from ouroboros.task_status import SETTLED_STATUSES
+
+        if not isinstance(payload.get("reply_to", ""), str):
+            return _json_error("reply_to must be an address string", 400)
         text = str(payload.get("text") or "")
         image_caption = str(payload.get("image_caption") or "")
         client_message_id = str(payload.get("client_message_id") or "").strip()[:128]
         chat_id = int(payload.get("chat_id") or 0)
+        if _inline_image_too_large(payload):  # refused on its encoded length, before any decode or queue
+            return _json_error(f"image_base64: at most {_INLINE_IMAGE_MAX // (1024 * 1024)} MiB per image", 413)
         wait_for_response = bool(payload.get("wait_for_response", False))
         if wait_for_response and not is_a2a_chat_id(chat_id):
             # A response subscription resolves on the FIRST non-progress frame
@@ -459,37 +555,59 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
         correlated = {"operation_ref": operation_ref(chat_id, client_message_id)} if client_message_id else {}
         rejoined = False
         if client_message_id:
-            rows = await asyncio.to_thread(_chat_rows, ctx, chat_id)
-            inbound = _inbound_row(rows, client_message_id)
+            accepted = await asyncio.to_thread(_accepted_inbound, ctx, chat_id, client_message_id)
+            inbound = accepted.row if accepted is not None else None
             if inbound is not None:
-                from ouroboros.project_dialogue import _text_sha256
-                from ouroboros.task_status import SETTLED_STATUSES
-
                 if str(inbound.get("source") or "") != f"skill:{skill_name}":
                     return _json_error("client_message_id is already bound to another source", 409)
-                logged = text.strip() or image_caption.strip() or (
-                    "(image attached)" if str(payload.get("image_base64") or "").strip()
-                    else "(file attached)" if payload.get("attachments") else ""
-                )
-                if _text_sha256(inbound.get("text")) != _text_sha256(logged):
+                try:  # the same message means the same words AND the same ordered attachment content
+                    incoming, inline_image = await run_sync_to_completion(_inject_identity, ctx, skill_name, payload)
+                except ValueError as exc:
+                    return _json_error(str(exc), 400)
+                # Reuse the accepted byte-proven kinds; same_message still checks every incoming digest/name.
+                logged = text.strip() or image_caption.strip() or chat_uploads.attachment_placeholder(
+                    inline_image, {"chat_attachments": inbound.get("attachments"), "chat_attachment_uploads": incoming})
+                if (not chat_uploads.same_message(inbound, logged, incoming)
+                        or (inbound.get("reply_to") or {}).get("address", "") != payload.get("reply_to", "")):
                     return _json_error("client_message_id was already used for a different message", 409)
-                state = _operation_state(ctx, rows, inbound)
+                state = await asyncio.to_thread(_operation_state, ctx, accepted)
                 if state["status"] in SETTLED_STATUSES:
                     return JSONResponse({
                         "ok": True, "response": str(state.get("text") or ""),
                         "status": state["status"], "rejoined": True, **correlated,
                     })
-                if not wait_for_response:
-                    return JSONResponse({"ok": True, "status": "accepted", "rejoined": True, **correlated}, status_code=202)
-                rejoined = True
-        uploads: list[dict[str, str]] = []
+                # A dispatch still owed (the acceptor died before the handoff): the named ingress below
+                # hands it over, once; anything else rejoins.
+                from supervisor.message_ingress import dispatch_facts
+
+                facts = dispatch_facts(inbound, ctx.data_dir)
+                rejoined = facts is None or facts["state"] != "pending"
+        metadata: dict[str, Any] = {}
+        inline, image_mime = "", ""
         if not rejoined:
             try:
-                uploads = await run_sync_to_completion(
-                    _inject_attachment_uploads, ctx, skill_name, payload.get("attachments"), pending_uploads,
+                uploads, refs, image_mime = await run_sync_to_completion(
+                    _inject_attachment_uploads, ctx, skill_name, payload, pending_uploads,
                 )
             except ValueError as exc:
                 return _json_error(str(exc), 400)
+            # Vision gets only bytes proven to be an image, under the type they prove; any
+            # other inline bytes travel as the ordinary staged file stored above.
+            inline = str(payload.get("image_base64") or "") if image_mime else ""
+            metadata = {**({"chat_attachment_uploads": uploads} if uploads else {}),
+                        **({"chat_attachments": refs} if refs else {})}
+        if payload.get("reply_to"):  # no reference adds nothing to a plain inject's kwargs
+            metadata["reply_to"] = payload["reply_to"]
+        from supervisor.message_ingress import ui_control_fact
+
+        try:  # a skill's control (an inline button) composed this text: the press is the owner's, not the words
+            control = ui_control_fact(payload.get("ui_control"), pressed_at=utc_now_iso(), owner_text=False)
+        except ValueError as exc:
+            return _json_error(str(exc), 400)
+        if control and client_message_id:  # a correlated operation is its accepted owner row; a press writes none
+            return _json_error("ui_control cannot name a client_message_id: a press is not an owner message", 400)
+        if control:
+            metadata["ui_control"] = control
         bridge = ctx.bridge_getter()
         response_event: asyncio.Event = asyncio.Event()
         response_holder: dict[str, str] = {}
@@ -507,11 +625,11 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
                 user_id=int(payload.get("user_id") or 0),
                 source=f"skill:{skill_name}",
                 sender_label=str(payload.get("sender_label") or skill_name),
-                image_base64=str(payload.get("image_base64") or ""),
-                image_mime=str(payload.get("image_mime") or ""),
+                image_base64=inline,
+                image_mime=image_mime,
                 image_caption=image_caption,
                 transport=payload.get("transport") if isinstance(payload.get("transport"), dict) else {},
-                **({"task_metadata": {"chat_attachment_uploads": uploads}} if uploads else {}),
+                **({"task_metadata": metadata} if metadata else {}),
                 **({"client_message_id": client_message_id} if client_message_id else {}),
             )
             if client_message_id:
@@ -520,13 +638,17 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
                 try:
                     _, rejoined = await run_sync_to_completion(
                         accept_local_message, bridge, ctx.data_dir, text,
-                        retain_inputs=pending_uploads.pop_all, **message,
+                        retain_inputs=pending_uploads.pop_all,
+                        dispatch=functools.partial(dispatch_accepted_restart, bridge), **message,
                     )
                 except ValueError as exc:
                     return _json_error(str(exc), 409)
             else:
-                bridge.enqueue_local_message(text, **message)
+                # Custody passes BEFORE the handoff: dispatch may enqueue and then raise, so from
+                # here a failure is unknown. The copies stay (an orphan at worst), never deleted
+                # under queued work; the error still answers the skill, nothing is re-dispatched.
                 pending_uploads.pop_all()
+                dispatch_accepted_restart(bridge, text, **message)
         if not wait_for_response:
             if rejoined:
                 return JSONResponse({"ok": True, "status": "accepted", "rejoined": True, **correlated}, status_code=202)
@@ -534,8 +656,6 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
         deadline = time.monotonic() + timeout
         while not response_event.is_set():
             if client_message_id:
-                from ouroboros.task_status import SETTLED_STATUSES
-
                 state = await asyncio.to_thread(_owned_operation_state, ctx, skill_name, chat_id, client_message_id)
                 if state and state["status"] in {*SETTLED_STATUSES, "lost"}:
                     return JSONResponse({"ok": True, "response": str(state.get("text") or ""),
@@ -577,44 +697,118 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
 _INJECT_ATTACHMENT_MAX = 25
 
 
-def _inject_attachment_uploads(
-    ctx: HostServiceContext, skill_name: str, value: Any, cleanup: ExitStack,
-) -> list[dict[str, str]]:
-    """Copy a skill's inbound files into the shared chat-upload store (#668).
+_INLINE_IMAGE_MAX = 50 * 1024 * 1024  # the routed-staging bound for a transport's inline photo
+_B64_BLANKS = " \t\r\n"  # MIME-style line wrapping; any other non-alphabet character is refused
+_B64_UNWRAP = str.maketrans("", "", _B64_BLANKS)
 
-    Each ``{path, name?, mime?}`` must be a regular file under the calling
-    skill's OWN state root (the ``staged_files`` confinement; a symlink that
-    resolves outside is refused). The host copies it through the SAME store the
-    browser paperclip uses — ``data/uploads``, unique name, verified bytes — so the
-    worker's ``stage_task_attachments`` and the secret-name rule see one upload
-    family. Returns ``chat_attachment_uploads`` specs (``{path, label, mime}``);
-    the skill removes its parked copy afterwards. Each new destination belongs
-    to the request cleanup stack until its message is accepted; partial batches
-    and cancelled copy waits therefore cannot orphan successful earlier copies.
-    """
+
+def _inline_image_too_large(payload: Dict[str, Any]) -> bool:
+    """Whether the inline photo's base64 decodes to more than the bound, judged before any
+    decode from its length: the exact decoded size of well-formed base64 (blanks aside,
+    ``=`` padding counted); malformed input is refused by the decode itself."""
+    encoded = str(payload.get("image_base64") or "")
+    tail = encoded.rstrip(_B64_BLANKS)
+    padding = 2 if tail.endswith("==") else 1 if tail.endswith("=") else 0
+    compact = len(encoded) - sum(encoded.count(blank) for blank in _B64_BLANKS)
+    return compact * 3 // 4 - padding > _INLINE_IMAGE_MAX
+
+
+def _inline_image_bytes(payload: Dict[str, Any]) -> tuple[bytes, bool]:
+    """The inline photo's bytes (size preflighted by the caller, re-checked on the decoded
+    bytes) and whether they prove an image; line-wrapped base64 is still base64, anything
+    else is refused rather than parked or forwarded half-read."""
+    raw = str(payload.get("image_base64") or "").translate(_B64_UNWRAP)
+    try:
+        data = base64.b64decode(raw, validate=True) if raw else b""
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("image_base64 is not valid base64") from exc
+    if len(data) > _INLINE_IMAGE_MAX:
+        raise ValueError(f"image_base64: at most {_INLINE_IMAGE_MAX // (1024 * 1024)} MiB per image")
+    return data, bool(data) and chat_uploads.detect_media(data, "")[1] == "image"
+
+
+def _skill_state_path(ctx: HostServiceContext, skill_name: str, raw: Any, field: str) -> pathlib.Path:
+    """``raw`` resolved, refused unless under the calling skill's OWN state root (a symlink
+    that resolves outside is refused)."""
+    path = pathlib.Path(str(raw or "")).expanduser().resolve(strict=False)
+    try:
+        path.relative_to((ctx.skills_state_dir / skill_name).resolve(strict=False))
+    except ValueError as exc:
+        raise ValueError(f"{field} is outside this skill's state") from exc
+    return path
+
+
+def _confined_inject_sources(
+    ctx: HostServiceContext, skill_name: str, value: Any,
+) -> list[tuple[pathlib.Path, str, str]]:
+    """``(source, name, mime)`` per ``{path, name?, mime?}``; each a regular file under the
+    calling skill's OWN state root (the ``staged_files`` confinement, ``_skill_state_path``)."""
     if value in (None, []):
         return []
     if not isinstance(value, list):
         raise ValueError("attachments must be a list of {path, name?, mime?}")
     if len(value) > _INJECT_ATTACHMENT_MAX:
         raise ValueError(f"attachments: at most {_INJECT_ATTACHMENT_MAX} files per message")
-    state_root = (ctx.skills_state_dir / skill_name).resolve(strict=False)
-    specs: list[dict[str, str]] = []
+    sources: list[tuple[pathlib.Path, str, str]] = []
     for index, item in enumerate(value):
         if not isinstance(item, dict):
             raise ValueError(f"attachments[{index}] must be an object")
-        source = pathlib.Path(str(item.get("path") or "")).expanduser().resolve(strict=False)
-        try:
-            source.relative_to(state_root)
-        except ValueError as exc:
-            raise ValueError(f"attachments[{index}] is outside this skill's state") from exc
+        source = _skill_state_path(ctx, skill_name, item.get("path"), f"attachments[{index}]")
         if not source.is_file():
             raise ValueError(f"attachments[{index}] is not a regular file")
-        name = os.path.basename(str(item.get("name") or "").strip()) or source.name
-        stored = store_chat_upload(source, name, data_dir=ctx.data_dir)
+        sources.append((source, os.path.basename(str(item.get("name") or "").strip()) or source.name,
+                        str(item.get("mime") or "")))
+    return sources
+
+
+def _inject_identity(
+    ctx: HostServiceContext, skill_name: str, payload: Dict[str, Any],
+) -> tuple[list[dict[str, str]], bool]:
+    """The attachment identity this delivery will record (inline bytes first, then files),
+    measured from the sources, so a regenerated stored name never changes it; and whether
+    the inline bytes are a proven image (what the placeholder text says)."""
+    data, inline_image = _inline_image_bytes(payload)
+    entries = [chat_uploads.bytes_identity(data, chat_uploads.inline_image_name(data))] if data else []
+    entries += [chat_uploads.source_identity(source, name)
+                for source, name, _mime in _confined_inject_sources(ctx, skill_name, payload.get("attachments"))]
+    return [{"sha256": sha256, "name": name} for sha256, name in entries], inline_image
+
+
+def _inject_attachment_uploads(
+    ctx: HostServiceContext, skill_name: str, payload: Dict[str, Any], cleanup: ExitStack,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+    """Copy a skill's inbound files (#668) and its inline photo into the shared upload store.
+
+    The host copies through the SAME store the browser paperclip uses —
+    ``data/uploads``, unique name, verified bytes — so the worker's
+    ``stage_task_attachments`` and the secret-name rule see one upload family.
+    Returns ``(chat_attachment_uploads specs, measured display refs, the inline photo's
+    byte-proven image mime or "")``. Inline bytes are parked ONCE, and the owner sees
+    one bubble. The original inline image is always staged, including a solitary
+    photo, so later explicit readers retain its pixels. Every lane drops the inline
+    copy once uploads stage. Inline bytes that prove no image are no photo: they are
+    staged as an ordinary file and never reach vision under the transport's label.
+    Each spec carries its ref's measured identity, which staging verifies while copying.
+    Each new destination belongs to the request cleanup stack until its message is
+    accepted; partial batches and cancelled copy waits therefore cannot orphan earlier copies.
+    """
+    refs: list[dict[str, Any]] = []
+    specs: list[dict[str, Any]] = []
+    sources = _confined_inject_sources(ctx, skill_name, payload.get("attachments"))
+
+    def park(source: Any, name: str, mime: str = "") -> None:
+        stored, ref = store_upload(source, name, data_dir=ctx.data_dir)
         cleanup.callback(stored.unlink, missing_ok=True)
-        specs.append({"path": str(stored), "label": name, "mime": str(item.get("mime") or "")})
-    return specs
+        refs.append(ref)
+        specs.append({"path": str(stored), "label": name, "mime": mime or ref["mime"],
+                      "size": ref["size"], "sha256": ref["sha256"]})
+
+    data, image = _inline_image_bytes(payload)
+    if data:  # parked first: a proven image's ref is refs[0]
+        park(data, chat_uploads.inline_image_name(data))
+    for source, name, mime in sources:
+        park(source, name, mime)
+    return specs, refs, refs[0]["mime"] if image else ""
 
 
 def _presence_staged_files(
@@ -626,214 +820,23 @@ def _presence_staged_files(
         return ()
     if not isinstance(value, list):
         raise ValueError("staged_files must be a list of paths")
-    state_root = (ctx.skills_state_dir / skill_name).resolve(strict=False)
-    files = []
-    for index, raw in enumerate(value):
-        # Keep the host boundary responsible only for request shape and source
-        # confinement.  Missing/non-file inputs and the staging limit belong to
-        # the existing canonical staging owner, which emits the complete typed
-        # ordinal manifest before Presence can call the model.
-        path = pathlib.Path(str(raw or "")).expanduser().resolve(strict=False)
-        try:
-            path.relative_to(state_root)
-        except ValueError as exc:
-            raise ValueError(f"staged_files[{index}] is outside this skill's state") from exc
-        files.append(path)
-    return tuple(files)
+    # Keep the host boundary responsible only for request shape and source
+    # confinement.  Missing/non-file inputs and the staging limit belong to
+    # the existing canonical staging owner, which emits the complete typed
+    # ordinal manifest before Presence can call the model.
+    return tuple(_skill_state_path(ctx, skill_name, raw, f"staged_files[{index}]") for index, raw in enumerate(value))
 
 
-async def _api_presence_delivery(request: Request) -> JSONResponse:
-    """Record exact provider receipts without sending or starting model work."""
-    ctx: HostServiceContext = request.app.state.host_service_context
-    try:
-        skill_name, token_payload = ctx.authenticate_token_payload(
-            request.headers.get("x-skill-token", "")
-        )
-        ctx.require_permission(skill_name, token_payload, "presence")
-    except HostServiceAuthError as exc:
-        return _json_error(str(exc), 403)
-    if not ctx.rate_limiter.allow(f"{skill_name}:presence_delivery"):
-        return _json_error("rate limit exceeded", 429)
-    if not ctx._enter_inflight(skill_name):
-        return _json_error("too many in-flight presence requests", 429)
-    try:
-        payload = await request.json()
-        result = await run_sync_to_completion(ctx.presence_deliveries.record, skill_name, payload)
-        return JSONResponse(result)
-    except PresenceDeliveryConflict as exc:
-        return _json_error(str(exc), 409)
-    except (ValueError, TypeError) as exc:
-        return _json_error(str(exc), 400)
-    except Exception:
-        log.warning("Presence delivery history write failed for skill %s", skill_name, exc_info=True)
-        return _json_error("presence delivery history write failed; retry the same receipt", 503)
-    finally:
-        ctx._leave_inflight(skill_name)
-
-
-async def _api_presence_turn(request: Request) -> JSONResponse:
-    """Run one non-owner event under a host-resolved reviewed profile ceiling."""
-
-    ctx: HostServiceContext = request.app.state.host_service_context
-    try:
-        skill_name, token_payload = ctx.authenticate_token_payload(
-            request.headers.get("x-skill-token", "")
-        )
-        ctx.require_permission(skill_name, token_payload, "presence")
-    except HostServiceAuthError as exc:
-        return _json_error(str(exc), 403)
-    if not ctx.rate_limiter.allow(f"{skill_name}:presence"):
-        return _json_error("rate limit exceeded", 429)
-    if not ctx._enter_inflight(skill_name):
-        return _json_error("too many in-flight presence requests", 429)
-    from ouroboros.presence_admission import PresenceAdmissionError, admit_presence_turn
-    from ouroboros.presence_runner import PresenceTurnError, PresenceTurnEvent
-
-    try:
-        payload = await request.json()
-        if not isinstance(payload, dict) or set(payload) - {
-            "binding_id", "event", "staged_files", "delivery_reporting_version",
-        }:
-            return _json_error("invalid presence payload", 400)
-        reporting_version = delivery_reporting_version(payload.get("delivery_reporting_version", 0))
-        event_payload = payload.get("event")
-        expected = {
-            "source_event_id", "provider", "account_id", "conversation_id", "thread_id",
-            "conversation_key", "actor", "conversation", "message", "text",
-        }
-        if not isinstance(event_payload, dict) or set(event_payload) != expected:
-            return _json_error("invalid presence event", 400)
-
-        from ouroboros.loop import _resolve_loop_max_rounds
-        admission = admit_presence_turn(
-            drive_root=ctx.data_dir,
-            authenticated_transport_skill=skill_name,
-            binding_id=str(payload.get("binding_id") or ""),
-            global_max_rounds=_resolve_loop_max_rounds(),
-        )
-        provider = str(event_payload.get("provider") or "").strip()
-        account_id = str(event_payload.get("account_id") or "").strip()
-        conversation_id = str(event_payload.get("conversation_id") or "").strip()
-        thread_id = str(event_payload.get("thread_id") or "").strip()
-        if (
-            provider != admission.origin.transport
-            or account_id != admission.origin.account_id
-            or (
-                admission.origin.conversation_id != "*"
-                and conversation_id != admission.origin.conversation_id
-            )
-            or (admission.origin.thread_id and thread_id != admission.origin.thread_id)
-        ):
-            return _json_error("presence event does not match its owner-created binding", 403)
-        event = PresenceTurnEvent(
-            source_event_id=str(event_payload["source_event_id"] or "").strip(),
-            provider=provider,
-            account_id=account_id,
-            conversation_id=conversation_id,
-            thread_id=thread_id,
-            # The transport authenticates provider facts, but it does not get
-            # to choose the concurrency/history identity. Derive that identity
-            # from the binding-checked origin facts above.
-            conversation_key=":".join((
-                provider,
-                account_id,
-                conversation_id,
-                thread_id or "0",
-            )),
-            actor=dict(event_payload["actor"]) if isinstance(event_payload["actor"], dict) else {},
-            conversation=(
-                dict(event_payload["conversation"])
-                if isinstance(event_payload["conversation"], dict)
-                else {}
-            ),
-            message=dict(event_payload["message"]) if isinstance(event_payload["message"], dict) else {},
-            text=str(event_payload["text"] or ""),
-            delivery_reporting_version=reporting_version,
-        )
-        if not event.source_event_id or not event.conversation_key or not event.actor:
-            return _json_error("presence event is missing identity facts", 400)
-        result = await asyncio.to_thread(
-            ctx.presence_runner,
-            admission=admission,
-            event=event,
-            staged_files=_presence_staged_files(ctx, skill_name, payload.get("staged_files")),
-        )
-        return JSONResponse({
-            "ok": True,
-            "status": "completed",
-            "outcome": result.outcome,
-            "text": result.text,
-            "turn_ref": result.task_id,
-            "work_ref": result.work_ref,
-            "delivery_reporting_version": getattr(result, "delivery_reporting_version", 0),
-        })
-    except json.JSONDecodeError:
-        return _json_error("invalid json", 400)
-    except (PresenceAdmissionError, PresenceTurnError) as exc:
-        payload = {"ok": False, "error": str(exc), "code": exc.code, "field": exc.field}
-        attachment_manifest = getattr(exc, "attachment_manifest", None)
-        if isinstance(attachment_manifest, list):
-            payload["attachment_manifest"] = [
-                dict(row) for row in attachment_manifest if isinstance(row, dict)
-            ]
-        return JSONResponse(payload, status_code=409)
-    except (OSError, ValueError) as exc:
-        return _json_error(str(exc), 400)
-    except Exception as exc:
-        log.debug("Host service presence turn failed", exc_info=True)
-        return _json_error(str(exc), 500)
-    finally:
-        ctx._leave_inflight(skill_name)
-
-
-async def _api_presence_work(request: Request) -> JSONResponse:
-    """Return a correlated late result without exposing the general task API."""
-
-    ctx: HostServiceContext = request.app.state.host_service_context
-    try:
-        skill_name, token_payload = ctx.authenticate_token_payload(
-            request.headers.get("x-skill-token", "")
-        )
-        ctx.require_permission(skill_name, token_payload, "presence")
-    except HostServiceAuthError as exc:
-        return _json_error(str(exc), 403)
-    work_ref = str(request.path_params.get("work_ref") or "").strip()
-    binding_id = str(request.query_params.get("binding_id") or "").strip()
-    try:
-        from ouroboros.presence_bindings import load_presence_binding
-        from ouroboros.task_results import load_task_result
-
-        load_presence_binding(ctx.data_dir, skill_name, binding_id)
-        stored = load_task_result(ctx.data_dir, work_ref) or {}
-        metadata = stored.get("metadata") if isinstance(stored.get("metadata"), dict) else {}
-        presence = metadata.get("presence") if isinstance(metadata.get("presence"), dict) else {}
-        if str(presence.get("binding_id") or "") != binding_id:
-            return _json_error("presence work reference not found", 404)
-        status = str(stored.get("status") or "")
-        if status not in {"completed", "failed", "cancelled"}:
-            return JSONResponse({"ok": True, "status": "pending", "work_ref": work_ref,
-                                 "delivery_reporting_version": presence.get("delivery_reporting_version", 0)}, status_code=202)
-        outcome = str(metadata.get("presence_outcome") or "message")
-        if outcome not in {"message", "silent", "tool_delivered", "deferred"}:
-            outcome = "message"
-        return JSONResponse({
-            "ok": True,
-            "status": status,
-            "outcome": outcome,
-            "text": (
-                str(metadata.get("presence_result_text") or stored.get("result") or "")
-                if outcome in {"message", "deferred"}
-                else ""
-            ),
-            "work_ref": work_ref,
-            "delivery_reporting_version": presence.get("delivery_reporting_version", 0),
-        })
-    except Exception as exc:
-        code = str(getattr(exc, "code", ""))
-        if code:
-            return _json_error(str(exc), 404)
-        log.debug("Host service presence work lookup failed", exc_info=True)
-        return _json_error("presence work lookup failed", 500)
+# Compatibility import surface; implementation is owned by the places handler module.
+from ouroboros.gateway.host_service_places import (  # noqa: E402
+    _admit_presence as _admit_presence,
+    _api_presence_delivery as _api_presence_delivery,
+    _api_presence_history as _api_presence_history,
+    _api_presence_turn as _api_presence_turn,
+    _api_presence_work as _api_presence_work,
+    _api_presence_place as _api_presence_place,
+    _presence_work_view as _presence_work_view,
+)
 
 
 async def _api_chat_decision(request: Request) -> JSONResponse:
@@ -846,8 +849,7 @@ async def _api_chat_decision(request: Request) -> JSONResponse:
     """
     ctx: HostServiceContext = request.app.state.host_service_context
     try:
-        skill_name, token_payload = ctx.authenticate_token_payload(request.headers.get("x-skill-token", ""))
-        ctx.require_permission(skill_name, token_payload, "inject_chat")
+        skill_name, _token_payload = await _authenticated(ctx, request.headers.get("x-skill-token", ""), "inject_chat")
     except HostServiceAuthError as exc:
         return _json_error(str(exc), 403)
     if not ctx.rate_limiter.allow(f"{skill_name}:decision"):
@@ -859,7 +861,7 @@ async def _api_chat_decision(request: Request) -> JSONResponse:
     from ouroboros.gateway.task_decision import answer_decision
 
     try:
-        status, payload = await answer_decision(ctx.data_dir, body, source=f"skill:{skill_name}")
+        status, payload = await answer_decision(ctx.data_dir, body, source=f"skill:{skill_name}", request=request)
     except Exception as exc:
         log.debug("Host service decision relay failed", exc_info=True)
         return _json_error(str(exc), 500)
@@ -867,20 +869,60 @@ async def _api_chat_decision(request: Request) -> JSONResponse:
     return JSONResponse(payload, status_code=status)
 
 
-async def _api_ws_message(request: Request) -> JSONResponse:
-    """WS-out bridge: relay a namespaced extension WS event to browser clients.
+async def _api_ui_language(request: Request) -> JSONResponse:
+    """Relay the owner's interface-language choice through the ONE language writer.
 
-    Identity is derived from the token (never the body); the host re-derives the
-    ``ext_<len>_<token>_<short>`` namespace, so an out-of-process child/companion
-    cannot spoof another skill's events. ``ws_handler`` is a manifest permission,
-    not an owner grant, mirroring the in-process ``send_ws_message`` check.
+    The same seam as ``POST /api/ui/i18n/language`` (``ui_i18n.choose_language``): a tag, a
+    language name or a description, resolved and written once for the whole install.
+    ``inject_chat`` is the owner grant that already lets this skill speak as the owner's
+    chat input; relaying the owner's own ``/language`` command needs nothing more.
     """
     ctx: HostServiceContext = request.app.state.host_service_context
     try:
-        skill_name, _payload = ctx.authenticate_token_payload(request.headers.get("x-skill-token", ""))
+        skill_name, _token_payload = await _authenticated(ctx, request.headers.get("x-skill-token", ""), "inject_chat")
     except HostServiceAuthError as exc:
         return _json_error(str(exc), 403)
-    loaded = find_skill(ctx.data_dir, skill_name)
+    if not ctx.rate_limiter.allow(f"{skill_name}:language"):
+        return _json_error("rate limit exceeded", 429)
+    try:
+        body = await request.json()
+    except Exception:
+        return _json_error("invalid json", 400)
+    if not isinstance(body, dict):
+        return _json_error("request body must be a JSON object", 400)
+    from ouroboros.gateway.owner_settings import SettingsDocumentBusy
+    from ouroboros.gateway.ui_i18n import choose_language
+
+    def _audit(facts: Dict[str, Any]) -> None:
+        append_jsonl(ctx.data_dir / "logs" / "events.jsonl", {
+            "ts": utc_now_iso(), "type": "owner_api_action", "action": "ui_language",
+            "client_host": f"host_service:{skill_name}", **facts,
+        })
+
+    try:
+        status, payload = await asyncio.to_thread(choose_language, ctx.data_dir, body, audit=_audit)
+    except SettingsDocumentBusy as exc:
+        return JSONResponse({"ok": False, "error": str(exc), "code": "settings_busy"}, status_code=503)
+    except Exception as exc:
+        log.debug("Host service language relay failed", exc_info=True)
+        return _json_error(str(exc), 500)
+    return JSONResponse(payload, status_code=status)
+
+
+async def _api_ws_message(request: Request) -> JSONResponse:
+    """WS-out bridge: relay a namespaced extension WS event to browser clients.
+
+    Identity is derived from the token (never the body); the host re-derives the ``ext_<len>_<token>_<short>``
+    namespace, so a child/companion cannot spoof another skill's events. ``ws_handler`` is a manifest permission,
+    not an owner grant (as in-process ``send_ws_message``). A refused relay is a 429 with ``Retry-After`` and
+    ``retry_after_sec``/``dropped_in_burst`` in the body.
+    """
+    ctx: HostServiceContext = request.app.state.host_service_context
+    try:
+        skill_name, _payload = await _authenticated(ctx, request.headers.get("x-skill-token", ""))
+    except HostServiceAuthError as exc:
+        return _json_error(str(exc), 403)
+    loaded = await asyncio.to_thread(find_skill, ctx.data_dir, skill_name)
     if loaded is None:
         return _json_error(f"skill {skill_name!r} is not installed", 403)
     if "ws_handler" not in {str(p).strip() for p in (loaded.manifest.permissions or [])}:
@@ -930,14 +972,9 @@ async def _api_ws_message(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "type": full}, status_code=202)
 
 
-# --- A2A operation correlation (#667) ---------------------------------------
-#
-# An accepted inbound message is identified by the (chat_id, client_message_id)
-# pair the caller supplied; ``operation_ref`` is that pair spelled
-# ``"<chat_id>:<client_message_id>"``, so a caller can address the operation
-# before its own inject wait has returned. The host keeps NO new record: the
-# canonical inbound source, actual task origin and in-flight turn registry
-# are the authorities. Annotation/outbound ids only help discover candidates.
+# A2A operation_ref is caller-known "<chat_id>:<client_message_id>" (#667), the origin key the
+# dialogue and the task store index (``dialogue_store.origin_key``). Canonical inbound source, task
+# origin and in-flight registry remain authoritative; the keys only discover. No new record is kept.
 
 
 def operation_ref(chat_id: int, client_message_id: str) -> str:
@@ -951,103 +988,133 @@ def _parse_operation_ref(value: Any) -> tuple[int, str]:
     return int(head), tail.strip()[:128]
 
 
-def _chat_rows(ctx: HostServiceContext, chat_id: int) -> list:
-    """Read retained canonical sources; a display tail cannot prove absence."""
-    from ouroboros.utils import iter_jsonl_objects, jsonl_chain_handles
+def _accepted_inbound(ctx: HostServiceContext, chat_id: int, client_message_id: str) -> Any:
+    """The canonical inbound row the id names: the ingress's own answer (``dialogue_store.accepted_row``,
+    the newest; a still-importing archive is searched, never answered absent; an unavailable store raises)."""
+    from ouroboros import dialogue_store
 
-    with jsonl_chain_handles(ctx.data_dir / "logs" / "chat.jsonl", strict=True) as handles:
-        return [row for path, handle in handles for row in iter_jsonl_objects(path, _handle=handle)
-                if row.get("chat_id") == chat_id]
-
-
-def _inbound_row(rows: list, client_message_id: str) -> Optional[Dict[str, Any]]:
-    return next(
-        (
-            row for row in rows
-            if str(row.get("direction") or "") == "in"
-            and str(row.get("client_message_id") or "") == client_message_id
-        ),
-        None,
-    )
+    return dialogue_store.accepted_row(ctx.data_dir, int(chat_id), client_message_id)
 
 
-def _operation_state(ctx: HostServiceContext, rows: list, inbound: Dict[str, Any]) -> Dict[str, Any]:
-    """Join the existing records into one typed view of an accepted message.
-
-    Authority is the task/turn's complete ingress origin matched to the skill's
-    canonical source, then that task's effective retry-aware status; otherwise
-    ``pending`` — or ``lost``
-    when the host session that accepted the message is gone and nothing else
-    answers. ``cancel_supported`` is true only for work THIS message started
-    that the cancellation owner can address: a promoted task or a live direct
-    turn; a message steered into a pre-existing task is disclosed, not cancelled.
-    """
-    from ouroboros.project_dialogue import latest_chat_annotations, entry_matches_source_ref, owner_message_ref_is_valid
-    from ouroboros.task_results import load_task_result
-    from ouroboros.task_status import SETTLED_STATUSES, load_effective_task_result
-    from supervisor.active_activity import get_direct_activity_registry
+def _task_view(state: Dict[str, Any], target: str, stored: Dict[str, Any], owner_matches: bool) -> Dict[str, Any]:
+    """The operation as the task TARGET answers it: its effective retry-aware ``stored`` result;
+    ``owner_matches``: this process's queue is the installation's cancellation owner."""
+    from ouroboros.task_status import SETTLED_STATUSES
     from supervisor import queue as task_queue
 
+    status = str(stored.get("status") or "")
+    state.update({"task_id": target, "phase": "managed_task", "status": status or "pending"})
+    if status in SETTLED_STATUSES:
+        state["text"] = str(stored.get("result") or "")
+        # A delivered result can precede post-task work or live descendants.
+        # Use the same ownership facts as the existing cancellation ingress.
+        state["cancel_supported"] = owner_matches and (
+            task_queue.task_has_live_ownership(target) or task_queue.task_subtree_is_live(target)
+        )
+    else:
+        state["cancel_supported"] = owner_matches
+        if not owner_matches:
+            state["reason"] = "cancel_owner_unavailable"
+        if stored.get("cancel_state"):
+            state["cancel_state"] = str(stored.get("cancel_state"))
+    return state
+
+
+def _operation_state(ctx: HostServiceContext, accepted: Any) -> Dict[str, Any]:
+    """Join the existing records into one typed view of an ``accepted`` inbound row.
+
+    Authority is a task/turn's complete top-level ingress origin matched to the skill's canonical
+    source (chat, id, time, text), then that work's effective retry-aware status. Discovery is
+    addressed by the message: the live queue, the tasks whose typed origin names it
+    (``task_store.origin_documents``, rows an older writer left underived included), the live
+    direct registry (a carried turn's lane row answers as that actor did) and the dialogue rows
+    indexed under that origin, a turn's own record told apart by its origin; no room history or routing
+    annotation is read. A managed root (a promoted or detached task) answers before the direct turn
+    that handed it off; children and retry successors fold into their root, unless a record its
+    retry-aware read went through cannot be read (``task_record_unreadable``). Otherwise ``pending``,
+    or ``lost`` when the host process or session that accepted the message is gone and nothing else
+    answers; a record linked to the message that cannot be read (``task_record_unreadable``) or a
+    dialogue range still importing after it (``history_importing``) keeps it ``pending`` with that
+    reason. ``cancel_supported`` is true only for work THIS message started that the cancellation
+    owner can address: a promoted task or a live direct turn; a message steered into a pre-existing
+    task is disclosed, not cancelled.
+    """
+    from ouroboros import dialogue_store
+    from ouroboros.project_dialogue import entry_matches_source_ref, owner_message_ref_is_valid
+    from ouroboros.task_carrier import conversation_origin
+    from ouroboros.task_status import SETTLED_STATUSES, load_effective_task_result
+    from ouroboros.task_store import origin_documents
+    from supervisor.active_activity import get_direct_activity_registry
+    from supervisor.conversation_lane import conversation_row
+    from supervisor import queue as task_queue
+
+    inbound = accepted.row
     chat_id = int(inbound.get("chat_id") or 0)
     client_message_id = str(inbound.get("client_message_id") or "")
+    key = operation_ref(chat_id, client_message_id)
     state: Dict[str, Any] = {
-        "operation_ref": operation_ref(chat_id, client_message_id),
+        "operation_ref": key,
         "chat_id": chat_id,
         "client_message_id": client_message_id,
         "accepted_at": str(inbound.get("ts") or ""),
         "status": "pending",
         "cancel_supported": False,
     }
+
     def owns(record: dict) -> bool:
         ref = record.get("origin_message_ref")
-        return bool(owner_message_ref_is_valid(ref) and entry_matches_source_ref(inbound, [ref]))
+        return bool(owner_message_ref_is_valid(ref) and ref["client_message_id"] == client_message_id
+                    and entry_matches_source_ref(inbound, [ref]))
 
-    # An annotation is only a discovery hint. The actual task's complete
-    # ingress origin, already scoped to the authenticated skill's row, is the
-    # authority. Live queue payloads cover tasks not yet persisted by a worker.
-    queued = {}
+    def root(record: dict) -> bool:
+        return not str(record.get("parent_task_id") or "").strip() and record.get("delegation_role") != "subagent"
+
+    # Live queue payloads cover tasks no worker has persisted yet: the current source. A conversation-lane row
+    # is the turn itself, live as the registry's actor was, never the managed root it may have promoted.
+    queued: Dict[str, Dict[str, Any]] = {}
+    turns: Dict[str, Dict[str, Any]] = {}
     cancel_owner_matches = (task_queue.DRIVE_ROOT is not None
                             and pathlib.Path(task_queue.DRIVE_ROOT).resolve() == ctx.data_dir.resolve())
     if cancel_owner_matches:
         with task_queue._queue_lock:
-            for task in [*task_queue.PENDING, *(meta.get("task") or {} for meta in task_queue.RUNNING.values())]:
-                if owns(task):
-                    queued[str(task.get("id") or "")] = dict(task)
-    receipt = latest_chat_annotations(ctx.data_dir).get(client_message_id) or {}
-    targets = dict.fromkeys([*queued, str(receipt.get("target") or ""),
-                            *(str(row.get("task_id") or "") for row in reversed(rows))])
-    for target in targets:
-        if not target:
-            continue
-        try:
-            raw = queued.get(target) or load_task_result(ctx.data_dir, target, strict=True) or {}
-        except ValueError:
-            continue  # An unreadable/disallowed discovery hint carries no authority.
-        if not owns(raw):
-            continue
+            rows = [*((task, False) for task in task_queue.PENDING),
+                    *((meta.get("task") or {}, conversation_row(meta)) for meta in task_queue.RUNNING.values())]
+            for task, lane in rows:
+                if str(task.get("id") or "") and owns(task) and root(task):
+                    (turns if lane else queued)[str(task["id"])] = dict(task)
+    documents, unreadable = origin_documents(ctx.data_dir, key)
+    owners = {tid: doc for tid, doc in documents.items() if owns(doc) and root(doc)}
+    for tid, doc in list(owners.items()):
+        if not (isinstance(doc.get("status"), str) and doc["status"].strip()):  # the strict reader's refusal
+            unreadable[tid] = "status_invalid"
+            del owners[tid]
+    successors = {str(doc.get(link) or "") for doc in owners.values() for link in ("superseded_by", "retry_task_id")}
+    heads = sorted((tid for tid in owners if tid not in successors and tid not in queued),
+                   key=lambda tid: (str(owners[tid].get("ts") or ""), tid), reverse=True)
+    direct = [tid for tid in heads if conversation_origin(owners[tid])]  # a turn's own record, whatever carried it
+    managed = [*queued, *(tid for tid in heads if tid not in direct)]
+    if managed:
+        target = managed[0]
         stored = load_effective_task_result(ctx.data_dir, target, materialize_artifacts=False) or {}
-        status = str(stored.get("status") or "")
-        state.update({
-            "task_id": target,
-            "phase": "managed_task",
-            "status": status or "pending",
-        })
-        if status in SETTLED_STATUSES:
-            state["text"] = str(stored.get("result") or "")
-            # A delivered result can precede post-task work or live descendants.
-            # Use the same ownership facts as the existing cancellation ingress.
-            state["cancel_supported"] = cancel_owner_matches and (
-                task_queue.task_has_live_ownership(target) or task_queue.task_subtree_is_live(target)
-            )
-        else:
-            state["cancel_supported"] = cancel_owner_matches
-            if not cancel_owner_matches:
-                state["reason"] = "cancel_owner_unavailable"
-            if stored.get("cancel_state"):
-                state["cancel_state"] = str(stored.get("cancel_state"))
-        return state
-    for entry in get_direct_activity_registry().snapshot(chat_id):
-        activity = get_direct_activity_registry().get(str(entry.get("activity_id") or ""))
+        # The rows the retry-aware read went through (its hops, their links, the row it answers from, a link it
+        # could not follow): a fault captured there leaves the answer unknown, never the damaged row's value
+        # or its predecessor's. Damage elsewhere hides nothing here.
+        hops = stored.get("retry_lineage") if isinstance(stored.get("retry_lineage"), list) else []
+        if unreadable.keys() & {str(row.get(link) or "") for row in (stored, *hops) if isinstance(row, dict)
+                                for link in ("task_id", "superseded_by", "retry_task_id")}:
+            state["reason"] = "task_record_unreadable"
+            return state
+        return _task_view(state, target, stored, cancel_owner_matches)
+    for tid, task in turns.items():  # live as the registry's actor was until its own record settles; then its
+        kind = "presence" if task.get("_presence_turn") else "direct_chat"  # final or record answers, below
+        if str((load_effective_task_result(ctx.data_dir, tid, materialize_artifacts=False) or {}).get("status")
+               or "") not in SETTLED_STATUSES:
+            state.update(status="running", phase=kind, task_id=tid, cancel_supported=kind == "direct_chat")
+            return state
+        direct += [] if tid in direct else [tid]
+    registry = get_direct_activity_registry()
+    for entry in registry.snapshot(chat_id):
+        activity = registry.get(str(entry.get("activity_id") or ""))
         if activity is not None and owns({"origin_message_ref": activity.origin_message_ref}):
             kind = str(entry.get("kind") or "direct_chat")
             state.update({
@@ -1059,14 +1126,36 @@ def _operation_state(ctx: HostServiceContext, rows: list, inbound: Dict[str, Any
             if kind == "direct_chat" and not cancel_owner_matches:
                 state["reason"] = "cancel_owner_unavailable"
             return state
-    for row in reversed(rows):
+    if unreadable:  # it may be the managed work this message started: no direct final or loss is proven
+        state["reason"] = "task_record_unreadable"
+        return state
+    for entry in dialogue_store.iter_probes(ctx.data_dir, "chat", [("origin", key)], newest_first=True):
+        row = entry.row
         terminal = str(row.get("task_terminal_status") or "")
         if row.get("direction") in {"out", "system"} and terminal in SETTLED_STATUSES and owns(row):
             state.update({"status": terminal, "text": str(row.get("text") or "")})
+            turn = str(row.get("task_id") or "")
+            if turn in direct:  # the turn's own record: its post-task work may still spend
+                state["task_id"] = turn
+                state["cancel_supported"] = cancel_owner_matches and (
+                    task_queue.task_has_live_ownership(turn) or task_queue.task_subtree_is_live(turn))
             return state
+    for target in direct:  # a settled turn whose final row is gone still answers from its own record
+        stored = load_effective_task_result(ctx.data_dir, target, materialize_artifacts=False) or {}
+        if str(stored.get("status") or "") in SETTLED_STATUSES:
+            return _task_view(state, target, stored, cancel_owner_matches)
+    if not dialogue_store.range_coverage(ctx.data_dir, "chat", lower=accepted.seq)["imported"]:
+        state["reason"] = "history_importing"  # an answer may sit in the rows still importing
+        return state
+    from supervisor.message_ingress import dispatch_lost, dispatch_taken_over_here
+
     accepted_session = str(inbound.get("session_id") or "")
     live_session = str((read_json_dict(ctx.data_dir / "state" / "state.json") or {}).get("session_id") or "")
-    if accepted_session and live_session and accepted_session != live_session:
+    # A crash keeps the session: the dispatch fact names the ended process (and its queue). A dispatch
+    # THIS process took over after the restart (an owed one, by a retry or the recovery) is live.
+    ended = dispatch_lost(inbound, ctx.data_dir)
+    restarted = accepted_session and live_session and accepted_session != live_session
+    if ended or (restarted and not dispatch_taken_over_here(inbound, ctx.data_dir)):
         state.update({"status": "lost", "reason": "host_restarted_before_answer"})
     return state
 
@@ -1075,11 +1164,10 @@ def _owned_operation_state(
     ctx: HostServiceContext, skill_name: str, chat_id: int, client_message_id: str,
 ) -> Optional[Dict[str, Any]]:
     """The operation view, or None unless THIS skill injected the message."""
-    rows = _chat_rows(ctx, chat_id)
-    inbound = _inbound_row(rows, client_message_id)
-    if inbound is None or str(inbound.get("source") or "") != f"skill:{skill_name}":
+    accepted = _accepted_inbound(ctx, chat_id, client_message_id)
+    if accepted is None or str(accepted.row.get("source") or "") != f"skill:{skill_name}":
         return None
-    return _operation_state(ctx, rows, inbound)
+    return _operation_state(ctx, accepted)
 
 
 def _cancel_owned_operation(
@@ -1163,8 +1251,7 @@ async def _api_chat_operation(request: Request) -> JSONResponse:
     """
     ctx: HostServiceContext = request.app.state.host_service_context
     try:
-        skill_name, token_payload = ctx.authenticate_token_payload(request.headers.get("x-skill-token", ""))
-        ctx.require_permission(skill_name, token_payload, "inject_chat")
+        skill_name, _token_payload = await _authenticated(ctx, request.headers.get("x-skill-token", ""), "inject_chat")
     except HostServiceAuthError as exc:
         return _json_error(str(exc), 403)
     if not ctx.rate_limiter.allow(f"{skill_name}:operations"):
@@ -1189,15 +1276,14 @@ async def _api_chat_cancel(request: Request) -> JSONResponse:
     The cancellation owner does the work — durable intent first
     (``cancel_intents.request_cancel``), then custody through the cascade path
     the browser Stop uses — and the answer is its typed outcome: ``cancelled``,
-    ``already_terminal``, ``unresolved`` (custody did not settle; the work is
-    still live) or ``cancel_unsupported`` (nothing this request started is
-    addressable yet: still queued, or a message delivered into a pre-existing
-    task). Never a ``cancelled`` that did not happen.
+    ``already_terminal``, ``unresolved`` (custody did not confirm settlement,
+    proving neither live nor ended work) or ``cancel_unsupported`` (nothing this
+    request started is addressable yet: still queued, or a message delivered
+    into a pre-existing task). Never a ``cancelled`` that did not happen.
     """
     ctx: HostServiceContext = request.app.state.host_service_context
     try:
-        skill_name, token_payload = ctx.authenticate_token_payload(request.headers.get("x-skill-token", ""))
-        ctx.require_permission(skill_name, token_payload, "inject_chat")
+        skill_name, _token_payload = await _authenticated(ctx, request.headers.get("x-skill-token", ""), "inject_chat")
     except HostServiceAuthError as exc:
         return _json_error(str(exc), 403)
     if not ctx.rate_limiter.allow(f"{skill_name}:cancel"):
@@ -1226,7 +1312,7 @@ async def _api_chat_cancel(request: Request) -> JSONResponse:
 async def _ws_events(websocket: WebSocket) -> None:
     ctx: HostServiceContext = websocket.app.state.host_service_context
     try:
-        skill_name, token_payload = ctx.authenticate_token_payload(_token_from_websocket(websocket))
+        skill_name, token_payload = await _authenticated(ctx, _token_from_websocket(websocket))
     except HostServiceAuthError:
         await websocket.close(code=1008)
         return
@@ -1243,7 +1329,9 @@ async def _ws_events(websocket: WebSocket) -> None:
             elif message.get("type") == "subscribe":
                 topic = str(message.get("topic") or "")
                 try:
-                    ctx.require_permission(skill_name, token_payload, f"subscribe_event:{topic}")
+                    await asyncio.to_thread(
+                        ctx.require_permission, skill_name, token_payload, f"subscribe_event:{topic}",
+                    )
                 except HostServiceAuthError as exc:
                     await websocket.send_json({"type": "error", "error": str(exc)})
                     continue
@@ -1277,8 +1365,13 @@ def create_host_service_app(
     ws_broadcaster_getter: Optional[Callable[[], Callable[[dict], None]]] = None,
     presence_runner: Optional[Callable[..., Any]] = None,
 ) -> Starlette:
+    # host_notify imports this module's helpers; mounted here, imported lazily.
+    from ouroboros.gateway.host_notify import _api_notify
+    from ouroboros.gateway.host_call import host_call_routes
+
     app = Starlette(
         routes=[
+            *host_call_routes(),
             Route("/identity", _api_identity, methods=["GET"]),
             Route("/tools/schemas", _api_tool_schemas, methods=["GET"]),
             Route("/chat/allocate-internal", _api_allocate_internal, methods=["POST"]),
@@ -1286,10 +1379,14 @@ def create_host_service_app(
             Route("/chat/operations/{operation_ref:path}", _api_chat_operation, methods=["GET"]),
             Route("/chat/cancel", _api_chat_cancel, methods=["POST"]),
             Route("/chat/decision", _api_chat_decision, methods=["POST"]),
+            Route("/ui/language", _api_ui_language, methods=["POST"]),
+            Route("/presence/place", _api_presence_place, methods=["GET"]),
             Route("/presence/turn", _api_presence_turn, methods=["POST"]),
             Route("/presence/delivery", _api_presence_delivery, methods=["POST"]),
-            Route("/presence/work/{work_ref}", _api_presence_work, methods=["GET"]),
+            Route("/presence/history", _api_presence_history, methods=["POST"]),
+            Route("/presence/work/{work_ref}", _api_presence_work, methods=["GET", "POST"]),
             Route("/ui/ws-message", _api_ws_message, methods=["POST"]),
+            Route("/notify", _api_notify, methods=["POST"]),
             WebSocketRoute("/events", _ws_events),
         ]
     )

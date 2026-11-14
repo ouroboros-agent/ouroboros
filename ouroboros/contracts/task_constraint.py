@@ -12,7 +12,8 @@ _ACTING_SUBAGENT_MODE = "acting_subagent"
 
 # Valid write surfaces for mutative (acting) subagents. SSOT shared with
 # tool_access.active_tool_profile so the fail-closed floor and the schema agree.
-# - self_worktree:     isolated git worktree of THIS repo (self-improvement).
+# - self_worktree:     isolated current-tree copy of the selected Git source.
+#                      Host task metadata binds its source and own-body identity.
 # - external_workspace: a pre-existing external git working tree.
 # - genesis:           a from-scratch project the supervisor provisions as a new
 #                      empty git repo under the durable projects root (game/site/
@@ -60,8 +61,9 @@ def normalize_task_constraint(value: Any) -> Optional[TaskConstraint]:
         if value.mode == _LOCAL_READONLY_SUBAGENT_MODE:
             return TaskConstraint(mode=_LOCAL_READONLY_SUBAGENT_MODE, allow_enable=False, allow_review=False)
         if value.mode == _ACTING_SUBAGENT_MODE:
-            # Acting children never enable tools, never run review/commit, and the
-            # parent is the only committer — re-pin those invariants.
+            # These flags govern tool expansion and review/commit gates. The
+            # separately admitted review_change capability only asks independent
+            # reviewers about assigned work; the parent remains the committer.
             return replace(value, allow_enable=False, allow_review=False, parent_only_commit=True)
         return value
     if not isinstance(value, Mapping):

@@ -63,11 +63,12 @@
 //
 // Pure helpers up top are node-tested without a DOM.
 
-import { apiFetch } from './api_client.js';
+import { apiFetch, createAccountReset, getAccountReset, refreshAccountResources } from './api_client.js';
 import { harnessPresentation } from './harness_presentation.js';
 
 export const STATUS_ENDPOINT = '/api/claudexor/status';
 export const WAKE_ENDPOINT = '/api/claudexor/wake';
+export const RESTART_ENDPOINT = '/api/claudexor/restart';
 export const DEFAULT_POLL_MS = 5000;
 
 export const READ_OK = 'ok';
@@ -84,6 +85,93 @@ export const FACET_CATALOG = 'catalog';
 export const FACET_ACCOUNTS = 'accounts';
 export const FACET_QUOTA = 'quota';
 export const STATUS_FACETS = [FACET_CATALOG, FACET_ACCOUNTS, FACET_QUOTA];
+
+export const accountTargetKey = (target) => JSON.stringify([target.harness, target.profile_id]);
+
+/** Temporary account x model marks, only beside a successful account read; older engines have none. */
+export function accountCapabilityMarks(payload, row) {
+    if (payload?.reads?.accounts !== READ_OK) return [];
+    const marks = payload?.profiles?.routing_evidence?.capabilities;
+    return Array.isArray(marks) ? marks.filter(mark => mark?.harness_id === row.harness
+        && mark.profile_id === row.profile_id && typeof mark.requested_model === 'string') : [];
+}
+
+/** When the marks could not be read, its time: ONE fact for the whole section, never "no marks". */
+export function capabilityMarksReadFailedAt(payload) {
+    const read = payload?.reads?.accounts === READ_OK ? payload?.profiles?.routing_evidence_read : null;
+    return read?.state === READ_FAILED ? String(read.observed_at || '') : '';
+}
+const sameTarget = (a, b) => a?.harness === b?.harness && a?.profile_id === b?.profile_id;
+const quotaTarget = (row) => ({ harness: row?.subject?.harness, profile_id: row?.subject?.subject_id });
+const observationTime = values => Math.max(-Infinity, ...values.map(value => Date.parse(value || '')).filter(Number.isFinite));
+const keepObservation = (held, incoming, onTie) => held > incoming || (onTie && held === incoming);
+
+export function resourceCapabilitiesRead(payload) {
+    return payload?.resource_capabilities_read
+        ?? (payload?.resource_capabilities ? READ_OK : READ_NOT_READ);
+}
+
+export function resetRecoverable(action) {
+    return Boolean(action?.request && (!action.receipt || action.receipt.state === 'running'
+        || ['pending', 'unknown', 'already_used'].includes(action.receipt.outcome)));
+}
+
+const retainResetRequest = entry => resetRecoverable(entry) || (entry.request && !entry.refreshed
+    && ['reset', 'already_redeemed'].includes(entry.receipt?.outcome) && entry.receipt.readback?.state !== 'fresh');
+const resetReferences = action => [...(action.earlierRequests || []), action];
+const resetReference = ({ request, key, receipt, refreshed }) => ({ request, key, refreshed,
+    receipt: receipt ? { ...receipt, resources: null } : undefined });
+
+/** Receipts settle operations; their observations may predate the current display. */
+export function mergeAccountResources(snapshot, envelope, target = null, { preferPreviousOnTie = false } = {}) {
+    if (!snapshot || !Array.isArray(envelope?.snapshots) || !Array.isArray(envelope?.absences)) {
+        throw new Error('The account resource response could not be understood');
+    }
+    const addressed = (rows, key) => (rows || []).filter(row => sameTarget(key(row), target));
+    const merge = (held, incoming, key) => {
+        if (!target) return incoming;
+        const previous = addressed(held, key), next = addressed(incoming, key);
+        if (previous.length === next.length && next.every((row, index) => row === previous[index])) return held || [];
+        return [...(held || []).filter(row => !sameTarget(key(row), target)), ...next];
+    };
+    const quotaTime = (snapshots, absences) => observationTime(
+        addressed([...(snapshots || []), ...(absences || [])], quotaTarget).map(row => row.observed_at));
+    const keepQuota = target && keepObservation(quotaTime(snapshot.quota, snapshot.quota_absences),
+        quotaTime(envelope.snapshots, envelope.absences), preferPreviousOnTie);
+    let resources = envelope.resources;
+    if (target && Array.isArray(resources)) {
+        const held = addressed(snapshot.resources, row => row.target)[0];
+        const incoming = addressed(resources, row => row.target)[0];
+        if (held && incoming) {
+            const merged = { ...incoming };
+            for (const name of ['balances', 'spending', 'resets', 'diagnostics']) {
+                const time = facet => observationTime([facet?.observed_at, facet?.last_attempt_at]);
+                if (keepObservation(time(held[name]), time(incoming[name]), preferPreviousOnTie)) merged[name] = held[name];
+            }
+            resources = [Object.keys(merged).filter(name => name !== 'target')
+                .every(name => merged[name] === held[name]) ? held : merged];
+        } else if (!incoming && held && preferPreviousOnTie) resources = [held];
+    }
+    const quota = merge(snapshot.quota, keepQuota ? snapshot.quota : envelope.snapshots, quotaTarget);
+    const absences = merge(snapshot.quota_absences, keepQuota ? snapshot.quota_absences : envelope.absences, quotaTarget);
+    const heldScope = snapshot.availability_scope, incomingScope = envelope.availability_scope;
+    const sameScope = heldScope && incomingScope && ['model', 'requestKind', 'basis'].every(key =>
+        Object.hasOwn(heldScope, key) && Object.hasOwn(incomingScope, key) && heldScope[key] === incomingScope[key]);
+    const retainedQuota = target && quota === snapshot.quota && absences === snapshot.quota_absences;
+    const mixedQuota = target && [...quota, ...absences].some(row => !sameTarget(quotaTarget(row), target));
+    // Scope binds the quota value, never the refresh operation. A new echo
+    // cannot certify retained siblings from another (or unproven) scope.
+    const scope = retainedQuota ? heldScope : (!mixedQuota || sameScope ? incomingScope : undefined);
+    const result = {
+        ...snapshot,
+        quota,
+        quota_absences: absences,
+        ...(Array.isArray(resources) ? { resources: merge(snapshot.resources, resources, row => row.target) } : {}),
+    };
+    if (scope === undefined) delete result.availability_scope;
+    else result.availability_scope = scope;
+    return result;
+}
 
 // ---------------------------------------------------------------------------
 // Pure helpers.
@@ -324,14 +412,35 @@ export function statusUnavailableNote(readState, {
 
 const isObject = (v) => Boolean(v) && typeof v === 'object' && !Array.isArray(v);
 
-export function unifiedAccounts(payload) {
-    // Whether the engine behind this payload serves the UNIFIED account model
-    // (every account a named registry row; routing facts in `accountPools`).
-    // The fact is stamped server-side from the engine's own /v2/operations
-    // catalog (`get:account-pools` present — sprint plan §L.2); anything else —
-    // old engine, unreadable catalog, an older backend without the field —
-    // reads false, which is the fail-closed legacy rendering.
-    return payload?.unified_accounts === true;
+// The accounts facet answers only the unified account model (Claudexor 3.6.0+).
+// A roster from before it is refused server-side with this typed reason
+// (gateway/claudexor_passive.py `roster_error`): a known state, never an empty
+// roster and never the generic "could not be read".
+export const ACCOUNT_MODEL_UNSUPPORTED = 'account_model_unsupported';
+// What a family says there, on Accounts and in onboarding alike.
+export const ACCOUNTS_UNSUPPORTED_STATUS = 'Not listed — needs a newer Claudexor';
+
+export function accountModelUnsupported(payload) {
+    return payload?.reads?.accounts === READ_FAILED
+        && payload?.facets?.accounts?.error === ACCOUNT_MODEL_UNSUPPORTED;
+}
+
+/** Why nothing is listed, and the way out the runtime projection actually names. */
+export function accountModelUnsupportedText(payload) {
+    const daemon = payload?.daemon || {};
+    const runtime = daemon.runtime || {};
+    const engine = String(daemon.engine_version || '');
+    const target = String(runtime.staged_version || runtime.target_version || '');
+    const way = runtime.source === 'override'
+        ? 'This Claudexor comes from OUROBOROS_CLAUDEXOR_BIN; point it at Claudexor 3.6 or later.'
+        : runtime.source === 'external' ? 'Update that Claudexor to 3.6 or later.'
+            : runtime.state === 'update_staged' && target
+                ? `Claudexor ${target} is installed and takes over when the agent daemon next restarts.`
+                : runtime.state === 'update_available' && target
+                    ? `Claudexor ${target} takes over when the agent daemon next restarts.`
+                    : 'Update Claudexor to 3.6 or later.';
+    return `${engine ? `Claudexor ${engine}` : 'This Claudexor'} keeps accounts in an older format that this `
+        + `version of Ouroboros no longer reads, so they can’t be listed or managed here. They are unchanged. ${way}`;
 }
 
 export function statusPayloadValid(payload) {
@@ -358,48 +467,18 @@ export function statusPayloadValid(payload) {
 export function accountRows(payload) {
     // Consume the REAL ControlCredentialProfilesResponse shape (Claudexor
     // packages/schema/src/credential-profile.ts): `profiles` is an ARRAY of
-    // wrapper objects `{profile, status, identity}` with snake_case fields, and
-    // `harnessAccounts` is an ARRAY of per-harness authority rows — not the flat
-    // camelCase maps an earlier draft invented. Fields are read exactly as the
-    // Zod schema names them so the golden fixture and the wire agree.
-    //
-    // DUAL-SHAPE (unified account model, sprint plan §L): a unified engine
-    // migrates every default CLI login into a named registry row, so ALL of
-    // its rows arrive as profile wrappers and `harnessAccounts` is emitted
-    // empty — no native pseudo-row is synthesized there. The synthesis below
-    // is additionally gated on the server-stamped `unified_accounts` fact so
-    // a unified engine that still emitted a compatibility row could not
-    // double-render the same account. A LEGACY engine keeps today's rule
-    // behavior-identical — a native pseudo-row per harness, addressed by the
-    // empty profile id — plus the additive fail-open `enabled` projection
-    // every row now carries.
+    // wrapper objects `{profile, status, identity}` with snake_case fields —
+    // not the flat camelCase maps an earlier draft invented. Fields are read
+    // exactly as the Zod schema names them so the golden fixture and the wire
+    // agree. Under the unified account model every account, a migrated default
+    // login included, is such a named row; an old client's `harnessAccounts`
+    // carrier is never read, so no pseudo-row with an empty id exists.
     //
     // Lives with the store because it is a projection OF the payload: the
     // accounts panel, the Subagents section and the login verify-race all read
     // it, and a second reader would be a second definition of "connected".
     const rows = [];
     const profiles = payload?.profiles?.profiles || [];
-    const harnessAccounts = unifiedAccounts(payload)
-        ? [] : (payload?.profiles?.harnessAccounts || []);
-    for (const native of Array.isArray(harnessAccounts) ? harnessAccounts : []) {
-        rows.push({
-            harness: String(native?.harness_id || ''),
-            profile_id: '',
-            kind: 'native',
-            identity: native?.identity || {},
-            // Whether the default login participates in the engine's
-            // credential ladder. Absent (older engines) reads as enabled —
-            // the pre-toggle behavior, never a silent exclusion claim.
-            enabled: native?.native_credentials_enabled !== false,
-            // Both engine schema versions declare this row
-            // additionalProperties:false with NO status field, so presence
-            // projects as local-store evidence — detected, liveness unproven.
-            status: {
-                verification: native?.native_login_detected ? 'passed' : '',
-                verification_source: 'local_store',
-            },
-        });
-    }
     for (const wrapper of Array.isArray(profiles) ? profiles : []) {
         const profile = wrapper?.profile || {};
         rows.push({
@@ -420,33 +499,27 @@ export function accountRows(payload) {
 
 export function accountName(row) {
     // The account's OWN name, in this order: the registry row's display name,
-    // the identity the daemon observed (email), the machine id. The old
-    // "Default CLI login" label claimed a TYPE — under the unified model every
-    // account is a named row of one type, and even on a legacy engine the
-    // honest name for the unnamed default is who it is signed in as. The
-    // legacy pseudo-row keeps a neutral fallback when the daemon observed no
-    // identity for it.
+    // the identity the daemon observed (email), the machine id. A label that
+    // claimed a TYPE ("Default CLI login") is gone: every account is a named
+    // row of one type, and the honest name of a migrated default login is who
+    // it is signed in as.
     //
     // Lives beside `accountRows` for the same reason: the Accounts tab and the
     // pin selects both name the rows this store projects, and a second namer is
     // how one of them ends up printing a raw profile id at the owner.
     const identity = row.identity || {};
     const named = String(row.display_name || '') || String(identity.email || '');
-    if (named) return named;
-    if (row.kind === 'native') return 'Default account';
-    return String(row.profile_id || '') || 'Account';
+    return named || String(row.profile_id || '') || 'Account';
 }
 
 export function nextUpAccount(payload, harness) {
-    // WHO an unpinned run of this harness would route to next — the DUAL-WIRE
-    // reader (one per app, same rule as accountRows): the unified engine's
-    // additive `profiles.accountPools` answers first; the legacy per-harness
-    // `harnessAccounts[].next_up` answers on engines that predate it. `null`
-    // means the payload carries no verdict for this harness (absence, never a
-    // synthesized "none"). The union is returned AS the wire spells it —
-    // {kind: profile|api_key_route|none|native|…} — and consumers must render
-    // an unknown kind fail-safe rather than crash: the legacy union and the
-    // pool union are both closed TODAY, but this reader outlives both.
+    // WHO an unpinned run of this harness would route to next: the engine's
+    // own `profiles.accountPools` verdict (one reader per app, same rule as
+    // accountRows). `null` means the payload carries no verdict for this
+    // harness (absence, never a synthesized "none"). The union is returned AS
+    // the wire spells it — {kind: profile|api_key_route|none|…} — and
+    // consumers must render an unknown kind fail-safe rather than crash: the
+    // pool union is closed TODAY, but this reader outlives it.
     const id = String(harness || '');
     if (!id) return null;
     const pools = payload?.profiles?.accountPools;
@@ -455,19 +528,13 @@ export function nextUpAccount(payload, harness) {
         const verdict = pool?.next_up;
         if (verdict && typeof verdict === 'object' && !Array.isArray(verdict)) return verdict;
     }
-    const legacy = payload?.profiles?.harnessAccounts;
-    for (const row of Array.isArray(legacy) ? legacy : []) {
-        if (String(row?.harness_id || '') !== id) continue;
-        const verdict = row?.next_up;
-        if (verdict && typeof verdict === 'object' && !Array.isArray(verdict)) return verdict;
-    }
     return null;
 }
 
 export function accountLoginConfirmed(payload, harness, profileId = '') {
     // The account-status truth the login verify-race re-check reads: the row
     // for THIS harness+profile shows a login — vendor-verified or the daemon's
-    // own local-store detection (accountRows already projects both as 'passed').
+    // local-store verdict, both 'passed'.
     const row = accountRows(payload).find((r) =>
         r.harness === String(harness || '')
         && String(r.profile_id || '') === String(profileId || ''));
@@ -489,6 +556,7 @@ export function createClaudexorStatusStore({
     fetchImpl = apiFetch,
     doc = () => (typeof document === 'undefined' ? null : document),
     pollMs = DEFAULT_POLL_MS,
+    storage = () => globalThis.localStorage,
 } = {}) {
     const getDoc = typeof doc === 'function' ? doc : () => doc;
     const inner = {
@@ -510,6 +578,8 @@ export function createClaudexorStatusStore({
         // answer is a fresh status payload, and a second committer of the
         // shared snapshot would be a second writer racing the first.
         wakeInFlight: null,
+        resourcesInFlight: null,
+        resourceActions: new Map(),
         queued: null,
         timer: 0,
         disposed: false,
@@ -517,6 +587,51 @@ export function createClaudexorStatusStore({
         holds: new Set(),
         visibilityBound: null,
     };
+
+    // Retain the exact request through response loss and closing this client window.
+    // Only operation references live here; credentials and provider binding stay host-side.
+    const storageKey = 'ouroboros.account-reset-requests';
+    try {
+        for (const entry of JSON.parse(storage()?.getItem(storageKey) || '[]')) {
+            if (entry?.key && entry.request?.target?.profile_id && entry.request?.target?.harness) {
+                const targetKey = accountTargetKey(entry.request.target);
+                const prior = inner.resourceActions.get(targetKey);
+                inner.resourceActions.set(targetKey, { ...resetReference(entry),
+                    earlierRequests: prior ? resetReferences(prior).filter(retainResetRequest).map(resetReference) : [] });
+            }
+        }
+    } catch { /* Unavailable client storage leaves the in-memory recovery path intact. */ }
+
+    function saveResetRequests() {
+        try {
+            storage()?.setItem(storageKey, JSON.stringify([...inner.resourceActions.values()]
+                .flatMap(resetReferences).filter(retainResetRequest).map(resetReference)));
+        } catch { /* The current page still retains the original request and key. */ }
+    }
+
+    function commitStatus(payload) {
+        for (const action of inner.resourceActions.values()) {
+            for (const request of resetReferences(action)) request.resourceRead = false;
+        }
+        if (!payload) return;
+        const held = inner.snapshot;
+        if (held && facetReadState(payload, FACET_QUOTA) !== READ_OK) {
+            // This client's own last value stands in (it may already carry a foreground refresh
+            // the server's memory never saw), dated by this client's own last stamp: a stamp
+            // the server took for a different value must never date it.
+            const facets = payload.facets && { ...payload.facets, [FACET_QUOTA]: { ...payload.facets[FACET_QUOTA],
+                observed_at: held.facets?.[FACET_QUOTA]?.observed_at ?? null, stale: true } };
+            payload = { ...payload, quota: held.quota, quota_absences: held.quota_absences, resources: held.resources,
+                availability_scope: held.availability_scope,
+                ...(facets ? { facets } : {}) };
+        }
+        // Agent discovery (reads.catalog) is independent of the operations catalog.
+        if (held && resourceCapabilitiesRead(payload) !== READ_OK) {
+            payload = { ...payload, resource_capabilities_read: resourceCapabilitiesRead(payload),
+                resources: held.resources, resource_capabilities: held.resource_capabilities };
+        }
+        inner.snapshot = payload;
+    }
 
     function facet(name) {
         // The store adds ONE dimension the wire cannot carry: this client has
@@ -638,8 +753,8 @@ export function createClaudexorStatusStore({
             inner.loading = false;
             inner.everSettled = true;
             inner.inFlight = null;
+            commitStatus(payload);
             if (payload) {
-                inner.snapshot = payload;
                 inner.snapshotHasModels = withModels;
                 inner.error = '';
             } else {
@@ -662,20 +777,22 @@ export function createClaudexorStatusStore({
      * `includeModels` upgrades the store permanently; a caller that needs
      * models while a model-less read is already in flight is served by ONE
      * queued follow-up read, shared by every other upgrading caller.
+     * `afterCurrent` requests evidence after an event (e.g. program maintenance).
      */
-    function refresh({ includeModels = false } = {}) {
+    function refresh({ includeModels = false, afterCurrent = false } = {}) {
         if (inner.disposed) return Promise.resolve(inner.snapshot);
         if (includeModels) inner.includeModels = true;
+        if (inner.resourcesInFlight) return inner.resourcesInFlight.then(() => refresh({ includeModels }));
         // A wake OWNS the reading while it runs: it ensures the daemon and then
         // reads, so its answer is the one worth having — and a GET beside it is
         // a second writer whose order against it cannot be established from the
         // client at all. The refresh JOINS the wake instead (and the wake waits
         // out an already-running read before POSTing — see `wake`), so the two
         // writers never overlap in either order.
-        if (inner.wakeInFlight) return inner.wakeInFlight.then(() => inner.snapshot);
+        if (inner.wakeInFlight) return inner.wakeInFlight.then(() => afterCurrent ? refresh({includeModels}) : inner.snapshot);
         const wantModels = inner.includeModels;
         if (inner.inFlight) {
-            if (!wantModels || inner.inFlightModels) return inner.inFlight;
+            if (!afterCurrent && (!wantModels || inner.inFlightModels)) return inner.inFlight;
             if (!inner.queued) {
                 // BOTH arms re-check disposal: they run after an await, and the
                 // world they were queued in may no longer exist.
@@ -688,7 +805,10 @@ export function createClaudexorStatusStore({
                     if (inner.wakeInFlight) {
                         return inner.wakeInFlight.then(() => refresh({ includeModels: true }));
                     }
-                    return startRead(true);
+                    if (inner.resourcesInFlight) {
+                        return inner.resourcesInFlight.then(() => refresh({ includeModels: true }));
+                    }
+                    return startRead(wantModels);
                 };
                 inner.queued = inner.inFlight.then(follow, follow);
             }
@@ -712,40 +832,53 @@ export function createClaudexorStatusStore({
      * it (see `refresh`). The answer commits through the same snapshot /
      * error / generation fields as every read — still ONE writer of the view.
      *
-     * @returns {Promise<{ok: boolean, error: string}>} the outcome. A failure
+     * The owner's Restart Claudexor (`restart`) is the same write with a body:
+     * its answer carries the receipt beside the fresh status (`{status, restart}`),
+     * so it commits through this one path and waits out a wake already in flight.
+     *
+     * @returns {Promise<{ok: boolean, error: string, httpStatus?: number, data?: Object}>}
+     *          the outcome; `data` is the answer's own body (a restart's receipt,
+     *          or its typed refusal). A failure
      *          deliberately does NOT touch the held snapshot or the store
      *          error: whether and how long to show a refused wake is the
      *          caller's lifecycle (the accounts panel keeps it until the
      *          daemon provably answers — `daemonAnswered`).
      */
-    function wake() {
+    function wake(restartToken = null) {
+        const restarting = restartToken !== null;
         if (inner.disposed) return Promise.resolve({ ok: false, error: 'store disposed' });
-        if (inner.wakeInFlight) return inner.wakeInFlight;
+        if (inner.wakeInFlight) return restarting ? inner.wakeInFlight.then(() => wake(restartToken)) : inner.wakeInFlight;
+        if (inner.resourcesInFlight) return inner.resourcesInFlight.then(() => wake(restartToken));
         const pendingRead = inner.inFlight;
         inner.wakeInFlight = (async () => {
             let outcome;
             try {
                 if (pendingRead) await pendingRead.then(() => {}, () => {});
-                const resp = await fetchImpl(WAKE_ENDPOINT, { method: 'POST' });
-                const data = await resp.json().catch(() => null);
+                const resp = await fetchImpl(restarting ? RESTART_ENDPOINT : WAKE_ENDPOINT, restarting
+                    ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: restartToken }) }
+                    : { method: 'POST' });
+                const body = await resp.json().catch(() => null);
+                const data = restarting ? body?.status : body;
                 if (inner.disposed) return { ok: false, error: 'store disposed' };
                 if (resp && resp.ok && statusPayloadValid(data)) {
                     inner.loading = false;
                     inner.everSettled = true;
-                    inner.snapshot = data;
+                    commitStatus(data);
                     // The wake endpoint never carries model discovery
                     // (include_models=False server-side).
                     inner.snapshotHasModels = false;
                     inner.error = '';
                     inner.generation += 1;
-                    outcome = { ok: true, error: '' };
+                    outcome = { ok: true, error: '', data: body };
                 } else {
                     outcome = {
                         ok: false,
-                        error: String((data && data.error)
+                        error: String((body && body.error)
                             || (resp && resp.ok
                                 ? 'the status answer could not be understood'
                                 : `HTTP ${resp ? resp.status : 'error'}`)),
+                        httpStatus: resp ? resp.status : 0,
+                        data: body,
                     };
                 }
             } catch (err) {
@@ -768,6 +901,121 @@ export function createClaudexorStatusStore({
             return outcome;
         })();
         return inner.wakeInFlight;
+    }
+
+    // Serialize view writers with existing status/wake reads. This is transport
+    // ordering, not provider admission: disabled profiles use the same path.
+    function resourceWrite(work) {
+        const preceding = inner.resourcesInFlight || inner.wakeInFlight || inner.inFlight;
+        const pending = (async () => {
+            if (preceding) await preceding.catch(() => {});
+            if (inner.inFlight) await inner.inFlight.catch(() => {});
+            if (inner.disposed) return null;
+            return work();
+        })();
+        const settled = pending.finally(() => {
+            if (inner.resourcesInFlight === settled) inner.resourcesInFlight = null;
+            if (!inner.disposed) { notify(); armPoll(); }
+        });
+        inner.resourcesInFlight = settled;
+        return settled;
+    }
+
+    function resourceAction(target) {
+        return inner.resourceActions.get(target ? accountTargetKey(target) : 'all') || {};
+    }
+
+    function refreshResources(target = null) {
+        const key = target ? accountTargetKey(target) : 'all';
+        const entry = inner.resourceActions.get(key) || {};
+        if (entry.busy) return Promise.resolve(null);
+        entry.busy = true;
+        entry.error = '';
+        entry.activity = 'refresh';
+        inner.resourceActions.set(key, entry);
+        notify();
+        return resourceWrite(async () => {
+            try {
+                const envelope = await refreshAccountResources(target, { fetchImpl });
+                if (inner.disposed) return null;
+                inner.snapshot = mergeAccountResources(inner.snapshot, envelope, target);
+                entry.refreshed = true;
+                entry.resourceRead = true;
+                entry.refreshDone = true;
+                for (const action of target ? [entry] : inner.resourceActions.values()) {
+                    for (const request of resetReferences(action)) request.refreshed = true;
+                    action.earlierRequests = (action.earlierRequests || []).filter(retainResetRequest);
+                }
+                inner.generation += 1;
+                saveResetRequests();
+                return envelope;
+            } catch (err) {
+                entry.error = String(err?.message || err);
+                entry.refreshDone = false;
+                return null;
+            } finally { entry.busy = false; }
+        });
+    }
+
+    function resetAccount(request, { key = '', recover = false } = {}) {
+        const target = request.target;
+        const prior = resourceAction(target);
+        if (prior.busy) return Promise.resolve(null);
+        // Recovery reuses its key; new opaque keys also work on plain HTTP LAN clients.
+        const entry = recover ? (key ? resetReferences(prior).find(entry => entry.key === key) : prior)
+            : { request: structuredClone(request), key: key || globalThis.crypto?.randomUUID?.()
+                || `account-reset-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`, refreshed: false,
+                earlierRequests: resetReferences(prior).filter(retainResetRequest).map(resetReference) };
+        if (!entry?.request || !entry.key) return Promise.resolve(null);
+        entry.busy = true;
+        entry.error = '';
+        entry.activity = recover ? 'inspect' : 'reset';
+        const current = recover ? prior : entry;
+        current.busy = true;
+        inner.resourceActions.set(accountTargetKey(target), current);
+        saveResetRequests();
+        notify();
+        return resourceWrite(async () => {
+            // A full refresh may have completed while this request was queued.
+            // Its observation precedes dispatch and cannot prove post-reset freshness.
+            if (!recover) {
+                entry.refreshed = false;
+                entry.resourceRead = false;
+                entry.refreshDone = false;
+            }
+            try {
+                const receipt = recover && entry.receipt?.id && entry.receipt.state === 'running'
+                    ? await getAccountReset(entry.receipt.id, { fetchImpl })
+                    : await createAccountReset(entry.request, entry.key, { fetchImpl });
+                if (inner.disposed) return null;
+                if (!receipt?.id || !sameTarget(receipt.request?.target, target)
+                    || receipt.request.offer_id !== entry.request.offer_id
+                    || receipt.request.grant_id !== entry.request.grant_id) {
+                    throw new Error('The reset receipt did not match the requested operation');
+                }
+                entry.receipt = { ...receipt, resources: null };
+                if (receipt.resources) {
+                    const merged = mergeAccountResources(inner.snapshot, receipt.resources, target,
+                        { preferPreviousOnTie: recover });
+                    if (['quota', 'quota_absences', 'resources'].some(name => merged[name] !== inner.snapshot[name])) {
+                        inner.snapshot = merged;
+                        entry.resourceRead = true;
+                        inner.generation += 1;
+                    }
+                }
+                if (receipt.readback?.state === 'fresh') entry.refreshed = true;
+                return receipt;
+            } catch (err) {
+                // A timeout says nothing about whether the provider consumed a reset.
+                entry.error = String(err?.message || err);
+                return null;
+            } finally {
+                entry.busy = false;
+                current.busy = false;
+                current.earlierRequests = (current.earlierRequests || []).filter(retainResetRequest);
+                saveResetRequests();
+            }
+        });
     }
 
     /**
@@ -838,6 +1086,11 @@ export function createClaudexorStatusStore({
         get reads() { return reads(); },
         get catalogKnown() { return facetKnown(facet(FACET_CATALOG)); },
         get accountsKnown() { return facetKnown(facet(FACET_ACCOUNTS)); },
+        // The engine answered with the retired pre-unified account model (this
+        // read, never a held snapshot behind a dead request).
+        get accountsUnsupported() {
+            return facet(FACET_ACCOUNTS) === READ_FAILED && accountModelUnsupported(inner.snapshot);
+        },
         get quotaKnown() { return facetKnown(facet(FACET_QUOTA)); },
         get includesModels() { return inner.snapshotHasModels; },
         get polling() { return Boolean(inner.timer); },
@@ -862,14 +1115,25 @@ export function createClaudexorStatusStore({
             // the detail resolution above — a banner that assembled the sentence
             // itself printed "could not be read" over an `unreachable` daemon
             // and silently dropped the one explanation the owner had.
+            // A failed facet's own typed error (`facets.<name>.error`) is the exact detail;
+            // a backend without it leaves the daemon's last_error as before. The
+            // retired account model is no read failure and says why in its own words.
             const state = facet(name);
+            if (name === FACET_ACCOUNTS && state === READ_FAILED && accountModelUnsupported(inner.snapshot)) {
+                return { tone: 'warn', action: null, text: accountModelUnsupportedText(inner.snapshot) };
+            }
             const daemonError = String(inner.snapshot?.daemon?.last_error || '');
+            const own = String(inner.snapshot?.facets?.[name]?.error || '');
             const detail = inner.error
-                || (state === READ_FAILED || state === READ_INDETERMINATE ? daemonError : '');
+                || (state === READ_FAILED ? own || daemonError : state === READ_INDETERMINATE ? daemonError : '');
             return statusUnavailableNote(state, { error: detail, facet: name, subject });
         },
         refresh,
-        wake,
+        refreshResources,
+        resetAccount,
+        resourceAction,
+        wake: () => wake(),
+        restart: (token) => wake(String(token ?? '')),
         subscribe,
         holdPolling,
         dispose,
@@ -879,9 +1143,9 @@ export function createClaudexorStatusStore({
 // The app-wide instance every UI surface shares.
 export const claudexorStatus = createClaudexorStatusStore();
 
-// The settings shell announces a page and a sub-tab becoming active; reaching a
-// panel is not a visibility CHANGE the store can observe on its own.
-export const SURFACE_ACTIVATION_EVENTS = ['ouro:page-shown', 'ouro:settings-subtab-shown'];
+// The app announces a page, and the Settings shell a Settings page, becoming visible;
+// reaching a page is not a visibility CHANGE the store can observe on its own.
+export const SURFACE_ACTIVATION_EVENTS = ['ouro:page-shown', 'ouro:settings-page-shown'];
 
 /**
  * Bind ONE surface to the shared store: a subscription that can actually keep
@@ -891,8 +1155,8 @@ export const SURFACE_ACTIVATION_EVENTS = ['ouro:page-shown', 'ouro:settings-subt
  * lived on — and two of them supplied neither a visibility predicate nor an
  * activation hook, so their comments promised "the daemon recovering is picked
  * up without a reload" while the store never polled for them at all. The rule
- * here is structural: an element that is on screen (an inactive `.page` /
- * `.settings-panel` is display:none, which is exactly what `offsetParent`
+ * here is structural: an element that is on screen (an inactive `.page` or a
+ * hidden Settings page is display:none, which is exactly what `offsetParent`
  * reports) is a visible surface, wherever the sprint later moves the section.
  *
  * @param {object} store the shared status store

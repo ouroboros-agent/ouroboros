@@ -21,15 +21,11 @@ from ouroboros.skill_loader import (
 
 _MANIFEST_NAMES = ("SKILL.md", "skill.json")
 
-# Native payloads are a readable skill-code surface for the two profiles that
-# already have direct/read-only inspection authority.  This is deliberately an
-# operation- and selector-specific overlay at the binding seam, not a broader
-# profile predicate or a change to the generic payload-path resolver.  Native
-# mutation, repair, and acting-child selection continue through the existing
-# top-level/operation guards below.
+# Parent-equivalent payload reads do not change native mutation or selected-skill authority.
 _NATIVE_PAYLOAD_READ_OPERATIONS = frozenset({"read", "list", "search"})
 _NATIVE_PAYLOAD_READ_PROFILES = frozenset({
     "local_readonly_subagent",
+    "acting_subagent",
     "operator_control",
 })
 
@@ -40,9 +36,9 @@ def _native_payload_read_allowed(
     operation: str,
     requested: str,
 ) -> bool:
-    """Admit only explicit native read/list/search selectors for read profiles."""
+    """Admit explicit read selectors without granting a mutation operation."""
     return (
-        requested == "native"
+        requested in {"native", "user_repo"}
         and operation in _NATIVE_PAYLOAD_READ_OPERATIONS
         and profile in _NATIVE_PAYLOAD_READ_PROFILES
     )

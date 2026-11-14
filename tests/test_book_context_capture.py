@@ -3,8 +3,10 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from ouroboros import context
-from ouroboros.context_fit import build_context_fit_plan
+from ouroboros.context_fit import MinimumViewUnfit, build_context_fit_plan
 from ouroboros.memory import Memory
 
 
@@ -35,10 +37,10 @@ def _capture(tmp_path, task=None):
     return env, context._capture_context_core(env, memory, task, None, None), task
 
 
-def _plan(env, core, task, mode):
+def _plan(env, core, task, mode, window=0):
     def route(*a, **kw):
-        return ({"model": "fixture", "provider": "fixture"},
-                SimpleNamespace(route_fp="fixture", status="unprobeable", stale=False, window_tokens=0))
+        return ({"model": "fixture", "provider": "fixture"}, SimpleNamespace(
+            route_fp="fixture", status="asserted" if window else "unprobeable", stale=False, window_tokens=window))
     return build_context_fit_plan(env, core, task, preferred_mode=mode, route_resolver=route)
 
 
@@ -78,7 +80,11 @@ def test_child_keeps_biography_and_book_orientation_in_max(tmp_path):
     assert "Full mechanism and WHY." not in text
     assert "Parent's unselected current working note." not in text
     assert "Unselected raw parent conversation." not in text
-    assert "chat_history" in text and "get_task_result" in text
+    # The child role line is carried verbatim: it no longer names tools or claims the
+    # parent's selected discussion is attached (that claim was false: nothing attached it).
+    assert "Read memory or sources whenever they could change what you do" in text and "name what you read in your answer" in text
+    assert "The shared biography is loaded above" not in text
+    assert "parent's selected discussion" not in text
 
 
 def test_missing_chapter_cannot_masquerade_as_a_complete_book(tmp_path):
@@ -97,7 +103,13 @@ def test_large_nano_task_retains_exact_owner_source_without_changing_max(tmp_pat
 
     task_text = "The exact whole task with a late correction. " * 10000 + "FINAL OWNER CRITERION"
     env, core, task = _capture(tmp_path, {"text": task_text})
-    plan = _plan(env, core, task, "nano")
+    # An unknown window does not hide the owner's words to chase the Nano target (#1527, owner A).
+    unknown = _plan(env, core, task, "nano")
+    assert unknown.messages_for("nano")[-1]["content"] == task_text
+    assert unknown.nano_projection.user_content_json is None
+    # A known window that cannot hold them: the exact source replaces them, and the pointer request fits.
+    window = 81920
+    plan = _plan(env, core, task, "nano", window)
     nano = plan.messages_for("nano")[-1]["content"]
     assert nano.startswith("[Exact task input source]")
     ref = json.loads(nano[nano.index("{"):])
@@ -105,7 +117,10 @@ def test_large_nano_task_retains_exact_owner_source_without_changing_max(tmp_pat
     assert original == task_text
     assert plan.messages_for("max")[-1]["content"] == task_text
     assert "FINAL OWNER CRITERION" in json.loads(core.user_content_json)
-    assert plan.nano_projection.estimated_tokens < 81920
+    assert plan.nano_projection.estimated_tokens < window
+    # Only a window that cannot hold even the pointer request names the incompatibility.
+    with pytest.raises(MinimumViewUnfit, match="cannot fit"):
+        _plan(env, core, task, "nano", 10_000)
 
 
 def test_authored_common_understanding_is_resident_with_every_note_summary(tmp_path):

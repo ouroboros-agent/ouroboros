@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 from ouroboros.gateway.history import make_chat_history_endpoint
 from ouroboros.subagent_messages import SUBAGENT_MESSAGE_FIELDS
+from tests._store_shared import seed_result
 
 
 def _run_full(tmp_path, params):
@@ -125,7 +126,8 @@ def test_task_bound_skill_review_refs_fold_before_human_quota(tmp_path):
         row for row in zero_window["messages"]
         if row.get("system_type") == "skill_review"
     ]
-    assert zero_window["window"] == {"complete": False, "truncated_by": ["quota"]}
+    # The bounds; Main's window also names its newest arrival (tests/test_project_unread_latest_arrival.py).
+    assert zero_window["window"].items() >= {"complete": False, "truncated_by": ["quota"]}.items()
 
 
 def test_task_bound_skill_review_owners_use_the_progress_window(tmp_path):
@@ -291,8 +293,10 @@ def test_panel_chat_zero_stays_hidden_and_request_zero_still_means_main(tmp_path
 def test_panel_zero_exclusion_does_not_override_project_task_binding():
     from ouroboros.gateway.history import _make_thread_filter
 
-    project_filter = _make_thread_filter(42, {42}, [], {"root-1": 42})
-    main_filter = _make_thread_filter(1, {42}, [], {"root-1": 42})
+    from tests._room_shared import RoomsFromBindings
+
+    project_filter = _make_thread_filter(42, {42}, [], RoomsFromBindings({"root-1": 42}))
+    main_filter = _make_thread_filter(1, {42}, [], RoomsFromBindings({"root-1": 42}))
 
     row = {"task_id": "root-1"}
     assert project_filter(0, row) is True
@@ -562,6 +566,8 @@ def test_default_request_does_not_open_archives_when_live_tail_sufficient(
         encoding="utf-8",
     )
 
+    from ouroboros import dialogue_import
+    assert dialogue_import.run_dialogue_import(tmp_path)["state"] == "done"
     seen = []
     real_iter = _helpers.iter_jsonl_objects
 
@@ -572,8 +578,8 @@ def test_default_request_does_not_open_archives_when_live_tail_sufficient(
     monkeypatch.setattr(_helpers, "iter_jsonl_objects", counted)
 
     msgs = _run(tmp_path, {})
-    assert seen  # the bounded reader served the endpoint
-    assert not any("/archive/" in path for path in seen)  # archives untouched
+    assert not any(path.endswith(("chat.jsonl", "progress.jsonl")) or "/archive/" in path for path in seen), \
+        "the dialogue is read out of the store, never a chain file or an archive"
     human = [m for m in msgs if not m.get("is_progress")]
     progress = [m for m in msgs if m.get("is_progress")]
     assert len(human) == 150   # default n_human window
@@ -611,7 +617,8 @@ def test_window_metadata_reports_quota_truncation(tmp_path):
     )
     (logs / "progress.jsonl").write_text("", encoding="utf-8")
     payload = _run_full(tmp_path, {"n_human": "3"})
-    assert payload["window"] == {"complete": False, "truncated_by": ["quota"]}
+    # The bounds; Main's window also names its newest arrival (tests/test_project_unread_latest_arrival.py).
+    assert payload["window"].items() >= {"complete": False, "truncated_by": ["quota"]}.items()
     assert len(payload["messages"]) == 3  # the slice actually applied
 
 
@@ -711,14 +718,15 @@ def test_window_metadata_reports_quota_when_slice_cuts_only_system_rows(tmp_path
     assert len(human) == 3  # the slice really dropped the two oldest system rows
 
 
-def test_window_metadata_reports_archive_floor(tmp_path):
-    """More rotated segments exist than the 3-archive backfill bound and the
-    quota is still unmet -> the reader stopped at the archive floor."""
+def test_window_metadata_is_complete_when_the_read_reaches_the_oldest_archive(tmp_path):
+    """No archive count bounds the recent read (owner decision 2026-10-05): with
+    the quota unmet it reads back to the oldest archive, so the window is the
+    whole history, however many archives that takes."""
     logs = tmp_path / "logs"
     logs.mkdir()
     archive = tmp_path / "archive"
     archive.mkdir()
-    for idx in range(4):  # 4 archives > the 3-newest backfill bound
+    for idx in range(4):  # more archives than the retired 3-newest backfill bound
         (archive / f"progress_2026060{idx + 1}T000000.jsonl").write_text(
             json.dumps({
                 "ts": f"2026-06-0{idx + 1}T00:00:00Z",
@@ -731,13 +739,14 @@ def test_window_metadata_reports_archive_floor(tmp_path):
         encoding="utf-8",
     )
     (logs / "chat.jsonl").write_text("", encoding="utf-8")
+    from ouroboros import dialogue_import
+    assert dialogue_import.run_dialogue_import(tmp_path)["state"] == "done"  # every archive is imported
 
     payload = _run_full(tmp_path, {})
-    assert payload["window"] == {"complete": False, "truncated_by": ["archive_floor"]}
+    assert payload["window"] == {"complete": True, "truncated_by": []}
+    assert payload["has_more"] is False
     texts = [m["text"] for m in payload["messages"]]
-    # The 3 newest archives were backfilled; the oldest stayed beyond the floor.
-    assert "archived-2" in texts and "archived-4" in texts and "live step" in texts
-    assert "archived-1" not in texts
+    assert {"archived-1", "archived-2", "archived-4", "live step"} <= set(texts)
 
 
 def test_window_metadata_reports_lineage_cap(tmp_path):
@@ -818,9 +827,7 @@ def test_terminal_silent_child_older_than_floor_stays_dropped(tmp_path):
     (logs / "progress.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
     results = tmp_path / "task_results"
     results.mkdir()
-    (results / "donechild.json").write_text(
-        json.dumps({"task_id": "donechild", "status": "completed"}), encoding="utf-8",
-    )
+    seed_result(tmp_path, "donechild", {"task_id": "donechild", "status": "completed"})
 
     msgs = _run(tmp_path, {"n_progress": "5"})
     lineage = [m for m in msgs if m.get("delegation_role") == "subagent"]
@@ -867,12 +874,8 @@ def test_stale_child_final_loses_raw_lineage_fields(tmp_path):
     )
     results = tmp_path / "task_results"
     results.mkdir()
-    (results / "root.json").write_text(
-        json.dumps({"task_id": "root", "status": "completed"}), encoding="utf-8",
-    )
-    (results / "child.json").write_text(
-        json.dumps({"task_id": "child", "status": "completed"}), encoding="utf-8",
-    )
+    seed_result(tmp_path, "root", {"task_id": "root", "status": "completed"})
+    seed_result(tmp_path, "child", {"task_id": "child", "status": "completed"})
 
     row = next(m for m in _run(tmp_path, {}) if m.get("task_id") == "child")
     assert row["text"] == "child answer"  # the row itself survives, de-roled
@@ -893,14 +896,12 @@ def test_stale_legacy_child_final_skips_task_result_revival(tmp_path):
     )
     results = tmp_path / "task_results"
     results.mkdir()
-    (results / "root.json").write_text(
-        json.dumps({"task_id": "root", "status": "completed"}), encoding="utf-8",
-    )
-    (results / "child-legacy.json").write_text(json.dumps({
+    seed_result(tmp_path, "root", {"task_id": "root", "status": "completed"})
+    seed_result(tmp_path, "child-legacy", {
         "task_id": "child-legacy", "status": "completed",
         "delegation_role": "subagent", "parent_task_id": "root",
         "root_task_id": "root", "role": "reviewer",
-    }), encoding="utf-8")
+    })
 
     row = next(m for m in _run(tmp_path, {}) if m.get("task_id") == "child-legacy")
     assert not any(field in row for field in SUBAGENT_MESSAGE_FIELDS)
@@ -919,11 +920,11 @@ def test_skill_review_group_never_inherits_legacy_subagent_lineage(tmp_path):
     (logs / "progress.jsonl").write_text("", encoding="utf-8")
     results = tmp_path / "task_results"
     results.mkdir()
-    (results / "child-1.json").write_text(json.dumps({
+    seed_result(tmp_path, "child-1", {
         "task_id": "child-1", "status": "completed",
         "delegation_role": "subagent", "parent_task_id": "root-1",
         "root_task_id": "root-1", "role": "reviewer",
-    }), encoding="utf-8")
+    })
 
     row = next(m for m in _run(tmp_path, {}) if m.get("review_group"))
     assert row["task_id"] == "child-1"
@@ -970,9 +971,7 @@ def test_recent_child_final_keeps_lineage_fields(tmp_path):
     )
     results = tmp_path / "task_results"
     results.mkdir()
-    (results / "child2.json").write_text(
-        json.dumps({"task_id": "child2", "status": "completed"}), encoding="utf-8",
-    )
+    seed_result(tmp_path, "child2", {"task_id": "child2", "status": "completed"})
 
     row = next(m for m in _run(tmp_path, {}) if m.get("task_id") == "child2")
     assert row["delegation_role"] == "subagent"

@@ -6,7 +6,7 @@ live in the per-project store (``data/projects/<id>/``), which generic data
 tools cannot reach (``project_store_access_block``) — these scoped tools are
 the only write path, exactly like project knowledge.
 
-Tools resolve the project from the CURRENT task (``ctx.project_id``); an
+Tools resolve the project from the CURRENT task's durable placement; an
 explicit ``project_id`` argument lets the main-chat agent annotate a specific
 project (e.g. when curating from the штаб).
 """
@@ -17,43 +17,142 @@ import hashlib
 import json
 import logging
 import pathlib
-from typing import Any, Dict, List
+from contextlib import nullcontext
+from typing import Any, Dict, List, Optional, Tuple
 
+from ouroboros.dialogue_provenance import PRESENCE_BINDING_AUTHORITY_KEY, is_presence_task, presence_caller_binding
+from ouroboros.focus import normalize_focus
 from ouroboros.project_facts import (
+    explicit_project_id_ok,
+    placed_project_id,
     project_journal_path,
+    project_reflections_path,
     project_workpad_path,
     sanitize_project_id,
 )
+from ouroboros.project_naming import CONTINUE_TITLE_PREFIX
+from ouroboros.task_carrier import inline_execution
 from ouroboros.tools.registry import ToolContext, ToolEntry
+from ouroboros.tools.tool_result import completed_local_read
 from ouroboros.utils import (
     append_jsonl,
     jsonl_generation_signature,
     utc_now_iso,
+    write_text_atomic,
 )
 
 log = logging.getLogger(__name__)
 
 _JOURNAL_KINDS = ("start", "checkpoint", "blocked", "done", "note")
+# journal_read's closed sources: the milestone journal, or the project's reflection-log
+# rows (historical automatic reflections and host rows, otherwise unreachable: generic
+# file tools refuse the project store).
+_READ_SOURCES = {"journal": project_journal_path, "reflections": project_reflections_path}
 _MAX_TEXT_CHARS = 4000
 _WORKPAD_MAX_BYTES = 256 * 1024
 
 
+def _actor_facts(ctx: ToolContext) -> tuple[Dict[str, Any], Dict[str, Any], bool, str, str]:
+    """``(metadata, task view, is a child, delegation_role, root_task_id)`` as the host admitted this actor."""
+    metadata = getattr(ctx, "task_metadata", {})
+    metadata = metadata if isinstance(metadata, dict) else {}
+    contract = getattr(ctx, "task_contract", {})
+    contract = contract if isinstance(contract, dict) else {}
+    lineage = contract.get("lineage") if isinstance(contract.get("lineage"), dict) else {}
+    task = {"metadata": metadata, "task_contract": contract,
+            "_presence_turn": bool(metadata.get("_presence_turn") or getattr(ctx, "_presence_turn", False)),
+            "_presence_origin": getattr(ctx, "_presence_origin", None)}
+    parent_task_id = str(lineage.get("parent_task_id") or metadata.get("parent_task_id") or "").strip()
+    delegation_role = str(lineage.get("delegation_role") or metadata.get("delegation_role") or "").strip()
+    root_task_id = str(lineage.get("root_task_id") or metadata.get("root_task_id") or "").strip()
+    return metadata, task, bool(parent_task_id) or delegation_role == "subagent", delegation_role, root_task_id
+
+
+def _scope_authority(ctx: ToolContext) -> tuple[str, Dict[str, Any]]:
+    metadata, task, child, delegation_role, root_task_id = _actor_facts(ctx)
+    if is_presence_task(task) or presence_caller_binding(ctx) is not None:  # a speaker, or acting for its binding
+        return "presence", metadata
+    if child:
+        return "child", metadata
+    # Root markers are host admission facts. A drive path or a missing metadata
+    # object is not evidence of root authority: test-shaped fallbacks here used
+    # to let an arbitrary scoped actor read another project's journal.
+    root = bool(getattr(ctx, "is_direct_chat", False)) or delegation_role == "root" or bool(root_task_id)
+    return ("root" if root else "scoped"), metadata
+
+
+def _admitted_continuation(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """The Continue record the host's admission stamped on this root, naming its work; ``{}`` for any other root."""
+    continuation = metadata.get("continuation") if isinstance(metadata.get("continuation"), dict) else {}
+    author = metadata.get("objective_author") if isinstance(metadata.get("objective_author"), dict) else {}
+    admitted = (str(continuation.get("work_id") or "").strip() and isinstance(continuation.get("admission"), dict)
+                and author.get("kind") == "continuation"
+                and author.get("predecessor_task_id") == continuation.get("predecessor_task_id"))
+    return continuation if admitted else {}
+
+
+def _focus_root(ctx: ToolContext) -> pathlib.Path:
+    metadata = getattr(ctx, "task_metadata", {})
+    metadata = metadata if isinstance(metadata, dict) else {}
+    return pathlib.Path(str(metadata.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or getattr(ctx, "drive_root", "")))
+
+
+def _bound_continue_root(ctx: ToolContext) -> bool:
+    """A Continue of a place-bound work, admitted into a Project: it inherits the binding but speaks nowhere and is
+    that Project's own root. Focus-only: its other journal scopes stay those of work acting for a binding."""
+    metadata, task, child, _role, _root = _actor_facts(ctx)
+    return bool(not child and not is_presence_task(task) and isinstance(metadata.get(PRESENCE_BINDING_AUTHORITY_KEY), dict)
+                and _admitted_continuation(metadata) and _bound_project(_focus_root(ctx), str(getattr(ctx, "task_id", "") or "")))
+
+
+def may_publish_focus(ctx: ToolContext) -> bool:
+    """Whether this actor's focus line is its own to publish: an independent root or a bound Continue
+    (``_bound_continue_root``), never a child or a speaker (``_update_focus``'s rule; its one exception, a
+    Project-bound inline speaker, is Presence).
+    The round's facts name an absent line only for such an actor in the pool (a live direct turn answers in chat)."""
+    return _scope_authority(ctx)[0] == "root" or _bound_continue_root(ctx)
+
+
+def _resolve_project_id(ctx: ToolContext, explicit: Any, *, write: bool = False) -> tuple[str, str]:
+    own_value = placed_project_id(ctx)
+    if own_value not in (None, "") and not isinstance(own_value, str):
+        return "", "⚠️ TOOL_ARG_ERROR: current project scope is malformed"
+    if explicit not in (None, "") and not isinstance(explicit, str):
+        return "", "⚠️ TOOL_ARG_ERROR: project_id is malformed"
+    own_raw = str(own_value or "").strip()
+    requested_raw = str(explicit or "").strip()
+    own = sanitize_project_id(own_raw) if own_raw else ""
+    if requested_raw and not explicit_project_id_ok(requested_raw):
+        return "", "⚠️ TOOL_ARG_ERROR: project_id is malformed"
+    requested = sanitize_project_id(requested_raw) if requested_raw else ""
+    authority, _metadata = _scope_authority(ctx)
+    if requested_raw and not requested:
+        return "", "⚠️ TOOL_ARG_ERROR: project_id is malformed"
+    if own_raw and not own:
+        return "", "⚠️ TOOL_ARG_ERROR: current project scope is malformed"
+    # A root reads every project; so does a place turn (owner 06.11, 4=A: it may read project journals and tell
+    # the task that leads its thread), read-only. A child reads only its own; writes stay with the current project.
+    reads_any = authority == "root" or (authority == "presence" and not write)
+    if own and requested and requested != own:
+        if write:
+            return "", "⚠️ TOOL_FORBIDDEN: foreign project writes are refused; write only the current project"
+        if not reads_any:
+            return "", "⚠️ TOOL_FORBIDDEN: this actor may read only its current project"
+        return requested, ""
+    if requested and not own and not reads_any:
+        return "", "⚠️ TOOL_FORBIDDEN: restricted actors may not access a foreign project"
+    return own or requested, ""
+
+
 def _authorized_project_id(ctx: ToolContext, explicit: Any) -> str:
-    """AUTHORIZATION (not membership): which project THIS journal write may touch.
-    Distinct from project_facts.resolve_project_id (task->project MEMBERSHIP): a
-    project-scoped task may only journal into ITS OWN project (no cross-project
-    writes); an explicit id is honored only from an unscoped (main/штаб) context,
-    where curating a specific project is legitimate. Never consults post-hoc UI
-    bindings — only the task's resolved scope (ctx.project_id) + an explicit arg."""
-    own = sanitize_project_id(getattr(ctx, "project_id", "") or "")
-    requested = sanitize_project_id(explicit) if explicit else ""
-    if own:
-        return own
-    return requested
+    """Compatibility resolver for the current scope (read semantics)."""
+    return _resolve_project_id(ctx, explicit, write=False)[0]
 
 
 def _journal_write(ctx: ToolContext, kind: str, text: str, project_id: str = "") -> str:
-    pid = _authorized_project_id(ctx, project_id)
+    pid, scope_error = _resolve_project_id(ctx, project_id, write=True)
+    if scope_error:
+        return scope_error + " (journal_write)"
     if not pid:
         return ("⚠️ TOOL_ARG_ERROR (journal_write): no project scope — this task is not "
                 "project-scoped and no explicit project_id was given.")
@@ -102,7 +201,7 @@ def append_journal_milestone(
     short); an automatic milestone MUST be recorded, so when the composed text
     exceeds ``_MAX_TEXT_CHARS`` it is bounded with a VISIBLE pointer instead of
     being silently sliced or dropped (the full text always survives in the task's
-    task_results and the consciousness digest). Centralizing here keeps every
+    task_results). Centralizing here keeps every
     project-journal append on one bounded path (no raw append_jsonl elsewhere)."""
     pid = sanitize_project_id(project_id)
     if not pid:
@@ -123,7 +222,7 @@ def append_journal_milestone(
         return
     if len(body) > _MAX_TEXT_CHARS:
         keep = _MAX_TEXT_CHARS - 80
-        body = body[:keep] + f"… [+{len(body) - keep} chars; full text in this task's task_results / digest]"
+        body = body[:keep] + f"… [+{len(body) - keep} chars; full text in this task's task_results]"
     path = project_journal_path(pid)
     path.parent.mkdir(parents=True, exist_ok=True)
     append_jsonl(path, {
@@ -226,12 +325,19 @@ def record_task_finalization(
         )
     except Exception:
         log.debug("project journal task-done entry failed", exc_info=True)
-    record_project_last_result(project_id, tid, drive_root)
+    is_root = not str(task.get("parent_task_id") or "").strip() and str(
+        task.get("delegation_role") or "") != "subagent"  # the door's own child predicate
+    if is_root:
+        # The pointer answers "continue from here" for the ROOM, so only a ROOT may
+        # stamp it: a child finalizing after its root moved the room's single
+        # candidate onto work no owner ever addressed - a helper the hint never
+        # offers (the mirror below is root-only for the same reason).
+        record_project_last_result(project_id, tid, drive_root)
     try:
         _record_work_location(project_id, task)
     except Exception:
         log.debug("project journal work-location entry failed", exc_info=True)
-    if not str(task.get("parent_task_id") or "").strip():
+    if is_root:
         try:
             mirror_tree_coordination_to_journal(
                 project_id, str(task.get("root_task_id") or tid), task_id=tid,
@@ -280,11 +386,13 @@ def mirror_tree_coordination_to_journal(project_id: str, root_id: str, task_id: 
         append_journal_milestone(pid, journal_kind, f"[swarm {kind}] ({who}): {text}", task_id=task_id)
 
 
-def _journal_snapshot(source: Dict[str, Any], project_id: str) -> str:
+def _journal_snapshot(source: Dict[str, Any], project_id: str, stream: str = "journal") -> str:
     payload = {
         "schema_version": 1,
         "project_id": project_id,
         "source": source,
+        # A reflections cursor is bound to its stream; a journal cursor keeps its old bytes.
+        **({"stream": stream} if stream != "journal" else {}),
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -293,6 +401,7 @@ def _journal_snapshot(source: Dict[str, Any], project_id: str) -> str:
 def _journal_snapshot_rows(
     path: pathlib.Path,
     project_id: str,
+    stream: str = "journal",
 ) -> tuple[List[Dict[str, Any]], str, bool, int]:
     """Capture one stateless journal generation, retrying one concurrent append."""
     rows: List[Dict[str, Any]] = []
@@ -324,31 +433,40 @@ def _journal_snapshot_rows(
         except OSError:
             unreadable += 1
         after = jsonl_generation_signature(path)
-        snapshot = _journal_snapshot(after, project_id)
+        snapshot = _journal_snapshot(after, project_id, stream)
         if before and before == after:
             return rows, snapshot, True, unreadable
     return rows, snapshot, False, unreadable
 
 
+@completed_local_read
 def _journal_read(
     ctx: ToolContext,
     project_id: str = "",
     limit: int = 30,
     offset: int = 0,
     snapshot: str = "",
+    source: str = "journal",
 ) -> str:
-    pid = _authorized_project_id(ctx, project_id)
+    source = "journal" if source in (None, "") else source  # an empty value asks for the default
+    if not isinstance(source, str) or source not in _READ_SOURCES:
+        return (f"⚠️ TOOL_ARG_ERROR (journal_read): source={source!r} is not one of "
+                f"{sorted(_READ_SOURCES)}; omit it for the journal.")
+    pid, scope_error = _resolve_project_id(ctx, project_id, write=False)
+    if scope_error:
+        return scope_error + " (journal_read)"
     if not pid:
         return ("⚠️ TOOL_ARG_ERROR (journal_read): no project scope — this task is not "
                 "project-scoped and no explicit project_id was given.")
-    path = project_journal_path(pid)
+    path = _READ_SOURCES[source](pid)
     if not path.is_file():
         if str(snapshot or "").strip():
             return (
                 "JOURNAL_READ_SNAPSHOT_CHANGED: the journal source is no longer "
                 "available; no mixed page was returned; restart with offset=0 and no snapshot."
             )
-        return f"(journal for project {pid} is empty)"
+        return f"(journal for project {pid} is empty)" if source == "journal" else (
+            f"(no reflection-log rows for project {pid})")
     try:
         take = max(1, min(int(limit or 30), 200))
     except (TypeError, ValueError):
@@ -357,7 +475,7 @@ def _journal_read(
         skip = max(0, int(offset or 0))
     except (TypeError, ValueError):
         skip = 0
-    rows, current_snapshot, stable, unreadable = _journal_snapshot_rows(path, pid)
+    rows, current_snapshot, stable, unreadable = _journal_snapshot_rows(path, pid, source)
     requested_snapshot = str(snapshot or "").strip().lower()
     if not stable:
         return (
@@ -387,12 +505,17 @@ def _journal_read(
             f"JOURNAL_READ_GAP: coverage is partial; {unreadable} non-empty physical "
             "row(s) were malformed or non-object JSON. Valid rows remain pageable."
         )
+    selector = "" if source == "journal" else f"source='{source}', "
     if remaining:
         lines.append(
             "Next older page: "
-            f"journal_read(project_id='{pid}', limit={take}, "
+            f"journal_read(project_id='{pid}', {selector}limit={take}, "
             f"offset={skip + len(page)}, snapshot='{current_snapshot}')"
         )
+    if source == "reflections":
+        # Whole recorded rows, dated by their own ts: history, not current understanding.
+        lines.extend(json.dumps(row, ensure_ascii=False, sort_keys=True) for row in page)
+        return f"## Project reflection log ({pid})\n\n" + "\n".join(lines)
     for row in page:
         lines.append(
             f"[{str(row.get('ts') or '')[:19]}] {str(row.get('kind') or 'note').upper()}: "
@@ -401,8 +524,11 @@ def _journal_read(
     return f"## Project journal ({pid})\n\n" + "\n".join(lines)
 
 
+@completed_local_read
 def _workpad_read(ctx: ToolContext, project_id: str = "") -> str:
-    pid = _authorized_project_id(ctx, project_id)
+    pid, scope_error = _resolve_project_id(ctx, project_id, write=False)
+    if scope_error:
+        return scope_error + " (workpad_read)"
     if not pid:
         return "⚠️ TOOL_ARG_ERROR (workpad_read): no project scope."
     path = project_workpad_path(pid)
@@ -415,7 +541,9 @@ def _workpad_read(ctx: ToolContext, project_id: str = "") -> str:
 
 
 def _workpad_write(ctx: ToolContext, content: str, project_id: str = "") -> str:
-    pid = _authorized_project_id(ctx, project_id)
+    pid, scope_error = _resolve_project_id(ctx, project_id, write=True)
+    if scope_error:
+        return scope_error + " (workpad_write)"
     if not pid:
         return "⚠️ TOOL_ARG_ERROR (workpad_write): no project scope."
     body = str(content or "")
@@ -425,10 +553,291 @@ def _workpad_write(ctx: ToolContext, content: str, project_id: str = "") -> str:
     path = project_workpad_path(pid)
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        path.write_text(body, encoding="utf-8")
+        # Replace, never truncate in place: a failed write leaves the previous page whole.
+        write_text_atomic(path, body)
     except OSError as exc:
         return f"⚠️ TOOL_ERROR (workpad_write): {exc}"
     return f"OK: workpad[{pid}] written ({len(body)} chars)."
+
+
+_FOCUS_SOURCE_REFUSAL_PREFIXES = (
+    "⚠️", "JOURNAL_READ_SNAPSHOT_CHANGED", "CHAT_HISTORY_SNAPSHOT_CHANGED",
+)
+# A focus points at ONE bounded page of an existing reader; a retained answer is
+# a cognitive artifact, not a mirror of the store. Larger answers are refused
+# with the repair (narrow the page), never clipped.
+_FOCUS_SOURCE_MAX_BYTES = 256 * 1024
+
+
+def _read_focus_source(ctx: ToolContext, source: Dict[str, Any]) -> Tuple[Optional[str], str]:
+    """Answer the focus source_ref through the very reader it names, as the caller.
+
+    Returns ``(text, "")`` when the reader answered, else ``("", reason)``.  The
+    call runs under the caller's own authority (the same scope checks the
+    reader applies to the model), so a focus cannot retain what its author
+    could not read.  A typed refusal or a snapshot mismatch is NOT evidence:
+    the focus is refused instead of pointing at nothing.
+    """
+    reader = str(source.get("reader") or "")
+    args = {key: item for key, item in source.items() if key != "reader"}
+    # The same admission the registry applies to a direct call of that reader:
+    # a task whose contract withholds `journal_read` cannot read it through
+    # update_focus either (and a consciousness Observe level keeps its argument
+    # refusals).  Retention never widens what the caller could dispatch.
+    try:
+        from ouroboros.tools.registry_guards import _capability_resource_guard_result
+
+        guard = _capability_resource_guard_result(ctx, reader, dict(args))
+    except Exception as exc:  # a guard that cannot be consulted is not permission
+        log.debug("focus source guard failed", exc_info=True)
+        return "", f"{reader} admission could not be established ({type(exc).__name__})"
+    if guard is not None:
+        return "", f"{reader} withheld for this task: {str(getattr(guard, 'text', '') or '').splitlines()[0][:160]}"
+    try:
+        if reader == "journal_read":
+            text = _journal_read(ctx, project_id=str(args.get("project_id") or ""),
+                                 offset=int(args.get("offset") or 0), snapshot=str(args.get("snapshot") or ""))
+        elif reader == "workpad_read":
+            text = _workpad_read(ctx, project_id=str(args.get("project_id") or ""))
+        elif reader == "recent_tasks":
+            from ouroboros.tools.recent_tasks import _handle_recent_tasks
+            text = _handle_recent_tasks(ctx, offset=int(args.get("offset") or 0), snapshot=str(args.get("snapshot") or ""))
+        elif reader == "live_roots":
+            from ouroboros.tools.recent_tasks import _handle_live_roots
+            text = _handle_live_roots(ctx, offset=int(args.get("offset") or 0), snapshot=str(args.get("snapshot") or ""))
+        elif reader == "get_task_result":
+            from ouroboros.task_status import load_effective_task_result
+            from ouroboros.task_status import SETTLED_STATUSES
+            from ouroboros.routing_wait import is_emitted_admission_stub
+            from ouroboros.tool_access import canonical_data_root
+            from ouroboros.tools.control_task_results import _get_task_result
+            row = load_effective_task_result(canonical_data_root(ctx), str(args.get("task_id") or ""))
+            if not row or is_emitted_admission_stub(row) or str(row.get("status") or "") not in SETTLED_STATUSES:
+                # The reader's unavailable/pending/running answers are prose
+                # without a typed marker; a task with no settled result is not a
+                # source (its live text is "Task is running.").
+                return "", f"{reader} refused: task {args.get('task_id')} unknown, admission pending or not yet settled"
+            text = _get_task_result(ctx, task_id=str(args.get("task_id") or ""))
+        elif reader == "chat_history":
+            from ouroboros.tools.control_runtime import _chat_history
+            text = _chat_history(ctx, offset=int(args.get("offset") or 0), snapshot=str(args.get("snapshot") or ""))
+        else:
+            return "", f"reader {reader!r} has no resolver"
+    except Exception as exc:  # a reader that raised answered nothing
+        log.debug("focus source read failed", exc_info=True)
+        return "", f"{reader} raised {type(exc).__name__}"
+    body = str(text or "")
+    stripped = body.lstrip()
+    if not stripped:
+        return "", f"{reader} answered nothing"
+    if stripped.startswith(_FOCUS_SOURCE_REFUSAL_PREFIXES):
+        return "", f"{reader} refused: {stripped.splitlines()[0][:160]}"
+    if stripped.startswith("{"):
+        try:
+            payload = json.loads(stripped)
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict) and (payload.get("ok") is False or payload.get("error")):
+            error = payload.get("error")
+            code = error.get("code") if isinstance(error, dict) else payload.get("host_code")
+            return "", f"{reader} refused: {code or 'typed error'}"
+    if len(body.encode("utf-8")) > _FOCUS_SOURCE_MAX_BYTES:
+        return "", (f"{reader} answered {len(body.encode('utf-8'))} bytes, above the {_FOCUS_SOURCE_MAX_BYTES}-byte "
+                    "focus source bound; point the focus at a narrower page (offset/snapshot) or a smaller reader")
+    return body, ""
+
+
+def _retain_focus_source(canonical: pathlib.Path, task_id: str, source: Dict[str, Any], body: str) -> Dict[str, Any]:
+    """Store the reader's exact answer write-once on the canonical root; return the handle.
+
+    The handle is the native ``task_source`` ref minus its ``read`` block: peers
+    resolve it through ``get_task_result(include_focus_source=True)`` against the
+    same canonical root the durable task result lives on, not through the
+    author's own (possibly forked) ``artifact_store``.
+    """
+    from ouroboros.artifacts import store_actor_source_bytes
+
+    ref = store_actor_source_bytes(canonical, task_id, category="context_checkpoints",
+                                   source_id=f"focus_source_{source.get('reader')}",
+                                   data=body.encode("utf-8"), extension="md")
+    return {key: ref[key] for key in ("kind", "root", "path", "size", "sha256")}
+
+
+def _offered_work_name(metadata: Dict[str, Any], work_name: Any, turn: bool) -> Tuple[str, str, str]:
+    """``(work id, cleaned name, "")``, ``("", "", why it is ignored)``, or all empty when none was offered. The work
+    is the one this root's own admission recorded, so no caller can name another."""
+    if not str(work_name or "").strip():
+        return "", "", ""
+    continuation = {} if turn else _admitted_continuation(metadata)
+    if not continuation:
+        return "", "", "only a Continue of existing work names it"
+    from ouroboros.project_naming import continued_work_name
+
+    name = continued_work_name(work_name)
+    return (str(continuation["work_id"]), name, "") if name else ("", "", "it is empty after cleanup")
+
+
+def _bound_project(root: Any, task_id: str) -> str:
+    """This task's own durable Project binding; an unreadable registry binds nothing here."""
+    from ouroboros.projects_registry import project_id_for_task
+
+    try:
+        return project_id_for_task(root, task_id, strict=True)
+    except Exception:
+        log.debug("focus project binding unreadable for %s", task_id, exc_info=True)
+        return ""
+
+
+def _update_focus(ctx: ToolContext, text: str, source_ref: Any, work_name: Any = "") -> str:
+    """Publish one short authored focus onto this live root's existing records."""
+    metadata = getattr(ctx, "task_metadata", {})
+    metadata = metadata if isinstance(metadata, dict) else {}
+    task_contract = getattr(ctx, "task_contract", {})
+    task_contract = task_contract if isinstance(task_contract, dict) else {}
+    task = {"metadata": metadata, "task_contract": task_contract,
+            "_presence_turn": bool(getattr(ctx, "_presence_turn", False)),
+            "_presence_origin": getattr(ctx, "_presence_origin", None)}
+    authority, _ = _scope_authority(ctx)
+    task_id = str(getattr(ctx, "task_id", "") or "").strip()
+    canonical = _focus_root(ctx)
+    # A live inline Presence speaker a move bound to a Project is that Project's work: its focus is
+    # dated context there, never authority, a new principal or speech outside (``presence_turn_is_live``).
+    inline = bool(authority == "presence" and is_presence_task(task) and task_id
+                  and metadata.get("presence_event_identity") and not metadata.get("parent_task_id")
+                  and _bound_project(canonical, task_id))
+    if not inline and (authority != "root" or is_presence_task(task)) and not _bound_continue_root(ctx):
+        return "⚠️ TOOL_FORBIDDEN (update_focus): only an independent project/root task may publish focus"
+    if not task_id:
+        return "⚠️ TOOL_ARG_ERROR (update_focus): task_id is required"
+    # The schema requires only ``reader``; a project reader without an explicit
+    # project_id means the caller's own current project (the handler canonicalizes
+    # what the provider was allowed to omit).
+    if isinstance(source_ref, dict) and str(source_ref.get("reader") or "") in ("journal_read", "workpad_read") \
+            and not str(source_ref.get("project_id") or "").strip():
+        own_project = str(placed_project_id(ctx) or "").strip()
+        if own_project:
+            source_ref = {**source_ref, "project_id": own_project}
+    from ouroboros.presence_runner import presence_turn_is_live
+    from ouroboros.task_results import STATUS_RUNNING, load_task_result, write_task_result
+
+    # The current carrier owns liveness; ``is_direct_chat`` keeps the origin after
+    # continue_in_background hands the same work to the pool. A bound inline Presence
+    # author is live by its own runner, never by the direct registry.
+    direct = inline_execution(ctx) and not inline
+    attempt_owner = metadata.get("_execution_owner")
+
+    def _live(row: Dict[str, Any]) -> bool:
+        """RUNNING and, for a pooled attempt, still the one the row names: a new attempt rebinds it."""
+        recorded = row.get("execution_owner")
+        superseded = (isinstance(attempt_owner, dict) and attempt_owner.get("kind") == "pooled"
+                      and isinstance(recorded, dict) and recorded != attempt_owner)
+        return str(row.get("status") or "") == STATUS_RUNNING and not superseded
+
+    if inline and not presence_turn_is_live(task_id, drive_root=canonical):
+        return "⚠️ FOCUS_TASK_NOT_LIVE (update_focus): the current Presence turn is no longer live"
+    if direct:
+        try:
+            from supervisor.workers import direct_chat_turn
+            if direct_chat_turn(task_id) is None:
+                return "⚠️ FOCUS_TASK_NOT_LIVE (update_focus): the current direct turn is no longer live"
+        except Exception:
+            return "⚠️ FOCUS_TASK_NOT_LIVE (update_focus): the current direct turn is no longer live"
+    else:
+        current = load_task_result(canonical, task_id)
+        if isinstance(current, dict) and not _live(current):
+            return "⚠️ FOCUS_TASK_NOT_LIVE (update_focus): the current task is no longer live"
+    try:
+        focus = normalize_focus(text, source_ref, task_id=task_id)
+    except ValueError as exc:
+        return f"⚠️ TOOL_ARG_ERROR (update_focus): {exc}"
+    # A source_ref is a pointer; the pointer must identify evidence after this
+    # task goes dormant (a workpad or live-root page is rewritten by then).  Read
+    # it now through the named reader and retain the exact answer beside the
+    # focus, so peers read what the author saw rather than what the page says
+    # later.  A source that cannot be read is not a source.
+    body, refusal = _read_focus_source(ctx, focus["source_ref"])
+    if refusal:
+        return f"⚠️ FOCUS_SOURCE_UNRESOLVED (update_focus): {refusal}"
+    try:
+        handle = _retain_focus_source(canonical, task_id, focus["source_ref"], body)
+        focus = normalize_focus(text, source_ref, task_id=task_id,
+                                authored_at=focus["authored_at"], source_handle=handle)
+    except (OSError, ValueError) as exc:
+        log.debug("focus source retention failed", exc_info=True)
+        return f"⚠️ FOCUS_SOURCE_UNRETAINED (update_focus): the source answer could not be retained ({type(exc).__name__})"
+
+    def _project(current: Dict[str, Any], fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not _live(current):
+            return None
+        prior = current.get("focus")
+        if prior:
+            from ouroboros.focus import compact_focus
+            prior_focus = compact_focus(prior)
+            if prior_focus and str(prior_focus.get("authored_at") or "") >= str(focus.get("authored_at") or ""):
+                return None
+        return fields
+
+    work_id, offered, naming_refused = _offered_work_name(metadata, work_name, direct or inline)
+    named = ""
+
+    def _claim_name(txn: Any, _current: Dict[str, Any], document: Dict[str, Any]) -> Dict[str, Any]:
+        """The focus write ``_project`` just accepted for the live attempt and the name land in one transaction."""
+        nonlocal named, naming_refused
+        from ouroboros.project_naming import adopt_continued_work_name
+
+        named, naming_refused = adopt_continued_work_name(txn, work_id, offered)
+        return {**document, "suggested_name": f"{CONTINUE_TITLE_PREFIX}{named[:80]}"} if named else document
+
+    # A direct turn is owned by the live ingress actor rather than the queue.
+    # Hold its existing admission lock across the liveness check and the locked
+    # result write, then require the same actor projection to accept the stamp.
+    lock = getattr(ctx, "owner_message_admission_lock", None) if direct or inline else None
+    guard = lock if lock is not None else nullcontext()
+    try:
+        with guard:
+            if direct:
+                from supervisor.workers import direct_chat_turn, stamp_direct_chat_turn
+                if direct_chat_turn(task_id) is None:
+                    return "⚠️ FOCUS_TASK_NOT_LIVE (update_focus): the current direct turn is no longer live"
+            if inline and not presence_turn_is_live(task_id, drive_root=canonical):
+                return "⚠️ FOCUS_TASK_NOT_LIVE (update_focus): the current Presence turn is no longer live"
+            current = load_task_result(canonical, task_id)
+            if not isinstance(current, dict) or not _live(current):
+                return "⚠️ FOCUS_TASK_NOT_LIVE (update_focus): the current task is no longer live"
+            stored = write_task_result(canonical, task_id, STATUS_RUNNING, focus=focus, _field_projector=_project,
+                                       _last_word=_claim_name if offered else None)
+            if not isinstance(stored, dict) or not _live(stored):
+                return "⚠️ FOCUS_TASK_NOT_LIVE (update_focus): the current task is no longer live"
+            if stored.get("focus") != focus:
+                return "⚠️ FOCUS_STALE (update_focus): a newer focus already exists"
+            if direct:
+                if not stamp_direct_chat_turn(task_id, focus=focus):
+                    return "⚠️ FOCUS_PROJECTION_UNAVAILABLE (update_focus): the direct turn projection rejected the focus"
+    except Exception:
+        log.debug("focus persistence failed", exc_info=True)
+        return "⚠️ TOOL_ERROR (update_focus): live focus could not be persisted"
+    event_queue = getattr(ctx, "event_queue", None)
+    if event_queue is not None:
+        try:
+            event_queue.put_nowait({"type": "task_focus_updated", "task_id": task_id, "focus": focus})
+        except Exception:
+            log.debug("focus projection event failed", exc_info=True)
+            # The durable task-result write succeeded, but the fast projection
+            # notification did not.  Do not claim a fully published update:
+            # callers may retry, while peer_roster independently reconciles
+            # the durable carrier on its next read.
+            return ("⚠️ FOCUS_PROJECTION_UNAVAILABLE (update_focus): focus was stored, "
+                    "but the live projection notification could not be queued")
+        if named:  # the first record's card and this one's, where either is open; a reload reads the records
+            for target, shown in ((work_id, named), (task_id, str(stored.get("suggested_name") or ""))):
+                try:
+                    event_queue.put_nowait({"type": "task_named", "task_id": target, "suggested_name": shown})
+                except Exception:
+                    log.debug("work name event failed for %s", target, exc_info=True)
+    receipt = f"OK: focus[{task_id}] updated (authored_at={focus['authored_at']})."
+    if named:
+        return f"{receipt} Work name set: {named!r}."
+    return f"{receipt} work_name ignored: {naming_refused}." if naming_refused else receipt
 
 
 def journal_tail_digest(project_id: str, *, limit: int = 40) -> str:
@@ -485,6 +894,50 @@ def get_tools() -> List[ToolEntry]:
     }
     return [
         ToolEntry(
+            "update_focus",
+            {
+                "name": "update_focus",
+                "description": (
+                    "Optionally publish one short line about this live root's work, the place for routine "
+                    "progress. Your context facts repeat "
+                    "its dated text as working thought, never an owner directive; revise it when your focus changes. "
+                    "OTHER live roots see it, and the owner reads it under the work's name, while this task is "
+                    "unsettled (waits included), until replaced; "
+                    "after settlement it is history. It is task-scoped, not a project-level record; "
+                    "journal/workpad writes do not publish it and nothing refreshes it. source_ref names a "
+                    "reader whose current answer is retained as evidence."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string", "description": "Short focus text (<=280 chars)."},
+                        "work_name": {"type": "string", "description": (
+                            "Only when your Continue work order says the work has no name yet: a short name of its "
+                            "subject that stays across Continues, never its status. The answer says if it was taken.")},
+                        "source_ref": {
+                            "type": "object",
+                            "description": "Reference to an existing bounded reader; this carries no content or path.",
+                            "properties": {
+                                "reader": {"type": "string", "enum": [
+                                    "journal_read", "workpad_read", "recent_tasks",
+                                    "get_task_result", "chat_history", "live_roots",
+                                ]},
+                                "project_id": {"type": "string"},
+                                "task_id": {"type": "string"},
+                                "offset": {"type": "integer", "minimum": 0},
+                                "snapshot": {"type": "string"},
+                            },
+                            "required": ["reader"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "required": ["text", "source_ref"],
+                },
+            },
+            lambda ctx, text, source_ref, work_name="": _update_focus(ctx, text, source_ref, work_name),
+            timeout_sec=15,
+        ),
+        ToolEntry(
             "journal_write",
             {
                 "name": "journal_write",
@@ -511,10 +964,20 @@ def get_tools() -> List[ToolEntry]:
             "journal_read",
             {
                 "name": "journal_read",
-                "description": "Read the tail of the current project's journal (newest last).",
+                "description": (
+                    "Read the tail of the current project's journal (newest last). source='reflections' "
+                    "pages the project's reflection log instead: dated rows earlier versions' automatic "
+                    "post-task reviews wrote, and late review settlements, each whole."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "source": {
+                            "type": "string",
+                            "enum": sorted(_READ_SOURCES),
+                            "default": "journal",
+                            "description": "journal (default) or reflections.",
+                        },
                         "limit": {"type": "integer", "default": 30, "description": "Max entries (<=200)."},
                         "offset": {
                             "type": "integer",
@@ -530,8 +993,8 @@ def get_tools() -> List[ToolEntry]:
                     },
                 },
             },
-            lambda ctx, limit=30, offset=0, snapshot="", project_id="": _journal_read(
-                ctx, project_id, limit, offset, snapshot,
+            lambda ctx, limit=30, offset=0, snapshot="", project_id="", source="journal": _journal_read(
+                ctx, project_id, limit, offset, snapshot, source,
             ),
             timeout_sec=15,
         ),

@@ -1,7 +1,7 @@
 """CPL4-C10 pins: per-skill owner-state files are ABI-2-stamped on write.
 
 review.json / enabled.json / grants.json / review_job.json /
-owner_attestation.json / accepted_rebuttals.json all land with
+owner_attestation.json all land with
 ``_schema_version: 1``; readers keep legacy-0 tolerance (an unstamped
 pre-upgrade file parses exactly as before and is never rewritten on read).
 """
@@ -82,30 +82,14 @@ def test_review_job_writes_route_through_the_stamped_seam(tmp_path):
     assert _read(runner.review_job_state_path(tmp_path, "s")) == merged
     # Whole writers keep the stamped seam, the merge stamps before its locked write.
     src = inspect.getsource(runner)
-    assert src.count("_write_review_job(") >= 5  # def + four whole writers
-    merge = inspect.getsource(runner._patch_review_job)
-    assert "update_json_locked(" in merge and "with_schema_version(" in merge
+    assert src.count("_write_review_job(") >= 2  # def + the start's whole write (under the lifecycle lock)
+    # The heartbeat and the lifecycle's stale/timeout/finish writers are locked, stamped merges,
+    # so a seat's pre-POST invocation checkpoint that landed meanwhile survives them.
+    for merger in (runner._patch_review_job, runner.mark_stale_review_job_interrupted,
+                   runner._mark_review_job_timeout, runner._on_finished):
+        merge = inspect.getsource(merger)
+        assert "update_json_locked(" in merge and "with_schema_version(" in merge, merger.__name__
     assert "atomic_write_json(review_job_state_path" not in src
-
-
-def test_accepted_rebuttals_stamped_and_legacy_tolerant(tmp_path):
-    from ouroboros.skill_review_cycles import (
-        accepted_rebuttals_path,
-        load_accepted_rebuttals,
-        record_accepted_rebuttal,
-    )
-
-    record_accepted_rebuttal(
-        tmp_path, "s", item="I1", rebuttal_text="because", content_hash="h1",
-    )
-    on_disk = _read(accepted_rebuttals_path(tmp_path, "s"))
-    assert on_disk[SCHEMA_VERSION_KEY] == SKILL_OWNER_STATE_SCHEMA_VERSION
-    assert [entry["item"] for entry in load_accepted_rebuttals(tmp_path, "s")] == ["I1"]
-
-    legacy = accepted_rebuttals_path(tmp_path, "legacy")
-    legacy.parent.mkdir(parents=True, exist_ok=True)
-    legacy.write_text(json.dumps({"items": [{"item": "L"}]}), encoding="utf-8")
-    assert [entry["item"] for entry in load_accepted_rebuttals(tmp_path, "legacy")] == ["L"]
 
 
 def test_owner_attestation_marker_is_stamped(tmp_path):

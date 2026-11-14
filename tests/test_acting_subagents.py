@@ -14,14 +14,15 @@ from ouroboros.contracts.task_constraint import (
     normalize_task_constraint,
 )
 from ouroboros.tool_access import active_tool_profile
-from ouroboros.tool_capabilities import ACTING_SUBAGENT_MODE, ACTING_SUBAGENT_TOOL_NAMES
+from ouroboros.tool_capabilities import ACTING_SUBAGENT_MODE, ACTING_SUBAGENT_TOOL_NAMES, META_TOOL_NAMES
 from ouroboros.runtime_mode_policy import mode_allows_protected_write
 from ouroboros.tools.registry import ToolContext, ToolRegistry
 from ouroboros import subagent_worktrees as sw
+from tests._store_shared import read_result, seed_result
 
 
-def _git(repo, *args, check=True):
-    return subprocess.run(["git", *args], cwd=str(repo), capture_output=True, text=True, check=check)
+def _git(repo, *args, check=True, text=True):
+    return subprocess.run(["git", *args], cwd=str(repo), capture_output=True, text=text, check=check)
 
 
 def _init_repo(path: pathlib.Path, files: dict) -> str:
@@ -274,7 +275,8 @@ def test_shrink_guard_covers_redundant_root_prefix(tmp_path, monkeypatch):
 def test_acting_tool_visibility_is_acting_set(tmp_path):
     reg, _ctx, _wt = _acting_registry(tmp_path)
     names = set(reg.initial_tool_names())
-    assert names == set(ACTING_SUBAGENT_TOOL_NAMES)
+    # The schema selectors ride every role (#1860): they load schemas and grant nothing.
+    assert names == set(ACTING_SUBAGENT_TOOL_NAMES) | META_TOOL_NAMES
     assert "commit_reviewed" not in names
     assert "integrate_subagent_patch" in names
 
@@ -303,19 +305,26 @@ def test_worktree_root_isolation_guard(tmp_path):
 
 
 def test_worktree_prune_guards_outside_root(tmp_path):
-    # A corrupt registry entry pointing OUTSIDE the worktree root must never cause deletion.
+    # A record pointing OUTSIDE the worktree root (corrupt, or left by a root that moved) must
+    # never cause deletion, even once its task is proven over. Nor is it forgotten (#1239): the
+    # record stays with a removal stamp, and the next pass of this process does not retry it.
+    from ouroboros.task_results import write_task_result
     repo = tmp_path / "repo"
     _init_repo(repo, {"a.txt": "hi\n"})
     data = tmp_path / "data"; data.mkdir()
     wtroot = tmp_path / "wtroot"
     outside = tmp_path / "precious"; outside.mkdir()
     (outside / "keep.txt").write_text("x", encoding="utf-8")
-    sw._save_registry(
-        [{"task_id": "evil", "path": str(outside), "branch": "", "repo_dir": str(repo), "created_at": 0.0}],
-        data_dir=data,
-    )
-    sw.prune_orphans(worktree_root=wtroot, data_dir=data, retention_days=0)
+    sw._put_record({"task_id": "evil", "path": str(outside), "branch": "", "repo_dir": str(repo),
+                    "created_at": 0.0}, data_dir=data)
+    write_task_result(data, "evil", "completed")
+    report = sw.prune_orphans(worktree_root=wtroot, data_dir=data, retention_days=0, live=lambda _task: False)
     assert outside.exists() and (outside / "keep.txt").exists()  # guard prevented deletion
+    assert report == {"removed": 0, "kept": 1}
+    (row,) = sw.list_worktrees(data_dir=data)
+    assert row["path"] == str(outside) and row.get("removal_failed")
+    assert sw.prune_orphans(worktree_root=wtroot, data_dir=data, retention_days=0,
+                            live=lambda _task: False) == {"removed": 0, "kept": 1}
 
 
 def test_worktree_prune_missing(tmp_path):
@@ -325,8 +334,13 @@ def test_worktree_prune_missing(tmp_path):
     wtroot = tmp_path / "wtroot"
     h = sw.provision_worktree(repo_dir=repo, task_id="t2", worktree_root=wtroot, data_dir=data)
     import shutil
+    from ouroboros.task_results import write_task_result
     shutil.rmtree(h.path)
-    res = sw.prune_orphans(worktree_root=wtroot, data_dir=data, retention_days=9999)
+    # A missing checkout is forgotten only once its task is proven over (C10: terminal row, negative probe).
+    kept = sw.prune_orphans(worktree_root=wtroot, data_dir=data, retention_days=9999, live=lambda _task: True)
+    assert kept["removed"] == 0 and kept["kept"] == 1
+    write_task_result(data, "t2", "completed")
+    res = sw.prune_orphans(worktree_root=wtroot, data_dir=data, retention_days=9999, live=lambda _task: False)
     assert res["removed"] == 1 and res["kept"] == 0
 
 
@@ -417,12 +431,11 @@ def test_reject_cleans_up_provisioned_worktree(tmp_path, monkeypatch):
 def _make_child_patch(target_repo: pathlib.Path, drive: pathlib.Path, child_id: str, rel: str, new_content: str, parent_task_id: str = "parent1", surface: str = ""):
     """Produce a real workspace.patch + manifest + lineage task_result for ``rel``."""
     from ouroboros.artifacts import task_artifact_dir_path
-    from ouroboros.task_results import task_result_path
     from hashlib import sha256
     (target_repo / rel).parent.mkdir(parents=True, exist_ok=True)
     original = (target_repo / rel).read_text(encoding="utf-8") if (target_repo / rel).exists() else ""
     (target_repo / rel).write_text(new_content, encoding="utf-8")
-    patch = _git(target_repo, "diff", "--binary", "HEAD", "--").stdout
+    patch = _git(target_repo, "diff", "--binary", "HEAD", "--", text=False).stdout
     # revert working tree so the patch can be applied fresh by the tool
     _git(target_repo, "checkout", "--", rel) if original else (target_repo / rel).unlink()
     art = task_artifact_dir_path(drive, child_id, create=True)
@@ -430,7 +443,7 @@ def _make_child_patch(target_repo: pathlib.Path, drive: pathlib.Path, child_id: 
     # hash. write_text() would translate "\n" -> "\r\n" on Windows, so the file's
     # sha256 (read back as bytes by the integrate tool) would diverge from the
     # manifest digest and trip INTEGRATE_PATCH_CORRUPT. Binary write keeps parity.
-    patch_bytes = patch.encode("utf-8")
+    patch_bytes = patch
     (art / "workspace.patch").write_bytes(patch_bytes)
     digest = sha256(patch_bytes).hexdigest()
     manifest = {
@@ -440,8 +453,6 @@ def _make_child_patch(target_repo: pathlib.Path, drive: pathlib.Path, child_id: 
         "diffstat": f"{rel} | 1 +",
     }
     (art / "workspace_patch.json").write_text(json.dumps(manifest), encoding="utf-8")
-    tr = task_result_path(drive, child_id)
-    tr.parent.mkdir(parents=True, exist_ok=True)
     result = {
         "_schema_version": 1,
         "id": child_id,
@@ -453,21 +464,20 @@ def _make_child_patch(target_repo: pathlib.Path, drive: pathlib.Path, child_id: 
     }
     if surface:
         result["task_constraint"] = {"mode": "acting_subagent", "surface": surface}
-    tr.write_text(json.dumps(result), encoding="utf-8")
+    seed_result(drive, child_id, result)
     return art
 
 
 def _make_child_delete_patch(target_repo: pathlib.Path, drive: pathlib.Path, child_id: str, rel: str, parent_task_id: str = "parent1", surface: str = ""):
     """Produce a real workspace.patch that deletes ``rel``."""
     from ouroboros.artifacts import task_artifact_dir_path
-    from ouroboros.task_results import task_result_path
     from hashlib import sha256
 
     (target_repo / rel).unlink()
-    patch = _git(target_repo, "diff", "--binary", "HEAD", "--").stdout
+    patch = _git(target_repo, "diff", "--binary", "HEAD", "--", text=False).stdout
     _git(target_repo, "checkout", "--", rel)
     art = task_artifact_dir_path(drive, child_id, create=True)
-    patch_bytes = patch.encode("utf-8")
+    patch_bytes = patch
     (art / "workspace.patch").write_bytes(patch_bytes)
     digest = sha256(patch_bytes).hexdigest()
     manifest = {
@@ -480,8 +490,6 @@ def _make_child_delete_patch(target_repo: pathlib.Path, drive: pathlib.Path, chi
         "diffstat": f"{rel} | 1 -",
     }
     (art / "workspace_patch.json").write_text(json.dumps(manifest), encoding="utf-8")
-    tr = task_result_path(drive, child_id)
-    tr.parent.mkdir(parents=True, exist_ok=True)
     result = {
         "_schema_version": 1,
         "id": child_id,
@@ -493,18 +501,16 @@ def _make_child_delete_patch(target_repo: pathlib.Path, drive: pathlib.Path, chi
     }
     if surface:
         result["task_constraint"] = {"mode": "acting_subagent", "surface": surface}
-    tr.write_text(json.dumps(result), encoding="utf-8")
+    seed_result(drive, child_id, result)
     return art
 
 
 def _record_child_workspace_root(drive: pathlib.Path, child_id: str, workspace: pathlib.Path) -> None:
-    from ouroboros.task_results import task_result_path
 
-    child_result_path = task_result_path(drive, child_id)
-    child_result = json.loads(child_result_path.read_text(encoding="utf-8"))
+    child_result = read_result(drive, child_id)
     child_result["workspace_root"] = str(workspace)
     child_result.setdefault("task_constraint", {})["write_root"] = str(workspace)
-    child_result_path.write_text(json.dumps(child_result), encoding="utf-8")
+    seed_result(drive, child_id, child_result)
 
 
 def _integrate_ctx(target_repo, drive, **constraint_kw):
@@ -595,16 +601,33 @@ def test_integrate_reject_records_verdict(tmp_path):
     assert child.get("child_result_disposition") == "irrelevant"
 
 
-def test_integrate_protected_blocked_in_advanced(tmp_path, monkeypatch):
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+@pytest.mark.parametrize(("mode", "caller"), [
+    ("advanced", "parent"), ("advanced", "acting"), ("pro", "acting"), ("cyber_pro", "acting"), ("pro", "granted"),
+])
+def test_integrate_protected_refusal_names_its_actual_cause(tmp_path, monkeypatch, mode, caller):
+    """The gate stays: mode allowing protected writes AND an acting caller's own protected_paths_grant.
+    #2734: a missing grant is named as the integrating task's own, never as a mode to switch to, and the
+    captured result stays for its parent; a mode refusal keeps the policy's advice."""
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", mode)
     from ouroboros.tools.subagent_integration import _integrate_subagent_patch
     repo = tmp_path / "repo"
     _init_repo(repo, {"ouroboros/safety.py": "X = 1\n"})
     drive = tmp_path / "data"; drive.mkdir()
     _make_child_patch(repo, drive, "child3", "ouroboros/safety.py", "X = 2\n")
-    ctx = _integrate_ctx(repo, drive)
-    out = _integrate_subagent_patch(ctx, task_id="child3")
-    assert "protected" in out.lower() or "PROTECTED" in out
+    acting = {} if caller == "parent" else {"mode": ACTING_SUBAGENT_MODE, "surface": "self_worktree",
+                                            "protected_paths_grant": caller == "granted"}
+    out = _integrate_subagent_patch(_integrate_ctx(repo, drive, **acting), task_id="child3")
+    if caller == "granted":
+        assert "Integrated subagent patch" in out, out
+        assert (repo / "ouroboros/safety.py").read_text(encoding="utf-8") == "X = 2\n"
+        return
+    assert out.startswith("⚠️ CORE_PROTECTION_BLOCKED") and "ouroboros/safety.py" in out, out
+    assert ("protected_paths_grant" in out) == (caller == "acting"), out
+    assert ("Switch to runtime_mode" in out) == (caller == "parent"), out
+    if caller == "acting":
+        assert f"runtime_mode={mode!r}" in out and "kept unapplied" in out and "your parent" in out, out
+    from ouroboros.task_status import load_effective_task_result
+    assert not load_effective_task_result(drive, "child3").get("child_result_disposition")  # the result stays
     assert (repo / "ouroboros/safety.py").read_text(encoding="utf-8") == "X = 1\n"  # unchanged
 
 
@@ -632,8 +655,8 @@ def test_mode_allows_protected_write_matrix():
 def test_acting_schemas_subset_of_acting_set(tmp_path):
     reg, _ctx, _wt = _acting_registry(tmp_path, grants=("mcp_foo",))
     names = {s["function"]["name"] for s in reg.schemas()}
-    # No first-party tool outside the acting set; ungranted ext/MCP never leak.
-    assert names <= set(ACTING_SUBAGENT_TOOL_NAMES)
+    # No first-party tool outside the acting set and its selectors; ungranted ext/MCP never leak.
+    assert names <= set(ACTING_SUBAGENT_TOOL_NAMES) | META_TOOL_NAMES
     assert reg._acting_tool_grants() == {"mcp_foo"}
 
 
@@ -777,29 +800,30 @@ def test_integrate_external_workspace_rejects_existing_but_mismatched_files(tmp_
     assert verdict["applied"] is False
 
 
-def test_integrate_external_workspace_requires_parent_active_workspace(tmp_path):
+def test_integrate_external_workspace_verifies_without_parent_active_workspace(tmp_path, monkeypatch):
     from ouroboros.tools.subagent_integration import _integrate_subagent_patch
 
     system_repo = tmp_path / "system"
     _init_repo(system_repo, {"README.md": "system\n"})
     workspace = tmp_path / "project"
     _init_repo(workspace, {"a.txt": "hi\n"})
-    drive = tmp_path / "data"; drive.mkdir()
+    drive = tmp_path / "state"; drive.mkdir()
     _make_child_patch(workspace, drive, "ext-project", "a.txt", "hi\nexternal\n", parent_task_id="parent-ext", surface="external_workspace")
     (workspace / "a.txt").write_text("hi\nexternal\n", encoding="utf-8")
     _record_child_workspace_root(drive, "ext-project", workspace)
     ctx = ToolContext(repo_dir=system_repo, drive_root=drive, task_id="parent-ext")
 
+    monkeypatch.setattr("ouroboros.tool_access._user_files_root", lambda: tmp_path)
     out = _integrate_subagent_patch(ctx, task_id="ext-project")
 
-    assert "INTEGRATE_EXTERNAL_WORKSPACE_PARENT_MISSING" in out
+    assert "Verified external_workspace child" in out, out
     verdict = json.loads((drive / "task_results" / "artifacts" / "parent-ext" / "subagent_patch_verdict_ext-project.json").read_text(encoding="utf-8"))
-    assert verdict["outcome"] == "shared_workspace_parent_missing"
-    assert verdict["target_root"] == str(system_repo.resolve(strict=False))
+    assert verdict["outcome"] == "verified_shared_workspace"
+    assert verdict["target_root"] == str(workspace.resolve(strict=False))
     assert (workspace / "a.txt").read_text(encoding="utf-8") == "hi\nexternal\n"
 
 
-def test_integrate_external_workspace_rejects_child_root_outside_parent_workspace(tmp_path):
+def test_integrate_external_workspace_verifies_assigned_child_root_outside_parent_workspace(tmp_path):
     from ouroboros.tools.subagent_integration import _integrate_subagent_patch
 
     system_repo = tmp_path / "system"
@@ -822,11 +846,11 @@ def test_integrate_external_workspace_rejects_child_root_outside_parent_workspac
 
     out = _integrate_subagent_patch(ctx, task_id="ext-other")
 
-    assert "INTEGRATE_EXTERNAL_WORKSPACE_TARGET_MISMATCH" in out
+    assert "Verified external_workspace child" in out, out
     assert (parent_workspace / "a.txt").read_text(encoding="utf-8") == "parent\n"
     verdict = json.loads((drive / "task_results" / "artifacts" / "parent-ext" / "subagent_patch_verdict_ext-other.json").read_text(encoding="utf-8"))
-    assert verdict["outcome"] == "shared_workspace_target_mismatch"
-    assert verdict["target_root"] == str(parent_workspace.resolve(strict=False))
+    assert verdict["outcome"] == "verified_shared_workspace"
+    assert verdict["target_root"] == str(child_workspace.resolve(strict=False))
 
 
 def test_integrate_external_workspace_verifies_deletions(tmp_path):
@@ -1163,14 +1187,14 @@ def test_acting_structured_write_stays_inside_its_selected_surface(tmp_path):
     assert not (wt.parent / "outside.txt").exists()
 
 
-def test_acting_read_schema_excludes_system_repo(tmp_path):
+def test_acting_read_schema_includes_parent_read_roots(tmp_path):
     reg, _ctx, _wt = _acting_registry(tmp_path)
     schemas = {s["function"]["name"]: s["function"] for s in reg.schemas()}
     rf = schemas.get("read_file")
     if rf:
         root_enum = rf["parameters"]["properties"].get("root", {}).get("enum")
         if isinstance(root_enum, list):
-            assert "system_repo" not in root_enum  # matches acting _POLICY (no system_repo)
+            assert {"system_repo", "user_files", "deliverables", "subagent_projects"} <= set(root_enum)
 
 
 def test_integrate_counts_as_reviewable_effect():
@@ -1287,8 +1311,8 @@ def test_no_workspace_acting_integrate_blocked(tmp_path):
     assert "ACTING_NO_WORKSPACE_BLOCKED" in reg.execute("integrate_subagent_patch", {"task_id": "x"})
 
 
-def test_acting_subagent_cannot_read_secrets(tmp_path):
-    # Acting children may write their surface but must NOT read owner secrets.
+def test_acting_subagent_reads_parent_visible_settings(tmp_path):
+    # Read reach follows the parent; the independent write surface is unchanged.
     from ouroboros.tools.core import _data_read
     repo = tmp_path / "repo"; repo.mkdir()
     drive = tmp_path / "data"; drive.mkdir()
@@ -1298,19 +1322,20 @@ def test_acting_subagent_cannot_read_secrets(tmp_path):
         task_constraint=TaskConstraint(mode="acting_subagent", surface="self_worktree", write_root=str(tmp_path / "wt")),
     )
     out = _data_read(ctx, "settings.json")
-    assert "DATA_READ_BLOCKED" in out and "sk-secret-xyz" not in out
+    assert "sk-secret-xyz" in out and "DATA_READ_BLOCKED" not in out
 
 
 def test_acting_subagent_keeps_workspace_access(tmp_path):
-    # The strict-readonly resource block must NOT restrict acting children's worktree.
-    from ouroboros.tools.core import _local_readonly_resource_block
+    from ouroboros.tools.core import _read_file
     repo = tmp_path / "repo"; repo.mkdir()
     drive = tmp_path / "data"; drive.mkdir()
+    work = tmp_path / "wt"; work.mkdir()
+    (work / "f.txt").write_text("child source", encoding="utf-8")
     ctx = ToolContext(
-        repo_dir=repo, drive_root=drive,
-        task_constraint=TaskConstraint(mode="acting_subagent", surface="self_worktree", write_root=str(tmp_path / "wt")),
+        repo_dir=repo, drive_root=drive, workspace_root=work, workspace_mode="external",
+        task_constraint=TaskConstraint(mode="acting_subagent", surface="self_worktree", write_root=str(work)),
     )
-    assert _local_readonly_resource_block(ctx, "active_workspace", tmp_path / "wt" / "f.txt", tmp_path / "wt", action="write") == ""
+    assert "child source" in _read_file(ctx, "f.txt")
 
 
 # 14. v6.21.0: genesis surface, compare helper, unified GC retention
@@ -1337,8 +1362,8 @@ def test_provision_genesis_project_is_durable_and_isolated(tmp_path):
     assert pathlib.Path(h.path).exists() and (pathlib.Path(h.path) / ".git").exists()
     assert h.base_sha  # seed commit exists
     assert sw._is_within(pathlib.Path(h.path), proot)
-    # NOT added to the worktree registry (durable, not GC-tracked).
-    assert all(e.get("path") != h.path for e in sw._load_registry(data))
+    # NOT given a copy record (durable, not GC-tracked).
+    assert all(e.get("path") != h.path for e in sw._records(data))
     # remove only inside projects root; refuses arbitrary paths.
     assert sw.remove_genesis_project(str(tmp_path / "elsewhere")) is False
     assert sw.remove_genesis_project(h.path, projects_root=proot) is True
@@ -1526,8 +1551,8 @@ def test_schedule_subagent_publishes_the_depth_request_and_the_handler_accepts_i
     assert row["default"] == 0
     # Absolute from the root, and telemetry rather than a cap: both semantics
     # have to be readable by the model that fills the field in.
-    assert "ABSOLUTELY FROM THE ROOT" in row["description"]
-    assert "never widens or narrows" in row["description"]
+    assert "absolute nesting depth from root=0" in row["description"]
+    assert "never changes configured caps" in row["description"]
     # The handler's closed keyword set DERIVES from the same schema.
     assert "requested_depth" in control.schedule_subagent_param_names()
     assert "requested_depth" not in control.HIDDEN_LEGACY_SCHEDULE_PARAMS

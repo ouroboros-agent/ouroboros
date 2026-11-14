@@ -90,17 +90,17 @@ def test_enable_tools_does_not_duplicate_active_tool_schemas():
     core_result = registry.execute("enable_tools", {"tools": "preflight_review"})
     names_after_core = [schema["function"]["name"] for schema in tool_schemas]
     assert names_after_core.count("preflight_review") == 1
-    assert "already active" in core_result
+    assert "Already loaded: preflight_review" in core_result
 
     extra_result = registry.execute("enable_tools", {"tools": "plan_task"})
     names_after_extra = [schema["function"]["name"] for schema in tool_schemas]
     assert names_after_extra.count("plan_task") == 1
-    assert "already active" in extra_result
+    assert "Already loaded: plan_task" in extra_result
 
     extra_again_result = registry.execute("enable_tools", {"tools": "plan_task"})
     names_after_extra_again = [schema["function"]["name"] for schema in tool_schemas]
     assert names_after_extra_again.count("plan_task") == 1
-    assert "already active" in extra_again_result
+    assert "Already loaded: plan_task" in extra_again_result
 
 
 def test_nano_initial_view_uses_compact_schema_selection():
@@ -115,18 +115,30 @@ def test_nano_initial_view_uses_compact_schema_selection():
     assert len(nano_names) < len(max_names)
 
 
-def test_list_available_tools_hides_enabled_extra_tools():
+def test_list_available_tools_lists_names_when_everything_is_resident():
+    """#1262: residency is an attribute of a row, never the answer. A Max task
+    whose whole catalog is loaded still gets the callable names back."""
     registry = _build_registry()
     tool_schemas = initial_tool_schemas(registry)
     messages = []
     loop_mod._setup_dynamic_tools(registry, tool_schemas, messages)
 
     before = registry.execute("list_available_tools", {})
-    assert "All tools are already" in before
+    assert "All tools are already" not in before
+    assert "- builtin:" in before and "Built-in, loaded:" in before
+    assert "plan_task" in before and "read_file" in before
+    assert "not loaded" not in before.split("Namespaces")[1]
 
-    registry.execute("enable_tools", {"tools": "plan_task"})
-    after = registry.execute("list_available_tools", {})
-    assert "All tools are already" in after
+    # A schema dropped from the resident list is listed as not loaded (with its
+    # purpose once the namespace is selected); enabling it makes it resident
+    # again without duplicating it.
+    tool_schemas[:] = [s for s in tool_schemas if s["function"]["name"] != "plan_task"]
+    assert "Built-in, not loaded: plan_task" in registry.execute("list_available_tools", {})
+    assert "- plan_task [not loaded]: " in registry.execute("list_available_tools", {"namespace": "builtin"})
+    assert "Call schemas loaded" in registry.execute("enable_tools", {"tools": "plan_task"})
+    after = registry.execute("list_available_tools", {"namespace": "builtin"})
+    assert "- plan_task [loaded]" in after
+    assert [s["function"]["name"] for s in tool_schemas].count("plan_task") == 1
 
 
 def test_live_extension_tools_are_initial_not_non_core(monkeypatch):

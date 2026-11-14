@@ -23,6 +23,7 @@ def test_update_state_is_exported_and_atomic(tmp_path):
     from supervisor import state
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     (tmp_path / "state").mkdir(parents=True, exist_ok=True)
     (tmp_path / "locks").mkdir(parents=True, exist_ok=True)
 
@@ -71,7 +72,7 @@ def test_dispatch_event_logs_unknown_event(tmp_path, caplog):
 # ───────────────────────── #32: stale temp sweep ─────────────────────────────
 
 def test_sweep_stale_temp_files(tmp_path):
-    from ouroboros.utils import sweep_stale_temp_files
+    from ouroboros.temp_sweep import sweep_stale_temp_files
 
     sub = tmp_path / "state"
     sub.mkdir()
@@ -105,7 +106,7 @@ def test_sweep_covers_the_tmp_scripts_fallback(tmp_path):
     """CPL4-C20: hard-kill orphans in the data-root tmp_scripts fallback are
     swept; young scripts, foreign names, and task-drive copies (owned by the
     drive prune) are not."""
-    from ouroboros.utils import sweep_stale_temp_files
+    from ouroboros.temp_sweep import sweep_stale_temp_files
 
     fallback = tmp_path / "tmp_scripts"
     fallback.mkdir()

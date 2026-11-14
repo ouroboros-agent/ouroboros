@@ -68,40 +68,38 @@ def test_process_code_specs_adapter_and_legacy_residuals_are_total():
     ).code == "LEGACY_BLOCKED"
 
 
-@pytest.mark.parametrize(
-    ("code", "loop_status"),
-    [(code, contract[1]) for code, contract in _CODE_CONTRACTS.items()],
-)
-def test_process_codes_preserve_loop_error_and_policy_denial(code, loop_status):
-    text = f"⚠️ {code}: fixture denial."
-    is_error = _is_tool_execution_failure(True, text)
-    meta = _extract_result_metadata("run_command", text, is_error)
-    buckets = _classify_tool_errors(
-        {
-            "tool_calls": [
+def test_process_codes_preserve_loop_error_and_policy_denial(subtests):
+    for code, loop_status in [(code, contract[1]) for code, contract in _CODE_CONTRACTS.items()]:
+        with subtests.test(code=code, loop_status=loop_status):
+            text = f"⚠️ {code}: fixture denial."
+            is_error = _is_tool_execution_failure(True, text)
+            meta = _extract_result_metadata("run_command", text, is_error)
+            buckets = _classify_tool_errors(
+                {
+                    "tool_calls": [
+                        {
+                            "tool": "run_command",
+                            "args": {"cmd": ["fixture"]},
+                            "result": text,
+                            "is_error": is_error,
+                            "status": meta["status"],
+                        }
+                    ]
+                }
+            )
+
+            assert is_error is True
+            assert meta["status"] == loop_status
+            assert buckets["unresolved"] == []
+            assert buckets["policy_denials"] == [
                 {
                     "tool": "run_command",
-                    "args": {"cmd": ["fixture"]},
+                    "status": loop_status,
+                    "exit_code": None,
+                    "signal": None,
                     "result": text,
-                    "is_error": is_error,
-                    "status": meta["status"],
                 }
             ]
-        }
-    )
-
-    assert is_error is True
-    assert meta["status"] == loop_status
-    assert buckets["unresolved"] == []
-    assert buckets["policy_denials"] == [
-        {
-            "tool": "run_command",
-            "status": loop_status,
-            "exit_code": None,
-            "signal": None,
-            "result": text,
-        }
-    ]
 
 
 @pytest.mark.parametrize(
@@ -212,7 +210,7 @@ def test_subagent_process_uses_one_configured_supervisor_decision(tmp_path, monk
         {"cmd": ["cat", str(data / "settings.json")]},
     )
 
-    assert (result.status, result.code) == (("ok", "OK") if allowed else ("blocked", "SAFETY_VIOLATION"))
+    assert (result.status, result.code) == (("ok", "OK") if allowed else ("blocked", "SAFETY_RETURNED"))
     assert calls == {"safety": 1, "handler": int(allowed)}
 
 
@@ -287,7 +285,7 @@ def test_both_git_receiver_branches_preserve_exact_text_and_stable_code(
         text=(
             "⚠️ GIT_VIA_SHELL_BLOCKED: `git commit` is blocked for acting self_worktree "
             "children (no commits; the parent integrates the returned patch and is the sole "
-            "committer). For read-only git: vcs_status, vcs_diff tools, or run_command with "
+            "committer). For read-only git: vcs_read tool, or run_command with "
             "git log/show/diff/status/rev-list/show-ref/for-each-ref/listing branch-tag forms."
         ),
     )
@@ -313,7 +311,7 @@ def test_both_git_receiver_branches_preserve_exact_text_and_stable_code(
             "may not target the Ouroboros runtime (system repo / data drives): self-repo "
             "changes go through commit_reviewed, which enforces pre-commit checks and review. "
             "Read-only git (status/log/diff/show/rev-parse/branch- and tag-listing, or the "
-            "vcs_status/vcs_diff tools) works everywhere, and mutating git is free in any "
+            "vcs_read tool) works everywhere, and mutating git is free in any "
             "tree OUTSIDE the runtime (e.g. ~/projects, /tmp, an attached project folder)."
         ),
     )

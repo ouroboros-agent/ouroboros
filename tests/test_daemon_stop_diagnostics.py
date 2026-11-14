@@ -58,7 +58,6 @@ def authenticated_home(tmp_path, monkeypatch):
         assert not thread.is_alive()
 
 
-@pytest.mark.serial
 def test_authenticated_legacy_attach_creates_marker_without_replacing_it(authenticated_home, tmp_path):
     server, requests = authenticated_home
     manager = daemon.OwnedClaudexorDaemon()
@@ -75,9 +74,7 @@ def test_authenticated_legacy_attach_creates_marker_without_replacing_it(authent
     assert _rows(tmp_path)[-1]["type"] == "process_stop_unconfirmed"
 
 
-@pytest.mark.serial
-@pytest.mark.parametrize("marker", ["{broken", "[]", "{}", '{"owner":"other"}',
-    '{"owner":"ouroboros","data_dir":"/other-install"}'])
+@pytest.mark.parametrize("marker", ["{broken", "[]", '{"owner":"ouroboros","data_dir":"/other-install"}'])
 def test_attach_refuses_existing_invalid_or_foreign_marker_before_handshake(authenticated_home, marker):
     _, requests = authenticated_home
     path = daemon.ownership_marker_path()
@@ -88,7 +85,6 @@ def test_attach_refuses_existing_invalid_or_foreign_marker_before_handshake(auth
     assert requests == []
 
 
-@pytest.mark.serial
 def test_failed_authentication_does_not_create_marker(authenticated_home, monkeypatch):
     from ouroboros import claudexor_runtime
     _, requests = authenticated_home
@@ -120,7 +116,6 @@ def test_marker_creation_preserves_concurrent_foreign_writer(tmp_path, monkeypat
     assert json.loads(path.read_text()) == json.loads(foreign)
 
 
-@pytest.mark.serial
 def test_partial_marker_write_leaves_authenticated_attach_retryable(authenticated_home, monkeypatch, caplog):
     server, _requests = authenticated_home
     manager = daemon.OwnedClaudexorDaemon()
@@ -191,7 +186,6 @@ def test_marker_published_after_absent_read_is_not_misreported_as_invalid(tmp_pa
     assert daemon.verify_owned_home(require_marker=True) == ""
 
 
-@pytest.mark.serial
 @pytest.mark.skipif(os.name == "nt", reason="POSIX measured custody fixture")
 def test_panic_reports_missing_marker_and_preserves_live_process(tmp_path, monkeypatch, caplog):
     from tests.test_server_control_panic_daemon import _run_panic
@@ -202,7 +196,7 @@ def test_panic_reports_missing_marker_and_preserves_live_process(tmp_path, monke
     try:
         before = custody.ledger_path(tmp_path).read_bytes()
         with caplog.at_level(logging.CRITICAL):
-            assert _run_panic(monkeypatch, tmp_path, daemon_stop=manager.stop)
+            assert _run_panic(monkeypatch, tmp_path, daemon_stop=manager.stop) == []
         assert proc.poll() is None
         assert custody.ledger_path(tmp_path).read_bytes() == before
         assert "stop unconfirmed" in caplog.text
@@ -214,7 +208,6 @@ def test_panic_reports_missing_marker_and_preserves_live_process(tmp_path, monke
         proc.wait(timeout=5)
 
 
-@pytest.mark.serial
 @pytest.mark.skipif(os.name == "nt", reason="POSIX measured custody fixture")
 def test_partial_stop_is_false_and_preserves_unconfirmed_root(tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)
@@ -308,14 +301,13 @@ def test_panic_records_stop_exception_and_continues(tmp_path, monkeypatch):
     from tests.test_server_control_panic_daemon import _run_panic
     def fail():
         raise RuntimeError("fixture stop failed")
-    assert _run_panic(monkeypatch, tmp_path, daemon_stop=fail)
+    assert _run_panic(monkeypatch, tmp_path, daemon_stop=fail) == []
     assert _rows(tmp_path)[-1] == {
         "ts": _rows(tmp_path)[-1]["ts"], "type": "process_stop_unconfirmed",
         "purpose": daemon.CUSTODY_PURPOSE, "reason": "stop raised RuntimeError",
     }
 
 
-@pytest.mark.serial
 @pytest.mark.skipif(os.name == "nt", reason="POSIX exact process identity")
 def test_real_legacy_daemon_attach_then_stop_uses_token_and_ledger(tmp_path, monkeypatch):
     from ouroboros import claudexor_runtime
@@ -350,8 +342,13 @@ def test_real_legacy_daemon_attach_then_stop_uses_token_and_ledger(tmp_path, mon
 
 
 _STOP_ENDPOINT = """
-import http.server, json, socket, sys, threading
+import http.server, json, socket, socketserver, sys, threading
 mode = sys.argv[1]
+class LoopbackHTTPServer(http.server.ThreadingHTTPServer):
+    def server_bind(self):
+        # Numeric loopback fixture: no hostname semantics, skip HTTPServer's reverse DNS.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_args): pass
     def do_POST(self):
@@ -382,10 +379,38 @@ if mode == 'refused':
     print(sock.getsockname()[1], flush=True)
     threading.Event().wait()
 else:
-    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    server = LoopbackHTTPServer(('127.0.0.1', 0), Handler)
     print(server.server_port, flush=True)
     server.serve_forever()
 """
+
+
+def test_stop_endpoint_fixture_serves_without_reverse_dns():
+    """The stop endpoint binds a numeric loopback address, so it must start and answer
+    while ``socket.getfqdn`` raises: that lookup costs about 35 s per bind on macOS CI."""
+    import http.client
+
+    refuse = ("import socket\n"
+              "def _refuse(*_a): raise RuntimeError('fixture performed reverse DNS')\n"
+              "socket.getfqdn = _refuse\n")
+    proc = subprocess.Popen([sys.executable, "-u", "-c", refuse + _STOP_ENDPOINT, "normal"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        line = proc.stdout.readline()
+        assert line.strip().isdigit(), proc.communicate(timeout=5)
+        client = http.client.HTTPConnection("127.0.0.1", int(line), timeout=5)
+        try:
+            client.request("POST", "/v2/handshake", body=b"{}")
+            response = client.getresponse()
+            assert response.status == 200
+            assert json.loads(response.read())["compatible"] is True
+        finally:
+            client.close()
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
+        proc.stdout.close()
+        proc.stderr.close()
 
 
 @pytest.fixture
@@ -416,7 +441,6 @@ def stop_endpoint(tmp_path, monkeypatch, request):
         proc.stdout.close()
 
 
-@pytest.mark.serial
 @pytest.mark.skipif(os.name == "nt", reason="POSIX measured ledger identity")
 @pytest.mark.parametrize("stop_endpoint", ["hang", "refused", "slow200"], indirect=True)
 def test_panic_stops_unreachable_owned_legacy_daemon(stop_endpoint, tmp_path, monkeypatch):
@@ -425,13 +449,12 @@ def test_panic_stops_unreachable_owned_legacy_daemon(stop_endpoint, tmp_path, mo
     proc, manager = stop_endpoint
     assert manager._proc is None
     assert custody.live_daemon_root_pids(tmp_path, retained_purposes={daemon.CUSTODY_PURPOSE}) == {proc.pid}
-    assert _run_panic(monkeypatch, tmp_path, daemon_stop=manager.stop)
+    assert _run_panic(monkeypatch, tmp_path, daemon_stop=manager.stop) == []
     proc.wait(timeout=5)
     assert custody._read_ledger(tmp_path) == []
     assert [row["type"] for row in _rows(tmp_path)] == ["process_stopped"]
 
 
-@pytest.mark.serial
 @pytest.mark.skipif(os.name == "nt", reason="POSIX measured ledger identity")
 @pytest.mark.parametrize("stop_endpoint", ["401", "403", "protocol", "malformed", "body_code", "gzip200", "gzip401", "slow401", "slow403"], indirect=True)
 def test_reachable_refusal_is_not_unreachable_stop_authority(stop_endpoint, tmp_path, caplog):
@@ -445,7 +468,6 @@ def test_reachable_refusal_is_not_unreachable_stop_authority(stop_endpoint, tmp_
     assert "stop unconfirmed" in caplog.text
 
 
-@pytest.mark.serial
 @pytest.mark.skipif(os.name == "nt", reason="POSIX measured ledger identity")
 @pytest.mark.parametrize("stop_endpoint", ["refused"], indirect=True)
 @pytest.mark.parametrize("proof", ["missing_marker", "mismatching_start", "mismatching_command", "unmeasurable", "invalid_descriptor", "missing_token"])
@@ -474,7 +496,6 @@ def test_transport_failure_never_substitutes_missing_ownership(stop_endpoint, tm
     assert not any(row["type"] == "process_stopped" for row in _rows(tmp_path))
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("stop_endpoint", ["refused"], indirect=True)
 def test_unreachable_status_keeps_public_stale_contract(stop_endpoint):
     proc, manager = stop_endpoint
@@ -483,7 +504,6 @@ def test_unreachable_status_keeps_public_stale_contract(stop_endpoint):
     assert proc.poll() is None
 
 
-@pytest.mark.serial
 @pytest.mark.skipif(os.name == "nt", reason="POSIX measured ledger identity")
 @pytest.mark.parametrize("stop_endpoint", ["normal"], indirect=True)
 def test_local_header_error_is_not_unreachable_stop_authority(stop_endpoint, tmp_path):

@@ -167,10 +167,20 @@ def test_grant_without_a_new_attempt_is_not_a_phantom_repeat(tmp_path):
         ("continued", "continuation_outcome_unknown", 1)]
 
 
-@pytest.mark.parametrize("flag", ["is_direct_chat"])
-def test_unknown_policy_does_not_expand_other_execution_classes(tmp_path, flag):
-    ctx = SimpleNamespace(task_id="t", **{flag: True})
-    assert transport.reconcile_transport_wait(None, ctx, msg_present=False,
+@pytest.mark.parametrize("presence", [{}, {"current_task_type": "presence"},
+                                     {"task_metadata": {"presence": {"binding": "b"}}}])
+def test_unknown_policy_admits_direct_turns_but_not_a_readable_operation(tmp_path, presence):
+    """Direct turns, including Presence, share bounded recovery; accepted operations only rejoin."""
+    notes = []
+    direct = SimpleNamespace(task_id="t", is_direct_chat=True, _accumulated_usage={}, **presence)
+    episode = transport.reconcile_transport_wait(None, direct, msg_present=False,
+        error_kind="provider_outcome_unknown", drive_logs=tmp_path, task_id="t", model="m",
+        emit_progress=lambda text, **_kw: notes.append(text))
+    assert episode is not None and episode.interactive and episode.wait_cause == "provider_outcome_unknown"
+    assert episode.wait_bound_sec is not None and notes and "Stop cancels" not in notes[0]
+    readable = {"_pending_transport_outcome": {"physical_attempt_id": "a", "same_operation_recoverable": True}}
+    direct._accumulated_usage = readable
+    assert transport.reconcile_transport_wait(None, direct, msg_present=False,
         error_kind="provider_outcome_unknown", drive_logs=tmp_path, task_id="t", model="m",
         emit_progress=lambda *a, **kw: pytest.fail("unexpected automatic continuation")) is None
 
@@ -212,7 +222,7 @@ def test_loopback_response_cannot_prove_upstream_recovery(monkeypatch):
     assert not transport.upstream_transport_reachable(llm, "vendor/model", timeout=3)
 
 
-@pytest.mark.parametrize("fact", ["absent", "stale", "local", "upstream"])
+@pytest.mark.parametrize("fact", ["absent", "local", "upstream"])
 def test_subscription_requires_fresh_typed_upstream_observation(monkeypatch, fact):
     from ouroboros import llm_claudexor
     now = datetime.now(timezone.utc)
@@ -275,8 +285,9 @@ def test_managed_continuation_keeps_old_money_and_mints_one_new_attempt(tmp_path
         text, usage, _ = run_llm_loop(**ledger_kwargs(tmp_path, llm, []))
     assert text == "done" and llm.calls == 2 and observations == [1]
     rows = _ledger(tmp_path)
-    assert [row["state"] for row in rows] == ["reserved", "dispatched", "unresolved", "reserved", "dispatched", "settled"]
-    old, new = rows[0]["attempt_id"], rows[3]["attempt_id"]
+    assert [(row["state"], row["revision"]) for row in rows] == [("unresolved", 4), ("settled", 3)]
+    assert rows[0]["physical_failure"]
+    old, new = rows[0]["attempt_id"], rows[1]["attempt_id"]
     assert old != new
     assert usage["transport_recovery"]["previous_attempt"]["physical_attempt_id"] == old
     assert ua.usage_projection(tmp_path)["unresolved_upper_bound_usd"] == 1.0
@@ -284,18 +295,23 @@ def test_managed_continuation_keeps_old_money_and_mints_one_new_attempt(tmp_path
 
 @pytest.mark.parametrize("reported_model", ["absent", None, "test"])
 @pytest.mark.parametrize("axis", ["matching", "empty", "before_wait", "source", "profile", "fingerprint", "model", "local"])
-def test_catalog_reachability_binds_effective_account_and_wait_start(monkeypatch, axis, reported_model):
+@pytest.mark.parametrize("advisory", [False, True])
+def test_catalog_reachability_binds_effective_account_and_wait_start(monkeypatch, axis, reported_model, advisory):
     import time
     from ouroboros import llm_claudexor
     started = time.time() - 10
     catalog = dict(source="codex", credentialProfileId="effective-profile", accountFingerprint="account-a",
                    observedAt=datetime.fromtimestamp(started + 1, timezone.utc).isoformat(),
                    provenance="provider_http", models=[{"id": "test"}])
+    if advisory:
+        catalog.update(models=[], admission={"requestedModel": "test", "inventoryAbsence": "advisory"})
     if axis == "before_wait": catalog["observedAt"] = datetime.fromtimestamp(started - 1, timezone.utc).isoformat()
     if axis == "source": catalog["source"] = "foreign"
     if axis == "profile": catalog["credentialProfileId"] = "foreign"
     if axis == "fingerprint": catalog["accountFingerprint"] = "foreign"
-    if axis == "model": catalog["models"] = [{"id": "foreign"}]
+    if axis == "model":
+        catalog["models"] = [{"id": "foreign"}]
+        if advisory: catalog["admission"]["requestedModel"] = "foreign"
     if axis == "local": catalog["provenance"] = "local_cache"
     if axis == "empty": catalog = {}
     route = {"source": "codex", "credentialProfileId": "effective-profile", "accountFingerprint": "account-a"}
@@ -335,8 +351,10 @@ def test_null_reported_model_recovers_without_rewriting_unknown_custody(tmp_path
                 "route": {"source": "codex", "model": None, "credentialProfileId": "profile-a",
                           "accountFingerprint": "account-a"}}
     episode = transport.TransportWaitEpisode(wait_cause="provider_outcome_unknown", outcome_custody=previous)
+    budgets = []
     def catalog(source, profile, **kwargs):
         assert (source, profile, kwargs["requested_model"]) == ("codex", "profile-a", "test")
+        budgets.append(kwargs["timeout_sec"])
         return {"source": source, "credentialProfileId": profile, "accountFingerprint": "account-a",
                 "provenance": "provider_http",
                 "observedAt": datetime.fromtimestamp(episode.started_at + 1, timezone.utc).isoformat(),
@@ -353,6 +371,10 @@ def test_null_reported_model_recovers_without_rewriting_unknown_custody(tmp_path
     assert usage["transport_recovery"]["previous_attempt"] == previous
     assert usage["transport_recovery"]["old_outcome"] == "unknown"
     assert previous["route"]["model"] is None and episode.outcome_custody == previous
+    # The observation stands in front of the configured routes: the connection allowance, never the read window.
+    from ouroboros.config import get_llm_transport_read_timeout_sec
+    from ouroboros.llm import LLMClient
+    assert budgets == [LLMClient._no_proxy_timeout().connect] and budgets[0] < get_llm_transport_read_timeout_sec()
 
 
 def test_stop_before_unknown_probe_preserves_no_send_boundary(tmp_path, monkeypatch):

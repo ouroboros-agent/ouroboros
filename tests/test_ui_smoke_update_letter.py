@@ -1,5 +1,5 @@
-"""Dashboard -> Updates update-letter acceptance (docs/ARCHITECTURE.md "Visual verification
-policy"): the letter on the real consumer flow, real UI, real browser.
+"""Dashboard -> Updates description acceptance (docs/ARCHITECTURE.md "Visual verification
+policy"): the description on the real consumer flow, real UI, real browser.
 
 Sibling of ``test_ui_smoke_playwright.py`` (which carries the shared server fixture and
 sits at its byte gate); marker-gated the same way, runs in the same CI job.
@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 
 import pytest
+
+from ouroboros.test_evidence import diagnostic_directory
 
 pytest_plugins = ("tests.test_ui_smoke_playwright",)
 
@@ -30,7 +32,7 @@ def test_ui_smoke_update_letter_renders_below_the_action(direct_server, tmp_path
         "author_version": "6.113.5", "target_version": "6.114.0",
         "written_at": "2026-09-03T20:10:10+00:00", "error_kind": "", "error_text": "",
         "key": {"base_sha": "a" * 40, "target_sha": "b" * 40, "update_channel": "stable", "target_ref": "managed/ouroboros"},
-        "has_last_good": False,
+        "has_last_good": False, "description_current": True,
     }
     status = {
         "managed": True, "check_ok": True, "available": True, "safe_to_apply": True,
@@ -64,14 +66,17 @@ def test_ui_smoke_update_letter_renders_below_the_action(direct_server, tmp_path
                         tag: label.tagName, label: label.textContent,
                         labelledBy: section.getAttribute('aria-labelledby'),
                         meta: document.querySelector('#updates-letter-meta').textContent,
+                        provenance: document.querySelector('#updates-letter-provenance').textContent,
                         strong: body.querySelectorAll('strong').length,
                         scripts: body.querySelectorAll('script').length,
                         xss: window.__letter_xss === 1,
-                        buttons: section.querySelectorAll('button').length,
+                        buttons: body.querySelectorAll('button').length,
+                        refresh: section.querySelector('#updates-letter-refresh').textContent.trim(),
+                        write: section.querySelector('#updates-letter-write').textContent.trim(),
                         codeBlocks: section.querySelectorAll('.md-code-block').length,
                         headline: document.querySelector('#updates-summary').textContent,
                         action: document.querySelector('#btn-update-primary').textContent,
-                        order: [top('.updates-action-row'), top('#updates-letter'), top('.updates-recovery')],
+                        order: [top('#btn-update-primary'), top('#updates-letter'), top('.updates-recovery')],
                         scrollWidth: document.documentElement.scrollWidth,
                         clientWidth: document.documentElement.clientWidth,
                     };
@@ -80,7 +85,7 @@ def test_ui_smoke_update_letter_renders_below_the_action(direct_server, tmp_path
             # The rendered card is saved for the human who runs this lane: DEVELOPMENT's
             # visible-change rule is satisfied by INSPECTING it, and a stored file alone is
             # not that inspection — it is what makes the inspection possible from CI.
-            shot = tmp_path / "updates_letter.png"
+            shot = diagnostic_directory(tmp_path, "updates-letter", publish=True) / "updates_letter.png"
             page.screenshot(path=str(shot), full_page=True)
             assert shot.stat().st_size > 0
             print(f"update letter card rendered for inspection: {shot}")
@@ -88,10 +93,12 @@ def test_ui_smoke_update_letter_renders_below_the_action(direct_server, tmp_path
             browser.close()
     assert info["tag"] == "H4" and info["label"] == "What's new"
     assert info["labelledBy"] == "updates-letter-label"
-    assert info["meta"].startswith("written by Ouroboros 6.113.5 about 6.114.0")
+    assert info["meta"].startswith("Written ")
+    assert info["provenance"].startswith("Written by Ouroboros 6.113.5 about 6.114.0")
     assert info["strong"] == 1 and info["scripts"] == 0 and info["xss"] is False
-    assert info["buttons"] == 0, "the letter is a fact, never an action — not even a Copy control"
+    assert info["buttons"] == 0, "the authored body retains no Copy or other generated controls"
+    assert "Check" in info["refresh"] and info["write"] == "Rewrite", "Check and the explicit authoring request stay apart"
     assert info["codeBlocks"] == 1, "the fenced block still renders; only its control is gone"
     assert info["headline"].startswith("Update available") and info["action"] == "Update to 6.114.0"
-    assert info["order"][0] < info["order"][1] < info["order"][2], "action row, then letter, then Recovery"
+    assert info["order"][0] < info["order"][1] < info["order"][2], "the headline's action, then letter, then Recovery"
     assert info["scrollWidth"] == info["clientWidth"], "no horizontal page scroll at a phone width"

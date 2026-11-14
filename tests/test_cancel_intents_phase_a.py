@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import pytest
 from ouroboros import cancel_intents as ci
+from ouroboros import store_import
 from ouroboros.contracts.schema_versions import SCHEMA_VERSION_KEY
 from ouroboros.task_results import (
     STATUS_CANCEL_REQUESTED,
@@ -212,6 +213,10 @@ def test_claim_settle_and_release_lifecycle(tmp_path):
     reclaimed = ci.claim_intent(tmp_path, "t2", owner="cancel_task_custody")
     assert reclaimed["generation"] == 2
 
+    # The real custody owner writes the terminal result before retiring intent.
+    # G1 transfers accepted Stop to this same result, including completion wins.
+    from ouroboros.task_results import write_task_result
+    write_task_result(tmp_path, "t2", "cancelled", result="teardown ok")
     settled = ci.settle_intent(tmp_path, "t2", outcome="cancelled", detail="teardown ok")
     assert settled["request_id"] == row["request_id"]
     # Settled rows LEAVE the projection (compactness is the design).
@@ -230,7 +235,6 @@ def test_claim_settle_and_release_lifecycle(tmp_path):
     "corrupt_bytes",
     [
         b'{"intents": [broken',
-        b'{"schema_version": 1, "intents": []}',
         b'{"schema_version": 1, "intents": {"corrupt-claim": []}}',
         b'{"schema_version": 1, "intents": {"unrelated": []}}',
     ],
@@ -298,7 +302,9 @@ def test_boot_migration_admits_the_unstamped_latch_and_quarantines_the_rest(tmp_
     _write_pre_7_0_row(tmp_path, "latched", STATUS_CANCEL_REQUESTED, note="pre-7.0")
     _write_pre_7_0_row(tmp_path, "finished", STATUS_COMPLETED, result="pre-7.0")
 
-    assert ci.migrate_legacy_cancel_latches(tmp_path) == ["latched"]
+    # Boot's import admits the latch (stamped) and runs the migration itself; a later scan finds nothing new.
+    assert store_import.ensure_current_store(tmp_path)["results"] == 1
+    assert ci.migrate_legacy_cancel_latches(tmp_path) == []
 
     stored = load_task_result(tmp_path, "latched")
     assert stored["status"] == STATUS_CANCEL_REQUESTED and stored["note"] == "pre-7.0"
@@ -328,13 +334,17 @@ def test_boot_migrates_the_latch_before_any_quarantining_read():
     from ouroboros import server_maintenance
 
     recovery = inspect.getsource(server_maintenance._run_startup_task_recovery)
-    assert recovery.index("_migrate_startup_cancel_latches") < recovery.index(
-        "reconcile_orphaned_running_tasks"), recovery
-    assert "migrate_legacy_cancel_latches" not in inspect.getsource(
-        server_maintenance._startup_custody_sweep), (
-        "the migration must not ALSO run from the later custody sweep, whose "
-        "own reads would already have quarantined the latch"
-    )
+    assert "_migrate_startup_cancel_latches" not in recovery
+    # The import owner (store_switch: prepare_startup_state on its thread) starts first; the
+    # recovery and the supervisor each wait for its publication before their first read.
+    import server
+    lifespan = inspect.getsource(server.lifespan)
+    assert lifespan.index("store_switch.start") < lifespan.index("_run_startup_task_recovery")
+    assert lifespan.index("store_switch.start") < lifespan.index("_start_supervisor_if_needed")
+    assert recovery.index("require_published(drive_root)") < recovery.index("_startup_live_task_ids")
+    assert "startup:current_store" in inspect.getsource(server._run_supervisor)
+    assert "migrate_legacy_cancel_latches" not in inspect.getsource(server_maintenance._startup_custody_sweep)
+
 
 def test_the_admitted_latch_reaches_the_cancelled_terminal(tmp_path, monkeypatch):
     """The carve-out's whole point. Once admitted, the latch is an ORDINARY
@@ -358,8 +368,9 @@ def test_the_admitted_latch_reaches_the_cancelled_terminal(tmp_path, monkeypatch
     monkeypatch.setattr(task_lifecycle, "CANCELLED_ROOT_FENCES", {}, raising=False)
     monkeypatch.setattr(task_lifecycle, "_ACTIVE_CASCADE_FENCES", {}, raising=False)
 
-    assert ci.migrate_legacy_cancel_latches(tmp_path) == ["wedged"]
+    assert store_import.ensure_current_store(tmp_path)["results"] == 1  # the import migrates the latch
     intent = ci.active_intent(tmp_path, "wedged")
+    assert intent["source"] == "boot_migration"
 
     outcome = cancel_publication._finalize_cancel_intent_on_miss(q, "wedged", intent=intent)
 
@@ -470,6 +481,47 @@ def test_stale_claimants_release_and_settle_are_fenced_by_generation(tmp_path):
     assert ci.active_intent(tmp_path, "fence1") is None
     trail = (tmp_path / "logs" / "supervisor.jsonl").read_text(encoding="utf-8")
     assert "claim_release_refused" in trail and "settle_refused" in trail
+
+def test_withdraw_intent_retires_only_the_callers_own_withdrawable_row(tmp_path):
+    """#3047: a withdrawable row of this claim leaves without a cancellation; a row a Stop joined comes back unchanged
+    and stays owed; a claim taken over, or another request, raises and changes nothing."""
+    ci.request_cancel(tmp_path, "wd-own", source="work_finished")
+    own = ci.claim_intent(tmp_path, "wd-own", owner="custody")
+    fence = {"expected_generation": own["generation"], "request_id": own["request_id"]}
+    assert ci.withdraw_intent(tmp_path, "wd-own", withdrawable=lambda row: True, detail="resumed", **fence) is None
+    assert ci.active_intent(tmp_path, "wd-own") is None
+    assert ci.withdraw_intent(tmp_path, "wd-own", withdrawable=lambda row: True, **fence) is None  # already gone
+    assert ci.withdraw_intent(tmp_path, "never-requested", withdrawable=lambda row: True) is None
+
+    ci.request_cancel(tmp_path, "wd-joined", source="work_finished")
+    claim = ci.claim_intent(tmp_path, "wd-joined", owner="custody")
+    assert ci.request_cancel(tmp_path, "wd-joined", source="http_single", requested_by="owner")["followup_stop"]
+    joined = ci.active_intent(tmp_path, "wd-joined")
+    assert ci.withdraw_intent(tmp_path, "wd-joined", withdrawable=lambda row: not row.get("followup_stop"),
+                              expected_generation=claim["generation"], request_id=claim["request_id"]) == joined
+    assert ci.active_intent(tmp_path, "wd-joined") == joined
+
+    ci.request_cancel(tmp_path, "wd-taken", source="work_finished")
+    stale = ci.claim_intent(tmp_path, "wd-taken", owner="custody-1")
+    store = tmp_path / "state" / "cancel_intents.json"
+    data = json.loads(store.read_text(encoding="utf-8"))
+    data["intents"]["wd-taken"]["claim_pid"] = 2 ** 22  # never a live pid: custody-2 takes the claim over
+    store.write_text(json.dumps(data), encoding="utf-8")
+    fresh = ci.claim_intent(tmp_path, "wd-taken", owner="custody-2")
+    taken = ci.active_intent(tmp_path, "wd-taken")
+    with pytest.raises(RuntimeError, match="generation"):
+        ci.withdraw_intent(tmp_path, "wd-taken", withdrawable=lambda row: True,
+                           expected_generation=stale["generation"], request_id=stale["request_id"])
+    with pytest.raises(RuntimeError, match="request_id"):
+        ci.withdraw_intent(tmp_path, "wd-taken", withdrawable=lambda row: True,
+                           expected_generation=fresh["generation"], request_id="ci_another_request")
+    assert ci.active_intent(tmp_path, "wd-taken") == taken
+
+    trail = (tmp_path / "logs" / "supervisor.jsonl").read_text(encoding="utf-8").splitlines()
+    withdrawn = [row for row in map(json.loads, filter(None, trail))
+                 if row.get("event") == "settled" and row.get("outcome") == "withdrawn"]
+    assert [(row["task_id"], row["request_id"], row["generation"], row["detail"]) for row in withdrawn] == [
+        ("wd-own", own["request_id"], own["generation"], "resumed")]
 
 def test_mark_intent_scope_is_widen_only(tmp_path):
     """GR2-1d: single→cascade widens; cascade→single is refused as a no-op plus

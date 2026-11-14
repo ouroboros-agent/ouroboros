@@ -1,18 +1,13 @@
-"""The single classifier answers exactly what the retired loop pair answered,
-except on a table of deltas the owner approved.
+"""Compare the classifier with the retired loop pair, except owner-approved deltas.
 
-The oracle is a golden snapshot of the OLD pair's answers, captured from the tree
-named in ``GOLDEN_SOURCE_SHA``, not a copy of the old parser: a copy is dead code
-that invites cleanup, a data file cannot drift silently.
-
-Both directions fail. An unapproved divergence fails because the cutover would then
-be changing behaviour nobody signed off. An APPROVED delta that no longer fires ALSO
-fails, so the table cannot rot into a permanent excuse list — once a delta is gone,
-its row goes with it.
+The oracle is the OLD pair's golden answers from ``GOLDEN_SOURCE_SHA``.
+An unapproved divergence fails; an approved delta that no longer fires also fails,
+so obsolete exceptions cannot survive silently.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import pathlib
 from types import MappingProxyType
@@ -24,6 +19,7 @@ from ouroboros._outcome_tool_errors import (
     _BLOCKING_TOOL_STATUSES,
     _NON_BLOCKING_READONLY_BLOCK_STATUSES,
     _NON_BLOCKING_RECOVERABLE_STATUSES,
+    _NON_EFFECT_OBSERVATION_STATUSES,
     _OK_TOOL_STATUSES,
     _POLICY_DENIAL_STATUSES,
     _UNPARTITIONED_BUCKETS,
@@ -35,12 +31,24 @@ from tests.tool_classification_corpus import (
     GOLDEN_SOURCE_SHA,
     _MARKER_RE,
     build_corpus,
-    harvested_identifiers,
-    harvested_native_codes,
+    harvest_producers,
     typed_result,
 )
+from tests.test_skill_install_checks import registry_release  # noqa: F401  (fixtures)
+from tests.test_scratchpad_fold import install as scratchpad_install  # noqa: F401  (fixtures)
 
 GOLDEN_PATH = pathlib.Path(__file__).resolve().parent / "fixtures" / "legacy_tool_classification_0f715831.json"
+
+
+@pytest.fixture(scope="session")
+def producer_harvest():
+    # Rebuilt from this candidate in each pytest process; no persisted index.
+    return harvest_producers()
+
+
+@pytest.fixture(scope="session")
+def classification_corpus(producer_harvest):
+    return build_corpus(producers=producer_harvest)
 
 
 class Delta(NamedTuple):
@@ -55,6 +63,23 @@ class Delta(NamedTuple):
 # Every entry traces to a numbered item of the delta list the owner approved
 # (batch #3 answer 1=A, batch #4 answers 1-3). Nothing else may differ.
 APPROVED_DELTAS: Mapping[str, Delta] = MappingProxyType({
+    # G2 lane C / owner issue #1657: source-backed effective-outcome repairs.
+    # Historical golden answers stay intact; only these live answers move.
+    "SEND_LINKS_NO_CHAT": Delta(False, "ok", True, "unavailable", "A.1657", "no active chat exists for the requested delivery"),
+    "ESCALATE_PARENT_SETTLED": Delta(False, "ok", True, "unavailable", "A.1657", "no live ancestor can receive the escalation"),
+    "ESCALATE_UNWRITTEN": Delta(False, "ok", True, "error", "A.1657", "the attempted parent mailbox write did not persist"),
+    "FILE_TOO_LARGE": Delta(False, "ok", True, "argument_error", "A.1657", "media input exceeds the admitted file limit before extraction"),
+    "SKILL_EXEC_EXTENSION": Delta(False, "ok", True, "argument_error", "A.1657", "an extension cannot run through the skill subprocess interface"),
+    "SKILL_EXEC_GRANT_REQUIRED": Delta(False, "ok", True, "blocked", "A.1657", "required skill grants are absent before process submission"),
+    "SKILL_EXEC_ARGV_TOO_LARGE": Delta(False, "ok", True, "argument_error", "A.1657", "oversized argv is refused before process submission"),
+    "SKILL_EXEC_OVERFLOW": Delta(False, "ok", True, "error", "A.1657", "the process exceeded output limits and was killed; earlier effects remain"),
+    "SKILL_REPAIR_STALE": Delta(False, "ok", True, "blocked", "A.1657", "the repair admission no longer authorizes writes to these bytes"),
+    "SERVICE_ALREADY_RUNNING": Delta(False, "ok", True, "blocked", "A.1657", "the requested start is refused; the existing process keeps its custody"),
+    "CHERRY_PICK_CONFLICT": Delta(False, "ok", True, "error", "A.1657", "a requested cherry-pick failed; earlier applied commits remain"),
+    "RESTORE_PARTIAL": Delta(False, "ok", True, "error", "A.1657", "checkout succeeded but cleanup failed; tracked changes remain discarded"),
+    "EVOLUTION_AUTHORITY_REVOKED": Delta(False, "ok", True, "blocked", "A.1657", "campaign authority no longer permits the next commit stage"),
+    "EVOLUTION_COMMIT_ORPHANED": Delta(False, "ok", True, "error", "A.1657", "the local commit exists but its authority receipt could not be recorded"),
+    "EVOLUTION_PUBLICATION_STOPPED": Delta(False, "ok", True, "blocked", "A.1657", "authority revoked publication after a retained local commit; containment failure is separately typed"),
     # v7next F3.1 note: the reference table also carried rows for producers this
     # lane did NOT cut over (the in-place core.py rows 2083-2086 — room writes,
     # forward_to_worker, memory REJECTED — and the control_routing/control_runtime
@@ -63,19 +88,24 @@ APPROVED_DELTAS: Mapping[str, Delta] = MappingProxyType({
     # producers' cutover.
     "ACCESS_DENIED": Delta(False, "ok", True, "blocked", "A.4", "an access denial recorded as success is the worst under-reporting"),
     "ACTING_SUBAGENT_TOOL_NOT_GRANTED": Delta(False, "ok", True, "blocked", "A.4", "an ungranted tool for the acting subagent is a denial"),
+    # Owner 2026-11-12, audit 08-11.11 item 8 ("п.8: брать" — the undeclared-output reminder stops being a
+    # refusal): the note rides a finished command, so the call is no error. The typed producer and the
+    # retired marker-first text keep the note's own bucket; behind an autocorrect line that retired text
+    # reads as the autocorrected success it was, as every trailing note of a shell result does.
+    "ARTIFACT_OUTPUT_UNDECLARED": Delta(True, "artifact_output_undeclared", False, "artifact_output_undeclared", "A.audit1111-8", "a note on a finished command is no refusal; its bucket stays readable"),
+    "shape:shell_undeclared": Delta(True, "artifact_output_undeclared", False, "artifact_output_undeclared", "A.audit1111-8", "a note on a finished command is no refusal; its bucket stays readable"),
+    "edge:autocorrect_undeclared": Delta(True, "artifact_output_undeclared", False, "ok_autocorrected", "A.audit1111-8", "the autocorrected success carries the note in its text, like its other trailing notes"),
     "CANCEL_INTENT_PROJECTION_CORRUPT": Delta(False, "ok", True, "error", "A.5", "a corrupted cancel projection is an error, not a success"),
     "CAPABILITY_UNAVAILABLE": Delta(True, "error", True, "unavailable", "A.18", "unavailability gets its own status name; the report bucket is unchanged"),
     "CHILD_RESULT_LINEAGE_FORBIDDEN": Delta(False, "ok", True, "blocked", "A.4", "a refused child-result lineage is a denial"),
-    "CI_UNAVAILABLE": Delta(True, "error", True, "unavailable", "A.18", "unavailability gets its own status name; the report bucket is unchanged"),
     "COGNITIVE_TOOL_REQUIRED": Delta(True, "cognitive_tool_required", False, "ok", "A.11", "owner batch #4: the cognitive redirect is a hint, the error flag is removed"),
-    "EXECUTOR_UNAVAILABLE": Delta(True, "error", True, "unavailable", "A.18", "unavailability gets its own status name; the report bucket is unchanged"),
-    # This tree's post-cutoff producers emit five more *_UNAVAILABLE identifiers
+    # This tree's post-cutoff producers emit four more *_UNAVAILABLE identifiers
     # the reference corpus never saw; each is the same A.18 move (the generic
     # `_UNAVAILABLE` marker keeps its own status instead of the coarse error).
-    "AUTHORITY_SOURCE_UNAVAILABLE": Delta(True, "error", True, "unavailable", "A.18", "unavailability gets its own status name; the report bucket is unchanged"),
     "REVIEW_BINDING_UNAVAILABLE": Delta(True, "error", True, "unavailable", "A.18", "unavailability gets its own status name; the report bucket is unchanged"),
     "REVIEW_STATE_UNAVAILABLE": Delta(True, "error", True, "unavailable", "A.18", "unavailability gets its own status name; the report bucket is unchanged"),
-    "SAFETY_UNAVAILABLE": Delta(True, "error", True, "unavailable", "A.18", "unavailability gets its own status name; the report bucket is unchanged"),
+    "SAFETY_UNAVAILABLE": Delta(True, "error", True, "safety_unavailable", "A.18",
+                                "a missing Safety reading gets its own status name: no failure, named on the card"),
     "SUBAGENT_UNAVAILABLE": Delta(True, "error", True, "unavailable", "A.18", "unavailability gets its own status name; the report bucket is unchanged"),
     "EXTRACT_VIDEO_FRAMES_UNAVAILABLE": Delta(True, "error", True, "unavailable", "A.18", "unavailability gets its own status name; the report bucket is unchanged"),
     "GH_TARGET_UNAVAILABLE": Delta(True, "error", True, "unavailable", "A.18", "unavailability gets its own status name; the report bucket is unchanged"),
@@ -87,7 +117,10 @@ APPROVED_DELTAS: Mapping[str, Delta] = MappingProxyType({
     "MCP_DISABLED": Delta(False, "ok", True, "unavailable", "A.3", "an MCP provider that is off is unavailable, not a success"),
     "MCP_TOOL_DISALLOWED": Delta(False, "ok", True, "blocked", "A.3", "an MCP tool refused by policy is a denial, not a success"),
     "MCP_TOOL_ERROR": Delta(True, "error", True, "mcp_error", "A.17", "the MCP error gets its own bucket, homed to the blocking partition"),
-    "MCP_TOOL_NOT_FOUND": Delta(False, "ok", True, "unavailable", "A.3", "a missing MCP tool is unavailable, not a success"),
+    # Owner decision on #1262 (item 3): a name the current MCP catalog does not list
+    # is the caller's unknown tool, not a provider outage; a known disabled server
+    # or an unlisted catalog keeps `unavailable` (MCP_DISABLED, MCP_CATALOG_UNAVAILABLE).
+    "MCP_TOOL_NOT_FOUND": Delta(False, "ok", True, "unknown_tool", "A.1262.3", "a name absent from the MCP catalog is an unknown tool, not a success and not an outage"),
     "MCP_TOOL_TIMEOUT": Delta(False, "ok", True, "timeout", "A.3", "an expired MCP call is a timeout, not a success"),
     "MUTATIVE_SUBAGENTS_DISABLED": Delta(False, "ok", True, "blocked", "A.4", "a disabled mutative subagent is a denial"),
     "OCR_PDF_SCANNED_UNAVAILABLE": Delta(True, "error", True, "unavailable", "A.18", "unavailability gets its own status name; the report bucket is unchanged"),
@@ -185,7 +218,7 @@ APPROVED_DELTAS: Mapping[str, Delta] = MappingProxyType({
     "shape:extension_async_timeout": Delta(True, "error", True, "timeout", "A.18", "an expired extension handler is named a timeout; the report bucket is unchanged"),
     "shape:extension_not_live": Delta(True, "error", True, "unavailable", "A.18", "an extension that may not dispatch is unavailable; the report bucket is unchanged"),
     "shape:mcp_disabled": Delta(False, "ok", True, "unavailable", "A.3", "same fix as MCP_DISABLED, through the native code the provider publishes"),
-    "shape:mcp_tool_not_found": Delta(False, "ok", True, "unavailable", "A.3", "same fix as MCP_TOOL_NOT_FOUND, through the native code the provider publishes"),
+    "shape:mcp_tool_not_found": Delta(False, "ok", True, "unknown_tool", "A.1262.3", "same fix as MCP_TOOL_NOT_FOUND, through the native code the provider publishes"),
     "shape:mcp_transport_timeout": Delta(False, "ok", True, "timeout", "A.3", "same fix as MCP_TOOL_TIMEOUT, through the native code the provider publishes"),
     "shape:unknown_tool_extension_down": Delta(False, "ok", True, "unavailable", "A.1",
         "a call to a tool whose extension is not live was never a success; the registry publishes the more precise `unavailable` rather than `unknown_tool`"),
@@ -217,14 +250,6 @@ APPROVED_DELTAS: Mapping[str, Delta] = MappingProxyType({
     "shape:promote_unconfirmed": Delta(False, "ok", True, "tool_reported_failure", "A.21", "an unconfirmed admission must not be reported as a created task"),
     "shape:route_rejected": Delta(False, "ok", True, "tool_reported_failure", "A.21", "a project route the supervisor refused scheduled nothing"),
     "shape:route_unconfirmed": Delta(False, "ok", True, "tool_reported_failure", "A.21", "an unconfirmed project route must not be reported as routed"),
-    # The same family through its IDENTIFIERS: `ROUTE_*`/`ROUTING_UNCONFIRMED`/
-    # `NEEDS_MANUAL_TARGET` end in none of the suffixes the generic marker chain
-    # reads, so a route that dispatched nothing and a picker card that replaced the
-    # route both reported an ordinary warning on a successful call.
-    "ROUTE_REJECTED": Delta(False, "ok", True, "tool_reported_failure", "A.21", "a route the supervisor refused is a refusal the agent must see, not a routed task"),
-    "ROUTE_UNCONFIRMED": Delta(False, "ok", True, "tool_reported_failure", "A.21", "a route with no confirmed receipt did not provably schedule anything"),
-    "ROUTING_UNCONFIRMED": Delta(False, "ok", True, "tool_reported_failure", "A.21", "an unconfirmed manual-target delivery dispatched no route and offered no options"),
-    "NEEDS_MANUAL_TARGET": Delta(False, "ok", True, "tool_reported_failure", "A.21", "a routing act that ended in a picker card dispatched no route"),
     # A.21 across the remaining control leaves. Same blindness as above: a
     # markerless sentence, or one that reaches its result through a helper the
     # publication wraps, has no (code, first line) pair to harvest.
@@ -250,7 +275,6 @@ APPROVED_DELTAS: Mapping[str, Delta] = MappingProxyType({
     "shape:followup_objective_required": Delta(False, "ok", True, "argument_error", "A.22", "an empty objective scheduled nothing"),
     "shape:followup_text_too_long": Delta(False, "ok", True, "argument_error", "A.22", "an over-limit objective or context is refused whole — never truncated, never scheduled"),
     "shape:followup_data_root_unresolved": Delta(False, "ok", True, "error", "A.22", "a drive root that could not be resolved wrote no record"),
-    "shape:followup_cap_reached": Delta(False, "ok", True, "resource_constraint_blocked", "A.22", "a follow-up beyond the per-task cap was never registered; the cap is the constraint"),
     "shape:followup_persist_failed": Delta(False, "ok", True, "error", "A.22", "a follow-up the table refused to store does not exist"),
     # A.23 — F6 rolling upstream sync (drift b9f7597f..8d13373b). Upstream's #440
     # fix-forward added both browser markers to its failure-prefix table; the
@@ -270,6 +294,18 @@ APPROVED_DELTAS: Mapping[str, Delta] = MappingProxyType({
     # same defect class the 329 OSWorld rows measured, on the composition seam.
     "compose:reported:route": Delta(False, "ok", True, "tool_reported_failure", "A.24", "a tool that reported its own failure is a failure, even behind an appended host note"),
     "compose:reported:route+safety": Delta(False, "ok", True, "tool_reported_failure", "A.24", "a tool that reported its own failure is a failure, even behind two appended host notes"),
+    # A.25 — cross-focus publication refusals.  The retired text chain only
+    # recognized the generic *_UNAVAILABLE suffix; stale/liveness names were
+    # warnings, while a TOOL_ prefix was still a generic execution failure.  The one identifier register now recovers
+    # the producer's substrate/policy split as typed results: an unavailable
+    # target or projection is policy-denied availability, while a stale or
+    # unauthorized publication is an explicit policy block.
+    "FOCUS_PROJECTION_UNAVAILABLE": Delta(True, "error", True, "unavailable", "A.25", "a direct focus projection the host cannot accept is unavailable, not a generic execution error"),
+    "FOCUS_TASK_NOT_LIVE": Delta(False, "ok", True, "unavailable", "A.25", "a focus update for a settled task has no live publication target"),
+    "FOCUS_STALE": Delta(False, "ok", True, "blocked", "A.25", "a newer focus wins the CAS and blocks the stale publication"),
+    "FOCUS_SOURCE_UNRESOLVED": Delta(False, "ok", True, "unavailable", "A.25", "a focus source the named reader refused or cannot answer is unavailable evidence, not a published focus"),
+    "FOCUS_SOURCE_UNRETAINED": Delta(False, "ok", True, "unavailable", "A.25", "a focus whose source answer could not be stored has no retained evidence to publish"),
+    "TOOL_FORBIDDEN": Delta(True, "error", True, "blocked", "A.25", "an unauthorized project/focus operation is a policy denial, not a generic tool failure"),
     # Owner's recovered transport WORK-ORDER B7 / #744: these producers now
     # publish existing codes for known refusals. No text-adapter policy changed.
     "native:LEGACY_BLOCKED:CHILD_RESULT_STALE": Delta(False, "ok", True, "blocked", "A.B7", "join_ledger refuses a disposition when the inspected child result changed"),
@@ -290,9 +326,13 @@ APPROVED_DELTAS: Mapping[str, Delta] = MappingProxyType({
     # SEES the refusal (is_error, and the policy-denial bucket tool_reported_failure
     # already routes to), while the execution health axis stays undegraded because
     # the refusal is not the agent's failure. Nothing new is declared: that status
-    # has been a non-failure for the ledger since v6.83.0.
-    "STEER_REJECTED": Delta(False, "ok", True, "tool_reported_failure", "A.I23", "a steer the host refused is a refusal the agent must see, not a delivered message"),
-    "STEER_UNCONFIRMED": Delta(False, "ok", True, "tool_reported_failure", "A.I23", "a steer with no confirmed receipt did not provably arrive, so it is not a success"),
+    # has been a non-failure for the ledger since v6.83.0. The one-bubble change
+    # deleted the text producers behind STEER_*, ROUTE_*, ROUTING_UNCONFIRMED,
+    # NEEDS_MANUAL_TARGET and the routing AUTHORITY_SOURCE_UNAVAILABLE (route_to_project,
+    # the manual-target picker, predecessor selection); their rows went with them per
+    # the unfired-rows rule. tell_task publishes its refusals natively
+    # (tests/test_control_native_results.py), and tool_result.py keeps the identifier
+    # register for stored traces.
     "native:TOOL_ARG_ERROR:ERROR": Delta(False, "ok", True, "argument_error", "A.B7", "both commit entry points reject an empty commit message before attempting a commit"),
     "native:TOOL_ARG_ERROR:REJECTED": Delta(False, "ok", True, "argument_error", "A.B7", "scratchpad and identity writers reject empty or malformed content before writing"),
     "native:TOOL_ERROR:TASK_MESSAGE_UNWRITTEN": Delta(False, "ok", True, "error", "A.B7", "forward_to_worker failed to persist the requested message"),
@@ -325,13 +365,153 @@ def _golden() -> dict[str, dict]:
 # New producer contracts have no historical answer: the recorded old SHA is
 # unavailable. Keep the historical corpus intact and assert the new observed
 # outcome explicitly rather than manufacture old evidence (04-AGENCY S1/S3).
-CURRENT_PRODUCER_CONTRACTS = {
+CURRENT_PRODUCER_CONTRACTS = {"WORLD_SIZE_NOTICE": (False, "ok"),  # the map's size notice rides a successful update_world
+    # check_safety: a flagged call returns before any effect with its own status (no failure of the tool); a call let
+    # through without a new reading trails the tool's own result with a note, so the note alone reads ok.
+    "SAFETY_RETURNED": (True, "safety_returned"),
+    "SAFETY_NOTE": (False, "ok"),
+    # read_archive: a file that is no ZIP, a folder, an encrypted member or a compression the reader does not decode is
+    # named without reading anything, as the PDF reader's own UNAVAILABLE notices are; a damaged member fails the read.
+    "ARCHIVE_UNAVAILABLE": (True, "unavailable"),
+    "ARCHIVE_MEMBER_UNAVAILABLE": (True, "unavailable"),
+    "ARCHIVE_READ_FAILED": (True, "error"),
+    # mcp_oauth: a remote MCP server that needs the owner's sign-in ran nothing; the substrate cannot serve the call yet.
+    "MCP_AUTH_REQUIRED": (True, "unavailable"),
+    # start_task / schedule_followup / manage_schedules: owner_words not found verbatim in my human's words that reached
+    # this run; nothing started. Every producer publishes the native argument refusal; the bare text is new to the pair.
+    "OWNER_WORDS_UNVERIFIED": (False, "ok"),
+    "native:TOOL_ARG_ERROR:OWNER_WORDS_UNVERIFIED": (True, "argument_error"),
+    # A readable diff with escaped Git output is still successful; the original Git failure, if any, keeps its own code.
+    "OUTPUT_NOT_UTF8": (False, "ok"),
+    # Staging was refused before any effect; the producer must publish that refusal, not a successful warning.
+    "GIT_INDEX_OUTSIDE_SELECTION_BLOCKED": (True, "blocked"),
+    # commit_reviewed refused to switch branches under a staged merge (a checkout would drop it); nothing changed.
+    "GIT_MERGE_IN_PROGRESS_BLOCKED": (True, "blocked"),
+    # The new retained-review selection guard refuses a changed subject before dispatch or Git; no old answer exists.
+    "REVIEW_SELECTION_CHANGED_BLOCKED": (True, "blocked"),
+    # tools/tool_discovery.py `enable_tools`: a load none of which fits the route's schema ceiling;
+    # the retired pair never saw it. A physical resource refusal: nothing loaded, every tool stays callable.
+    "TOOL_SCHEMA_LIMIT": (True, "resource_constraint_blocked"),
+    # D1 per-target mutation custody: the existing INTEGRATE_ family reports a
+    # busy target as a substrate refusal; no historical answer is fabricated.
+    "INTEGRATE_DELEGATED_TARGET_BUSY": (True, "integration_blocked"),
+    # #2889: a target another git step holds is no conflict: nothing applied, no verdict recorded, the result kept; an
+    # INTEGRATE_ refusal like its family, which the retired pair never saw.
+    "INTEGRATE_NOT_STARTED": (True, "integration_blocked"),
+    # #2795 schedule_followup destination refusals and #2889 commit_reviewed author-continuation refusals: bare
+    # warnings the retired pair never saw (nothing was scheduled, staged or committed; the text says so).
+    "FOLLOWUP_DESTINATION_OWNER": (False, "ok"),
+    "FOLLOWUP_DESTINATION_REQUIRED": (False, "ok"),
+    "REVIEW_AUTHOR_CONTINUATION_INVALID": (False, "ok"),
+    # integrate_subagent_patch decision='accept' on a non-shared result: refused before any
+    # effect, an INTEGRATE_ refusal like its family; the retired pair never saw the decision.
+    "INTEGRATE_ACCEPT_UNSUPPORTED": (True, "integration_blocked"),
+    # Q: the bare warning is legacy ok; the native error keeps a sent write unknown and says do not resend.
+    "GH_WRITE_UNKNOWN": (False, "ok"),
+    "native:TOOL_ERROR:GH_WRITE_UNKNOWN": (True, "error"),
+    # Q: the bare warning is legacy ok; the native error attests GitHub refused the write with no effect.
+    "GH_WRITE_NOT_APPLIED": (False, "ok"),
+    "native:TOOL_ERROR:GH_WRITE_NOT_APPLIED": (True, "error"),
+    # Q: a failed precondition is an error in both forms; the native refusal attests no write was sent.
+    "GH_EXPECTATION_FAILED": (True, "error"),
+    "native:TOOL_ERROR:GH_EXPECTATION_FAILED": (True, "error"),
+    # Q: the bare warning is legacy ok; the native argument refusal redirects the mutation to github_write.
+    "GH_API_READ_ONLY": (False, "ok"),
+    "native:TOOL_ARG_ERROR:GH_API_READ_ONLY": (True, "argument_error"),
+    # Q: readback differs after a confirmed write; keep completed/ok with its warning so no retry duplicates the effect.
+    "GH_WRITE_READBACK_MISMATCH": (False, "ok"),
+    "native:OK:GH_WRITE_READBACK_MISMATCH": (False, "ok"),
+    # #1657: only missing logs are unavailable; status/stop retain warnings.
+    "SERVICE_NOT_FOUND": (False, "ok"),
+    "native:LEGACY_UNAVAILABLE:SERVICE_NOT_FOUND": (True, "unavailable"),
+    # services `_start_service` over an exited record: a restart refused because the previous start's processes are
+    # not confirmed ended, or another call still holds the name, publishes native LEGACY_BLOCKED with
+    # process_not_started (the retire may already have signalled processes, so no operation_outcome). The bare text
+    # keeps the recorded identifier row's answer (delta A.1657); only the native pair is new to the harvest.
+    "SERVICE_ALREADY_RUNNING": (True, "blocked"),
+    "native:LEGACY_BLOCKED:SERVICE_ALREADY_RUNNING": (True, "blocked"),
+    # #1657: containment failure is already an error through the legacy adapter
+    # (LEGACY_TOOL_ERROR). Its new native TOOL_ERROR publication preserves that
+    # outcome when wrapped by an authority-refusal message after a local commit.
+    # Only the native producer is new; retain the historical text golden intact.
+    "EVOLUTION_ORPHAN_CONTAINMENT_FAILED": (True, "error"),
+    "native:TOOL_ERROR:EVOLUTION_ORPHAN_CONTAINMENT_FAILED": (True, "error"),
+    # Body-candidate admission adds these two markers after the retired golden
+    # source. Pin what the live classifier actually answers; do not backfill a
+    # historical answer from a checkout that never emitted these strings.
+    "CANDIDATE_ALREADY_BOUND": (False, "ok"),
+    "IN_PLACE_REQUIRES_CYBER_PRO": (False, "ok"),
+    "native:ACCESS_BLOCKED:CANDIDATE_ALREADY_BOUND": (True, "blocked"),
+    "native:ACCESS_BLOCKED:IN_PLACE_REQUIRES_CYBER_PRO": (True, "blocked"),
+    # Declared-source admission is a new native argument refusal. The retired
+    # text adapter never recognized this marker; do not fabricate its golden.
+    "INPUT_SOURCE_SELECTION_UNSUPPORTED": (False, "ok"),
+    "native:TOOL_ARG_ERROR:INPUT_SOURCE_SELECTION_UNSUPPORTED": (True, "argument_error"),
+    # New merge producers are absent from the historical oracle. The partial
+    # f-string harvest is a legacy warning; the real tool carries TOOL_ERROR
+    # (and argument refusals TOOL_ARG_ERROR) through its typed sidecar.
+    "PR_MERGE_": (False, "ok"),
+    "PR_MERGE_REFUSED": (False, "ok"),
+    "native:TOOL_ERROR:PR_MERGE_": (True, "error"),
+    "native:TOOL_ERROR:PR_MERGE_REFUSED": (True, "error"),
+    "native:TOOL_ARG_ERROR:PR_MERGE_REFUSED": (True, "argument_error"),
+    # PR detail markers: native errors vs bare-text legacy warnings; public writes carry the shared receipt.
+    "PR_CREATE_UNKNOWN": (False, "ok"),
+    "PR_EXISTS": (False, "ok"),
+    "PR_PRECHECK_FAILED": (True, "error"),
+    "PR_READY_UNKNOWN": (False, "ok"),
+    "PR_UPDATE_UNKNOWN": (False, "ok"),
+    "native:TOOL_ERROR:PR_CREATE_UNKNOWN": (True, "error"),
+    "native:TOOL_ERROR:PR_EXISTS": (True, "error"),
+    "native:TOOL_ERROR:PR_PRECHECK_FAILED": (True, "error"),
+    "native:TOOL_ERROR:PR_READY_UNKNOWN": (True, "error"),
+    "native:TOOL_ERROR:PR_UPDATE_UNKNOWN": (True, "error"),
     # Saved-setting selection uses the existing process access authority; its new
     # foreground refusal remains blocked through both text and native ACCESS_BLOCKED.
     "PROCESS_ENV_REFERENCE_BLOCKED": (True, "blocked"),
-    "SAFETY_ADVICE": (False, "ok"),
+    # A command whose task deadline or execution budget is already spent starts no child
+    # (shell_process.command_bound_spent): the substrate's refusal, after the golden source.
+    "TASK_DEADLINE_BLOCKED": (True, "blocked"),
+    # Stop now ending a running run_command/run_script publishes the calling tool's native SHELL_ERROR
+    # (shell_process.unfinished_command_result). Only the native producer is new; the bare text keeps
+    # its golden `ident:SHELL_ERROR` answer, restated here and retained intact.
+    "SHELL_ERROR": (True, "shell_error"),
+    "native:SHELL_ERROR:SHELL_ERROR": (True, "shell_error"),
+    # Owner Batch4: a call the owner's Pause fenced before its launch handoff never
+    # ran; it is the substrate's answer, homed with the other runtime refusals.
+    "OWNER_PAUSE_NOT_STARTED": (True, "blocked"),
+    # git_managed_postcommit: a managed merge whose post-commit gates Pause refused, and a
+    # retained commit whose binding changed before Resume. Both publish typed results; the
+    # bare texts carry no marker the adapter types, as for CANDIDATE_ALREADY_BOUND above.
+    "OWNER_PAUSE": (False, "ok"),
+    "native:LEGACY_BLOCKED:OWNER_PAUSE": (True, "blocked"),
+    "MANAGED_UPDATE_POSTCOMMIT_CHANGED": (False, "ok"),
+    "native:LEGACY_TOOL_ERROR:MANAGED_UPDATE_POSTCOMMIT_CHANGED": (True, "error"),
+    "OWNER_LAUNCH_AUTHORITY_UNAVAILABLE": (True, "unavailable"),
+    # Direction06 adds producer-owned whole-invocation phase, not a rewritten historical golden.
+    "OWNER_OPERATION_REFUSED": (True, "blocked"),
+    "TOOL_ADMISSION_UNAVAILABLE": (True, "unavailable"),
+    "STOP_ACTION_CONFLICT": (True, "blocked"),
     "LIGHT_MODE_REPO_CHANGED": (False, "ok"),
     "BROWSER_ACTION_OUTCOME_UNKNOWN": (True, "error"),
+    # tools/vision.py `_no_image_route`: no configured model could take the image at all,
+    # told apart from VLM_NO_VISION_MODEL (every candidate confirmed unable); same VLM family answer.
+    "VLM_NO_MODEL": (True, "vlm_error"),
+    # Foreign-install refusals (copied data folder, owner Q3): a parent escalation keeps its
+    # approved plain delta and a forward names the foreign mailbox; both publish ACCESS_BLOCKED.
+    "ESCALATE_UNWRITTEN": (True, "error"),
+    "native:ACCESS_BLOCKED:ESCALATE_UNWRITTEN": (True, "blocked"),
+    "TASK_FOREIGN_INSTALL": (False, "ok"),
+    "native:ACCESS_BLOCKED:TASK_FOREIGN_INSTALL": (True, "blocked"),
+    # imagegen.py adds its typed markers after the retired golden source.
+    # Same contract shape as the VLM family: rate limit is a soft window
+    # (text lane unaffected), unknown outcome and provider failure are errors.
+    "IMAGE_RATE_LIMITED": (True, "unavailable"),
+    "IMAGE_OUTCOME_UNKNOWN": (True, "error"),
+    "IMAGE_NOT_DISPATCHED": (True, "unavailable"),
+    "IMAGE_PROVIDER_REJECTED": (True, "error"),
+    "IMAGE_RESULT_INCOMPLETE": (True, "error"),
+    "PATH_BLOCKED": (True, "blocked"),
     # The actual skill-metadata target refusal publishes its specific native
     # code; standalone historical-style text retains the generic blocked code.
     "SKILL_PAYLOAD_BLOCKED": (True, "blocked"),
@@ -340,10 +520,28 @@ CURRENT_PRODUCER_CONTRACTS = {
     # acknowledge these requested apply/discard operations as completed.
     "INTEGRATE_DELEGATED_APPLY_UNCONFIRMED": (True, "integration_blocked"),
     "INTEGRATE_DELEGATED_DISCARD_UNCONFIRMED": (True, "integration_blocked"),
+    # delegate_continuation.disposition_refusal: a captured result whose snapshot a
+    # continuation took over, or may be taking over (a pending hand-over), is not
+    # applied or rejected alone; nothing changes. Its peers' answer, asserted live.
+    "INTEGRATE_DELEGATED_CONTINUATION_PENDING": (True, "integration_blocked"),
+    "INTEGRATE_DELEGATED_SUPERSEDED": (True, "integration_blocked"),
+    # An evidence-only investigation's capture is never integrated (#1609): its
+    # refusal changes nothing and is its peers' answer, asserted live.
+    "INTEGRATE_DELEGATED_INVESTIGATION_EVIDENCE": (True, "integration_blocked"),
+    # #1969: an apply that had to prepare the capture returns it for inspection;
+    # nothing is applied, recorded or released. The protocol worked, so the call is
+    # no error, and its own bucket keeps it out of the success set (no effect).
+    "INTEGRATE_DELEGATED_INSPECT_CAPTURE": (False, "inspection_required"),
+    # #2070: named evidence that could not all be retained keeps its surviving copy;
+    # apply and reject record nothing and change nothing, so it is its peers' answer.
+    "INTEGRATE_DELEGATED_EVIDENCE_UNRETAINED": (True, "integration_blocked"),
     # A reject request cannot undo direct effects already in the folder.
     # The refusal belongs to this disposition, not to the earlier write.
     "INTEGRATE_DIRECTORY_ALREADY_APPLIED": (True, "integration_blocked"),
     "INTEGRATE_DIRECTORY_UNCONFIRMED": (True, "integration_blocked"),
+    # An unsuccessful directory run published no file work product: nothing was
+    # captured, so Apply applies nothing and keeps the engine copy; its peers' answer.
+    "INTEGRATE_DELEGATED_NOTHING_CAPTURED": (True, "integration_blocked"),
     # subagent_integration refuses to accept mismatched or unavailable file
     # evidence, or to integrate direct folder results through another surface.
     "INTEGRATE_DIRECTORY_OUTPUT_MISMATCH": (True, "integration_blocked"),
@@ -352,6 +550,16 @@ CURRENT_PRODUCER_CONTRACTS = {
     "INTEGRATE_CAPPED_TREE": (True, "integration_blocked"),
     "INTEGRATE_DIRECTORY_SURFACE_MISMATCH": (True, "integration_blocked"),
     "INTEGRATE_FILE_OUTPUTS_UNAVAILABLE": (True, "integration_blocked"),
+    "INTEGRATE_APPLY_UNKNOWN": (True, "integration_blocked"),
+    "INTEGRATE_COPY_BINDING_MISMATCH": (True, "integration_blocked"),
+    # #2753 late native captures (subagent_integration.py `_locate_child_patch` / `_integrate_subagent_patch`,
+    # subagent_integration_delegated.py `_integrate_git_capture`): a cancelled child, a capture that had to be
+    # refreshed (or could not be), and an unreadable child result apply nothing to the target. Plain text the
+    # registry adapts, so the live answer through the tool is the family's, the same as for the bare text.
+    "INTEGRATE_NATIVE_CANCELLED": (True, "integration_blocked"),
+    "INTEGRATE_NATIVE_CAPTURE": (True, "integration_blocked"),
+    "INTEGRATE_NATIVE_CAPTURE_UNAVAILABLE": (True, "integration_blocked"),
+    "INTEGRATE_RESULT_UNREADABLE": (True, "integration_blocked"),
     # The harvest puts every identifier first. A standalone capture failure
     # is an error; the actual successful-write suffix is pinned separately.
     "OUTPUT_CAPTURE_FAILED": (True, "error"),
@@ -369,6 +577,84 @@ CURRENT_PRODUCER_CONTRACTS = {
     "SCOPE_UNCONFIRMED": (True, "tool_reported_failure"),
     "TOOL_ERROR": (True, "error"),
     "native:TOOL_REPORTED_FAILURE:TOOL_ERROR": (True, "tool_reported_failure"),
+    # extension_dispatch's async runner that ended without a result is the first
+    # EXTENSION_ERROR producer with a literal first line, so the harvest now sees
+    # the pair. Its code answers as the shape:extension_handler_error row does (A.17).
+    "native:EXTENSION_ERROR:TOOL_ERROR": (True, "extension_error"),
+    # Release admission split its one PREFLIGHT_BLOCKED text in two: a source it
+    # could not read is unavailable evidence, not a candidate defect. The new
+    # identifier reaches its text through the `code` variable, so it is declared
+    # in the corpus' interpolated list and answered live here — the retired pair
+    # never saw a tree that emitted it.
+    "PREFLIGHT_UNAVAILABLE": (True, "unavailable"),
+    # Peer admission adds current producers; the historical fixture stays intact.
+    "TASK_CANCEL_STATE_UNAVAILABLE": (True, "unavailable"),
+    # #939: the new marker alone is a legacy warning. The actual scheduling
+    # refusal publishes TOOL_ERROR with reason=task_lifetime_exhausted; pin both
+    # answers without inventing a retired-golden entry or changing the producer.
+    "TASK_LIFETIME_EXHAUSTED": (False, "ok"),
+    "native:TOOL_ERROR:TASK_LIFETIME_EXHAUSTED": (True, "error"),
+    # #1262: an enabled MCP server with no current listing makes a name's existence
+    # unknown — the provider's unavailability, never the caller's unknown tool.
+    "MCP_CATALOG_UNAVAILABLE": (True, "unavailable"),
+    "TASK_FORBIDDEN": (True, "blocked"),
+    "native:LEGACY_BLOCKED:TASK_FORBIDDEN": (True, "blocked"),
+    # #1412: send_user_message(destination="main") refuses a caller with no Main
+    # voice (delegated, Presence, agent-to-agent) through native ACCESS_BLOCKED.
+    "MAIN_NOTICE_BLOCKED": (True, "blocked"),
+    "native:ACCESS_BLOCKED:MAIN_NOTICE_BLOCKED": (True, "blocked"),
+    # #1074: an admitted, absent path is a discovery miss — a successful call with
+    # a warning, the list_files/read_file parity. search_code's miss is a new
+    # identifier; the image loader now publishes the already-recorded
+    # FILE_NOT_FOUND text natively as LEGACY_WARNING (the plain answer is unchanged).
+    "SEARCH_NOT_FOUND": (False, "ok"),
+    "FILE_NOT_FOUND": (False, "ok"),
+    "native:LEGACY_WARNING:FILE_NOT_FOUND": (False, "ok"),
+    # Skills v4 sources are new producers, absent from the retired oracle. Plain
+    # *_ERROR markers are legacy errors; *_REFUSED markers are legacy warnings.
+    # The live tools publish argument errors or host failures explicitly, including
+    # bad-check arguments returned by the installer. Keep the old golden intact.
+    "SKILL_INSTALL_ERROR": (True, "error"),
+    "SKILL_INSTALL_REFUSED": (False, "ok"),
+    "SKILL_SOURCES_ERROR": (True, "error"),
+    "SKILL_SOURCES_REFUSED": (False, "ok"),
+    "SKILL_UPDATE_ERROR": (True, "error"),
+    "SKILL_UPDATE_REFUSED": (False, "ok"),
+    "native:TOOL_ARG_ERROR:SKILL_INSTALL_ERROR": (True, "argument_error"),
+    "native:TOOL_ARG_ERROR:SKILL_INSTALL_REFUSED": (True, "argument_error"),
+    "native:TOOL_ARG_ERROR:SKILL_SOURCES_ERROR": (True, "argument_error"),
+    "native:TOOL_ARG_ERROR:SKILL_UPDATE_ERROR": (True, "argument_error"),
+    "native:TOOL_ARG_ERROR:SKILL_UPDATE_REFUSED": (True, "argument_error"),
+    "native:TOOL_ERROR:SKILL_INSTALL_REFUSED": (True, "error"),
+    "native:TOOL_ERROR:SKILL_SOURCES_ERROR": (True, "error"),
+    "native:TOOL_ERROR:SKILL_SOURCES_REFUSED": (True, "error"),
+    "native:TOOL_ERROR:SKILL_UPDATE_REFUSED": (True, "error"),
+    # Owner decision (PR #1636): an exact edit that leaves .py/.json unparsable is
+    # applied and reported, never refused; the warning is a successful call.
+    "SYNTAX_WARNING": (False, "ok"),
+    # control_runtime `_send_user_message`: a relay answer that cannot be recorded as owed sends nothing and
+    # keeps the relay open, published as native CAPABILITY_UNAVAILABLE. The bare warning names no suffix the
+    # retired text chain keyed on, so it is the generic ok the retired chain gave FOCUS_STALE and CHERRY_PICK_CONFLICT.
+    "RELAY_RETURN_NOT_OWED": (False, "ok"),
+    "native:CAPABILITY_UNAVAILABLE:RELAY_RETURN_NOT_OWED": (True, "unavailable"),
+    # #2751 send family (owner_delivery.py `publish_delivery_receipt`, cards.py `_show_card`): a local-room frame an
+    # inline turn has no consumer for, and a non-text frame for an unbound peer, queue nothing and publish native
+    # CAPABILITY_UNAVAILABLE. The bare `_UNAVAILABLE` warning already reads unavailable; the bare `_UNSUPPORTED` one
+    # names no suffix the retired chain keyed on, so it is the generic ok and only the typed result carries the refusal.
+    "LOCAL_ROOM_UNAVAILABLE": (True, "unavailable"),
+    "native:CAPABILITY_UNAVAILABLE:LOCAL_ROOM_UNAVAILABLE": (True, "unavailable"),
+    "PEER_DELIVERY_UNSUPPORTED": (False, "ok"),
+    "native:CAPABILITY_UNAVAILABLE:PEER_DELIVERY_UNSUPPORTED": (True, "unavailable"),
+    # control_runtime `_fold_refusal`: a scratchpad fold that changed no block publishes native
+    # TOOL_REPORTED_FAILURE for a failed fold and for a conflict alike. The bare `_FAILED` warning is the
+    # retired chain's error (every prefix-free `_FAILED` golden row); a bare `_CONFLICT` reads as ok.
+    "SCRATCHPAD_FOLD_FAILED": (True, "error"),
+    "native:TOOL_REPORTED_FAILURE:SCRATCHPAD_FOLD_FAILED": (True, "tool_reported_failure"),
+    "SCRATCHPAD_FOLD_CONFLICT": (False, "ok"),
+    "native:TOOL_REPORTED_FAILURE:SCRATCHPAD_FOLD_CONFLICT": (True, "tool_reported_failure"),
+    # control_runtime `_update_scratchpad`: the canonical blocks hold the change and only the markdown
+    # projection is stale, so the warning trails a SUCCESSFUL write (status ok, code OK).
+    "SCRATCHPAD_PROJECTION_STALE": (False, "ok"),
 }
 
 
@@ -378,17 +664,195 @@ def _live_answer(case) -> tuple[bool, str]:
     return is_error, _typed_result_metadata(case.tool, case.text, is_error, typed)["status"]
 
 
-@pytest.mark.parametrize("subject", tuple(CURRENT_PRODUCER_CONTRACTS))
-@pytest.mark.parametrize("detail", [": detail line\nbody line", " (fixture_tool): detail line\nbody line"])
-def test_current_producer_contracts_have_explicit_live_answers(subject, detail):
+def _published_answer(tool: str, result) -> tuple[bool, str]:
+    is_error = _typed_execution_failure(True, result)
+    return is_error, _typed_result_metadata(tool, result.text, is_error, result)["status"]
+
+
+def test_current_producer_contracts_have_explicit_live_answers(subtests):
     """New producers need present contracts, never fabricated old answers."""
-    code = subject.split(":", 2)[1] if subject.startswith("native:") else ""
-    identifier = subject.rsplit(":", 1)[-1]
-    case = Case("current:" + subject, subject, "read_file", "⚠️ " + identifier + detail, code)
-    assert _live_answer(case) == CURRENT_PRODUCER_CONTRACTS[subject]
+    for subject in tuple(CURRENT_PRODUCER_CONTRACTS):
+        for detail in [": detail line\nbody line", " (fixture_tool): detail line\nbody line"]:
+            with subtests.test(subject=subject, detail=detail):
+                code = subject.split(":", 2)[1] if subject.startswith("native:") else ""
+                identifier = subject.rsplit(":", 1)[-1]
+                case = Case("current:" + subject, subject, "read_file", "⚠️ " + identifier + detail, code)
+                assert _live_answer(case) == CURRENT_PRODUCER_CONTRACTS[subject]
 
 
-@pytest.mark.parametrize("tool", ["write_file", "edit_text", "apply_patch", "edit_batch"])
+@pytest.mark.parametrize(("failure", "tool"), [
+    ("staged_hash", "skill_install"),
+    ("landing", "skill_install"),
+    ("bad_check", "skill_update"),
+    ("empty_notes", "skill_update"),
+])
+def test_registry_failures_keep_the_current_producer_contract(registry_release, monkeypatch, tool, failure):  # noqa: F811
+    from ouroboros.skill_install_record import read_install_record
+    from ouroboros.tools.registry import ToolContext
+    from tests.test_skill_source_tools import _typed_call
+
+    drive, storage, registry = registry_release
+    registry["latest"] = "2.0.0"
+    if tool == "skill_install":
+        drive = drive.parent / "fresh-install"
+    previous = read_install_record(drive, "demo")
+
+    def fail(*args, **kwargs):
+        raise OSError("injected registry disk failure")
+
+    arguments = {"id": "clawhub/demo", "reason": "r"} if tool == "skill_install" else {
+        "name": "demo", "mode": "replace"}
+    bad_arguments = failure in {"bad_check", "empty_notes"}
+    if bad_arguments:
+        arguments.update(check="unknown" if failure == "bad_check" else "self", check_notes="")
+    else:
+        monkeypatch.setattr(storage, "_registry_install_record" if failure == "staged_hash"
+                            else "_land_staged_into_data_plane", fail)
+    result = _typed_call(tool, ToolContext(repo_dir=drive.parent, drive_root=drive), **arguments)
+    expected_code = "TOOL_ARG_ERROR" if bad_arguments else "TOOL_ERROR"
+    assert (result.status, result.code) == ("error", expected_code)
+    if bad_arguments:
+        assert '"code": "bad_check"' in result.text
+    else:
+        assert "injected registry disk failure" in result.text
+    is_error = _typed_execution_failure(True, result)
+    actual = (is_error, _typed_result_metadata(tool, result.text, is_error, result)["status"])
+    assert actual == CURRENT_PRODUCER_CONTRACTS[f"native:{expected_code}:{tool.upper()}_REFUSED"]
+    current = read_install_record(drive, "demo")
+    assert (current or {}).get("release") == (previous or {}).get("release")
+
+
+def test_spent_execution_budget_publishes_the_actual_scheduling_refusal(tmp_path, monkeypatch):
+    from queue import Queue
+    from ouroboros.tools import control_scheduling
+    from ouroboros.tools.registry import ToolContext
+    from tests.test_control_native_results import _published
+
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id="bounded-parent")
+    ctx.event_queue = Queue()
+    monkeypatch.setattr(control_scheduling, "_inherited_execution_allowance", lambda _ctx: 0)
+    monkeypatch.setattr(control_scheduling, "select_subagent_snapshot",
+                        lambda *a, **kw: pytest.fail("spent allowance must refuse before child selection"))
+    result = _published(ctx, "schedule_subagent", lambda: control_scheduling._schedule_task(
+        ctx, subagent_id="unused", objective="Inspect", expected_output="Findings"),
+        owner_delta="the exhausted execution allowance is a typed refusal")
+    assert result.text == (
+        "⚠️ TASK_LIFETIME_EXHAUSTED (schedule_subagent): this task's execution budget is spent; "
+        "no child was scheduled. Finalize with what you have.")
+    assert (result.status, result.code, dict(result.meta)) == (
+        "error", "TOOL_ERROR", {"reason": "task_lifetime_exhausted"})
+    is_error = _typed_execution_failure(True, result)
+    assert (is_error, _typed_result_metadata("schedule_subagent", result.text, is_error, result)["status"]) == (
+        CURRENT_PRODUCER_CONTRACTS["native:TOOL_ERROR:TASK_LIFETIME_EXHAUSTED"])
+    from ouroboros import store
+
+    assert ctx.event_queue.empty() and not store.store_path(tmp_path).exists()  # no child row was written
+
+
+def test_unrecordable_relay_answer_publishes_the_current_producer_contract(tmp_path, monkeypatch):
+    from queue import Queue
+    from ouroboros.tools.control_runtime import _send_user_message
+    from tests.test_control_native_results import _published
+    from tests.test_owner_relay import context, source
+
+    _row, handle = source(tmp_path)
+    recipient = context(tmp_path)
+    recipient.task_id, recipient.event_queue = "recipient", Queue()
+    recipient._open_relays = {"once": {"relay_id": "once", "source": {"chat_id": 1, "address": handle, "label": "Main"}}}
+    monkeypatch.setattr("supervisor.terminal_delivery.register_pending_delivery", lambda *_a, **_k: False)
+    result = _published(recipient, "send_user_message", lambda: _send_user_message(
+        recipient, "Response after relay", reply_to_relay="once"),
+        owner_delta="an answer that cannot be recorded as owed is a typed unavailable refusal")
+    assert (result.status, result.code) == ("unavailable", "CAPABILITY_UNAVAILABLE")
+    assert "RELAY_RETURN_NOT_OWED" in result.text and recipient.event_queue.empty() and "once" in recipient._open_relays
+    assert _published_answer("send_user_message", result) == (
+        CURRENT_PRODUCER_CONTRACTS["native:CAPABILITY_UNAVAILABLE:RELAY_RETURN_NOT_OWED"])
+
+
+@pytest.mark.parametrize(("identifier", "tool"), [
+    ("LOCAL_ROOM_UNAVAILABLE", "send_user_message"),
+    ("LOCAL_ROOM_UNAVAILABLE", "send_video"),
+    ("LOCAL_ROOM_UNAVAILABLE", "send_links"),
+    ("PEER_DELIVERY_UNSUPPORTED", "send_photo"),
+    ("PEER_DELIVERY_UNSUPPORTED", "send_file"),
+    ("PEER_DELIVERY_UNSUPPORTED", "show_card"),
+])
+def test_undelivered_send_frames_publish_the_current_producer_contract(tmp_path, monkeypatch, identifier, tool):
+    """A send that queued nothing answers through the registry as the producer's typed refusal.
+
+    LOCAL_ROOM_UNAVAILABLE: an inline Presence turn's local-room frame with no live queue, worker sink or
+    supervisor bus (owner_delivery `_no_consumer`). PEER_DELIVERY_UNSUPPORTED: a non-text frame for an unbound
+    peer, where text still goes. Real Place turns and their receipt words: tests/test_presence_final_route.py
+    and tests/test_owner_live_delivery.py.
+    """
+    from queue import Queue
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
+    from ouroboros.utils import WORKER_PROCESS_ENV
+
+    def no_supervisor_bus(**_kwargs):
+        raise RuntimeError("no supervisor event bus in this process")
+
+    peer = identifier == "PEER_DELIVERY_UNSUPPORTED"
+    monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_SAFETY_MODE", "off")
+    monkeypatch.delenv(WORKER_PROCESS_ENV, raising=False)
+    monkeypatch.setattr("supervisor.workers.get_event_q", no_supervisor_bus)
+    repo, data = tmp_path / "repo", tmp_path / "data"
+    repo.mkdir()
+    data.mkdir()
+    (repo / "a.mp4").write_bytes(b"0" * 64)
+    (repo / "a.txt").write_text("a report", encoding="utf-8")
+    arguments = {"send_user_message": {"text": "A word."},
+                 "send_photo": {"image_base64": base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"0" * 4096).decode()},
+                 "send_video": {"file_path": str(repo / "a.mp4")}, "send_file": {"file_path": str(repo / "a.txt")},
+                 "send_links": {"links": [{"label": "Docs", "url": "https://example.test/x"}]},
+                 "show_card": {"title": "Status", "fallback_text": "All green",
+                               "components": [{"type": "metric", "label": "Up", "value": "9"}]}}
+    ctx = ToolContext(repo_dir=repo, drive_root=data, budget_drive_root=data, task_id="sender",
+                      current_chat_id=-5 if peer else 1001, task_contract={},
+                      task_metadata={} if peer else {"presence_event_identity": "place-event:fixture"})
+    ctx.event_queue = Queue() if peer else None
+    registry = ToolRegistry(repo_dir=repo, drive_root=data)
+    registry.set_context(ctx)
+    result = registry.execute_result(tool, arguments[tool])
+    words = json.loads(result.text)["delivery"] if tool == "show_card" else result.text
+    if peer and tool == "send_user_message":  # the refusal is the frame's, not the peer's: text is queued for it
+        assert (result.code, words, len(ctx.pending_events)) == (
+            "OK", "OK: message queued for delivery to the peer conversation.", 1)
+        return
+    assert words.startswith(f"⚠️ {identifier}: ") and "not delivered" in words, words
+    assert (result.status, result.code) == ("unavailable", "CAPABILITY_UNAVAILABLE")
+    assert not ctx.pending_events and (ctx.event_queue is None or ctx.event_queue.empty())
+    assert _published_answer(tool, result) == CURRENT_PRODUCER_CONTRACTS[f"native:CAPABILITY_UNAVAILABLE:{identifier}"]
+
+
+@pytest.mark.parametrize("scenario", ["fold_conflict", "fold_failed", "projection_stale"])
+def test_scratchpad_warnings_publish_the_current_producer_contract(scratchpad_install, monkeypatch, scenario):  # noqa: F811
+    from ouroboros.memory import Memory, ScratchpadFoldFailed
+    from tests.test_scratchpad_fold import _tool
+
+    identifier = f"SCRATCHPAD_{scenario.upper()}"
+    _env, _memory, registry = scratchpad_install
+    assert _tool(registry, content="a block for the fold to name").status == "ok"
+    if scenario == "projection_stale":
+        def stale_projection(self, blocks):
+            raise OSError("injected projection failure")
+        monkeypatch.setattr(Memory, "_write_scratchpad_markdown", stale_projection)
+        result = _tool(registry, content="a block whose projection cannot be written")
+        published, contract = ("ok", "OK"), CURRENT_PRODUCER_CONTRACTS[identifier]
+    else:
+        if scenario == "fold_failed":
+            def refuse(self, *args, **kwargs):
+                raise ScratchpadFoldFailed("write_failed", "injected disk failure")
+            monkeypatch.setattr(Memory, "fold_scratchpad_blocks", refuse)
+        result = _tool(registry, content="FOLD naming a block nobody holds.", replaces=["0" * 64])
+        published = ("error", "TOOL_REPORTED_FAILURE")
+        contract = CURRENT_PRODUCER_CONTRACTS[f"native:TOOL_REPORTED_FAILURE:{identifier}"]
+    assert (result.status, result.code) == published and identifier in result.text
+    assert _published_answer("update_scratchpad", result) == contract
+
+
+@pytest.mark.parametrize("tool", ["write_file", "apply_patch", "edit_batch"])
 def test_output_capture_warning_preserves_the_successful_write(tool):
     """workspace_file_outputs.capture_known_workspace_outputs runs post-write.
 
@@ -404,9 +868,17 @@ def test_output_capture_warning_preserves_the_successful_write(tool):
     assert _live_answer(case._replace(text=warning)) == CURRENT_PRODUCER_CONTRACTS["OUTPUT_CAPTURE_FAILED"]
 
 
-def test_single_classifier_matches_the_retired_pair_except_approved_deltas() -> None:
+@pytest.mark.parametrize("tool", ["edit_text", "apply_patch", "edit_batch"])
+def test_syntax_warning_suffix_keeps_the_applied_edit_successful(tool):
+    """edit_ops.edit_syntax_note trails an edit that already landed."""
+    text = (f"✅ {tool} applied 1 edit(s) across 1 file(s):\n"
+            "⚠️ SYNTAX_WARNING: content is not valid JSON in a.json; the edit WAS applied.")
+    assert _live_answer(Case("current:syntax-suffix:" + tool, "SYNTAX_WARNING", tool, text)) == (False, "ok")
+
+
+def test_single_classifier_matches_the_retired_pair_except_approved_deltas(classification_corpus) -> None:
     golden = _golden()
-    corpus = build_corpus()
+    corpus = classification_corpus
     assert len(corpus) >= 600, "the corpus collapsed; a harvest regression would hide every delta"
 
     unexpected: list[tuple[str, dict, tuple[bool, str]]] = []
@@ -443,9 +915,9 @@ def test_every_approved_delta_names_an_owner_item() -> None:
         assert (delta.old_is_error, delta.old_status) != (delta.new_is_error, delta.new_status), subject
 
 
-def test_native_golden_answers_have_identical_retired_text_inputs() -> None:
+def test_native_golden_answers_have_identical_retired_text_inputs(classification_corpus) -> None:
     """The old pair ignores native codes; aliases must retain its exact input."""
-    corpus = {case.key: case for case in build_corpus()}
+    corpus = {case.key: case for case in classification_corpus}
     golden = _golden()
     for key, native in corpus.items():
         if not key.startswith("native:"):
@@ -462,7 +934,7 @@ def test_native_golden_answers_have_identical_retired_text_inputs() -> None:
             assert _live_answer(plain) == CURRENT_PRODUCER_CONTRACTS[identifier]
 
 
-def test_shape_golden_answers_match_their_own_identifier_line() -> None:
+def test_shape_golden_answers_match_their_own_identifier_line(classification_corpus) -> None:
     """A hand-added shape answer is derived from the golden, never invented.
 
     The retired pair is a pure text chain over the result's first marker line,
@@ -479,7 +951,7 @@ def test_shape_golden_answers_match_their_own_identifier_line() -> None:
     """
     golden = _golden()
     checked = []
-    for case in build_corpus():
+    for case in classification_corpus:
         if not case.key.startswith("shape:"):
             continue
         marker = _MARKER_RE.match(case.text.strip())
@@ -493,16 +965,16 @@ def test_shape_golden_answers_match_their_own_identifier_line() -> None:
     assert len(checked) >= 20, "the marker-led shape rows collapsed; the rule lost its witnesses"
 
 
-def test_every_delta_without_a_producer_is_named_with_its_reason() -> None:
+def test_every_delta_without_a_producer_is_named_with_its_reason(producer_harvest) -> None:
     """The two unreachable deltas stay documented, never approved: an approved row
     that cannot fire would fail the table's own staleness direction."""
     assert set(_DELTAS_WITHOUT_A_PRODUCER).isdisjoint(APPROVED_DELTAS)
     for subject, reason in _DELTAS_WITHOUT_A_PRODUCER.items():
         assert reason.strip(), subject
-    assert "SKILL_PAYLOAD_CONTROL_BLOCKED" not in harvested_identifiers()
+    assert "SKILL_PAYLOAD_CONTROL_BLOCKED" not in producer_harvest.identifiers
 
 
-def test_every_native_code_is_covered_by_the_corpus() -> None:
+def test_every_native_code_is_covered_by_the_corpus(classification_corpus, producer_harvest) -> None:
     """A producer cannot publish a code the differential has never classified.
 
     The text corpus is blind to a producer that assembles its text at runtime, and
@@ -510,8 +982,8 @@ def test_every_native_code_is_covered_by_the_corpus() -> None:
     That blind spot let four extension terminals, both MCP unavailable terminals and
     the registry's unknown-tool publish change status with no test able to notice.
     Any new native code now fails here until a corpus case exercises it."""
-    covered = {case.code for case in build_corpus() if case.code}
-    uncovered = sorted(set(harvested_native_codes()) - covered)
+    covered = {case.code for case in classification_corpus if case.code}
+    uncovered = sorted(set(producer_harvest.native_codes) - covered)
     assert not uncovered, (
         "native producer codes no corpus case classifies (add a _PRODUCER_SHAPES "
         f"entry transcribed from the producer): {uncovered}"
@@ -585,15 +1057,32 @@ def test_a_control_refusal_typed_unavailable_is_the_substrates_answer() -> None:
     assert [row["tool"] for row in mistake["unresolved"]] == ["get_task_result"]
 
 
-def test_golden_covers_every_harvested_producer() -> None:
+def test_golden_covers_every_harvested_producer(producer_harvest) -> None:
     """A producer added after the cutover has no golden answer, so it fails here
     instead of silently entering the tree with an unverified classification."""
     golden = _golden()
     missing = [
-        identifier for identifier in harvested_identifiers()
+        identifier for identifier in producer_harvest.identifiers
         if f"ident:{identifier}:plain" not in golden and identifier not in CURRENT_PRODUCER_CONTRACTS
     ]
     assert not missing, f"new warning identifiers without a golden answer: {missing}"
+
+
+def test_harvest_reads_changed_and_new_producers(tmp_path):
+    """An explicit harvest is current even after the same root was read before."""
+    source = tmp_path / "ouroboros" / "producer.py"
+    source.parent.mkdir()
+    source.write_text('ToolResult(code="BEFORE", text="⚠️ BEFORE: detail")\n', encoding="utf-8")
+    before = harvest_producers(tmp_path)
+    source.write_text('ToolResult(code="AFTER", text="⚠️ AFTER: detail")\n', encoding="utf-8")
+    (source.parent / "new.py").write_text(
+        'ToolResult(code="ADDED", text=message)\n', encoding="utf-8")
+    after = harvest_producers(tmp_path)
+    assert "BEFORE" in before.identifiers and "BEFORE" not in after.identifiers
+    assert before.native_codes == ("BEFORE",)
+    assert after.native_codes == ("ADDED", "AFTER")
+    assert before.native_pairs == (("BEFORE", "BEFORE"),)
+    assert after.native_pairs == (("AFTER", "AFTER"),)
 
 
 def test_specific_identifiers_beat_their_family_and_families_beat_generic_markers() -> None:
@@ -639,6 +1128,7 @@ def test_every_outcome_bucket_is_partitioned() -> None:
         | set(_NON_BLOCKING_RECOVERABLE_STATUSES)
         | set(_NON_BLOCKING_READONLY_BLOCK_STATUSES)
         | set(_OK_TOOL_STATUSES)
+        | set(_NON_EFFECT_OBSERVATION_STATUSES)
         | set(_UNPARTITIONED_BUCKETS)
     )
     unhomed = sorted({spec.outcome_bucket for spec in TOOL_CODE_SPECS.values()} - known)
@@ -658,14 +1148,13 @@ _RESIDUAL_TEXT_INSPECTIONS: Mapping[str, tuple[int, str]] = MappingProxyType({
     # The row is gone rather than zeroed: a module absent from this inventory may
     # hold none at all, which is exactly the claim now.
     "ouroboros/memory.py": (1, "tools.jsonl rows appended by consciousness carry neither status nor code"),
-    "ouroboros/skill_review_prompt.py": (2, "skill review verdict text, not a tool result"),
     "ouroboros/tools/github.py": (12, "private helper-failure checks between two functions of one tool"),
     # Upstream re-homed the skill-publish helper checks into their own module
-    # (skill_publish_github.py) and split the advisory run into
-    # preflight_review_run.py on this tree — redistribution, not growth.
+    # (skill_publish_github.py) — redistribution, not growth. The advisory
+    # pipeline's seven (claude_advisory_review.py, preflight_review_run.py) and
+    # the skill advisory critic's two (skill_review_prompt.py) left with that
+    # pipeline; their rows are gone rather than zeroed.
     "ouroboros/skill_publish_github.py": (7, "private helper-failure checks between two functions of one tool"),
-    "ouroboros/tools/claude_advisory_review.py": (4, "private helper-failure checks between two functions of one tool"),
-    "ouroboros/tools/preflight_review_run.py": (3, "private helper-failure checks between two functions of one tool"),
     # Post-cutoff upstream module: the request-wire custom-tool receipts compose
     # their own ⚠️ argument-error texts; predates the organ, upstream truth.
     "ouroboros/openai_chat_dispatch.py": (2, "private helper-failure checks between two functions of one tool"),
@@ -706,9 +1195,9 @@ def test_residual_text_inspection_inventory_does_not_grow() -> None:
 
 
 @pytest.mark.parametrize("case_key", ["shape:shell_no_match_autocorrected", "shape:shell_ok"])
-def test_process_facts_stay_typed_not_parsed(case_key: str) -> None:
+def test_process_facts_stay_typed_not_parsed(case_key: str, classification_corpus) -> None:
     """The three post-rules that are NOT text classification keep working off meta."""
-    case = next(item for item in build_corpus() if item.key == case_key)
+    case = next(item for item in classification_corpus if item.key == case_key)
     typed = typed_result(case)
     meta = _typed_result_metadata(case.tool, case.text, False, typed)
 

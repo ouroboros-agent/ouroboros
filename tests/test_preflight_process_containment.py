@@ -18,6 +18,34 @@ import pytest
 from ouroboros.platform_layer import force_kill_pid, pid_is_alive
 
 
+def test_process_container_does_not_propagate_launcher_authority(monkeypatch):
+    """A contained child must not inherit the launcher-only destructive marker.
+
+    The real launcher starts its managed server through its direct Popen seam;
+    ProcessContainer is used for fixtures and helper children, where carrying
+    this authority would let a child bootstrap/reset an arbitrary checkout.
+    """
+    from ouroboros.process_containment import ProcessContainer
+
+    monkeypatch.setenv("OUROBOROS_MANAGED_BY_LAUNCHER", "1")
+    monkeypatch.setenv("OUROBOROS_MANAGED_REPO_DIR", "/private/launcher-repo")
+    container = ProcessContainer()
+    proc = container.spawn(
+        [sys.executable, "-c", "import os; print(os.environ.get('OUROBOROS_MANAGED_BY_LAUNCHER', ''), flush=True); print(os.environ.get('OUROBOROS_MANAGED_REPO_DIR', ''), flush=True)"],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert proc.stdout is not None
+        assert proc.stdout.readline().strip() == ""
+        assert proc.stdout.readline().strip() == ""
+        assert proc.wait(timeout=10) == 0
+    finally:
+        container.close()
+        if proc.stdout is not None:
+            proc.stdout.close()
+
+
 def test_windows_containment_uses_the_shared_job_seam_and_closes_the_spawn_race(monkeypatch):
     """The Windows branch must reuse platform_layer's OWN Job Object seam, and it
     must assign the process to the job BEFORE the process can run.
@@ -50,9 +78,10 @@ def test_windows_containment_uses_the_shared_job_seam_and_closes_the_spawn_race(
         return _FakeProc()
 
     monkeypatch.setattr(platform_layer, "IS_WINDOWS", True)
-    # CREATE_NEW_PROCESS_GROUP does not exist in `subprocess` on POSIX, so the
-    # real kwargs helper cannot run here; its Windows return value is stubbed.
-    monkeypatch.setattr(platform_layer, "subprocess_new_group_kwargs", lambda: {"creationflags": 0x200})
+    # CREATE_NEW_PROCESS_GROUP does not exist in `subprocess` on POSIX, so the real kwargs helper cannot run
+    # here; its Windows return value is stubbed (the group flag, plus the below-normal class for `background`).
+    monkeypatch.setattr(platform_layer, "subprocess_new_group_kwargs",
+                        lambda background=False, **kwargs: {"creationflags": 0x200 | (0x4000 if background else 0)})
     monkeypatch.setattr(subprocess, "Popen", _fake_popen)
     monkeypatch.setattr(platform_layer, "create_kill_on_close_job", lambda: calls.append(("create_job",)) or "job")
     monkeypatch.setattr(platform_layer, "assign_pid_to_job", lambda job, pid: calls.append(("assign", job, pid)) or True)
@@ -79,6 +108,36 @@ def test_windows_containment_uses_the_shared_job_seam_and_closes_the_spawn_race(
     assert flags & 0x200, "the new-process-group creation flag was dropped"
     assert calls[2] == ("assign", "job", 4321)
     assert calls[3] == ("resume", 4321)
+    # The background priority class is one more creation flag beside the group and suspended ones.
+    calls.clear()
+    behind = process_containment.ProcessContainer()
+    behind.spawn(["pytest"], background=True, cwd=".")
+    behind.reap()
+    behind.close()
+    assert calls[0][1] & 0x4000 and calls[0][1] & 0x4 and calls[0][1] & 0x200, calls[0]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX nice; the Windows class is asserted on the creation flags above")
+def test_a_background_spawn_lowers_the_priority_of_the_whole_tree():
+    """The gate's tree runs behind the owner's work: ``background=True`` lowers the root's process group by ten
+    right after it exists (argv untouched, so the container's root identity and every reader of the command hold)
+    and a grandchild inherits it; a plain spawn keeps the caller's priority."""
+    from ouroboros.process_containment import ProcessContainer
+
+    # `os.getpriority`, not `os.nice(0)`: macOS refuses even a zero increment at the ceiling (EPERM).
+    script = ("import os, subprocess, sys; print(os.getpid(), os.getpriority(os.PRIO_PROCESS, 0), subprocess.run("
+              "[sys.executable, '-c', 'import os; print(os.getpriority(os.PRIO_PROCESS, 0))'], capture_output=True, "
+              "text=True).stdout.strip())")
+    mine = os.getpriority(os.PRIO_PROCESS, 0)
+    for background, expected in ((True, min(mine + 10, 19)), (False, mine)):
+        container = ProcessContainer()
+        proc = container.spawn([sys.executable, "-c", script], background=background, stdout=subprocess.PIPE, text=True)
+        out, _ = proc.communicate(timeout=60)
+        assert container.reap() == ""
+        container.close()
+        pid, own, child = out.split()
+        assert proc.args[0] == sys.executable  # the command is the caller's, never a wrapper's
+        assert (int(pid), int(own), int(child)) == (proc.pid, expected, expected), (background, out)
 
 def test_a_windows_root_that_cannot_be_job_held_is_killed_and_reported(monkeypatch):
     """A root no Job Object can hold is terminated, never resumed uncontained.
@@ -102,7 +161,7 @@ def test_a_windows_root_that_cannot_be_job_held_is_killed_and_reported(monkeypat
         pid = 99
 
     monkeypatch.setattr(platform_layer, "IS_WINDOWS", True)
-    monkeypatch.setattr(platform_layer, "subprocess_new_group_kwargs", lambda: {"creationflags": 0x200})
+    monkeypatch.setattr(platform_layer, "subprocess_new_group_kwargs", lambda **kwargs: {"creationflags": 0x200})
     monkeypatch.setattr(subprocess, "Popen", lambda argv, **kwargs: _FakeProc())
     monkeypatch.setattr(platform_layer, "create_kill_on_close_job", lambda: None)
     monkeypatch.setattr(platform_layer, "assign_pid_to_job", lambda job, pid: calls.append(("assign", pid)) or True)
@@ -390,6 +449,7 @@ def test_the_membership_token_survives_the_preflight_env_scrub(tmp_path, monkeyp
     outer = CONTAINMENT_ENV_PREFIX + "outer0123456789"
     monkeypatch.setenv(outer, "1")
     monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_SAFETY_MODE", "off")
 
     env = _preflight_env(tmp_path / "root", tmp_path / "root" / "repo")
 
@@ -486,7 +546,6 @@ def test_a_stranger_that_took_a_recycled_pid_or_pgid_is_never_signalled(monkeypa
         stranger.wait(timeout=10)
 
 
-@pytest.mark.serial
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux nondumpable process fixture")
 def test_unrelated_nondumpable_process_does_not_block_or_receive_a_signal(monkeypatch, caplog):
     import builtins

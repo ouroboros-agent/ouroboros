@@ -44,10 +44,12 @@ class Api:
 
 
 class Client:
+    bot_id = ""
     updates: list = []
     instances: list = []
 
     def __init__(self, token, **_kwargs):
+        self.token = token
         self.sent, self.downloads = [], []
         Client.instances.append(self)
 
@@ -185,9 +187,16 @@ def test_unsupported_kinds_get_an_explicit_notice(tmp_path, monkeypatch):
                                 "(document, video, audio, voice).")]
 
 
-def test_inbound_file_descriptor_shapes():
+def test_inbound_file_descriptor_shapes(tmp_path, monkeypatch):
     plugin = _load_plugin()
     inbound = plugin.telegram_inbound
+    from ouroboros import i18n_memory as memory
+
+    plugin.telegram_i18n.configure(tmp_path)
+    monkeypatch.setenv("OUROBOROS_UI_LANGUAGE", "ru")
+    memory.update_memory(tmp_path, "ru", lambda doc: (memory.apply_generated(doc, {
+        "code:tg.inbound.too_large": {"text": "Файл весит {size} МиБ; эта интеграция принимает файлы не больше 10 МиБ."}},
+        model="test"), doc)[1], create=True)
     assert inbound.inbound_file({"text": "hi"}) is None
     doc = inbound.inbound_file({"document": {"file_id": "f", "file_name": "../../evil.sh", "mime_type": "text/x-sh"}})
     assert doc["name"] == "evil.sh" and doc["refusal"] == ""
@@ -195,6 +204,8 @@ def test_inbound_file_descriptor_shapes():
     assert note["name"] == "video_note_12345678.mp4" and note["mime"] == "video/mp4"
     assert inbound.inbound_file({"audio": {"file_id": "", "file_name": "x.mp3"}}) is None
     assert inbound.refusal_text({"size": 12 * 1024 * 1024}, "ru").startswith("Файл весит 12.0 МиБ")
+    assert inbound.refusal_text({"size": 12 * 1024 * 1024}, "").startswith("This file is 12.0 MiB")
+    plugin.telegram_i18n.configure(None)
 
 
 @pytest.mark.parametrize("filename", [r"x\..\..\..\escape.txt", r"C:\outside\data.pdf", "report.pdf"])

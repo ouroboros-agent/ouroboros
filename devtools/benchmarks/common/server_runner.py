@@ -16,13 +16,16 @@ devtools/benchmarks/terminal_bench/harbor_installed_agent.py.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import pathlib
+import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -32,7 +35,7 @@ import uuid
 if __package__ in {None, ""}:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
 
-from devtools.benchmarks.common.manifests import runtime_attestation
+from devtools.benchmarks.common.manifests import ACTIVE_MODEL_SLOT_KEYS, MODEL_SLOT_KEYS, runtime_attestation
 from devtools.benchmarks.common.secrets import isolated_credential_grants  # noqa: F401 (re-export)
 from ouroboros.context_mode_compat import normalize_context_mode_compat
 from ouroboros.platform_layer import (
@@ -42,6 +45,7 @@ from ouroboros.platform_layer import (
 )
 from ouroboros.provider_models import (
     ALL_PROVIDER_CREDENTIAL_KEYS,
+    CONNECTIONS_KEY,
     LEGACY_MODEL_SETTING_KEYS,
     provider_credential_plan,
 )
@@ -68,7 +72,10 @@ STALE_INHERITED_ENV_KEYS = (
     # advanced sandbox — strip it so the sanitized settings win.
     "OUROBOROS_BOOT_RUNTIME_MODE",
     "USE_LOCAL_MAIN", "USE_LOCAL_CODE", "USE_LOCAL_LIGHT", "USE_LOCAL_FALLBACK",
-    "USE_LOCAL_CONSCIOUSNESS", "OUROBOROS_REVIEWER_SLOTS",
+    "USE_LOCAL_CONSCIOUSNESS",
+    # The review pool rides the roster (OUROBOROS_SUBAGENTS, stripped above); the
+    # lane-era panel key is inert but must not leak either.
+    "OUROBOROS_REVIEWER_SLOTS",
     # Owner/control SECRETS must never leak into the isolated server's env (untrusted
     # benchmark tasks run here). Provider creds are loaded from the sanitized settings.json.
     "GITHUB_TOKEN", "GITHUB_REPO", "OUROBOROS_NETWORK_PASSWORD",
@@ -86,14 +93,15 @@ _ISO_SETTINGS_ALLOW_PREFIX = ("OUROBOROS_MODEL", "OUROBOROS_EFFORT", "LOCAL_MODE
 # see _grant_provider_credentials. Deliberately NOT a `*_API_KEY` pattern either: a custom
 # skill secret could be named `<x>_API_KEY` and must NOT be copied.
 _ISO_SETTINGS_ALLOW_EXACT = frozenset({
+    # The roster carries the delegation actor AND the review pool (its marked rows).
     "OUROBOROS_SUBAGENTS",
-    "OUROBOROS_REVIEWER_SLOTS",
-    "OUROBOROS_WEBSEARCH_MODEL", "OUROBOROS_REVIEW_MODELS",
-    "OUROBOROS_SCOPE_REVIEW_MODELS", "OUROBOROS_SCOPE_REVIEW_MODEL",
-    # Review policy knobs (non-secret): must propagate so settings.json's task-acceptance
-    # self-review config is honored by isolated benchmark servers (else it silently
+    # The web search Source and Model are one choice: a ddgs pin's stale Model must not become
+    # paid Auto search, nor an Anthropic pin's legacy bare id change meaning. Overrides still win.
+    "OUROBOROS_WEBSEARCH_MODEL", "OUROBOROS_WEBSEARCH_BACKEND",
+    # Review policy knobs (non-secret): must propagate so settings.json's result-review
+    # config is honored by isolated benchmark servers (else it silently
     # falls back to the "auto" default and the end-of-task review never runs).
-    "OUROBOROS_TASK_REVIEW_MODE", "OUROBOROS_REVIEW_ENFORCEMENT",
+    "OUROBOROS_TASK_REVIEW_MODE",
     # Shared paid review-cycle ceiling (non-secret): bench templates pin it to
     # "unlimited" for methodology comparability; a live-settings pin must forward
     # into isolated bench servers the same way the other review knobs do.
@@ -112,6 +120,7 @@ _PROVIDER_ENV_KEYS = frozenset({
     "OPENROUTER_API_KEY", "OPENAI_API_KEY", "OPENAI_COMPATIBLE_API_KEY",
     "CLOUDRU_FOUNDATION_MODELS_API_KEY", "ANTHROPIC_API_KEY", "MINIMAX_API_KEY",
     "DEEPSEEK_API_KEY",
+    "ZAI_API_KEY",
     "GIGACHAT_CREDENTIALS", "GIGACHAT_PASSWORD",
 })
 
@@ -122,7 +131,7 @@ _PROVIDER_ENV_KEYS = frozenset({
 # path/port values that this lifecycle writes back explicitly, plus one
 # operational host-load lever: ``OUROBOROS_PREFLIGHT_TEST_WORKERS`` caps the
 # xdist fan-out of the commit gate's hermetic pytest pass (read by
-# ``preflight_runner._preflight_worker_count`` in the server process, never a
+# ``preflight_probe._preflight_worker_count`` in the server process, never a
 # model/credential/settings key, and still scrubbed from the candidate suite's
 # own environment by ``preflight_runner._preflight_env``).  Without it every
 # isolated server resolves ``-n auto`` to the host's CPU count.  This is scoped
@@ -145,6 +154,7 @@ _AUTHORITATIVE_ENV_PREFIXES = (
     "ANTHROPIC_",
     "MINIMAX_",
     "DEEPSEEK_",
+    "ZAI_",
     "CLOUDRU_",
     "GIGACHAT_",
     "CLAUDE_",
@@ -175,13 +185,14 @@ def _settings_json_bytes(config: dict) -> bytes:
 
 
 def _is_secret_env_key(key: str) -> bool:
-    """A non-provider secret-shaped env var (token/secret/password/api-key/credentials)."""
+    """A non-provider secret-shaped env var (token/secret/password/api-key/credentials), or the
+    added API keys' rows (``OUROBOROS_CONNECTIONS``), whose fields carry their keys."""
     ku = str(key).upper()
     if ku in _PROVIDER_ENV_KEYS:
         return False
     return (
         "TOKEN" in ku or "SECRET" in ku or "PASSWORD" in ku
-        or ku.endswith("_API_KEY") or ku.endswith("_CREDENTIALS")
+        or ku.endswith("_API_KEY") or ku.endswith("_CREDENTIALS") or ku == CONNECTIONS_KEY
     )
 
 
@@ -219,6 +230,9 @@ def build_isolated_settings(
         if ks in _ISO_SETTINGS_ALLOW_EXACT or ks.startswith(_ISO_SETTINGS_ALLOW_PREFIX):
             out[ks] = value
     out.update(overrides)
+    # Historical manifest keys are never execution settings for a new run.
+    for key in set(MODEL_SLOT_KEYS) - set(ACTIVE_MODEL_SLOT_KEYS):
+        out.pop(key, None)
     if "OUROBOROS_CONTEXT_MODE" in overrides and "OUROBOROS_CONTEXT_MODE_AUTO_LOW" not in overrides:
         # A benchmark override is an explicit operator choice, not ambiguous legacy disk state.
         out["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "false"
@@ -281,33 +295,39 @@ def _api_status(base_url: str, method: str, path: str, payload: dict | None = No
 
 
 def seed_owner_state(data_root: pathlib.Path, *, evolution_enabled: bool = False) -> None:
-    """Pre-seed state.json so the evolution loop's owner_chat_id gate passes (the
-    /api/tasks path never binds owner_chat_id). Optionally pre-enable the campaign."""
-    state_path = pathlib.Path(data_root) / "state" / "state.json"
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    st: dict = {}
-    if state_path.exists():
-        try:
-            st = json.loads(state_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            st = {}
-    st["owner_chat_id"] = 1
-    if evolution_enabled:
-        campaign_path = pathlib.Path(data_root) / "state" / "evolution_campaign.json"
-        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        campaign_path.write_text(json.dumps({
-            "schema_version": 1,
-            "id": uuid.uuid4().hex[:8],
-            "status": "active",
-            "objective": "Autonomously improve Ouroboros from benchmark evidence.",
-            "source": "benchmark",
-            "started_at": now,
-            "updated_at": now,
-            "cycles_done": 0,
-            "absorbed_cycles_done": 0,
-        }), encoding="utf-8")
-        st["evolution_mode_enabled"] = True
-    state_path.write_text(json.dumps(st), encoding="utf-8")
+    """Initialize a fresh isolated root before boot; never repair/reseed old state.
+
+    The real boot completes this pending identity before admitting work. Defaults
+    are valid here only because the existing initializer witnessed a fresh root.
+    """
+    from supervisor import state, state_initialization
+
+    root = pathlib.Path(data_root)
+    state_path, lock_path = root / "state/state.json", root / "locks/state.lock"
+    lock_fd = state.acquire_file_lock(lock_path)
+    if lock_fd is None:
+        raise state.StateUnavailable("lock_timeout", "benchmark seed")
+    try:
+        for path in (state_path, state_path.with_name("state.last_good.json")):
+            status, _, detail = state.read_state_copy(path)
+            if status != "missing":
+                raise state.StateUnavailable("seed_requires_new_state", f"{path.name}: {status} {detail}")
+        decision = state_initialization.initialization_decision(root, origin="isolated_benchmark")
+        if not decision.get("create"):
+            raise state.StateUnavailable(decision["reason"], str(decision.get("detail") or ""))
+        st = state.ensure_state_defaults({"initialization_id": decision["initialization_id"], "owner_chat_id": 1})
+        if evolution_enabled:
+            now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            state.atomic_write_text(root / "state/evolution_campaign.json", json.dumps({
+                "schema_version": 1, "id": uuid.uuid4().hex[:8], "status": "active",
+                "objective": "Autonomously improve Ouroboros from benchmark evidence.",
+                "source": "benchmark", "started_at": now, "updated_at": now,
+                "cycles_done": 0, "absorbed_cycles_done": 0,
+            }))
+            st["evolution_mode_enabled"] = True
+        state.atomic_write_text(state_path, json.dumps(st))
+    finally:
+        state.release_file_lock(lock_path, lock_fd)
 
 
 def campaign_summary(data_root: pathlib.Path) -> dict:
@@ -413,16 +433,151 @@ def supervisor_state_is_ready(state: dict) -> bool:
     return bool(state.get("supervisor_ready")) and int(state.get("workers_total") or 0) > 0
 
 
+@contextlib.contextmanager
+def alarm_deferred():
+    """Hold a SIGALRM that lands inside the block and deliver it once the block is done.
+
+    A test's timeout alarm (pytest-timeout's signal method) raises from its handler wherever
+    the main thread is. Landing inside a server stop it would unwind the stop before the
+    forced kill and reap, and leave a live server for whatever runs next. Inside this block
+    the cleanup runs to completion first; the held alarm then reaches the handler it was
+    meant for, so the timeout still fails its test. Python runs signal handlers only in the
+    main thread, so another thread needs no hold, and a host without SIGALRM has no alarm.
+    """
+    if not hasattr(signal, "SIGALRM") or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    held: list = []
+    previous = signal.signal(signal.SIGALRM, lambda _signum, frame: held.append(frame))
+    try:
+        yield
+    finally:
+        # None: a handler installed outside Python, which cannot be put back; the default stands in.
+        signal.signal(signal.SIGALRM, signal.SIG_DFL if previous is None else previous)
+        if held and callable(previous):
+            previous(signal.SIGALRM, held[0])
+        elif held and previous == signal.SIG_DFL:
+            signal.raise_signal(signal.SIGALRM)
+
+
+# ``server_control.restart_current_process`` ledgers a spawned successor (the POSIX
+# fallback after a failed exec, the normal transfer on Windows) under this purpose.
+RESTART_SUCCESSOR_PURPOSE = "server_restart_fallback"
+
+
+def stop_restart_successors(data_root: pathlib.Path, *, grace_sec: float, rounds: int = 5) -> list[str]:
+    """Stop every restart successor this run's own custody ledger proves live; return what stays unconfirmed.
+
+    The original process exits 42 once its successor runs under another PID and group.
+    Identity is the row this data root's ledger recorded, re-proved by its measured
+    birth and command (``process_custody``), never a name, a port or a bare PID; an
+    unreadable ledger or unmeasurable identity is reported, not signalled. A successor
+    that itself restarted is found by the next read; ``rounds`` only bounds a restart loop.
+    One that died before this stop is reported while its recorded group still runs.
+    """
+    from ouroboros.process_custody import process_stop_snapshot
+
+    unconfirmed: list[str] = []
+    handled: set = set()  # each successor is judged once
+    for _ in range(rounds):
+        try:
+            rows = process_stop_snapshot(pathlib.Path(data_root), {RESTART_SUCCESSOR_PURPOSE})
+        except OSError as exc:
+            return [*unconfirmed, f"restart successor custody unreadable: {exc}"]
+        fresh = [row for row in rows if _custody_key(row) not in handled]
+        if not fresh:
+            return unconfirmed + _leaderless_successor_groups(pathlib.Path(data_root), handled)
+        for row in fresh:
+            handled.add(_custody_key(row))
+            unconfirmed += _stop_restart_successor(row, grace_sec)
+    return [*unconfirmed, f"restart successors still appearing after {rounds} reads"]
+
+
+def _custody_key(row: dict) -> tuple:
+    """A ledger row's pid with its recorded birth/command."""
+    return row.get("pid"), json.dumps(row.get("fingerprint"), sort_keys=True)
+
+
+def _leaderless_successor_groups(data_root: pathlib.Path, handled: set) -> list[str]:
+    """Recorded successor groups this stop never judged that still have live members.
+
+    The live snapshot omits a successor that died first, but a child sharing its group (a
+    plain ``subprocess.run``, as ``supervisor.git_ops`` runs git) can outlive it. Nothing
+    re-proves who those members are, so they are reported and never signalled. As in the
+    reaper's ``_service_group_survives_leader``, a measured foreign process at the group's
+    own PID refutes the group: that PID could not be reused while the recorded group had
+    members.
+    """
+    from ouroboros.process_containment import process_group_has_live_members
+    from ouroboros.process_custody import _read_ledger_strict, measured_identity_mismatch
+
+    readable, rows = _read_ledger_strict(data_root)
+    if not readable:
+        return ["restart successor custody unreadable after the stop"]
+    found = []
+    for row in rows:
+        pid, pgid = int(row.get("pid") or 0), int(row.get("pgid") or 0)
+        if (row.get("purpose") == RESTART_SUCCESSOR_PURPOSE and _custody_key(row) not in handled and pgid > 0
+                and not (pgid == pid and measured_identity_mismatch(row)) and process_group_has_live_members(pgid)):
+            found.append(f"restart successor {pid}: process group {pgid} still has live members, not signalled")
+    return found
+
+
+def _stop_restart_successor(row: dict, grace_sec: float) -> list[str]:
+    """Graceful then forced stop of one ledgered successor, as ``stop`` treats the original server."""
+    from ouroboros.platform_layer import (
+        IS_WINDOWS, current_process_group_id, deliver_signal, kill_process_group_id, process_group_id,
+        terminate_process_group_id,
+    )
+    from ouroboros.process_containment import process_group_has_live_members
+    from ouroboros.process_custody import process_fingerprint_matches
+
+    pid, pgid = int(row.get("pid") or 0), int(row.get("pgid") or 0)
+    if not process_fingerprint_matches(row, require_measured=True):
+        return [f"restart successor {pid}: identity unmeasurable, not signalled"]
+    # Its own group, recorded at spawn and still led by it: the graceful signal reaches its workers too.
+    group = pgid if pgid == pid and process_group_id(pid) == pgid != current_process_group_id() else 0
+
+    def gone(within: float) -> bool:
+        deadline = time.monotonic() + within
+        while process_fingerprint_matches(row) or (group and process_group_has_live_members(group)):
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+        return True
+
+    if not IS_WINDOWS:  # Windows has no graceful signal for a process the caller did not start
+        if group:
+            terminate_process_group_id(group)
+        else:
+            deliver_signal(pid, graceful=True)
+        if gone(grace_sec):
+            return []
+    if process_fingerprint_matches(row, require_measured=True):  # re-proved before forcing
+        kill_pid_tree(pid, include_process_group=bool(group))
+    elif group:
+        kill_process_group_id(group)  # the leader left; its live group cannot have been reused
+    return [] if gone(5.0) else [f"restart successor {pid}: exit unconfirmed after a forced stop"]
+
+
 class IsolatedServer:
     """A throwaway Ouroboros server bound to an isolated clone + data root + port."""
 
+    # How long the server's tree gets after SIGTERM before it is force-killed.
+    stop_grace_sec = 15.0
+
     def __init__(self, clone: pathlib.Path, data_root: pathlib.Path, settings_path: pathlib.Path,
                  *, host: str = "127.0.0.1", settings_authoritative_env: bool = False,
-                 expected_settings_sha256: str | None = None) -> None:
+                 expected_settings_sha256: str | None = None, stdio_path: pathlib.Path | None = None) -> None:
         self.clone = pathlib.Path(clone)
         self.data_root = pathlib.Path(data_root)
         self.settings_path = pathlib.Path(settings_path)
         self.host = host
+        # Where the server's stdout and stderr go, appended (``None``: nowhere, the historical
+        # DEVNULL). ``start`` hands the child the descriptor and closes only its own copy: the
+        # process keeps writing through its in-place re-exec, and a failure before the first
+        # import (a missing dependency, a syntax error) stays readable after the stop.
+        self.stdio_path = pathlib.Path(stdio_path) if stdio_path else None
         # Some adapters inject one deliberately selected credential after this base
         # environment is built. Those adapters opt into settings-authoritative mode so
         # ambient provider/model settings cannot shadow the applied snapshot. The default
@@ -432,6 +587,7 @@ class IsolatedServer:
         self.host_service_port = free_port()
         self.base_url = f"http://{host}:{self.port}"
         self.proc: subprocess.Popen | None = None
+        self.stop_unconfirmed: list[str] = []
         # Stable per-task hurry request ids (see `hurry_task`), the driver-side mirror of
         # the UI's `hurryRequestId` map.
         self._hurry_request_ids: dict = {}
@@ -554,13 +710,25 @@ class IsolatedServer:
             # into a defaults-only file, defeating the authority contract.
             self._read_authoritative_settings()
         self._patch_settings_ports()
-        # Own process group/session so a hung server + its worker children can be
-        # killed as a tree (platform_layer), not orphaned past graceful SIGTERM.
-        self.proc = subprocess.Popen(
-            [sys.executable, "server.py"], cwd=str(self.clone), env=self._env(),
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            **subprocess_new_group_kwargs(),
-        )
+        sink = None
+        if self.stdio_path is not None:
+            self.stdio_path.parent.mkdir(parents=True, exist_ok=True)
+            # 0600 like a strict lane's settings file: a server's output can carry what it was configured with.
+            sink = os.fdopen(os.open(self.stdio_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "ab")
+            sink.write(f"=== IsolatedServer.start {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} "
+                       f"port {self.port} ===\n".encode("utf-8"))
+            sink.flush()
+        try:
+            # Own process group/session so a hung server + its worker children can be
+            # killed as a tree (platform_layer), not orphaned past graceful SIGTERM.
+            self.proc = subprocess.Popen(
+                [sys.executable, "server.py"], cwd=str(self.clone), env=self._env(),
+                stdout=sink or subprocess.DEVNULL, stderr=subprocess.STDOUT if sink else subprocess.DEVNULL,
+                **subprocess_new_group_kwargs(),
+            )
+        finally:
+            if sink is not None:
+                sink.close()
         try:
             self._wait_ready(ready_timeout)
         except BaseException:
@@ -641,9 +809,11 @@ class IsolatedServer:
         callers (a driver cleaning up after its own ``wait_task`` deadline) keep the
         byte-identical legacy single-task request they have always sent.
 
-        The cascade lane answers only once the subtree is actually torn down, hence the
-        wide default timeout. Returns the ``_api_status`` envelope; the refusal statuses are
-        part of the contract under test, so nothing is raised or swallowed.
+        A hard Stop records the intent first and answers 200 once the teardown was driven,
+        404 when nothing was live, or 202 ``cancel_state=pending`` while the intent is still
+        open for the watchdog; the cascade lane still waits for the kills it asked for, hence
+        the wide default timeout. Returns the ``_api_status`` envelope; the refusal statuses
+        are part of the contract under test, so nothing is raised or swallowed.
         """
         body: dict = {}
         if cascade:
@@ -673,8 +843,8 @@ class IsolatedServer:
             {"request_id": rid}, timeout=30)
 
     def wait_for_health(self, timeout: float = 180) -> bool:
-        """Wait for /api/state to answer with supervisor ready again (after a
-        self-evolution os.execvpe re-exec the same PID restarts on new code)."""
+        """Wait for /api/state to answer with supervisor ready again after a restart: an
+        exec keeps the PID, a spawned successor does not, and only HTTP is polled here."""
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
@@ -726,18 +896,30 @@ class IsolatedServer:
         return {"absorbed": False, "new_sha": self.current_sha(), "cycles": absorbed_cycles_done(self.data_root),
                 "reason": "timeout", "campaign": campaign_summary(self.data_root)}
 
-    def stop(self) -> None:
-        if self.proc is not None and self.proc.poll() is None:
-            pid = self.proc.pid
-            terminate_process_tree(self.proc)
-            try:
-                self.proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                kill_pid_tree(pid)
+    def stop(self) -> list[str]:
+        """SIGTERM the server's tree, then force-kill and reap it, and do the same for a
+        restart successor it spawned (``stop_restart_successors``); a timeout alarm landing
+        inside is held until the trees are down (``alarm_deferred``). Returns, and keeps in
+        ``stop_unconfirmed``, every exit this stop could not prove; nothing is deleted."""
+        unconfirmed: list[str] = []
+        with alarm_deferred():
+            if self.proc is not None and self.proc.poll() is None:
+                pid = self.proc.pid
+                terminate_process_tree(self.proc)
                 try:
-                    self.proc.wait(timeout=5)
+                    self.proc.wait(timeout=self.stop_grace_sec)
                 except subprocess.TimeoutExpired:
-                    pass
+                    kill_pid_tree(pid)
+                    try:
+                        self.proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        unconfirmed.append(f"server {pid}: exit unconfirmed after a forced stop")
+            unconfirmed += stop_restart_successors(self.data_root, grace_sec=self.stop_grace_sec)
+        self.stop_unconfirmed = unconfirmed
+        if unconfirmed:
+            print(f"isolated server stop unconfirmed under {self.data_root}: {'; '.join(unconfirmed)}",
+                  file=sys.stderr)
+        return unconfirmed
 
     def __enter__(self) -> "IsolatedServer":
         return self.start()

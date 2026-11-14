@@ -25,7 +25,6 @@ from ouroboros.utils import utc_now_iso
 
 log = logging.getLogger(__name__)
 
-
 # Typed per-id cancellation outcome (v6.82.0). A boolean cannot distinguish
 # "cancelled", "it had already finished on its own" and "refused/failed" — and a
 # cascade that OR-aggregates booleans reports success while a child is still live.
@@ -35,6 +34,98 @@ CANCEL_NOT_FOUND = "not_found"
 CANCEL_FAILED = "failed"
 _CANCEL_TERMINALIZED = frozenset({CANCEL_CANCELLED, CANCEL_ALREADY_SETTLED, CANCEL_NOT_FOUND})
 
+# Transport is recorded fact, never proof that an HTTP caller was the owner.
+# The browser twin is ``web/modules/cancel_presentation.js``; both
+# tables must name the same sources, because one stored ``cancel_origin`` is
+# rendered by the task card AND by this host's durable terminal rows.
+CANCEL_SOURCE_PHRASES = {
+    "server_shutdown": "Server shutdown",
+    "http_single": "Stopped from the app (Stop now)",
+    "http_cascade": "Stopped from the app (Stop now)",
+    "http_graceful": "Stopped from the app (Wrap up)",
+    # ``_cancel_subtree_sweep`` mints this for every captured descendant.
+    "cascade_descendant": "Stopped with the task tree it belongs to",
+    # ``server_restart._stop_owned_work``: the /restart command (chat or app button).
+    "owner_restart": "Stopped by the Restart command",
+    # ``queue_snapshot._fence_snapshot_running_rows``: a row still RUNNING when the
+    # previous server stopped (``shutdown_cancel_text`` states it on the result).
+    "snapshot_restore": "The server stopped while this task was still running",
+    # ``join_ledger`` cancel_task, Ouroboros's own tool; the asking run is below.
+    "agent_tool": "Stopped by Ouroboros",
+    # Historical rows of the retired silence diagnostic (#1376, removed 09.11.2026):
+    # a silence check whose observed work moved on, settled or stopped.
+    "silence_resolved": "Silence check withdrawn: the observed work no longer needed it",
+    # ``ended_work_helpers``: a helper still paused when the work it helped truly ended.
+    "work_finished": "Closed with the work it helped",
+}
+# The fixed label a producer writes as ``reason`` restates its phrase, so that
+# exact label is not repeated beside it; any other reason text still shows.
+CANCEL_SOURCE_LABELS = {
+    "http_graceful": "owner requested finalize-then-stop",
+    "owner_restart": "Owner restart",
+    "snapshot_restore": "server_shutdown",
+    "work_finished": "the work it helped has ended",
+}
+# A recorded cause is producer free text; bound it before it joins an owner line.
+# The bound is a PREVIEW of a reason the record keeps whole, and says so.
+CANCEL_REASON_MAX_CHARS = 160
+CANCEL_REASON_PREVIEW_NOTE = " (preview; the full reason is kept with the task)"
+
+def cancel_cause_clauses(
+    origin: Dict[str, Any], result: Dict[str, Any], event: Dict[str, Any],
+) -> List[str]:
+    """The clauses a recorded ``cancel_origin`` PROVES, for one owner line.
+
+    Written here, beside ``_intent_outcome_fields`` which records the origin, so
+    the producer and the sentence share a home. The caller joins them with its
+    own separator; the browser twin is the cancelled branch of
+    ``log_events.js::taskReasonDetail`` and must stay word for word identical.
+
+    ``requested_by`` says which run ASKED — a cascade stamps the SWEPT ROOT
+    there — so reading it as the initiator named a task that somebody else had
+    stopped (#1061). When this record's OWN lineage proves that asker is its
+    parent or ancestor, the line states that relation. Only a typed
+    ``request_origin`` proves an actor; ``requested_by`` alone never does.
+    Ouroboros's own cancel_task stamps the run that asked, not a swept root,
+    so there the relation is the asker's, and it names that same actor.
+    """
+    from ouroboros.utils import strip_markdown
+
+    request_origin = origin.get("request_origin")
+    actor = (
+        str(request_origin.get("task_id") or "")
+        if isinstance(request_origin, dict) and request_origin.get("kind") == "agent_task"
+        else ""
+    )
+    source = str(origin.get("source") or "")
+    asker = source == "agent_tool"
+    asked = str(origin.get("requested_by") or "")
+    record = {**event, **result}
+    self_id = str(record.get("task_id") or record.get("id") or record.get("subagent_task_id") or "")
+    parent = str(record.get("parent_task_id") or "")
+    root = str(record.get("root_task_id") or "")
+    relation = ""
+    if asked and asked != self_id:
+        if asked == parent:
+            relation = "Requested by its parent task" if asker else "Stopped with its parent task"
+        elif parent and asked == root:
+            relation = "Requested by an ancestor task" if asker else "Stopped with an ancestor task"
+    stated = str(origin.get("reason") or "")
+    reason = ("" if " ".join(stated.split()) == CANCEL_SOURCE_LABELS.get(source)
+              else " ".join(strip_markdown(stated).split()))
+    if len(reason) > CANCEL_REASON_MAX_CHARS:
+        reason = reason[:CANCEL_REASON_MAX_CHARS - 1].rstrip() + "\u2026" + CANCEL_REASON_PREVIEW_NOTE
+    # Hardening a Wrap up keeps its original source but changes the effective button.
+    phrase_source = ({"immediate": "http_single", "finalize_then_cancel": "http_graceful"}
+                     .get(str(origin.get("stop_policy") or ""), source)
+                     if source in {"http_single", "http_cascade", "http_graceful"} else source)
+    return [
+        CANCEL_SOURCE_PHRASES.get(phrase_source, source),
+        reason,
+        "this task and its sub-tasks" if origin.get("scope") == "cascade" else "",
+        relation,
+        "Requested by a task" if actor and not (asker and relation and actor == asked) else "",
+    ]
 
 def _load_result_row(q: Any, task_id: str) -> Dict[str, Any]:
     """The durable result row, or ``{}`` — fail-soft."""
@@ -46,13 +137,16 @@ def _load_result_row(q: Any, task_id: str) -> Dict[str, Any]:
         log.debug("durable result read failed for %s", task_id, exc_info=True)
         return {}
 
-
 def _is_workspace_task_record(record: Optional[Dict[str, Any]]) -> bool:
     if not isinstance(record, dict):
         return False
     metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
     return bool(str(record.get("workspace_root") or "").strip() or str(metadata.get("workspace_root") or "").strip())
 
+def queued_address(task: Any, existing: Any) -> Dict[str, Any]:
+    """A never-started task's queue address for its first result row; a recorded one stays."""
+    chat = task.get("chat_id") if isinstance(task, dict) else None
+    return {"chat_id": chat} if chat is not None and (existing or {}).get("chat_id") is None else {}
 
 def _cancel_result_fields(
     task: Optional[Dict[str, Any]],
@@ -74,8 +168,12 @@ def _cancel_result_fields(
     shared workspace tree carry ``artifact_attribution: "shared_unproven"`` —
     the tree was not quiesced through the normal patch-capture seam, so the diff
     cannot prove which actor authored it (until the phase-C run isolation).
+
+    A task cancelled before it ever ran has no result row yet, so its queue address
+    is kept: the first terminal publication may run before ``task_done`` and would
+    otherwise read no room at all (an existing address, hidden 0 included, stays).
     """
-    payload: Dict[str, Any] = {**fields, "result": result}
+    payload: Dict[str, Any] = {**fields, "result": result, **queued_address(task, existing)}
     if not (_is_workspace_task_record(task) or _is_workspace_task_record(existing)):
         return payload
     try:
@@ -129,7 +227,6 @@ def _cancel_result_fields(
         log.debug("Failed to build cancelled artifact fields for task %s", (task or existing or {}).get("id") or (task or existing or {}).get("task_id"), exc_info=True)
     return payload
 
-
 def shutdown_cancel_text(intent: Dict[str, Any]) -> str:
     """The owner sentence for a fence the snapshot restore minted, else "".
 
@@ -148,6 +245,15 @@ def shutdown_cancel_text(intent: Dict[str, Any]) -> str:
     ):
         return "Task cancelled: the server stopped while this task was still running."
     return ""
+
+
+def stop_notice_outcome(origin: Any) -> str:
+    """The cancel receipt's outcome words: a restore fence names its cause.
+
+    The owner did not ask for this stop, so "was stopped" alone reads like one.
+    The sentence is the card's own phrase for the same stored ``cancel_origin``.
+    """
+    return f"stopped. {CANCEL_SOURCE_PHRASES['snapshot_restore']}" if shutdown_cancel_text(origin) else "stopped"
 
 
 def _miss_lane_cancel_text(intent: Dict[str, Any]) -> str:
@@ -173,7 +279,7 @@ def _intent_outcome_fields(intent: Dict[str, Any]) -> Dict[str, Any]:
     # Preserve the recorded cause after the active intent is removed. Actor
     # evidence is independent of requested_by, which also drives parent decisions.
     origin = {key: str(intent[key]) for key in (
-        "source", "requested_by", "scope", "reason", "requested_at", "request_id",
+        "source", "requested_by", "scope", "reason", "requested_at", "request_id", "stop_policy",
     ) if intent.get(key)}
     request_origin = (fields.get("cancel_observation") or {}).get("request_origin")
     if isinstance(request_origin, dict):
@@ -254,11 +360,17 @@ def _register_owed_terminal_delivery(
         if not deliver or str((task or {}).get("delegation_role") or "") == "subagent":
             return True
         stored_status = str((stored or {}).get("status") or "")
+        if stored_status and stored_status != STATUS_CANCELLED:
+            # The worker's own terminal row won over the Stop: the provisional
+            # salvage owed before the terminal write is not this task's answer.
+            from supervisor.terminal_delivery import withdraw_stop_episode
+
+            withdraw_stop_episode(pathlib.Path(q.DRIVE_ROOT), task_id)
         event: Optional[Dict[str, Any]] = None
         if stored_status == STATUS_CANCELLED:
             event = build_unreviewed_salvage_event(
                 pathlib.Path(q.DRIVE_ROOT), task, task_id,
-                outcome="cancelled",
+                outcome=stop_notice_outcome((stored or {}).get("cancel_origin")),
                 salvaged_text=salvage_text, preserved_path=salvage_path,
                 unreconciled_runs=list(unreconciled_runs or []),
                 settled_status=stored_status,
@@ -322,7 +434,7 @@ def _publish_cancelled_task(
     reload, so the stored status is emitted instead.
     """
     from supervisor import workers
-
+    from ouroboros.model_wait import record_execution_close
     from ouroboros.task_results import STATUS_CANCELLED
     from ouroboros.headless import terminal_task_files_ready
 
@@ -330,12 +442,12 @@ def _publish_cancelled_task(
         return CANCEL_FAILED  # Publication/cleanup cannot outrun terminal source custody.
 
     settled_status = str((stored or {}).get("status") or STATUS_CANCELLED)
-    # The row leaves RUNNING only NOW — death confirmed, terminal result durable.
-    # A natural task_done that raced us may have consumed the row already; that
-    # handler also emitted the terminal event, so whoever pops the row owns the
-    # emit and the card resolves exactly once.
+    # The row leaves RUNNING only NOW (death confirmed, result durable; its #939 clock closes first), custody's own
+    # only (its reaping slot's): a raced task_done consumed it and owns the emit; a newer row is another attempt's.
+    row = q.RUNNING.get(task_id) if (q.RUNNING.get(task_id) or {}).get("worker_id", worker.wid) == worker.wid else None
+    record_execution_close(q.DRIVE_ROOT, task_id, task, row)
     with q._queue_lock:
-        row_owned = q.RUNNING.pop(task_id, None) is not None
+        row_owned = row is not None and q.RUNNING.get(task_id) is row and q.RUNNING.pop(task_id) is row
     try:
         from ouroboros.tools.services import archive_task_service_logs
         archive_task_service_logs(pathlib.Path(q.DRIVE_ROOT), str(task_id), task)
@@ -355,7 +467,7 @@ def _publish_cancelled_task(
             if settled_status == STATUS_CANCELLED:
                 deliver_unreviewed_salvage(
                     pathlib.Path(q.DRIVE_ROOT), task, task_id,
-                    outcome="cancelled",
+                    outcome=stop_notice_outcome((stored or {}).get("cancel_origin")),
                     salvaged_text=salvage_text, preserved_path=salvage_path,
                     unreconciled_runs=list(unreconciled_runs or []),
                     settled_status=settled_status,
@@ -384,12 +496,9 @@ def _publish_cancelled_task(
     # the lock so the crash detector can recover the slot on a later tick.
     from supervisor.task_reaper import _respawn_after_reap
     _respawn_after_reap(q, workers, worker.wid, expected_worker=worker)
-    if str(task.get("delegation_role") or "") == "subagent":
-        try:
-            from ouroboros.headless import remove_subagent_task_drive
-            remove_subagent_task_drive(q.DRIVE_ROOT, str(task_id))
-        except Exception:
-            log.debug("Failed to remove cancelled subagent drive for %s", task_id, exc_info=True)
+    # A cancelled subagent's drive is NOT settled here: settlement copies and hashes the
+    # child store, which the cancel path must not carry. The off-loop reconcile pass
+    # settles it without waiting out retention (``headless.prune_headless_task_drives``).
     try:
         q.persist_queue_snapshot(reason="cancel_running")
     except Exception:
@@ -502,11 +611,14 @@ def _audit_delegated_runs_on_kill(
     from supervisor.terminal_delivery import RUN_STATE_UNKNOWN_PREFIX
 
     try:
+        from ouroboros.delegate_custody_reconcile import attach_only_gateway
         from ouroboros.delegate_terminal import terminal_reconcile_task
 
+        # A kill boundary attaches and settles; it never starts a daemon or
+        # replays a pending invocation (the admitted sweep recovers those).
         audit = terminal_reconcile_task(
             pathlib.Path(q.DRIVE_ROOT), task_id, trigger=trigger,
-            deliberate_terminal=deliberate_terminal,
+            deliberate_terminal=deliberate_terminal, gateway_factory=attach_only_gateway,
         )
     except Exception:
         log.warning(
@@ -557,6 +669,28 @@ def _reconcile_delegated_runs_on_kill(q: Any, task_id: str) -> List[str]:
     return list(_audit_delegated_runs_on_kill(q, task_id).get("unreconciled") or [])
 
 
+def _stop_open_tree_runs(q: Any, task_id: str) -> None:
+    """The cascade's verdict over its tree's open delegated runs, before its postcondition.
+
+    A member killed by the sweep cancels its own runs behind the owner's verdict, but a member that
+    had already settled spared every run its own end was no verdict for (a provider death, a crash),
+    so a settled tree whose only live writer is such a run stays live. The owner's Stop of the tree
+    is that verdict: ``stop_tree_runs`` cancels them attach-only, and the settled owners' stored
+    custody disclosures are refreshed, as the kill path's fast lane does. A failure is logged and
+    judged by the postcondition, which counts every run still open as live.
+    """
+    root = pathlib.Path(q.DRIVE_ROOT)
+    try:
+        from ouroboros.delegate_custody_reconcile import stop_tree_runs
+        from ouroboros.delegate_terminal import refresh_terminal_reconciliation
+
+        outcomes = stop_tree_runs(root, task_id)
+        for owner in sorted({str(row.get("task_id") or "") for row in outcomes} - {""}):
+            refresh_terminal_reconciliation(root, owner, trigger="kill_path_clear")
+    except Exception:
+        log.warning("Cascade could not stop the open delegated runs of %s", task_id, exc_info=True)
+
+
 def _cascade_delivery_row_locked(q: Any, task_id: str) -> Dict[str, Any]:
     """A routing row for a cascade whose ROOT has already left the live maps.
 
@@ -582,7 +716,7 @@ def _finish_captured_chat_turn(
     arms the cooperative stop and waits its short bound
     (``worker_chat_lane.stop_direct_chat_turn``); custody settles the intent
     against what the turn published, or releases the claim so the sweep
-    retries — the HTTP caller then sees "still live", never a fabricated
+    retries — the HTTP caller then sees 202 pending, never a fabricated
     ``cancelled`` row over a turn that is still running. A turn that ENDED
     without publishing a terminal (the lane's error path writes none) takes
     the same miss finalizer a pooled task does — ``cancelled`` with the
@@ -620,6 +754,13 @@ def _finish_captured_chat_turn(
             intent=intent,
         )
         return CANCEL_FAILED
+    from supervisor.active_activity import get_direct_activity_registry
+
+    if get_direct_activity_registry().get(task_id) is not None:
+        # Closed admission is not completion: preparation/teardown keeps the actor
+        # until its runner exits, observing the durable Stop through task control.
+        _release_intent_claim(q, task_id, error="direct activity still owns work", intent=intent)
+        return CANCEL_FAILED
     stored = load_task_result(q.DRIVE_ROOT, task_id) or {}
     if str(stored.get("status") or "") not in SETTLED_STATUSES:
         return _finalize_cancel_intent_on_miss(q, task_id, intent=intent)
@@ -628,19 +769,93 @@ def _finish_captured_chat_turn(
     return CANCEL_ALREADY_SETTLED if outcome == DIRECT_TURN_STOP_GONE else CANCEL_CANCELLED
 
 
+def finish_in_process_turn(q: Any, task_id: str, turn: Optional[Dict[str, Any]], row: Dict[str, Any], *,
+                           intent: Optional[Dict[str, Any]] = None, deliver: bool = True,
+                           runner_owned: bool = False) -> Optional[str]:
+    """Custody of a task no queue map holds but this process runs, else ``None``: a direct chat turn or its
+    billing synthesis takes ``_finish_captured_chat_turn``. An inline Presence turn the census witnesses or
+    cannot rule out (``presence_execution_witness``) reads this open intent and its runner writes the terminal
+    (#2012); custody never writes that row: it releases the claim (an unreadable census recorded as unknown)
+    and settles the intent once the row settles (``cancelled`` only for this request); an absent turn: None.
+    A pooled author whose Stop custody left to its runner (``runner_owned``, ``runner_takes_stop``) is held the
+    same way, and while its row is unsettled it never reaches the miss lane, whose cancelled write would land
+    beside a worker that may still run: the next pass reads it again (#2566)."""
+    from ouroboros.post_task_checkpoint import post_task_synthesis_in_flight
+    from ouroboros.presence_runner import presence_execution_witness
+    from supervisor.queue_transitions import settled_status_of
+    from supervisor.task_lifecycle import SETTLED_ALREADY, _release_intent_claim, _settle_intent
+    from supervisor import workers
+    if turn is not None or workers.get_direct_chat_agent(task_id) is not None or post_task_synthesis_in_flight(q.DRIVE_ROOT, task_id):
+        return _finish_captured_chat_turn(q, task_id, turn, intent=intent, deliver=deliver)
+    carried = isinstance(owner := (row or {}).get("execution_owner"), dict) and owner.get("kind") == "presence"
+    if not (carried or runner_owned):
+        return None
+    live = presence_execution_witness(task_id, drive_root=pathlib.Path(q.DRIVE_ROOT))
+    current = _load_result_row(q, task_id) or row  # read after the witness: an end in between is settled
+    if not (settled := settled_status_of(current)):
+        if live is False and carried:
+            return None
+        # The Stop stays pending, recorded as what it is.
+        if live is None:
+            error = "Presence liveness unknown: its author census is unreadable"
+        elif live:
+            error = "Presence turn has not reached its next stop check"
+        else:  # the pooled author left its census before its terminal: the next pass reads its worker again
+            error = "Presence author no longer witnessed before its terminal"
+        _release_intent_claim(q, task_id, intent=intent, error=error)
+        return CANCEL_FAILED
+    stopped = (settled == "cancelled" and bool(intent) and isinstance(origin := current.get("cancel_origin"), dict)
+               and origin.get("request_id") == intent.get("request_id"))
+    _settle_intent(q, task_id, outcome="cancelled" if stopped else SETTLED_ALREADY, detail=settled, intent=intent)
+    return CANCEL_CANCELLED if stopped else CANCEL_ALREADY_SETTLED
+
+
+def runner_takes_stop(q: Any, task_id: str, row: Any) -> bool:
+    """A live Presence turn's Stop is its runner's wherever it runs (#2012), the conversation lane's carrier
+    included, and so is a moved text turn's author a pool worker continues (#2566: a Resume or a restart's return
+    stamps its row ``pooled``; it reads its own Stop, ``owner_stop.runner_reads_stop``): custody never captures or
+    kills a carrier whose author the census positively witnesses, and ``finish_in_process_turn`` keeps the Stop
+    pending until the runner's next stop check writes the terminal. Read before Q; an author that cannot be
+    witnessed takes the ordinary capture and kill, and saved work the queue holds takes the queue's cancel."""
+    from ouroboros.presence_carrier import moved_text_turn
+    from ouroboros.presence_runner import presence_execution_witness
+    from supervisor.queue_transitions import settled_status_of
+
+    owner = row.get("execution_owner") if isinstance(row, dict) else None
+    carried_saved = (isinstance(owner, dict) and owner.get("kind") == "pooled" and not settled_status_of(row)
+                     and moved_text_turn(q.DRIVE_ROOT, task_id, row.get("metadata")))
+    return ((live_presence_row(row) or carried_saved)
+            and presence_execution_witness(task_id, drive_root=pathlib.Path(q.DRIVE_ROOT)) is True)
+
+
+def live_presence_row(row: Any) -> bool:
+    """An unsettled row a live Presence turn owns: its runner settles it, not cancel custody. A moved turn's
+    saved work the queue keeps (``presence_recovery.queue_kept``) is the queue's, as any queued row."""
+    from ouroboros.presence_recovery import queue_kept
+    from supervisor.queue_transitions import settled_status_of
+
+    owner = row.get("execution_owner") if isinstance(row, dict) else None
+    return (isinstance(owner, dict) and owner.get("kind") == "presence" and not settled_status_of(row)
+            and not queue_kept(row))
+
+
 def _finalize_cancel_intent_on_miss(
     q: Any, task_id: str, *, intent: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Neither queued nor running: settle an open cancel intent (or a legacy
     ``cancel_requested`` latch file) as cancelled with reconstructed cost.
 
-    Two things this lane must NOT do. It must not invent a task: an intent for an
-    id that has no durable result at all names a task that never existed, and
+    Three things this lane must NOT do. It must not invent a task: an intent for
+    an id that has no durable result at all names a task that never existed, and
     fabricating a ``cancelled`` row with $0 for it would put a phantom task in the
-    ledger — it settles as ``not_found`` instead. And it must not bury a child
+    ledger — it settles as ``not_found`` instead. It must not take a row whose
+    execution owner is a live Presence turn (no supervisor map knows it): that
+    settles ``not_found`` too, the row untouched. And it must not bury a child
     that finished: when the row names a child drive, the child's own result is
     copied back BEFORE the cancelled write, so a crash of the split-drive
-    copy-back window cannot cost a completed answer.
+    copy-back window cannot cost a completed answer. Nor does a direct restore fence
+    bury an answer the host already owes or delivered under cancel text and a
+    "no salvageable output" notice: that attempt is finalized from the answer.
     """
     from supervisor.queue_transitions import _settled_status
     from supervisor.task_lifecycle import (
@@ -670,6 +885,14 @@ def _finalize_cancel_intent_on_miss(
             # the intent honestly rather than minting a cancelled task.
             _settle_intent(q, task_id, outcome="not_found",
                            detail="no durable task result for this id", intent=intent)
+            return CANCEL_NOT_FOUND
+        if live_presence_row(existing):
+            # A live Presence turn runs on its own thread outside every supervisor
+            # map: nothing here can capture it, and a cancelled write would only
+            # strand a turn that keeps spending. The row stays its runner's and
+            # the Stop answers "not active", as it did before intent-first minting.
+            _settle_intent(q, task_id, outcome="not_found",
+                           detail="execution owned by a live Presence turn", intent=intent)
             return CANCEL_NOT_FOUND
         # A concurrent custody attempt may have captured this task between our
         # own capture miss and here (the pending double-settle probe). If the
@@ -734,17 +957,57 @@ def _finalize_cancel_intent_on_miss(
             return CANCEL_ALREADY_SETTLED
         existing = load_task_result(q.DRIVE_ROOT, task_id) or existing
         cost_fields = _reconstructed_cost_fields(q, task_id, existing)
-        stored = write_task_result(
-            q.DRIVE_ROOT, task_id, STATUS_CANCELLED,
-            **_cancel_result_fields(
-                existing, existing=existing, **cost_fields,
-                **_intent_outcome_fields(active),
-                # R2/R4: the audited list AND its envelope ride this single
-                # cancelled write — a clean audit clears a stale stored list.
-                **_custody_disclosure_fields(audit),
-                result=_miss_lane_cancel_text(active),
-            ),
-        )
+        from ouroboros.store import StoreBusy, acquisition_budget
+        from ouroboros.working_checkpoint import adopt_registered_answer, registered_answer
+        from supervisor.task_reaper import _deferred_reap_jobs
+        registry_root = pathlib.Path(existing.get("budget_drive_root") or q.DRIVE_ROOT)
+        # A direct restore fence keeps a positively held answer, like dead-worker recovery.
+        # Other cancel paths (including pooled restore) keep their existing outcome.
+        owner = existing.get("execution_owner")
+        adopt = (isinstance(owner, dict) and owner.get("kind") == "direct"
+                 and bool(shutdown_cancel_text(active))
+                 and registered_answer(registry_root, task_id).get("basis") in {"owed", "exhausted", "delivered"})
+        adopted: Optional[Dict[str, Any]] = None
+        # Under Q the health tick hands a retained reap back to its reaper wholly before or after
+        # this write: an idle one replays over it; one out for its replay keeps the slot and the write.
+        try:
+            with acquisition_budget(0), q._queue_lock:
+                retained = [job for job in _deferred_reap_jobs if str(job.get("task_id") or "") == task_id]
+                replaying = any(job.get("_replaying") for job in retained)
+                if not replaying and adopt:
+                    adopted = adopt_registered_answer(q.DRIVE_ROOT, existing, task_id, cause="app_stop",
+                                                      attempt=int(existing.get("task_attempt") or 0),
+                                                      registry_root=registry_root)
+                if not replaying and not adopted:
+                    stored = write_task_result(
+                        q.DRIVE_ROOT, task_id, STATUS_CANCELLED,
+                        **_cancel_result_fields(
+                            existing, existing=existing, **cost_fields,
+                            **_intent_outcome_fields(active),
+                            # R2/R4: the audited list AND its envelope ride this single
+                            # cancelled write — a clean audit clears a stale stored list.
+                            **_custody_disclosure_fields(audit),
+                            result=_miss_lane_cancel_text(active),
+                        ),
+                    )
+        except StoreBusy:  # Q never waits on the store: the open intent returns to the watchdog
+            _release_intent_claim(q, task_id, error="result store contended under the queue lock", intent=intent)
+            return CANCEL_FAILED
+        if replaying:  # the open intent returns to the watchdog, as for any reaper-owned slot
+            _release_intent_claim(q, task_id, error="slot owned by the reaper's replay", intent=intent)
+            return CANCEL_FAILED
+        if adopted:  # published like dead-worker recovery's adoption: no cancel text, no "no output" notice
+            if not retained:
+                from supervisor import workers
+                from supervisor.task_reaper import _finish_self_finalized_task
+                from supervisor.worker_health import terminal_task_metadata
+
+                _finish_self_finalized_task(q, workers, existing, task_id, str(existing.get("type") or "task"),
+                                            str(adopted.get("status") or ""), adopted,
+                                            terminal_task_metadata(existing.get("metadata")), unreconciled)
+            _settle_intent(q, task_id, outcome=SETTLED_ALREADY, detail="registered_answer_finalized", intent=intent)
+            q.persist_queue_snapshot(reason="cancel_finalize")
+            return CANCEL_ALREADY_SETTLED
         stored_status = str((stored or {}).get("status") or "")
         if stored_status != STATUS_CANCELLED:
             # The monotonic guard refused: something settled it while we worked.
@@ -762,7 +1025,9 @@ def _finalize_cancel_intent_on_miss(
                                    unreconciled_runs=unreconciled)
         _settle_or_reopen_intent(q, task_id, owed_ok=owed_ok, intent=intent,
                                  outcome="cancelled", detail="finalized on miss")
-        q._emit_cancel_task_done(existing, task_id, cost_fields=cost_fields)
+        # A reap the reaper retains (its slot, its replay) publishes this terminal once, on that replay.
+        if not retained:
+            q._emit_cancel_task_done(existing, task_id, cost_fields=cost_fields)
         q.persist_queue_snapshot(reason="cancel_finalize")
         return CANCEL_CANCELLED
     except Exception:

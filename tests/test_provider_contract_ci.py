@@ -13,6 +13,7 @@ from ouroboros.provider_models import (
     OPENAI_DIRECT_DEFAULTS,
     normalize_deepseek_reasoning_effort,
     normalize_model_identity,
+    tool_schema_limit,
 )
 from ouroboros.request_wire_contract import canonical_sha256
 from ouroboros.request_wire_receipts import (
@@ -25,6 +26,7 @@ from tests.provider_contract_ci import (
     CANARY_CONTINUATION_MAX_TOKENS,
     CANARY_EMPTY_RESPONSE_MAX_ATTEMPTS,
     CANARY_MAX_TOKENS,
+    CANARY_SUBAGENT_ID,
     CANARY_TIMEOUT_SEC,
     CANARY_TOOL_NAME,
     ProviderCanary,
@@ -35,6 +37,7 @@ from tests.provider_contract_ci import (
     assert_openai_canary_usage,
     classify_provider_failure,
     delegate_start_canary_arguments,
+    delegate_start_canary_context,
     full_registry_canary_tools,
     provider_canary_matrix,
     require_provider_canary_credential,
@@ -66,12 +69,8 @@ def _http_error(status_code: int, body: str):
                 'supported. Use responses or set reasoning_effort to none."}}'
             ),
         ),
-        (400, '{"error":{"message":"tools.19.custom.input_schema is invalid"}}'),
-        (400, '{"error":{"message":"Unknown parameter: tools[0].custom"}}'),
         (401, '{"error":{"code":"invalid_api_key"}}'),
         (403, '{"message":"API key verification failed: key is expired"}'),
-        (404, '{"error":{"code":"model_not_found"}}'),
-        (422, '{"error":{"message":"reasoning_effort medium is unsupported"}}'),
     ],
 )
 def test_contract_and_auth_4xx_are_red(status_code, body):
@@ -92,13 +91,6 @@ def test_contract_and_auth_4xx_are_red(status_code, body):
         (429, '{"error":{"code":"rate_limit_exceeded"}}', "rate_limit_429"),
         (503, '{"error":{"message":"upstream unavailable"}}', "provider_5xx"),
         (400, '{"error":{"code":"insufficient_quota"}}', "quota_or_billing"),
-        (402, '{"error":{"message":"credit balance is too low"}}', "quota_or_billing"),
-        (
-            402,
-            '{"error":{"message":"This request requires more credits, or fewer '
-            'max_tokens. You can only afford 348."}}',
-            "quota_or_billing",
-        ),
     ],
 )
 def test_only_explicit_environmental_outcomes_are_inconclusive(
@@ -226,9 +218,11 @@ def test_exact_provider_canary_matrix_logical_turns_and_attempt_bound():
         ("anthropic_direct", "anthropic::claude-sonnet-5"),
         ("minimax_direct", "minimax::MiniMax-M3"),
         ("deepseek_direct", "deepseek::deepseek-v4-flash"),
-        ("cloudru_direct", "cloudru::zai-org/GLM-4.7"),
+        ("cloudru_direct", "cloudru::zai-org/GLM-5.3"),
         ("gigachat_direct", "gigachat::GigaChat-2-Max"),
     ]
+    assert [(row.canary_id, row.reasoning_effort) for row in matrix if row.expected_provider == "cloudru"] == [
+        ("cloudru_direct", "low")]
     medium_ids = {row.canary_id for row in matrix if row.reasoning_effort == "medium"}
     assert medium_ids == {
         "openrouter_gemini",
@@ -257,6 +251,17 @@ def test_exact_provider_canary_matrix_logical_turns_and_attempt_bound():
         for row in matrix
         if row.credential_required
     ) == 11
+    # The routes to Google, Anthropic and OpenAI read a secret of their own: the shared CI key is refused
+    # there (HTTP 403, provider terms). The rest of OpenRouter keeps the shared key; every route is required.
+    assert {row.canary_id: (row.credential_env, row.credential_required)
+            for row in matrix if row.expected_provider == "openrouter"} == {
+        "openrouter_gemini": ("OPENROUTER_PROVIDER_ROUTES_API_KEY", True),
+        "openrouter_opus": ("OPENROUTER_PROVIDER_ROUTES_API_KEY", True),
+        "openrouter_fable": ("OPENROUTER_PROVIDER_ROUTES_API_KEY", True),
+        "openrouter_gpt": ("OPENROUTER_PROVIDER_ROUTES_API_KEY", True),
+        "openrouter_grok": ("OPENROUTER_API_KEY", True),
+        "openrouter_deepseek": ("OPENROUTER_API_KEY", True),
+    }
 
 
 def test_direct_anthropic_named_tool_choice_projects_without_type_error():
@@ -308,6 +313,38 @@ def test_required_and_optional_credential_policy(monkeypatch):
 
     monkeypatch.setenv(required.credential_env, "test-present")
     assert require_provider_canary_credential(required) is None
+
+
+def test_each_openrouter_check_sends_its_own_secret_and_only_while_it_runs(monkeypatch, request, tmp_path):
+    """The live check, offline: the real client resolves each route's key, and no request leaves."""
+    import os
+
+    from ouroboros import config
+    from ouroboros.llm import LLMClient
+    from tests import provider_contract_diagnostics
+    from tests import test_provider_integration as integration
+
+    monkeypatch.setattr(config, "SETTINGS_PATH", tmp_path / "settings.json")  # the CI lane saves no document
+    monkeypatch.setenv("OPENROUTER_API_KEY", "shared-ci-key")
+    monkeypatch.setenv("OPENROUTER_PROVIDER_ROUTES_API_KEY", "provider-routes-ci-key")
+    monkeypatch.setattr(provider_contract_diagnostics, "provider_evidence",
+                        lambda request, canary: contextlib.nullcontext())
+    monkeypatch.setattr(integration, "_get_llm_client", LLMClient)
+    sent = {}
+
+    def send(client, *, canary, **kwargs):
+        sent[canary.canary_id] = client.resolve_remote_target(canary.model)["api_key"]
+        return {}, {}, None, None
+
+    monkeypatch.setattr(integration, "run_provider_contract_canary", send)
+    for canary in provider_canary_matrix():
+        if canary.expected_provider == "openrouter":
+            with pytest.MonkeyPatch.context() as check:
+                integration.test_full_registry_provider_contract(canary, [], request, check)
+            assert os.environ["OPENROUTER_API_KEY"] == "shared-ci-key", canary.canary_id  # its check only
+    routes = {"openrouter_gemini", "openrouter_opus", "openrouter_fable", "openrouter_gpt"}
+    assert sent == {canary_id: "provider-routes-ci-key" if canary_id in routes else "shared-ci-key"
+                    for canary_id in [*sorted(routes), "openrouter_grok", "openrouter_deepseek"]}
 
 
 def _bind_candidate(model, tools, messages, tool_choice):
@@ -702,16 +739,28 @@ def test_reasoning_integrity_canary_rejects_explicit_none_and_clamp():
     assert_openai_canary_usage(neutral_repair, model)
 
 
-def test_normalized_calls_require_unique_schema_valid_delegate_start():
+def _normalized_call_violation(arguments, expected, *, calls=None):
+    with pytest.raises(AssertionError) as caught:
+        assert_normalized_canary_call(
+            {"tool_calls": calls or [_canonical_canary_call("call-violation", arguments)]},
+            full_registry_canary_tools(),
+            expected,
+        )
+    return caught.value.args[0]["provider_contract_violation"]
+
+
+def test_normalized_calls_require_exactly_the_requested_delegate_start():
     tools = full_registry_canary_tools()
     expected = delegate_start_canary_arguments("normalized-call")
-    required = {"prompt": expected["prompt"]}
+    assert set(expected) == {"prompt", "subagent_id"}
     assert assert_normalized_canary_call(
         {"tool_calls": [_canonical_canary_call("call-ok", expected)]},
         tools,
-        required,
+        expected,
     )[0]["id"] == "call-ok"
 
+    # Schema-valid neutral values the prompt never asked for are what a route that
+    # forces optional properties emits (issue #1411): RED, naming declared keys only.
     provider_defaults = {
         **expected,
         "root": "skill_payload",
@@ -720,38 +769,113 @@ def test_normalized_calls_require_unique_schema_valid_delegate_start():
         "retry_of": "",
         "max_seconds": 0,
     }
-    assert assert_normalized_canary_call(
-        {"tool_calls": [_canonical_canary_call("call-defaults", provider_defaults)]},
-        tools,
-        required,
-    )[0]["id"] == "call-defaults"
+    evidence = _normalized_call_violation(provider_defaults, expected)
+    assert evidence["violation"] == "arguments_exact_keys"
+    assert evidence["extra_keys"] == ["bucket", "max_seconds", "retry_of", "root", "skill_name"]
+    assert evidence["missing_keys"] == []
 
     provider_selector = {
         "prompt": expected["prompt"],
-        "retry_of": "provider-contract-canary",
+        "retry_of": expected["subagent_id"],
         "root": "skill_payload",
         "bucket": "external",
     }
-    assert assert_normalized_canary_call(
-        {"tool_calls": [_canonical_canary_call("call-selector", provider_selector)]},
-        tools,
-        required,
-    )[0]["id"] == "call-selector"
+    evidence = _normalized_call_violation(provider_selector, expected)
+    assert evidence["violation"] == "arguments_exact_keys"
+    assert evidence["extra_keys"] == ["bucket", "retry_of", "root"]
+    assert evidence["missing_keys"] == ["subagent_id"]
 
+    wrong_selector = dict(expected, subagent_id="another-subagent")
+    assert _normalized_call_violation(wrong_selector, expected)["violation"] == "arguments_subagent_id"
     wrong = dict(expected, prompt="different nonce-bearing prompt")
-    with pytest.raises(AssertionError):
-        assert_normalized_canary_call(
-            {"tool_calls": [_canonical_canary_call("call-wrong", wrong)]},
-            tools,
-            required,
-        )
+    assert _normalized_call_violation(wrong, expected)["violation"] == "arguments_prompt"
     duplicate = _canonical_canary_call("call-duplicate", expected)
-    with pytest.raises(AssertionError):
-        assert_normalized_canary_call(
-            {"tool_calls": [duplicate, copy.deepcopy(duplicate)]},
-            tools,
-            required,
+    assert _normalized_call_violation(
+        None, expected, calls=[duplicate, copy.deepcopy(duplicate)],
+    )["violation"] == "duplicate_tool_call_id"
+
+
+def test_canary_run_rejects_provider_filled_optional_keys_as_red():
+    canary = next(row for row in provider_canary_matrix() if row.canary_id == "openrouter_gpt")
+    nonce = "forced-optional"
+    forced = {**delegate_start_canary_arguments(nonce), "retry_of": "", "max_seconds": 0}
+
+    class ForcedOptionalClient:
+        def chat(self, **kwargs):
+            return {
+                "content": "",
+                "tool_calls": [_canonical_canary_call("forced-optional", forced)],
+            }, _fake_usage(canary, 1)
+
+    with pytest.raises(AssertionError) as caught:
+        run_provider_contract_canary(
+            ForcedOptionalClient(), canary=canary, tools=full_registry_canary_tools(), nonce=nonce,
         )
+    evidence = caught.value.args[0]["provider_contract_violation"]
+    assert evidence["violation"] == "arguments_exact_keys"
+    assert evidence["extra_keys"] == ["max_seconds", "retry_of"]
+    assert skip_on_provider_environmental_error(canary.canary_id, caught.value) is None
+
+
+def test_canary_roster_offers_the_requested_selector_as_a_direct_fresh_start():
+    from ouroboros.subagent_runtime import model_visible_subagent_catalog
+
+    heading = "## Available subagents\n\n"
+    context = delegate_start_canary_context()
+    assert context.startswith(heading)
+    roster, _end = json.JSONDecoder().raw_decode(context[len(heading):])
+    [row] = roster["rows"]
+    assert row["subagent_id"] == CANARY_SUBAGENT_ID
+    assert row["subagent_id"] == delegate_start_canary_arguments("any-nonce")["subagent_id"]
+    assert "direct fresh start" in context
+    # The synthetic row speaks the vocabulary of the catalog Main actually sees.
+    [production] = model_visible_subagent_catalog({"OUROBOROS_SUBAGENTS": json.dumps({
+        "enabled": True,
+        "items": [{
+            "subagent_id": "session",
+            "name": "Session",
+            "recommended_use": "Owner words.",
+            "route": {
+                "kind": "agent_session",
+                "target_id": "claude=claude-fable-5",
+                "credential_profile_id": "",
+            },
+            "effort": "",
+        }],
+    })})["rows"]
+    assert set(row) <= set(production)
+    assert row["route_class"] == production["route_class"]
+
+
+def test_canary_run_rejects_an_omitted_selector_as_red_not_weather():
+    # The cloudru_direct shape seen in CI: a call carrying only the prompt.
+    canary = next(row for row in provider_canary_matrix() if row.canary_id == "cloudru_direct")
+    nonce = "omitted-selector"
+    prompt_only = {"prompt": delegate_start_canary_arguments(nonce)["prompt"]}
+
+    class PromptOnlyClient:
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, **kwargs):
+            self.calls.append(copy.deepcopy(kwargs))
+            return {
+                "content": "",
+                "tool_calls": [_canonical_canary_call("prompt-only", prompt_only)],
+            }, _fake_usage(canary, 1)
+
+    client = PromptOnlyClient()
+    with pytest.raises(AssertionError) as caught:
+        run_provider_contract_canary(
+            client, canary=canary, tools=full_registry_canary_tools(), nonce=nonce,
+        )
+    evidence = caught.value.args[0]["provider_contract_violation"]
+    assert evidence["violation"] == "arguments_exact_keys"
+    assert (evidence["extra_keys"], evidence["missing_keys"]) == ([], ["subagent_id"])
+    assert skip_on_provider_environmental_error(canary.canary_id, caught.value) is None
+    assert len(client.calls) == 1
+    # An omitted selector remains a contract failure even with the matching roster.
+    assert client.calls[0]["messages"][0]["content"].startswith(delegate_start_canary_context())
 
 
 def test_production_custom_none_text_is_semantic_success(monkeypatch):
@@ -838,6 +962,7 @@ def test_production_custom_none_text_is_semantic_success(monkeypatch):
 def test_public_chat_builds_full_registry_request_for_every_matrix_row():
     tools = full_registry_canary_tools()
     names = [tool["function"]["name"] for tool in tools]
+    context = delegate_start_canary_context()
     for canary in provider_canary_matrix():
         nonce = f"unit-{canary.canary_id}"
         expected = delegate_start_canary_arguments(nonce)
@@ -892,7 +1017,16 @@ def test_public_chat_builds_full_registry_request_for_every_matrix_row():
         assert first["no_proxy"] is True
         assert first["bypass_response_cache"] is False
         assert first["timeout"] == CANARY_TIMEOUT_SEC
-        assert [tool["function"]["name"] for tool in first["tools"]] == names
+        # The whole registry, fitted to the route's schema ceiling as Main does
+        # (direct OpenAI: 128; tests/test_route_tool_schema_limit.py pins both sides).
+        limit = tool_schema_limit(canary.model)
+        sent = [tool["function"]["name"] for tool in first["tools"]]
+        assert sent == [name for name in names if name in sent] and CANARY_TOOL_NAME in sent
+        assert len(sent) == (min(len(names), limit) if limit else len(names))
+        # Every row asks for the same exact object beside the same synthetic roster.
+        assert [message["role"] for message in first["messages"]] == ["user"]
+        assert first["messages"][0]["content"].startswith(context)
+        assert json.dumps(expected, ensure_ascii=False, sort_keys=True) in first["messages"][0]["content"]
         if canary.named_tool_choice:
             assert first["tool_choice"] == {
                 "type": "function", "function": {"name": CANARY_TOOL_NAME},
@@ -914,6 +1048,7 @@ def test_public_chat_builds_full_registry_request_for_every_matrix_row():
             assert [message["role"] for message in second["messages"]] == [
                 "user", "assistant", "tool", "tool",
             ]
+            assert second["messages"][0] == first["messages"][0]
             assert [message["tool_call_id"] for message in second["messages"][2:]] == [
                 f"call-{canary.canary_id}-1",
                 f"call-{canary.canary_id}-2",

@@ -1,13 +1,15 @@
-// The chat header derives from the /api/state census, the owner's own
-// unconfirmed sends and live cards — never from a WS `typing` frame. A typing
-// frame is a submission receipt: it pulls the census at once and retires the
-// linked `Sending...` once that read has answered. These cases pin that contract, including the incident
-// replay (kind-less subagent typing kept "Thinking..." forever) and the #866
-// shape where the same phantom entry shielded a card from durable reconcile.
+// The chat header says the server's room (/api/state `rooms`, the work projection) and the owner's own
+// unconfirmed sends — never a WS `typing` frame and never a card the projection does not list. A typing
+// frame is a submission receipt: it pulls the state at once and retires the linked `Sending...` once that
+// read has answered. Cards keep their own words from the census. These cases pin that contract, including
+// the incident replay (kind-less subagent typing kept "Thinking..." forever) and the #866 shape where the
+// same phantom entry shielded a card from durable reconcile.
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createChatInstance } from '../modules/chat.js';
 import { ElementStub, installDom, restoreDom, walkCard } from './chat_dom_fixture.js';
+import { projection, room, SERVER_CASES, work } from './work_fixture.js';
+import { resumeAttemptWords, workLine } from '../modules/work_status.js';
 
 // The flat fixture's querySelector does not descend; lazily inserted controls
 // (the status badge, card internals) need a real descendant lookup.
@@ -18,10 +20,18 @@ ElementStub.prototype.querySelector = function (selector) {
     for (const child of this.children) { const found = child.querySelector(selector); if (found) return found; }
     return null;
 };
+// A chip's status mark (docs/DESIGN.md "Status marks"): its shape and hue, or `none` while it is hidden.
+const markOf = (chip) => {
+    const mark = chip.firstElementChild;
+    return mark && !mark.hidden ? `${mark.dataset.shape}/${mark.dataset.hue}` : 'none';
+};
 
-function makeInstance({ details = {}, calls = [], state = { census: null } } = {}) {
+function makeInstance({ details = {}, calls = [], state = { census: null }, chatId = 1, asPanel = false, hook = null } = {}) {
     const env = installDom(async (url) => {
         calls.push(String(url));
+        // A test's own answer for one address (held, refused), else the fixture's.
+        const hooked = hook && await hook(String(url));
+        if (hooked) return hooked;
         const id = String(url).split('/').at(-1);
         if (String(url).startsWith('/api/tasks/')) {
             return details[id]
@@ -31,26 +41,35 @@ function makeInstance({ details = {}, calls = [], state = { census: null } } = {
         // `state.census` is what a fetched /api/state answers with (null = idle);
         // `state.fail` makes the read reject like a dropped connection.
         if (state.fail) throw new Error('offline');
+        if (String(url).startsWith('/api/chat/history') && state.pages) {
+            const cursor = new URL(String(url), 'http://local').searchParams.get('cursor') || 'recent';
+            assert.ok(state.pages.has(cursor), cursor);
+            return { ok: true, json: async () => state.pages.get(cursor) };
+        }
+        if (String(url).startsWith('/api/chat/history') && state.history) {
+            return { ok: true, json: async () => ({ messages: state.history, window: { complete: true } }) };
+        }
         return { ok: true, json: async () => state.census || { active_direct_turns: [] } };
     });
     const handlers = new Map();
     let generation = 0;
+    let connected = true;
     let inst = null;
     const instance = createChatInstance({
         ws: {
             on(type, fn) { handlers.set(type, fn); return () => handlers.delete(type); },
-            isConnected: () => true,
-            send: () => ({ status: 'sent', clientMessageId: 'cm-send' }),
+            isConnected: () => connected,
+            send: () => ({ status: 'sent', clientMessageId: state.messageId || 'cm-send' }),
         },
         state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
         updateUnreadBadge() {},
         stateSnapshots: {
-            begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+            begin: () => ({ generation: ++generation, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
             isCurrent: () => true,
             // The page-wide sequencer fans a fetched census into the instance.
             apply: (request, data) => { inst?.hydrateStateSnapshot(data, request.requestedAt); },
         },
-        chatId: 1, idPrefix: 'chat', mountEl: env.mount,
+        chatId, idPrefix: 'chat', mountEl: env.mount, asPanel,
     });
     inst = instance;
     const status = () => env.mount.querySelector('.status-badge')?.textContent;
@@ -69,17 +88,130 @@ function makeInstance({ details = {}, calls = [], state = { census: null } } = {
     const settle = async () => { for (let i = 0; i < 6; i += 1) await new Promise((resolve) => setTimeout(resolve, 0)); };
     return {
         ...env, handlers, instance, calls, state, status, watchStatus, settle,
+        close() { connected = false; handlers.get('close')(); },
+        open() { connected = true; handlers.get('open')({ previouslyConnected: true }); },
         // The indicator is created with createElement, so it never lands in the
         // fixture's id index — find it by its class among the message children.
         typingHidden: () => globalThis.document.byId.get('chat-messages').children
             .find((node) => String(node.className || '').includes('typing-bubble'))?.style.display === 'none',
         card: (id) => walkCard(globalThis.document.byId.get('chat-messages'), id),
-        census: (rows, complete, requestedAt = Infinity) => instance.hydrateStateSnapshot({
+        // One body: the census rows (the cards' facts) beside the server's room for this chat and one work per row.
+        census: (rows, complete, requestedAt = Infinity, serverRoom = null) => instance.hydrateStateSnapshot({
             active_chat_activities: rows,
             active_chat_activities_complete: complete,
             supervisor_ready: true,
+            ...body(rows, serverRoom, complete),
         }, requestedAt, ++generation),
     };
+    function body(rows, serverRoom = null, complete = true) {
+        const mine = rows.filter((row) => Number(row.chat_id ?? 1) === chatId);
+        const paused = { budget_paused: 'paused', budget_pausing: 'working', unknown: 'unknown', queued: 'queued' };
+        // Each work's shape as the server names it (gateway/work_status.mark_of).
+        const marks = { working: 'moving', queued: 'still', paused: 'pause', unknown: 'ring' };
+        return projection(chatId, mine.map((row) => {
+            const activity = paused[row.phase] || 'working';
+            return work(row, { activity, transition: row.phase === 'budget_pausing' ? 'pausing' : 'none', mark: marks[activity] });
+        }), serverRoom, complete);
+    }
+}
+
+for (const chatId of [1, 7]) {
+    test(`plain direct work stays neutral and explicit legacy thinking survives (chat ${chatId})`, () => {
+        const fx = makeInstance({ chatId });
+        const row = { activity_id: 'neutral-call', chat_id: chatId, kind: 'direct_chat', phase: 'working' };
+        try {
+            fx.handlers.get('chat')({ task_id: row.activity_id, chat_id: chatId, role: 'assistant',
+                is_progress: true, content: 'Inspecting current work', ts: '2026-10-11T00:00:00Z' });
+            // The header says the server room's exact call (gateway/work_status._call); the card its own chip.
+            const show = (facts, expected, call) => {
+                fx.census([{ ...row, ...facts }], true, Infinity, room('working', { call }));
+                assert.equal(fx.status(), expected);
+                assert.equal(fx.card(row.activity_id).querySelector('[data-live-phase]').textContent, expected);
+            };
+            const detail = () => fx.card(row.activity_id).querySelector('[data-live-phase-detail]');
+            show({}, 'Working', 'working');
+            show({ phase: 'thinking' }, 'Thinking', 'thinking');
+            show({ phase: 'preparing' }, 'Preparing', 'preparing');
+            show({ model_activity: { phase: 'response_received' } }, 'Working', 'working');
+            assert.equal(detail().textContent, 'Model call: Response received · processing');
+            show({}, 'Working', 'working'); // finished call cleared its observation, not the task's work
+            assert.equal(detail().hidden, true);
+            // Works whose calls differ: the server's room names no call, and the header says Working.
+            fx.census([row, { ...row, activity_id: 'another-call', phase: 'preparing' }], true, Infinity, room('working'));
+            assert.equal(fx.status(), 'Working', 'different active phases never imply provider reasoning');
+        } finally { fx.instance.destroy(); restoreDom(fx.prior); }
+    });
+
+    test(`a preparing turn's start step rides beside the header word, and its started call clears it (chat ${chatId})`, () => {
+        const fx = makeInstance({ chatId });
+        const hydrate = (name) => {
+            const served = structuredClone(SERVER_CASES[name]);
+            fx.state.census = { active_chat_activities: [], active_chat_activities_complete: true, supervisor_ready: true,
+                ...served, works: served.works.map((item) => ({ ...item, room: chatId })), rooms: { [chatId]: served.rooms[1] } };
+            fx.instance.hydrateStateSnapshot(fx.state.census, Infinity);
+            const badge = fx.mount.querySelector('.status-badge');
+            return [badge.textContent, badge.dataset.step, fx.mount.querySelector('.rw-trigger')?.title];
+        };
+        try {
+            assert.deepEqual(hydrate('direct_preparing'), ['Preparing', 'Building context', 'Preparing · Building context']);
+            assert.deepEqual(hydrate('direct_requested'), ['Working', '', 'Working']);
+        } finally { fx.instance.destroy(); restoreDom(fx.prior); }
+    });
+
+    test(`the header says the server's room over mixed census rows; each card keeps its own words (chat ${chatId})`, () => {
+        const fx = makeInstance({ chatId });
+        const row = { activity_id: 'queued-call', chat_id: chatId, kind: 'direct_chat', phase: 'working',
+            model_activity: { phase: 'queued' } };
+        const other = { activity_id: 'settling-task', chat_id: chatId, kind: 'managed_task', phase: 'budget_pausing' };
+        const chip = (id) => fx.card(id)?.querySelector('[data-live-phase]').textContent;
+        try {
+            fx.handlers.get('chat')({ task_id: row.activity_id, chat_id: chatId, role: 'assistant',
+                is_progress: true, content: 'Waiting for admission', ts: '2026-10-11T00:00:00Z' });
+            // One turn works while another settles its Pause: the room works (the server rolls it up so).
+            fx.census([row, other], true, Infinity, room('working', { call: 'working' }));
+            assert.equal(fx.status(), 'Working');
+            assert.equal(chip(row.activity_id), 'Queued', 'the card keeps its own model-call word');
+            fx.census([{ ...row, model_activity: undefined }, other], true, Infinity, room('working', { call: 'working' }));
+            assert.equal(fx.status(), 'Working', 'a model observation never reorders the room');
+            fx.census([row, other], true, Infinity, room('working', { transition: 'pausing' }));
+            assert.equal(fx.status(), 'Pausing…', 'every working work settling its Pause: the room says so');
+            fx.census([{ ...row, phase: 'budget_paused', pause_cause: 'owner' }], true, Infinity, room('paused'));
+            assert.equal(fx.status(), 'Paused', 'the reason (who paused) stays on the row, never in the header');
+        } finally { fx.instance.destroy(); restoreDom(fx.prior); }
+    });
+
+    test(`model observations reach header and card without typing or new polling (chat ${chatId})`, () => {
+        const fx = makeInstance({ chatId });
+        const row = { activity_id: 'observed-call', chat_id: chatId, kind: 'direct_chat', phase: 'working', task_attempt: 1 };
+        const show = (phase, call = 'working') => fx.census([{ ...row, model_activity: { phase, operation_id: 'same',
+            invocation_id: 'same-send' } }], true, Infinity, room('working', { call }));
+        try {
+            fx.handlers.get('chat')({ task_id: row.activity_id, chat_id: chatId, role: 'assistant',
+                is_progress: true, content: 'Inspecting current work', ts: '2026-10-11T00:00:00Z' });
+            // The room names the exact call the server reads (Sending for a dispatched request, else Working).
+            for (const [phase, expected, exact, call] of [
+                ['queued', 'Queued', 'Request accepted · waiting for admission', 'working'],
+                ['dispatching', 'Sending', 'Preparing request dispatch', 'sending'],
+                ['awaiting_response', 'Sending', 'Sending request / waiting for response', 'sending'],
+                ['rejoining', 'Rejoining', 'Rejoining the same model operation', 'working'],
+                ['response_received', 'Working', 'Response received · processing', 'working'],
+            ]) {
+                show(phase, call);
+                assert.equal(fx.status(), call === 'sending' ? 'Sending' : 'Working');
+                assert.equal(fx.card(row.activity_id).querySelector('[data-live-phase]').textContent, expected);
+                // The exact phase waits in the card's details, the same card the chip names.
+                assert.equal(fx.card(row.activity_id).querySelector('[data-live-phase-detail]').textContent, `Model call: ${exact}`);
+                assert.equal(fx.card(row.activity_id).querySelector('[data-wait-id]'), null);
+            }
+            fx.close();
+            assert.equal(fx.status(), 'Reconnecting…');
+            fx.handlers.get('chat')({ task_id: row.activity_id, chat_id: chatId, role: 'assistant',
+                content: 'Done', system_type: 'task_summary', task_terminal_status: 'completed', ts: '2026-10-11T00:00:01Z' });
+            show('queued');
+            assert.equal(fx.card(row.activity_id).querySelector('[data-live-phase]').textContent, 'Done');
+            assert.notEqual(fx.status(), 'Queued');
+        } finally { fx.instance.destroy(); restoreDom(fx.prior); }
+    });
 }
 
 test('incident replay: a finished turn whose subagent typed with no kind returns to Online', async () => {
@@ -113,15 +245,318 @@ test('incident replay: a finished turn whose subagent typed with no kind returns
     } finally { fx.instance.destroy(); restoreDom(fx.prior); }
 });
 
-test('the census alone moves the header between Thinking... and Online', () => {
+for (const chatId of [1, 7]) {
+    const progress = (fx, id) => fx.handlers.get('chat')({ chat_id: chatId, task_id: id,
+        role: 'assistant', is_progress: true, content: 'Inspecting the work.', ts: '2026-10-08T10:00:00Z' });
+    // The chip's facts: its words, its status mark, the quieter late fact beside it and whether the card settled.
+    const observed = fx => id => {
+        const card = fx.card(id);
+        return { text: card.querySelector('[data-live-phase]').textContent,
+            mark: markOf(card.querySelector('[data-live-phase]')),
+            secondary: card.querySelector('[data-live-phase-secondary]').textContent, finished: card.dataset.finished };
+    };
+    test(`R1 census-only outcome reaches the actual full card and updates at the same phase (chat ${chatId})`, () => {
+        const fx = makeInstance({ chatId });
+        try {
+            const id = 'census-outcome', row = { activity_id: id, chat_id: chatId, kind: 'managed_task', phase: 'finalizing' };
+            progress(fx, id);
+            fx.census([row], true);
+            assert.equal(observed(fx)(id).text, 'Finalizing…');
+            const failed = { ...row, status: 'failed', root_phase_checkpoint: { post_task_synthesis: 'running' },
+                outcome_axes: { lifecycle: { status: 'failed' }, execution: { status: 'infra_failed' } } };
+            fx.census([failed], true);
+            assert.deepEqual(observed(fx)(id), { text: 'Failed', mark: 'dot/failed', secondary: 'Finalizing…',
+                finished: '0' });
+            fx.census([row], true); // Missing optional metadata cannot erase already observed evidence.
+            assert.equal(observed(fx)(id).text, 'Failed');
+            fx.census([{ ...failed, status: 'cancelled', outcome_axes: { lifecycle: { status: 'cancelled' } } }], true);
+            assert.deepEqual(observed(fx)(id), { text: 'Stopped', mark: 'dot/neutral', secondary: '',
+                finished: '1' });
+            fx.census([failed], true); // The original in-flight snapshot cannot revive a concluded task.
+            assert.equal(observed(fx)(id).text, 'Stopped');
+            const later = `${id}-mounted-after-census`;
+            fx.census([{ ...failed, activity_id: later }], true);
+            progress(fx, later);
+            assert.equal(observed(fx)(later).text, 'Failed');
+            assert.equal(observed(fx)(later).secondary, 'Finalizing…');
+        } finally { fx.instance.destroy(); restoreDom(fx.prior); }
+    });
+
+    test(`R1 real close/open parks full cards until each receives a fresh positive activity (chat ${chatId})`, async () => {
+        const fx = makeInstance({ chatId });
+        try {
+            const id = 'late-failure', sibling = 'independent-work', settled = 'already-done';
+            progress(fx, id); progress(fx, sibling); progress(fx, settled);
+            fx.handlers.get('chat')({ chat_id: chatId, task_id: id, role: 'system', system_type: 'task_summary',
+                status: 'failed', task_phase: 'finalizing', content: 'Task failed.', ts: '2026-10-08T10:00:01Z' });
+            fx.handlers.get('chat')({ chat_id: chatId, task_id: settled, role: 'system', system_type: 'task_summary',
+                status: 'completed', content: 'Task done.', ts: '2026-10-08T10:00:02Z' });
+            const failed = { activity_id: id, chat_id: chatId, kind: 'managed_task', phase: 'finalizing', status: 'failed',
+                root_phase_checkpoint: { post_task_synthesis: 'running' } };
+            const working = { activity_id: sibling, chat_id: chatId, kind: 'managed_task', phase: 'working' };
+            fx.census([failed, working], true);
+            assert.equal(observed(fx)(id).secondary, 'Finalizing…');
+            fx.close();
+            const offline = { text: 'Failed', mark: 'dot/failed', secondary: 'Activity unconfirmed', finished: '0' };
+            assert.deepEqual(observed(fx)(id), offline);
+            fx.census([failed, working], true); // A REST answer while the socket is down cannot restore motion.
+            assert.deepEqual(observed(fx)(id), offline);
+            assert.equal(observed(fx)(sibling).mark, 'ring/ink');
+            assert.equal(observed(fx)(settled).text, 'Done');
+            assert.equal(observed(fx)(settled).finished, '1');
+            fx.state.fail = true; // Open is connectivity, not a successful new census/history read.
+            fx.open();
+            await fx.settle();
+            assert.deepEqual(observed(fx)(id), offline);
+            fx.census([], false);
+            assert.deepEqual(observed(fx)(id), offline);
+            fx.census([working], false);
+            assert.equal(observed(fx)(sibling).mark, 'moving/ink');
+            assert.deepEqual(observed(fx)(id), offline);
+            fx.census([failed], false);
+            assert.equal(observed(fx)(id).text, 'Failed');
+            assert.equal(observed(fx)(id).secondary, 'Finalizing…');
+            assert.equal(observed(fx)(sibling).mark, 'ring/ink', 'an omitted row is retained as unknown, not reanimated');
+            assert.equal(observed(fx)(settled).text, 'Done');
+        } finally { fx.instance.destroy(); restoreDom(fx.prior); }
+    });
+}
+
+test('the server room alone moves the header between Thinking... and Online', () => {
     const fx = makeInstance();
     try {
-        fx.census([{ activity_id: 'direct-1', chat_id: 1, kind: 'direct_chat', phase: 'thinking' }], true);
-        assert.equal(fx.status(), 'Thinking...');
+        fx.census([{ activity_id: 'direct-1', chat_id: 1, kind: 'direct_chat', phase: 'thinking' }], true, Infinity,
+            room('working', { call: 'thinking' }));
+        assert.equal(fx.status(), 'Thinking');
         assert.equal(fx.typingHidden(), false);
         fx.census([], true);
         assert.equal(fx.status(), 'Online');
         assert.equal(fx.typingHidden(), true);
+    } finally { fx.instance.destroy(); restoreDom(fx.prior); }
+});
+
+for (const withdrawBeforeMount of [false, true]) {
+    test(`R2 terminal census precedes its card, withdrawal first=${withdrawBeforeMount}`, async () => {
+        const fx = makeInstance();
+        try {
+            const id = 'early-cancel', row = { activity_id: id, chat_id: 1, kind: 'managed_task', phase: 'finalizing',
+                status: 'cancelled', root_phase_checkpoint: { post_task_synthesis: 'running' } };
+            fx.census([row], true);
+            if (withdrawBeforeMount) fx.census([], true);
+            fx.handlers.get('chat')({ chat_id: 1, task_id: id, role: 'assistant', is_progress: true,
+                content: 'A progress frame already in transit.', ts: '2026-10-08T10:00:00Z' });
+            const card = fx.card(id);
+            assert.ok(card);
+            assert.equal(card.dataset.finished, '1');
+            assert.equal(card.querySelector('[data-live-phase]').textContent, 'Stopped');
+            assert.equal(markOf(card.querySelector('[data-live-phase]')), 'dot/neutral');
+            fx.census([row], true);
+            fx.census([], true);
+            await fx.settle();
+            assert.equal(card.querySelector('[data-live-phase]').textContent, 'Stopped');
+            assert.equal(card.dataset.finished, '1');
+            assert.equal(fx.calls.filter(url => url.endsWith(`/api/tasks/${id}`)).length, 0, 'the known outcome needs no rescue read');
+            const fresh = { activity_id: 'independent', chat_id: 1, kind: 'managed_task', phase: 'working', status: 'running' };
+            fx.census([fresh], true);
+            fx.handlers.get('chat')({ chat_id: 1, task_id: 'independent', role: 'assistant', is_progress: true,
+                content: 'A different task is running.', ts: '2026-10-08T10:00:01Z' });
+            assert.equal(fx.card('independent').dataset.finished, '0');
+            assert.equal(markOf(fx.card('independent').querySelector('[data-live-phase]')), 'moving/ink');
+        } finally { fx.instance.destroy(); restoreDom(fx.prior); }
+    });
+}
+
+for (const firstCarrier of ['narration', 'metrics', 'tool span']) {
+    test(`R3 a cached terminal keeps initial authored content after ${firstCarrier}`, () => {
+        const fx = makeInstance();
+        try {
+            const id = 'initial-content';
+            fx.census([{ activity_id: id, chat_id: 1, kind: 'managed_task', phase: 'working', status: 'cancelled' }], true);
+            if (firstCarrier !== 'narration') {
+                fx.handlers.get('log')({ chat_id: 1, data: { task_id: id, ts: '2026-10-08T10:00:00Z',
+                    ...(firstCarrier === 'metrics' ? { type: 'task_metrics_event', tool_calls: 1 }
+                        : { type: 'tool_call_started', tool: 'read_file', tool_call_id: 'initial-span' }) } });
+                assert.equal(fx.card(id).querySelector('[data-live-phase]').textContent, 'Stopped');
+                assert.equal(markOf(fx.card(id).querySelector('[data-live-phase]')), 'dot/neutral');
+            }
+            const text = 'I found the relevant state transition.';
+            fx.handlers.get('chat')({ chat_id: 1, task_id: id, role: 'assistant', system_type: 'model_narration',
+                is_progress: true, narration: true, content: text, ts: '2026-10-08T10:00:01Z' });
+            const card = fx.card(id);
+            assert.equal(card.querySelector('[data-live-title]').textContent, text);
+            assert.equal(card.querySelector('[data-live-phase]').textContent, 'Stopped');
+            assert.equal(card.dataset.finished, '1');
+            assert.equal(markOf(card.querySelector('[data-live-phase]')), 'dot/neutral');
+            assert.ok(card.querySelector('[data-live-timeline]').children.length > 0, 'initial content reaches the timeline renderer');
+            const count = card.querySelector('[data-live-count]').textContent;
+            fx.handlers.get('chat')({ chat_id: 1, task_id: id, role: 'assistant', is_progress: true, narration: true,
+                content: 'Late progress must not replace the established finished card.', ts: '2026-10-08T10:00:02Z' });
+            assert.equal(card.querySelector('[data-live-title]').textContent, text);
+            assert.equal(card.querySelector('[data-live-count]').textContent, count);
+            assert.equal(fx.calls.filter(url => url.endsWith(`/api/tasks/${id}`)).length, 0);
+        } finally { fx.instance.destroy(); restoreDom(fx.prior); }
+    });
+}
+
+for (const [status, label, mark] of [['completed', 'Done', 'dot/ok'], ['failed', 'Failed', 'dot/failed']]) {
+    test(`R3 off-screen ${status} card rematerializes with its retained narrative`, async () => {
+        const id = 'evicted-root', text = 'Reading the repository before completion';
+        const progress = { chat_id: 1, task_id: id, role: 'assistant', is_progress: true, narration: true,
+            text, content: text, ts: '2026-10-08T10:00:00Z', history_id: 'old-progress', history_position: { source: 'progress', offset: 1 } };
+        const terminal = { chat_id: 1, task_id: id, role: 'assistant', system_type: 'task_summary', status,
+            task_terminal_status: status, text: 'Finished', content: 'Finished', ts: '2026-10-08T10:00:05Z',
+            history_id: 'old-terminal', history_position: { source: 'chat', offset: 2 } };
+        const page = (messages, cursor, next = null) => ({ messages, progress: [], page_cursor: cursor,
+            next_cursor: next, has_more: Boolean(next), window: { complete: !next }, coverage: null });
+        const pages = new Map([['recent', page([progress, terminal], 'recent-first')]]);
+        const fx = makeInstance({ state: { pages, census: { active_chat_activities: [],
+            active_chat_activities_complete: true, supervisor_ready: true } } });
+        const descriptor = Object.getOwnPropertyDescriptor(ElementStub.prototype, 'innerHTML');
+        const rect = ElementStub.prototype.getBoundingClientRect, rects = ElementStub.prototype.getClientRects, rendered = [];
+        Object.defineProperty(ElementStub.prototype, 'innerHTML', { ...descriptor,
+            set(value) { rendered.push(String(value)); descriptor.set.call(this, value); } });
+        const settle = async () => { for (let n = 0; n < 30; n += 1) await new Promise(resolve => setTimeout(resolve, 0)); };
+        try {
+            fx.handlers.get('chat')({ chat_id: 1, task_id: id, role: 'assistant', is_progress: true, narration: true,
+                content: text, ts: progress.ts });
+            fx.handlers.get('chat')({ chat_id: 1, task_id: id, role: 'assistant', system_type: 'task_summary',
+                task_terminal_status: status, content: 'Finished', ts: terminal.ts });
+            fx.open(); await settle();
+            const original = fx.card(id);
+            assert.ok(original);
+            const messages = globalThis.document.byId.get('chat-messages');
+            ElementStub.prototype.getBoundingClientRect = function () { return this === messages || this === fx.mount
+                ? { top: 0, bottom: 800, left: 0, right: 1000, width: 1000, height: 800 }
+                : { top: -5000, bottom: -4980, left: 0, right: 100, width: 100, height: 20 }; };
+            ElementStub.prototype.getClientRects = function () { return [this.getBoundingClientRect()]; };
+            pages.set('recent', page([{ chat_id: 1, role: 'user', text: 'A newer request', content: 'A newer request',
+                ts: '2026-10-08T10:10:00Z', history_id: 'newer-owner', history_position: { source: 'chat', offset: 9 } }],
+                'recent-second', 'older-first'));
+            pages.set('older-first', page([progress, terminal], 'older-first'));
+            fx.close(); fx.open(); await settle();
+            assert.equal(fx.card(id), null, 'the real history owner evicts the finished off-screen card');
+            rendered.length = 0;
+            const older = messages.querySelector('.chat-load-older-btn');
+            assert.equal(older.hidden, false);
+            older.listeners.get('click')[0]({ target: older }); await settle();
+            const restored = fx.card(id);
+            assert.ok(restored, 'Load more history restores the retained work');
+            assert.notEqual(restored, original);
+            assert.equal(restored.querySelector('[data-live-title]').textContent, text);
+            assert.equal(restored.querySelector('[data-live-count]').textContent, '2 notes');
+            assert.equal(restored.querySelector('[data-live-phase]').textContent, label);
+            assert.equal(markOf(restored.querySelector('[data-live-phase]')), mark);
+            assert.equal(restored.dataset.finished, '1');
+            assert.equal(restored.dataset.ts, String(Date.parse(progress.ts)));
+            assert.ok(rendered.some(value => value.includes(text) && value.includes('chat-live-line')));
+        } finally {
+            fx.instance.destroy(); restoreDom(fx.prior);
+            ElementStub.prototype.getBoundingClientRect = rect; ElementStub.prototype.getClientRects = rects;
+            Object.defineProperty(ElementStub.prototype, 'innerHTML', descriptor);
+        }
+    });
+}
+
+test('R2 a terminal census retires only its linked Sending receipt without a typing frame', async () => {
+    const fx = makeInstance();
+    try {
+        fx.census([], true);
+        const input = globalThis.document.byId.get('chat-input');
+        const send = () => globalThis.document.byId.get('chat-send').listeners.get('click')[0]();
+        input.value = 'Complete this request'; send(); await fx.settle();
+        assert.equal(fx.status(), 'Sending');
+        const row = { activity_id: 'completed-before-receipt', client_message_id: 'cm-send', chat_id: 1,
+            kind: 'direct_chat', phase: 'thinking', status: 'completed',
+            root_phase_checkpoint: { post_task_synthesis: 'completed' } };
+        fx.census([row], true);
+        assert.equal(fx.status(), 'Online');
+        fx.state.messageId = 'second-send'; input.value = 'Another request'; send(); await fx.settle();
+        fx.census([row], true);
+        assert.equal(fx.status(), 'Sending', 'an old completion cannot retire a different request');
+        fx.census([{ activity_id: 'second', client_message_id: 'second-send', chat_id: 1,
+            kind: 'direct_chat', phase: 'thinking' }], true, Infinity, room('working', { call: 'thinking' }));
+        assert.equal(fx.status(), 'Thinking');
+    } finally { fx.instance.destroy(); restoreDom(fx.prior); }
+});
+
+test('R2 only fresh connected child activity releases disconnect uncertainty; replay, waits and terminals stay factual', async () => {
+    const fx = makeInstance();
+    try {
+        const root = { activity_id: 'parent', chat_id: 1, kind: 'managed_task', phase: 'working' };
+        const childFrame = { chat_id: 1, task_id: 'child', subagent_task_id: 'child', root_task_id: 'parent',
+            parent_task_id: 'parent', delegation_role: 'subagent', subagent_role: 'research', subagent_event: 'running',
+            role: 'system', is_progress: true, content: 'Inspecting the evidence.', ts: '2026-10-08T10:00:00Z' };
+        fx.handlers.get('chat')({ chat_id: 1, task_id: 'parent', role: 'assistant', is_progress: true,
+            content: 'Working with a child.', ts: '2026-10-08T09:59:00Z' });
+        fx.handlers.get('chat')(childFrame);
+        fx.census([root], true);
+        const phase = () => fx.card('child').querySelector('[data-live-phase]');
+        assert.equal(markOf(phase()), 'moving/ink');
+        fx.close();
+        assert.equal(phase().textContent, 'Activity unconfirmed');
+        fx.handlers.get('chat')({ ...childFrame, content: 'Already buffered before the socket closed.' });
+        assert.equal(markOf(phase()), 'ring/ink');
+        const historyText = 'Retained history-only child evidence';
+        fx.state.history = [{ ...childFrame, subagent_event: 'progress', history_id: 'progress:r2-child', text: historyText, content: historyText,
+            ts: '2026-10-08T10:00:00.500Z', is_progress: true }];
+        fx.state.census = { active_chat_activities: [root], active_chat_activities_complete: true, supervisor_ready: true };
+        fx.open(); await fx.instance.refreshHistory({ revision: 1 }); await fx.settle();
+        const replayed = fx.card('child');
+        if (replayed.dataset.expanded !== '1') replayed.querySelector('[data-live-disclosure]').listeners.get('click')[0]({});
+        const rendered = node => [node.textContent, node.innerHTML, ...node.children.map(rendered)].join(' ');
+        assert.match(rendered(replayed), /Retained history-only child evidence/,
+            'the negative control must have admitted and rendered the historical row');
+        assert.equal(phase().textContent, 'Activity unconfirmed', 'history replay and the fresh parent do not prove child activity');
+        fx.handlers.get('chat')({ ...childFrame, content: 'Fresh child progress.', ts: '2026-10-08T10:00:01Z' });
+        assert.equal(phase().textContent, 'Working');
+        assert.equal(markOf(phase()), 'moving/ink');
+        const wait = { wait_id: 'child-wait', revision: 1, task_attempt: 1, state: 'waiting', reason: 'quota', role: 'main', model: 'test' };
+        fx.handlers.get('log')({ chat_id: 1, data: { type: 'task_model_wait', chat_id: 1, task_id: 'child', ...wait } });
+        fx.close(); fx.open(); await fx.settle();
+        fx.handlers.get('chat')({ ...childFrame, content: 'Fresh progress with an unresolved model wait.', ts: '2026-10-08T10:00:02Z' });
+        assert.equal(phase().textContent, 'Waiting for access');
+        // A quota wait resumes by itself: neutral and still, never the owner's amber.
+        assert.deepEqual([markOf(phase()), phase().dataset.chipTone], ['still/ink', 'neutral']);
+        fx.handlers.get('log')({ chat_id: 1, data: { type: 'task_model_wait', chat_id: 1, task_id: 'child',
+            ...wait, revision: 2, state: 'resolved' } });
+        assert.equal(markOf(phase()), 'moving/ink');
+        fx.handlers.get('chat')({ ...childFrame, subagent_event: 'completed', status: 'completed', content: 'Child result.',
+            ts: '2026-10-08T10:00:03Z' });
+        assert.equal(fx.card('child').dataset.finished, '1');
+        fx.handlers.get('chat')({ ...childFrame, content: 'Late old progress.', ts: '2026-10-08T10:00:04Z' });
+        assert.equal(fx.card('child').dataset.finished, '1');
+        assert.equal(markOf(phase()), 'dot/ok');
+    } finally { fx.instance.destroy(); restoreDom(fx.prior); }
+});
+
+test('a direct owner Pause agrees between the actual card and header, then Resume restores Thinking', () => {
+    const fx = makeInstance();
+    try {
+        const id = 'paused-direct-turn';
+        fx.handlers.get('chat')({ chat_id: 1, task_id: id, role: 'assistant', is_progress: true,
+            _is_direct_chat: true, cancelable: true, content: 'Checking the saved work.', ts: '2026-09-28T06:00:00Z' });
+        const row = { activity_id: id, chat_id: 1, kind: 'direct_chat' };
+        fx.census([{ ...row, phase: 'thinking' }], true, Infinity, room('working', { call: 'thinking' }));
+        assert.equal(fx.status(), 'Thinking');
+        fx.census([{ ...row, phase: 'budget_pausing' }], true, Infinity, room('working', { transition: 'pausing' }));
+        assert.equal(fx.status(), 'Pausing…');
+        assert.equal(fx.card(id).querySelector('[data-live-phase]')?.textContent, 'Pausing…');
+        fx.census([{ ...row, phase: 'budget_paused' }], true, Infinity, room('paused'));
+        assert.equal(fx.status(), 'Paused');
+        assert.equal(fx.typingHidden(), true);
+        assert.equal(fx.card(id).querySelector('[data-live-phase]')?.textContent, 'Paused');
+        assert.equal(markOf(fx.card(id).querySelector('[data-live-phase]')), 'pause/ink');
+        fx.census([{ ...row, phase: 'unknown' }], false, Infinity, room('unknown'));
+        assert.equal(fx.status(), 'Activity unconfirmed');
+        assert.equal(fx.typingHidden(), true);
+        assert.equal(fx.card(id).querySelector('[data-live-phase]')?.textContent, 'Activity unconfirmed');
+        assert.equal(markOf(fx.card(id).querySelector('[data-live-phase]')), 'ring/ink');
+        fx.census([{ ...row, phase: 'budget_paused' }], true, Infinity, room('paused'));
+        assert.equal(fx.status(), 'Paused');
+        fx.census([{ ...row, phase: 'thinking' }], true, Infinity, room('working', { call: 'thinking' }));
+        assert.equal(fx.status(), 'Thinking');
+        assert.equal(fx.card(id).querySelector('[data-live-phase]')?.textContent, 'Thinking');
+        assert.equal(markOf(fx.card(id).querySelector('[data-live-phase]')), 'moving/ink');
     } finally { fx.instance.destroy(); restoreDom(fx.prior); }
 });
 
@@ -131,10 +566,10 @@ for (const kind of ['', undefined, 'direct_chat', 'managed_task', 'future_kind']
         for (const complete of [true, false]) {
             const fx = makeInstance();
             try {
-                fx.census(seed, true);
-                assert.equal(fx.status(), kind === 'managed_task' ? 'Working...' : 'Thinking...');
+                fx.census(seed, true, Infinity, room('working', { call: kind === 'managed_task' ? 'working' : 'thinking' }));
+                assert.equal(fx.status(), kind === 'managed_task' ? 'Working' : 'Thinking');
                 fx.census([], complete);
-                assert.equal(fx.status(), complete ? 'Online' : (kind === 'managed_task' ? 'Working...' : 'Thinking...'));
+                assert.equal(fx.status(), complete ? 'Online' : 'Activity unconfirmed');
             } finally { fx.instance.destroy(); restoreDom(fx.prior); }
         }
     });
@@ -156,23 +591,25 @@ test('a typing frame is a receipt: Sending... steps to the census verdict, never
         input.value = 'hello';
         globalThis.document.byId.get('chat-send').listeners.get('click')[0]();
         await fx.settle();
-        assert.equal(fx.status(), 'Sending...', 'the owner\'s own unconfirmed send owns the header');
+        assert.equal(fx.status(), 'Sending', 'the owner\'s own unconfirmed send owns the header');
 
         // The census answers the receipt's read with the turn listed: the header
         // moves Sending... -> Thinking... with no Online in between.
+        const turn = { activity_id: 'turn-1', chat_id: 1, kind: 'direct_chat', phase: 'thinking', client_message_id: 'cm-send' };
         fx.state.census = {
-            active_chat_activities: [{ activity_id: 'turn-1', chat_id: 1, kind: 'direct_chat', phase: 'thinking', client_message_id: 'cm-send' }],
-            active_chat_activities_complete: true, supervisor_ready: true,
+            active_chat_activities: [turn], active_chat_activities_complete: true, supervisor_ready: true,
+            ...projection(1, [work(turn)], room('working', { call: 'thinking' })),
         };
         fx.handlers.get('typing')({ chat_id: 1, activity_id: 'turn-1', kind: 'direct_chat', client_message_id: 'cm-send' });
         await fx.settle();
-        assert.equal(fx.status(), 'Thinking...');
+        assert.equal(fx.status(), 'Thinking');
         assert.ok(stateCalls() > before, 'the receipt pulled the authoritative census at once');
-        assert.ok(seen.includes('Sending...'), `the send was observed: ${seen.join(' > ')}`);
-        assert.ok(!seen.slice(seen.indexOf('Sending...')).includes('Online'), `no Online blink: ${seen.join(' > ')}`);
+        assert.ok(seen.includes('Sending'), `the send was observed: ${seen.join(' > ')}`);
+        assert.ok(!seen.slice(seen.indexOf('Sending')).includes('Online'), `no Online blink: ${seen.join(' > ')}`);
 
         // A receipt whose census does not list the turn settles at Online.
-        fx.state.census = { active_chat_activities: [], active_chat_activities_complete: true, supervisor_ready: true };
+        fx.state.census = { active_chat_activities: [], active_chat_activities_complete: true, supervisor_ready: true,
+            ...projection(1) };
         fx.handlers.get('typing')({ chat_id: 1, activity_id: 'turn-1', kind: 'direct_chat', client_message_id: 'cm-send' });
         await fx.settle();
         assert.equal(fx.status(), 'Online');
@@ -182,7 +619,7 @@ test('a typing frame is a receipt: Sending... steps to the census verdict, never
         input.value = 'again';
         globalThis.document.byId.get('chat-send').listeners.get('click')[0]();
         await fx.settle();
-        assert.equal(fx.status(), 'Sending...');
+        assert.equal(fx.status(), 'Sending');
         fx.handlers.get('typing')({ chat_id: 1, activity_id: 'turn-2', kind: 'direct_chat', client_message_id: 'cm-send' });
         await fx.settle();
         assert.equal(fx.status(), 'Online', 'the settled read retired the send the census never listed');
@@ -191,12 +628,47 @@ test('a typing frame is a receipt: Sending... steps to the census verdict, never
         input.value = 'once more';
         globalThis.document.byId.get('chat-send').listeners.get('click')[0]();
         await fx.settle();
-        assert.equal(fx.status(), 'Sending...');
+        assert.equal(fx.status(), 'Sending');
         fx.state.fail = true;
         fx.handlers.get('typing')({ chat_id: 1, activity_id: 'turn-3', kind: 'direct_chat', client_message_id: 'cm-send' });
         await fx.settle();
         fx.state.fail = false;
         assert.equal(fx.status(), 'Online', 'a failed census read still retires the send');
+    } finally { fx.instance.destroy(); restoreDom(fx.prior); }
+});
+
+test('#1403: an unrelated System row keeps Working and Sending; a refusal settles only its own submission', async () => {
+    const fx = makeInstance();
+    const notice = (extra = {}) => fx.handlers.get('chat')({ chat_id: 1, role: 'system', system_type: 'budget_notice',
+        task_id: '', content: '🚫 Model budget reached. Unrelated runtime fact.', ts: '2026-10-13T09:00:00Z', ...extra });
+    const send = async (text, cmid) => {
+        fx.state.messageId = cmid;
+        globalThis.document.byId.get('chat-input').value = text;
+        globalThis.document.byId.get('chat-send').listeners.get('click')[0]();
+        await fx.settle();
+    };
+    try {
+        fx.census([{ activity_id: 'turn-1', chat_id: 1, kind: 'direct_chat', phase: 'working' }], true, Infinity,
+            room('working', { call: 'working' }));
+        assert.equal(fx.status(), 'Working');
+        notice();
+        assert.equal(fx.status(), 'Working', 'a runtime notice concludes no turn');
+        fx.census([], true);
+        await send('first', 'cm-first');
+        await send('second', 'cm-second');
+        assert.equal(fx.status(), 'Sending');
+        notice();
+        assert.equal(fx.status(), 'Sending', 'nor retires a submission it does not name');
+        // A host refusal names the submission it answers: only that one settles.
+        notice({ system_type: 'task_admission_notice', content: '🚫 Budget exhausted. Task rejected.',
+            client_message_id: 'cm-first' });
+        assert.equal(fx.status(), 'Sending', 'the other submission is still unanswered');
+        notice({ system_type: 'command_reply', content: '🧠 Background consciousness: on', client_message_id: 'cm-second' });
+        assert.equal(fx.status(), 'Online');
+        // A legacy unkeyed model final still ends the unscoped turn, as documented.
+        await send('third', 'cm-third');
+        fx.handlers.get('chat')({ chat_id: 1, role: 'assistant', task_id: '', content: 'Done.', ts: '2026-10-13T09:01:00Z' });
+        assert.equal(fx.status(), 'Online');
     } finally { fx.instance.destroy(); restoreDom(fx.prior); }
 });
 
@@ -230,7 +702,7 @@ test('a progress-only root the census omits loses Stop authority at once, then s
             content: 'Working.', ts: '2026-09-14T09:59:00Z',
         });
         assert.ok(fx.card(id).querySelector('[data-cancel-run]'), 'the cancelable progress row granted Stop');
-        assert.equal(fx.status(), 'Working...');
+        assert.notEqual(fx.status(), 'Working', 'a card the projection does not list never sets the header');
         // The queue census omits the root: Stop has no row to target, and the
         // card is handed to the durable-detail read (one /api/tasks call).
         fx.census([], true, Date.now() + 1_000);
@@ -241,4 +713,288 @@ test('a progress-only root the census omits loses Stop authority at once, then s
         assert.equal(fx.card(id).dataset.finished, '1');
         assert.equal(fx.status(), 'Online');
     } finally { fx.instance.destroy(); restoreDom(fx.prior); }
+});
+
+test('a finished card keeps the Stop… of a work the body still lists and drops it with the next body', async () => {
+    const id = 'post-task-tail';
+    const fx = makeInstance({ details: { [id]: { task_id: id, status: 'completed', phase: 'done', ts: '2026-10-19T09:00:05Z' } } });
+    const row = { activity_id: id, chat_id: 1, kind: 'managed_task', phase: 'working' };
+    const listed = work(row, { controls: [{ action: 'stop', target: id }] });
+    // One body; a read the instance makes itself (a terminal's re-read) answers the same.
+    const body = (rows, works) => {
+        fx.state.census = { active_chat_activities: rows, active_chat_activities_complete: true, supervisor_ready: true,
+            ...projection(1, works, works.length ? room('working') : null, true) };
+        fx.instance.hydrateStateSnapshot(fx.state.census, Infinity);
+    };
+    const stop = () => fx.card(id).querySelector('[data-cancel-run]');
+    try {
+        fx.handlers.get('chat')({ chat_id: 1, task_id: id, role: 'assistant', is_progress: true,
+            content: 'Delivering the files', ts: '2026-10-19T09:00:00Z' });
+        body([row], [listed]);
+        assert.ok(stop(), 'a listed work offers its Stop… on its card');
+        fx.handlers.get('log')({ chat_id: 1, data: { type: 'task_done', task_id: id, status: 'completed',
+            ts: '2026-10-19T09:00:05Z' } });
+        await fx.settle();
+        // The census has let the task go while its work (the post-task tail) is still listed.
+        body([], [listed]);
+        await fx.settle();
+        assert.equal(fx.card(id).dataset.finished, '1');
+        assert.ok(stop(), 'the finished card keeps the Stop… of a work the server still lists');
+        body([], []);
+        // A boolean: a failing comparison would otherwise print the whole stub DOM around the button.
+        assert.equal(Boolean(stop()), false, 'the first body without the work takes its Stop… off the finished card');
+    } finally { fx.instance.destroy(); restoreDom(fx.prior); }
+});
+
+// A browser click on the fixture's stub (each control stops its own event); the nodes under a stub that match.
+const press = (node) => { for (const fn of node.listeners.get('click') || []) fn({ target: node, stopPropagation() {}, preventDefault() {} }); };
+const collect = (node, predicate, out = []) => {
+    if (predicate(node)) out.push(node);
+    for (const child of node?.children || []) collect(child, predicate, out);
+    return out;
+};
+
+for (const [chatId, asPanel] of [[1, false], [7, true]]) {
+    for (const complete of [true, false]) {
+        test(`a finished parent keeps its work's Stop… while its helper works and the Stop reaches the tree (${asPanel ? 'Project room' : 'Main'}, ${complete ? 'complete' : 'partial'} body)`, async () => {
+            const fx = makeInstance({ chatId, asPanel, details: {
+                p: { task_id: 'p', status: 'completed', phase: 'done', ts: '2026-10-19T09:00:05Z' },
+                cancel: { ok: true, task_id: 'p', cancel_state: 'requested', cascade: true },
+            } });
+            const parent = { activity_id: 'p', chat_id: chatId, kind: 'managed_task', phase: 'working' };
+            const helper = { activity_id: 'h', chat_id: chatId, kind: 'managed_task', phase: 'working',
+                parent_task_id: 'p', root_task_id: 'p' };
+            const running = work(parent, { controls: [{ action: 'pause', target: 'p' }, { action: 'stop', target: 'p', scope: 'cascade' }] });
+            // The server's own work once the parent has finished and its helper still works (episode not live).
+            const after = { ...structuredClone(SERVER_CASES.helper_after_parent.works[0]), room: chatId };
+            const body = (rows, works, whole = true) => {
+                fx.state.census = { active_chat_activities: rows, active_chat_activities_complete: whole, supervisor_ready: true,
+                    ...projection(chatId, works, works.length ? room('working') : null, whole) };
+                fx.instance.hydrateStateSnapshot(fx.state.census, Infinity);
+            };
+            const stop = () => fx.card('p').querySelector('[data-cancel-run]');
+            const priorObserver = globalThis.IntersectionObserver;
+            globalThis.IntersectionObserver = class { observe() {} disconnect() {} takeRecords() { return []; } };
+            const page = new ElementStub('body', globalThis.document);
+            page.isConnected = true;
+            globalThis.document.body = page;
+            try {
+                fx.handlers.get('chat')({ chat_id: chatId, task_id: 'p', role: 'assistant', is_progress: true,
+                    content: 'Handing the survey to a helper', ts: '2026-10-19T09:00:00Z' });
+                body([parent, helper], [running]);
+                assert.ok(stop(), 'the running work offers its Stop… on the parent card');
+                fx.handlers.get('log')({ chat_id: chatId, data: { type: 'task_done', task_id: 'p', status: 'completed',
+                    ts: '2026-10-19T09:00:05Z' } });
+                await fx.settle();
+                body([helper], [after], complete);
+                await fx.settle();
+                assert.equal(fx.card('p').dataset.finished, '1');
+                assert.ok(stop(), 'the finished parent keeps the Stop… its work offers while the helper works');
+                press(stop());
+                const [stopNow] = collect(page, (node) => node?.dataset?.taskControl === 'stop_now');
+                assert.ok(stopNow, 'the Stop… opens the work\'s Stop');
+                press(stopNow);
+                for (let i = 0; i < 10 && !fx.calls.includes('/api/tasks/p/cancel'); i += 1) await fx.settle();
+                assert.ok(fx.calls.includes('/api/tasks/p/cancel'), 'the finished card\'s Stop reaches its tree\'s door');
+                // An incomplete body that leaves the work out keeps it unconfirmed, and an unconfirmed work offers
+                // no controls anywhere (reconcileWorkState): the Stop… goes until a body lists the work again.
+                body([helper], [], false);
+                assert.equal(Boolean(stop()), false, 'an omitted, unconfirmed work offers no Stop…');
+                body([helper], [after]);
+                assert.ok(stop(), 'a body that lists the work again brings its Stop… back');
+                body([], []);
+                assert.equal(Boolean(stop()), false, 'once a complete body no longer lists the work, its Stop… goes');
+            } finally {
+                fx.instance.destroy();
+                globalThis.IntersectionObserver = priorObserver;
+                restoreDom(fx.prior);
+            }
+        });
+    }
+}
+
+for (const [chatId, asPanel, refused] of [[1, false, true], [7, true, true], [1, false, false], [7, true, false]]) {
+    test(`a Stop out when its parent finished is usable again once ${refused ? 'refused' : 'accepted'} and stops the tree (${asPanel ? 'Project room' : 'Main'})`, async () => {
+        let release = null;
+        const cancels = [];
+        const accepted = { ok: true, status: 200, json: async () => ({ ok: true, task_id: 'p', cascade: true }) };
+        // The first Stop is held, then answered (refused as the host refuses an unrecorded intent, or accepted).
+        const hook = (url) => {
+            if (url !== '/api/tasks/p/cancel') return null;
+            cancels.push(url);
+            return cancels.length > 1 ? accepted : new Promise((resolve) => { release = () => resolve(refused
+                ? { ok: false, status: 503, json: async () => ({ reason_code: 'cancel_intent_write_failed',
+                    error: 'durable cancel intent could not be recorded; nothing was cancelled' }) } : accepted); });
+        };
+        const fx = makeInstance({ chatId, asPanel, hook,
+            details: { p: { task_id: 'p', status: 'running', phase: 'working', ts: '2026-10-19T09:00:00Z' } } });
+        const parent = { activity_id: 'p', chat_id: chatId, kind: 'managed_task', phase: 'working' };
+        const helper = { activity_id: 'h', chat_id: chatId, kind: 'managed_task', phase: 'working',
+            parent_task_id: 'p', root_task_id: 'p' };
+        const running = work(parent, { controls: [{ action: 'wrap_up', target: 'p' }, { action: 'stop', target: 'p', scope: 'cascade' }] });
+        const after = { ...structuredClone(SERVER_CASES.helper_after_parent.works[0]), room: chatId };
+        const body = (rows, works) => {
+            fx.state.census = { active_chat_activities: rows, active_chat_activities_complete: true, supervisor_ready: true,
+                ...projection(chatId, works, works.length ? room('working') : null, true) };
+            fx.instance.hydrateStateSnapshot(fx.state.census, Infinity);
+        };
+        const stop = () => fx.card('p').querySelector('[data-cancel-run]');
+        const priorObserver = globalThis.IntersectionObserver;
+        globalThis.IntersectionObserver = class { observe() {} disconnect() {} takeRecords() { return []; } };
+        const page = new ElementStub('body', globalThis.document);
+        page.isConnected = true;
+        globalThis.document.body = page;
+        const item = (action) => collect(page, (node) => node?.dataset?.taskControl === action).at(-1);
+        try {
+            fx.handlers.get('chat')({ chat_id: chatId, task_id: 'p', role: 'assistant', is_progress: true, cancelable: true,
+                content: 'Handing the survey to a helper', ts: '2026-10-19T09:00:00Z' });
+            body([parent, helper], [running]);
+            press(stop());
+            press(item('finalize'));
+            await fx.settle();
+            assert.equal(cancels.length, 1, 'the Wrap up is out');
+            assert.equal(stop().disabled, true, 'its Stop… waits for the answer');
+            // The parent finishes while the request is out; its helper still works.
+            fx.handlers.get('log')({ chat_id: chatId, data: { type: 'task_done', task_id: 'p', status: 'completed',
+                ts: '2026-10-19T09:00:05Z' } });
+            await fx.settle();
+            body([helper], [after]);
+            assert.equal(fx.card('p').dataset.finished, '1');
+            // The answer has settled once the card has read its task's detail after it.
+            const reads = () => fx.calls.filter((url) => url === '/api/tasks/p').length, before = reads();
+            release();
+            for (let i = 0; i < 20 && reads() === before; i += 1) await fx.settle();
+            await fx.settle();
+            const toasts = collect(page, (node) => node?.classList?.contains('toast')).map((node) => node.textContent);
+            // A refusal is said as a running card says it; an accepted Stop says nothing.
+            assert.equal(toasts.some((text) => text.startsWith('Cancel failed: durable cancel intent could not be recorded')),
+                refused, toasts);
+            assert.equal(stop()?.disabled, false, 'the Stop… the work still offers is usable again');
+            press(stop());
+            press(item('stop_now'));
+            for (let i = 0; i < 10 && cancels.length < 2; i += 1) await fx.settle();
+            assert.equal(cancels.length, 2, 'pressed again, it reaches the tree\'s Stop door');
+        } finally {
+            fx.instance.destroy();
+            globalThis.IntersectionObserver = priorObserver;
+            restoreDom(fx.prior);
+        }
+    });
+}
+
+// Races of the same Stop (astra's reviews of eedc75c55 and 6a311ccaf): the parent's end learned only from the detail
+// read that follows a refused or 404 answer; a Stop… replaced while the request is out (a partial body takes it, the
+// next one mounts another) before the refusal arrives; and the same with no Stop… mounted until after the answer
+// ('gone'). Every way, the card keeps a usable Stop… and the request says its refusal once.
+for (const [chatId, asPanel] of [[1, false], [7, true]]) {
+    for (const [race, answer] of [['learned', 503], ['learned', 404], ['replaced', 503], ['replaced', 0],
+        ['gone', 503], ['gone', 0]]) {
+        test(`a Stop out across the parent's end settles the card as it is now (${race}, ${answer || 'network error'}, ${asPanel ? 'Project room' : 'Main'})`, async () => {
+            let release = null;
+            const cancels = [];
+            const hook = (url) => {
+                if (url !== '/api/tasks/p/cancel') return null;
+                cancels.push(url);
+                if (cancels.length > 1) return { ok: true, status: 200, json: async () => ({ ok: true, task_id: 'p', cascade: true }) };
+                return new Promise((resolve, reject) => { release = () => (answer ? resolve({ ok: false, status: answer,
+                    json: async () => ({ error: answer === 404 ? 'no such live task' : 'durable cancel intent could not be recorded' }) })
+                    : reject(new TypeError('network down'))); });
+            };
+            // The detail read after the answer: the parent's end when it is learned there, else still running.
+            const detail = race === 'learned' ? { task_id: 'p', status: 'completed', phase: 'done', ts: '2026-10-19T09:00:05Z' }
+                : { task_id: 'p', status: 'running', phase: 'working', ts: '2026-10-19T09:00:00Z' };
+            const fx = makeInstance({ chatId, asPanel, hook, details: { p: detail } });
+            const parent = { activity_id: 'p', chat_id: chatId, kind: 'managed_task', phase: 'working' };
+            const helper = { activity_id: 'h', chat_id: chatId, kind: 'managed_task', phase: 'working',
+                parent_task_id: 'p', root_task_id: 'p' };
+            const running = work(parent, { controls: [{ action: 'wrap_up', target: 'p' }, { action: 'stop', target: 'p', scope: 'cascade' }] });
+            const after = { ...structuredClone(SERVER_CASES.helper_after_parent.works[0]), room: chatId };
+            const body = (rows, works, whole = true) => {
+                fx.state.census = { active_chat_activities: rows, active_chat_activities_complete: whole, supervisor_ready: true,
+                    ...projection(chatId, works, works.length ? room('working') : null, whole) };
+                fx.instance.hydrateStateSnapshot(fx.state.census, Infinity);
+            };
+            const stop = () => fx.card('p').querySelector('[data-cancel-run]');
+            const priorObserver = globalThis.IntersectionObserver;
+            globalThis.IntersectionObserver = class { observe() {} disconnect() {} takeRecords() { return []; } };
+            const page = new ElementStub('body', globalThis.document);
+            page.isConnected = true;
+            globalThis.document.body = page;
+            const item = (action) => collect(page, (node) => node?.dataset?.taskControl === action).at(-1);
+            const refusals = () => collect(page, (node) => node?.classList?.contains('toast'))
+                .filter((node) => node.textContent.startsWith('Cancel failed:')).length;
+            try {
+                fx.handlers.get('chat')({ chat_id: chatId, task_id: 'p', role: 'assistant', is_progress: true, cancelable: true,
+                    content: 'Handing the survey to a helper', ts: '2026-10-19T09:00:00Z' });
+                body([parent, helper], [running]);
+                const first = stop();
+                press(first);
+                press(item('finalize'));
+                await fx.settle();
+                assert.equal(cancels.length, 1, 'the Wrap up is out');
+                assert.equal(first.disabled, true, 'its Stop… waits for the answer');
+                if (race !== 'learned') {
+                    fx.handlers.get('log')({ chat_id: chatId, data: { type: 'task_done', task_id: 'p', status: 'completed',
+                        ts: '2026-10-19T09:00:05Z' } });
+                    await fx.settle();
+                    body([helper], [after]);
+                    body([helper], [], false);
+                    assert.equal(Boolean(stop()), false, 'a partial body takes the Stop… away');
+                }
+                if (race === 'replaced') {
+                    body([helper], [after]);
+                    assert.ok(stop() && stop() !== first, 'the next body mounts another Stop…');
+                }
+                // The answer has settled once the card has read its task's detail after it.
+                const reads = () => fx.calls.filter((url) => url === '/api/tasks/p').length, before = reads();
+                release();
+                for (let i = 0; i < 20 && reads() === before; i += 1) await fx.settle();
+                await fx.settle();
+                // A refusal is said by the request itself, even with no Stop… on the card when it arrives ('gone').
+                if (race === 'gone') assert.equal(Boolean(stop()), false, 'no Stop… is mounted at the answer');
+                // Once the parent's end is known, the census lists the work its helper keeps going.
+                body([helper], [after]);
+                assert.equal(fx.card('p').dataset.finished, '1');
+                assert.equal(refusals(), answer === 404 ? 0 : 1, 'a refusal is said once; a 404 is no refusal');
+                assert.equal(stop()?.disabled, false, 'the Stop… the work still offers is usable');
+                press(stop());
+                press(item('stop_now'));
+                for (let i = 0; i < 10 && cancels.length < 2; i += 1) await fx.settle();
+                assert.equal(cancels.length, 2, 'pressed again, it reaches the tree\'s Stop door');
+            } finally {
+                fx.instance.destroy();
+                globalThis.IntersectionObserver = priorObserver;
+                restoreDom(fx.prior);
+            }
+        });
+    }
+}
+
+// #2380/#2411: a paused card says its refused Resume as the server sends it (dated at the end of its line, the door's
+// words in its Details), again in a fresh instance (as after a reload); a body without it drops both.
+test('a paused card says its refused Resume dated on its line and in words in its Details; a fresh read keeps it', () => {
+    const work = SERVER_CASES.paused_resume_refused.works[0];
+    const served = (keep) => {
+        const body = structuredClone(SERVER_CASES.paused_resume_refused);
+        const works = body.works.map((item) => ({ ...item, room: 1 }));
+        if (!keep) for (const item of works) [item, ...Object.values(item.members.states)].forEach((s) => delete s.last_resume);
+        return { active_chat_activities: [{ activity_id: 'rr', chat_id: 1, kind: 'managed_task', phase: 'budget_paused',
+            pause_cause: 'owner', can_resume: false, task_attempt: 1 }], active_chat_activities_complete: true,
+            supervisor_ready: true, ...body, works, rooms: { 1: Object.values(body.rooms)[0] } };
+    };
+    for (const round of ['live', 'fresh read']) {
+        const fx = makeInstance({ chatId: 1 });
+        const paint = (keep) => {
+            fx.instance.hydrateStateSnapshot(served(keep), Infinity);
+            const card = fx.card('rr'), detail = card.querySelector('[data-live-phase-detail]');
+            return [card.querySelector('[data-live-phase]').textContent,
+                card.querySelector('[data-live-phase-secondary]').textContent, detail.hidden ? '' : detail.textContent];
+        };
+        try {
+            fx.handlers.get('chat')({ task_id: 'rr', chat_id: 1, role: 'assistant', is_progress: true,
+                content: 'Comparing the saved notes', ts: '2026-10-17T14:00:00Z' });
+            assert.deepEqual(paint(true), ['Paused', workLine(work), resumeAttemptWords(work.last_resume)], round);
+            assert.deepEqual(paint(false), ['Paused', workLine({ ...work, last_resume: undefined }), ''], round);
+        } finally { fx.instance.destroy(); restoreDom(fx.prior); }
+    }
 });

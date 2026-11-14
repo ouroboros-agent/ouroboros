@@ -33,6 +33,8 @@ def _index_rows(text: str) -> dict[str, str]:
         if "\t" in line:
             disposition, path = line.split("\t", 1)
             rows[path] = disposition
+        elif line.strip():
+            rows[line] = "indexed"  # a bare row is the ordinary indexed class
     return rows
 
 

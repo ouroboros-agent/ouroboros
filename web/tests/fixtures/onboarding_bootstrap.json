@@ -1,4 +1,11 @@
 {
+  "consciousnessOffer": {
+    "autonomy": "act",
+    "dailyUsd": 20.0,
+    "enabled": null,
+    "maxTasks": 2,
+    "offered": true
+  },
   "contract": {
     "budgetFields": [
       {
@@ -6,9 +13,8 @@
         "inputId": "total-budget",
         "label": "Total Budget (USD)",
         "min": "0.01",
-        "note": "Global spend budget across the runtime. Keep this editable even after onboarding.",
+        "note": "Spending limits use known spend only: confirmed and estimated prices count toward the applicable limit; known $0 local calls are priced at $0 and do not use the limit. Unpriced calls stay without a price and are not counted as $0: they add nothing to known spend, so unpriced spending alone never triggers a limit. Open reservations and unresolved charges are not counted as spending. The Total Budget covers all work: once known spend reaches it, new paid calls are refused, API calls with an unknown price included, while known $0 calls and subscription or local calls on a route that has charged nothing continue. The Per-task Cost Cap covers one task's whole tree, subagents included: once that tree's known spend reaches it, every new model call of the tree is refused, known $0 and unpriced calls included. A resumable task pauses with its work saved; without a continuation it ends budget-exhausted. Calls already in flight settle normally and can overshoot the limit. Raising the cap does not resume a paused task; it must be resumed explicitly.",
         "settingKey": "TOTAL_BUDGET",
-        "settingsInputId": "s-total-budget",
         "stateKey": "totalBudget",
         "step": "any",
         "title": "Total budget"
@@ -18,9 +24,8 @@
         "inputId": "per-task-budget",
         "label": "Per-task Cost Cap (USD)",
         "min": "0.01",
-        "note": "Hard cap over one task's WHOLE tree, subagents included: further model calls are refused and the task is force-stopped once the tree's accounted spend reaches this (a graceful wrap-up fires just before). The wrap-up itself needs about $3.00 of room, so a cap at or below that finalizes the task immediately instead of running any work rounds.",
+        "note": "Spending limits use known spend only: confirmed and estimated prices count toward the applicable limit; known $0 local calls are priced at $0 and do not use the limit. Unpriced calls stay without a price and are not counted as $0: they add nothing to known spend, so unpriced spending alone never triggers a limit. Open reservations and unresolved charges are not counted as spending. The Total Budget covers all work: once known spend reaches it, new paid calls are refused, API calls with an unknown price included, while known $0 calls and subscription or local calls on a route that has charged nothing continue. The Per-task Cost Cap covers one task's whole tree, subagents included: once that tree's known spend reaches it, every new model call of the tree is refused, known $0 and unpriced calls included. A resumable task pauses with its work saved; without a continuation it ends budget-exhausted. Calls already in flight settle normally and can overshoot the limit. Raising the cap does not resume a paused task; it must be resumed explicitly.",
         "settingKey": "OUROBOROS_PER_TASK_COST_USD",
-        "settingsInputId": "s-settings-per-task-cost",
         "stateKey": "perTaskCostUsd",
         "step": "any",
         "title": "Per-task cost cap"
@@ -66,6 +71,7 @@
       {
         "inputId": "main-model",
         "label": "Main Model",
+        "managed": false,
         "note": "Primary reasoning and long-form work.",
         "settingKey": "OUROBOROS_MODEL",
         "settingsInputId": "s-model",
@@ -76,7 +82,8 @@
       {
         "inputId": "light-model",
         "label": "Light Model",
-        "note": "Fast summaries, lightweight internal work, reflections, and the default Fast scout. Empty uses Main.",
+        "managed": false,
+        "note": "Fast summaries, lightweight internal work and the default Fast scout. Empty uses Main.",
         "settingKey": "OUROBOROS_MODEL_LIGHT",
         "settingsInputId": "s-model-light",
         "settingsToggleId": "s-local-light",
@@ -84,8 +91,20 @@
         "stateKey": "lightModel"
       },
       {
+        "inputId": "safety-model",
+        "label": "Safety Supervisor",
+        "managed": false,
+        "note": "Empty uses the Light model.",
+        "settingKey": "OUROBOROS_MODEL_SAFETY",
+        "settingsInputId": "s-model-safety",
+        "settingsToggleId": "",
+        "slot": "safety",
+        "stateKey": "safetyModel"
+      },
+      {
         "inputId": "vision-model",
         "label": "Vision Model",
+        "managed": false,
         "note": "Caption and VLM lane. Empty uses Main.",
         "settingKey": "OUROBOROS_MODEL_VISION",
         "settingsInputId": "s-model-vision",
@@ -96,6 +115,7 @@
       {
         "inputId": "consciousness-model",
         "label": "Consciousness Model",
+        "managed": false,
         "note": "High-horizon background consciousness. Empty uses Main.",
         "settingKey": "OUROBOROS_MODEL_CONSCIOUSNESS",
         "settingsInputId": "s-model-consciousness",
@@ -106,6 +126,7 @@
       {
         "inputId": "fallback-model",
         "label": "Fallback Model",
+        "managed": false,
         "note": "Fallback and resilience path.",
         "settingKey": "OUROBOROS_MODEL_FALLBACKS",
         "settingsInputId": "s-model-fallback",
@@ -120,7 +141,7 @@
         "id": "openrouter-key",
         "inputType": "password",
         "label": "OpenRouter API Key",
-        "note": "Optional. Best when you want one router for OpenAI, Anthropic, Google, and more.",
+        "note": "Best when you want one router for OpenAI, Anthropic, Google, and more.",
         "placeholder": "sk-or-v1-...",
         "settingKey": "OPENROUTER_API_KEY",
         "settingsInputId": "s-openrouter",
@@ -131,7 +152,7 @@
         "id": "openai-key",
         "inputType": "password",
         "label": "OpenAI API Key",
-        "note": "Optional. If this is the only remote key, the next step prefills OpenAI's own model ids.",
+        "note": "",
         "placeholder": "sk-...",
         "settingKey": "OPENAI_API_KEY",
         "settingsInputId": "s-openai",
@@ -142,7 +163,7 @@
         "id": "cloudru-key",
         "inputType": "password",
         "label": "Cloud.ru Foundation Models API Key",
-        "note": "Optional. If this is the only remote key, the next step prefills Cloud.ru's own model ids.",
+        "note": "",
         "placeholder": "Cloud.ru API key",
         "settingKey": "CLOUDRU_FOUNDATION_MODELS_API_KEY",
         "settingsInputId": "s-cloudru-key",
@@ -150,10 +171,43 @@
       },
       {
         "group": "more",
+        "id": "gigachat-credentials",
+        "inputType": "password",
+        "label": "GigaChat Authorization Key",
+        "note": "",
+        "placeholder": "Base64 client_id:secret",
+        "settingKey": "GIGACHAT_CREDENTIALS",
+        "settingsInputId": "s-gigachat-credentials",
+        "stateKey": "gigachatCredentials"
+      },
+      {
+        "group": "more",
+        "id": "gigachat-user",
+        "inputType": "text",
+        "label": "GigaChat User",
+        "note": "Basic auth instead of an authorization key, with the password below.",
+        "placeholder": "username",
+        "settingKey": "GIGACHAT_USER",
+        "settingsInputId": "s-gigachat-user",
+        "stateKey": "gigachatUser"
+      },
+      {
+        "group": "more",
+        "id": "gigachat-password",
+        "inputType": "password",
+        "label": "GigaChat Password",
+        "note": "Basic auth, with the user above.",
+        "placeholder": "password",
+        "settingKey": "GIGACHAT_PASSWORD",
+        "settingsInputId": "s-gigachat-password",
+        "stateKey": "gigachatPassword"
+      },
+      {
+        "group": "more",
         "id": "minimax-key",
         "inputType": "password",
         "label": "MiniMax API Key",
-        "note": "Optional. If this is the only remote key, the next step prefills MiniMax's own model ids.",
+        "note": "",
         "placeholder": "MiniMax API key",
         "settingKey": "MINIMAX_API_KEY",
         "settingsInputId": "s-minimax-key",
@@ -175,18 +229,40 @@
         "id": "deepseek-key",
         "inputType": "password",
         "label": "DeepSeek API Key",
-        "note": "Optional. If this is the only remote key, the next step prefills DeepSeek's own model ids.",
+        "note": "",
         "placeholder": "sk-...",
         "settingKey": "DEEPSEEK_API_KEY",
         "settingsInputId": "s-deepseek-key",
         "stateKey": "deepseekKey"
       },
       {
+        "group": "more",
+        "id": "zai-key",
+        "inputType": "password",
+        "label": "Z.ai API Key (GLM)",
+        "note": "",
+        "placeholder": "...",
+        "settingKey": "ZAI_API_KEY",
+        "settingsInputId": "s-zai-key",
+        "stateKey": "zaiKey"
+      },
+      {
+        "group": "more",
+        "id": "zai-plan",
+        "inputType": "text",
+        "label": "Z.ai Plan",
+        "note": "Choose payg (pay-as-you-go, default) or coding (Coding Plan endpoint; officially intended for supported coding tools only).",
+        "placeholder": "payg or coding",
+        "settingKey": "ZAI_PLAN",
+        "settingsInputId": "s-zai-plan",
+        "stateKey": "zaiPlan"
+      },
+      {
         "group": "primary",
         "id": "anthropic-key",
         "inputType": "password",
         "label": "Anthropic API Key",
-        "note": "Optional. Saved for models routed straight to Anthropic, and for Claude tooling.",
+        "note": "Saved for models routed straight to Anthropic, and for Claude tooling.",
         "placeholder": "sk-ant-...",
         "settingKey": "ANTHROPIC_API_KEY",
         "settingsInputId": "s-anthropic",
@@ -236,6 +312,11 @@
         "modelCopy": "Multiple direct providers are configured. Start here, then split model slots across them if you want.",
         "providerCopy": "Multiple direct providers are present, so the next step keeps your model values editable without forcing one provider family."
       },
+      "gigachat": {
+        "label": "GigaChat",
+        "modelCopy": "GigaChat-only setup detected. These defaults use GigaChat's own model ids.",
+        "providerCopy": "GigaChat is present, so the next step prefills GigaChat's own model ids."
+      },
       "local": {
         "label": "Local-first",
         "modelCopy": "Local-only setup detected. Review the model values and local routing before launch.",
@@ -243,7 +324,7 @@
       },
       "minimax": {
         "label": "MiniMax",
-        "modelCopy": "MiniMax-only setup detected. These defaults include MiniMax-M3 and MiniMax-M2.7.",
+        "modelCopy": "MiniMax-only setup detected. These defaults include MiniMax-M3 and MiniMax-M3.1-Flash.",
         "providerCopy": "MiniMax is present, so the next step prefills MiniMax's own model ids."
       },
       "openai": {
@@ -260,49 +341,38 @@
         "label": "OpenRouter",
         "modelCopy": "OpenRouter-style routing remains active. OpenRouter stays the source for ids such as openai/gpt-5.6-terra or anthropic/claude-sonnet-5.",
         "providerCopy": "OpenRouter is present, so the next step keeps router-style defaults while still saving any extra direct keys you paste here."
+      },
+      "zai": {
+        "label": "Z.ai (GLM)",
+        "modelCopy": "Z.ai-only setup detected. These defaults use glm-5.3 for main work and glm-5.3-flash for the light lane. The plan setting selects the pay-as-you-go or Coding Plan endpoint.",
+        "providerCopy": "Z.ai is present, so the next step prefills Z.ai's own GLM model ids."
       }
     },
-    "reviewModes": [
-      {
-        "className": "advisory",
-        "copy": "Review still runs. After feedback, Ouroboros can fix, reject or finish; raw reviewer findings remain visible.",
-        "label": "Advisory",
-        "tone": "Flexible",
-        "value": "advisory"
-      },
-      {
-        "className": "blocking",
-        "copy": "Slower and more expensive, but much safer. Critical review findings stop commits, which dramatically reduces the chance of gradual code degradation.",
-        "label": "Blocking",
-        "tone": "Strict",
-        "value": "blocking"
-      }
-    ],
     "runtimeModes": [
       {
         "className": "light",
-        "copy": "Self-modification of the main repo is disabled. Best for trying Ouroboros out without repo self-modification.",
+        "copy": "Works on your projects. Never changes its own code.",
         "label": "Light",
         "tone": "Safest",
         "value": "light"
       },
       {
         "className": "advanced",
-        "copy": "Self-modification of the evolutionary layer is allowed (current behaviour). Protected core/contract/release files stay guarded by Advanced mode.",
+        "copy": "May grow its own skills and outer layer.",
         "label": "Advanced",
         "tone": "Default",
         "value": "advanced"
       },
       {
         "className": "pro",
-        "copy": "Direct protected-surface mode. Protected core/contract/release edits are allowed on disk, but commits still require the normal triad + scope review gate.",
+        "copy": "May change its protected core. Reads a review before each change.",
         "label": "Pro",
         "tone": "Power",
         "value": "pro"
       },
       {
         "className": "cyber-pro",
-        "copy": "Host and configuration authority, including credentials, models, Supervisor and protected rewrites. Review scope and Blocking or Advisory enforcement remain owner-controlled.",
+        "copy": "Full say over itself and this computer. Asks for reviews when it judges.",
         "label": "Cyber Pro",
         "tone": "Maximum power",
         "value": "cyber_pro"
@@ -311,7 +381,7 @@
     "steps": [
       {
         "copy": "Connect Codex to start without an API key, or add an API key or local model. The same account can serve models and agents.",
-        "footer": "Add more subscriptions or API access later in Settings \u2192 Accounts. Subscription limits and optional provider credits still apply.",
+        "footer": "Add more subscriptions or API access later in Settings \u2192 Accounts and keys.",
         "id": "accounts",
         "railCopy": "Subscriptions + API",
         "title": "Connect your accounts"
@@ -324,21 +394,21 @@
         "title": "Choose models"
       },
       {
-        "copy": "Decide how strict pre-commit review should be before Ouroboros starts modifying itself.",
-        "footer": "Pick both review enforcement and the initial runtime mode before Ouroboros starts.",
+        "copy": "Choose how much access Ouroboros gets.",
+        "footer": "",
         "id": "review_mode",
-        "railCopy": "Advisory vs blocking",
-        "title": "Choose review mode"
+        "railCopy": "Reach",
+        "title": "Choose access"
       },
       {
         "copy": "Review subscription quotas and optional API spending limits.",
-        "footer": "When subscription quota is exhausted, work waits for renewal or your choice of another account or model. This integration does not enable paid provider credits.",
+        "footer": "",
         "id": "budget",
         "railCopy": "Quota + API budget",
         "title": "Review limits"
       },
       {
-        "copy": "Check the final provider, model, review, and budget picture. Ouroboros will save these onboarding values before starting.",
+        "copy": "Check the final provider, model, and budget picture. Ouroboros will save these onboarding values before starting.",
         "footer": "The same onboarding values remain editable later in Settings.",
         "id": "summary",
         "railCopy": "Final check",
@@ -361,19 +431,33 @@
     ],
     "version": 1
   },
+  "deployment": null,
   "freshInstall": false,
   "hostMode": "desktop",
   "initialState": {
     "anthropicKey": "",
+    "automaticModels": [
+      "mainModel",
+      "lightModel",
+      "safetyModel",
+      "visionModel",
+      "consciousnessModel",
+      "fallbackModel"
+    ],
     "cloudruKey": "",
     "compatibleApiKey": "",
     "compatibleBaseUrl": "",
+    "connections": [],
     "consciousnessModel": "",
     "deepseekKey": "",
     "fallbackModel": "openai/gpt-5.6-luna",
-    "lightModel": "openai/gpt-5.6-luna",
+    "gigachatCredentials": "",
+    "gigachatPassword": "",
+    "gigachatUser": "",
+    "legacyCompatibleBaseUrl": "",
+    "lightModel": "openai/gpt-6-luna",
     "localChatFormat": "",
-    "localContextLength": 16384,
+    "localContextLength": 65536,
     "localFilename": "",
     "localGpuLayers": -1,
     "localPreset": "",
@@ -390,42 +474,45 @@
     "perTaskCostUsd": 50.0,
     "processingPreference": "",
     "providerProfile": "openrouter",
-    "reviewEnforcement": "advisory",
     "runtimeMode": "advanced",
+    "safetyModel": "",
     "skillsRepoPath": "",
     "totalBudget": 200.0,
-    "visionModel": ""
+    "visionModel": "",
+    "zaiKey": "",
+    "zaiPlan": ""
   },
   "localPresets": {
-    "qwen25-7b": {
+    "qwen35-9b": {
       "chatFormat": "",
-      "contextLength": 16384,
-      "filename": "qwen2.5-7b-instruct-q3_k_m.gguf",
-      "label": "Qwen2.5-7B Instruct Q3_K_M",
-      "source": "Qwen/Qwen2.5-7B-Instruct-GGUF"
+      "contextLength": 65536,
+      "filename": "Qwen3.5-9B-Q4_K_M.gguf",
+      "label": "Qwen3.5-9B Q4_K_M (5.7 GB file)",
+      "source": "unsloth/Qwen3.5-9B-GGUF"
     },
-    "qwen3-14b": {
+    "qwen36-35b-a3b": {
       "chatFormat": "",
-      "contextLength": 16384,
-      "filename": "Qwen3-14B-Q4_K_M.gguf",
-      "label": "Qwen3-14B Instruct Q4_K_M",
-      "source": "Qwen/Qwen3-14B-GGUF"
+      "contextLength": 65536,
+      "filename": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+      "label": "Qwen3.6-35B-A3B Q4_K_M (22 GB file)",
+      "source": "unsloth/Qwen3.6-35B-A3B-GGUF"
     },
-    "qwen3-32b": {
+    "qwen38-27b": {
       "chatFormat": "",
-      "contextLength": 32768,
-      "filename": "Qwen3-32B-Q4_K_M.gguf",
-      "label": "Qwen3-32B Instruct Q4_K_M",
-      "source": "Qwen/Qwen3-32B-GGUF"
+      "contextLength": 65536,
+      "filename": "Qwen3.8-27B-UD-Q4_K_M.gguf",
+      "label": "Qwen3.8-27B Q4_K_M (16.6 GB file)",
+      "source": "unsloth/Qwen3.8-27B-GGUF"
     }
   },
   "modelDefaults": {
     "anthropic": {
       "consciousness": "",
-      "deep_self_review": "anthropic::claude-opus-5",
+      "deep_self_review": "anthropic::claude-opus-5-5",
       "fallback": "anthropic::claude-sonnet-5",
       "light": "anthropic::claude-sonnet-5",
-      "main": "anthropic::claude-opus-5",
+      "main": "anthropic::claude-opus-5-5",
+      "safety": "",
       "vision": ""
     },
     "cloudru": {
@@ -433,6 +520,7 @@
       "fallback": "cloudru::zai-org/GLM-4.7",
       "light": "cloudru::zai-org/GLM-4.7",
       "main": "cloudru::zai-org/GLM-4.7",
+      "safety": "",
       "vision": ""
     },
     "deepseek": {
@@ -441,20 +529,39 @@
       "fallback": "deepseek::deepseek-v4-flash",
       "light": "deepseek::deepseek-v4-flash",
       "main": "deepseek::deepseek-v4-pro",
+      "safety": "",
+      "vision": ""
+    },
+    "direct-multi": {
+      "consciousness": "",
+      "fallback": "",
+      "light": "",
+      "main": "",
+      "safety": "",
+      "vision": ""
+    },
+    "gigachat": {
+      "consciousness": "",
+      "fallback": "gigachat::GigaChat-2-Max",
+      "light": "gigachat::GigaChat-2-Max",
+      "main": "gigachat::GigaChat-2-Max",
+      "safety": "",
       "vision": ""
     },
     "local": {
       "consciousness": "",
-      "fallback": "openai/gpt-5.6-luna",
-      "light": "openai/gpt-5.6-luna",
+      "fallback": "",
+      "light": "",
       "main": "google/gemini-3.8-flash",
+      "safety": "",
       "vision": ""
     },
     "minimax": {
       "consciousness": "",
-      "fallback": "minimax::MiniMax-M2.7",
-      "light": "minimax::MiniMax-M2.7",
+      "fallback": "minimax::MiniMax-M3.1-Flash",
+      "light": "minimax::MiniMax-M3.1-Flash",
       "main": "minimax::MiniMax-M3",
+      "safety": "",
       "vision": ""
     },
     "openai": {
@@ -463,6 +570,7 @@
       "fallback": "openai::gpt-5.6-sol",
       "light": "openai::gpt-5.6-luna",
       "main": "openai::gpt-5.6-terra",
+      "safety": "",
       "vision": ""
     },
     "openai-compatible": {
@@ -470,19 +578,32 @@
       "fallback": "",
       "light": "",
       "main": "",
+      "safety": "",
       "vision": ""
     },
     "openrouter": {
       "consciousness": "",
       "fallback": "openai/gpt-5.6-luna",
-      "light": "openai/gpt-5.6-luna",
+      "light": "openai/gpt-6-luna",
       "main": "google/gemini-3.8-flash",
+      "safety": "",
       "vision": ""
+    },
+    "zai": {
+      "consciousness": "",
+      "fallback": "zai::glm-5.3-flash",
+      "light": "zai::glm-5.3-flash",
+      "main": "zai::glm-5.3",
+      "safety": "",
+      "vision": "zai::glm-5.3-flash"
     }
   },
   "modelSuggestions": [
     "google/gemini-3.8-flash",
     "x-ai/grok-4.6",
+    "openai/gpt-6.1-sol",
+    "openai/gpt-6-luna",
+    "anthropic/claude-opus-5.5",
     "openai/gpt-5.6-terra",
     "openai/gpt-5.6-sol",
     "openai/gpt-5.6-luna",
@@ -492,15 +613,18 @@
     "anthropic/claude-sonnet-5",
     "anthropic/claude-opus-5",
     "anthropic::claude-sonnet-5",
+    "anthropic::claude-opus-5-5",
     "anthropic::claude-opus-5",
     "anthropic::claude-opus-4-6",
     "deepseek/deepseek-v4-pro",
     "deepseek::deepseek-v4-pro",
     "deepseek::deepseek-v4-flash",
+    "zai::glm-5.3",
+    "zai::glm-5.3-flash",
     "openai-compatible::meta-llama/compatible",
     "cloudru::zai-org/GLM-4.7",
     "minimax::MiniMax-M3",
-    "minimax::MiniMax-M2.7"
+    "minimax::MiniMax-M3.1-Flash"
   ],
   "secretPlaceholder": "***set***",
   "stepOrder": [

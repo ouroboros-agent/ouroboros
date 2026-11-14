@@ -12,6 +12,8 @@ import pytest
 import httpx
 
 from ouroboros import usage_accounting as ua
+from ouroboros import usage_journal, usage_store
+from tests._usage_store_testing import ledger_rows
 
 
 @pytest.fixture
@@ -42,10 +44,9 @@ def _request(data_root, **overrides):
 
 
 def _ledger(data_root):
-    path = data_root / ua.LEDGER_REL
-    if not path.exists():
-        return []
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    """Every attempt's CURRENT row in write order (the store keeps no superseded
+    transition rows, so an attempt reads as its latest state)."""
+    return ledger_rows(data_root)
 
 
 def test_attempt_lifecycle_and_root_projection(data_root):
@@ -58,15 +59,16 @@ def test_attempt_lifecycle_and_root_projection(data_root):
         cost_final=True,
     )
 
-    projection = ua.usage_projection(data_root)
+    projection = ua.usage_projection(data_root, include_roots=True)
     assert projection["settled_usd"] == 0.25
     assert projection["confirmed_usd"] == 0.25
     assert projection["cost_final"] is True
     assert projection["by_root"]["root"]["settled_usd"] == 0.25
     assert projection["by_root"]["root"]["limit_usd"] == 2.0
+    assert "by_root" not in ua.usage_projection(data_root)  # the per-root map is an explicit request
     rows = _ledger(data_root)
-    assert [row["state"] for row in rows] == ["reserved", "dispatched", "settled"]
-    assert [row["seq"] for row in rows] == [1, 2, 3]
+    assert [row["state"] for row in rows] == ["settled"]  # one row per attempt, updated in place
+    assert [(row["seq"], row["revision"]) for row in rows] == [(3, 3)]
 
 
 def test_unresolved_reason_is_redacted_before_truncation_and_fails_closed(
@@ -139,10 +141,10 @@ def test_a_bucket_whose_rows_disclosed_no_token_counts_reports_absence_not_zero(
     # The row itself is still counted — absence of TOKENS is not absence of the row.
     assert silent["subscription_sessions"] == 1
 
-    ua.record_subscription_session(
+    ua.record_subscription_session(  # a session's input axes are its normalized split
         "sess-reporting", drive_root=data_root, route="codex", task_id="t1",
-        prompt_tokens=120, completion_tokens=None, cached_tokens=None,
-        spend_usd=0.0, spend_estimated=False,
+        prompt_tokens=120, completion_tokens=None, cached_tokens=None, spend_usd=0.0, spend_estimated=False,
+        input_token_usage={"total_tokens": 120, "cache_read_tokens": None, "cache_write_tokens": None},
     )
     mixed = ua.usage_breakdown(data_root)
     assert mixed["prompt_tokens"] == 120           # the one that reported
@@ -152,12 +154,32 @@ def test_a_bucket_whose_rows_disclosed_no_token_counts_reports_absence_not_zero(
     # And a MEASURED zero stays a zero: the fix must not turn every 0 into absence.
     ua.record_subscription_session(
         "sess-real-zero", drive_root=data_root, route="codex", task_id="t1",
-        prompt_tokens=0, completion_tokens=0, cached_tokens=0,
-        spend_usd=0.0, spend_estimated=False,
+        prompt_tokens=0, completion_tokens=0, cached_tokens=0, spend_usd=0.0, spend_estimated=False,
+        input_token_usage={"total_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0},
     )
     measured = ua.usage_breakdown(data_root)
     assert measured["completion_tokens"] == 0
     assert measured["cached_tokens"] == 0
+
+
+def test_status_prints_a_token_sum_no_row_reported_as_unknown_never_zero(tmp_path, monkeypatch):
+    """A model reached only through sessions without an input split has no known input sum; /status and
+    its per-model line say so instead of printing 0, and a known sum still prints as a number."""
+    from supervisor import state
+
+    prior = state.DRIVE_ROOT, state.TOTAL_BUDGET_LIMIT
+    state.init(tmp_path, 0)
+    try:
+        state.save_state({})
+        bucket = {"physical_calls": 3, "accounted_usd": 0.0, "settled_usd": 0.0, "prompt_tokens": None,
+                  "completion_tokens": 45, "cached_tokens": None}
+        ledger = {**bucket, "by_model": {"agy-model": dict(bucket), "api-model": {**bucket, "prompt_tokens": 7}}}
+        monkeypatch.setattr(ua, "usage_breakdown", lambda *_a, **_k: dict(ledger))
+        text = state.status_text({}, [], {})
+    finally:
+        state.init(*prior)
+    assert "prompt_tokens: unknown, completion_tokens: 45, cached_tokens: unknown" in text
+    assert "agy-model: $0.00 (3 calls, ?p/45c tok)" in text and "api-model: $0.00 (3 calls, 7p/45c tok)" in text
 
 
 def test_breakdown_uses_final_rows_and_keeps_unattributed_explicit(data_root):
@@ -260,10 +282,9 @@ def test_abandoned_attempt_settles_with_the_usage_the_dead_child_reported(data_r
     projection = ua.usage_projection(data_root)
     assert projection["unresolved_upper_bound_usd"] == 0.0
     assert projection["accounted_usd"] < 5.0
-    # Idempotent: a terminal attempt is never transitioned again (a post-terminal
-    # row would make the whole ledger unreadable for every later reader).
+    # Idempotent: a terminal attempt is never transitioned again.
     assert ua.terminalize_abandoned_attempt(reservation, reason="again") == "settled"
-    assert [row["state"] for row in _ledger(data_root)] == ["reserved", "dispatched", "settled"]
+    assert [(row["state"], row["revision"]) for row in _ledger(data_root)] == [("settled", 3)]
 
 
 def test_abandoned_attempt_closes_with_its_price_honestly_unknown(data_root):
@@ -357,12 +378,25 @@ def test_provider_reported_zero_cost_is_final_not_missing(data_root):
     assert _ledger(data_root)[-1]["cost_usd"] == 0
 
 
-def test_torn_final_row_is_quarantined_but_midstream_corruption_fails(data_root):
-    reservation = ua.reserve_attempt(_request(data_root))
-    ua.release_attempt(reservation)
-    ledger = data_root / ua.LEDGER_REL
-    with ledger.open("ab") as handle:
-        handle.write(b'{"seq":')
+def _released_journal_rows():
+    return [
+        {"seq": 1, "kind": "attempt", "attempt_id": "a1", "state": "reserved", "root_task_id": "root",
+         "reservation_upper_bound_usd": 1.0, "ts": "2026-01-01T00:00:00Z"},
+        {"seq": 2, "kind": "attempt", "attempt_id": "a1", "state": "released", "root_task_id": "root",
+         "reservation_upper_bound_usd": 1.0, "reason": "not_dispatched", "ts": "2026-01-01T00:00:01Z"},
+    ]
+
+
+def _journal_text(rows):
+    return "".join(json.dumps(row) + "\n" for row in rows)
+
+
+def test_torn_final_journal_row_is_quarantined_at_import_but_midstream_corruption_fails(data_root):
+    """The retired journal is read ONCE, by the store's import, with the
+    validated reader: a torn final row is quarantined (integrity disclosed
+    from then on), corruption before it refuses the import."""
+    ledger = data_root / "state" / "usage_attempts.jsonl"
+    ledger.write_text(_journal_text(_released_journal_rows()) + '{"seq":')
 
     projection = ua.usage_projection(data_root)
     assert projection["attempt_counts"]["released"] == 1
@@ -372,29 +406,18 @@ def test_torn_final_row_is_quarantined_but_midstream_corruption_fails(data_root)
     assert breakdown["integrity_degraded"] is True
     assert breakdown["cost_final"] is False
     assert (data_root / ua.QUARANTINE_REL).is_file()
-    repaired = ledger.read_bytes()
-    assert b'{"seq":' not in repaired
+    imported = (data_root / "state" / "usage_attempts.jsonl").read_text()  # kept in place, truncated
+    assert imported == _journal_text(_released_journal_rows())  # the torn tail left for quarantine
 
 
 @pytest.mark.parametrize(
     "field,value",
     (("seq", "not-a-number"), ("prompt_tokens", "not-a-number")),
 )
-def test_structurally_invalid_numeric_tail_is_quarantined(data_root, field, value):
-    reservation = ua.reserve_attempt(_request(data_root))
-    ua.release_attempt(reservation)
-    ledger = data_root / ua.LEDGER_REL
-    row = {
-        "seq": 3,
-        "ts": "2026-01-01T00:00:00Z",
-        "attempt_id": "tail-attempt",
-        "kind": "attempt",
-        "state": "reserved",
-        "reservation_upper_bound_usd": 1.0,
-        field: value,
-    }
-    with ledger.open("a") as handle:
-        handle.write(json.dumps(row) + "\n")
+def test_structurally_invalid_numeric_journal_tail_is_quarantined(data_root, field, value):
+    row = {"seq": 3, "ts": "2026-01-01T00:00:00Z", "attempt_id": "tail-attempt", "kind": "attempt",
+           "state": "reserved", "reservation_upper_bound_usd": 1.0, field: value}
+    (data_root / "state" / "usage_attempts.jsonl").write_text(_journal_text([*_released_journal_rows(), row]))
 
     projection = ua.usage_projection(data_root)
     assert projection["integrity_degraded"] is True
@@ -402,51 +425,41 @@ def test_structurally_invalid_numeric_tail_is_quarantined(data_root, field, valu
     assert projection["attempt_counts"]["released"] == 1
 
 
-def test_quarantined_dispatch_tail_makes_replay_evidence_degraded(data_root):
-    reservation = ua.reserve_attempt(_request(data_root, task_id="replay-risk"))
-    ledger = data_root / ua.LEDGER_REL
-    corrupt_dispatch = {
-        **_ledger(data_root)[-1],
-        "seq": 2,
-        "state": "dispatched",
-        "prompt_tokens": "torn",
-    }
-    with ledger.open("a") as handle:
-        handle.write(json.dumps(corrupt_dispatch) + "\n")
+def test_quarantined_dispatch_journal_tail_makes_replay_evidence_degraded(data_root):
+    reserved = {"seq": 1, "kind": "attempt", "attempt_id": "r1", "state": "reserved", "task_id": "replay-risk",
+                "root_task_id": "replay-risk", "reservation_upper_bound_usd": 1.0, "ts": "2026-01-01T00:00:00Z"}
+    corrupt_dispatch = {**reserved, "seq": 2, "state": "dispatched", "prompt_tokens": "torn"}
+    (data_root / "state" / "usage_attempts.jsonl").write_text(_journal_text([reserved, corrupt_dispatch]))
 
     evidence = ua.usage_breakdown(data_root, task_id="replay-risk")
     assert evidence["physical_calls"] == 0
     assert evidence["integrity_degraded"] is True
-    ua.release_attempt(reservation)
 
-    lines = ledger.read_text().splitlines()
-    ledger.write_text(lines[0] + "\nnot-json\n" + lines[1] + "\n")
+
+def test_journal_corruption_before_the_final_row_refuses_the_import(data_root):
+    rows = _released_journal_rows()
+    (data_root / "state" / "usage_attempts.jsonl").write_text(
+        json.dumps(rows[0]) + "\nnot-json\n" + json.dumps(rows[1]) + "\n")
     with pytest.raises(ua.UsageLedgerCorrupt):
         ua.usage_projection(data_root)
+    assert not (data_root / usage_store.STORE_REL).exists()  # nothing half-imported
 
 
-def test_structurally_invalid_final_row_is_quarantined_but_midstream_is_fatal(data_root):
-    reservation = ua.reserve_attempt(_request(data_root))
-    ua.release_attempt(reservation)
-    ledger = data_root / ua.LEDGER_REL
-    bad = {
-        "seq": 999,
-        "kind": "attempt",
-        "attempt_id": "bad-tail",
-        "state": "dispatched",
-    }
-    with ledger.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(bad) + "\n")
+def test_structurally_invalid_final_journal_row_is_quarantined_but_midstream_is_fatal(data_root):
+    bad = {"seq": 999, "kind": "attempt", "attempt_id": "bad-tail", "state": "dispatched"}
+    (data_root / "state" / "usage_attempts.jsonl").write_text(_journal_text([*_released_journal_rows(), bad]))
 
     assert ua.usage_projection(data_root)["attempt_counts"] == {"released": 1}
     assert all(row.get("attempt_id") != "bad-tail" for row in _ledger(data_root))
     assert (data_root / ua.QUARANTINE_REL).is_file()
 
-    lines = ledger.read_text().splitlines()
-    bad["seq"] = 2
-    ledger.write_text(lines[0] + "\n" + json.dumps(bad) + "\n" + lines[1] + "\n")
+    other = data_root / "other"
+    (other / "state").mkdir(parents=True)
+    rows = _released_journal_rows()
+    (other / "state" / "usage_attempts.jsonl").write_text(_journal_text([rows[0], {**bad, "seq": 2},
+                                                                         {**rows[1], "seq": 3}]))
     with pytest.raises(ua.UsageLedgerCorrupt):
-        ua.usage_projection(data_root)
+        ua.usage_projection(other)
 
 
 def test_concurrent_writers_keep_monotonic_sequence(data_root):
@@ -458,16 +471,25 @@ def test_concurrent_writers_keep_monotonic_sequence(data_root):
     with ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(one, range(16)))
     rows = _ledger(data_root)
-    assert [row["seq"] for row in rows] == list(range(1, len(rows) + 1))
+    # One row per attempt; every transition took the next store write sequence.
+    assert len(rows) == 16 and all(row["revision"] == 3 for row in rows)
+    assert sorted(row["seq"] for row in rows) == [row["seq"] for row in rows]
+    assert len({row["seq"] for row in rows}) == 16 and max(row["seq"] for row in rows) == 48
     assert ua.usage_projection(data_root)["settled_usd"] == 0.16
 
 
-def test_known_reservation_is_checked_before_dispatch(data_root):
+def test_known_spend_not_open_holds_is_checked_before_dispatch(data_root):
+    """#1487: a $0.60 hold is exposure, so a second $0.50 call is admitted under $1;
+    once a price is KNOWN at the limit, the next reservation is refused before dispatch."""
     first = ua.reserve_attempt(_request(data_root, reservation_usd=0.6, global_limit_usd=1.0))
-    with pytest.raises(ua.BudgetExceeded):
-        ua.reserve_attempt(_request(data_root, reservation_usd=0.5, global_limit_usd=1.0))
-    assert [row["state"] for row in _ledger(data_root)] == ["reserved"]
-    ua.release_attempt(first)
+    second = ua.reserve_attempt(_request(data_root, reservation_usd=0.5, global_limit_usd=1.0))
+    assert [row["state"] for row in _ledger(data_root)] == ["reserved", "reserved"]
+    ua.release_attempt(second)
+    ua.mark_dispatched(first)
+    ua.settle_attempt(first, {}, cost_usd=1.0, cost_final=False)  # a disclosed estimate is known
+    with pytest.raises(ua.BudgetExceeded, match=r"known=\$1\.000000"):
+        ua.reserve_attempt(_request(data_root, reservation_usd=0.01, global_limit_usd=1.0))
+    assert sorted(row["state"] for row in _ledger(data_root)) == ["released", "settled"]
 
 
 def test_live_openrouter_catalog_produces_known_reservation(data_root, monkeypatch):
@@ -600,9 +622,10 @@ def test_request_carried_applied_ttl_wins_over_the_global_setting(data_root, mon
 
 
 def test_admission_honors_the_cheaper_owner_tier(data_root, monkeypatch):
-    """G3-5 end-to-end: under a finite root limit sized between the 5m and 1h
-    reservation bounds, the owner's 5m selection must ADMIT the call that the
-    old hardcoded-1h pricing rejected — and 1h must still reject it."""
+    """G3-5 end-to-end: the owner's cache tier prices the recorded reservation bound.
+    Under a finite root limit sized between the 5m and 1h bounds both are ADMITTED
+    (#1487: a call's own bound is exposure, known spend decides), each recording its
+    own tier's worst case."""
     _isolated_anthropic_catalog(monkeypatch)
 
     def _admit(root_id):
@@ -619,8 +642,9 @@ def test_admission_honors_the_cheaper_owner_tier(data_root, monkeypatch):
         ))
 
     monkeypatch.setenv("OUROBOROS_PROMPT_CACHE_TTL", "1h")
-    with pytest.raises(ua.BudgetExceeded):
-        _admit("ttl-root-1h")
+    hour = _admit("ttl-root-1h")
+    assert _ledger(data_root)[-1]["reservation_upper_bound_usd"] > 0.02
+    ua.release_attempt(hour)
     monkeypatch.setenv("OUROBOROS_PROMPT_CACHE_TTL", "5m")
     reservation = _admit("ttl-root-5m")
     assert _ledger(data_root)[-1]["reservation_upper_bound_usd"] == 0.01875
@@ -654,8 +678,12 @@ def test_scope_runtime_limit_is_enforced_without_provider_retry(data_root):
         sends += 1
 
     scope = ua.UsageScope(drive_root=data_root, global_limit_usd=0.5)
-    with ua.usage_scope(scope), pytest.raises(ua.BudgetExceeded):
-        ua.execute_physical_attempt(_request(data_root, reservation_usd=0.6), send)
+    with ua.usage_scope(scope):
+        spent = ua.reserve_attempt(_request(data_root, reservation_usd=0.1))
+        ua.mark_dispatched(spent)
+        ua.settle_attempt(spent, {}, cost_usd=0.5, cost_final=True)  # known spend reaches the limit
+        with pytest.raises(ua.BudgetExceeded):
+            ua.execute_physical_attempt(_request(data_root, reservation_usd=0.01), send)
     assert sends == 0
 
 
@@ -672,7 +700,6 @@ def test_llm_retry_machine_does_not_classify_budget_rail_as_provider_failure(dat
     def forbidden(*args, **kwargs):
         raise AssertionError("local accounting rail reached provider retry logic")
 
-    monkeypatch.setattr(client, "_retry_without_optional_sampling", forbidden)
     monkeypatch.setattr(client, "_openrouter_signature_retry_kwargs", forbidden)
     monkeypatch.setattr(client, "_reroute_kwargs_for_body_error", forbidden)
     target = {
@@ -806,10 +833,10 @@ def test_live_pricing_lookup_finishes_before_ledger_lock(data_root, monkeypatch)
     @contextlib.contextmanager
     def tracked_lock(root):
         nonlocal lock_active
-        with original_locked(root):
+        with original_locked(root) as txn:  # the money hold yields its store transaction
             lock_active = True
             try:
-                yield
+                yield txn
             finally:
                 lock_active = False
 
@@ -925,16 +952,21 @@ def test_direct_chat_loop_budget_exhaustion_never_suggests_new_run(data_root, mo
     assert trace["resource_limit"]["replay_safe"] is False
 
 
-def test_zero_bound_cannot_dispatch_after_finite_limit_is_reached(data_root):
+def test_known_zero_bound_is_admitted_after_finite_limit_is_reached(data_root):
+    """Owner 2A (04.11, BIBLE P8): a reached global limit refuses paid admission only; a known
+    $0 bound is not paid, a known positive one is (tests/test_budget_paid_admission.py)."""
     first = ua.reserve_attempt(_request(data_root, reservation_usd=1.0, global_limit_usd=1.0))
     ua.mark_dispatched(first)
     ua.settle_attempt(first, {}, cost_usd=1.0, cost_final=True)
 
+    free = ua.reserve_attempt(_request(
+        data_root, task_id="next", reservation_usd=None,
+        max_budget_usd=0.0, global_limit_usd=1.0,
+    ))
+    ua.mark_dispatched(free)
     with pytest.raises(ua.BudgetExceeded):
-        ua.reserve_attempt(_request(
-            data_root, task_id="next", reservation_usd=None,
-            max_budget_usd=0.0, global_limit_usd=1.0,
-        ))
+        ua.reserve_attempt(_request(data_root, task_id="paid", reservation_usd=None,
+                                    max_budget_usd=0.01, global_limit_usd=1.0))
 
 
 def test_legacy_state_projection_cannot_regress_under_reordered_writers(
@@ -943,17 +975,20 @@ def test_legacy_state_projection_cannot_regress_under_reordered_writers(
     from supervisor import state
 
     state.init(data_root, total_budget_limit=0.0)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     first_started = threading.Event()
+    second_started = threading.Event()
     release_first = threading.Event()
     calls = []
 
-    def breakdown(_root):
+    def breakdown(_root, **_display_read):
         calls.append(len(calls) + 1)
         if len(calls) == 1:
             first_started.set()
             assert release_first.wait(2.0)
             value = 1.0
         else:
+            second_started.set()
             value = 2.0
         return {
             "accounted_usd": value, "physical_calls": int(value),
@@ -961,17 +996,20 @@ def test_legacy_state_projection_cannot_regress_under_reordered_writers(
             "settled_usd": value, "confirmed_usd": value, "estimated_usd": 0.0,
             "reserved_usd": 0.0, "unresolved_upper_bound_usd": 0.0,
             "unknown_unmetered": 0, "cost_final": True, "attempt_counts": {},
+            "_ledger_high_water_seq": [0, int(value)],
         }
 
-    monkeypatch.setattr(ua, "ensure_legacy_imported", lambda *_args, **_kwargs: {})
-    monkeypatch.setattr(ua, "usage_breakdown", breakdown)
+    monkeypatch.setattr(ua, "usage_writer_snapshot", breakdown)
     older = threading.Thread(target=state.update_budget_from_usage, args=({},))
     newer = threading.Thread(target=state.update_budget_from_usage, args=({},))
     older.start()
     assert first_started.wait(2.0)
     newer.start()
-    time.sleep(0.1)
-    assert calls == [1]
+    # Ledger snapshots are intentionally taken before STATE_LOCK, so the
+    # newer writer can read while the older one is paused; the sequence marker
+    # below prevents the paused snapshot from regressing state afterward.
+    assert second_started.wait(2.0)
+    assert calls == [1, 2]
     release_first.set()
     older.join(2.0)
     newer.join(2.0)
@@ -984,6 +1022,7 @@ def test_legacy_budget_projection_accepts_nullable_usage_cost(data_root):
     from supervisor import state
 
     state.init(data_root, total_budget_limit=0.0)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     reservation = ua.reserve_attempt(_request(
         data_root,
         provider="openai",
@@ -1040,15 +1079,17 @@ def test_legacy_import_is_resumable_and_preserves_delta(data_root):
     settings.write_text('{"secret":"unchanged"}\n')
     before = settings.read_bytes()
 
-    first = ua.ensure_legacy_imported(data_root)
+    report = usage_store.migrate_from_journal(data_root)
+    first = json.loads((data_root / usage_journal.IMPORT_REL).read_text())
     row_count = len(_ledger(data_root))
-    second = ua.ensure_legacy_imported(data_root)
+    again = usage_store.migrate_from_journal(data_root)
 
+    assert report["status"] == "completed" and again["status"] == "already_completed"
     assert first["legacy_usage_count"] == 1
     assert first["legacy_metadata_count"] == 2
     assert first["legacy_delta_usd"] == 0.3
     assert first["legacy_baseline_source"] == "state.json"
-    assert second == first
+    assert json.loads((data_root / usage_journal.IMPORT_REL).read_text()) == first
     assert len(_ledger(data_root)) == row_count
     projection = ua.usage_projection(data_root)
     assert projection["settled_usd"] == 0.4
@@ -1089,16 +1130,19 @@ def test_completed_import_is_immutable_without_a_second_repair_api(data_root):
     )
     (data_root / "settings.json").write_text('{"secret":"unchanged"}\n')
 
-    incomplete = ua.ensure_legacy_imported(data_root)
-    original_ledger = (data_root / ua.LEDGER_REL).read_bytes()
-    original_watermark = (data_root / ua.IMPORT_REL).read_bytes()
+    usage_store.migrate_from_journal(data_root)
+    incomplete = json.loads((data_root / usage_journal.IMPORT_REL).read_text())
+    original_rows = _ledger(data_root)
+    original_watermark = (data_root / usage_journal.IMPORT_REL).read_bytes()
     assert incomplete["legacy_baseline_source"] == "state.json"
     assert incomplete["legacy_usage_count"] == 2
     assert incomplete["legacy_metadata_count"] == 0
 
-    assert ua.ensure_legacy_imported(data_root) == incomplete
-    assert (data_root / ua.LEDGER_REL).read_bytes() == original_ledger
-    assert (data_root / ua.IMPORT_REL).read_bytes() == original_watermark
+    # A completed import is never re-imported, whatever the sources say later.
+    (data_root / "state" / "state.json").write_text(json.dumps({"spent_usd": 9, "spent_calls": 9}))
+    assert usage_store.migrate_from_journal(data_root)["status"] == "already_completed"
+    assert _ledger(data_root) == original_rows
+    assert (data_root / usage_journal.IMPORT_REL).read_bytes() == original_watermark
 
 
 def test_concurrent_legacy_importers_share_one_exact_snapshot(data_root, monkeypatch):
@@ -1121,7 +1165,7 @@ def test_concurrent_legacy_importers_share_one_exact_snapshot(data_root, monkeyp
     (data_root / "state" / "state.json").write_text(json.dumps({"spent_usd": 0.1, "spent_calls": 1}))
     (data_root / "settings.json").write_text('{"secret":"unchanged"}\n')
 
-    original = ua._legacy_snapshot
+    original = usage_journal.legacy_snapshot
     calls = 0
     calls_lock = threading.Lock()
     barrier = threading.Barrier(4)
@@ -1136,15 +1180,15 @@ def test_concurrent_legacy_importers_share_one_exact_snapshot(data_root, monkeyp
 
     def import_once(_index):
         barrier.wait()
-        return ua.ensure_legacy_imported(data_root)
+        return usage_store.migrate_from_journal(data_root)["status"]
 
-    monkeypatch.setattr(ua, "_legacy_snapshot", snapshot)
+    monkeypatch.setattr(usage_journal, "legacy_snapshot", snapshot)
     with ThreadPoolExecutor(max_workers=4) as pool:
         results = list(pool.map(import_once, range(4)))
 
     assert calls == 1
-    assert all(result == results[0] for result in results)
-    assert results[0]["legacy_usage_count"] == 1
+    assert sorted(results) == ["already_completed"] * 3 + ["completed"]
+    assert json.loads((data_root / usage_journal.IMPORT_REL).read_text())["legacy_usage_count"] == 1
     assert len(_ledger(data_root)) == 1
 
 
@@ -1194,7 +1238,7 @@ def test_actor_limit_blocks_third_retry_before_provider_send(data_root, monkeypa
     }
 
 
-def test_env_zero_is_unbounded_but_explicit_zero_is_a_hard_rail(data_root, monkeypatch):
+def test_env_zero_is_unbounded_but_explicit_zero_is_a_hard_rail_for_paid_admission(data_root, monkeypatch):
     monkeypatch.setenv("TOTAL_BUDGET", "0")
     request = ua.AttemptRequest(
         model="local/test",
@@ -1206,15 +1250,12 @@ def test_env_zero_is_unbounded_but_explicit_zero_is_a_hard_rail(data_root, monke
     assert "limit_usd" not in ua.usage_projection(data_root)
 
     with pytest.raises(ua.BudgetExceeded) as exc_info:
-        ua.reserve_attempt(
-            ua.AttemptRequest(
-                model="local/test",
-                provider="local",
-                drive_root=data_root,
-                global_limit_usd=0,
-            )
-        )
+        ua.reserve_attempt(_request(data_root, reservation_usd=0.01, global_limit_usd=0))
     assert exc_info.value.limit_scope == "global"
+    # Owner 2A: the local lane is a known $0, never paid admission, so the zero limit admits it.
+    local = ua.reserve_attempt(ua.AttemptRequest(model="local/test", provider="local", drive_root=data_root,
+                                                 global_limit_usd=0))
+    ua.release_attempt(local)
 
 
 def test_explicit_zero_root_limit_blocks_only_that_root(data_root, monkeypatch):
@@ -1239,7 +1280,8 @@ def test_body_error_zero_usage_settles_confirmed_zero():
     # of an HTTP-200) that billed zero tokens is a request rejected before
     # generation — settle a confirmed $0, not an unknown cost that holds the bound.
     normalized, cost, final = ua.usage_from_response(
-        {"error": {"code": 429, "message": "rate limited"}, "choices": None, "usage": None}
+        {"error": {"code": 429, "message": "rate limited"}, "choices": None,
+         "usage": {"prompt_tokens": 0, "completion_tokens": 0}}
     )
     assert cost == 0.0
     assert final is True
@@ -1264,7 +1306,8 @@ def test_body_error_storm_does_not_phantom_exhaust_budget(data_root):
     # accumulating a phantom unresolved sum that exhausts the finite budget.
     class _BodyErrResp:
         def model_dump(self):
-            return {"error": {"code": 429, "message": "rate limited"}, "usage": None}
+            return {"error": {"code": 429, "message": "rate limited"},
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0}}
 
     for i in range(7):
         ua.execute_physical_attempt(
@@ -1312,58 +1355,63 @@ def test_cache_bearing_sends_are_measured_on_every_cache_inclusive_route(tmp_pat
         "cache_write_tokens": 100_000,
     }
 
-    for provider, model in (
-        ("anthropic", "anthropic/claude-sonnet-5"),
-        ("openrouter", "openrouter/some-model"),
-        ("openai", "openai/gpt-5.5"),
-        ("openai-compatible", "compat/some-model"),
-        ("cloudru", "cloudru/some-model"),
-        ("local", "local/some-model"),
-    ):
+    try:
+        for provider, model in (
+            ("anthropic", "anthropic/claude-sonnet-5"),
+            ("openrouter", "openrouter/some-model"),
+            ("openai", "openai/gpt-5.5"),
+            ("openai-compatible", "compat/some-model"),
+            ("cloudru", "cloudru/some-model"),
+            ("local", "local/some-model"),
+        ):
+            _DENSITY_MEMO.clear()
+            root = tmp_path / provider
+            ua._observe_token_density(
+                ua.AttemptRequest(
+                    model=model,
+                    provider=provider,
+                    prompt_tokens_estimate=1_000_000,
+                    drive_root=root,
+                ),
+                dict(cached_usage),
+            )
+            measured = get_token_density(root, normalize_model_identity(model))
+            assert abs(measured - 1.5) < 1e-6, f"{provider} must be measured, got {measured}"
+
+        # The other direction: a route whose cache-token semantics are undocumented is still
+        # skipped, because there an under-measured density loosens the cap.
         _DENSITY_MEMO.clear()
-        root = tmp_path / provider
+        root = tmp_path / "gigachat"
         ua._observe_token_density(
             ua.AttemptRequest(
-                model=model,
-                provider=provider,
+                model="gigachat/some-model",
+                provider="gigachat",
                 prompt_tokens_estimate=1_000_000,
                 drive_root=root,
             ),
             dict(cached_usage),
         )
-        measured = get_token_density(root, normalize_model_identity(model))
-        assert abs(measured - 1.5) < 1e-6, f"{provider} must be measured, got {measured}"
+        assert get_token_density(root, normalize_model_identity("gigachat/some-model")) == 0.0
 
-    # The other direction: a route whose cache-token semantics are undocumented is still
-    # skipped, because there an under-measured density loosens the cap.
-    _DENSITY_MEMO.clear()
-    root = tmp_path / "gigachat"
-    ua._observe_token_density(
-        ua.AttemptRequest(
-            model="gigachat/some-model",
-            provider="gigachat",
-            prompt_tokens_estimate=1_000_000,
-            drive_root=root,
-        ),
-        dict(cached_usage),
-    )
-    assert get_token_density(root, normalize_model_identity("gigachat/some-model")) == 0.0
-
-    # And an UNCACHED send on that same route is measured normally — the skip is about
-    # cache accounting, not about distrusting the provider.
-    _DENSITY_MEMO.clear()
-    root = tmp_path / "gigachat_uncached"
-    ua._observe_token_density(
-        ua.AttemptRequest(
-            model="gigachat/some-model",
-            provider="gigachat",
-            prompt_tokens_estimate=1_000_000,
-            drive_root=root,
-        ),
-        {"prompt_tokens": 1_500_000},
-    )
-    measured = get_token_density(root, normalize_model_identity("gigachat/some-model"))
-    assert abs(measured - 1.5) < 1e-6
+        # And an UNCACHED send on that same route is measured normally — the skip is about
+        # cache accounting, not about distrusting the provider.
+        _DENSITY_MEMO.clear()
+        root = tmp_path / "gigachat_uncached"
+        ua._observe_token_density(
+            ua.AttemptRequest(
+                model="gigachat/some-model",
+                provider="gigachat",
+                prompt_tokens_estimate=1_000_000,
+                drive_root=root,
+            ),
+            {"prompt_tokens": 1_500_000},
+        )
+        measured = get_token_density(root, normalize_model_identity("gigachat/some-model"))
+        assert abs(measured - 1.5) < 1e-6
+    finally:
+        # Process-global and keyed WITHOUT drive_root: the last measurement left
+        # here would throttle a co-located test's witness for the same model id.
+        _DENSITY_MEMO.clear()
 
 
 def test_an_open_row_is_not_final_however_little_it_costs(data_root):
@@ -1407,6 +1455,8 @@ def test_a_non_final_projection_names_its_cause(data_root):
     dashboard it feeds — that could explain it. The count that DECIDES finality is the
     same number that discloses it, so the two cannot disagree.
     """
+    from ouroboros.task_results import write_task_result
+    write_task_result(data_root, "root", "running", root_task_id="root")  # the child's real root
     ua.record_subscription_session(
         "s-est", drive_root=data_root, route="r", task_id="t", root_task_id="root",
         spend_usd=0.0, spend_estimated=True)
@@ -1426,6 +1476,7 @@ def test_a_non_final_projection_names_its_cause(data_root):
     assert second["non_final_rows"] == 2 and second["cost_final"] is False
 
     # A fully settled ledger says so with the same field.
+    write_task_result(data_root / "free", "root", "running", root_task_id="root")
     ua.record_subscription_session(
         "s-free", drive_root=data_root / "free", route="r", task_id="t",
         root_task_id="root", spend_usd=0.0)
@@ -1435,8 +1486,9 @@ def test_a_non_final_projection_names_its_cause(data_root):
 
 def test_review_wave_admission_override_compares_against_the_given_remaining(monkeypatch):
     """The managed-update admission gate runs OUTSIDE any task usage scope: the
-    override branch must estimate with the normal reservation math and compare
-    against the caller's remaining USD, never a task projection."""
+    override branch estimates with the normal reservation math and decides on the
+    caller's known remaining USD, never a task projection. The estimate larger than
+    the remainder is disclosed, not a refusal (#1487); no known room refuses."""
     import ouroboros.usage_accounting as ua
 
     monkeypatch.setattr(ua, "_reservation_cost", lambda _request: 1.25)
@@ -1451,10 +1503,15 @@ def test_review_wave_admission_override_compares_against_the_given_remaining(mon
         prompt_chars=400_000,
         remaining_usd_override=2.0,
     )
-    assert tight["fits"] is False
+    assert tight["fits"] is True
     assert tight["estimated_wave_usd"] == 2.5
     assert tight["remaining_usd"] == 2.0
     assert tight["limit_usd"] is None
+    spent = ua.review_wave_admission(
+        root_task_id="managed-update-admission", models=["prov/a"], prompt_chars=400_000,
+        remaining_usd_override=0.0,
+    )
+    assert spent["fits"] is False and spent["estimated_wave_usd"] == 1.25
 
     roomy = ua.review_wave_admission(
         root_task_id="managed-update-admission",

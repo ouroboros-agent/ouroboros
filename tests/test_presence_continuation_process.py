@@ -1,0 +1,709 @@
+"""Real child Host death/exec, manual follow-up and controls with production agent bootstrap.
+
+This is a TCP Host consumer, not a Slack provider or full server/supervisor boot.
+Inference and reviewer transports are local scripts; lifecycle owners are real. The
+author parks through the kept trigger (``tests/presence_lifecycle_host.py``): it
+reviews its own result, leaves that review for an addressed message and parks, so
+two model calls precede every park. Blocking and Advisory enforcement park alike:
+nothing is released early.
+"""
+from __future__ import annotations
+
+from tests import _dialogue as dialogue_test
+
+import json
+import os
+from pathlib import Path
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import urlsplit
+
+import httpx
+import pytest
+
+from ouroboros.test_environment import isolated_environment
+from tests._store_shared import as_install, read_result, result_exists
+
+
+def host_result(root, task_id):
+    """The host install's stored row, read as that install (its server booted the root)."""
+    with as_install(root):
+        return read_result(root, task_id)
+
+
+def host_has(root, task_id):
+    with as_install(root):
+        return result_exists(root, task_id)
+
+ROOT = Path(__file__).resolve().parents[1]
+TOKEN = "lifecycle-fixture-token"
+HEADERS = {"X-Skill-Token": TOKEN}
+ANSWER = "The checked status report is ready."
+REVISED_ANSWER = "The checked status report is ready; the independent report remains scheduled."
+LATE_CHILD = "work-promoted-after-first-yield"
+MANUAL = "I checked the prior delivery. Continue the interrupted report as a new turn."
+ACKNOWLEDGEMENT = "On it: checking the report now."
+TOOL_NOTE = "My transport tool already delivered the checked report."
+pytestmark = [pytest.mark.skipif(
+    os.name != "posix", reason="This fixture qualifies POSIX SIGKILL/process-group custody only")]
+
+
+@pytest.fixture
+def tmp_path(tmp_path):
+    """Keep private multiprocessing sockets short, independent of runner basetemp.
+
+    macOS limits AF_UNIX addresses to 104 bytes. The runner's nested pytest
+    root can consume that before multiprocessing appends its own socket name.
+    Retain this test's separate root and leave its address in pytest's tree,
+    just like the other isolated session trees; never discard failure evidence.
+    """
+    # Probe the real AF_UNIX bind with the multiprocessing name shape rather
+    # than assuming character count equals the platform's encoded byte limit.
+    probe_dir = tmp_path / "tmp" / "pymp-12345678"
+    probe_dir.mkdir(parents=True)
+    address = probe_dir / "listener-12345678"
+    with socket.socket(socket.AF_UNIX) as probe:
+        try:
+            probe.bind(str(address))
+        except OSError:
+            fits = False
+        else:
+            fits = True
+    address.unlink(missing_ok=True)
+    probe_dir.rmdir()
+    boundary = os.environ.get("OUROBOROS_TEST_TEMP_ROOT")
+    root = tmp_path if fits else Path(tempfile.mkdtemp(prefix="h", dir=boundary or "/tmp"))
+    if boundary and not fits:
+        from ouroboros.test_environment import declare_scratch
+        declare_scratch(root, "pytest-session")
+    if not fits:
+        (tmp_path / "presence-root.txt").write_text(str(root), encoding="utf-8")
+    try:
+        yield root
+    finally:
+        from ouroboros.test_evidence import diagnostic_directory, diagnostics_incomplete
+        import shutil
+        try:
+            evidence = diagnostic_directory(root / "evidence", "presence-" + root.name)
+            # These are this producer's diagnostic originals, not its DB/cache.
+            named = list(root.glob("*.log")) + list(root.glob("*.json")) + list(root.glob("*.jsonl"))
+            named += list((root / "data" / "logs").glob("*.jsonl"))
+            for path in named:
+                target = evidence / path.relative_to(root)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(path, target)
+        except OSError as exc:
+            diagnostics_incomplete(str(exc), root)
+    print(f"Presence fixture tree {'owned by outer test run' if boundary else 'retained (no outer owner)'}: {root}")
+
+
+def eventually(read, *, seconds=45):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        try:
+            value = read()
+        except httpx.TransportError:
+            value = None  # the socket may be bound before the server starts serving
+        if value:
+            return value
+        time.sleep(.05)
+    raise AssertionError("child Host condition did not settle")
+
+
+class Host:
+    def __init__(self, root, generation, mode, scenario="incoming", *, with_event_bus=False):
+        self.root, self.generation = root, generation
+        self.ready = root / f"ready-{generation}.json"
+        env = isolated_environment(root, ROOT)
+        self.log = (root / f"host-{generation}.log").open("w")
+        self.proc = subprocess.Popen(
+            [sys.executable, "-m", "tests.presence_lifecycle_host", str(root), str(generation), mode, scenario,
+             *(["--fixture-event-bus"] if with_event_bus else [])],
+            cwd=ROOT, env=env, stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True,
+        )
+        self.client = None
+        try:
+            def ready():
+                assert self.proc.poll() is None, (root / f"host-{generation}.log").read_text()
+                return json.loads(self.ready.read_text()) if self.ready.exists() else None
+            self.info = eventually(ready)
+            self.client = httpx.Client(base_url=self.info["url"], headers=HEADERS,
+                                       trust_env=False, timeout=60)
+            eventually(lambda: self.client.get("/identity").status_code == 200)
+        except BaseException:
+            self.close()
+            raise
+
+    def payload(self, event="original", text="Prepare the report.", version=1):
+        return {
+            "binding_id": self.info["binding"], "continuation_version": version,
+            "event": {"source_event_id": event, "provider": "telegram", "account_id": "bot-1",
+                      "conversation_id": "room-1", "thread_id": "topic-1",
+                      "conversation_key": "ignored-by-host",
+                      "actor": {"platform_actor_id": "user-7"}, "conversation": {},
+                      "message": {"message_id": event}, "text": text}}
+
+    def turn(self, event="original", text="Prepare the report.", version=1):
+        return self.client.post("/presence/turn", json=self.payload(event, text, version))
+
+    def work(self, ref):
+        return self.client.get(f"/presence/work/{ref}", params={"binding_id": self.info["binding"]})
+
+    def inputs(self):
+        path = self.root / "model-inputs.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def restart(self):
+        assert self.client.post("/fixture/restart").status_code == 200
+        self.client.close()
+        self.generation += 1
+        self.ready = self.root / f"ready-{self.generation}.json"
+
+        def ready():
+            assert self.proc.poll() is None, "direct restart lost the original PID"
+            return json.loads(self.ready.read_text()) if self.ready.exists() else None
+
+        self.info = eventually(ready)
+        self.client = httpx.Client(base_url=self.info["url"], headers=HEADERS, trust_env=False, timeout=60)
+        eventually(lambda: self.client.get("/identity").status_code == 200)
+
+    def close(self):
+        if self.proc.poll() is None:
+            if self.client is not None:
+                try:
+                    self.client.post("/fixture/shutdown")
+                except httpx.HTTPError:
+                    pass
+            try:
+                self.proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+                self.proc.wait(timeout=10)
+        if self.client is not None:
+            self.client.close()
+        self.log.close()
+        # The child starts a private process group; no descendants may outlive it.
+        try:
+            os.killpg(self.proc.pid, 0)
+        except ProcessLookupError:
+            group_gone = True
+        else:
+            os.killpg(self.proc.pid, signal.SIGKILL)
+            group_gone = False
+        (self.root / f"exit-{self.generation}.json").write_text(json.dumps({
+            "pid": self.proc.pid, "returncode": self.proc.returncode, "process_group_gone": group_gone}))
+        assert group_gone, "child exited with a live descendant in its private group"
+
+
+def test_host_close_rejects_a_live_descendant_after_the_parent_exits(tmp_path):
+    """Support-process cleanup must not turn an actual orphan into a pass."""
+    host = Host.__new__(Host)
+    host.root, host.generation, host.client = tmp_path, 1, None
+    host.log = (tmp_path / "host-1.log").open("w")
+    host.proc = subprocess.Popen([
+        sys.executable, "-c",
+        "import os, subprocess, sys; "
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)']); "
+        "os._exit(0)",
+    ], cwd=ROOT, env=isolated_environment(tmp_path, ROOT), stdout=host.log,
+        stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        assert host.proc.wait(timeout=10) == 0
+        with pytest.raises(AssertionError, match="live descendant"):
+            host.close()
+        assert json.loads((tmp_path / "exit-1.json").read_text()) == {
+            "pid": host.proc.pid, "returncode": 0, "process_group_gone": False}
+    finally:
+        # Only the private group created above is ours. Reap even if the
+        # negative control fails before Host.close reaches its own cleanup.
+        try:
+            os.killpg(host.proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        host.proc.wait(timeout=10)
+        host.log.close()
+
+        def gone():
+            try:
+                os.killpg(host.proc.pid, 0)
+            except ProcessLookupError:
+                return True
+            except PermissionError:
+                # macOS can briefly retain an unsignalable exiting group.
+                # It still must disappear; EPERM is not evidence of cleanup.
+                return False
+            return False
+
+        eventually(gone, seconds=10)
+
+
+@pytest.mark.parametrize("method", ["spawn", "forkserver"])
+def test_fixture_joins_owned_multiprocessing_support_before_exit(tmp_path, method):
+    """Force the bus to exist; test cleanup independently of late-notice timing.
+
+    The bus process is spawn-started whatever the worker start method is (ARCHITECTURE §5: it inherits no
+    forkserver), so under ``forkserver`` the script starts the forkserver the first worker start would, and the
+    fixture must join it too."""
+    script = r'''
+import json, os, sys
+from pathlib import Path
+os.environ["OUROBOROS_WORKER_START_METHOD"] = sys.argv[2]
+from supervisor import queue
+from supervisor.workers import get_event_q
+from multiprocessing import forkserver, resource_tracker
+from tests.presence_lifecycle_host import shutdown_fixture_processes
+root = Path(sys.argv[1])
+try:
+    bus = get_event_q()
+    bus.put({"fixture": True})
+    assert bus.get(timeout=5) == {"fixture": True}
+    if sys.argv[2] == "forkserver":
+        forkserver.ensure_running()  # what a worker start under forkserver brings; the bus itself is spawn-started
+    shutdown_fixture_processes(root, 1)
+    assert forkserver._forkserver._forkserver_pid is None
+    record = json.loads((root / "process-cleanup-1.json").read_text())
+    assert record["event_bus_children"] and record["resource_tracker_pid"], record
+    assert record["remaining_children"] == [] and record["resource_tracker_joined"], record
+    assert record["forkserver_joined"], record
+    assert bool(record["forkserver_pid"]) == (sys.argv[2] == "forkserver"), record
+finally:
+    # A failing old fixture still must not leave its support processes behind.
+    forkserver._forkserver._stop()
+    resource_tracker._resource_tracker._stop()
+'''
+    result = subprocess.run([sys.executable, "-c", script, str(tmp_path), method],
+                            cwd=ROOT, env=isolated_environment(tmp_path, ROOT),
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("mode", ["blocking", "advisory"])
+def test_direct_exec_restart_interrupts_same_pid_author_without_replaying_effects(tmp_path, mode):
+    from ouroboros.presence_continuation import continuation_status
+    from ouroboros.review_operation import controller_identity, controller_state
+
+    host = Host(tmp_path, 1, mode)
+    try:
+        initial = host.turn().json()
+        assert initial["status"] == "continuing"
+        ref = initial["continuation_ref"]
+        before = host_result(tmp_path / "data", ref)
+        original = before["presence_continuation"]["author_controller"]
+        assert original == host.info["controller"] and original["birth"] and original["session"]
+        # A genuine live controller in another process remains pending despite
+        # its different custody session and absence from this process's registry.
+        assert original["session"] != controller_identity()["session"]
+        assert controller_state(original) == "alive" and continuation_status(before) == "running"
+        assert host.work(ref).status_code == 202 and len(host.inputs()) == 2
+
+        host.restart()
+        successor = host.info["controller"]
+        assert successor["pid"] == original["pid"] == host.proc.pid
+        # Both births survive exec (they name the process, not its program): the session decides.
+        assert successor["birth"] == original["birth"] and successor["kernel_birth"] == original["kernel_birth"]
+        assert successor["session"] and successor["session"] != original["session"]
+        assert host.client.get("/fixture/live").json() == [] and len(host.inputs()) == 2
+        # Only the successor can prove replacement of its own local controller;
+        # an unrelated observer's PID/birth probe still sees a live process.
+        assert controller_state(original) == "alive"
+        interrupted = host.work(ref)
+        facts = {"mode": mode, "original_controller": original, "successor_controller": successor,
+                 "initial": initial, "poll_status": interrupted.status_code, "poll": interrupted.json(),
+                 "model_calls_after_exec": len(host.inputs()), "foreign_observer_state": controller_state(original)}
+        (tmp_path / "exec-facts.json").write_text(json.dumps(facts, indent=2))
+        assert interrupted.status_code == 200, interrupted.text
+        assert interrupted.json()["status"] == "failed"  # ended: its controller is positively gone
+        assert interrupted.json()["code"] == "presence_attempt_outcome_unknown"
+        assert (interrupted.json()["text"], interrupted.json()["output_ref"]) == ("", "")
+        assert interrupted.json()["outputs"] == before["presence_continuation"].get("outputs", [])
+        for _ in range(2):
+            assert host.turn().json() == initial
+            assert host.work(ref).json() == interrupted.json()
+        assert len(host.inputs()) == 2
+        after = host_result(tmp_path / "data", ref)
+        # The restarted Host's boot reconcile settled the dead author from the same fact.
+        assert (after["status"], after["status_reconciled_from"]) == ("failed", "running")
+        assert after["presence_continuation"] == before["presence_continuation"]
+
+        manual = host.turn("manual-followup", MANUAL).json()
+        assert manual["status"] == "completed" and manual["turn_ref"] != ref
+        assert len(host.inputs()) == 3
+        prompt = str(host.inputs()[-1]["messages"])
+        assert ref in prompt and "interrupted" in prompt and MANUAL in prompt
+        assert host.turn().json() == initial and len(host.inputs()) == 3
+        facts.update(manual=manual, model_calls_after_manual=3, original_replay_unchanged=True)
+        (tmp_path / "exec-facts.json").write_text(json.dumps(facts, indent=2))
+    finally:
+        host.close()
+
+
+@pytest.mark.parametrize(("death", "mode"), [("sigkill", "blocking"), ("panic", "advisory")])
+def test_killed_author_stays_interrupted_and_explicit_new_event_can_continue(tmp_path, mode, death):
+    first_host = Host(tmp_path, 1, mode)
+    try:
+        first = first_host.turn().json()
+        assert first.get("status") == "continuing", first
+        assert (first["outcome"], first["text"], first["output_ref"]) == ("deferred", "", "")
+        ref = first["continuation_ref"]
+        assert first_host.work(ref).status_code == 202
+        assert len(first_host.inputs()) == 2
+        # The initial response is published before direct_owner_wait parks.
+        def parked_record():
+            record = host_result(tmp_path / "data", ref)
+            return record if record.get("owner_wait", {}).get("state") == "waiting" else None
+
+        record = eventually(parked_record)
+        assert record["execution_owner"]["kind"] == "presence"
+        assert record["owner_wait"]["state"] == "waiting"
+        continuation = record["presence_continuation"]
+        from ouroboros.presence_continuation import continuation_status
+        assert continuation["author_controller"]["pid"] == first_host.proc.pid
+        assert continuation_status(record) == "running"  # another process sees the real owner alive
+        if death == "sigkill":
+            first_host.proc.kill()
+            assert first_host.proc.wait(timeout=10) == -signal.SIGKILL
+        else:
+            try:
+                first_host.client.post("/fixture/panic")
+            except httpx.HTTPError:
+                pass  # real hard exit may beat the acknowledgement
+            assert first_host.proc.wait(timeout=15) == 73
+            assert (tmp_path / "data" / "state" / "panic_stop.flag").exists()
+    finally:
+        first_host.close()
+
+    second_host = Host(tmp_path, 2, mode)
+    try:
+        assert second_host.info["pid"] != first_host.info["pid"]
+        assert second_host.info["reconciled"] == 1  # the dead author's witness, never a pooled-orphan guess
+        assert second_host.turn().json() == first
+        interrupted = second_host.work(ref)
+        assert interrupted.status_code == 200, interrupted.text
+        assert interrupted.json()["status"] == "failed"
+        assert interrupted.json()["status_reconciled_from"] == "running"
+        assert (interrupted.json()["text"], interrupted.json()["output_ref"]) == ("", "")
+        assert interrupted.json()["outputs"] == continuation["outputs"]
+        assert len(second_host.inputs()) == 2  # no automatic author and no original event regeneration
+        legacy = second_host.turn(version=0)
+        assert legacy.status_code == 409 and legacy.json()["code"] == "presence_attempt_outcome_unknown"
+        assert len(second_host.inputs()) == 2
+
+        # This is a fresh, explicit conversational request, never a resumed dead stack/API.
+        manual = second_host.turn("manual-continuation", MANUAL).json()
+        assert manual["status"] == "completed" and manual["text"] == "Continued after the explicit request."
+        assert manual["turn_ref"] != ref
+        assert manual["output_ref"] and manual["output_ref"] != first["output_ref"]
+        inputs = second_host.inputs()
+        assert len(inputs) == 3 and inputs[-1]["pid"] == second_host.info["pid"]
+        assert ref in str(inputs[-1]["messages"]) and "interrupted" in str(inputs[-1]["messages"])
+        assert all("send_message" not in tool for row in inputs for tool in row["tools"])
+        assert second_host.turn().json() == first
+        assert second_host.work(ref).json() == interrupted.json()
+        assert host_result(tmp_path / "data", ref)["presence_continuation"] == continuation
+        (tmp_path / "consumer-facts.json").write_text(json.dumps({
+            "death": death, "mode": mode, "initial": first, "interrupted": interrupted.json(),
+            "manual": manual, "original_model_calls": 2, "manual_model_calls": 1,
+            "original_event_replay_unchanged": True, "no_direct_send_tool": True}, indent=2))
+    finally:
+        second_host.close()
+
+
+def second_park_with_late_child(host):
+    """Drive two actual reviewer waits, with promotion only after the first yield."""
+    response = host.turn()
+    assert response.status_code == 200, response.text
+    initial = response.json()
+    assert initial["status"] == "continuing" and initial["work_ref"] == ""
+    ref = initial["continuation_ref"]
+
+    def parked():
+        record = host_result(host.root / "data", ref)
+        return record if record.get("owner_wait", {}).get("state") == "waiting" else None
+
+    before = eventually(parked)
+    first_continuation = before["presence_continuation"]
+    assert first_continuation["initial"]["work_ref"] == ""
+    assert not host_has(host.root / "data", LATE_CHILD)
+    assert host.work(ref).status_code == 202 and len(host.inputs()) == 2
+    assert host.client.post("/fixture/release-review").status_code == 200
+
+    def second_park():
+        record = parked()
+        if not record:
+            return None
+        continuation = record["presence_continuation"]
+        state = host.client.get("/fixture/review-state").json()
+        return record if (continuation["review_binding"] != first_continuation["review_binding"]
+                          and state == {"reviews": 2, "model_calls": 4, "held": True}) else None
+
+    after = eventually(second_park)
+    assert after["presence_continuation"]["initial"] == first_continuation["initial"]
+    assert after["presence_continuation"]["author_controller"] == first_continuation["author_controller"]
+    assert host.client.get("/fixture/live").json() == [ref]
+    assert host.turn().json() == initial and len(host.inputs()) == 4
+    return initial, after
+
+
+@pytest.mark.parametrize("mode", ["blocking", "advisory"])
+@pytest.mark.parametrize("ending", ["complete", "stop"])
+def test_second_park_exposes_late_child_without_changing_initial_replay(tmp_path, mode, ending):
+    host = Host(tmp_path, 1, mode, "late_child", with_event_bus=ending == "stop")
+    try:
+        if ending == "stop":
+            assert host.info["event_bus_children"]
+        initial, record = second_park_with_late_child(host)
+        ref = initial["continuation_ref"]
+        pending = host.work(ref)
+        assert pending.status_code == 202, pending.text
+        child_ref = pending.json().get("child_work_ref")
+        assert child_ref == LATE_CHILD, pending.text
+        assert record["presence_continuation"]["child_work_ref"] == child_ref
+        child = host.work(child_ref)
+        assert child.status_code == 202 and child.json()["status"] == "pending"
+        assert child.json()["work_ref"] == child_ref and "continuation_ref" not in child.json()
+        if ending == "stop":
+            assert host.client.post("/fixture/stop", json={"task_id": ref}).status_code == 200
+        else:
+            assert host.client.post("/fixture/release-review").status_code == 200
+        final = eventually(lambda: (reply if (reply := host.work(ref)).status_code == 200 else None))
+        assert final.json()["child_work_ref"] == child_ref, final.text
+        # A Stop while parked ends on the zero-call control rail (owner_requested_finalization): Stop now of an
+        # inline Presence turn settles cancelled (#2012), retained and never spoken; a released review lets the
+        # author complete.
+        assert final.json()["status"] == ("cancelled" if ending == "stop" else "completed")
+        assert ending != "stop" or (final.json()["text"], final.json()["output_ref"]) == ("", "")
+        assert ending != "stop" or (final.json()["code"], final.json()["reason_code"]) == (
+            "presence_turn_cancelled", "owner_requested_finalization")
+        assert len(host.inputs()) == (4 if ending == "stop" else 5)
+        # A completed answer polls final once recorded, before handle_task's finally closes its model
+        # receiver (a cancelled one only after the author ended). Require actual closure too; terminal is not its ACK.
+        eventually(lambda: host.client.get("/fixture/live").json() == [])
+        assert host.turn().json() == initial
+        assert host_result(host.root / "data", ref)["presence_continuation"]["initial"] == record["presence_continuation"]["initial"]
+        assert host.work(child_ref).json() == child.json()  # independent work survives the author's end
+        (tmp_path / "late-child-facts.json").write_text(json.dumps({
+            "mode": mode, "ending": ending, "initial": initial, "second_park": pending.json(),
+            "final": final.json(), "child": child.json(), "model_calls": len(host.inputs()),
+            "promotion_dispatch_scripted": True, "original_replay_unchanged": True}, indent=2))
+    finally:
+        host.close()
+    cleanup = json.loads((tmp_path / "process-cleanup-1.json").read_text())
+    assert cleanup["remaining_children"] == [] and cleanup["resource_tracker_joined"]
+    if ending == "stop":
+        # The bus existed before this author started. Both owned support
+        # processes must be joined before the parent's group assertion runs.
+        assert cleanup["event_bus_children"] and cleanup["resource_tracker_pid"], cleanup
+        assert set(host.info["event_bus_children"]) <= set(cleanup["event_bus_children"])
+
+
+def test_terminal_poll_precedes_author_teardown_but_cleanup_must_finish(tmp_path):
+    """Deterministically expose the stop/advisory race; never infer cleanup from HTTP 200."""
+    host = Host(tmp_path, 1, "advisory", "late_child_close_barrier", with_event_bus=True)
+    try:
+        assert host.info["event_bus_children"]
+        initial, record = second_park_with_late_child(host)
+        ref = initial["continuation_ref"]
+        assert host.client.post("/fixture/stop", json={"task_id": ref}).status_code == 200
+        marker = tmp_path / "before-author-close.json"
+        blocked = eventually(lambda: json.loads(marker.read_text()) if marker.exists() else None)
+        assert blocked["task_id"] == ref and blocked["closed"] is False
+        # The owner's Stop now of a parked direct turn is recorded cancelled, silently (#2012), before the
+        # author's teardown closes its model receiver: the durable terminal is not process cleanup.
+        assert blocked["status"] == "cancelled"
+        polled = host.work(ref)
+        # Only a canonical answer is final the moment it is recorded (``presence_recovery.retained_work_view``):
+        # an unanswered terminal of a still-live author stays observed as 202 until its execution ends.
+        assert (polled.status_code, polled.json()["status"]) == (202, "pending"), polled.text
+        assert polled.json()["child_work_ref"] == LATE_CHILD
+        assert host.client.get("/fixture/live").json() == [ref]
+        assert len(host.inputs()) == 4
+        assert host.client.post("/fixture/release-close").status_code == 200
+        eventually(lambda: host.client.get("/fixture/live").json() == [])
+        # The receiver closes before the stack leaves the live registry: wait for the ended view, never one read.
+        final = eventually(lambda: (reply if (reply := host.work(ref)).status_code == 200 else None))
+        assert (final.json()["status"], final.json()["text"], final.json()["output_ref"]) == ("cancelled", "", "")
+        assert final.json()["code"] == "presence_turn_cancelled" and final.json()["child_work_ref"] == LATE_CHILD
+        assert host.work(ref).json() == final.json()
+        assert host.turn().json() == initial and len(host.inputs()) == 4
+        assert host.work(LATE_CHILD).status_code == 202
+        (tmp_path / "teardown-order-facts.json").write_text(json.dumps({
+            "blocked": blocked, "polled": polled.json(), "terminal": final.json(),
+            "initial": record["presence_continuation"]["initial"],
+            "receiver_closed_after_release": True, "model_calls": 4}, indent=2))
+    finally:
+        host.close()
+    cleanup = json.loads((tmp_path / "process-cleanup-1.json").read_text())
+    assert cleanup["remaining_children"] == [] and cleanup["resource_tracker_joined"]
+    assert cleanup["event_bus_children"] and cleanup["resource_tracker_pid"], cleanup
+    assert set(host.info["event_bus_children"]) <= set(cleanup["event_bus_children"])
+
+
+@pytest.mark.parametrize("mode", ["blocking", "advisory"])
+def test_killed_second_park_author_preserves_late_child_for_tcp_consumer(tmp_path, mode):
+    first_host = Host(tmp_path, 1, mode, "late_child")
+    try:
+        initial, record = second_park_with_late_child(first_host)
+        ref = initial["continuation_ref"]
+        # Physical process death drops the author stack and all in-memory refs.
+        first_host.proc.kill()
+        assert first_host.proc.wait(timeout=10) == -signal.SIGKILL
+    finally:
+        first_host.close()
+
+    second_host = Host(tmp_path, 2, mode, "late_child")
+    try:
+        interrupted = second_host.work(ref)
+        assert interrupted.status_code == 200 and interrupted.json()["status"] == "failed"
+        child_ref = interrupted.json().get("child_work_ref")
+        assert child_ref == LATE_CHILD, interrupted.text
+        assert (interrupted.json()["text"], interrupted.json()["output_ref"]) == ("", "")
+        assert interrupted.json()["outputs"] == record["presence_continuation"]["outputs"]
+        assert record["presence_continuation"]["child_work_ref"] == child_ref
+        child = second_host.work(child_ref)
+        assert child.status_code == 202 and child.json()["status"] == "pending"
+        assert child.json()["work_ref"] == child_ref and "continuation_ref" not in child.json()
+        for _ in range(2):
+            assert second_host.turn().json() == initial
+            assert second_host.work(ref).json() == interrupted.json()
+            assert second_host.work(child_ref).json() == child.json()
+        assert len(second_host.inputs()) == 4  # no original author restart or event regeneration
+        assert second_host.client.get("/fixture/live").json() == []
+        assert host_result(second_host.root / "data", ref)["presence_continuation"] == record["presence_continuation"]
+        (tmp_path / "late-child-facts.json").write_text(json.dumps({
+            "mode": mode, "death": "SIGKILL", "initial": initial,
+            "interrupted": interrupted.json(), "independent_child": child.json(),
+            "original_model_calls": 4, "recycled_model_calls": 0,
+            "promotion_dispatch_scripted": True, "original_replay_unchanged": True}, indent=2))
+    finally:
+        second_host.close()
+
+
+@pytest.mark.parametrize("mode", ["blocking", "advisory"])
+def test_v1_tcp_disconnect_before_first_park_keeps_one_author(tmp_path, mode):
+    from ouroboros.presence_runner import presence_turn_task_id
+
+    host = Host(tmp_path, 1, mode, "disconnect")
+    try:
+        body = json.dumps(host.payload()).encode()
+        endpoint = urlsplit(host.info["url"])
+        # Raw TCP gives a physical disconnect with no HTTP retry by the client.
+        with socket.create_connection((endpoint.hostname, endpoint.port), timeout=10) as connection:
+            connection.sendall((
+                f"POST /presence/turn HTTP/1.1\r\nHost: {endpoint.netloc}\r\n"
+                f"X-Skill-Token: {TOKEN}\r\nContent-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode() + body)
+            eventually(lambda: (tmp_path / "before-first-inference.json").exists())
+            ref = presence_turn_task_id(host.info["binding"], "original")
+            before = host_result(tmp_path / "data", ref)
+            assert not before.get("presence_continuation")
+            assert len(host.inputs()) == 1
+            connection.shutdown(socket.SHUT_RDWR)
+        # Only now may the first inference return and later reach the review park.
+        assert host.client.post("/fixture/release-inference").status_code == 200
+        eventually(lambda: host_result(tmp_path / "data", ref).get("presence_continuation"))
+        initial = host.turn().json()
+        assert initial["status"] == "continuing" and initial["turn_ref"] == ref
+        assert host.work(ref).status_code == 202 and len(host.inputs()) == 2
+        assert host.turn().json() == initial and len(host.inputs()) == 2
+        assert host.client.post("/fixture/release-review").status_code == 200
+        final = eventually(lambda: (reply if (reply := host.work(ref)).status_code == 200 else None)).json()
+        assert final["status"] == "completed" and len(host.inputs()) == 3
+        assert initial["text"] == "" and initial["output_ref"] == ""
+        assert final["text"] == ANSWER and final["output_ref"] and final["outputs"] == []
+        assert host.turn().json() == initial and len(host.inputs()) == 3
+        # The final polls once recorded, before the author's teardown closes its receiver: require that closure too.
+        eventually(lambda: host.client.get("/fixture/live").json() == [])
+        (tmp_path / "consumer-facts.json").write_text(json.dumps({
+            "mode": mode, "tcp_disconnected_before_first_inference_returned": True,
+            "continuation_absent_at_disconnect": True, "initial": initial, "final": final,
+            "model_calls": 3, "original_replay_unchanged": True}, indent=2))
+    finally:
+        host.close()
+
+
+@pytest.mark.parametrize("mode", ["blocking", "advisory"])
+def test_proactive_caller_process_death_and_recycle_preserve_interrupted_work(tmp_path, mode):
+    first_host = Host(tmp_path, 1, mode, "proactive")
+    try:
+        initial = first_host.client.post("/fixture/proactive").json()
+        assert initial["status"] == "continuing" and initial["continuation_ref"] == initial["turn_ref"]
+        ref = initial["turn_ref"]
+        record = host_result(tmp_path / "data", ref)
+        original_continuation = record["presence_continuation"]
+        assert original_continuation["author_controller"]["pid"] == first_host.proc.pid
+        assert record["metadata"]["presence"]["event"]["actor"]["kind"] == "proactive_initiation"
+        assert len(first_host.inputs()) == 2 and first_host.work(ref).status_code == 202
+        # The actual initiating tool and retained author run in this process;
+        # killing it must not be confused with merely timing out its caller wait.
+        first_host.proc.kill()
+        assert first_host.proc.wait(timeout=10) == -signal.SIGKILL
+    finally:
+        first_host.close()
+    second_host = Host(tmp_path, 2, mode, "proactive")
+    try:
+        interrupted = second_host.work(ref)
+        assert interrupted.status_code == 200 and interrupted.json()["status"] == "failed"
+        assert (interrupted.json()["text"], interrupted.json()["output_ref"]) == ("", "")
+        assert second_host.client.post("/fixture/proactive").json() == initial
+        assert second_host.client.post("/fixture/proactive").json() == initial
+        assert len(second_host.inputs()) == 2
+        assert second_host.client.get("/fixture/live").json() == []
+        assert host_result(tmp_path / "data", ref)["presence_continuation"] == original_continuation
+        (tmp_path / "consumer-facts.json").write_text(json.dumps({
+            "mode": mode, "initial": initial, "interrupted": interrupted.json(),
+            "caller_pid": first_host.proc.pid, "recycled_pid": second_host.proc.pid,
+            "proactive_dedupe_replay_unchanged": True, "model_calls": 2,
+            "author_shared_callers_process": True}, indent=2))
+    finally:
+        second_host.close()
+
+
+def _tool_receipt(ref, text):
+    """An isolated transport fixture reports a tool effect it already delivered; no provider is contacted."""
+    return {"schema_version": 1, "delivery_id": "fixture-tool-effect", "part_id": "0",
+            "state": "delivered", "provider": "telegram", "account_id": "bot-1",
+            "conversation_id": "room-1", "thread_id": "topic-1", "text": text,
+            "format": "plain", "message": {"message_id": "fixture-tool-message"},
+            "origin": {"kind": "tool", "task_id": ref, "source_event_id": "original"}}
+
+
+@pytest.mark.parametrize("scenario", ["acknowledged", "tool_silent"])
+@pytest.mark.parametrize("mode", ["blocking", "advisory"])
+def test_a_delivered_tool_send_never_selects_the_final_and_replay_never_duplicates(tmp_path, mode, scenario):
+    """A receipt is evidence of what was sent, not a completion: the author's new final is new
+    speech once, its explicit silence adds nothing, and replay or polling never offers either again."""
+    host = Host(tmp_path, 1, mode, scenario)
+    try:
+        initial = host.turn().json()
+        assert initial["status"] == "continuing"
+        ref = initial["turn_ref"]
+        sent = ACKNOWLEDGEMENT if scenario == "acknowledged" else ANSWER
+        for _ in range(2):
+            reply = host.client.post("/presence/delivery", json=_tool_receipt(ref, sent))
+            assert reply.status_code == 200, reply.text
+        assert initial["text"] == "" and initial["output_ref"] == ""
+        assert host.work(ref).status_code == 202
+        assert host.client.post("/fixture/release-review").status_code == 200
+        final = eventually(lambda: (reply if (reply := host.work(ref)).status_code == 200 else None)).json()
+        assert final["status"] == "completed" and final["outputs"] == []
+        if scenario == "acknowledged":
+            assert (final["outcome"], final["text"]) == ("message", ANSWER) and final["output_ref"]
+        else:
+            assert (final["outcome"], final["text"], final["output_ref"]) == ("silent", "", "")
+            assert host_result(tmp_path / "data", ref)["result"] == TOOL_NOTE  # the words stay internal
+        assert host.turn().json() == initial and host.work(ref).json() == final
+        rows = dialogue_test.log_rows(tmp_path / "data" / "logs" / "chat.jsonl")
+        deliveries = [row for row in rows if row.get("type") == "presence_delivery"]
+        assert len(deliveries) == 1 and deliveries[0]["text"] == sent
+        assert len(host.inputs()) == 3
+        assert all("send_message" not in tool for row in host.inputs() for tool in row["tools"])
+        (tmp_path / "consumer-facts.json").write_text(json.dumps({
+            "mode": mode, "scenario": scenario, "initial": initial, "final": final,
+            "fixture_delivery_receipt_rows": len(deliveries), "model_calls": 3,
+            "provider_transport_scripted": True}, indent=2))
+    finally:
+        host.close()

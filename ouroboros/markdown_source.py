@@ -7,11 +7,12 @@ The existing tree-sitter Markdown grammars own syntax; PyYAML owns frontmatter.
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import html
 import string
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import yaml
 
@@ -87,7 +88,8 @@ class MarkdownSource:
 
     def lines(self, start_line: int = 1, max_lines: int | None = None) -> SourceRange:
         """Select physical LF lines, without inventing a composed-book address."""
-        starts = [0] + [i + 1 for i, byte in enumerate(self.raw) if byte == 10]
+        newlines = _newlines(self.raw)
+        starts = [0] + [at + 1 for at in newlines]
         total = len(starts) - int(bool(self.raw) and self.raw.endswith(b"\n"))
         if isinstance(start_line, bool) or start_line < 1 or start_line > total:
             raise ValueError("start_line is outside the Markdown source")
@@ -95,12 +97,22 @@ class MarkdownSource:
             raise ValueError("max_lines must be positive")
         last = total if max_lines is None else min(total, start_line + max_lines - 1)
         end = starts[last] if last < len(starts) else len(self.raw)
-        return _range(self.raw, starts[start_line - 1], end)
+        return _range(newlines, starts[start_line - 1], end)
 
 
-def _range(raw: bytes, start: int, end: int) -> SourceRange:
-    first = raw.count(b"\n", 0, start) + 1
-    last = raw.count(b"\n", 0, max(start, end - 1)) + 1
+def _newlines(raw: bytes) -> list[int]:
+    """The byte offset of every LF, in order: one index per parse, so no range recounts the source from byte 0."""
+    offsets, at = [], raw.find(b"\n")
+    while at >= 0:
+        offsets.append(at)
+        at = raw.find(b"\n", at + 1)
+    return offsets
+
+
+def _range(newlines: Sequence[int], start: int, end: int) -> SourceRange:
+    """``[start, end)`` and the LF lines of its first and last byte: the LFs before a byte, bisected."""
+    first = bisect.bisect_left(newlines, start) + 1
+    last = bisect.bisect_left(newlines, max(start, end - 1)) + 1
     return SourceRange(start, end, first, last)
 
 
@@ -139,6 +151,49 @@ def _destination(node: Any) -> str:
     return _markdown_value(value)
 
 
+def _heading_title(node: Any) -> str:
+    content = node.child_by_field_name("heading_content")
+    if content is None:
+        content = next((c for c in node.named_children if c.type in ("inline", "paragraph")), None)
+    return content.text.decode("utf-8").strip() if content else ""
+
+
+def parse_markdown_navigation(raw: bytes, source_path: str) -> tuple[Mapping[str, Any], str | None]:
+    """Read frontmatter and title without building links or physical ranges.
+
+    The same YAML reader and block grammar own syntax. An authored title needs
+    no body parse; otherwise visit only as far as the first real heading. This
+    projection is not a complete MarkdownSource or evidence of its links.
+    """
+    try:
+        raw.decode("utf-8")
+        metadata, body_start = _frontmatter(raw)
+        metadata = metadata or {}
+        # Missing native grammars must keep the same visible source gap as a
+        # complete read, including for a titled archived note.
+        block_parser = _markdown_parser("markdown", source_path)
+        _markdown_parser("markdown_inline", source_path)
+        title = metadata.get("title")
+        if isinstance(title, str) and title.strip():
+            return metadata, title
+        root = block_parser.parse(raw[body_start:]).root_node
+
+        def first_heading(node: Any) -> str | None:
+            if node.type in ("atx_heading", "setext_heading"):
+                return _heading_title(node)
+            for child in node.named_children:
+                title = first_heading(child)
+                if title is not None:
+                    return title
+            return None
+
+        return metadata, first_heading(root)
+    except MarkdownSourceError:
+        raise
+    except (UnicodeError, ValueError, yaml.YAMLError) as exc:
+        raise MarkdownSourceError(f"{source_path}: {type(exc).__name__}: {exc}") from exc
+
+
 def parse_markdown_source(raw: bytes, source_path: str) -> MarkdownSource:
     """Parse supplied bytes, including exact Git/index bytes, without any I/O."""
     try:
@@ -163,9 +218,10 @@ def _parse_markdown_source(raw: bytes, source_path: str) -> MarkdownSource:
             walk(child)
 
     walk(root)
+    newlines = _newlines(raw)
 
     def span(node: Any) -> SourceRange:
-        return _range(raw, body_start + node.start_byte, body_start + node.end_byte)
+        return _range(newlines, body_start + node.start_byte, body_start + node.end_byte)
 
     def label(value: bytes) -> str:
         return " ".join(_markdown_value(value.decode("utf-8").strip("[]")).split()).casefold()
@@ -183,13 +239,10 @@ def _parse_markdown_source(raw: bytes, source_path: str) -> MarkdownSource:
     links: list[MarkdownLink] = []
     for node in nodes:
         if node.type in ("atx_heading", "setext_heading"):
-            content = node.child_by_field_name("heading_content")
-            if content is None:
-                content = next((c for c in node.named_children if c.type in ("inline", "paragraph")), None)
             marker = next((c.type for c in node.named_children if "marker" in c.type or "underline" in c.type), "")
             level = int(marker[5]) if marker.startswith("atx_h") else (1 if "h1" in marker else 2)
             headings.append(MarkdownHeading(
-                content.text.decode("utf-8").strip() if content else "", level,
+                _heading_title(node), level,
                 span(node), span(node.parent) if node.parent.type == "section" else span(node),
             ))
         if node.type != "inline":
@@ -209,7 +262,7 @@ def _parse_markdown_source(raw: bytes, source_path: str) -> MarkdownSource:
                 if target:
                     links.append(MarkdownLink(
                         text_node.text.decode("utf-8") if text_node else "",
-                        target, _range(raw, base + part.start_byte, base + part.end_byte),
+                        target, _range(newlines, base + part.start_byte, base + part.end_byte),
                     ))
                 return
             for child in part.named_children:
@@ -218,7 +271,7 @@ def _parse_markdown_source(raw: bytes, source_path: str) -> MarkdownSource:
         inline_links(inline_parser.parse(node.text).root_node)
     return MarkdownSource(
         str(source_path), raw, hashlib.sha256(raw).hexdigest(), frontmatter,
-        _range(raw, 0, body_start) if body_start else None, _range(raw, body_start, len(raw)),
+        _range(newlines, 0, body_start) if body_start else None, _range(newlines, body_start, len(raw)),
         tuple(headings), tuple(span(n) for n in nodes if n.type == "paragraph"),
         tuple(span(n) for n in nodes if n.type == "list"),
         tuple(span(n) for n in nodes if n.type == "list_item"), tuple(links),

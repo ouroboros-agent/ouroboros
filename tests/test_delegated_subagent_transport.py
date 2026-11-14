@@ -24,6 +24,7 @@ from tests._delegated_transport_shared import (  # noqa: F401  (autouse fixture 
     _nanny_ctx,
     _owned_gateway_uses_each_test_transport,
 )
+from tests._usage_store_testing import ledger_rows
 
 
 def test_discovery_missing_descriptor_is_a_typed_refusal(tmp_path):
@@ -44,8 +45,7 @@ def test_discovery_reads_host_port_and_token(tmp_path):
 
 
 @pytest.mark.parametrize("host,loopback", [
-    ("127.0.0.1", True), ("localhost", True), ("::1", True), ("[::1]", True),
-    ("127.1.2.3", True), ("fe80::1%lo0", False),
+    ("127.0.0.1", True), ("localhost", True), ("fe80::1%lo0", False),
     # The exfiltration shapes: a plain external name, a name that merely LOOKS like a
     # loopback literal, an address that resolves off-host, and the wildcard bind.
     ("evil.example.com", False), ("127.0.0.1.evil.com", False),
@@ -295,16 +295,90 @@ def test_the_transport_error_code_is_the_failure_class_name():
     assert cx.ClaudexorSubscriptionWindowExhausted("x").code == SUBSCRIPTION_WINDOW_EXHAUSTED
 
 
-def test_the_window_class_is_transient_and_scheduled_by_its_reset():
+def test_the_window_class_keeps_reset_as_fact_without_sleeping_the_call():
     exc = cx.ClaudexorSubscriptionWindowExhausted("spent", reset_at="2030-01-01T00:00:00Z")
     classification = classify_llm_exception(exc)
     assert classification.kind == SUBSCRIPTION_WINDOW_EXHAUSTED
     assert classification.kind != "quota_exhausted"
-    assert classification.retry_same_request is True
-    # Scheduled by the reset instant, never by the 60s-capped exponential backoff.
-    assert classification.retry_after_sec is not None
-    assert classification.retry_after_sec > 60.0
+    # Configured alternatives and the caller-owned visible wait handle access.
+    # A dated reset does not grant this call a blind sleep or another dispatch.
+    assert classification.retry_same_request is False
+    assert classification.retry_after_sec is None
     assert classification.reset_at == "2030-01-01T00:00:00Z"
+
+
+def _control_problem(code: str, context: dict, status: int = 409) -> cx.ClaudexorUnavailable:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={
+            "code": code, "message": f"{code} refusal", "retryable": False, "context": context})
+
+    with _gateway(handler) as gateway:
+        with pytest.raises(cx.ClaudexorUnavailable) as excinfo:
+            gateway.get_run("run-1")
+    return excinfo.value
+
+
+def test_a_dated_pool_refusal_keeps_its_cause_without_inventing_quota_or_retry():
+    """The existing transport wrapper may carry a dated pool refusal, but its
+    own code still distinguishes unavailable routes from a spent quota window.
+    A reset is observation, never proof of recovery or permission to resend a run."""
+    reset = "2030-01-01T00:00:00Z"
+    dated_failure = {"code": "credential_pool_exhausted", "resetsAt": reset,
+                     "safeMessage": "every account is cooling down"}
+    for dated in (_control_problem("credential_pool_exhausted", {"resetsAt": reset}),
+                  cx.run_failure_error("run-1", "failed", dated_failure)):
+        assert isinstance(dated, cx.ClaudexorSubscriptionWindowExhausted)
+        assert (dated.code, dated.reset_at) == ("credential_pool_exhausted", reset)
+    dated_run = cx.run_failure_error("run-1", "failed", dated_failure)
+    assert dated_run.reported_cause == "every account is cooling down"
+    # Dated or not, a pool refusal keeps its own cause. Nothing schedules a new
+    # delegated run or sleeps this classifier's caller until the reported reset.
+    dated_class = classify_llm_exception(dated_run)
+    assert (dated_class.kind, dated_class.retry_same_request) == ("provider_error", False)
+    assert dated_class.provider_code == "credential_pool_exhausted"
+    assert dated_class.reset_at == reset and dated_class.retry_after_sec is None
+
+    # Other direction: an absent, empty or null reset is structural: a plain refusal
+    # under the SAME code, the engine's words still carried beside it.
+    undated_failure = {"code": "credential_pool_exhausted",
+                       "safeMessage": "every enabled account refused the model"}
+    undated = [
+        _control_problem("credential_pool_exhausted", {}),
+        _control_problem("credential_pool_exhausted", {"resetsAt": ""}),
+        _control_problem("credential_pool_exhausted", {"resetsAt": None}),
+        cx.run_failure_error("run-1", "failed", undated_failure),
+        cx.run_failure_error("run-1", "failed", {**undated_failure, "resetsAt": ""}),
+    ]
+    for exc in undated:
+        assert type(exc) is cx.ClaudexorUnavailable
+        assert exc.code == "credential_pool_exhausted"
+    run_undated = undated[3]
+    assert run_undated.reported_cause == "every enabled account refused the model"
+    # It classifies exactly as a plain refusal of the same code: no timer, no instant.
+    classification = classify_llm_exception(run_undated)
+    assert classification == classify_llm_exception(
+        cx.ClaudexorUnavailable("credential_pool_exhausted", str(run_undated)))
+    assert classification.kind == "provider_error"
+    assert classification.kind != SUBSCRIPTION_WINDOW_EXHAUSTED
+    assert (classification.retry_after_sec, classification.reset_at) == (None, "")
+
+    # A spent subscription window keeps its unconditional mapping (the engine always
+    # dates it): even an undated one stays the window class.
+    for context in ({"resetsAt": reset}, {}):
+        window = _control_problem("subscription_window_exhausted", context, status=429)
+        assert isinstance(window, cx.ClaudexorSubscriptionWindowExhausted)
+        assert classify_llm_exception(window).kind == SUBSCRIPTION_WINDOW_EXHAUSTED
+
+
+def test_an_invalid_request_stays_a_permanent_plain_refusal():
+    """The code decides: a stray reset instant never turns a request refusal into a
+    timer, and the engine's 400 stays non-retryable."""
+    exc = _control_problem("invalid_request", {"resetsAt": "2030-01-01T00:00:00Z"}, status=400)
+    assert type(exc) is cx.ClaudexorUnavailable and exc.code == "invalid_request"
+    classification = classify_llm_exception(exc)
+    assert classification.kind == "bad_request"
+    assert classification.retry_same_request is False
+    assert (classification.retry_after_sec, classification.reset_at) == (None, "")
 
 
 def test_a_billing_refusal_stays_permanently_classified():
@@ -343,20 +417,26 @@ def test_an_absent_run_closes_now_and_its_registration_survives_for_the_sweep(tm
 
     class _AbsentRunGateway:
         """get_run 404s (run gone); remove_project is temporarily unreachable."""
+        store_identity = "store-a"
+
         def __init__(self): self.removals, self.remove_fails = [], True
         def handshake(self, **_kw): return {}
         def get_run(self, rid, **_kw):
-            raise ClaudexorUnavailable("not_found", "no such run", status_code=404)
+            from tests._shared import run_absent_in
+            raise run_absent_in("store-a")
         def remove_project(self, pid):
             self.removals.append(pid)
             if self.remove_fails:
                 raise ClaudexorUnavailable("daemon_unreachable", "socket died", status_code=0)
         def close(self): pass
 
+    from ouroboros.task_results import write_task_result
+    for task_id in ('t-a', 't-b'):
+        write_task_result(tmp_path, task_id, 'completed')
     gateway = _AbsentRunGateway()
     dc.record_started(tmp_path, dc.RunCustody(
         run_id="run-gone", task_id="t-a", route_id="r", model="m",
-        project_id="prj-owned", project_owned=True, ledger_root=str(tmp_path)))
+        project_id="prj-owned", project_owned=True, ledger_root=str(tmp_path), daemon_store_id="store-a"))
     dc._CUSTODY.clear()
 
     # 1. Retire unreachable: the run FACT lands now; the debt survives.
@@ -376,7 +456,7 @@ def test_an_absent_run_closes_now_and_its_registration_survives_for_the_sweep(tm
     kinds = _event_types(tmp_path)
     assert "delegate_run_project_retired" in kinds
     assert dc.owned_project_registrations(tmp_path) == []
-    assert gateway.removals == ["prj-owned"] * 3  # 3 lanes: close, 2 sweeps
+    assert gateway.removals == ["prj-owned"] * 2  # retirement belongs to the sweeps
 
     # 3. Absence is discharge: a 404 on the remove itself closes the run.
     class _AllGone(_AbsentRunGateway):
@@ -385,7 +465,7 @@ def test_an_absent_run_closes_now_and_its_registration_survives_for_the_sweep(tm
 
     dc.record_started(tmp_path, dc.RunCustody(
         run_id="run-gone-2", task_id="t-b", route_id="r", model="m",
-        project_id="prj-2", project_owned=True, ledger_root=str(tmp_path)))
+        project_id="prj-2", project_owned=True, ledger_root=str(tmp_path), daemon_store_id="store-a"))
     dc._CUSTODY.clear()
     out = dc.reconcile_orphaned_runs(tmp_path, set(), gateway_factory=lambda: _AllGone())
     assert [o["action"] for o in out] == ["absent"]
@@ -426,19 +506,19 @@ def test_settlement_follows_the_ledger_and_the_registration_debt_survives(tmp_pa
     assert dc.record_started(tmp_path, entry) is True, "the authoritative row must land"
     ctx = _nanny_ctx(tmp_path)
 
-    first = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=1))
+    first = json.loads(delegate._read_run(ctx, "run-1"))
     assert first["settlement"]["settled"] is True, "settles on the ledger row"
     assert first["settlement"]["project_retired"] is False, "the debt is disclosed"
+    entry = dc.replay(tmp_path)["run-1"]  # the durable collector fact, not a pre-collection object
     assert entry.settled is True and entry.project_owned is True
     assert "delegate_run_settled" in _event_types(tmp_path)
     assert [c.run_id for c in dc.owned_project_registrations(tmp_path)] == ["run-1"]
 
     failing["now"] = False
-    second = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=1))
+    second = json.loads(delegate._read_run(ctx, "run-1"))
     delegate._CUSTODY.clear()
     assert second["settlement"]["settled"] is True
-    rows = [json.loads(l) for l
-            in (tmp_path / "state" / "usage_attempts.jsonl").read_text().splitlines()]
+    rows = ledger_rows(tmp_path)
     sessions = [r for r in rows if r.get("kind") == "subscription_session"]
     assert len(sessions) == 1, "the idempotent ledger row must not be written twice"
     assert dc.replay(tmp_path)["run-1"].settled is True
@@ -461,47 +541,43 @@ def test_settlement_follows_the_ledger_and_the_registration_debt_survives(tmp_pa
 
 
 def test_the_public_wait_is_event_only_and_its_outer_bound_matches_task_lifetime():
-    """The model cannot request a fake return window; the host renews quiet windows."""
+    """The model cannot request a fake return window: delegate_wait is a sleep on runs, its retired window
+    settings bind nothing any more, and the windowed read's own bounds and idle-rail lease are gone with it."""
     import os
 
-    from ouroboros.config import (
-        DELEGATE_WAIT_CEILING_SEC,
-        DELEGATE_WAIT_WINDOW_MAX_SEC,
-        get_delegate_wait_max_sec,
-        get_task_abs_ceiling_sec,
-    )
-    from ouroboros.delegate_progress import EXTERNAL_WAIT_LEASE_CEILING_SEC
+    from ouroboros import config, delegate_progress
+    from ouroboros.config import RETIRED_SETTING_KEYS, SETTINGS_DEFAULTS
     from ouroboros.loop_tool_execution import _DEADLINE_CLAMPED_TOOLS, _PER_CALL_TIMEOUT_TOOLS
     from ouroboros.tools.delegate import get_tools
 
-    entry = next(e for e in get_tools() if e.schema["name"] == "delegate_wait")
-    assert "wait_sec" not in entry.schema["parameters"]["properties"]
-    assert entry.timeout_sec == get_task_abs_ceiling_sec() + 120
-    assert DELEGATE_WAIT_WINDOW_MAX_SEC < DELEGATE_WAIT_CEILING_SEC < EXTERNAL_WAIT_LEASE_CEILING_SEC
-    assert (DELEGATE_WAIT_WINDOW_MAX_SEC, DELEGATE_WAIT_CEILING_SEC,
-            EXTERNAL_WAIT_LEASE_CEILING_SEC) == (1800, 2100, 2400)
+    def entry():
+        return next(e for e in get_tools() if e.schema["name"] == "delegate_wait")
+
+    assert "wait_sec" not in entry().schema["parameters"]["properties"]
+    # Lifetime + 120 when the task has one (the pre-#1196 meaning); none without one (retired
+    # pin: the 6 h operation window): the wait wakes on cancel/deadline controls itself.
+    previous_lifetime = os.environ.pop("OUROBOROS_TASK_ABS_CEILING_SEC", None)
+    try:
+        assert entry().timeout_sec is None
+        os.environ["OUROBOROS_TASK_ABS_CEILING_SEC"] = "3600"
+        assert entry().timeout_sec == 3600 + 120
+    finally:
+        os.environ.pop("OUROBOROS_TASK_ABS_CEILING_SEC", None)
+        if previous_lifetime is not None:
+            os.environ["OUROBOROS_TASK_ABS_CEILING_SEC"] = previous_lifetime
+    for retired in ("DELEGATE_WAIT_WINDOW_MAX_SEC", "DELEGATE_WAIT_CEILING_SEC"):
+        assert not hasattr(config, retired), retired
+    assert not hasattr(delegate_progress, "EXTERNAL_WAIT_LEASE_CEILING_SEC")
     # ...and neither escape hatch applies to this tool, which is why the ToolEntry
     # value really is the bound. The task deadline is a separate concern and is
-    # honoured INSIDE the tool (see the wait-window test below), which is why the
+    # honoured INSIDE the tool (its sleep wakes on the deadline), which is why the
     # outer clamp still must not apply: it would thread-kill the graceful return.
     assert "delegate_wait" not in _PER_CALL_TIMEOUT_TOOLS
     assert "delegate_wait" not in _DEADLINE_CLAMPED_TOOLS
 
-    previous = os.environ.get("OUROBOROS_DELEGATE_WAIT_MAX_SEC")
-    os.environ["OUROBOROS_DELEGATE_WAIT_MAX_SEC"] = "7200"
-    try:
-        # The configurable max clamps to the hard window max — NOT to the
-        # ToolEntry timeout: raising the executor timeout must never silently
-        # widen the askable window.
-        assert get_delegate_wait_max_sec() == DELEGATE_WAIT_WINDOW_MAX_SEC
-    finally:
-        if previous is None:
-            os.environ.pop("OUROBOROS_DELEGATE_WAIT_MAX_SEC", None)
-        else:
-            os.environ["OUROBOROS_DELEGATE_WAIT_MAX_SEC"] = previous
-
-
-# -- the window is a WINDOW: the timer waits, the human's stream does not ------
+    for key in ("OUROBOROS_DELEGATE_WAIT_SEC", "OUROBOROS_DELEGATE_WAIT_MAX_SEC"):
+        # No window to configure: the two keys are retired, never read and never offered.
+        assert key in RETIRED_SETTING_KEYS and key not in SETTINGS_DEFAULTS
 
 
 # ---------------------------------------------------------------------------

@@ -9,6 +9,7 @@ from ouroboros.agent_task_pipeline import _store_task_result
 from ouroboros.loop_llm_call import call_llm_with_retry
 from ouroboros.subagent_history import record_task_execution, record_last_delegation, subagent_last_delegation, session_request_facts
 from ouroboros.subagent_runtime import resolve_configured_actor_dispatch
+from tests._store_shared import result_exists
 
 
 def _task(kind="api_model", target="openai::fixture"):
@@ -40,11 +41,15 @@ def test_api_failure_fallback_and_retry_reach_next_task_context(tmp_path, monkey
     # Another model's usable response does not erase this route's own incident.
     usage["llm_call_refs"].append({"model": "openai::fallback", "usable_solve_response": True})
     _store_task_result(SimpleNamespace(drive_root=tmp_path), task, "Fallback answered", usage, {"tool_calls": []})
-    assert (tmp_path / "task_results" / "task-history.json").is_file()
-    row = _delegation_capability_fact()["subagents_last_executions"][0]
-    assert row["outcome"] == "failed" and row["occurred_at"] == failure["ts"]
-    assert row["task_id"] == task["id"] and row["fallback"]["model"] == "openai::fallback"
-    assert row["applied_model"] == ""
+    assert result_exists(tmp_path, "task-history")
+    fact = _delegation_capability_fact()
+    row = fact["subagents_last_executions"][0]
+    assert row["outcome"] == "failed" and row["task_id"] == task["id"]
+    assert "fallback" not in row and "applied_model" not in row
+    reader = next(item for item in fact["readers"] if item["arguments"]["path"].endswith("subagent_last_delegation.json"))
+    saved = json.loads((tmp_path / reader["arguments"]["path"]).read_text(encoding="utf-8"))
+    assert saved["occurred_at"] == failure["ts"] and saved["fallback"]["model"] == "openai::fallback"
+    assert saved["applied_model"] == ""
     monkeypatch.setattr("ouroboros.provider_models.model_has_credentials", lambda *_: True)
     assert resolve_configured_actor_dispatch(task, task_type="task").executor == "native"
     provider.broken = False
@@ -94,6 +99,95 @@ def test_recovery_settlement_and_refused_start_share_history(tmp_path, monkeypat
                           "finishedAt": "2001-09-18T12:00:00Z", "failure": {"code": "quota_exhausted"}}}
     custody.settle_run(tmp_path, SimpleNamespace(), old, detail)
     assert subagent_last_delegation(tmp_path) == row
+
+
+def test_first_post_upgrade_write_preserves_legacy_subagent_row(tmp_path):
+    path = tmp_path / "state" / "subagent_last_delegation.json"
+    path.parent.mkdir()
+    legacy = {
+        "ts": "2026-09-17T12:00:00Z",
+        "observed_at": "2026-09-17T12:00:00Z",
+        "occurred_at": "2026-09-17T12:00:00Z",
+        "route": "api_model",
+        "requested_model": "openai::legacy",
+        "applied_model": "openai::legacy",
+        "requested_profile": "",
+        "applied_profile": "",
+        "selected_subagent_id": "legacy-worker",
+        "run_id": "legacy-run",
+        "outcome": "succeeded",
+    }
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    record_last_delegation(
+        route="api_model",
+        requested_model="openai::new",
+        applied_model="openai::new",
+        run_id="new-run",
+        selected_subagent_id="new-worker",
+        drive_root=tmp_path,
+        occurred_at="2026-09-20T12:00:00Z",
+        outcome="succeeded",
+    )
+
+    row = subagent_last_delegation(tmp_path)
+    assert row["selected_subagent_id"] == "new-worker"
+    assert row["latest_by_subagent"]["new-worker"]["run_id"] == "new-run"
+    assert row["latest_by_subagent"]["legacy-worker"]["run_id"] == "legacy-run"
+    assert "latest_by_subagent" not in row["latest_by_subagent"]["legacy-worker"]
+
+
+def test_legacy_first_write_reaches_runtime_context(tmp_path, monkeypatch):
+    monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path)
+    path = tmp_path / "state" / "subagent_last_delegation.json"
+    path.parent.mkdir()
+    # Exactly what 7.1.0 wrote: one top-level receipt, no per-actor map.
+    legacy = {
+        "ts": "2026-09-17T12:00:00Z",
+        "route": "api_model",
+        "requested_model": "openai::legacy",
+        "applied_model": "openai::legacy",
+        "requested_profile": "",
+        "applied_profile": "",
+        "selected_subagent_id": "legacy-worker",
+        "run_id": "legacy-run",
+    }
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    record_last_delegation(
+        route="api_model",
+        requested_model="openai::new",
+        applied_model="openai::new",
+        run_id="new-run",
+        selected_subagent_id="new-worker",
+        drive_root=tmp_path,
+        occurred_at="2026-09-20T12:00:00Z",
+        outcome="succeeded",
+    )
+
+    row = subagent_last_delegation(tmp_path)
+    assert row["selected_subagent_id"] == "new-worker"
+    assert row["latest_by_subagent"]["new-worker"]["run_id"] == "new-run"
+    assert row["latest_by_subagent"]["legacy-worker"] == legacy
+    # The consumer still sees the previous subagent's last run.
+    seen = {fact["run_id"] for fact in _delegation_capability_fact()["subagents_last_executions"]}
+    assert seen == {"new-run", "legacy-run"}
+
+
+def test_first_write_same_actor_orders_mixed_utc_timestamp_spellings(tmp_path):
+    """A fractional +00:00 instant follows a whole-second legacy Z instant."""
+    path = tmp_path / "state" / "subagent_last_delegation.json"
+    path.parent.mkdir()
+    path.write_text(json.dumps({"ts": "2026-09-17T12:00:00Z",
+                                "selected_subagent_id": "legacy-worker", "run_id": "legacy-run",
+                                "route": "api_model"}), encoding="utf-8")
+    record_last_delegation(route="api_model", requested_model="openai::new",
+                           applied_model="openai::new", run_id="new-run",
+                           selected_subagent_id="legacy-worker", drive_root=tmp_path,
+                           occurred_at="2026-09-17T12:00:00.999999+00:00", outcome="succeeded")
+    row = subagent_last_delegation(tmp_path)
+    assert row["run_id"] == "new-run"
+    assert row["latest_by_subagent"]["legacy-worker"]["run_id"] == "new-run"
 
 
 def test_old_corrupt_missing_and_unknown_time_are_not_health(tmp_path):

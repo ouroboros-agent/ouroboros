@@ -1,45 +1,21 @@
-// Agent accounts (D30, regrouped in the Agents tab) — the owner-facing surface
-// over the owned Claudexor daemon's account truth.
-//
-// The shape is the owner's (2026-08-08): "все акки клод кода должны быть
-// эквивалентны", "позиции кнопок нелогичные… в каждой секции добавить кнопку",
-// "текст про лимиты компактнее и понятнее". So:
-//
-//  * ONE CARD PER FAMILY (Claude Code / Codex / Cursor). The family name and
-//    its aggregate status sit in the card header, and that card owns its own
-//    Add-account button — the button used to hang off the native row, which is
-//    why adding a Codex account meant hunting for a control under an unrelated
-//    line.
-//  * ROWS ARE ONE TYPE, on both engine generations. A UNIFIED engine (the
-//    server-stamped `unified_accounts` fact) serves every account — migrated
-//    default logins included — as a named registry row, so every row carries
-//    the same name, Enabled toggle and Remove. A LEGACY engine still emits a
-//    native pseudo-row per harness; it renders through the same two-line
-//    layout, named by the identity the daemon observed, and only its ACTIONS
-//    differ — no Remove and no toggle, because the legacy engine has no route
-//    for either on that row.
-//  * TWO LINES PER ROW. Line 1 is the one primary thing (the account) plus its
-//    status; line 2 is muted metadata in human words — "38% used · resets in
-//    2h", never a raw ISO instant.
-//  * REMOVAL and the ENABLED toggle go through the ENGINE's own contract
-//    (DELETE/PATCH /api/claudexor/credential-profiles/…). A legacy native CLI
-//    login has neither button: that account belongs to the vendor's CLI, and
-//    simulating an effect this app cannot have would be a lie.
-//
-// The status payload comes from the SHARED store (`claudexor_status_store.js`)
-// — this section owns no poll — and the login card is the SHARED controller
-// (`harness_login_cards.js`), so the onboarding wizard mounts the same flow.
-//
-// PROVENANCE IS PER FACET (the store's rule) and it OUTRANKS the aggregate:
-// `daemon.state` can say `unreachable` while two of the three fanned-out reads
-// landed, so no sentence here judges the daemon off the aggregate alone —
-// `daemonAnswered` below is the one predicate, and the status line asks the
-// facets before it repeats any runtime claim ("keeps running", "ready").
-//
-// Pure helpers up top are node-tested without a DOM.
+// A provider's subscription accounts (Settings › Accounts and keys › that provider's page, whose frame
+// settings_accounts.js draws) — the owner-facing surface over the owned Claudexor daemon's account truth. The shape
+// is the owner's (2026-08-08: "все акки клод кода должны быть эквивалентны", "в каждой секции добавить кнопку",
+// "текст про лимиты компактнее и понятнее"): ONE CARD PER FAMILY whose head carries its own Add button and whose
+// first line its status; ROWS ARE ONE TYPE (every account a named registry row with
+// the same name, Enabled toggle and Remove; an engine on the pre-unified model lists none and the service banner
+// says why); TWO LINES PER ROW (the account and its status, then metadata in human words, never a raw ISO
+// instant); removal and Enabled go through the ENGINE's own contract (DELETE/PATCH credential-profiles).
+// The status payload comes from the SHARED store (claudexor_status_store.js; this section owns no poll) and the
+// login card is the SHARED controller (harness_login_cards.js), so the wizard mounts the same flow. PROVENANCE IS
+// PER FACET and outranks the aggregate: `daemonAnswered` is the one predicate, and the status line asks the facets
+// before it repeats any runtime claim. Pure helpers up top are node-tested without a DOM.
 
 import { apiFetch } from './api_client.js';
+import { capabilityMarkup, createAccountResourcesController, resourcePanelId, resourceReadGap,
+    resourceSummary, targetFor } from './account_resources.js';
 import {
+    ACCOUNTS_UNSUPPORTED_STATUS,
     FACET_ACCOUNTS,
     FACET_CATALOG,
     FACET_QUOTA,
@@ -53,6 +29,7 @@ import {
     accountName,
     accountRows,
     bindStatusSurface,
+    capabilityMarksReadFailedAt,
     claudexorPreparationLine,
     claudexorStatus,
     facetReadState,
@@ -60,13 +37,15 @@ import {
     nextUpAccount,
     quotaConstraintFact,
     readsFor,
-    unifiedAccounts,
 } from './claudexor_status_store.js';
+import { createRestartController } from './claudexor_restart.js';
 import { openConfirmDialog } from './confirm_dialog.js';
-import { harnessIdentityMarkup } from './harness_presentation.js';
+import { planLabel } from './harness_presentation.js';
 import { createLoginCardController, normalizeProfileName, preserveCardFocus } from './harness_login_cards.js';
+import { refreshMaintenanceCatalogs } from './settings_catalog.js';
+import { createHarnessMaintenanceController } from './harness_maintenance.js';
 import { formatRelativeAge } from './ui_helpers.js';
-import { escapeHtmlAttr as escapeHtml } from './utils.js';
+import { absoluteTime, escapeHtmlAttr as escapeHtml } from './utils.js';
 
 // ---------------------------------------------------------------------------
 // Pure helpers.
@@ -88,7 +67,7 @@ export function verificationBadge(profile, { known = true } = {}) {
     const availability = String(status.availability || '');
     const badge = () => {
         if (source === 'vendor' && verification === 'passed') {
-            return { tone: 'ok', label: 'Verified live' };
+            return { tone: 'ok', label: 'Login verified' };
         }
         if (verification === 'passed') {
             // The claim is NARROWER than "signed in" and must stay narrower in
@@ -114,8 +93,8 @@ export function verificationBadge(profile, { known = true } = {}) {
     };
     const value = badge();
     // `known` = the ACCOUNTS facet was really read. Otherwise this row is the
-    // retained snapshot's memory of an account, and painting a green "Verified
-    // live" over a read that never landed is the same lie as the banner's — the
+    // retained snapshot's memory of an account, and painting a green "Login
+    // verified" over a read that never landed is the same lie as the banner's — the
     // panel used to say nothing could be listed while a stale row sat below it
     // dressed as verified. The row survives (it is the only Connect affordance
     // some harnesses have); only its claim is dated, and the green goes with it.
@@ -136,8 +115,7 @@ export function humanizeResetAt(resetsAt, nowMs = Date.now()) {
 }
 
 export function quotaSummary(snapshots, harnessId, subjectId = '',
-                             { quotaRead = READ_OK, nowMs = Date.now(),
-                               fallbackSubjectIds = [], absences = [] } = {}) {
+                             { quotaRead = READ_OK, nowMs = Date.now(), absences = [] } = {}) {
     // The exhausted window is SHOWN with its reset time, never hidden (Q2-б):
     // hiding it would make the D28 fallback to API money unexplainable. What
     // CHANGED is only the wording — the owner asked for the limit text to be
@@ -153,10 +131,10 @@ export function quotaSummary(snapshots, harnessId, subjectId = '',
     const freshRowsFor = (wantedSubject) => (snapshots || []).filter((snap) => {
         const subject = snap?.subject || {};
         if (String(subject.harness || '') !== String(harnessId)) return false;
-        // EXACT subject, including the default account's empty id. The old
-        // `!subjectId ||` wildcard made the native row match EVERY subject on the
-        // harness, so the default account reported a named profile's exhausted
-        // window — red styling and all — as its own.
+        // EXACT subject. A wildcard made one row report another subject's
+        // exhausted window — red styling and all — as its own, and a null
+        // subject (an unprofiled API-key route) belongs to no named row,
+        // whatever that row's id.
         if (String(subject.subject_id || '') !== String(wantedSubject)) return false;
         // The RUNTIME ignores a stale reading ("an old reading must not block a lane",
         // subagents.py `_exhausted_window`), so a card that paints one red is
@@ -164,22 +142,10 @@ export function quotaSummary(snapshots, harnessId, subjectId = '',
         // same answer, on both sides of the glass.
         return String(snap?.freshness || '') === 'fresh';
     });
-    let rows = freshRowsFor(subjectId);
-    // DUAL-KEYED SUBJECT (unified migration window, plan §K.3): the quota
-    // journal is never rewritten, so right after the engine migrates a default
-    // login onto its named registry row the row's fresh window can still be
-    // keyed by the LEGACY empty/null subject until the next refresh re-keys
-    // it. The caller names the legacy aliases this exact row may inherit
-    // (`fallbackSubjectIds`); they are consulted ONLY when the exact subject
-    // has no fresh window, so a re-keyed reading always wins and no other
-    // account's window can be borrowed (the aliases still match the same
-    // harness, exactly).
-    for (const alias of fallbackSubjectIds) {
-        if (rows.length) break;
-        if (String(alias) === String(subjectId)) continue;
-        rows = freshRowsFor(alias);
-    }
+    const rows = freshRowsFor(subjectId);
     let worst = null;
+    // A fully used ratio without a valid future reset is non-blocking and shown as
+    // "availability not proven", unless an explicit active cooldown is in effect.
     // The runtime's own bar, per snapshot: spent when a constraint is cooling down OR
     // its window is fully used with a future reset — ANY constraint, not just the highest
     // ratio. Reading exhaustion off `worst` alone hid a cooling constraint whenever
@@ -191,7 +157,7 @@ export function quotaSummary(snapshots, harnessId, subjectId = '',
     const scopedSpent = [];
     for (const snap of rows) {
         for (const constraint of snap.constraints || []) {
-            const used = Number(constraint.used_ratio);
+            const used = constraint.used_ratio;
             const fact = quotaConstraintFact(constraint, nowMs);
             const spent = fact.exhausted;
             const models = Array.isArray(constraint.applies_to_models)
@@ -214,7 +180,7 @@ export function quotaSummary(snapshots, harnessId, subjectId = '',
                 exhaustedResetsAt = fact.resetsAt;
             }
             unknown ||= fact.unknown;
-            if (!Number.isFinite(used)) continue;
+            if (typeof used !== 'number' || !Number.isFinite(used)) continue;
             if (!worst || used > worst.used) {
                 worst = { used, resetsAt: fact.unknown ? ''
                     : String(constraint.resets_at || constraint.cooldown_until || '') };
@@ -230,9 +196,8 @@ export function quotaSummary(snapshots, harnessId, subjectId = '',
         base = `${Math.min(100, Math.round(worst.used * 100))}% used${resets ? ` · resets ${resets}` : ''}`;
         if (unknown) base += ' · availability not proven';
     }
-    // Match typed gaps by the exact current subject only: the legacy default
-    // alias belongs to retained snapshots, never to another subject's
-    // credential verdict. Claudexor suppresses snapshot-covered absences at
+    // Match typed gaps by the exact current subject only, as the windows are.
+    // Claudexor suppresses snapshot-covered absences at
     // its response boundary; a contradictory future body stays visible here
     // rather than authorizing a stronger consumer-side interpretation.
     const absence = (Array.isArray(absences) ? absences : []).find((row) => {
@@ -352,12 +317,8 @@ export function daemonAnswered(payload) {
     return STATUS_FACETS.some((facet) => facetReadState(payload, facet) === READ_OK);
 }
 
-// The Refresh button's honest label. It only ever RE-READS while the daemon is
-// alive, but with a sleeping daemon a plain re-read returns the same nothing
-// forever — so there it becomes an explicit owner action that STARTS the
-// daemon, and the label says so rather than hiding the side effect. ONE
-// predicate behind BOTH the label and the click, so they cannot drift apart
-// again (they were written separately once, and did).
+// Refresh updates resources while the daemon is alive. For a sleeping daemon,
+// the same predicate gives both the button and its handler an explicit start.
 export function refreshActionKind(payload) {
     return daemonAnswered(payload) ? 'refresh' : 'wake';
 }
@@ -384,6 +345,94 @@ function facetGapNames(reads) {
 }
 
 export function daemonStatusLine(payload, { checking = false, reads = null } = {}) {
+    return withEngineFacts(daemonBaseStatusLine(payload, { checking, reads }), payload);
+}
+
+// Engine observations ride on whichever line the banner finally shows; a refused
+// account/quota facet never hides the separate process facts. What changes what the
+// owner can do stays on the line (recovery admits no product work, its import
+// progress, explicit store failures, a stop while not serving); measurements (home, heap,
+// loop, store, jobs, caps) are the banner's Diagnostics, opened on demand.
+function withEngineFacts(line, payload) {
+    if (!line) return line;
+    const { visible, diagnostics, healthWarning } = engineFacts(payload);
+    const shown = visible.filter((fact) => !line.text.includes(fact));
+    const known = new Set((line.facts || []).map(([label]) => label));
+    const text = healthWarning && line.text === 'Claudexor ready' ? 'Claudexor running' : line.text;
+    return { ...line, tone: healthWarning && TONE_RANK[line.tone] < TONE_RANK.warn ? 'warn' : line.tone,
+        text: [text, ...shown].join(' · '),
+        facts: [...(line.facts || []), ...diagnostics.filter(([label]) => !known.has(label))] };
+}
+
+function engineFacts(payload) {
+    const daemon = payload?.daemon || {};
+    // The engine's own state, not the line's tone: a refused quota read beside a serving engine is no stop.
+    const serving = daemon.state === 'running' && daemon.servingMode !== 'recovery_only';
+    const visible = [];
+    const diagnostics = [];
+    if (daemon.ownership_problem) return { visible, diagnostics };
+    if (payload?.config_dir) diagnostics.push(['Home', String(payload.config_dir)]);
+    const exit = daemon.last_exit;
+    if (exit) {
+        const cause = String(exit.classification || 'unclassified').replaceAll('_', ' ');
+        const ending = exit.exit_signal != null ? ` (signal ${exit.exit_signal})`
+            : exit.exit_code != null ? ` (exit code ${exit.exit_code})` : '';
+        const phase = exit.phase === 'startup' ? ' during startup' : exit.phase ? ` while ${exit.phase}` : '';
+        const seen = typeof exit.observed_at === 'string' && exit.observed_at.length >= 16
+            ? `, seen ${exit.observed_at.slice(0, 16).replace('T', ' ')}${/(Z|[+-]00:?00)$/.test(exit.observed_at) ? ' UTC' : ''}` : '';
+        const when = exit.engine_version || seen ? ` · engine ${exit.engine_version || 'unknown'}${seen}` : '';
+        // A stop the serving engine has recovered from is history; while it is not serving it is the reason.
+        const stop = `${cause}${phase}${ending}${when}`;
+        if (serving) diagnostics.push(['Last stop', stop]);
+        else visible.push(`Last stop: ${stop}`);
+    }
+    const memory = daemon.memory;
+    const measured = (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+    const gib = (value) => (value / 2 ** 30).toFixed(1);
+    if (memory && measured(memory.heapLimitBytes)) {
+        diagnostics.push(['Heap', measured(memory.heapUsedBytes)
+            ? `${gib(memory.heapUsedBytes)} of ${gib(memory.heapLimitBytes)} GiB; headroom ${gib(memory.heapLimitBytes - memory.heapUsedBytes)} GiB`
+            : `limit ${gib(memory.heapLimitBytes)} GiB; use unknown`]);
+    }
+    if (daemon.servingMode === 'recovery_only') visible.push('Recovery only; product work is not admitted');
+    const value = (number, unit = '') => measured(number) ? `${number}${unit}` : 'unknown';
+    const loop = daemon.loop;
+    if (loop) {
+        const busy = measured(loop.utilization) && loop.utilization <= 1
+            ? `${Math.round(loop.utilization * 100)}%` : 'unknown';
+        diagnostics.push(['Loop', `p99 ${value(loop.delay?.p99Ms, ' ms')}, max ${value(loop.delay?.maxMs, ' ms')}, busy ${busy} (${value(loop.windowMs, ' ms')} window)`]);
+    }
+    const store = daemon.store;
+    const healthWarning = store?.integrity === 'failed' || store?.flusher?.state === 'down';
+    if (store) {
+        // Only explicit engine verdicts, not thresholds or absent measurements, are exceptions to folding.
+        if (store.integrity === 'failed') visible.push('Store integrity failed');
+        if (store.flusher?.state === 'down') visible.push('Store flusher down');
+        const wal = measured(store.wal_bytes) ? `${(store.wal_bytes / 2 ** 20).toFixed(1)} MiB` : 'unknown';
+        diagnostics.push(['Store', `integrity ${store.integrity || 'unknown'}, flusher ${store.flusher?.state || 'unknown'}, flush lag ${value(store.flush_lag_ms, ' ms')}, WAL ${wal}, obligations ${value(store.obligations_open)}`]);
+        const migration = store.migration;
+        if (migration) {
+            const bytes = (number) => measured(number) ? (number / 2 ** 20).toFixed(1) : '?';
+            visible.push(`Import ${migration.phase || 'unknown'}: ${value(migration.completedPartitions)}/${value(migration.totalPartitions)} partitions, ${bytes(migration.processedBytes)}/${bytes(migration.totalBytes)} MiB${migration.currentPartition ? ` (${migration.currentPartition})` : ''}`);
+        }
+    }
+    const admission = daemon.admission;
+    if (admission) diagnostics.push(['Jobs', `model ${value(admission.active?.model)} active / ${value(admission.queued?.model)} queued; other ${value(admission.active?.non_model)} active / ${value(admission.queued?.non_model)} queued`]);
+    const caps = daemon.capacity;
+    if (caps) {
+        const cap = (key, sourceKey) => {
+            const raw = caps[key];
+            const limit = raw === 'unlimited' ? 'unlimited'
+                : Number.isSafeInteger(raw) && raw > 0 ? String(raw) : 'unknown';
+            const source = caps.sources?.[sourceKey];
+            return `${limit} (${source && source !== 'unknown' ? source : 'source unknown'})`;
+        };
+        diagnostics.push(['Effective caps', `total ${cap('maxConcurrent', 'max_concurrent')}, model ${cap('maxConcurrentModelOperations', 'max_concurrent_model_operations')}, other ${cap('maxConcurrentNonModelJobs', 'max_concurrent_non_model_jobs')}`]);
+    }
+    return { visible, diagnostics, healthWarning };
+}
+
+function daemonBaseStatusLine(payload, { checking = false, reads = null } = {}) {
     const daemon = payload?.daemon || {};
     const runtime = daemon.runtime || {};
     const runtimeState = String(runtime.state || '');
@@ -434,6 +483,19 @@ export function daemonStatusLine(payload, { checking = false, reads = null } = {
         const gap = gapNames ? `${capitalize(gapNames)} were not read` : 'The status answer did not complete';
         return { tone: 'warn', text: `${gap}${daemon.last_error ? `: ${daemon.last_error}` : ''}. Claudexor ${target} is staged and activates after the daemon next restarts.` };
     }
+    // A LOWER pin never activates: planned restarts keep the newer engine, and
+    // after it stops the older one may refuse data the newer one served. The
+    // same facet gate decides whether the line may say what is serving.
+    if (runtimeState === 'newer_serving') {
+        const pinned = runtime.target_version || '?';
+        const refusal = `After Restart Claudexor, Panic or an engine exit, ${pinned} may refuse data a newer engine served.`;
+        if (!unread.length) {
+            return { tone: 'warn', text: `Engine ${daemon.engine_version || '?'} keeps serving; this Ouroboros version pins older Claudexor ${pinned}. ${refusal}` };
+        }
+        const gap = gapNames ? `${capitalize(gapNames)} were not read` : 'The status answer did not complete';
+        const pinNote = `Last observed engine ${daemon.engine_version || '?'}. This Ouroboros version pins older Claudexor ${pinned}. ${refusal}`;
+        return { tone: 'warn', pinNote, text: `${gap}${daemon.last_error ? `: ${daemon.last_error}` : ''}. ${pinNote}` };
+    }
     if (status === 'running') {
         // A REAL refusal (a read that was made and did not land) demotes the
         // green line: "ready" would be an overclaim about the facets. A gap
@@ -444,9 +506,13 @@ export function daemonStatusLine(payload, { checking = false, reads = null } = {
             facetReads[facet] === READ_FAILED || facetReads[facet] === READ_TRANSPORT);
         if (refused.length) {
             const names = joinSubjects(refused.map((facet) => FACET_SUBJECT[facet] || facet));
-            return { tone: 'warn', text: `Claudexor is running, but ${names} were not read${daemon.last_error ? `: ${daemon.last_error}` : ''}. What those cover is unknown.` };
+            const detail = [...new Set(refused.map((facet) => payload?.facets?.[facet]?.error).filter(Boolean))].join('; ') || daemon.last_error;
+            return { tone: 'warn', text: `Claudexor is running, but ${names} were not read${detail ? `: ${detail}` : ''}. What those cover is unknown.` };
         }
-        return { tone: 'ok', text: `Claudexor ready (engine ${daemon.engine_version || '?'}) · home ${payload.config_dir || ''}` };
+        const recovering = daemon.servingMode === 'recovery_only';
+        // The engine version is a quiet fact beside the verdict; its home is a diagnostic.
+        return { tone: recovering ? 'warn' : 'ok', text: `Claudexor ${recovering ? 'running' : 'ready'}`,
+            version: `engine ${daemon.engine_version || '?'}` };
     }
     if (status === 'not_provisioned') {
         if (runtimeState === 'ready') {
@@ -456,18 +522,9 @@ export function daemonStatusLine(payload, { checking = false, reads = null } = {
         return { tone: 'muted', explainsUnread: true, text: 'No accounts connected yet. Connect installs Claudexor and starts Ouroboros’s own agent daemon automatically.' };
     }
     if (status === 'stale') {
-        // NOT a warning: the daemon is LAZY by design (the status read never
-        // spawns it), so "home exists, nothing answering" is the ordinary idle
-        // state, not a fault. Lead with what is true and what happens next; a
-        // genuine RUNTIME fault renders through the `error` branch above.
-        // Disclosed residual (both review lenses, 2026-08-08): `stale` is also
-        // what a CRASHED daemon lands in — the state machine cannot tell the two
-        // apart (the detail lives only in last_error, which the warn-toned line
-        // never showed either), so the only thing a crash loses here is the
-        // alarming tone. The sentence stays true for it: ensure_running restarts
-        // a dead daemon on the next login or delegated run, and a crash mid-run
-        // surfaces through that run's own typed failure, not this panel. Hence
-        // no "yet" — that word would claim it had never started.
+        // An idle owned home and an observed crash share this liveness state.
+        // daemonStatusLine appends any saved exit fact without changing tone;
+        // the next explicit wake or delegated run still owns restart policy.
         const version = runtime.version ? ` ${runtime.version}` : '';
         return { tone: 'muted', explainsUnread: true, text: `Claudexor${version} is installed; the agent daemon is not running. It starts automatically on the next login or delegated run.` };
     }
@@ -506,39 +563,38 @@ export { familyLabel };
 // payload).
 export { accountRows };
 
-export function bareRowStatusText(accountsRead) {
+export function bareRowStatusText(accountsRead, { accountsUnsupported = false } = {}) {
     // The verdict for a family with NO row. "no account connected" is a claim
     // about the ACCOUNT STORE, and it may only be made once that store was
     // actually read: an idle daemon is never asked, so the emptiness says
     // nothing (BIBLE P1 — a gap is not a zero). The Connect button stays in
-    // every case; onboarding must remain reachable.
+    // every case but one: an engine whose account format this version no
+    // longer reads, where no connection could be listed or confirmed.
+    if (accountsUnsupported) return ACCOUNTS_UNSUPPORTED_STATUS;
     if (accountsRead === READ_OK) return 'No account connected';
     if (accountsRead === READ_UNREAD) return 'Checking…';
-    if (accountsRead === READ_TRANSPORT) return 'Not checked — the status request did not complete';
-    if (accountsRead === READ_FAILED) return 'Not checked — the daemon did not answer this read';
+    if (accountsRead === READ_TRANSPORT) return 'Not checked: the status request did not complete';
+    if (accountsRead === READ_FAILED) return 'Not checked: the daemon did not answer this read';
     // The coarse state: the answer did not complete, and it does not say which
     // read was the one that failed — so the row claims nothing beyond that.
     // Without this branch a legacy payload's global refusal fell through to
     // "never asked", which is the opposite of what happened.
-    if (accountsRead === READ_INDETERMINATE) return 'Not checked — the status answer did not complete';
+    if (accountsRead === READ_INDETERMINATE) return 'Not checked: the status answer did not complete';
     // NOT READ says nobody asked; it does NOT say why. "the agent daemon is not
     // running" named a cause this row cannot see — a runtime awaiting repair, a
     // foreign daemon on the stale port and an ownership problem all arrive here
     // as the same unread facet, and the tab's ONE banner is the place that
-    // explains which of them it is.
-    return 'Not checked — the agent daemon was never asked';
+    // explains which of them it is. So the row says only that it has not happened yet.
+    return 'Not checked yet';
 }
 
-export function familyStatus(rows, { accountsRead = READ_OK } = {}) {
-    // The aggregate lozenge in a card header: how many accounts ROTATION can
-    // actually use. That claim may only count accounts that are BOTH signed in
-    // and enabled — a disabled row is the owner's own exclusion, and a header
-    // that counted it would over-promise the pool exactly the way counting a
-    // cold row used to.
-    if (!rows.length) return { tone: 'muted', label: bareRowStatusText(accountsRead) };
+export function familyStatus(rows, { accountsRead = READ_OK, accountsUnsupported = false } = {}) {
+    // Count logins independently of rotation: authentication and catalog
+    // access do not establish a working main-chat transport or configured agent.
+    if (!rows.length) return { tone: 'muted', label: bareRowStatusText(accountsRead, { accountsUnsupported }) };
     // …and the SAME provenance rule the rows obey. These rows are the retained
     // snapshot's memory when the accounts facet did not land, so a green
-    // "Connected" over them is the row badge's lie one level up — and the two
+    // "Signed in" over them is the row badge's lie one level up — and the two
     // would contradict each other inside one card, the header claiming fresh
     // while the badge under it says last known.
     const known = accountsRead === READ_OK;
@@ -559,25 +615,24 @@ export function familyStatus(rows, { accountsRead = READ_OK } = {}) {
     // deliberately does not probe disabled rows and reports `not_run`; that
     // unknown verification must not hide the stronger fact that every account
     // has been excluded from rotation.
-    if (rows.every((row) => row.enabled === false)) {
+    const allDisabled = rows.every((row) => row.enabled === false);
+    const live = rows.filter((row) => String(row?.status?.verification || '') === 'passed').length;
+    if (allDisabled && !live) {
         return verdict('muted', `${rows.length} account${rows.length === 1 ? '' : 's'} · all disabled`);
     }
-    const live = rows.filter((row) => String(row?.status?.verification || '') === 'passed'
-        && row.enabled !== false).length;
     if (!live) {
         const notRun = rows.some((row) => String(row?.status?.verification || '') === 'not_run');
         if (notRun) return verdict('muted', `${rows.length} account${rows.length === 1 ? '' : 's'} · not verified`);
         return verdict('muted', `${rows.length} account${rows.length === 1 ? '' : 's'} · not signed in`);
     }
-    if (live < rows.length) return verdict('ok', `${live} of ${rows.length} connected`);
-    if (live === 1) return verdict('ok', 'Connected');
-    return verdict('ok', `${live} accounts · rotating`);
+    const label = live < rows.length ? `${live} of ${rows.length} signed in`
+        : live === 1 ? 'Signed in' : `${live} accounts signed in`;
+    return verdict(allDisabled ? 'muted' : 'ok', `${label}${allDisabled ? ' · all disabled' : ''}`);
 }
 
 export function nextUpBadge(payload, harness, { accountsRead = READ_OK } = {}) {
     // The family header's "Next up" badge: who an unpinned run would take,
-    // read through the store's ONE dual-wire reader (accountPools first,
-    // legacy harnessAccounts[].next_up second). '' = nothing to show — no
+    // read through the store's ONE pool reader. '' = nothing to show — no
     // verdict in the payload, or an accounts read that did not land (a stale
     // routing claim dressed as current is the exact lie the facets exist to
     // stop). Every kind renders FAIL-SAFE: an unknown future kind becomes a
@@ -592,12 +647,6 @@ export function nextUpBadge(payload, harness, { accountsRead = READ_OK } = {}) {
     }
     if (kind === 'api_key_route') return 'Next up: API key (no subscription capacity)';
     if (kind === 'none') return '';
-    if (kind === 'native') {
-        // The legacy union's default-subject verdict. Its optional route says
-        // whether the session or a configured key would actually serve it.
-        return String(verdict.route || '') === 'api_key'
-            ? 'Next up: API key' : 'Next up: default account';
-    }
     return 'Next up: unknown';
 }
 
@@ -606,55 +655,41 @@ export function nextUpBadge(payload, harness, { accountsRead = READ_OK } = {}) {
 // payload — the account pin selects name their options through it too.
 export { accountName };
 
-// The quota-subject LEGACY ALIASES one row may inherit (see quotaSummary's
-// dual-keyed fallback): only the unified engine's migrated default row — the
-// reserved `<harness>-default` registry id, frozen contract §L.3 — may inherit
-// the legacy empty/null subject its account was keyed by before migration.
-// Every other row gets no alias: exact-subject matching stays the rule.
-export function quotaSubjectAliases(row, payload) {
-    if (!unifiedAccounts(payload)) return [];
-    return row.profile_id === `${row.harness}-default` ? [''] : [];
+/** Line 2 as facts, each whole on its line: the window (in the warning's hue when it is spent), the plan in the
+ *  owner's words, who it is, when it was last checked. Order is the owner's. */
+export function accountMetaParts(row, payload, { quotaRead = READ_OK, nowMs = Date.now(), action = {} } = {}) {
+    const parts = [];
+    // The one user-settable routing fact, stated where the rotation claim lives.
+    if (row.enabled === false) parts.push({ text: 'Out of rotation' });
+    const resources = resourceSummary(row, payload, { known: quotaRead === READ_OK, action });
+    const quota = quotaSummary(payload?.quota || [], row.harness, row.profile_id,
+        { quotaRead, nowMs, absences: payload?.quota_absences || [] });
+    if (resourceReadGap(action)) parts.push({ text: resources });
+    else parts.push({ text: quota.label, tone: quota.exhausted ? 'warn' : '' }, { text: resources });
+    const identity = row.identity || {};
+    if (identity.plan) parts.push({ text: planLabel(identity.plan) });
+    // The email is metadata only while it is not already the row's name.
+    if (identity.email && String(identity.email) !== accountName(row)) parts.push({ text: String(identity.email) });
+    const at = Date.parse(String(row?.status?.last_verified_at || ''));
+    const age = Number.isFinite(at) ? formatRelativeAge(at, 'just now') : '';
+    if (age) parts.push({ text: `checked ${age}` });
+    return parts.filter((part) => part.text);
 }
 
-export function accountMetaLine(row, payload, { quotaRead = READ_OK, nowMs = Date.now() } = {}) {
-    // Line 2: everything that is NOT the account itself, in human words and at
-    // muted ink. Order is the owner's — how much of the window is left, which
-    // plan, who it is, when we last checked. (The former "Managed by the X
-    // CLI" caption is gone: it described a separate account TYPE the unified
-    // model retired, and on a legacy engine the row's actions already say
-    // everything the caption did.)
-    const parts = [];
-    if (row.enabled === false) {
-        // The one user-settable routing fact, stated where the rotation claim
-        // lives: a disabled account is excluded from rotation however healthy
-        // its login is.
-        parts.push('disabled — excluded from rotation');
-    }
-    parts.push(quotaSummary(payload?.quota || [], row.harness, row.profile_id,
-        { quotaRead, nowMs, fallbackSubjectIds: quotaSubjectAliases(row, payload),
-          absences: payload?.quota_absences || [] }).label);
-    const identity = row.identity || {};
-    if (identity.plan) parts.push(String(identity.plan));
-    // The email is metadata only while it is not already the row's name.
-    if (identity.email && String(identity.email) !== accountName(row)) {
-        parts.push(String(identity.email));
-    }
-    const at = Date.parse(String(row?.status?.last_verified_at || ''));
-    if (Number.isFinite(at)) {
-        const age = formatRelativeAge(at, 'just now');
-        if (age) parts.push(`checked ${age}`);
-    }
-    return parts.filter(Boolean).join(' · ');
+export function accountMetaLine(row, payload, options = {}) {
+    return accountMetaParts(row, payload, options).map((part) => part.text).join(' · ');
 }
 
 export function accountGroups(payload, {
     accountsRead = READ_OK,
     catalogKnown = false,
+    accountsUnsupported = false,
 } = {}) {
     // One group per family, in a stable order: discovered families first (the
     // engine's own order), then any bootstrap family still missing, so a fresh
     // install shows all three cards and every one of them can be connected.
-    const rows = accountRows(payload);
+    // An engine on the retired account model lists nothing, held rows included.
+    const rows = accountsUnsupported ? [] : accountRows(payload);
     const order = [];
     for (const harness of payload?.harnesses || []) {
         const id = String(harness?.id || '');
@@ -668,7 +703,7 @@ export function accountGroups(payload, {
             harness: id,
             label: familyLabel(id, payload, { catalogKnown }),
             rows: own,
-            status: familyStatus(own, { accountsRead }),
+            status: familyStatus(own, { accountsRead, accountsUnsupported }),
         };
     });
 }
@@ -768,12 +803,38 @@ function faultOutranksReassurance(service, note) {
         service.tone === 'error' || service.tone === 'warn' || service.explainsUnread === true
     );
     if (GENERIC_FACET_NOTE_YIELDS.has(note.tone) && serviceSpeaksFirst) {
-        return { tone: service.tone, text: service.text };
+        return { tone: service.tone, text: service.text, ...(service.version ? { version: service.version } : {}) };
     }
-    return { tone: note.tone, text: note.text };
+    // A failed facet owns its diagnosis, not the separate lower-pin warning.
+    return { tone: note.tone, text: `${note.text}${service?.pinNote ? ` ${service.pinNote}` : ''}` };
 }
 
-export function serviceBannerLine(store, { wakeError = '', wakeBusy = false } = {}) {
+// The current program inspection's missing executable, said once for the tab: every family's
+// reading depends on it, and the conditional recovery stays the owner's. "Last" is the honest
+// tense: status carries no engine process identity, so a replacement made from another tab or
+// phone is only noticed by this page's next inspection (opening the tab, Refresh, Check version).
+const MISSING_EXECUTABLE_NOTICE = 'The executable reported by the last program inspection is no longer present. '
+    + 'Versions below are last known. If the app was moved or replaced, Restart Claudexor in Accounts may help; '
+    + 'it ends every run on the engine, and success is not guaranteed.';
+
+function withMissingExecutable(line, problem) {
+    const context = problem.context;
+    const engine = [context.engineVersion, context.engineBuildSha].filter(Boolean).join(' · ');
+    return { ...line, tone: TONE_RANK[line.tone] < TONE_RANK.warn ? 'warn' : line.tone,
+        // Serving, but it could not start the child that inspection needs.
+        text: `${line.text.replace(/^Claudexor ready/, 'Claudexor running')} · ${MISSING_EXECUTABLE_NOTICE}`,
+        facts: [['Last program inspection', [absoluteTime(context.observedAt), `${problem.code}: ${problem.message}`].filter(Boolean).join(' · ')],
+            ...(engine ? [['Inspected by engine', engine]] : []), ...(line.facts || [])] };
+}
+
+export function serviceBannerLine(store, options = {}) {
+    const line = serviceReadLine(store, options);
+    // A wake the owner just pressed, and its refusal, lead outright.
+    return options.programProblem && !options.wakeBusy && !options.wakeError
+        ? withMissingExecutable(line, options.programProblem) : line;
+}
+
+function serviceReadLine(store, { wakeError = '', wakeBusy = false } = {}) {
     if (wakeBusy) {
         return { tone: 'muted', text: 'Starting the agent daemon…' };
     }
@@ -806,8 +867,13 @@ export function serviceBannerLine(store, { wakeError = '', wakeBusy = false } = 
     }
     const reads = store.reads || {};
     const facets = [FACET_CATALOG, FACET_ACCOUNTS, FACET_QUOTA];
-    const bad = facets.filter((facet) => reads[facet] !== READ_OK);
-    if (!bad.length) {
+    // An engine on the retired account model ANSWERED: its accounts are no read
+    // gap, so they lead in the store's own sentence and never join another
+    // facet's group (whose sentence would claim they could not be read).
+    const unsupported = Boolean(store.accountsUnsupported);
+    const bad = facets.filter((facet) => reads[facet] !== READ_OK
+        && !(unsupported && facet === FACET_ACCOUNTS));
+    if (!bad.length && !unsupported) {
         return daemonStatusLine(store.snapshot || {}, {
             checking: store.loading && !store.everSettled,
             reads,
@@ -839,17 +905,18 @@ export function serviceBannerLine(store, { wakeError = '', wakeBusy = false } = 
     // directly printed "could not be read" and dropped it.
     const states = new Set(bad.map((facet) => reads[facet]));
     if (bad.length === 3 && states.size === 1) {
-        return faultOutranksReassurance(service,
-            store.unavailableNote(bad[0], { subject: 'agents, accounts and limits' }));
+        return withEngineFacts(faultOutranksReassurance(service,
+            store.unavailableNote(bad[0], { subject: 'agents, accounts and limits' })), store.snapshot);
     }
+    const unsupportedNote = unsupported ? store.unavailableNote(FACET_ACCOUNTS) : null;
     // A PARTIAL gap: name EVERY facet that could not be read — one sentence per
     // distinct way they failed — and let the closing reassurance cover only the
     // facets that genuinely read. Reporting `bad[0]` alone and appending
     // "everything else was read normally" told the owner two of three failures
     // had landed fine; the backend stamps `reads` per facet on every answer,
     // which is exactly what makes a mixed verdict possible.
-    const sentences = [];
-    let tone = 'muted';
+    const sentences = unsupportedNote ? [unsupportedNote.text] : [];
+    let tone = unsupportedNote ? unsupportedNote.tone : 'muted';
     for (const readState of states) {
         const group = bad.filter((facet) => reads[facet] === readState);
         const subjects = group.map((facet) => FACET_SUBJECT[facet] || facet);
@@ -864,13 +931,14 @@ export function serviceBannerLine(store, { wakeError = '', wakeBusy = false } = 
     const readOk = facets
         .filter((facet) => reads[facet] === READ_OK)
         .map((facet) => FACET_SUBJECT[facet] || facet);
-    const tail = readOk.length ? ` Your ${joinSubjects(readOk)} were read normally.` : '';
+    const tail = bad.length && readOk.length ? ` Your ${joinSubjects(readOk)} were read normally.` : '';
     // The SAME precedence as the full-gap branch above — the two are one
     // decision, and fixing only one half of it is how this class survives. The
     // backend stamps `reads` per facet on every answer, so a mixed verdict is
     // an ordinary state — and a muted "some facets were never asked · the rest
     // read normally" must not swallow a runtime that needs repair.
-    return faultOutranksReassurance(service, { tone, text: `${sentences.join(' ')}${tail}` });
+    return withEngineFacts(faultOutranksReassurance(service,
+        { tone, text: `${sentences.join(' ')}${tail}` }), store.snapshot);
 }
 
 export async function removeAccount(harness, profileId, { fetchImpl = apiFetch } = {}) {
@@ -908,6 +976,9 @@ export function removeAccountConfirmBody(name, family) {
         + 'unavailable until you repoint them.';
 }
 
+// A refused deletion stays an error (removeAccount throws). Only a receipt whose
+// disposition is vendor-owned, left unchanged and scoped to the OS user yields the
+// retained-credential warning; any other receipt yields no notice.
 export function vendorCredentialRetainedNotice(receipt, name, family) {
     const disposition = receipt?.vendorCredentialDisposition;
     if (!disposition || disposition.owner !== 'vendor'
@@ -925,6 +996,8 @@ const state = {
     store: claudexorStatus,
     loginCard: null,
     loginFamily: '',
+    resources: null,
+    maintenance: null,
     disposers: [],
     removeError: '',
     removeNotice: '',
@@ -937,78 +1010,118 @@ const state = {
     // its accounts. The wake POST itself is the STORE's (single writer).
     wakeError: '',
     wakeBusy: false,
+    restart: null, // the Restart Claudexor controller: its request in flight and the last outcome's note
+    family: '',    // the provider whose page is mounted ('' lists every family)
+    path: '',      // that page's Settings path: its showing is the owner's act that may activate the read
+    mark: null,    // the page's lead mark for a row: `({ row, badge, quota }) => html`
 };
 
-/** The tab's ONE service banner; rendered above every section. */
+// The disclosure's quiet chevron (it turns when open).
+const DISCLOSURE_CARET = '<svg class="settings-disclosure-caret" width="10" height="10" viewBox="0 0 10 10" aria-hidden="true" focusable="false"><path d="M3.5 2 7 5 3.5 8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path></svg>';
+
+/** The tab's ONE service banner; rendered above every section. Its verdict sentence
+ *  leads; the engine version is a quiet fact beside it; the engine's measurements
+ *  open under Diagnostics, which stays open (or closed) across every status refresh. */
 export function renderAgentsServiceBanner() {
-    return `<div id="agents-service-banner" class="agents-service-banner settings-inline-status" data-tone="muted">Checking the agent service…</div>`;
+    return `<div class="agents-service">
+        <div id="agents-service-banner" class="agents-service-banner settings-inline-status" data-tone="muted">Checking the agent service…</div>
+        <span id="agents-service-version" class="agents-service-version" hidden></span>
+        <button type="button" id="agents-service-diagnostics-toggle" class="settings-disclosure ui-hit-area" aria-expanded="false" aria-controls="agents-service-diagnostics" hidden>Diagnostics${DISCLOSURE_CARET}</button>
+        <dl id="agents-service-diagnostics" class="agents-service-diagnostics" hidden></dl>
+    </div>`;
 }
 
-export function renderAgentAccountsSection() {
-    return `
-        <div class="form-section" id="harness-accounts-section">
-            <h3>Accounts</h3>
-            <div class="settings-section-copy">
-                Subscriptions shared by Models, delegated subagents, and review lanes. Unpinned work
-                rotates across a family's enabled, signed-in accounts; a disabled account keeps its
-                login and stays out of rotation. Accounts live in Ouroboros's own agent home; your
-                personal logins are never read or imported.
-            </div>
-            <div id="harness-accounts-error" class="settings-inline-status" data-tone="error" hidden></div>
-            <div id="harness-accounts-groups" class="agent-family-list"></div>
-            <div id="harness-login-card"></div>
-            <div class="settings-toolbar">
-                <button type="button" class="btn btn-default" id="btn-harness-refresh">Refresh</button>
-            </div>
-        </div>
-    `;
+// The banner's quiet version and Diagnostics, painted in place: the toggle keeps its focus and its
+// open state, and a refresh rewrites only the values that changed.
+function paintServiceDiagnostics(line) {
+    const version = document.getElementById('agents-service-version');
+    if (version) {
+        const text = line.version || '';
+        if (version.textContent !== text) version.textContent = text;
+        version.hidden = !text;
+    }
+    const toggle = document.getElementById('agents-service-diagnostics-toggle');
+    const list = document.getElementById('agents-service-diagnostics');
+    if (!toggle || !list) return;
+    const facts = line.facts || [];
+    toggle.hidden = !facts.length;
+    const rows = [...list.children];
+    rows.forEach((row) => { if (!facts.some(([label]) => label === row.dataset.fact)) row.remove(); });
+    facts.forEach(([label, value], index) => {
+        let row = [...list.children].find((node) => node.dataset.fact === label);
+        if (!row) {
+            row = document.createElement('div');
+            row.dataset.fact = label;
+            const term = document.createElement('dt');
+            term.textContent = label;
+            row.append(term, document.createElement('dd'));
+        }
+        const dd = row.lastElementChild;
+        if (dd.textContent !== value) dd.textContent = value;
+        if (list.children[index] !== row) list.insertBefore(row, list.children[index] || null);
+    });
+    list.hidden = !facts.length || toggle.getAttribute('aria-expanded') !== 'true';
+}
+
+function bindServiceDiagnostics() {
+    const toggle = document.getElementById('agents-service-diagnostics-toggle');
+    if (!toggle?.addEventListener) return () => {};
+    const onClick = () => {
+        const open = toggle.getAttribute('aria-expanded') !== 'true';
+        toggle.setAttribute('aria-expanded', String(open));
+        const list = document.getElementById('agents-service-diagnostics');
+        if (list) list.hidden = !open || !list.children.length;
+    };
+    toggle.addEventListener('click', onClick);
+    return () => toggle.removeEventListener?.('click', onClick);
 }
 
 export function accountRowFacts(row, payload,
-                                { accountsRead = READ_OK, quotaRead = READ_OK, nowMs = Date.now() } = {}) {
-    // Each projection is gated by ITS OWN facet: the identity claim is the
-    // ACCOUNTS read, the window is the QUOTA read, and one lands while the
-    // other refuses. The panel used to render both off the retained snapshot
-    // regardless, so after a refused read the banner said nothing could be
-    // listed while a stale row sat underneath it showing "Verified live" and a
-    // red exhausted window. Pure, because that rule is the thing worth pinning.
-    //
-    // The two-line anatomy is the owner's (D-10): line 1 is the account and its
-    // status, line 2 is muted metadata in human words. `quotaSummary` carries
-    // the quota gap itself — an unread window says "Limits not checked" rather
-    // than dressing a remembered percentage as current, and it never paints the
-    // row red, because the exhausted styling is a claim about RIGHT NOW and the
-    // reset it promises may already have happened.
+                                { accountsRead = READ_OK, quotaRead = READ_OK, nowMs = Date.now(), action = {} } = {}) {
+    // Each projection is gated by ITS OWN facet: the identity claim is the ACCOUNTS read, the window is the
+    // QUOTA read, and one lands while the other refuses (a refused read once left a stale verified badge and a
+    // red window under a banner saying nothing could be listed). Line 1 is the account and its status, line 2 the
+    // facts in human words: an unread window says "Limits not checked" rather than dressing a remembered
+    // percentage as current, and it never paints the row, because exhaustion is a claim about RIGHT NOW.
+    if (action.resourceRead) quotaRead = READ_OK;
+    if (action.activity === 'refresh' && action.error) quotaRead = READ_FAILED;
+    const metaParts = accountMetaParts(row, payload, { quotaRead, nowMs, action });
     return {
         badge: verificationBadge(row, { known: accountsRead === READ_OK }),
         quota: quotaSummary(payload?.quota || [], row.harness, row.profile_id,
-            { quotaRead, nowMs, fallbackSubjectIds: quotaSubjectAliases(row, payload),
-              absences: payload?.quota_absences || [] }),
-        name: accountName(row),
-        meta: accountMetaLine(row, payload, { quotaRead, nowMs }),
+            { quotaRead: resourceReadGap(action) ? READ_FAILED : quotaRead,
+              nowMs, absences: payload?.quota_absences || [] }),
+        name: accountName(row), meta: metaParts.map((part) => part.text).join(' · '), metaParts,
     };
 }
 
+/** An account that needs its owner: in rotation, and its login was checked and did not pass (`known`: the accounts
+ *  facet was really read; a remembered row claims nothing). */
+export const needsSignIn = (row, known = true) => row.enabled !== false && verificationBadge(row, { known }).tone === 'error';
+
 function rowHtml(row, payload, facets = {}) {
-    const { badge, quota, name, meta } = accountRowFacts(row, payload, facets);
+    const action = facets.store?.resourceAction?.(targetFor(row)) || {};
+    const { badge, quota, name, metaParts } = accountRowFacts(row, payload, { ...facets, action });
     const loginAction = rowLoginAction(row, payload);
-    // Row ACTIONS follow the engine's own routes, never the row's looks: a
-    // named registry row (every row on a unified engine, the named profiles on
-    // a legacy one) has the PATCH Enabled toggle and DELETE Remove; the legacy
-    // native pseudo-row has neither, because that engine has no route for
-    // either and a dead button would claim an effect this app cannot have.
-    const rowActions = row.kind === 'native' ? '' : `
-                <button type="button" class="btn btn-default" data-harness-toggle data-enabled="${row.enabled === false ? '0' : '1'}" title="${row.enabled === false ? 'Let rotation use this account again' : 'Keep the login, take this account out of rotation'}">${row.enabled === false ? 'Enable' : 'Disable'}</button>
-                <button type="button" class="btn btn-default" data-harness-remove title="Ask the agent service to forget this account">Remove</button>`;
+    const on = row.enabled !== false;
+    // Row ACTIONS follow the engine's own routes: every named registry row has the PATCH Enabled toggle (its place in
+    // rotation, a switch that acts at once) and DELETE Remove. Sign in stands in the row while the account is not
+    // signed in; what is rare (Sign in again, Remove) waits behind More with the account's resources. A login that
+    // is verified is the quiet case and says nothing: the card's first line counts them, and a row speaks of trouble.
+    const rare = String(row?.status?.verification || '') === 'passed';
+    const login = `<button type="button" class="btn btn-default btn-sm" data-harness-login${rare ? ' data-rare' : ''}>${escapeHtml(loginAction.label)}</button>`;
     return `
-        <div class="harness-account-row${quota.exhausted ? ' harness-exhausted' : ''}" data-harness="${escapeHtml(row.harness)}" data-profile="${escapeHtml(row.profile_id)}" data-kind="${escapeHtml(row.kind)}">
+        <div class="ui-row harness-account-row${quota.exhausted ? ' harness-exhausted' : ''}" data-harness="${escapeHtml(row.harness)}" data-profile="${escapeHtml(row.profile_id)}" data-kind="${escapeHtml(row.kind)}"${on && badge.tone === 'error' ? ' data-tone="warn"' : ''}>
+            <span class="harness-account-mark" aria-hidden="true">${facets.mark?.({ row, badge, quota }) || ''}</span>
             <div class="harness-account-main">
                 <strong>${escapeHtml(name)}</strong>
-                <span class="ui-status" data-tone="${badge.tone}">${escapeHtml(badge.label)}</span>
+                ${badge.tone === 'ok' ? '' : `<span class="ui-status" data-tone="${badge.tone}">${escapeHtml(badge.label)}</span>`}
             </div>
-            <div class="harness-account-meta muted">${escapeHtml(meta)}</div>
-            <div class="harness-account-actions">
-                <button type="button" class="btn btn-default" data-harness-login>${escapeHtml(loginAction.label)}</button>${rowActions}
+            <div class="harness-account-meta muted">${metaParts.map((part) => `<span class="meta-fact"${part.tone ? ` data-tone="${part.tone}"` : ''}>${escapeHtml(part.text)}</span>`).join('')}${capabilityMarkup(row, payload)}</div>
+            <div class="harness-account-actions">${rare ? '' : login}
+                <label class="ui-switch"><input type="checkbox" role="switch" data-harness-toggle data-enabled="${on ? '1' : '0'}" aria-checked="${on}" aria-label="${escapeHtml(`Use ${name} in rotation`)}"${on ? ' checked' : ''}><span class="ui-switch-track" aria-hidden="true"><span class="ui-switch-thumb"></span></span></label>
+                <button type="button" class="settings-disclosure ui-hit-area" data-resources aria-expanded="false" aria-controls="${escapeHtml(resourcePanelId(row))}">More${DISCLOSURE_CARET}</button>
+                ${rare ? login : ''}<button type="button" class="btn btn-danger btn-sm" data-harness-remove data-rare>Remove</button>
             </div>
         </div>
     `;
@@ -1018,23 +1131,41 @@ export function harnessFamilyMarkup(group, payload, facets) {
     // An empty family is a ONE-LINE card: the header already carries the verdict
     // (familyStatus falls through to it), and printing the same sentence again
     // in the body just made the card twice as tall to say nothing new.
-    const body = group.rows.map((row) => rowHtml(row, payload, facets)).join('');
+    const known = (facets?.accountsRead ?? READ_OK) === READ_OK;
+    const body = [...group.rows].sort((a, b) => Number(needsSignIn(b, known)) - Number(needsSignIn(a, known)))
+        .map((row) => rowHtml(row, payload, facets)).join('');
     const nextUp = nextUpBadge(payload, group.harness,
         { accountsRead: facets?.accountsRead ?? READ_OK });
     return `
         <section class="agent-family-card" data-family="${escapeHtml(group.harness)}">
-            <div class="agent-family-head">
-                <div class="agent-family-id">
-                    <h4>${harnessIdentityMarkup(group.harness, { label: group.label })}</h4>
-                    <span class="ui-status" data-tone="${group.status.tone}">${escapeHtml(group.status.label)}</span>
-                    ${nextUp ? `<span class="ui-status" data-tone="muted" data-next-up>${escapeHtml(nextUp)}</span>` : ''}
+            <div class="ui-card settings-card agent-family-program" data-family-maintenance="${escapeHtml(group.harness)}"></div>
+            <div class="ui-card settings-card agent-family-accounts"${group.maintenanceOnly ? ' hidden' : ''}>
+                <div class="settings-card-head agent-family-head">
+                    <h3 class="settings-card-title">Accounts</h3>
+                    ${group.maintenanceOnly || facets?.accountsUnsupported ? '' : `<button type="button" class="btn btn-default btn-sm" data-family-add>${escapeHtml(familyActionLabel(group, payload))}</button>`}
                 </div>
-                <button type="button" class="btn btn-default" data-family-add>${escapeHtml(familyActionLabel(group, payload))}</button>
+                <p class="settings-card-lead agent-family-id">
+                    ${group.maintenanceOnly ? '' : `<span class="ui-status" data-tone="${group.status.tone}">${escapeHtml(group.status.label)}</span>`}
+                    ${nextUp ? `<span class="agent-family-next" data-next-up>${escapeHtml(nextUp)}</span>` : ''}
+                </p>
+                <div class="agent-family-login" data-family-login="${escapeHtml(group.harness)}"></div>
+                <div class="agent-family-rows settings-rows">${body}</div>
             </div>
-            <div class="agent-family-login" data-family-login="${escapeHtml(group.harness)}"></div>
-            <div class="agent-family-rows">${body}</div>
         </section>
     `;
+}
+
+function paintServiceBanner() {
+    const banner = document.getElementById('agents-service-banner');
+    if (!banner) return;
+    const line = serviceBannerLine(state.store, {
+        wakeError: state.wakeError,
+        wakeBusy: state.wakeBusy,
+        programProblem: state.maintenance?.inspectionProblem,
+    });
+    banner.textContent = line.text;
+    banner.dataset.tone = line.tone;
+    paintServiceDiagnostics(line);
 }
 
 function renderRows() {
@@ -1047,46 +1178,58 @@ function renderRows() {
         state.wakeError = '';
     }
     const host = document.getElementById('harness-accounts-groups');
-    const banner = document.getElementById('agents-service-banner');
-    if (banner) {
-        const line = serviceBannerLine(state.store, {
-            wakeError: state.wakeError,
-            wakeBusy: state.wakeBusy,
-        });
-        banner.textContent = line.text;
-        banner.dataset.tone = line.tone;
-    }
+    paintServiceBanner();
     // The Refresh button says what pressing it does (one predicate feeds the
     // label AND the click — see initHarnessAccounts), and while a wake is in
     // flight it says that instead of inviting a second one.
     const refreshEl = document.getElementById('btn-harness-refresh');
     if (refreshEl) {
+        const resourceBusy = state.store.resourceAction?.(null).busy;
         refreshEl.textContent = state.wakeBusy
             ? 'Starting the agent daemon…'
-            : refreshActionLabel(state.store.snapshot);
-        refreshEl.disabled = Boolean(state.wakeBusy);
+            : resourceBusy ? 'Refreshing…' : refreshActionLabel(state.store.snapshot);
+        refreshEl.disabled = Boolean(state.wakeBusy || resourceBusy);
     }
+    state.restart?.paint(document.getElementById('btn-claudexor-restart'), state.store.snapshot, state.wakeBusy);
     if (!host) return;
     const errorBox = document.getElementById('harness-accounts-error');
     if (errorBox) {
-        const text = state.removeError || state.removeNotice;
+        const text = state.removeError || state.removeNotice || state.restart?.note?.text || '';
         errorBox.hidden = !text;
         errorBox.textContent = text;
-        errorBox.dataset.tone = state.removeError ? 'error' : 'warn';
+        errorBox.dataset.tone = state.removeError ? 'error' : state.removeNotice ? 'warn' : state.restart?.note?.tone || 'warn';
     }
     const payload = state.store.snapshot || {};
+    const marksNote = document.getElementById('harness-model-marks-note');
+    if (marksNote) {
+        const failedAt = capabilityMarksReadFailedAt(payload);
+        marksNote.hidden = !failedAt;
+        marksNote.textContent = failedAt
+            ? `Temporary model marks could not be read \u00b7 checked ${formatRelativeAge(Date.parse(failedAt), 'just now')}` : '';
+    }
     const accountsRead = state.store.facet(FACET_ACCOUNTS);
     const quotaRead = state.store.facet(FACET_QUOTA);
+    const accountsUnsupported = Boolean(state.store.accountsUnsupported);
     // The family-mounted login card lives INSIDE this container, so the
     // innerHTML rebuild destroys a focused paste-code/name input before the
     // card's own render can see it. The capture must therefore wrap the
     // whole rebuild: same SSOT helper, one level up.
-    preserveCardFocus(host, () => {
-        host.innerHTML = accountGroups(payload, {
+    const repaint = () => preserveCardFocus(host, () => {
+        const groups = accountGroups(payload, {
             accountsRead,
             catalogKnown: state.store.catalogKnown,
-        })
-            .map((group) => harnessFamilyMarkup(group, payload, { accountsRead, quotaRead })).join('');
+            accountsUnsupported,
+        });
+        for (const harness of state.maintenance?.harnesses || []) {
+            if (!groups.some((group) => group.harness === harness)) groups.push({
+                harness, label: familyLabel(harness, payload, { catalogKnown: state.store.catalogKnown }),
+                rows: [], maintenanceOnly: true,
+            });
+        }
+        host.innerHTML = groups.filter((group) => !state.family || group.harness === state.family)
+            .map((group) => harnessFamilyMarkup(group, payload,
+                { accountsRead, quotaRead, store: state.store, accountsUnsupported, mark: state.mark })).join('');
+        state.resources?.mount(host, accountsUnsupported ? [] : accountRows(payload), payload, quotaRead);
         host.querySelectorAll('[data-harness-login]').forEach((button) => {
             button.addEventListener('click', () => {
                 if (!state.initialized) return;
@@ -1113,9 +1256,9 @@ function renderRows() {
         host.querySelectorAll('[data-harness-toggle]').forEach((button) => {
             button.addEventListener('click', () => {
                 const row = button.closest('[data-harness]');
-                // The button carries the state it RENDERED for, so a click flips
-                // exactly what the owner saw — never a re-read of a row the poll
-                // may have replaced mid-click.
+                // The switch carries the state it RENDERED for, so a press flips exactly what the owner saw —
+                // never a re-read of a row the poll may have replaced mid-press. In flight it is disabled and busy.
+                Object.assign(button, { disabled: true }).setAttribute?.('aria-busy', 'true');
                 toggleAccountEnabled(row?.dataset.harness, row?.dataset.profile,
                     button.dataset.enabled === '0');
             });
@@ -1138,7 +1281,10 @@ function renderRows() {
             });
         });
         state.loginCard?.render();
+        state.maintenance?.render();
     });
+    if (state.resources) state.resources.preserve(host, repaint);
+    else repaint();
 }
 
 async function toggleAccountEnabled(harness, profileId, enabled) {
@@ -1148,6 +1294,7 @@ async function toggleAccountEnabled(harness, profileId, enabled) {
     if (!harness || !profileId) return;
     state.removeError = '';
     state.removeNotice = '';
+    state.restart?.clear();
     try {
         await setAccountEnabled(harness, profileId, enabled);
     } catch (error) {
@@ -1182,6 +1329,7 @@ export async function confirmRemoveAccount(harness, profileId, {
     if (answer !== true) return;
     state.removeError = '';
     state.removeNotice = '';
+    state.restart?.clear();
     try {
         const receipt = await removeImpl(harness, profileId);
         state.removeNotice = vendorCredentialRetainedNotice(
@@ -1220,6 +1368,7 @@ export async function wakeDaemon() {
             : String(result?.error || 'request failed');
     }
     renderRows();
+    void state.maintenance?.refresh({ fresh: true });
 }
 
 // Harness ids are conservative tokens; escape defensively for the attribute
@@ -1264,13 +1413,14 @@ export async function startLogin(harness, profile) {
         ?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
 }
 
-/** Read the shared status once (the Refresh button, and the first paint). */
+/** Read the shared status once for passive consumers and first paint. */
 export function refreshHarnessStatus() {
+    void state.maintenance?.refresh({ fresh: true });
     return state.store.refresh();
 }
 
 /**
- * Opening Agents is an explicit owner action. Refresh first so an old live
+ * Opening a provider's page is an explicit owner action. Refresh first so an old live
  * snapshot cannot hide a daemon reaped by a server restart; only the exact
  * already-provisioned idle state is then restarted. First-time installation,
  * foreign ownership and repair remain behind Connect.
@@ -1281,55 +1431,74 @@ async function refreshHarnessStatusOnActivation() {
     // the panel can keep useful context.  That retained snapshot is not fresh
     // evidence for an owner-triggered write: a transient outage must never
     // turn yesterday's `stale + ready` into a wake request.
-    if (state.store.error) return null;
+    if (state.store.error) return state.maintenance?.refresh({ fresh: true, checkLatest: true });
     const daemon = snapshot?.daemon || state.store.snapshot?.daemon || {};
     if (String(daemon.state || '') === 'stale'
         && String(daemon.runtime?.state || '') === 'ready'
         && !daemon.ownership_problem) {
-        return wakeDaemon();
+        await wakeDaemon();
     }
-    return null;
+    return state.maintenance?.refresh({ fresh: true, checkLatest: true });
 }
 
 /**
  * Mount the section. The exported destroy seam is an honest local detach, so
  * remount never waits on or invents daemon release proof.
  */
-export function initHarnessAccounts({ store = claudexorStatus } = {}) {
-    return _init(store);
+export function initHarnessAccounts({ store = claudexorStatus, restartDeps = {}, family = '', path = '', mark = null } = {}) {
+    return _init(store, restartDeps, { family, path, mark });
 }
 
-async function _init(store) {
+async function _init(store, restartDeps, page) {
     _destroy();
-    state.store = store;
+    Object.assign(state, { store, family: String(page.family || ''), mark: page.mark,
+        path: String(page.path || `accounts/${page.family || ''}`) });
+    state.resources = createAccountResourcesController({ store, render: renderRows });
     state.removeError = '';
     state.removeNotice = '';
     state.wakeError = '';
     state.wakeBusy = false;
+    // Restart Claudexor (`claudexor_restart.js`): preview, the in-app confirmation, then the restart.
+    state.restart = createRestartController({ store, render: renderRows,
+        onStart: () => { state.removeError = state.removeNotice = ''; },
+        onSettled: () => { void state.maintenance?.refresh({ fresh: true }); } });
+    state.maintenance = createHarnessMaintenanceController({
+        host: () => document.getElementById('harness-accounts-groups'),
+        onInventory: renderRows,
+        onInspectionProblem: paintServiceBanner,
+        onSettled: refreshMaintenanceCatalogs,
+        visible: () => !document.hidden
+            && document.getElementById('harness-accounts-groups')?.offsetParent != null,
+    });
     ensureLoginCard();
+    state.disposers.push(bindServiceDiagnostics());
     document.getElementById('btn-harness-refresh')
         ?.addEventListener('click', () => {
             if (!state.initialized) return;
             // A sleeping daemon cannot be re-read into existence: there the
-            // button is the owner's explicit start. Live, it stays a plain
-            // re-read. SAME predicate the LABEL uses (renderRows), so the two
-            // cannot disagree again.
+            // button is the owner's explicit start. Live, it refreshes account
+            // resources, then re-reads status with the same store.
             return refreshActionKind(state.store.snapshot) === 'refresh'
-                ? state.store.refresh()
+                ? refreshAllAccounts()
                 : wakeDaemon();
         });
-    // The SHARED surface binding: the visibility predicate that lets this
-    // section keep the poll armed, and the catch-up read when the panel becomes
-    // reachable — one implementation, released by one disposer. It carries no
-    // tab NAME on purpose, and this section is the proof: it moved from
-    // Providers to Agents in this very sprint, so a hardcoded tab name would
-    // have gone quietly dead on arrival while its comment still promised that
-    // a daemon coming up is picked up without a reload.
+    document.getElementById('btn-claudexor-restart')
+        ?.addEventListener('click', () => (state.initialized ? state.restart?.run(restartDeps) : undefined));
+    // The SHARED surface binding keeps the poll armed only while this page's rows are on screen (an inactive page or
+    // a hidden Settings level is display:none, which `offsetParent` reports). Activation is this page's own: the shell
+    // says which Settings page is shown, and only the showing of this provider's page is the owner's act that reads
+    // (and may start an idle daemon); the home and the list of providers never do.
     state.disposers.push(bindStatusSurface(state.store, {
-        listener: () => renderRows(),
+        listener: (view) => {
+            renderRows();
+            if (!view?.loading) state.maintenance?.poll();
+        },
         elementId: 'harness-accounts-groups',
-        onActivate: refreshHarnessStatusOnActivation,
+        activationEvents: [],
     }));
+    const onShown = (event) => (event?.detail?.path === state.path ? refreshHarnessStatusOnActivation() : undefined);
+    globalThis.window?.addEventListener?.('ouro:settings-page-shown', onShown);
+    state.disposers.push(() => globalThis.window?.removeEventListener?.('ouro:settings-page-shown', onShown));
     state.initialized = true;
     // The first read must not wait for the poll interval: init runs while the
     // page may not be visible yet, and the panel would sit on "Checking
@@ -1337,6 +1506,18 @@ async function _init(store) {
     state.store.refresh();
     renderRows();
     return true;
+}
+
+async function refreshAllAccounts() {
+    void state.maintenance?.refresh({ fresh: true });
+    if (!state.store.refreshResources) return state.store.refresh();
+    if (state.store.resourceAction(null).busy) return;
+    state.removeError = '';
+    state.restart?.clear();
+    const result = await state.store.refreshResources();
+    if (!result) state.removeError = state.store.resourceAction(null).error || 'Account refresh did not complete';
+    else await state.store.refresh();
+    renderRows();
 }
 
 /**
@@ -1354,6 +1535,8 @@ function _destroy() {
         try { dispose(); } catch (err) { /* a broken disposer must not block the rest */ }
     }
     state.initialized = false;
+    state.maintenance?.dispose();
+    state.maintenance = null;
     const card = state.loginCard;
     if (!card) return true;
     card.detach();

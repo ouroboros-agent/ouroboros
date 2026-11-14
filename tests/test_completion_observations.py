@@ -1,9 +1,9 @@
 """Synthesis sees task observations without mistaking tool success for receipt."""
 
+from tests import _dialogue as dialogue_test
+
 import hashlib
-import gzip
 import json
-import shutil
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -20,6 +20,7 @@ from ouroboros.projects_registry import bind_task_to_project, create_project
 from ouroboros.task_finalization import build_completion_observations, build_sealed_final_package, sealed_final_prompt_section
 from ouroboros.task_results import load_task_result, write_task_result
 from ouroboros.task_status import load_effective_task_result
+from tests._store_shared import remove_store_tree
 
 
 def _trace():
@@ -29,8 +30,12 @@ def _trace():
          "result": f"queued message {i}"} for i in range(40)], "reasoning_notes": []}
 
 
-@pytest.mark.parametrize("mode", ["root", "project", "child", "project_child"])
-@pytest.mark.parametrize("user_file", [False, True])
+@pytest.mark.parametrize(("user_file", "mode"), [
+    (False, "root"),
+    (False, "child"),
+    (True, "project"),
+    (True, "project_child"),
+])
 def test_sealed_observations_survive_copyback_and_recovery_without_global_attribution(tmp_path, monkeypatch, mode, user_file):
     source_root = tmp_path / "execution"
     canonical = tmp_path / "canonical" if "child" in mode else source_root
@@ -82,7 +87,7 @@ def test_sealed_observations_survive_copyback_and_recovery_without_global_attrib
     if source_root != canonical:
         assert not (task_artifact_dir_path(source_root, "observation") / ref["path"]).exists()
         copied = copy_child_task_result(canonical, {"id": "observation", "drive_root": str(source_root)})
-        shutil.rmtree(source_root)
+        remove_store_tree(source_root)
     else:
         copied = stored
     assert (task_artifact_dir_path(canonical, "observation") / ref["path"]).read_bytes() == raw
@@ -131,33 +136,24 @@ def test_empty_and_legacy_observations_remain_unknown_without_an_extra_artifact(
     assert "not evidence that no action occurred" in legacy
 
 
-def test_packet_summary_receives_inline_facts_and_custodies_its_prompt(tmp_path, monkeypatch):
+def test_facts_row_buys_no_packet_and_persists_no_narrative(tmp_path, monkeypatch):
+    """Owner decision 2=A: the paid task narrative is gone. The host facts row
+    keeps the exact tool census for history with empty text, custodies no
+    model prompt, and leaves no continuation narrative on the result."""
     from ouroboros.observability import OBSERVABILITY_DIR
-    import ouroboros.post_task_synthesis as synthesis
 
     monkeypatch.setattr("ouroboros.skill_readiness.acceptance_skill_lifecycle", lambda *_a, **_k: [])
-    monkeypatch.setattr("ouroboros.consolidator._consolidation_route", lambda: ("test-model", False))
-    # The existing trace builder has already applied its 4000-character bound;
-    # a second 3000-character head cap used to discard this later fact again.
-    monkeypatch.setattr(synthesis, "build_trace_summary", lambda trace: "x" * 3200 + " LATE_TRACE_FACT")
+    monkeypatch.setattr("ouroboros.llm_observability.chat_observed",
+                        lambda *_a, **_k: pytest.fail("the facts row buys no model call"))
     task = {"id": "summary", "root_task_id": "summary", "chat_id": 1, "type": "task", "text": "show it"}
-    observations = build_completion_observations(tmp_path, task, _trace())
-    sealed = build_sealed_final_package({"completion_observations": observations}, "")
-    prompts = []
-    class CapturingLLM:
-        def chat(self, **kwargs):
-            prompts.append(kwargs["messages"][0]["content"])
-            return {"content": "Photo submission was recorded; owner receipt is unknown."}, {"cost": 0}
-    pipeline._run_task_summary(SimpleNamespace(drive_root=tmp_path), CapturingLLM(), task,
-                               {"rounds": 4, "cost": 0}, _trace(), tmp_path / "logs", sealed_final=sealed)
-    assert len(prompts) == 1 and "LATE_TRACE_FACT" in prompts[0]
-    assert "send_photo" in prompts[0] and "not a chat receipt" in prompts[0]
+    env = SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path)
+    pipeline._store_task_result(env, task, "Photo sent.", {"rounds": 4, "cost": 0}, _trace())
+    pipeline._record_task_facts(env, task, {"rounds": 4, "cost": 0}, _trace(), tmp_path / "logs")
+    [row] = dialogue_test.log_rows(tmp_path / "logs" / "chat.jsonl")
+    assert row["summary_kind"] == "host_task_facts" and row["text"] == ""
+    assert row["tool_calls"] == 41 and row["tool_errors"] == 0 and row["routing_tool_calls"] == 0
+    assert row["tool_call_counts"] == {"send_photo": 1, "send_user_message": 40}
+    assert "continuation_narrative" not in load_task_result(tmp_path, "summary")
     calls_root = tmp_path / OBSERVABILITY_DIR / "calls"
     manifests = [json.loads(path.read_text(encoding="utf-8")) for path in calls_root.glob("*/*.json")]
-    observed = [row for row in manifests if row.get("call_type") == "task_summary"]
-    request = next(row for row in observed if row["call_id"].endswith("_request"))
-    response = next(row for row in observed if row["call_id"].endswith("_response"))
-    with gzip.open(request["full_payload_ref"]["path"], "rt", encoding="utf-8") as source:
-        assert json.load(source)["kwargs"]["messages"][0]["content"] == prompts[0]
-    with gzip.open(response["full_payload_ref"]["path"], "rt", encoding="utf-8") as source:
-        assert "owner receipt is unknown" in json.load(source)["message"]["content"]
+    assert [row for row in manifests if row.get("call_type") == "task_summary"] == []

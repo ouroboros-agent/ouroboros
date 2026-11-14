@@ -1,7 +1,12 @@
 """Task-local schema residency over the registry's permitted capability envelope.
 
-Low/Max start complete. Nano selects canonical schemas while retaining the
-existing discovery/reclaim transport. Residency never grants execution authority.
+Low/Max start complete except MCP servers the owner did not pin: their call schemas load
+on demand (``enable_tools``) while the connections map (``tool_connections``) keeps
+their tools known. Nano selects canonical schemas while retaining the existing
+discovery/reclaim transport. A route whose provider caps the schemas in one request
+leaves the overflow unloaded (``fit_tool_schemas_to_limit``).
+Residency never grants execution authority.
+The tool namespaces and the bounded catalog/name-miss renderings live here too.
 """
 
 from __future__ import annotations
@@ -10,7 +15,8 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Protocol, Sequence
 
-from ouroboros.tool_capabilities import META_TOOL_NAMES
+from ouroboros.tool_capabilities import CORE_TOOL_NAMES, MCP_GATEWAY_TOOL_NAME, META_TOOL_NAMES
+from ouroboros.contracts.task_contract import canonical_tool_name
 
 
 NANO_SCHEMA_META_NAMES = META_TOOL_NAMES | frozenset({"compact_context"})
@@ -59,8 +65,11 @@ def select_tool_schemas(
     unavailable_reasons: Mapping[str, str] | None = None,
 ) -> ToolSchemaSelection:
     """Pure selection from one permitted snapshot, retaining its canonical order."""
-    requested = _schema_names(schema_names)
     available = {schema["function"]["name"] for schema in canonical_schemas}
+    requested = _schema_names(
+        canonical_tool_name(name) if canonical_tool_name(name) in available else name
+        for name in _schema_names(schema_names)
+    )
     selected = set(requested) | NANO_SCHEMA_META_NAMES
     schemas = tuple(deepcopy(schema) for schema in canonical_schemas
                     if context_mode != "nano" or schema["function"]["name"] in selected)
@@ -81,13 +90,75 @@ def initial_tool_schemas(
     """Return full Low/Max or selected Nano schemas from the current registry.
 
     Visibility is selected by the registry context: ordinary top-level tasks
-    expose all available first-party built-ins plus live extension/MCP schemas;
+    expose all available first-party built-ins plus live extension schemas and the
+    MCP schemas listed so far (the read never waits for an MCP listing);
     delegated-child, repair, credential, resource, and contract
     filters narrow independently. A parent suggestion is an initial Nano view,
     not an allowlist; the actor can request any other permitted schema later.
+    In every mode the tools of an unpinned MCP server start without schemas
+    (``on_demand_schema_names``) unless named in ``schema_names``.
     """
-    return list(select_tool_schemas(registry.schemas(), context_mode=context_mode,
-                                    schema_names=schema_names).schemas)
+    on_demand = getattr(registry, "on_demand_schema_names", frozenset)()
+    requested = set(_schema_names(schema_names))
+    return [schema for schema in select_tool_schemas(registry.schemas(), context_mode=context_mode,
+                                                     schema_names=schema_names).schemas
+            if schema["function"]["name"] not in on_demand or schema["function"]["name"] in requested]
+
+
+def fit_tool_schemas_to_limit(
+    schemas: Sequence[Dict[str, Any]], limit: int | None, *, keep: Iterable[str] = (),
+    first: Iterable[str] = (), protect: Iterable[str] = (),
+) -> tuple[List[Dict[str, Any]], tuple[str, ...]]:
+    """Fit one request's schemas under a route's physical ceiling: ``(kept, left_out)``.
+
+    Under the ceiling (or without one) the list is unchanged. Above it, core and meta
+    schemas and Main's MCP gateway stay first, then ``protect`` (names this task's history already called),
+    then ``first`` (the load being made now), then ``keep`` (names the actor loaded on
+    purpose before), then the rest in their own order; the tail beyond the ceiling is
+    left out. Kept schemas retain their order, so the request's prefix is stable.
+    Nothing is withdrawn from the registry: a left-out schema stays callable and
+    ``enable_tools``, where the actor has it, loads it.
+    """
+    if limit is None or len(schemas) <= limit:
+        return list(schemas), ()
+    keep, first, protect = frozenset(keep), frozenset(first), frozenset(protect)
+    names = [str(schema["function"]["name"]) for schema in schemas]
+    rank = [0 if name in CORE_TOOL_NAMES or name in META_TOOL_NAMES or name == MCP_GATEWAY_TOOL_NAME else 1 if name in protect
+            else 2 if name in first else 3 if name in keep else 4 for name in names]
+    kept = set(sorted(range(len(names)), key=lambda index: (rank[index], index))[:max(0, limit)])
+    return ([schema for index, schema in enumerate(schemas) if index in kept],
+            tuple(name for index, name in enumerate(names) if index not in kept))
+
+
+def usable_selectors(registry: Any, resident: Iterable[Dict[str, Any]] | None = None) -> frozenset[str]:
+    """The discovery tools (``META_TOOL_NAMES``) this actor can use now, so advice names no other.
+
+    Dispatchable per ``callable_rows`` (a consciousness-origin contract keeps a disabled
+    tool's schema visible yet refuses the call) and, given the request's fitted ``resident``
+    schemas, sent in it too.
+    """
+    names = {row["name"] for row in registry.callable_rows(BUILTIN_NAMESPACE) or ()} & META_TOOL_NAMES
+    if resident is not None:
+        names &= {schema["function"]["name"] for schema in resident}
+    return frozenset(names)
+
+
+def route_tool_limit_notice(model: str, limit: int, total: int, left_out: Sequence[str], *,
+                            selectors: Iterable[str]) -> str:
+    """The fact an actor reads when its route could not carry all of its loaded schemas.
+
+    It names only the ``selectors`` this actor can use in the fitted request (``usable_selectors``).
+    """
+    selectors = frozenset(selectors)
+    ways = [way for name, way in (
+        ("list_available_tools", "list_available_tools marks them not loaded"),
+        ("enable_tools", "enable_tools loads one (the request then leaves out another schema to stay within "
+                         "the limit)"),
+    ) if name in selectors]
+    return ("[SYSTEM NOTICE]\n"
+            f"The route {model} accepts at most {limit} tool schemas in one request; this task had "
+            f"{total} loaded. Not loaded for now: {', '.join(left_out)}. They stay callable"
+            + (": " + ", and ".join(ways) if ways else "") + ".")
 
 
 def compact_tool_catalog(
@@ -150,13 +221,103 @@ def list_non_core_tools(
     registry: ToolSchemaProvider, context_mode: str = "max",
     schema_names: Iterable[str] | None = None,
 ) -> List[Dict[str, Any]]:
-    """Compatibility discovery view: only Nano has intentionally unloaded tools."""
-    if context_mode != "nano":
-        return []
+    """The permitted tools a task starts without schemas for: Nano's unselected ones, unpinned MCP servers'."""
     canonical = registry.schemas()
-    selected = select_tool_schemas(canonical, context_mode=context_mode, schema_names=schema_names)
-    return [row for row in compact_tool_catalog(canonical, schema_names=selected.chosen)
-            if row["residency"] == "not_loaded"]
+    resident = [schema["function"]["name"]
+                for schema in initial_tool_schemas(registry, context_mode=context_mode, schema_names=schema_names)]
+    return [row for row in compact_tool_catalog(canonical, schema_names=resident) if row["residency"] == "not_loaded"]
+
+
+BUILTIN_NAMESPACE = "builtin"
+# A name-miss answer lists the addressed namespace inline up to this many tools;
+# a larger one gets its count and the discovery call that lists it completely.
+NAME_MISS_INLINE_ROWS = 12
+NAME_MISS_INLINE_CHARS = 4000
+
+
+def tool_namespace(name: str) -> str:
+    """The namespace a name addresses: one MCP server, one extension, or builtin.
+
+    Read from the name's shape (``mcp_<server>__…``, ``ext_<n>_<skill>_…``), so a
+    missed name the strict MCP parser rejects still addresses its server.
+    """
+    from ouroboros.extension_surface_names import parse_extension_surface_name
+
+    text = str(name or "").strip()
+    server, separator, _tool = text[4:].partition("__") if text.startswith("mcp_") else ("", "", "")
+    if server and separator:
+        return f"mcp_{server}"
+    extension = parse_extension_surface_name(text)
+    return f"ext_{len(extension[0])}_{extension[0]}" if extension else BUILTIN_NAMESPACE
+
+
+def catalog_row_lines(rows: Sequence[Mapping[str, Any]], *, include_purpose: bool = False) -> List[str]:
+    """One line per callable tool; an MCP row shows ``'raw MCP name' → callable name``.
+
+    The server-supplied raw name is quoted as data. ``loaded`` (when present) is
+    residency — whether the schema is already in the caller's tool list — never
+    availability; a not-loaded row carries its ``compact_tool_catalog`` purpose.
+    """
+    lines = []
+    for row in rows:
+        name = str(row["name"])
+        line = f"- {row['raw_name']!r} → {name}" if row.get("raw_name") else f"- {name}"
+        if "loaded" in row:
+            line += " [loaded]" if row["loaded"] else " [not loaded]"
+            if include_purpose and row.get("marks"):
+                line += f" {row['marks']}"
+            if (include_purpose or not row["loaded"]) and row.get("description"):
+                purpose = repr(row["description"]) if row.get("raw_name") else row["description"]
+                line += f": {purpose}" + ("…" if row.get("description_truncated") else "")
+        lines.append(line)
+    return lines
+
+
+def name_miss_guidance(
+    requested: str, namespace: str, rows: Sequence[Mapping[str, Any]] | None, *,
+    discovery: bool, identity: Sequence[Mapping[str, Any]] = (),
+) -> List[str]:
+    """What the caller can call instead, from ONE namespace of the current catalog.
+
+    ``rows`` are that namespace's callable tools (``None``: unreadable here);
+    ``identity`` are rows an exact naming rule relates to ``requested``. Nothing
+    outside the namespace or the callable catalog is named, and nothing is called.
+    """
+    select = f'list_available_tools(namespace="{namespace}")'
+    successor = canonical_tool_name(requested) if namespace == BUILTIN_NAMESPACE else requested
+    if successor != requested:  # a saved or remembered built-in spelling: the rename is the fact the caller lacks
+        return [f"{requested!r} was renamed {successor!r} (not called).",
+                *name_miss_guidance(successor, namespace, rows, discovery=discovery)]
+    if rows is None:
+        return [f"The current catalog of {namespace} could not be read here"
+                + ("; list_available_tools reports it with any discovery omission." if discovery else ".")]
+    if not rows:
+        return [f"No tool in {namespace} is currently callable in this task"
+                + ("; list_available_tools shows the callable namespaces." if discovery else ".")]
+    rendered = catalog_row_lines(rows) if len(rows) <= NAME_MISS_INLINE_ROWS else []
+    if len(rows) > NAME_MISS_INLINE_ROWS or sum(map(len, rendered)) > NAME_MISS_INLINE_CHARS:
+        lines = [f"{namespace} has {len(rows)} currently callable tools"
+                 + (f"; {select} lists them all." if discovery else ".")]
+    else:
+        pairs = " (raw MCP name → callable name)" if namespace.startswith("mcp_") else ""
+        lines = [f"Currently callable in {namespace}{pairs}:", *rendered]
+    if len(identity) == 1:
+        match = identity[0]
+        hint = (f"Naming-rule identity (exact; not called): {requested!r} corresponds to raw "
+                f"MCP name {match['raw_name']!r}, callable as {match['name']}.")
+        lines.append(hint if sum(map(len, lines)) + len(hint) <= NAME_MISS_INLINE_CHARS
+                     else (f"Naming-rule identity exists but exceeds the inline bound; inspect {select}."
+                           if discovery else "Naming-rule identity exceeds the inline bound; discovery is unavailable."))
+    elif len(identity) > NAME_MISS_INLINE_ROWS:
+        lines.append(f"Naming-rule identity is ambiguous among {len(identity)} callable tools (not called); "
+                     + (f"inspect {select}." if discovery else "a unique identity cannot be given."))
+    elif identity:
+        hint = (f"Naming-rule identity is ambiguous (not called): {requested!r} corresponds to "
+                + "; ".join(f"{row['raw_name']!r} → {row['name']}" for row in identity) + ".")
+        lines.append(hint if sum(map(len, lines)) + len(hint) <= NAME_MISS_INLINE_CHARS
+                     else (f"Naming-rule identity is ambiguous; inspect {select} for the {len(identity)} callable names."
+                           if discovery else "Naming-rule identity is ambiguous; discovery is unavailable."))
+    return lines
 
 
 CAPABILITY_OMISSION_HEADER = "[CAPABILITY_OMISSION_MANIFEST]"
@@ -181,10 +342,15 @@ def format_capability_omissions(
         if not isinstance(item, dict):
             continue
         names = item.get("tools")
+        servers = item.get("servers")
         detail = (
             item.get("error")
             or item.get("resource")
             or (", ".join(str(name) for name in names) if isinstance(names, list) and names else "")
+            # An enabled MCP server without tools: its own last error, else "no tools listed".
+            or ("; ".join(f"{server.get('id')}: {server.get('last_error') or 'no tools listed'}"
+                          for server in servers if isinstance(server, dict))
+                if isinstance(servers, list) else "")
             or "no detail"
         )
         lines.append(

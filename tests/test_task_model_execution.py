@@ -1,7 +1,6 @@
 """A solve response, requested route and post-task authorship are distinct facts."""
 from __future__ import annotations
 
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +11,7 @@ from ouroboros.outcomes import collect_trace_refs
 from ouroboros.task_finalization import model_execution_projection
 from ouroboros.task_results import load_task_result, write_task_result
 from tests.test_loop_compaction import _ctx
+from tests._store_shared import read_result, result_signature
 
 
 class Model:
@@ -130,16 +130,15 @@ def test_terminal_store_and_event_preserve_the_same_projection(tmp_path):
 
 @pytest.mark.parametrize("new", [0, None, 7])
 def test_old_fanout_keys_normalize_on_read_only_and_new_values_win(tmp_path, new):
-    path = tmp_path / "task_results/task.json"
     write_task_result(tmp_path, "task", "completed", swarm_efficiency={
         "wave_count": 9, "inter_wave_latency_sec_total": 40,
         "fanout_count": new, "fanout_interval_sec_total": new, "kept": "evidence"})
-    before = path.read_bytes()
+    before = result_signature(tmp_path, "task")
     result = load_task_result(tmp_path, "task", strict=True)["swarm_efficiency"]
     assert result == {"fanout_count": new, "fanout_interval_sec_total": new, "kept": "evidence"}
-    assert path.read_bytes() == before
+    assert result_signature(tmp_path, "task") == before
     write_task_result(tmp_path, "task", "completed", note="unrelated")
-    assert json.loads(path.read_text())["swarm_efficiency"]["wave_count"] == 9
+    assert read_result(tmp_path, "task")["swarm_efficiency"]["wave_count"] == 9
 
 
 def test_old_only_fanout_keys_keep_unknown_siblings(tmp_path):
@@ -165,11 +164,14 @@ def test_real_loop_records_initial_request_before_the_first_fallback(tmp_path, m
     monkeypatch.setenv("USE_LOCAL_FALLBACK", "false")
     monkeypatch.setattr(loop, "_measure_round_main_fit", lambda *a, **k: None)
     monkeypatch.setattr(loop, "_rebind_context_fit_plan", lambda *a, **k: (None, "max"))
+    noted = []
+    monkeypatch.setattr(loop, "_note_low_start", lambda _ctx, _plan, mode, task_id, _queue: noted.append((task_id, mode)))
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     kwargs = _loop_kwargs(tmp_path, registry, [], FallbackModel({"role": "assistant", "content": "Fallback result"}, {}))
     kwargs["drive_logs"] = tmp_path / "logs"
     text, usage, trace = loop.run_llm_loop(**kwargs)
     assert text == "Fallback result"
+    assert noted == [(kwargs["task_id"], "max")]  # a fresh start is weighed for its Low-start line once
     assert usage["initial_model_request"] == {"model": "primary", "use_local": False}
     assert model_execution_projection(usage)["used_model"] == "fallback"
     assert registry._ctx.active_model == "fallback"

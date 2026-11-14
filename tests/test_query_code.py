@@ -143,7 +143,7 @@ def test_query_code_workspace_and_subagent_schema_roots(tmp_path):
     )
     registry.set_context(readonly)
     schema = registry.get_schema_by_name("query_code")["function"]
-    assert schema["parameters"]["properties"]["root"]["enum"] == ["active_workspace", "system_repo"]
+    assert set(schema["parameters"]["properties"]["root"]["enum"]) == {"active_workspace", "system_repo", "user_files", "skill_payload"}
 
     acting = ToolContext(
         repo_dir=repo,
@@ -152,9 +152,9 @@ def test_query_code_workspace_and_subagent_schema_roots(tmp_path):
     )
     registry.set_context(acting)
     schema = registry.get_schema_by_name("query_code")["function"]
-    assert schema["parameters"]["properties"]["root"]["enum"] == ["active_workspace"]
-    blocked = _query_code(acting, op="symbols", query="Worker", root="system_repo")
-    assert "TOOL_ACCESS_BLOCKED" in blocked
+    assert set(schema["parameters"]["properties"]["root"]["enum"]) == {"active_workspace", "system_repo", "user_files", "skill_payload"}
+    result = _query_code(acting, op="symbols", query="Worker", root="system_repo")
+    assert "Worker" in result and "TOOL_ACCESS_BLOCKED" not in result
 
 
 def test_query_code_subagent_name_shape_is_not_authorization(tmp_path):

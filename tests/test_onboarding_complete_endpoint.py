@@ -30,11 +30,13 @@ _PROVIDER_ENV = (
 )
 
 # Shapes copied from the LIVE daemon (GET /v2/credential-profiles, GET
-# /v2/agent-capabilities, 2026-08-09) through the same projection the accounts
-# panel uses: a per-harness accounts row carrying the engine's own `next_up`
-# routing pointer, and credential profiles carrying `credential_kind` +
-# availability. A fake without `next_up` is a fake of an engine that does not
-# exist.
+# /v2/agent-capabilities) through the same projection the accounts panel uses:
+# the unified roster (Claudexor 3.6.0+) — every account a named registry row
+# carrying `credential_kind` + availability, and per harness the engine's own
+# routing pointer in `accountPools[].next_up`. A fake without `next_up` is a
+# fake of an engine that does not exist. A pre-unified roster never reaches the
+# preset (the status read refuses it): its native row below serves only the
+# negative tests that prove it is never read.
 def _native_account(harness, *, route="local_session", detected=True, enabled=True):
     return {
         "harness_id": harness,
@@ -45,14 +47,8 @@ def _native_account(harness, *, route="local_session", detected=True, enabled=Tr
     }
 
 
-def _profile_account(harness, profile_id):
-    return {
-        "harness_id": harness,
-        "native_credentials_enabled": True,
-        "native_login_detected": False,
-        "identity": None,
-        "next_up": {"kind": "profile", "profileId": profile_id},
-    }
+def _pool(harness, next_up):
+    return {"harness_id": harness, "next_up": next_up}
 
 
 def _profile(harness, profile_id, *, kind="config_dir_login", enabled=True,
@@ -68,13 +64,21 @@ def _profile(harness, profile_id, *, kind="config_dir_login", enabled=True,
     }
 
 
+def _routed(*harnesses):
+    """Each harness's migrated default login, next up for its own pool."""
+    return {"profiles": [_profile(harness, f"{harness}-default") for harness in harnesses],
+            "harnessAccounts": [],
+            "accountPools": [_pool(harness, {"kind": "profile", "profileId": f"{harness}-default"})
+                             for harness in harnesses]}
+
+
 LIVE_SNAPSHOT = {
     "daemon": {"state": "running"},
     "harnesses": [
         {
             "id": "claude", "status": "ok", "enabled": True,
             "access_profiles_supported": ["readonly", "workspace_write"],
-            "models": [{"id": "claude-opus-5"}, {"id": "claude-sonnet-5"},
+            "models": [{"id": "claude-opus-5-5"}, {"id": "claude-opus-5"}, {"id": "claude-sonnet-5"},
                        {"id": "claude-fable-5"}, {"id": "claude-opus-4-6"}],
         },
         {
@@ -82,16 +86,12 @@ LIVE_SNAPSHOT = {
             "models": [{"id": "gpt-5.6-sol"}, {"id": "gpt-5.6-terra"}, {"id": "gpt-5.5"}],
         },
     ],
-    "profiles": {
-        "harnessAccounts": [_native_account("claude"), _native_account("codex")],
-        "profiles": [],
-    },
+    "profiles": _routed("claude", "codex"),
 }
 
 WIZARD_PAYLOAD = {
     "OPENROUTER_API_KEY": "sk-or-v1-abcdefghijklmnop",
     "OUROBOROS_MODEL": "openai/gpt-5.6-luna",
-    "OUROBOROS_REVIEW_ENFORCEMENT": "advisory",
     "OUROBOROS_RUNTIME_MODE": "advanced",
     "TOTAL_BUDGET": 25.0,
     "OUROBOROS_PER_TASK_COST_USD": 5.0,
@@ -135,8 +135,14 @@ def onboarding(monkeypatch, tmp_path):
         return payload
 
     monkeypatch.setattr(gw_onboarding, "_read_harness_snapshot", _snapshot)
-    monkeypatch.setattr(config, "apply_settings_to_env",
-                        lambda settings: calls["env"].append(dict(settings)))
+    original_apply_settings = config.apply_settings_to_env
+
+    def apply_settings(settings, *, environ=None):
+        if environ is not None:
+            return original_apply_settings(settings, environ=environ)
+        calls["env"].append(dict(settings))
+
+    monkeypatch.setattr(config, "apply_settings_to_env", apply_settings)
 
     def _supervisor(_request, _settings):
         calls["supervisor"] += 1
@@ -147,6 +153,9 @@ def onboarding(monkeypatch, tmp_path):
 
     monkeypatch.setattr(gw_settings, "_start_supervisor_if_needed_for_request", _supervisor)
     monkeypatch.setattr(gw_settings, "_apply_settings_save_side_effects", _side_effects)
+    # The starter installer runs in the background after a completed save (tests below).
+    monkeypatch.setattr(gw_onboarding, "after_onboarding",
+                        lambda drive_root, ids: calls.setdefault("starter", []).append((drive_root, ids)))
 
     app = Starlette(routes=[
         Route("/api/onboarding/subagents/preview",
@@ -175,24 +184,23 @@ def test_fresh_install_applies_the_preset_in_one_write(onboarding):
     assert onboarding.calls["snapshot"] == 1  # exactly ONE daemon read
 
     saved = onboarding.saved()
-    assert saved[PRESET_MARKER_KEY] == "3"
+    assert saved[PRESET_MARKER_KEY] == "4"
     assert saved["OUROBOROS_SUBAGENT_HARNESS"] == ""
     available = json.loads(saved[SUBAGENTS_SETTING])
-    # 4=A: the advisory seat's session route matches no task actor, so the
-    # preset mints a roster row for it and every reviewer slot is a
-    # subagent_id REFERENCE into the roster the preset ships.
-    roster = {row["subagent_id"]: row["route"]["target_id"] for row in available["items"]}
-    assert [row["route"]["target_id"] for row in available["items"]] == [
-        "claude=claude-opus-5", "codex=gpt-5.6-sol", "openai/gpt-5.6-luna",
-        "claude=claude-sonnet-5",
+    # One list: the actors are Auto rows (the owner's effort range decides), so the
+    # review seats keep their pinned levels on minted rows of their own (the scope
+    # seat merges into the codex reviewer row); no advisory seat exists, and no
+    # lane key is written.
+    assert [(row["route"]["target_id"], row.get("review_eligible", False)) for row in available["items"]] == [
+        ("claude=claude-opus-5-5", False), ("codex=gpt-5.6-sol", False), ("openai/gpt-5.6-luna", False),
+        ("claude=claude-opus-5-5", True), ("codex=gpt-5.6-sol", True),
     ]
     assert all("name" not in row for row in available["items"])  # retired (1=A)
-    assert json.loads(saved[SUBAGENTS_RECEIPT_KEY])["available_subagents_fingerprint"]
-    slots = json.loads(saved["OUROBOROS_REVIEWER_SLOTS"])
-    assert [roster[row["subagent_id"]] for row in slots["triad"]] == [
-        "claude=claude-opus-5", "codex=gpt-5.6-sol"]
-    assert roster[slots["scope"][0]["subagent_id"]] == "codex=gpt-5.6-sol"
-    assert roster[slots["advisory"]["subagent_id"]] == "claude=claude-sonnet-5"
+    assert [row.get("effort") for row in available["items"]] == [None, None, None, "medium", "medium"]
+    receipt = json.loads(saved[SUBAGENTS_RECEIPT_KEY])
+    assert receipt["available_subagents_fingerprint"]
+    assert receipt["review_pool"] == [row["subagent_id"] for row in available["items"][3:]]
+    assert "OUROBOROS_REVIEWER_SLOTS" not in saved
     # Everything else of the transaction landed in the SAME file.
     assert saved["OUROBOROS_RUNTIME_MODE"] == "advanced"
     assert saved["OPENROUTER_API_KEY"] == WIZARD_PAYLOAD["OPENROUTER_API_KEY"]
@@ -214,8 +222,8 @@ def test_antigravity_install_succeeds_without_inventing_reviewer_seats(onboardin
             ],
         }],
         "profiles": {
-            "harnessAccounts": [_profile_account("agy", "google-owner")],
-            "profiles": [_profile("agy", "google-owner", kind="oauth_token")],
+            "profiles": [_profile("agy", "google-owner", kind="oauth_token")], "harnessAccounts": [],
+            "accountPools": [_pool("agy", {"kind": "profile", "profileId": "google-owner"})],
         },
     }
 
@@ -232,7 +240,8 @@ def test_antigravity_install_succeeds_without_inventing_reviewer_seats(onboardin
         "target_id": "agy=gemini-3.8-flash-high",
         "credential_profile_id": "",
     }
-    assert saved["OUROBOROS_REVIEWER_SLOTS"] == ""
+    # The review lanes are retired (PR-3): the onboarding authors no lane key at all.
+    assert "OUROBOROS_REVIEWER_SLOTS" not in saved
 
 
 def test_daemon_unavailable_persists_nothing_and_keeps_the_wizard_open(onboarding):
@@ -423,7 +432,7 @@ def test_unresolvable_model_refuses_before_any_write(onboarding):
         "daemon": {"state": "running"},
         "harnesses": [{"id": "claude", "status": "ok", "enabled": True,
                        "models": [{"id": "claude-sonnet-5"}]}],
-        "profiles": {"harnessAccounts": [_native_account("claude")]},
+        "profiles": _routed("claude"),
     }
 
     response = onboarding.client.post(
@@ -441,7 +450,7 @@ def test_a_signed_in_account_without_discovery_is_a_typed_failure(onboarding):
         "daemon": {"state": "running"},
         "harnesses": [{"id": "claude", "status": "ok", "enabled": True,
                        "models": [], "models_error": "harness_unavailable"}],
-        "profiles": {"harnessAccounts": [_native_account("claude")]},
+        "profiles": _routed("claude"),
     }
 
     response = onboarding.client.post(
@@ -481,6 +490,21 @@ def test_no_subscription_declared_never_reads_the_daemon(onboarding):
     assert response.json()["preset"]["reason"] == "applied"
     assert onboarding.calls["snapshot"] == 0
     assert json.loads(onboarding.saved()[SUBAGENTS_SETTING])["items"]
+
+
+def test_completing_onboarding_authors_no_web_search_model(onboarding):
+    """A blank search Model follows each source's recommended one (owner decision, 1 Nov 2026), so the
+    defaults-merged first document of an install keeps it blank rather than freezing a shipped id."""
+    from ouroboros import config
+    from ouroboros.search_routes import SEARCH_MODELS, resolve_web_search_route
+
+    response = onboarding.client.post("/api/onboarding/complete", json=dict(WIZARD_PAYLOAD))
+    assert response.status_code == 200, response.text
+    assert onboarding.saved().get("OUROBOROS_WEBSEARCH_MODEL", "") == ""
+    loaded = config.load_settings()
+    assert loaded["OUROBOROS_WEBSEARCH_MODEL"] == ""
+    route = resolve_web_search_route(settings=loaded)
+    assert {leg["source"]: leg["model"] for leg in route["legs"] + route["unavailable"]} == SEARCH_MODELS
 
 
 def test_api_only_preview_is_read_only_and_never_reads_claudexor(onboarding):
@@ -533,11 +557,14 @@ def test_local_only_preview_materializes_only_local_routes_without_daemon_read(o
     )
 
     assert response.status_code == 200, response.text
-    targets = [
-        row["route"]["target_id"]
-        for row in response.json()["available_subagents"]["items"]
-    ]
+    items = response.json()["available_subagents"]["items"]
+    targets = [row["route"]["target_id"] for row in items if not row.get("review_eligible")]
     assert targets == ["owner-main (local)", "owner-light (local)"]
+    # The factory pool of a local-only install is its one reachable model, run once
+    # (I3-1 after owner Q5=A: copies of it would only multiply the cost), never a remote panel.
+    reviewers = [row for row in items if row.get("review_eligible") is True]
+    assert [row["minted_from"] for row in reviewers] == ["factory_default"]
+    assert {row["route"]["target_id"] for row in reviewers} <= {"owner-main", "owner-main (local)"}
     assert onboarding.calls["snapshot"] == 0
     assert not onboarding.settings_path.exists()
 
@@ -572,11 +599,12 @@ def test_completion_validates_but_never_replaces_owner_edited_actor_rows(onboard
     )
     assert preview.status_code == 200, preview.text
     assert preview.json()["source"] == "configured"
-    expected = {
-        "enabled": True,
-        "items": [{k: v for k, v in owner["items"][0].items() if k != "name"}],
-    }
-    assert preview.json()["available_subagents"] == expected
+    expected = preview.json()["available_subagents"]
+    # The owner's row stays verbatim; the review pool IS catalog rows, so the
+    # connected subscriptions' reviewer rows are appended to it, marked.
+    assert expected["items"][0] == {k: v for k, v in owner["items"][0].items() if k != "name"}
+    assert [(row["route"]["target_id"], row["review_eligible"], row["minted_from"]) for row in expected["items"][1:]] == [
+        ("claude=claude-opus-5-5", True, "factory_default"), ("codex=gpt-5.6-sol", True, "factory_default")]
     assert not onboarding.settings_path.exists()
 
     response = onboarding.client.post(
@@ -669,36 +697,36 @@ def test_nonfresh_recovery_completion_still_saves_an_explicit_owner_draft(onboar
         SUBAGENTS_SETTING: "",
         "OUROBOROS_REVIEWER_SLOTS": "owner-reviewer-bytes",
     }), encoding="utf-8")
-    owner = {
-        "enabled": True,
-        "items": [{
-            "subagent_id": "owner-route",
-            "name": "Owner route",
-            "recommended_use": "Use this exact recovery draft.",
-            "route": {"kind": "api_model", "target_id": "openai/gpt-5.6-sol"},
-        }],
+    row = {
+        "subagent_id": "owner-route",
+        "name": "Owner route",
+        "recommended_use": "Use this exact recovery draft.",
+        "route": {"kind": "api_model", "target_id": "openai/gpt-5.6-sol"},
     }
 
-    response = onboarding.client.post(
-        "/api/onboarding/complete",
-        json={
-            **WIZARD_PAYLOAD,
-            "subscriptionsConnected": True,
-            SUBAGENTS_SETTING: owner,
-        },
-    )
+    def _finish(item, **extra):
+        return onboarding.client.post("/api/onboarding/complete", json={
+            **WIZARD_PAYLOAD, "subscriptionsConnected": True,
+            SUBAGENTS_SETTING: {"enabled": True, "items": [item]}, **extra})
+
+    # A recovery draft that marks no reviewer is the empty-pool refusal: nothing is written.
+    refused = _finish(row)
+    assert refused.status_code == 400, refused.text
+    assert refused.json()["code"] == "empty_review_pool"
+    assert json.loads(onboarding.settings_path.read_text(encoding="utf-8"))["OUROBOROS_REVIEWER_SLOTS"] == "owner-reviewer-bytes"
+
+    marked = {**row, "review_eligible": True}
+    response = _finish(marked)
 
     assert response.status_code == 200, response.text
     assert response.json()["preset"]["reason"] == "configured_by_owner"
     assert response.json()["preset"]["applied"] is True
     assert onboarding.calls["snapshot"] == 0
     saved = onboarding.saved()
-    expected = {
-        "enabled": True,
-        "items": [{k: v for k, v in owner["items"][0].items() if k != "name"}],
-    }
+    expected = {"enabled": True, "items": [{k: v for k, v in marked.items() if k != "name"}]}
     assert json.loads(saved[SUBAGENTS_SETTING]) == expected
-    assert saved["OUROBOROS_REVIEWER_SLOTS"] == "owner-reviewer-bytes"
+    # The owner's catalog save is the one that clears the unmigratable lane bytes.
+    assert "OUROBOROS_REVIEWER_SLOTS" not in saved
     assert not saved.get(PRESET_MARKER_KEY)
 
 
@@ -747,7 +775,7 @@ def test_an_environment_completion_fact_cannot_close_the_install_window(monkeypa
     assert body["preset"]["applied"] is True
     assert onboarding.calls["snapshot"] == 1, "the daemon was never consulted"
     saved = onboarding.saved()
-    assert saved[PRESET_MARKER_KEY] == "3"
+    assert saved[PRESET_MARKER_KEY] == "4"
     # The endpoint's own timestamp, not the environment's.
     assert saved[ONBOARDING_COMPLETED_KEY] != "2020-01-01T00:00:00Z"
 
@@ -774,7 +802,7 @@ def test_subscription_free_completion_still_materializes_actor_default(onboardin
     assert response.json()["preset"]["applied"] is True
     saved = onboarding.saved()
     assert saved[ONBOARDING_COMPLETED_KEY], "the completion fact IS unconditional"
-    assert saved.get(PRESET_MARKER_KEY) == "3"
+    assert saved.get(PRESET_MARKER_KEY) == "4"
     assert json.loads(saved[SUBAGENTS_SETTING])["items"]
 
 
@@ -862,7 +890,7 @@ def test_a_post_commit_failure_reports_the_save_that_landed(monkeypatch, onboard
     assert "supervisor refused to start" in body["error"]
     # And the transaction really IS on disk, preset marker included.
     saved = onboarding.saved()
-    assert saved[PRESET_MARKER_KEY] == "3"
+    assert saved[PRESET_MARKER_KEY] == "4"
     assert saved[ONBOARDING_COMPLETED_KEY]
     assert saved["OPENROUTER_API_KEY"] == WIZARD_PAYLOAD["OPENROUTER_API_KEY"]
 
@@ -981,9 +1009,9 @@ def test_install_time_status_cannot_be_forged_from_the_payload(onboarding):
     assert response.json()["preset"]["applied"] is False
     saved = onboarding.saved()
     assert not saved.get(PRESET_MARKER_KEY)
-    # Review is now an ordinary editable wizard surface. Its valid explicit
-    # value is preserved, but it cannot reopen presets or lower safety.
-    assert saved["OUROBOROS_REVIEWER_SLOTS"] == manual_slots
+    # Reviewers are catalog rows now: a posted lane value is not authored, and
+    # it cannot reopen presets or lower safety.
+    assert not saved.get("OUROBOROS_REVIEWER_SLOTS")
     assert saved.get("OUROBOROS_SAFETY_MODE", "") != "off"
 
 
@@ -1047,7 +1075,10 @@ def test_running_process_keeps_its_boot_runtime_mode(onboarding):
 # ---------------------------------------------------------------------------
 
 
-def _routable_snapshot(accounts, profiles=(), harnesses=None):
+def _routable_snapshot(pools=(), profiles=(), harnesses=None, *, legacy_accounts=()):
+    roster = {"profiles": list(profiles), "harnessAccounts": list(legacy_accounts)}
+    if pools is not None:  # None: a pre-unified body, which carries no pool key at all
+        roster["accountPools"] = list(pools)
     return {
         "daemon": {"state": "running"},
         "harnesses": harnesses if harnesses is not None else [
@@ -1056,7 +1087,7 @@ def _routable_snapshot(accounts, profiles=(), harnesses=None):
             {"id": "cursor", "status": "ok", "enabled": True,
              "models": [{"id": "cursor-grok-4.6-high"}]},
         ],
-        "profiles": {"harnessAccounts": list(accounts), "profiles": list(profiles)},
+        "profiles": roster,
     }
 
 
@@ -1066,14 +1097,13 @@ def test_only_daemon_routable_accounts_become_discoveries():
     from ouroboros.gateway.onboarding import verified_harness_discoveries
 
     snapshot = _routable_snapshot(
-        # claude: the live CLI session. codex: the engine would rotate onto a
-        # verified subscription profile. cursor: signed in nowhere.
-        [_native_account("claude"),
-         _profile_account("codex", "koshak"),
-         {"harness_id": "cursor", "native_credentials_enabled": True,
-          "native_login_detected": False, "identity": None,
-          "next_up": {"kind": "none", "reason": "the default credential is not ready"}}],
-        [_profile("codex", "koshak")],
+        # claude: its migrated default login is next up. codex: the engine
+        # would rotate onto a verified subscription profile. cursor: signed in
+        # nowhere.
+        [_pool("claude", {"kind": "profile", "profileId": "claude-default"}),
+         _pool("codex", {"kind": "profile", "profileId": "koshak"}),
+         _pool("cursor", {"kind": "none", "reason": "the default credential is not ready"})],
+        [_profile("claude", "claude-default"), _profile("codex", "koshak")],
     )
 
     discoveries, failure = verified_harness_discoveries(snapshot)
@@ -1089,7 +1119,7 @@ def test_an_api_key_profile_is_never_counted_as_a_subscription():
     from ouroboros.gateway.onboarding import subscription_routable_harnesses
 
     routable, refused = subscription_routable_harnesses(_routable_snapshot(
-        [_profile_account("claude", "byok")],
+        [_pool("claude", {"kind": "profile", "profileId": "byok"})],
         [_profile("claude", "byok", kind="api_key", availability="unavailable")],
     ))
 
@@ -1097,50 +1127,44 @@ def test_an_api_key_profile_is_never_counted_as_a_subscription():
     assert "API credential" in refused["claude"]
 
 
-def test_a_native_api_key_route_is_never_counted_as_a_subscription():
-    """Same class on the OTHER seat: the default account of an API-key-only
-    harness is a detected login too — the engine names its route `api_key`."""
-    from ouroboros.gateway.onboarding import subscription_routable_harnesses
-
-    routable, refused = subscription_routable_harnesses(
-        _routable_snapshot([_native_account("codex", route="api_key")]))
-
-    assert routable == {}
-    assert "API key" in refused["codex"]
-
-
-def test_a_disabled_or_unavailable_harness_is_refused_even_when_signed_in():
+def test_a_disabled_harness_is_refused_and_an_unavailable_row_needs_a_vouched_seat():
     """The other half of the reviewer's probe: the harness row itself. An
-    engine that cannot run the harness cannot run a subscription session on it,
-    however healthy the account looks."""
+    engine that has the harness disabled runs nothing on it, however healthy
+    the account looks; an unavailable row runs only a named seat its own
+    doctor probe vouches (the agy shape, Claudexor INV-135)."""
     from ouroboros.gateway.onboarding import subscription_routable_harnesses
 
     routable, refused = subscription_routable_harnesses(_routable_snapshot(
-        [_native_account("claude"), _native_account("codex")],
+        [_pool("claude", {"kind": "profile", "profileId": "claude-default"}),
+         _pool("codex", {"kind": "profile", "profileId": "codex-default"}),
+         _pool("cursor", {"kind": "none", "reason": "nothing routable"})],
+        [_profile("claude", "claude-default"), _profile("codex", "codex-default")],
         harnesses=[
             {"id": "claude", "status": "ok", "enabled": False, "models": [{"id": "claude-opus-5"}]},
             {"id": "codex", "status": "unavailable", "enabled": True,
              "models": [{"id": "gpt-5.6-sol"}]},
+            {"id": "cursor", "status": "unavailable", "enabled": True, "models": []},
         ],
     ))
 
-    assert routable == {}
     assert refused == {"claude": "the engine has this harness disabled",
-                       "codex": "the engine reports it unavailable"}
+                       "cursor": "the engine reports it unavailable"}
+    assert routable["codex"].startswith(
+        "account 'codex-default' (config_dir_login) (the harness row reads unavailable")
 
 
 def test_an_unverified_or_disabled_profile_seat_is_refused():
     from ouroboros.gateway.onboarding import subscription_routable_harnesses
 
     unverified = subscription_routable_harnesses(_routable_snapshot(
-        [_profile_account("cursor", "koshakcot-ultra")],
+        [_pool("cursor", {"kind": "profile", "profileId": "koshakcot-ultra"})],
         [_profile("cursor", "koshakcot-ultra", availability="unavailable",
                   verification="not_run")]))
     disabled = subscription_routable_harnesses(_routable_snapshot(
-        [_profile_account("cursor", "sol-validator")],
+        [_pool("cursor", {"kind": "profile", "profileId": "sol-validator"})],
         [_profile("cursor", "sol-validator", enabled=False)]))
     missing = subscription_routable_harnesses(
-        _routable_snapshot([_profile_account("cursor", "ghost")]))
+        _routable_snapshot([_pool("cursor", {"kind": "profile", "profileId": "ghost"})]))
 
     assert unverified[0] == {} and "unavailable" in unverified[1]["cursor"]
     assert disabled[0] == {} and "disabled" in disabled[1]["cursor"]
@@ -1155,15 +1179,10 @@ _ROUTE_UNKNOWN_NOW = ("the default credential route is unknown; refresh Accounts
                       "`claudexor doctor`")
 
 
-def _no_capacity_now(harness, *, native_login):
+def _no_capacity_now(harness, reason):
     """A harness whose subscription IS configured and whose CURRENT routing answer
     is a refusal — the shape of a spent window at the moment of onboarding."""
-    return {"harness_id": harness, "native_credentials_enabled": True,
-            "native_login_detected": native_login,
-            "identity": {"email": "owner@example.com", "plan": "claude_max"}
-                        if native_login else None,
-            "next_up": {"kind": "none",
-                        "reason": _NOT_READY_NOW if native_login else _ROUTE_UNKNOWN_NOW}}
+    return _pool(harness, {"kind": "none", "reason": reason})
 
 
 def test_a_routing_refusal_now_does_not_delete_a_subscription_from_the_preset():
@@ -1176,23 +1195,23 @@ def test_a_routing_refusal_now_does_not_delete_a_subscription_from_the_preset():
     got a Codex-only preset PERMANENTLY, with no seam left to revisit it. D-3
     says an exhausted subscription row stays CONFIGURED and waits for capacity.
 
-    Two shapes, both with the engine's verbatim reason strings: a signed-in
-    default session the engine will not route this minute, and a harness whose
-    only seat is a named subscription profile (the default `limit_action: fail`
-    policy never names a profile in `next_up`, so this is the ordinary Cursor
-    account shape)."""
+    Two shapes, both with the engine's verbatim reason strings: the migrated
+    default login the engine will not route this minute, and a harness whose
+    only seat is another named subscription profile (the default `limit_action:
+    fail` policy never names a profile in `next_up`, so this is the ordinary
+    Cursor account shape)."""
     from ouroboros.gateway.onboarding import subscription_routable_harnesses
 
     routable, refused = subscription_routable_harnesses(_routable_snapshot(
-        [_no_capacity_now("claude", native_login=True),
-         _no_capacity_now("cursor", native_login=False)],
-        [_profile("cursor", "sol-validator")],
+        [_no_capacity_now("claude", _NOT_READY_NOW), _no_capacity_now("cursor", _ROUTE_UNKNOWN_NOW)],
+        [_profile("claude", "claude-default"), _profile("cursor", "sol-validator")],
     ))
 
     assert refused == {}
     assert set(routable) == {"claude", "cursor"}
     # The evidence stays honest: the seat, and the engine's own reason beside it.
-    assert routable["claude"] == f"signed-in default session; no capacity right now ({_NOT_READY_NOW})"
+    assert routable["claude"] == (
+        f"account 'claude-default' (config_dir_login); no capacity right now ({_NOT_READY_NOW})")
     assert routable["cursor"] == (
         f"account 'sol-validator' (config_dir_login); no capacity right now ({_ROUTE_UNKNOWN_NOW})")
 
@@ -1204,10 +1223,12 @@ def test_a_seat_with_no_capacity_still_reaches_the_compiled_preset_with_its_mode
     from ouroboros.gateway.onboarding import verified_harness_discoveries
 
     snapshot = _routable_snapshot(
-        [_no_capacity_now("claude", native_login=True), _native_account("codex")],
+        [_no_capacity_now("claude", _NOT_READY_NOW),
+         _pool("codex", {"kind": "profile", "profileId": "codex-default"})],
+        [_profile("claude", "claude-default"), _profile("codex", "codex-default")],
         harnesses=[
             {"id": "claude", "status": "ok", "enabled": True,
-             "models": [{"id": "claude-opus-5"}, {"id": "claude-sonnet-5"},
+             "models": [{"id": "claude-opus-5-5"}, {"id": "claude-opus-5"}, {"id": "claude-sonnet-5"},
                         {"id": "claude-fable-5"}, {"id": "claude-opus-4-6"}]},
             {"id": "codex", "status": "ok", "enabled": True,
              "models": [{"id": "gpt-5.6-sol"}, {"id": "gpt-5.6-terra"}, {"id": "gpt-5.5"}]},
@@ -1222,27 +1243,20 @@ def test_a_seat_with_no_capacity_still_reaches_the_compiled_preset_with_its_mode
 
 
 # ---------------------------------------------------------------------------
-# The UNIFIED account model's wire (sprint plan §K.7 + frozen contract §L):
-# `harnessAccounts` arrives EMPTY (every account a named registry row) and the
-# routing verdict rides the additive `accountPools: [{harness_id, next_up}]`.
+# The pool verdicts of the unified roster: `harnessAccounts` arrives EMPTY
+# (every account a named registry row) and is never read; the routing verdict
+# rides `accountPools: [{harness_id, next_up}]`.
 # ---------------------------------------------------------------------------
 
 
 def _unified_snapshot(pools, profiles=(), harnesses=None, legacy_accounts=()):
-    snapshot = _routable_snapshot(list(legacy_accounts), profiles, harnesses)
-    snapshot["profiles"]["accountPools"] = list(pools)
-    return snapshot
-
-
-def _pool(harness, next_up):
-    return {"harness_id": harness, "next_up": next_up}
+    return _routable_snapshot(pools, profiles, harnesses, legacy_accounts=legacy_accounts)
 
 
 def test_a_unified_engine_routes_through_account_pools_not_the_empty_legacy_key():
-    """The dual-read's load-bearing half: on a unified engine the legacy
-    `harnessAccounts` is `[]`, so the old accounts.get(harness) authority is
-    absent — skipping there would silently drop EVERY unified harness from the
-    preset. The pool row is the accounts authority on that wire."""
+    """The pool row is the routing authority: `harnessAccounts` is `[]` on this
+    wire, and a harness skipped for lacking a row there would silently drop
+    EVERY harness from the preset."""
     from ouroboros.gateway.onboarding import subscription_routable_harnesses
 
     routable, refused = subscription_routable_harnesses(_unified_snapshot(
@@ -1252,10 +1266,9 @@ def test_a_unified_engine_routes_through_account_pools_not_the_empty_legacy_key(
     ))
 
     assert routable == {"claude": "account 'claude-default' (config_dir_login)"}
-    # The pool union's explicit API-key verdict is a refusal, same wording
-    # class as the legacy native api_key route.
+    # The pool union's explicit API-key verdict is a refusal.
     assert "API key" in refused["codex"]
-    # No pool row and no legacy row: silent absence, exactly as before.
+    # No pool row: silent absence.
     assert "cursor" not in routable and "cursor" not in refused
 
 
@@ -1279,7 +1292,7 @@ def test_a_unified_refusal_still_keeps_a_configured_named_seat_in_the_preset():
 
 
 def test_an_unknown_pool_kind_is_fail_safe_and_the_seat_scan_still_answers():
-    """Either wire may grow a spelling this reader predates (plan §E: degrade
+    """The pool union may grow a spelling this reader predates (plan §E: degrade
     honestly). An unknown kind is never a subscription verdict; a configured
     named profile still counts through the seat scan, and a harness with none
     is refused with the unknown state named."""
@@ -1296,35 +1309,20 @@ def test_an_unknown_pool_kind_is_fail_safe_and_the_seat_scan_still_answers():
     assert "unknown routing state 'quantum_pool'" in refused["codex"]
 
 
-def test_when_both_wires_carry_a_verdict_the_pool_wins():
-    """A transitional payload may carry both. Profiles own account facts, the
-    pool owns routing facts — one authority, or the two could disagree about
-    the same harness."""
-    from ouroboros.gateway.onboarding import subscription_routable_harnesses
-
-    routable, refused = subscription_routable_harnesses(_unified_snapshot(
-        [_pool("codex", {"kind": "api_key_route"})],
-        legacy_accounts=[_native_account("codex")],  # legacy says: healthy session
-    ))
-
-    assert routable == {}
-    assert "API key" in refused["codex"]
-
-
 def test_out_of_capacity_never_launders_an_api_key_or_an_unusable_seat():
     """The round-one finding must not regress through the new fallback: being out
     of capacity is not evidence of being a subscription. A harness whose only
     seats are API credentials, disabled or unverified stays refused."""
     from ouroboros.gateway.onboarding import subscription_routable_harnesses
 
-    # The default login exists, but the harness's auth_preference puts an API key
-    # ahead of it — durable, and exactly what D-3 forbids.
+    # An unpinned run takes an API key and the only named seat is an API
+    # credential: billing the owner's key is exactly what D-3 forbids.
     api_route = subscription_routable_harnesses(
-        _routable_snapshot([_native_account("codex", route="api_key")],
+        _routable_snapshot([_pool("codex", {"kind": "api_key_route"})],
                            [_profile("codex", "koshak", kind="api_key")]))
-    # No native login at all; the only named seats are unusable.
+    # The engine names a seat it does not list; the named seats are unusable.
     only_bad_profiles = subscription_routable_harnesses(_routable_snapshot(
-        [_profile_account("cursor", "ghost")],
+        [_pool("cursor", {"kind": "profile", "profileId": "ghost"})],
         [_profile("cursor", "byok", kind="api_key"),
          _profile("cursor", "off", enabled=False),
          _profile("cursor", "new", verification="not_run")]))
@@ -1337,7 +1335,7 @@ def test_no_routable_account_is_a_typed_failure_that_names_the_reason():
     from ouroboros.gateway.onboarding import verified_harness_discoveries
 
     discoveries, failure = verified_harness_discoveries(_routable_snapshot(
-        [_native_account("claude", detected=False)]))
+        [_pool("claude", {"kind": "none", "reason": "no signed-in session is detected"})]))
 
     assert discoveries == ()
     assert failure is not None and failure.code == "no_verified_account"
@@ -1394,7 +1392,7 @@ def test_get_onboarding_read_writes_nothing(monkeypatch, tmp_path):
     assert not settings_path.exists(), "GET /api/onboarding created settings.json"
 
     # And with a settings file present, its bytes and mtime are untouched.
-    settings_path.write_text(json.dumps({"OUROBOROS_MODEL": "openai/gpt-5.6-luna"}),
+    settings_path.write_text(json.dumps({"OUROBOROS_MODEL": "openai/gpt-5.6-luna", "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE": "full"}),
                              encoding="utf-8")
     before_bytes = settings_path.read_bytes()
     before_mtime = settings_path.stat().st_mtime_ns
@@ -1509,7 +1507,7 @@ def test_a_connected_agy_account_composes_with_core_reviewers(onboarding):
         "daemon": {"state": "running"},
         "harnesses": [
             {"id": "claude", "status": "ok", "enabled": True,
-             "models": [{"id": "claude-opus-5"}, {"id": "claude-sonnet-5"},
+             "models": [{"id": "claude-opus-5-5"}, {"id": "claude-opus-5"}, {"id": "claude-sonnet-5"},
                         {"id": "claude-fable-5"}, {"id": "claude-opus-4-6"}]},
             {"id": "agy", "status": "unavailable", "enabled": True,
              "models": [{"id": "gemini-3.8-flash-high"}, {"id": "gemini-3.1-pro-high"}]},
@@ -1519,13 +1517,10 @@ def test_a_connected_agy_account_composes_with_core_reviewers(onboarding):
             # DEFAULT credential is not ready, which is agy's permanent state —
             # the routable verdict must come from the configured-profile
             # fallback, not from a profile-kind next_up.
-            "harnessAccounts": [
-                _native_account("claude"),
-                {"harness_id": "agy", "native_credentials_enabled": True,
-                 "native_login_detected": False, "identity": None,
-                 "next_up": {"kind": "none", "reason": "no default credential store"}},
-            ],
-            "profiles": [_profile("agy", "work")],
+            "profiles": [_profile("claude", "claude-default"), _profile("agy", "work")],
+            "harnessAccounts": [],
+            "accountPools": [_pool("claude", {"kind": "profile", "profileId": "claude-default"}),
+                             _pool("agy", {"kind": "none", "reason": "no default credential store"})],
         },
     }
 
@@ -1536,22 +1531,12 @@ def test_a_connected_agy_account_composes_with_core_reviewers(onboarding):
 
     assert response.status_code == 200, response.text
     saved = onboarding.saved()
-    actor_targets = [
-        row["route"]["target_id"]
-        for row in json.loads(saved[SUBAGENTS_SETTING])["items"]
-    ]
-    assert "agy=gemini-3.8-flash-high" in actor_targets
-    reviewer = json.loads(saved["OUROBOROS_REVIEWER_SLOTS"])
-    roster = {
-        row["subagent_id"]: row["route"]["target_id"]
-        for row in json.loads(saved[SUBAGENTS_SETTING])["items"]
-    }
-    triad_targets = [
-        roster[row["subagent_id"]] if "subagent_id" in row
-        else row["route"]["target_id"]
-        for row in reviewer["triad"]
-    ]
-    assert all("agy=" not in target for target in triad_targets)
+    items = json.loads(saved[SUBAGENTS_SETTING])["items"]
+    assert "agy=gemini-3.8-flash-high" in [row["route"]["target_id"] for row in items]
+    # The review pool is the marked rows: the core reviewers, never an agy session.
+    reviewers = [row["route"]["target_id"] for row in items if row.get("review_eligible") is True]
+    assert reviewers and all("agy=" not in target for target in reviewers)
+    assert "OUROBOROS_REVIEWER_SLOTS" not in saved
     assert onboarding.calls["supervisor"] == 1
 
 
@@ -1565,21 +1550,176 @@ def test_an_unavailable_harness_row_with_a_verified_named_profile_is_routable():
 
     snapshot = {
         "harnesses": [{"id": "agy", "status": "unavailable", "enabled": True}],
-        "profiles": {
-            "harnessAccounts": [_profile_account("agy", "work")],
-            "profiles": [_profile("agy", "work")],
-        },
+        "profiles": {"profiles": [_profile("agy", "work")], "harnessAccounts": [],
+                     "accountPools": [_pool("agy", {"kind": "profile", "profileId": "work"})]},
     }
     routable, refused = subscription_routable_harnesses(snapshot)
     assert "agy" in routable, refused
     assert "no default credential store" in routable["agy"]
 
-    # Same row, but only a signed-in DEFAULT session: still refused — the
-    # harness row is that seat's only runnability signal.
+    # Same row with no vouched named seat: refused — nothing else can vouch a
+    # seat on a row that reads unavailable.
     snapshot = {
         "harnesses": [{"id": "agy", "status": "unavailable", "enabled": True}],
-        "profiles": {"harnessAccounts": [_native_account("agy")], "profiles": []},
+        "profiles": {"profiles": [], "harnessAccounts": [],
+                     "accountPools": [_pool("agy", {"kind": "none", "reason": "no default credential store"})]},
     }
     routable, refused = subscription_routable_harnesses(snapshot)
     assert "agy" not in routable
     assert refused["agy"] == "the engine reports it unavailable"
+
+
+# --- the preview judges a draft against the keys the runtime resolves (#2969) ---
+
+_WORK_ROW = {"kind": "openai", "name": "work", "api_key": "row-work-key-0001"}
+
+
+def _bootstrap_draft(onboarding, monkeypatch, **environ) -> dict:
+    """The API-only draft the wizard posts, from the real bootstrap of an install whose environment holds ``environ``."""
+    from ouroboros.gateway import onboarding_host
+    from ouroboros.provider_models import CONNECTIONS_KEY
+
+    for key in (CONNECTIONS_KEY, "OUROBOROS_MODEL", "OUROBOROS_MODEL_LIGHT", "OUROBOROS_MODEL_FALLBACKS"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in environ.items():
+        monkeypatch.setenv(key, value)
+    app = Starlette(routes=[Route("/api/onboarding/bootstrap", endpoint=onboarding_host.api_onboarding_bootstrap)])
+    app.state.drive_root = onboarding.settings_path.parent
+    with TestClient(app) as client:
+        state = client.get("/api/onboarding/bootstrap").json()["bootstrap"]["initialState"]
+    return {CONNECTIONS_KEY: state["connections"], "OPENAI_API_KEY": state["openaiKey"],
+            "OUROBOROS_MODEL": state["mainModel"], "OUROBOROS_MODEL_LIGHT": state["lightModel"],
+            "OUROBOROS_MODEL_FALLBACKS": state["fallbackModel"],
+            "OUROBOROS_RUNTIME_MODE": "advanced", "TOTAL_BUDGET": 25.0, "OUROBOROS_PER_TASK_COST_USD": 5.0,
+            "subscriptionsConnected": False}
+
+
+@pytest.mark.parametrize(("environ", "key"), [
+    ({"OUROBOROS_CONNECTIONS": json.dumps([_WORK_ROW])}, "openai@work"),
+    ({"OPENAI_API_KEY": "env-built-in-key-0001"}, "openai"),
+], ids=["named", "built-in"])
+def test_an_environment_only_key_previews_and_completes_as_the_runtime_reads_it(onboarding, monkeypatch, environ, key):
+    """The wizard shows an operator's key masked (or as the configured placeholder); preview and completion read it
+    where the runtime does, so the reviewers the preview shows are the ones the install then runs."""
+    import ouroboros.config as config
+    from ouroboros.llm_routing import resolve_target
+
+    draft = _bootstrap_draft(onboarding, monkeypatch, **environ)
+    assert draft["OUROBOROS_MODEL"].startswith(f"{key}::")
+    preview = onboarding.client.post("/api/onboarding/subagents/preview", json=draft)
+    assert preview.status_code == 200, preview.text
+    reviewers = [row["route"]["target_id"] for row in preview.json()["available_subagents"]["items"]
+                 if row.get("review_eligible")]
+    assert reviewers and all(target.startswith(f"{key}::") for target in reviewers)
+    assert not onboarding.settings_path.exists()  # previewing writes nothing
+    done = onboarding.client.post("/api/onboarding/complete", json={
+        **draft, SUBAGENTS_SETTING: preview.json()["available_subagents"], "attempt_id": "env-only-key-0000001"})
+    assert done.status_code == 200, done.text
+    loaded = config.load_settings()
+    assert loaded["OUROBOROS_MODEL"] == draft["OUROBOROS_MODEL"]
+    marked = [row["route"]["target_id"] for row in json.loads(loaded[SUBAGENTS_SETTING])["items"]
+              if row.get("review_eligible")]
+    assert marked == reviewers and all(resolve_target(target, loaded).get("api_key") for target in marked)
+
+
+@pytest.mark.parametrize("case", ["disabled-row", "masked-row-of-another-key", "placeholder-without-a-key"])
+def test_a_draft_without_a_key_the_runtime_resolves_is_refused_by_both(onboarding, monkeypatch, case):
+    """No other key stands in: a disabled row, a masked row naming a key the install lacks (the operator's other key
+    is not borrowed) and the configured-key placeholder with no key anywhere all leave the draft without access."""
+    from ouroboros.secret_masking import CONFIGURED_SECRET_PLACEHOLDER
+
+    environ = {"disabled-row": {"OUROBOROS_CONNECTIONS": json.dumps([{**_WORK_ROW, "enabled": False}])},
+               "masked-row-of-another-key": {"OUROBOROS_CONNECTIONS": json.dumps([_WORK_ROW])},
+               "placeholder-without-a-key": {}}[case]
+    draft = _bootstrap_draft(onboarding, monkeypatch, **environ)
+    if case == "masked-row-of-another-key":
+        draft["OUROBOROS_CONNECTIONS"] = [{**row, "name": "home"} for row in draft["OUROBOROS_CONNECTIONS"]]
+        draft["OUROBOROS_MODEL"] = "openai@home::gpt-5.6-terra"
+    if case == "placeholder-without-a-key":
+        draft["OPENAI_API_KEY"] = CONFIGURED_SECRET_PLACEHOLDER
+    preview = onboarding.client.post("/api/onboarding/subagents/preview", json=draft)
+    assert preview.status_code == 400 and "before continuing" in preview.json()["error"], preview.text
+    done = onboarding.client.post("/api/onboarding/complete", json={**draft, "attempt_id": f"refused-{case}"})
+    assert done.status_code == 400, done.text
+    assert not onboarding.settings_path.exists()
+
+
+@pytest.mark.parametrize("environ", [
+    {"GIGACHAT_CREDENTIALS": "env-gigachat-authorization-key"},
+    {"GIGACHAT_USER": "env-gigachat-user", "GIGACHAT_PASSWORD": "short"},  # a password is no API key: any length
+], ids=["authorization-key", "user-and-password"])
+def test_a_built_in_gigachat_key_previews_and_completes_on_the_built_in_route(onboarding, monkeypatch, environ):
+    """Either of GigaChat's declared ways to be ready, from the environment: the bootstrap shows a secret only as the
+    configured placeholder, and the draft built from it previews and completes on ``gigachat::``."""
+    import ouroboros.config as config
+    from ouroboros.gateway import onboarding_host
+    from ouroboros.secret_masking import CONFIGURED_SECRET_PLACEHOLDER
+
+    for key in ("GIGACHAT_CREDENTIALS", "GIGACHAT_USER", "GIGACHAT_PASSWORD"):
+        monkeypatch.delenv(key, raising=False)
+    draft = _bootstrap_draft(onboarding, monkeypatch, **environ)
+    app = Starlette(routes=[Route("/api/onboarding/bootstrap", endpoint=onboarding_host.api_onboarding_bootstrap)])
+    app.state.drive_root = onboarding.settings_path.parent
+    with TestClient(app) as client:
+        state = client.get("/api/onboarding/bootstrap").json()["bootstrap"]["initialState"]
+    secrets = {"GIGACHAT_CREDENTIALS": "gigachatCredentials", "GIGACHAT_PASSWORD": "gigachatPassword"}
+    for key, state_key in secrets.items():
+        assert state[state_key] == (CONFIGURED_SECRET_PLACEHOLDER if key in environ else "")
+        draft[key] = state[state_key]
+    draft["GIGACHAT_USER"] = state["gigachatUser"]
+    assert state["mainModel"].startswith("gigachat::")
+    draft.update(OUROBOROS_MODEL=state["mainModel"], OUROBOROS_MODEL_LIGHT=state["lightModel"],
+                 OUROBOROS_MODEL_FALLBACKS=state["fallbackModel"])
+    preview = onboarding.client.post("/api/onboarding/subagents/preview", json=draft)
+    assert preview.status_code == 200, preview.text
+    reviewers = [row["route"]["target_id"] for row in preview.json()["available_subagents"]["items"]
+                 if row.get("review_eligible")]
+    assert reviewers and all(target.startswith("gigachat::") for target in reviewers)
+    done = onboarding.client.post("/api/onboarding/complete", json={
+        **draft, SUBAGENTS_SETTING: preview.json()["available_subagents"], "attempt_id": "built-in-gigachat-0001"})
+    assert done.status_code == 200, done.text
+    assert config.load_settings()["OUROBOROS_MODEL"] == state["mainModel"]
+
+
+_OWN_ROW = {"subagent_id": "owner-helper", "recommended_use": "The owner's own helper, no reviewer marked.",
+            "route": {"kind": "api_model", "target_id": "openai/gpt-5.6-sol"}}
+
+
+@pytest.mark.parametrize("catalog", [
+    {"enabled": True, "items": []},  # explicitly empty
+    {"enabled": False, "items": []},  # Off
+    {"enabled": True, "items": [_OWN_ROW]},  # rows, none marked Reviewer
+    None,  # control: never configured, the wizard's to generate
+], ids=["empty", "off", "unmarked", "automatic"])
+@pytest.mark.parametrize("where", ["saved", "operator"])
+def test_connected_subscriptions_keep_the_installs_own_catalog_and_generate_only_an_automatic_one(
+        onboarding, monkeypatch, catalog, where):
+    """#2969: reopening setup with subscriptions connected shows and saves a catalog the install has (saved, or an
+    operator's variable) as it is, empty, Off and unmarked included; only an automatic one gains the reviewers."""
+    from ouroboros.configured_subagents import configured_subagents_dict, normalize_configured_subagents
+
+    def canonical(value):
+        return configured_subagents_dict(normalize_configured_subagents(value)[0])
+
+    if catalog is not None and where == "saved":
+        onboarding.settings_path.write_text(json.dumps({**WIZARD_PAYLOAD, SUBAGENTS_SETTING: json.dumps(catalog)}),
+                                            encoding="utf-8")
+    elif catalog is not None:  # no document: the install-time preset applies, over the operator's catalog
+        monkeypatch.setenv(SUBAGENTS_SETTING, json.dumps(catalog))
+    draft = {**WIZARD_PAYLOAD, "subscriptionsConnected": True}
+    first = onboarding.client.post("/api/onboarding/subagents/preview", json=draft)  # the wizard's first: no catalog
+    assert first.status_code == 200, first.text
+    shown = first.json()["available_subagents"]
+    again = onboarding.client.post("/api/onboarding/subagents/preview", json={**draft, SUBAGENTS_SETTING: shown})
+    assert again.status_code == 200, again.text
+    assert again.json()["available_subagents"] == shown  # the visible catalog previews as itself
+    done = onboarding.client.post("/api/onboarding/complete", json={
+        **draft, SUBAGENTS_SETTING: shown, "attempt_id": f"own-catalog-{where}-0001"})
+    assert done.status_code == 200, done.text
+    after = canonical(onboarding.saved()[SUBAGENTS_SETTING])
+    if catalog is None:
+        assert [(row["route"]["target_id"], row.get("review_eligible", False)) for row in shown["items"]
+                if row.get("review_eligible")] == [("claude=claude-opus-5-5", True), ("codex=gpt-5.6-sol", True)]
+        assert after == shown
+    else:
+        assert shown == canonical(catalog) == after, (shown, after)

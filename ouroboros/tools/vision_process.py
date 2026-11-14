@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 import threading
-from typing import Any
+from typing import Any, Optional
 
 from jsonschema import Draft202012Validator
 
@@ -27,7 +27,7 @@ from ouroboros.usage_accounting import (
     PhysicalAttemptCapture, PhysicalAttemptContext, adopt_physical_attempt_capture,
     capture_attempt_ids, current_usage_scope, last_physical_attempt_capture,
 )
-from ouroboros.utils import atomic_write_json
+from ouroboros.utils import atomic_write_json, read_text_across_replace
 
 log = logging.getLogger(__name__)
 
@@ -41,13 +41,22 @@ _STRING = {"type": "string"}
 _DICT = {"type": "object"}
 _NULL_INT = {"type": ["integer", "null"]}
 _CONTEXT = _object({
-    "profile": {"enum": ["owner_max", "owner_low", "owner_nano", "task_local_low"]},
+    "profile": {"enum": ["owner_max", "owner_low", "owner_nano", "task_local_low", "task_local_nano"]},
     "rendered_mode": {"enum": ["max", "low", "nano"]},
-    "measurement_basis": {"enum": ["fresh_route_usage", "fresh_model_usage", "cold_estimate"]},
+    "measurement_basis": {"enum": ["fresh_route_usage", "fresh_model_usage", "refused_input", "cold_estimate"]},
     "route_fp": _STRING, "round_id": _STRING,
     "target_total_tokens": _NULL_INT, "capacity_total_tokens": _NULL_INT,
     "context_target_miss": {"type": "boolean"}, "automatic_pass_used": {"type": "boolean"},
+    "measurement_density": {"type": ["number", "null"]},
+    "view_kind": _STRING,
+    "response_reserve_tokens": {"type": "integer", "minimum": 0},
+    "window_witness_bound": {"type": "boolean"},
+    "window_observation_fp": _STRING,
+    "required_book_tokens": {"type": "integer", "minimum": 0},
 })
+_CONTEXT["properties"].update(preferred_mode={"enum": ["", "max", "low", "nano"]}, mode_cause={  # optional: receipts
+    "enum": ["", "memory", "route", "window", "after_start"]},  # retained before these facts carry neither
+    prefix={"type": ["object", "null"]})  # what the candidate did to its route's cached start (transcript_prefix)
 _CAPTURE = _object({
     **{key: _STRING for key in ("attempt_id", "model", "provider", "provider_code", "provider_error_type", "provider_error")},
     "state": {"enum": ["reserved", "released", "dispatched", "settled", "unresolved"]},
@@ -61,6 +70,8 @@ _CAPTURE = _object({
     "processing_preference": _STRING,
     "submitted_processing_mode": _STRING,
     "processing_basis": {"type": ["object", "null"]},
+    "effort": {"type": ["object", "null"]},
+    "prompt_tokens_bounded_estimate": {"type": "integer", "minimum": 0},
 })
 _CUSTODY = _object({
     "operation_id": _STRING, "invocation_id": {"type": "string", "minLength": 1},
@@ -73,7 +84,7 @@ _RECEIPT = _object({
 })
 _RESULT = _object({
     **_RECEIPT["properties"],
-    "kind": {"enum": ["success", "model", "not_dispatched", "interrupted", "error"]},
+    "kind": {"enum": ["success", "model", "not_dispatched", "send_refused", "interrupted", "error"]},
     "text": _STRING, "usage": _DICT, "ledger_attempt_ids": {"type": "array", "items": _STRING},
     "error": _STRING, "problem": _DICT, "operation_id": _STRING,
     "model_role": _STRING, "route": _DICT, "unknown": {"type": "boolean"},
@@ -101,6 +112,9 @@ def _read_receipt(value: Any, receipt_id: str, *, terminal: bool = False) -> dic
             raise ValueError("VLM non-dispatch requires its released physical attempt receipt")
         if custody and custody["operation_id"] and custody["operation_id"] != value["operation_id"]:
             raise ValueError("VLM terminal error belongs to another model operation")
+    if terminal and value["kind"] == "send_refused" and (value["unknown"] or value["control_reason"] != "deadline"
+                                                         or (capture is not None and capture["state"] != "released")):
+        raise ValueError("A refused VLM send names its own window and holds no open physical attempt")
     return value
 
 
@@ -125,6 +139,7 @@ def _private_json(path: Path, value: dict) -> None:
 def child_main(payload_path: str) -> None:
     """Entrypoint imported by the tracked child, never a second wait owner."""
     from ouroboros.llm import LLMClient
+    from ouroboros.llm_attempt import PhysicalDispatchInterrupted
     from ouroboros.llm_claudexor import ClaudexorModelError, ClaudexorModelNotDispatched
     from ouroboros.model_wait import ModelWaitInterrupted
     from ouroboros.usage_accounting import UsageScope, usage_scope
@@ -139,21 +154,26 @@ def child_main(payload_path: str) -> None:
     if sleep_for > 0:
         import time
         time.sleep(sleep_for)
-    custody = None
+    custody = receipted_custody = None
 
     def observe(value):
-        nonlocal custody
-        Draft202012Validator(_CUSTODY).validate(value)
-        custody = value
+        nonlocal custody, receipted_custody
+        # The transport also publishes activity. IPC keeps its custody-only ABI.
+        projected = {key: value[key] for key in _CUSTODY["properties"] if key in value}
+        Draft202012Validator(_CUSTODY).validate(projected)
+        if projected == receipted_custody:
+            return
+        custody = projected
         capture = last_physical_attempt_capture()
         _private_json(payload_file.with_name("receipt.json"), {
             "receipt_id": receipt_id, "custody": custody,
             "capture": asdict(capture) if capture else None,
         })
+        receipted_custody = custody  # A failed write stays eligible at the next observation.
 
     def control():
         try:
-            value = json.loads(payload_file.with_name("control.json").read_text(encoding="utf-8"))
+            value = json.loads(read_text_across_replace(payload_file.with_name("control.json")))
             if set(value) != {"receipt_id", "reason"} or value["receipt_id"] != receipt_id or not isinstance(value["reason"], str):
                 return "child_control_invalid"
             return value["reason"] or None
@@ -176,6 +196,15 @@ def child_main(payload_path: str) -> None:
         except BaseException as exc:
             envelope["kind"] = "error"
             envelope["error"] = f"{type(exc).__name__}: {exc}"
+            if subscription and isinstance(exc, PhysicalDispatchInterrupted):
+                refused = getattr(exc, "physical_attempt_capture", None)
+                if exc.control_reason != "deadline":  # a real control read here keeps its rail at the parent
+                    exc = ModelWaitInterrupted(exc.control_reason, role=str(kwargs.get("model_role") or ""), cause=exc)
+                elif refused is None or refused.state == "released":
+                    # A child has no wait owner or tool window: this clock is only the window its parent selected
+                    # (the task's own deadline arrives as a control). Unsent, with the capture it has, if any; the
+                    # task's remaining time stays with its owner. An open attempt falls through to unknown.
+                    envelope.update(kind="send_refused", control_reason=exc.control_reason)
             if isinstance(exc, (ClaudexorModelError, ModelWaitInterrupted)):
                 cause = getattr(exc, "previous_error", None)
                 cause = cause if isinstance(cause, ClaudexorModelError) else exc
@@ -235,7 +264,7 @@ def _decode_terminal(value: dict, receipt_id: str) -> tuple[str, dict]:
         if attempts or "ledger_attempt_ids" in data["usage"]:
             data["usage"]["ledger_attempt_ids"] = attempts
         return data["text"], data["usage"]
-    if data["kind"] == "error":
+    if data["kind"] in {"error", "send_refused"}:  # a tool failure; no task control a waiter could rewrap
         error = RuntimeError(data["error"])
     else:
         problem = data["problem"]
@@ -256,8 +285,10 @@ def _decode_terminal(value: dict, receipt_id: str) -> tuple[str, dict]:
     raise error
 
 
-def run_vision_child(*, child_timeout: float, subscription: bool, **kwargs: Any) -> tuple[str, dict]:
-    """Run exactly one killable child; every retry remains the parent's decision."""
+def run_vision_child(*, child_timeout: Optional[float], subscription: bool, **kwargs: Any) -> tuple[str, dict]:
+    """Run exactly one killable child; every retry remains the parent's decision. ``None`` (a
+    subscription call no task clock bounds) waits without a timeout: Stop reaches it through the
+    control watcher below, Panic through the tracked process tree."""
     from ouroboros.tools.shell import _tracked_subprocess_run
 
     poll = kwargs.pop("model_poll_control", None)

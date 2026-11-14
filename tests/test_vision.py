@@ -13,17 +13,122 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 
-@pytest.mark.serial
-def test_vision_query_with_timeout_returns_without_waiting_for_hung_worker(monkeypatch):
+def _hang_in_provider_call(ready):
+    """Child side, installed before the real child entry: the direct provider call names its process, then never
+    returns, so only the parent's timeout and kill can end this child."""
+    import threading
+
+    from ouroboros.llm import LLMClient
+
+    def chat(self, **_kwargs):
+        pathlib.Path(f"{ready}.tmp").write_text(str(os.getpid()), encoding="utf-8")
+        os.replace(f"{ready}.tmp", ready)
+        threading.Event().wait()
+
+    LLMClient.chat = chat
+
+
+def test_vision_query_with_timeout_returns_without_waiting_for_hung_worker(monkeypatch, tmp_path):
+    """The real wrapper, child entry, tracked runner, timeout and kill. The child's start-up is not the window
+    (#1895): the real ``communicate`` timeout runs once the child is inside a provider call that never returns,
+    so returning at all proves the caller did not wait for it."""
+    import signal
+    import subprocess
+    import threading
+
     import ouroboros.tools.vision as vision
+    from ouroboros.tools import shell, shell_process
 
     monkeypatch.setattr(vision, "NESTED_SETTLEMENT_MARGIN_SEC", 0.05)
-    started = time.monotonic()
-    with unittest.TestCase().assertRaises(TimeoutError):
-        vision._vision_query_with_timeout(
-            None, prompt="x", images=[], model="m", timeout=0.01, _test_sleep_sec=2,
-        )
-    assert time.monotonic() - started < 0.5
+    registry = set()
+    monkeypatch.setattr(shell_process, "_active_subprocesses", registry)
+    ready, seen, kills, fired = tmp_path / "provider-entered", {}, [], []
+    entered, settled = threading.Event(), threading.Event()
+    original_run, original_kill = shell._tracked_subprocess_run, shell_process._kill_process_group
+
+    original_communicate = subprocess.Popen.communicate
+    def communicate(self, input=None, timeout=None):
+        if "_hang_in_provider_call" not in str(self.args):
+            return original_communicate(self, input, timeout)
+        seen.update(proc=self, window=timeout)
+        limit = time.monotonic() + 120  # start-up only: a bound for a child that never gets there
+        while not ready.exists():
+            if self.poll() is not None or time.monotonic() > limit:
+                self.kill()
+                _out, err = original_communicate(self, timeout=10)
+                pytest.fail(f"the vision child never entered its provider call (exit {self.returncode}): "
+                            f"{err[-2000:]}")
+            time.sleep(0.01)
+        seen["provider_pid"] = int(ready.read_text(encoding="utf-8"))
+        if os.name == "nt":  # a venv's python.exe is a launcher: the interpreter it starts names itself
+            import psutil
+
+            seen["provider"] = psutil.Process(seen["provider_pid"])
+            seen["ancestry"] = {parent.pid for parent in seen["provider"].parents()}
+        entered.set()
+        try:
+            return original_communicate(self, input, timeout)
+        except subprocess.TimeoutExpired as exc:
+            seen["expired"] = exc
+            raise
+
+    def kill(proc):
+        kills.append(proc.poll())  # None: the child was still running when the timeout's kill began
+        original_kill(proc)
+
+    def run(argv, **kwargs):
+        seen.update(forwarded=kwargs["timeout"], ipc=pathlib.Path(argv[-1]).parent)
+        child = list(argv)
+        child[2] = f"import runpy; runpy.run_path({__file__!r})['_hang_in_provider_call']({str(ready)!r}); " + argv[2]
+        with monkeypatch.context() as patch:
+            patch.setattr(subprocess.Popen, "communicate", communicate)
+            return original_run(child, **kwargs)
+
+    def watchdog():
+        # The test's own bound, independent of the code under test: its firing is the failure.
+        if entered.wait(150) and not settled.wait(30):
+            fired.append(seen["proc"].pid)
+            seen["proc"].kill()
+
+    monkeypatch.setattr(shell, "_tracked_subprocess_run", run)
+    monkeypatch.setattr(shell_process, "_kill_process_group", kill)
+    guard = threading.Thread(target=watchdog, name="vision-timeout-watchdog", daemon=True)
+    guard.start()
+    outcome = None
+    try:
+        vision._vision_query_with_timeout(None, prompt="x", images=[], model="m", timeout=0.01)
+    except Exception as exc:  # judged below, after the watchdog's verdict
+        outcome = exc
+    finally:
+        settled.set()
+        entered.set()
+        guard.join()
+        proc = seen.get("proc")
+        alive = proc is not None and proc.poll() is None
+        if alive:
+            proc.kill()  # whatever failed, the test's own child never outlives it
+            proc.wait(10)
+        provider, provider_alive = seen.get("provider"), False
+        if provider is not None:  # the interpreter behind the launcher: the tree kill must have reached it
+            import psutil
+
+            try:
+                provider.wait(10)  # a killed process is gone a moment after the kill returns
+            except psutil.TimeoutExpired:
+                provider_alive = True
+                provider.kill()  # judged below; it never outlives the test either
+    assert not fired, f"the real timeout never ended the hung child; the test's watchdog did ({outcome!r})"
+    assert isinstance(outcome, TimeoutError) and outcome.__cause__ is seen.get("expired"), outcome
+    assert seen["forwarded"] == seen["window"] == pytest.approx(0.01 + 0.05), seen
+    assert seen["provider_pid"] == proc.pid or proc.pid in seen.get("ancestry", ()), \
+        "readiness came from this tracked child"
+    assert not alive and kills == [None], (alive, kills)  # killed while running, never a voluntary exit
+    assert not provider_alive, "the timeout's kill ended the interpreter behind the launcher too"
+    if os.name != "nt":
+        assert proc.returncode == -signal.SIGKILL, proc.returncode
+    else:  # native Windows termination is not qualified by this run
+        assert proc.returncode not in (None, 0), proc.returncode
+    assert not registry and not seen["ipc"].exists(), (registry, seen["ipc"])
 
 
 def test_vlm_tool_envelopes_follow_the_supported_timeout_setting(monkeypatch):
@@ -243,8 +348,7 @@ class TestLLMVisionQuery(unittest.TestCase):
         buf = io.BytesIO()
         img.save(buf, format="PNG")
 
-        with patch.object(vision, "_VLM_MAX_PROVIDER_BYTES", 20_000), \
-             patch.object(vision, "_VLM_MAX_IMAGE_SIDE", 256):
+        with patch.object(vision, "_VLM_MAX_PROVIDER_BYTES", 20_000):
             capped, mime = vision._downscale_image_for_vlm(buf.getvalue(), "image/png")
 
         self.assertEqual(mime, "image/jpeg")
@@ -298,10 +402,10 @@ class TestAnalyzeScreenshotTool(unittest.TestCase):
         images = call_kwargs[1].get("images") or call_kwargs[0][1]
         self.assertEqual(len(images), 1)
         self.assertIn("base64", images[0])
-        # C2.1/C2.2: the VLM call must use a VISION-CAPABLE model (routed to a
-        # capable slot), not blindly the active/default model.
+        # The VLM call never goes to a route confirmed unable to see; with no
+        # metadata at all the configured route is unknown and is called.
         from ouroboros.provider_models import supports_vision
-        self.assertTrue(supports_vision(call_kwargs[1]["model"]))
+        self.assertIsNot(supports_vision(call_kwargs[1]["model"]), False)
         self.assertEqual(call_kwargs[1]["reasoning_effort"], "medium")
         self.assertEqual(call_kwargs[1]["timeout"], 90.0)
 
@@ -588,14 +692,14 @@ def _vision_registry(tmp_path, monkeypatch):
     return registry, uploads
 
 
-def test_view_image_missing_file_is_a_typed_error_at_the_registry(tmp_path, monkeypatch):
+def test_view_image_missing_file_is_a_typed_warning_at_the_registry(tmp_path, monkeypatch):
+    """#1074: an admitted, absent image is a discovery miss, not a failed call."""
     registry, uploads = _vision_registry(tmp_path, monkeypatch)
 
     result = registry.execute_result("view_image", {"path": str(uploads / "missing.png")})
 
-    assert result.status == "error"
-    assert result.code == "TOOL_ARG_ERROR"
-    assert "not found" in result.text.lower()
+    assert (result.status, result.code) == ("ok", "LEGACY_WARNING")
+    assert result.text.startswith("⚠️ FILE_NOT_FOUND: image file not found: ")
     assert registry._ctx.messages == []
 
 
@@ -613,8 +717,7 @@ def test_vlm_query_missing_file_is_typed_and_never_builds_a_client(tmp_path, mon
         "vlm_query", {"prompt": "what is this?", "file_path": str(uploads / "missing.png")},
     )
 
-    assert result.status == "error"
-    assert result.code == "TOOL_ARG_ERROR"
+    assert (result.status, result.code) == ("ok", "LEGACY_WARNING")
     assert "not found" in result.text.lower()
     assert registry._ctx.messages == []
 

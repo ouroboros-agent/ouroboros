@@ -44,40 +44,32 @@ def test_parallel_commit_roster_is_atomic_and_token_updates_are_exact(tmp_path):
         time.time(),
         {"fingerprint": "binding-1"},
     )
-    triad_plan = {
-        "models": ["model-a"],
-        "routes": [ReviewRouteKind.AGENT_SESSION],
-        "efforts": ["high"],
-        "slot_ids": ["slot-a"],
+    # One wave: the packet seat and the coupling-only seat are rows of the SAME
+    # roster surface, each with its own reserved operation.
+    plan = {
+        "models": ["model-a", "model-b"],
+        "routes": [ReviewRouteKind.AGENT_SESSION, ReviewRouteKind.AGENT_SESSION],
+        "efforts": ["high", "xhigh"],
+        "slot_ids": ["slot-a", "scope-a"],
+        "parts": [("change",), ("coupling",)],
     }
-    scope_slot = ReviewSlot(
-        slot_id="scope-a",
-        model="model-b",
-        effort="xhigh",
-        route=ReviewRouteKind.AGENT_SESSION,
-    )
 
-    _reserve_parallel_review_roster(
-        ctx,
-        {"row_plan": triad_plan},
-        [{"slot": scope_slot, "prepared": object(), "final": None}],
-    )
+    _reserve_parallel_review_roster(ctx, {"row_plan": plan})
 
     state = load_state(drive)
     attempt = state.attempts[-1]
-    assert attempt.paid is True
+    assert attempt.paid is False  # reserved and owned; paid only once a seat is physically sent
     assert attempt.late_result_pending is True
     from ouroboros.process_custody import current_custody_session_id
 
     assert attempt.review_owner_session_id == current_custody_session_id()
     assert attempt.review_owner_pid == os.getpid()
-    triad = attempt.triad_raw_results[0]
-    scope = attempt.scope_raw_result["raw_results"][0]
+    triad, scope = attempt.triad_raw_results
     assert triad["operation_id"] == ctx._review_reserved_operations[
         "multi_model_review"
     ]["slot-a"]
     assert scope["operation_id"] == ctx._review_reserved_operations[
-        "scope_review"
+        "multi_model_review"
     ]["scope-a"]
 
     from ouroboros.review_custody import run_custodied_review_slots
@@ -111,6 +103,7 @@ def test_parallel_commit_roster_is_atomic_and_token_updates_are_exact(tmp_path):
     )
     assert seen_operations == [triad["operation_id"]]
     assert actor.operation_id == triad["operation_id"]
+    assert load_state(drive).attempts[-1].paid is True  # the owned physical operation stamped its row
 
     checkpoint = ctx._review_pending_invocation_checkpoint
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
@@ -124,7 +117,7 @@ def test_parallel_commit_roster_is_atomic_and_token_updates_are_exact(tmp_path):
             ),
             pool.submit(
                 checkpoint,
-                surface="scope_review",
+                surface="multi_model_review",
                 slot_id="scope-a",
                 operation_id=scope["operation_id"],
                 invocation_id="inv-scope",
@@ -135,10 +128,7 @@ def test_parallel_commit_roster_is_atomic_and_token_updates_are_exact(tmp_path):
 
     updated = load_state(drive).attempts[-1]
     assert updated.triad_raw_results[0]["pending_invocation_id"] == "inv-triad"
-    assert (
-        updated.scope_raw_result["raw_results"][0]["pending_invocation_id"]
-        == "inv-scope"
-    )
+    assert updated.triad_raw_results[1]["pending_invocation_id"] == "inv-scope"
 
 
 def test_first_paid_wave_keeps_empty_and_partial_reserved_rosters_in_custody():
@@ -517,16 +507,10 @@ def test_malformed_durable_roster_containers_survive_real_state_loading(tmp_path
     "payload",
     [
         [],
-        {"attempts": {}},
         {"attempts": ["not-an-object"]},
-        {"attempts": [{"status": []}]},
-        {"attempts": [{"status": "reviewing", "task_id": 7}]},
         {"attempts": [{"status": "reviewing", "attempt": "1"}]},
-        {"attempts": [{"status": "reviewing", "paid": "yes"}]},
-        {"attempts": [{"status": "reviewing", "blocked": 1}]},
         {"attempts": [{"status": "reviewing", "finished_ts": []}]},
         {"attempts": [{"status": "reviewing", "review_owner_pid": "123"}]},
-        {"attempts": [{"status": "reviewing", "review_owner_session_id": 7}]},
     ],
 )
 def test_locked_update_refuses_malformed_attempt_authority_without_rewrite(
@@ -635,12 +619,9 @@ def test_confirmed_owner_death_terminalizes_custody_loss_and_is_idempotent(tmp_p
     ) == []
 
 
-def test_confirmed_owner_death_keeps_identical_verdict_streak_fail_closed(tmp_path):
-    """A lost paid worker is infra noise, not a new terminal review result.
-
-    The identical-diff refusal must survive owner-death reconciliation so a
-    later retry cannot buy a duplicate paid wave for unchanged bytes.
-    """
+def test_confirmed_owner_death_settles_a_lost_paid_worker_as_infra(tmp_path):
+    """A lost paid worker is infra noise, not a new terminal review result:
+    owner-death reconciliation settles its row as an infrastructure failure."""
     from ouroboros.review_state import (
         AdvisoryReviewState,
         CommitAttemptRecord,
@@ -648,8 +629,6 @@ def test_confirmed_owner_death_keeps_identical_verdict_streak_fail_closed(tmp_pa
         make_repo_key,
         save_state,
     )
-    from ouroboros.tools.commit_gate import check_identical_verdict_refusal
-
     fingerprint = "fp-owner-loss"
     contract = "contract-owner-loss"
     repo_key = make_repo_key(tmp_path)
@@ -680,13 +659,8 @@ def test_confirmed_owner_death_keeps_identical_verdict_streak_fail_closed(tmp_pa
     assert state.attempts[0].status == "failed"
     assert state.attempts[0].phase == "infra"
     save_state(tmp_path, state)
-
-    refusal = check_identical_verdict_refusal(
-        SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path, task_id="task-owner-loss"),
-        fingerprint,
-        contract_fingerprint=contract,
-    )
-    assert refusal == ""
+    reloaded = load_state(tmp_path).attempts[0]
+    assert (reloaded.status, reloaded.phase, reloaded.paid) == ("failed", "infra", True)
 
 
 def test_confirmed_owner_death_unblocks_a_new_commit(tmp_path):

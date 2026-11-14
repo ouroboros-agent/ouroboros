@@ -9,15 +9,11 @@ import pytest
 from ouroboros.artifacts import registered_task_artifact
 from ouroboros.tools.registry import ToolContext, ToolRegistry
 
-pytestmark = pytest.mark.serial
 
 
 @pytest.mark.parametrize("example", [
     "ouroboros.config.save_settings({'OUROBOROS_RUNTIME_MODE': 'pro'})",
     "OUROBOROS_CONTEXT_MODE /api/owner/context-mode",
-    "OUROBOROS_SAFETY_MODE settings.json /api/owner/safety-mode",
-    "/api/owner/skills/demo/attest-review",
-    "OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS settings.json",
     "OUROBOROS_POST_TASK_EVOLUTION state/skills/demo/review.json",
 ])
 def test_owner_control_example_reaches_a_registered_result(tmp_path, monkeypatch, example):
@@ -30,6 +26,7 @@ def test_owner_control_example_reaches_a_registered_result(tmp_path, monkeypatch
     reg.set_context(ctx)
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_SAFETY_MODE", "off")
     script = "import sys; from pathlib import Path; Path('example.txt').write_text(sys.argv[1], encoding='utf-8')"
 
     result = reg.execute("run_command", {

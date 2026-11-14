@@ -6,6 +6,15 @@ still requires a runnable OSWorld checkout plus VM/desktop control
 infrastructure; public verified leaderboard claims require the official
 verification path (the OSWorld 2.0 maintainers run agent code on their side).
 
+Result review uses Required in the template. Both launchers check the executing
+server through `/api/settings`; a local setting cannot configure a remote server.
+The whole-task computer-use bridge produces GUI-input receipts during the task;
+those can qualify review without certifying goal success. `finish_task` stays
+available to select a result after feedback. The step agent predicts an action
+before the external runner executes it: its inner result review cannot judge
+that future GUI effect. Synthetic adapter tests do not establish live deployment
+or historical score parity.
+
 Aligned upstream (pinned; see `ALIGNED_UPSTREAM` in `run_step_agent.py` and
 `METHODOLOGY.md` §0): OSWorld 2.0,
 <https://github.com/xlang-ai/OSWorld-V2> @
@@ -59,7 +68,16 @@ Files:
   the result directory, calls `ouroboros run --attach <screenshot>` for the next
   structured action, executes those actions through `env.step(...)`, and records
   the official trajectory plus denominator-preserving ledgers. It is the runnable
-  adapter; the skeleton remains a stricter installed-agent preflight path.
+  adapter; the skeleton remains a stricter installed-agent preflight path. Its
+  owner leaves are re-exported by it, so behaviour, flags and reward semantics
+  are unchanged: `step_agent_common.py` (run configuration dataclasses and two
+  shared primitives), `step_agent_env.py` (aligned upstream pin, provider
+  preflight, DesktopEnv construction/teardown, live-server guard),
+  `step_agent_claims.py` (cross-lane task claims and the scored-claim ledger of
+  METHODOLOGY §7.9), `step_agent_actions.py` (action translation and the
+  `WAIT`/`DONE`/`FAIL` specials) and `step_agent_policy.py`
+  (`OuroborosStepAgent`). `_preflight` deliberately stays in the launcher: its
+  runtime attestation is pinned to that file by the devtools test suite.
 - `run_cu_bridge_agent.py` is the **persistent-agent** OSWorld runner: it resets
   an official VM, publishes the VM HTTP target into the bench data dir's
   `unix_computer_use` skill state, submits ONE Ouroboros task (`--memory-mode
@@ -67,7 +85,14 @@ Files:
   backend until it finishes. `reset()`/`evaluate()` are the official ones. This
   is the Terminal-Bench / Pointer shape — see the cu_bridge details below and
   METHODOLOGY.md §7 for the protocol deltas that make it NOT the official
-  step-loop.
+  step-loop. Its owner leaves carry the parts that are not the launcher itself
+  and are re-exported by it, so behaviour, flags and reward semantics are
+  unchanged: `cu_bridge_runtime.py` (shared bench-server call and terminal-answer
+  reading), `cu_bridge_prompts.py` (gate/working preambles and acceptance
+  claims), `cu_bridge_tool_policy.py` (core-tool allowlist, computed host
+  denylist, GUI action set, denied connection tools), `cu_bridge_gate.py` (the
+  read-only premise gate) and `cu_bridge_budget.py` (step/round budgets, proxy
+  configuration, dataset and step-claim refusals, disclosure counters).
 
 Important step-loop details:
 
@@ -107,8 +132,7 @@ Important step-loop details:
 Important cu_bridge details (`run_cu_bridge_agent.py`):
 
 - **Start the isolated Ouroboros server with `unix_computer_use` ALREADY
-  ENABLED.** The skill declares `net`, so it is NOT in the launcher's native
-  auto-enable class; the server loads enabled+reviewed extensions only at
+  ENABLED.** The server loads enabled+reviewed extensions only at
   startup (`reload_all`). The runner's `_enable_skill` writes `enabled.json`,
   which a server started BEFORE that write will not hot-reload — the skill's
   `ext_*` tools then come back "Not found" and the agent declares the task
@@ -147,8 +171,9 @@ Important cu_bridge details (`run_cu_bridge_agent.py`):
   `llm_rounds`, `screenshots`, `gui_action_calls`, `remote_exec_calls`) and
   `max_rounds_effective`; the manifest records the OSWorld checkout variant/pin
   (`osworld_checkout`) and `a11y_enabled`. The budget is the Ouroboros server's
-  `OUROBOROS_MAX_ROUNDS` (default 200) plus `--task_timeout_sec`; this is NOT a
-  100-step leaderboard cap — report both.
+  `OUROBOROS_MAX_ROUNDS` (200 in `settings_base.json`; the runtime itself ships
+  `unlimited`) plus `--task_timeout_sec`; this is NOT a 100-step leaderboard cap —
+  report both. A declared `--max-steps` is refused unless that cap is finite.
 - The VM sudo password is injected into `prompt.txt` (official OSWorld practice;
   `mm_agents/prompts.py`). Keep run artifacts access-controlled.
 - Proxy: for `"proxy": true` tasks the runner enables OSWorld's proxy pool only

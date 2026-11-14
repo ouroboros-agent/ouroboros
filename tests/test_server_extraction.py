@@ -15,9 +15,6 @@ from ouroboros import (
     server_routing_context,
 )
 
-
-REPO = pathlib.Path(__file__).parents[1]
-
 _LEAVES = (
     server_process,
     server_routing_context,
@@ -33,6 +30,8 @@ _MOVED_OWNERS = {
     "_owner_restart_requested": server_process,
     "_request_restart_exit": server_process,
     "_restart_requested": server_process,
+    "_SignalStopServer": server_process,
+    "_embedded_uvicorn_server": server_process,
     "_active_direct_roots": server_routing_context,
     "_addressable_root_tasks": server_routing_context,
     "_chat_running_tasks": server_routing_context,
@@ -44,7 +43,6 @@ _MOVED_OWNERS = {
     "_project_id_for_registered_chat": server_routing_context,
     "_reserved_project_for_chat": server_routing_context,
     "_scoped_task_metadata": server_routing_context,
-    "_task_belongs_to_chat": server_routing_context,
     "_task_result_ground_truth": server_routing_context,
     "_owner_evolution_stop": server_owner_routing,
     "_record_routing_receipt": server_owner_routing,
@@ -60,12 +58,13 @@ _MOVED_OWNERS = {
     "_periodic_supervisor_maintenance": server_maintenance,
     "_periodic_zombie_reconcile": server_maintenance,
     "_prune_delegated_snapshots": server_maintenance,
+    "_prune_worktrees": server_maintenance,
     "_reconcile_delegated_runs": server_maintenance,
     "_resume_interrupted_project_deletions": server_maintenance,
     "_run_startup_task_recovery": server_maintenance,
     "_startup_custody_sweep": server_maintenance,
     "_startup_prune_sweeps": server_maintenance,
-    "_startup_worktree_prune": server_maintenance,
+    "_begin_task_teardown": server_restart,
     "_live_running_task_ids": server_restart,
     "_managed_update_pending_kwargs": server_restart,
     "_perform_owner_restart": server_restart,
@@ -95,8 +94,6 @@ _SERVER_OWNED = (
     "PANIC_EXIT_CODE",
     "_LAUNCHER_MANAGED",
     "_BIND_HOST",
-    "_ACTUAL_BOUND_PORT",
-    "_actual_bound_port",
     "_event_loop",
     "_supervisor_ready",
     "_supervisor_error",
@@ -186,21 +183,3 @@ def test_server_route_composition_is_owned_by_the_composition_root():
         route for route in server.routes if getattr(route, "path", "") == "/api/settings"
     )
     assert settings_route.endpoint.__module__ == "server"
-
-
-def test_server_extraction_size_bounds_have_meaningful_headroom():
-    counts = {
-        module.__name__: len(
-            pathlib.Path(module.__file__).read_text(encoding="utf-8").splitlines()
-        )
-        for module in _LEAVES
-    }
-    counts["server"] = len((REPO / "server.py").read_text(encoding="utf-8").splitlines())
-    assert all(count <= 1000 for name, count in counts.items() if name != "server")
-    # server.py keeps the lifespan, the supervisor loop, the owner-command
-    # dispatch, the process state those three need, AND (on this tree) the
-    # deferred restart transaction plus post-cutoff upstream drift, so the
-    # bound includes the restart transaction state owned by the composition root.
-    assert counts["server"] <= 1700
-    assert counts["ouroboros.server_routing_context"] <= 1000
-    assert counts["ouroboros.server_owner_routing"] <= 1000

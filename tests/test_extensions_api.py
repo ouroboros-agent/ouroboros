@@ -10,6 +10,8 @@ Uses Starlette TestClient so the full request path is exercised.
 """
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import json
 import pathlib
 import asyncio
@@ -110,8 +112,28 @@ class _FakeUvicornServer:
         await asyncio.sleep(0)
 
 
-def _patch_lifespan_for_drive_root_test(monkeypatch, srv, settings: dict):
-    monkeypatch.setattr(srv, "load_settings", lambda: dict(settings))
+def _patch_lifespan_for_drive_root_test(monkeypatch, srv, settings: dict, request):
+    # These two lifecycle tests own the import thread their TestClient starts.
+    import threading
+    imports = []
+    original_import = srv.store_switch._run
+
+    def tracked_import(*args, **kwargs):
+        imports.append(threading.current_thread())
+        return original_import(*args, **kwargs)
+
+    def join_imports():
+        for thread in imports:
+            thread.join(60)
+            assert not thread.is_alive(), "the fixture's store import did not stop"
+
+    async def no_host_listener(*_args):
+        pass
+
+    monkeypatch.setattr(srv.store_switch, "_run", tracked_import)
+    monkeypatch.setattr(srv.server_boot, "serve_host_service", no_host_listener)
+    request.addfinalizer(join_imports)
+    monkeypatch.setattr(srv, "load_settings", lambda **_k: dict(settings))
     monkeypatch.setattr(srv, "save_settings", lambda *_a, **_k: None)
     monkeypatch.setattr(srv, "apply_runtime_provider_defaults", lambda s: (s, False, []))
     monkeypatch.setattr(srv, "_apply_settings_to_env", lambda *_a, **_k: None)
@@ -127,7 +149,20 @@ def _patch_lifespan_for_drive_root_test(monkeypatch, srv, settings: dict):
     monkeypatch.setattr("ouroboros.server_auth.get_configured_network_password", lambda: "")
 
 
-def test_testclient_lifespan_reload_all_uses_app_state_drive_root(tmp_path, monkeypatch):
+def _boot_step_ended(client, name: str, timeout: float = 30.0) -> None:
+    """The boot runs its steps while the socket serves: wait for one to end (``/api/health.boot``)."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        steps = {row["name"]: row["state"] for row in client.get("/api/health").json()["boot"]["steps"]}
+        if steps.get(name) in {"done", "failed"}:
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"boot step {name} did not end")
+
+
+def test_testclient_lifespan_reload_all_uses_app_state_drive_root(tmp_path, monkeypatch, request):
     from starlette.testclient import TestClient
     import server as srv
     from ouroboros import extension_loader
@@ -142,6 +177,7 @@ def test_testclient_lifespan_reload_all_uses_app_state_drive_root(tmp_path, monk
         monkeypatch,
         srv,
         {"OUROBOROS_SKILLS_REPO_PATH": str(repo_root), "OUROBOROS_RUNTIME_MODE": "advanced"},
+        request,
     )
     monkeypatch.setattr("ouroboros.config.get_skills_repo_path", lambda: str(repo_root))
     calls: list[tuple[pathlib.Path, str | None]] = []
@@ -151,13 +187,13 @@ def test_testclient_lifespan_reload_all_uses_app_state_drive_root(tmp_path, monk
         lambda root, _reader, *, repo_path=None: calls.append((pathlib.Path(root), repo_path)) or {},
     )
 
-    with TestClient(srv.app):
-        pass
+    with TestClient(srv.app) as client:
+        _boot_step_ended(client, "extensions")
 
     assert calls == [(drive_root, str(repo_root))]
 
 
-def test_testclient_settings_hot_reload_uses_app_state_drive_root(tmp_path, monkeypatch):
+def test_testclient_settings_hot_reload_uses_app_state_drive_root(tmp_path, monkeypatch, request):
     from starlette.testclient import TestClient
     import server as srv
     from ouroboros import extension_loader
@@ -171,7 +207,11 @@ def test_testclient_settings_hot_reload_uses_app_state_drive_root(tmp_path, monk
     srv.app.app.state.drive_root = drive_root  # type: ignore[attr-defined]
     srv.app.app.state.repo_dir = tmp_path / "repo"  # type: ignore[attr-defined]
     settings = {"OUROBOROS_SKILLS_REPO_PATH": str(old_repo), "OUROBOROS_RUNTIME_MODE": "advanced"}
-    _patch_lifespan_for_drive_root_test(monkeypatch, srv, settings)
+    _patch_lifespan_for_drive_root_test(monkeypatch, srv, settings, request)
+    # The POST persists through the gateway's owner writer (``config.SETTINGS_PATH``), not
+    # through the ``server.save_settings`` name patched above: keep the document it writes
+    # in this test's tree instead of the worker-shared pytest data root.
+    monkeypatch.setattr("ouroboros.config.SETTINGS_PATH", drive_root / "settings.json")
     monkeypatch.setattr("ouroboros.config.get_skills_repo_path", lambda: str(old_repo))
     calls: list[tuple[pathlib.Path, str | None]] = []
     monkeypatch.setattr(
@@ -181,6 +221,7 @@ def test_testclient_settings_hot_reload_uses_app_state_drive_root(tmp_path, monk
     )
 
     with TestClient(srv.app) as client:
+        _boot_step_ended(client, "extensions")
         response = client.post("/api/settings", json={"OUROBOROS_SKILLS_REPO_PATH": str(new_repo)})
 
     assert response.status_code == 200, response.text
@@ -237,105 +278,7 @@ def test_api_extensions_index_lists_extension_skills(tmp_path, monkeypatch):
         _stop_patches(patches)
 
 
-def test_reviewed_presence_runtime_card_projection_and_owner_cas(tmp_path, monkeypatch):
-    from ouroboros.presence_capabilities import load_presence_state
-    from ouroboros.skill_loader import SkillReviewState, compute_content_hash, save_review_state
-
-    skills_root = tmp_path / "skills"
-    skill_dir = _write_ext(
-        skills_root,
-        "presence_ext",
-        permissions=[],
-        plugin="def register(api):\n    pass\n",
-        presence=(
-            "presence:\n"
-            "  instructions: Participate when useful.\n"
-            "  runtime_defaults:\n"
-            "    model_slot: light\n"
-            "    inline_max_rounds: 10\n"
-        ),
-    )
-    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
-    client, drive_root, patches = _make_client(tmp_path, monkeypatch)
-    try:
-        content_hash = compute_content_hash(skill_dir, manifest_entry="plugin.py")
-        save_review_state(
-            drive_root,
-            "presence_ext",
-            SkillReviewState(status="pass", content_hash=content_hash),
-        )
-        review_path = drive_root / "state" / "skills" / "presence_ext" / "review.json"
-        review_before = review_path.read_bytes()
-
-        row = next(
-            item for item in client.get("/api/extensions").json()["skills"]
-            if item["name"] == "presence_ext"
-        )
-        runtime = row["presence_runtime"]
-        assert runtime["defaults"] == {"model_slot": "light", "inline_max_rounds": 10}
-        assert runtime["overrides"] == {"model_slot": None, "inline_max_rounds": None}
-        assert runtime["workspace_root"] == ""
-        workspace = tmp_path / "presence-workspace"
-        workspace.mkdir()
-
-        update = client.post(
-            "/api/owner/skills/presence_ext/presence-runtime",
-            json={
-                "expected_state_fingerprint": runtime["state_fingerprint"],
-                "runtime_overrides": {"model_slot": "main", "inline_max_rounds": 7},
-                "workspace_root": str(workspace),
-            },
-        )
-        assert update.status_code == 200, update.text
-        updated_runtime = update.json()["presence_runtime"]
-        assert updated_runtime["overrides"] == {"model_slot": "main", "inline_max_rounds": 7}
-        assert updated_runtime["workspace_root"] == str(workspace)
-        assert review_path.read_bytes() == review_before
-        assert load_presence_state(drive_root, "presence_ext").runtime_overrides.model_slot == "main"
-
-        conflict = client.post(
-            "/api/owner/skills/presence_ext/presence-runtime",
-            json={
-                "expected_state_fingerprint": runtime["state_fingerprint"],
-                "runtime_overrides": {"model_slot": "light", "inline_max_rounds": 5},
-            },
-        )
-        assert conflict.status_code == 409
-        assert conflict.json()["code"] == "presence_state_conflict"
-
-        reset = client.post(
-            "/api/owner/skills/presence_ext/presence-runtime",
-            json={
-                "expected_state_fingerprint": updated_runtime["state_fingerprint"],
-                "runtime_overrides": {"model_slot": None, "inline_max_rounds": None},
-            },
-        )
-        assert reset.status_code == 200, reset.text
-        assert reset.json()["presence_runtime"]["overrides"] == {
-            "model_slot": None,
-            "inline_max_rounds": None,
-        }
-        assert reset.json()["presence_runtime"]["workspace_root"] == str(workspace)
-        invalid = client.post(
-            "/api/owner/skills/presence_ext/presence-runtime",
-            json={
-                "expected_state_fingerprint": reset.json()["presence_runtime"]["state_fingerprint"],
-                "runtime_overrides": {"model_slot": "main", "inline_max_rounds": 8},
-                "workspace_root": str(drive_root),
-            },
-        )
-        assert invalid.status_code == 400
-        assert load_presence_state(drive_root, "presence_ext").workspace_root == str(workspace)
-        refreshed = next(
-            item for item in client.get("/api/extensions").json()["skills"]
-            if item["name"] == "presence_ext"
-        )
-        assert refreshed["review_stale"] is False
-    finally:
-        _stop_patches(patches)
-
-
-def test_presence_runtime_controls_require_fresh_executable_review(tmp_path, monkeypatch):
+def test_retired_presence_runtime_is_absent_from_cards_and_routes(tmp_path, monkeypatch):
     skills_root = tmp_path / "skills"
     _write_ext(
         skills_root,
@@ -359,7 +302,7 @@ def test_presence_runtime_controls_require_fresh_executable_review(tmp_path, mon
                 "runtime_overrides": {"model_slot": None, "inline_max_rounds": None},
             },
         )
-        assert response.status_code == 409
+        assert response.status_code == 404
     finally:
         _stop_patches(patches)
 
@@ -415,7 +358,9 @@ def test_api_extensions_index_uses_one_request_local_repo_identity(
 
     assert response.status_code == 200
     assert config_reads == [request_repo]
-    assert reconcile_calls == [(drive_root, request_repo)]
+    # A passive read: the review-job heal belongs to boot, the maintenance pass
+    # and the next review start, never to the Skills list GET.
+    assert reconcile_calls == []
     assert build_calls == [(drive_root, request_repo)]
 
 
@@ -428,7 +373,6 @@ def test_extensions_index_collision_row_skips_lifecycle_projections(
     import ouroboros.marketplace.provenance as marketplace_provenance
     import ouroboros.skill_review_runner as skill_review_runner
     import ouroboros.tools.github as github_tools
-    import supervisor.queue as supervisor_queue
     from ouroboros.contracts.skill_manifest import SkillManifest
     from ouroboros.skill_loader import LoadedSkill
 
@@ -463,12 +407,6 @@ def test_extensions_index_collision_row_skips_lifecycle_projections(
     monkeypatch.setattr(extension_health, "read_extension_health", _unexpected)
     monkeypatch.setattr(skill_review_runner, "skill_review_ui_projection", _unexpected)
     monkeypatch.setattr(marketplace_provenance, "read_provenance", _unexpected)
-    schedule_inputs = []
-    monkeypatch.setattr(
-        supervisor_queue,
-        "sync_skill_schedules",
-        lambda skills, **_kwargs: schedule_inputs.append(list(skills)),
-    )
     monkeypatch.setattr(github_tools, "github_token_from_env_or_settings", _unexpected)
 
     payload = extensions_api._build_extensions_index(drive_root, repo_path="")
@@ -492,7 +430,6 @@ def test_extensions_index_collision_row_skips_lifecycle_projections(
         "state": "hard_block",
         "reason": "",
     }
-    assert schedule_inputs == [[collision]]
     assert not (drive_root / "state").exists()
 
 
@@ -1081,15 +1018,11 @@ def test_api_skill_toggle_allows_warnings_under_blocking(tmp_path, monkeypatch):
         _stop_patches(patches)
 
 
-def test_api_skill_toggle_blocks_missing_isolated_deps_env(tmp_path, monkeypatch):
+def test_api_skill_toggle_installs_a_missing_isolated_deps_env(tmp_path, monkeypatch):
+    """Inverted pin: a missing env used to refuse Enable (409, deps_status missing); Enable installs it."""
     from ouroboros.marketplace.install_specs import install_specs_hash
     from ouroboros.marketplace.isolated_deps import DEPS_STATE_FILENAME
-    from ouroboros.skill_loader import (
-        SkillReviewState,
-        compute_content_hash,
-        save_review_state,
-        skill_state_dir,
-    )
+    from ouroboros.skill_loader import SkillReviewState, compute_content_hash, save_review_state, skill_state_dir
 
     skills_root = tmp_path / "skills"
     plugin = "def register(api):\n    api.register_tool('t', lambda ctx: 'ok', description='', schema={})\n"
@@ -1121,13 +1054,16 @@ def test_api_skill_toggle_blocks_missing_isolated_deps_env(tmp_path, monkeypatch
             json.dumps({"status": "installed", "specs_hash": install_specs_hash(specs)}),
             encoding="utf-8",
         )
+        installs = []
+        monkeypatch.setattr("ouroboros.marketplace.isolated_deps._install_python_packages",
+                            lambda packages, *args, **kwargs: installs.append(list(packages)) or [])
+        monkeypatch.setattr("ouroboros.skill_lifecycle_actions._reconcile", lambda *a, **k: {"action": "extension_loaded"})
 
         resp = client.post("/api/skills/ext_deps/toggle", json={"enabled": True})
 
-        assert resp.status_code == 409, resp.text
-        data = resp.json()
-        assert data["deps_status"] == "missing"
-        assert not (state_dir / "enabled.json").exists()
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["enabled"] is True and installs == [["wheel"]]
+        assert (state_dir / "enabled.json").exists()
     finally:
         _stop_patches(patches)
 
@@ -1595,30 +1531,31 @@ def test_api_skill_grants_soft_fails_extension_reconcile_after_persist(tmp_path,
         _stop_patches(patches)
 
 
-def test_api_skill_grants_rejects_blocking_blocker_review(tmp_path, monkeypatch):
+def test_api_skill_grants_follow_the_review_gate_for_blocker_findings(tmp_path, monkeypatch):
+    """Blocker findings outside Cyber Pro leave the grant to the author's decision; a skill from a source that
+    reviews each skill keeps its blockers for the owner, and the grant is refused with what it still needs."""
+    from ouroboros.skill_install_record import write_install_record
     from ouroboros.skill_loader import SkillReviewState, compute_content_hash, save_review_state
 
     skills_root = tmp_path / "skills"
-    skill_dir = _write_ext(
-        skills_root,
-        "grant_blocked",
-        permissions=["tool", "read_settings"],
-        plugin="def register(api):\n    pass\n",
-        env_from_settings=["OPENROUTER_API_KEY"],
-    )
+    dirs = {name: _write_ext(skills_root, name, permissions=["tool", "read_settings"],
+                             plugin="def register(api):\n    pass\n", env_from_settings=["OPENROUTER_API_KEY"])
+            for name in ("grant_advised", "grant_blocked")}
     monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
-    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
     client, drive_root, patches = _make_client(tmp_path, monkeypatch)
     try:
-        content_hash = compute_content_hash(skill_dir, manifest_entry="plugin.py")
-        save_review_state(
-            drive_root,
-            "grant_blocked",
-            SkillReviewState(status="blockers", content_hash=content_hash),
-        )
+        for name, skill_dir in dirs.items():
+            save_review_state(drive_root, name, SkillReviewState(
+                status="blockers", content_hash=compute_content_hash(skill_dir, manifest_entry="plugin.py")))
+        write_install_record(drive_root, "grant_blocked", {"basis": "review", "release": {"digest": "d"},
+                                                            "source": {"id": "hub"}})
+        advised = client.post("/api/skills/grant_advised/grants", json={"items": ["OPENROUTER_API_KEY"]})
+        assert advised.status_code == 200 and advised.json()["granted_keys"] == ["OPENROUTER_API_KEY"], advised.text
         resp = client.post("/api/skills/grant_blocked/grants", json={"items": ["OPENROUTER_API_KEY"]})
         assert resp.status_code == 409
-        assert "fresh executable review" in resp.json()["error"]
+        assert resp.json()["error"] == ("key and permission grants need the review gate to permit the current bytes: "
+                                        "the owner's Skip review for these exact bytes, or a review without blocker findings")
+        assert resp.json()["review_gate"]["blocking_reason"] == "blocker_findings_need_owner"
     finally:
         _stop_patches(patches)
 
@@ -1809,7 +1746,12 @@ def test_api_skill_review_offloads_to_thread_and_returns_outcome(tmp_path, monke
         _stop_patches(patches)
 
 
-def test_lifecycle_queue_endpoint_marks_stale_review_job_interrupted(tmp_path, monkeypatch):
+def test_lifecycle_queue_endpoint_leaves_stale_review_job_to_its_owners(tmp_path, monkeypatch):
+    """The queue GET is polled every second during a lifecycle action; it reads
+    the snapshot and heals nothing — ``reconcile_stale_review_jobs`` (boot, the
+    maintenance pass) still heals the same dead job."""
+    from ouroboros.skill_review_runner import reconcile_stale_review_jobs
+
     client, drive_root, patches = _make_client(tmp_path, monkeypatch)
     job_dir = drive_root / "state" / "skills" / "alpha"
     job_dir.mkdir(parents=True)
@@ -1828,18 +1770,20 @@ def test_lifecycle_queue_endpoint_marks_stale_review_job_interrupted(tmp_path, m
         ),
         encoding="utf-8",
     )
+    before = job_path.read_bytes()
     monkeypatch.setattr("ouroboros.skill_review_runner._pid_alive", lambda _pid: False)
     try:
         resp = client.get("/api/skills/lifecycle-queue")
         assert resp.status_code == 200
+        assert "active" in resp.json()
+        assert job_path.read_bytes() == before
+        assert not dialogue_test.log_rows(drive_root / "logs" / "progress.jsonl")
+
+        assert reconcile_stale_review_jobs(drive_root, repo_path="") == 1
         data = json.loads(job_path.read_text(encoding="utf-8"))
         assert data["status"] == "interrupted"
         assert data["interrupt_reason"] == "owner_process_exited"
-        progress = [
-            json.loads(line)
-            for line in (drive_root / "logs" / "progress.jsonl").read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
+        progress = dialogue_test.log_rows(drive_root / "logs" / "progress.jsonl")
         assert progress[-1]["lifecycle"]["status"] == "interrupted"
         assert progress[-1]["task_id"] == "skill_lifecycle_review_alpha_skill-job-old"
     finally:
@@ -2004,6 +1948,8 @@ def test_tool_registry_execute_dispatches_ext_tool(tmp_path, monkeypatch):
         save_review_state,
     )
 
+    monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_SAFETY_MODE", "off")
     skills_root = tmp_path / "skills"
     drive_root = tmp_path / "drive"
     drive_root.mkdir()
@@ -2034,12 +1980,7 @@ def test_tool_registry_execute_dispatches_ext_tool(tmp_path, monkeypatch):
         assert schema is not None
         assert schema["function"]["name"] == tool_name
         result = tmp_reg.execute(tool_name, {"who": "phase5"})
-        # v5.1.2 iter-2: extension dispatch now goes through
-        # ``ouroboros.safety.check_safety``. In test envs without a
-        # safety backend, the supervisor returns a visible
-        # ``SAFETY_WARNING`` prefix while still letting the call run
-        # (fail-open). Assert the handler ran and produced its output;
-        # the warning prefix is acceptable.
+        # Safety is disabled above so this regression exercises extension dispatch.
         assert "hello phase5" in result, result
         # get_timeout honours the extension's declared timeout plus the v5.7.0
         # cleanup buffer used by async handlers (so the outer tool executor
@@ -2096,3 +2037,290 @@ def test_extensions_index_carries_the_preflight_failed_fact(tmp_path, monkeypatc
         assert row["review_gate"]["preflight_failed"] is False
     finally:
         _stop_patches(patches)
+
+
+# ---------------------------------------------------------------------------
+# Passive Skills list read (DEVELOPMENT "Passive GET"): no lock wait, no heal,
+# no schedule sync, no state-dir creation, one settings read per skill.
+# ---------------------------------------------------------------------------
+
+
+def _log_bytes(drive_root: pathlib.Path) -> dict:
+    logs = drive_root / "logs"
+    return {
+        name: ((logs / name).read_bytes() if (logs / name).exists() else None)
+        for name in ("chat.jsonl", "progress.jsonl", "events.jsonl")
+    }
+
+
+def test_api_extensions_index_returns_while_queue_lock_is_held(tmp_path, monkeypatch):
+    """The list read takes no supervisor queue lock: it answers while another
+    thread holds ``_queue_lock`` and answers the same list once it is free."""
+    import threading
+
+    import supervisor.queue as supervisor_queue
+
+    skills_root = tmp_path / "skills"
+    _write_ext(skills_root, "ext_lock", permissions=["tool"], plugin="def register(api):\n    pass\n")
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    client, drive_root, patches = _make_client(tmp_path, monkeypatch)
+    held = threading.Event()
+    release = threading.Event()
+    answered: list = []
+
+    def hold_lock():
+        with supervisor_queue._queue_lock:
+            held.set()
+            release.wait(timeout=30)
+
+    def read_list():
+        answered.append(client.get("/api/extensions"))
+
+    holder = threading.Thread(target=hold_lock, daemon=True)
+    reader = threading.Thread(target=read_list, daemon=True)
+    try:
+        holder.start()
+        assert held.wait(timeout=5)
+        reader.start()
+        reader.join(timeout=5)
+        assert not reader.is_alive(), "GET /api/extensions waited for the supervisor queue lock"
+        assert not release.is_set()
+        release.set()
+        holder.join(timeout=5)
+        locked = answered[0]
+        assert locked.status_code == 200
+        assert [row["name"] for row in locked.json()["skills"]] == ["ext_lock"]
+        free = client.get("/api/extensions")
+        assert free.status_code == 200
+        assert free.json() == locked.json()
+    finally:
+        release.set()
+        _stop_patches(patches)
+
+
+def test_skills_list_and_toggle_do_not_heal_review_jobs(tmp_path, monkeypatch):
+    """List reads and toggle leave review recovery to its existing owner."""
+    import ouroboros.skill_review_runner as review_runner
+
+    skills_root = tmp_path / "skills"
+    _write_ext(skills_root, "ext_passive", permissions=["tool"], plugin="def register(api):\n    pass\n")
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    client, drive_root, patches = _make_client(tmp_path, monkeypatch)
+    calls = {"reconcile_stale_review_jobs": 0}
+
+    def _count(module, attr):
+        original = getattr(module, attr)
+
+        def counted(*args, **kwargs):
+            calls[attr] += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(module, attr, counted)
+
+    # Armed after the app is built (see tests/test_gateway_widgets.py).
+    _count(review_runner, "reconcile_stale_review_jobs")
+    try:
+        assert client.get("/api/extensions").status_code == 200
+        assert client.get("/api/skills/lifecycle-queue").status_code == 200
+        assert calls == {"reconcile_stale_review_jobs": 0}
+
+        resp = client.post("/api/skills/ext_passive/toggle", json={"enabled": False})
+        assert resp.status_code == 200, resp.text
+        assert calls["reconcile_stale_review_jobs"] == 0
+    finally:
+        _stop_patches(patches)
+
+
+def test_api_extensions_index_creates_no_skill_state_dirs_on_a_fresh_root(tmp_path, monkeypatch):
+    """One list read leaves a fresh data root without ``state/skills/<name>/``:
+    every reader the GET reaches answers a missing directory exactly like a
+    missing file. A writer still creates the directory it writes into."""
+    from ouroboros.extension_health import read_extension_health, record_extension_health
+    from ouroboros.marketplace.isolated_deps import read_deps_state
+    from ouroboros.marketplace.provenance import read_provenance, read_publication_record
+    from ouroboros.skill_review_runner import skill_review_ui_projection
+
+    skills_root = tmp_path / "skills"
+    plugin = "def register(api):\n    pass\n"
+    _write_ext(skills_root, "ext_fresh", permissions=["tool"], plugin=plugin)
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    client, drive_root, patches = _make_client(tmp_path, monkeypatch)
+    hub_dir = _write_ext(drive_root / "skills" / "clawhub", "hub_fresh", permissions=["tool"], plugin=plugin)
+    (hub_dir / ".clawhub.json").write_text("{}\n", encoding="utf-8")
+    try:
+        resp = client.get("/api/extensions")
+        assert resp.status_code == 200
+        rows = {row["name"]: row for row in resp.json()["skills"]}
+        assert rows["ext_fresh"]["published"] is None
+        assert rows["ext_fresh"]["skill_review"] == {}
+        assert rows["hub_fresh"]["source"] == "clawhub"
+        assert "provenance" not in rows["hub_fresh"]
+        assert not (drive_root / "state" / "skills").exists()
+
+        assert read_extension_health(drive_root, "ext_fresh") is None
+        assert read_provenance(drive_root, "hub_fresh") is None
+        assert read_publication_record(drive_root, "ext_fresh") == (None, None)
+        assert read_deps_state(drive_root, "ext_fresh") == {}
+        assert skill_review_ui_projection(drive_root, "ext_fresh") == {}
+        assert not (drive_root / "state" / "skills").exists()
+
+        record_extension_health(drive_root, "ext_fresh", status="inactive")
+        assert (drive_root / "state" / "skills" / "ext_fresh" / "health.json").is_file()
+        assert read_extension_health(drive_root, "ext_fresh") is not None
+    finally:
+        _stop_patches(patches)
+
+
+def test_extension_rows_reuse_the_runtime_grant_status(tmp_path, monkeypatch):
+    """An extension row carries the grant status its runtime state computed
+    (one settings read per skill); a non-extension row still computes its own."""
+    import ouroboros.gateway.extensions as extensions_api
+    from ouroboros.skill_loader import find_skill, grant_status_for_skill
+
+    skills_root = tmp_path / "skills"
+    _write_ext(
+        skills_root, "ext_grants", permissions=["tool"],
+        plugin="def register(api):\n    pass\n", env_from_settings=["TELEGRAM_BOT_TOKEN"],
+    )
+    note_dir = skills_root / "note_grants"
+    note_dir.mkdir(parents=True)
+    (note_dir / "SKILL.md").write_text(
+        "---\nname: note_grants\ndescription: Notes.\nversion: 0.1.0\ntype: instruction\n---\nbody\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    client, drive_root, patches = _make_client(tmp_path, monkeypatch)
+    row_calls: list[str] = []
+    real = extensions_api.grant_status_for_skill
+
+    def counted(root, skill):
+        row_calls.append(skill.name)
+        return real(root, skill)
+
+    monkeypatch.setattr(extensions_api, "grant_status_for_skill", counted)
+    try:
+        resp = client.get("/api/extensions")
+        assert resp.status_code == 200
+        rows = {row["name"]: row for row in resp.json()["skills"]}
+        assert "ext_grants" not in row_calls
+        assert row_calls.count("note_grants") == 1
+        assert rows["ext_grants"]["grants"]["requested_keys"] == ["TELEGRAM_BOT_TOKEN"]
+        for name in ("ext_grants", "note_grants"):
+            loaded = find_skill(drive_root, name, repo_path=str(skills_root))
+            assert rows[name]["grants"] == grant_status_for_skill(drive_root, loaded)
+    finally:
+        _stop_patches(patches)
+
+
+def test_api_extensions_index_presents_dead_running_review_job_as_interrupted_without_writing(
+    tmp_path, monkeypatch,
+):
+    """A ``running`` review job whose process is gone (or whose heartbeat is
+    stale) is shown as interrupted by the read; the file on disk and the
+    chat/progress/events logs stay unchanged. A live job stays ``running``, and
+    the file-stamp memo never freezes the liveness answer."""
+    import ouroboros.skill_review_runner as review_runner
+    from ouroboros.utils import utc_now_iso
+
+    skills_root = tmp_path / "skills"
+    _write_ext(skills_root, "alpha", permissions=[], plugin="def register(api):\n    pass\n")
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    client, drive_root, patches = _make_client(tmp_path, monkeypatch)
+    job_path = review_runner.review_job_state_path(drive_root, "alpha")
+    alive = {"value": True}
+    monkeypatch.setattr(review_runner, "_pid_alive", lambda _pid: alive["value"])
+
+    def write_job(**overrides) -> bytes:
+        now = utc_now_iso()
+        job = {
+            "status": "running", "lifecycle_status": "running", "skill": "alpha",
+            "content_hash": "abc", "job_id": "skill-job-live", "group_id": "manual:alpha",
+            "review_round": 1, "snapshot_attempt": 1, "started_at": now,
+            "last_heartbeat_at": now, "pid": 424242,
+        }
+        job.update(overrides)
+        job_path.write_text(json.dumps(job), encoding="utf-8")
+        return job_path.read_bytes()
+
+    def current() -> dict:
+        resp = client.get("/api/extensions")
+        assert resp.status_code == 200
+        row = next(r for r in resp.json()["skills"] if r["name"] == "alpha")
+        return row["skill_review"]["current"]
+
+    try:
+        before = write_job()
+        logs_before = _log_bytes(drive_root)
+        live = current()
+        assert live["status"] == "running"
+        assert live["lifecycle_status"] == "running"
+        assert "terminal_reason" not in live
+
+        alive["value"] = False  # the worker dies; not a byte changes on disk
+        dead = current()
+        assert dead["status"] == "interrupted"
+        assert dead["lifecycle_status"] == "interrupted"
+        assert dead["terminal_reason"] == "owner_process_exited"
+        assert dead["job_id"] == "skill-job-live"
+        assert job_path.read_bytes() == before
+        assert not (job_path.parent / "review_history.jsonl").exists()
+        assert _log_bytes(drive_root) == logs_before
+
+        alive["value"] = True
+        before = write_job(last_heartbeat_at="2020-01-01T00:00:00+00:00")
+        stale = current()
+        assert stale["status"] == "interrupted"
+        assert stale["terminal_reason"] == "heartbeat_stale"
+        assert job_path.read_bytes() == before
+        assert _log_bytes(drive_root) == logs_before
+    finally:
+        _stop_patches(patches)
+
+
+def test_the_listing_projects_declared_secret_fields_as_configured_missing_or_unknown(tmp_path, monkeypatch):
+    """Skills › Installed reads whether each declared secret field holds a value from one strict read of the
+    effective settings: configured, missing or unknown; never a value, prefix or length, and no requirement."""
+    import ouroboros.gateway.extensions as extensions_api
+    from ouroboros import config as cfg
+
+    monkeypatch.setattr(cfg, "SETTINGS_PATH", tmp_path / "settings.json")
+    monkeypatch.setattr(cfg, "get_skills_repo_path", lambda: "")
+    for name, extra in (("fakeplug", "env_from_settings: [FAKEPLUG_TOKEN]\nsecret_fields:\n  botToken: FAKEPLUG_TOKEN\n"),
+                        ("plain", "")):
+        skill = tmp_path / "skills" / "external" / name
+        (skill / "scripts").mkdir(parents=True)
+        (skill / "scripts" / "run.py").write_text("print('ok')\n", encoding="utf-8")
+        (skill / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: d\nversion: 0.1.0\ntype: script\nruntime: python3\n{extra}"
+            "scripts:\n  - name: run.py\n---\n# skill\n", encoding="utf-8")
+
+    def rows(document):
+        if document is None:
+            cfg.SETTINGS_PATH.write_text("{\"FAKEPLUG_TOKEN\": ", encoding="utf-8")
+        else:
+            cfg.SETTINGS_PATH.write_text(json.dumps(document), encoding="utf-8")
+        payload = extensions_api._build_extensions_index(tmp_path, repo_path="")
+        return {row["name"]: row.get("secret_config") for row in payload["skills"]}
+
+    secret = "synthetic-secret-value"
+    configured = rows({"FAKEPLUG_TOKEN": secret})
+    assert configured == {"fakeplug": {"fields": [{"id": "botToken", "key": "FAKEPLUG_TOKEN", "state": "configured"}]},
+                          "plain": None}
+    assert secret not in json.dumps(extensions_api._build_extensions_index(tmp_path, repo_path=""))
+    assert rows({"FAKEPLUG_TOKEN": "  "})["fakeplug"]["fields"][0]["state"] == "missing"
+    assert rows(None)["fakeplug"]["fields"][0]["state"] == "unknown"
+
+    # One rule with the secret form: the card asks secret_requests.configured_fields, so a change there reaches it.
+    from ouroboros import secret_requests
+
+    asked: list[list[dict]] = []
+
+    def rule(document, request):
+        asked.append(request["fields"])
+        return {row["id"]: document.get(row["setting_key"]) == "counts" for row in request["fields"]}
+
+    monkeypatch.setattr(secret_requests, "configured_fields", rule)
+    assert rows({"FAKEPLUG_TOKEN": "counts"})["fakeplug"]["fields"][0]["state"] == "configured"
+    assert rows({"FAKEPLUG_TOKEN": secret})["fakeplug"]["fields"][0]["state"] == "missing"
+    assert asked and all(fields == [{"id": "botToken", "setting_key": "FAKEPLUG_TOKEN"}] for fields in asked)
+    assert rows(None)["fakeplug"]["fields"][0]["state"] == "unknown" and len(asked) == 2  # unreadable: never asked

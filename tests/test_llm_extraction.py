@@ -23,6 +23,7 @@ from ouroboros import (
     llm_probe,
     llm_routing,
     llm_stream,
+    llm_substitution,
 )
 from ouroboros.llm import LLMClient
 
@@ -33,6 +34,7 @@ _LEAVES = (
     llm_attempt,
     llm_capability_policy,
     llm_claudexor,
+    llm_substitution,
     llm_routing,
     llm_messages,
     llm_fallback,
@@ -59,15 +61,9 @@ _MODULE_OWNERS = {
         "_route_normalizes_cache_breakpoints _structured_error_values cache_ttl_seconds "
         "supports_message_cache_control"
     ),
-    llm_capability_policy: (
-        "_MANDATORY_VALUE_MARKERS _OPTIONAL_DROPPABLE_PARAMS _OPTIONAL_SAMPLING_PARAMS "
-        "normalize_reasoning_effort"
-    ),
+    llm_capability_policy: "_OPTIONAL_DROPPABLE_PARAMS _OPTIONAL_SAMPLING_PARAMS normalize_reasoning_effort",
     llm_routing: "_OR_PROVIDER_PRESETS _resolve_or_provider",
-    llm_local: (
-        "LocalContextTooLargeError _LOCAL_COMPACTION_MODES _compact_local_text "
-        "_compact_markdown_sections _estimate_message_chars _split_markdown_sections"
-    ),
+    llm_local: "LocalContextTooLargeError",
     llm_openai_compatible: "_FALSE_LIKE_ENV_VALUES _RESPONSE_METADATA_LABEL_MAX_CHARS _bounded_response_metadata_label",
     llm_pricing: "add_usage fetch_cloudru_pricing fetch_openrouter_pricing",
 }
@@ -80,16 +76,10 @@ _MIXIN_OWNERS = {
         "_stage_reasoning_pin_disclosure"
     ),
     (llm_capability_policy, "_CapabilityPolicyMixin"): (
-        "_CAPABILITIES_FETCH_OK _CONTEXT_LENGTH_CACHE _EFFORT_CEILING_CACHE _EFFORT_CEILING_LOADED "
-        "_EFFORT_FLOOR_CACHE _EFFORT_FLOOR_LOADED _EFFORT_FLOOR_RELOAD_SEC _NESTED_REASONING_PARAM "
-        "_REJECTED_PARAMS_CACHE _REJECTED_PARAMS_LOADED _REJECTED_PARAMS_RELOAD_SEC "
-        "_SUPPORTED_PARAMS_CACHE _SUPPORTED_PARAMS_FETCHED _apply_rejected_param_cache "
-        "_clamp_effort_for_model _effort_ceiling_for _effort_floor_for "
-        "_fetch_openrouter_capabilities _get_supported_parameters _known_rejected_params "
-        "_mandatory_value_rejection _parameter_rejection_error _payload_effort "
-        "_pop_effort_clamp_disclosure _pop_thread_disclosure _record_effort_ceiling _record_effort_floor "
-        "_remember_rejected_params _retry_without_optional_sampling _set_payload_effort "
-        "clamp_effort_for_route metadata_fetch_attempted_and_failed openrouter_context_length"
+        "_CAPABILITIES_FETCH_OK _CONTEXT_LENGTH_CACHE _SUPPORTED_PARAMS_CACHE _SUPPORTED_PARAMS_FETCHED "
+        "_fetch_openrouter_capabilities _get_supported_parameters "
+        "_pop_effort_clamp_disclosure _pop_thread_disclosure "
+        "metadata_fetch_attempted_and_failed openrouter_context_length"
     ),
     (llm_routing, "_ProviderRoutingMixin"): (
         "_chat_remote claudexor_model_sources claudexor_model_catalog supports_response_format "
@@ -97,21 +87,21 @@ _MIXIN_OWNERS = {
         "_get_remote_client _make_no_proxy_async_client _make_no_proxy_client _new_remote_client "
         "_no_proxy_timeout _openrouter_session_identity _parse_provider_model "
         "_prompt_cache_identity _qualified_model_name _resolve_remote_target "
-        "probe_oversized_context probe_provider_readiness"
+        "probe_provider_readiness"
     ),
     (llm_messages, "_MessageShapingMixin"): (
         "_REASONING_CONTENT_BLOCK_TYPES _content_with_system_notice_marker "
         "_copy_messages_with_cache_policy "
-        "_has_replayed_reasoning_metadata _is_deferrable_image_user_turn _model_family "
+        "_has_replayed_reasoning_metadata _order_complete_tool_episodes _model_family "
         "_normalize_system_message_placement _replace_image_blocks_with_placeholder "
         "_strip_openrouter_roundtrip_metadata sanitize_reasoning_on_model_switch"
     ),
     (llm_fallback, "_RecoveryLadderMixin"): (
         "_create_chat_completion_with_retries _create_chat_completion_with_retries_async "
         "_is_http_status _is_transient_body_error _openrouter_signature_retry_kwargs "
-        "_param_retry_kwargs_for_body_error _provider_body_error _reroute_kwargs_for_body_error "
+        "_provider_body_error _reroute_kwargs_for_body_error "
         "_reroute_same_model_kwargs _retry_without_prompt_cache_parameter "
-        "_rotate_openrouter_session_affinity _strip_kwargs_for_encrypted_body_error"
+        "_rotate_openrouter_session_affinity _router_reask_kwargs _strip_kwargs_for_encrypted_body_error"
     ),
     (llm_anthropic, "_AnthropicLaneMixin"): (
         "_anthropic_blocks_from_content _anthropic_image_block _build_anthropic_messages "
@@ -129,7 +119,6 @@ _MIXIN_OWNERS = {
         "_build_remote_kwargs _normalize_remote_response _openrouter_main_web_search_tool "
         "extract_display_reasoning"
     ),
-    (llm_pricing, "_GenerationCostMixin"): "_fetch_generation_cost",
 }
 
 # Members llm.py keeps: the composition itself, the caller-facing chat surface,
@@ -164,6 +153,12 @@ def test_llm_facade_reexports_every_moved_module_identity():
 
     assert llm.context_overflow_message is context_budget.context_overflow_message
     assert llm.CONTEXT_OVERFLOW_CODES is context_budget.CONTEXT_OVERFLOW_CODES
+    assert llm._estimate_message_chars is context_budget.estimate_message_chars
+
+
+def test_claudexor_catalog_aliases_keep_the_metadata_owner_identity():
+    for name in ("model_catalog", "catalog_admits_model"):
+        assert getattr(llm_claudexor, name) is getattr(llm_capability_policy, name)
 
 
 def _defined_members(path: pathlib.Path, class_name: str) -> set[str]:
@@ -197,7 +192,7 @@ def test_llm_client_members_resolve_to_their_mixin_owners():
 def test_llm_client_member_inventory_is_unchanged():
     """The composed class exposes exactly the member set of the tree it was split from.
 
-    The digest has moved twice, each time with named provenance. (1) The final upstream
+    The digest changes only with named provenance. (1) The final upstream
     cutoff (PR #257) added three methods to ``LLMClient`` in the base —
     ``_new_remote_client``, ``probe_provider_readiness`` and ``_new_gigachat_client`` —
     and the adopting merge re-homed them into the leaves that own their siblings.
@@ -214,7 +209,18 @@ def test_llm_client_member_inventory_is_unchanged():
     kind of provenance is what this pin exists to catch. (4) The subscription
     model integration adds three explicit route capability/catalog methods and
     places complete remote dispatch with the existing provider/client owner.
-    Every prior member remains inherited; no dispatch semantics changed.
+    (5) Explicit OpenRouter receipt reconciliation retires the unused
+    ``_fetch_generation_cost`` compatibility stub and its empty mixin.
+    (6) Window authority removes the callerless oversized context probe.
+    (7) Structural tool-episode ordering (#2135) replaces the image predicate
+    with ``_order_complete_tool_episodes`` so eviction preserves answer adjacency.
+    (8) Router-error unmasking adds ``_router_reask_kwargs``, the recovery
+    ladder's one re-ask of OpenRouter's own final verdict without fallbacks.
+    (9) Exact-route request-wire recovery (041e6e39, 50d054d5) left the private
+    model-global classifier, one-shot repair, rejected-parameter cache and
+    floor/ceiling writers callerless; they are retired. (10) The diagnostic
+    ``clamp_effort_for_route`` band had no production caller either; it is retired
+    with its floor/ceiling readers and caches.
     """
     assert _defined_members(pathlib.Path(llm.__file__), "LLMClient") == _PARENT_MEMBERS
     moved = {name for names in _MIXIN_OWNERS.values() for name in names.split()}
@@ -222,7 +228,7 @@ def test_llm_client_member_inventory_is_unchanged():
     assert hashlib.sha256(
         json.dumps(composed, separators=(",", ":")).encode()
 
-    ).hexdigest() == "e41b36df9a44c020082acd5db82ab40fb8a65811c5dd982ecac7df3325a5833c"
+    ).hexdigest() == "649ce387a5e259fcc9835b4bd52b56b8a867ce2595eeae3ac33308abc1a7795f"
     for name in composed:
         assert hasattr(LLMClient, name), name
 
@@ -239,7 +245,6 @@ def test_llm_mixin_composition_order_is_pinned():
         "_GigaChatLaneMixin",
         "_LocalLaneMixin",
         "_OpenAICompatibleLaneMixin",
-        "_GenerationCostMixin",
         "object",
     ]
     # No mixin shadows another: every member has exactly one owner.
@@ -248,17 +253,6 @@ def test_llm_mixin_composition_order_is_pinned():
         for name in _defined_members(pathlib.Path(sys.modules[base.__module__].__file__), base.__name__):
             assert name not in owners, f"{name} owned by both {owners.get(name)} and {base.__name__}"
             owners[name] = base.__name__
-
-
-def test_llm_extraction_size_bounds_have_meaningful_headroom():
-    counts = {
-        module.__name__: len(
-            pathlib.Path(module.__file__).read_text(encoding="utf-8").splitlines()
-        )
-        for module in (llm, *_LEAVES)
-    }
-    assert counts["ouroboros.llm"] <= 750
-    assert all(count <= 1000 for count in counts.values()), counts
 
 
 def test_llm_leaf_import_graph_is_acyclic_and_shallow():

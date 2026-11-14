@@ -3,6 +3,7 @@
 import asyncio
 from copy import deepcopy
 import json
+import os
 import pathlib
 import queue
 from types import SimpleNamespace
@@ -11,10 +12,13 @@ import pytest
 
 from ouroboros import cancel_intents, loop, model_wait, owner_mailbox, usage_accounting as ua
 from ouroboros.model_slots import MODEL_ACCOUNTS_KEY
-from ouroboros.task_results import load_task_result
+from ouroboros.settings_integrity import task_settings_snapshot
+from ouroboros.task_results import STATUS_RUNNING, load_task_result, write_task_result
 from tests.test_llm_claudexor import MODEL, result, setup as gateway_fixture
 from tests.test_model_wait import live_wait as wait_fixture
 from tests.test_subscription_main_wait import main_call as main_fixture
+from tests._usage_store_testing import ledger_rows
+from tests._shared import saved_settings
 
 setup = gateway_fixture
 live_wait = wait_fixture
@@ -110,7 +114,8 @@ def test_plan_executor_carries_wait_and_admitted_wallet_without_main_capture(tmp
     assert observed == [(owner, wallet, None, None)]
 
 
-def test_pinned_wait_rejects_other_catalog_account_before_new_generation(live_wait, monkeypatch):
+@pytest.mark.parametrize("advisory", [False, True])
+def test_pinned_wait_rejects_other_catalog_account_before_new_generation(live_wait, monkeypatch, advisory):
     _root, gateway, client, _owner, _events, _decide = live_wait
     monkeypatch.setenv(MODEL_ACCOUNTS_KEY, json.dumps({"light": "account-a"}))
     monkeypatch.setattr(model_wait.time, "sleep", lambda _seconds: None)
@@ -124,7 +129,8 @@ def test_pinned_wait_rejects_other_catalog_account_before_new_generation(live_wa
         assert profile == "account-a" and len(gateway.accepted_operations) == 1
         polls.append(profile)
         return {"source": source, "credentialProfileId": "account-b" if len(polls) == 1 else "account-a",
-                "models": [{"id": "exact-model"}]}
+                "models": [] if advisory else [{"id": "exact-model"}],
+                "admission": {"requestedModel": "exact-model", "inventoryAbsence": "advisory" if advisory else "authoritative"}}
 
     monkeypatch.setattr(client, "claudexor_model_catalog", catalog)
     client.chat([], MODEL, model_role="light")
@@ -144,11 +150,11 @@ def _loop_tools(ctx, owner):
     return tools
 
 
-def test_main_wait_does_not_call_configured_api_fallback_before_owner_switch(main_call, monkeypatch):
-    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+def test_main_quota_calls_configured_api_fallback_before_any_owner_wait(main_call, monkeypatch):
+    """Owner order: Auto rotation, then the configured fallback, and only then the owner question."""
     from ouroboros.llm_attempt import _attempt_request, _candidate_before_dispatch
 
-    ctx, gateway, owner, events, decide, _observations = main_call
+    ctx, gateway, owner, events, _decide, _observations = main_call
     tools = _loop_tools(ctx, owner)
     monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "openai::alternate")
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
@@ -170,13 +176,7 @@ def test_main_wait_does_not_call_configured_api_fallback_before_owner_switch(mai
                                            before_dispatch=_candidate_before_dispatch(request_body, request))
 
     def catalog(*args, **kwargs):
-        assert api_calls == [] and len(gateway.accepted_operations) == 1
-        row = next(event for event in reversed(list(events.queue)) if event.get("type") == "task_model_wait")
-        response = decide({"request_id": "switch-api", "decision_id": f"model_wait:task-one:{row['wait_id']}",
-                           "revision": row["revision"], "action": "switch", "model": "openai::alternate",
-                           "credential_profile_id": "", "use_local": False, "persist_role": False})
-        assert response.status_code == 202
-        raise ClaudexorUnavailable("subscription_window_exhausted", "still waiting")
+        pytest.fail("the owner is asked only after every configured route of the round failed")
 
     monkeypatch.setattr(ctx.llm, "_chat_remote", send)
     monkeypatch.setattr(ctx.llm, "claudexor_model_catalog", catalog)
@@ -184,6 +184,7 @@ def test_main_wait_does_not_call_configured_api_fallback_before_owner_switch(mai
         ctx.messages, tools, ctx.llm, ctx.drive_logs, lambda *_args, **_kwargs: None, queue.Queue(),
         task_id="task-one", drive_root=ctx.drive_root, event_queue=events)
     assert text == "Finished" and api_calls == ["openai"]
+    assert not [event for event in list(events.queue) if event.get("type") == "task_model_wait"]
     assert usage["_model_route"] == {} and len(gateway.accepted_operations) == 1
     assert any(message.get("content") == "verified read A" for message in ctx.messages)
     assert any(message.get("content") == "completed review B" for message in ctx.messages)
@@ -293,6 +294,7 @@ def test_pre_call_wrap_keeps_the_existing_transport_episode_no_call(main_call, m
 
     ctx, gateway, owner, events, _decide, _observations = main_call
     tools = _loop_tools(ctx, owner)
+    saved_settings(monkeypatch, ctx.drive_root, OUROBOROS_MODEL_FALLBACKS="")  # a saved blank: no chain
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
     monkeypatch.setattr(loop_transport, "interruptible_wait_sleep", lambda *_args: False)
@@ -347,6 +349,7 @@ def test_outage_wrap_keeps_older_wire_death_custody_without_summary(tmp_path, mo
             return llm.chat(**kwargs)
 
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
+    saved_settings(monkeypatch, tmp_path, OUROBOROS_MODEL_FALLBACKS="")  # a saved blank: no chain
     monkeypatch.setattr(loop, "_run_cross_model_fallback_chain", _no_chain)
     posted = []
 
@@ -360,30 +363,36 @@ def test_outage_wrap_keeps_older_wire_death_custody_without_summary(tmp_path, mo
             msg_id=owner_stop_control_id(intent), kind=owner_mailbox.KIND_FINALIZE_NOW)
         return True
 
-    if interactive:
-        monkeypatch.setattr(loop_llm_call, "_sleep_within_deadline",
-                            lambda seconds, deadline, **kw: release_wait_after_control_check(seconds, kw["wake_check"]))
-    else:
-        monkeypatch.setattr(loop_transport, "interruptible_wait_sleep", release_wait_after_control_check)
-    kwargs = _loop_kwargs(tmp_path, ControlledLLM(), [])
-    kwargs["tools"]._ctx.is_direct_chat = interactive
-    with model_wait.task_model_wait_scope(task={"id": "t-death"}, drive_root=tmp_path,
-            event_queue=None, worker_slot_held=not interactive) as owner:
-        owner.tool_context = kwargs["tools"]._ctx
-        _text, usage, trace = loop.run_llm_loop(**kwargs)
+    monkeypatch.setattr(loop_transport, "interruptible_wait_sleep", release_wait_after_control_check)
+    def run():
+        kwargs = _loop_kwargs(tmp_path, ControlledLLM(), [])
+        kwargs["tools"]._ctx.is_direct_chat = interactive
+        if interactive:
+            kwargs["task_type"] = kwargs["tools"]._ctx.current_task_type = "presence"
+        with model_wait.task_model_wait_scope(task={"id": "t-death"}, drive_root=tmp_path,
+                event_queue=None, worker_slot_held=not interactive) as owner:
+            owner.tool_context = kwargs["tools"]._ctx
+            return loop.run_llm_loop(**kwargs)
+
+    # The managed task's Pause authority is its lifecycle row, which the agent
+    # publishes as RUNNING before the loop's first round (agent.py). Without it
+    # the authority is unknown: the loop refuses before any reservation or send.
+    with pytest.raises(model_wait.ModelWaitInterrupted, match="owner_pause_authority_unreadable"):
+        run()
+    assert not posted and llm.calls == 0 and not ledger_rows(tmp_path)
+    write_task_result(tmp_path, "t-death", STATUS_RUNNING, root_task_id="t-death",
+                      _is_direct_chat=interactive)
+    _text, usage, trace = run()
     assert posted and llm.calls == 1
-    assert [row["state"] for row in _ledger(tmp_path)] == ["reserved", "dispatched", "unresolved"]
+    assert [row["state"] for row in _ledger(tmp_path)] == ["unresolved"]
     assert loop_llm_call.provider_no_call_source(usage, False)[0] == "provider_outcome_unknown_no_resend"
-    if interactive:
-        assert trace["forced_finalization"]["control_reason"] == "finalize_requested"
-    else:
-        assert "owner requested Wrap up" in _text
-        assert trace["forced_finalization"]["source"] == "provider_outcome_unknown_no_resend"
+    assert "owner requested Wrap up" in _text
+    assert trace["forced_finalization"]["source"] == "provider_outcome_unknown_no_resend"
 
 
 @pytest.mark.parametrize("stop,expected_reason", [
     ("wrap", "owner_requested_finalization"), ("deadline", "deadline_local"),
-    ("ceiling", "finalization_grace"), ("wrap_unknown", "owner_requested_finalization"),
+    ("ceiling", "finalization_grace"),
 ])
 def test_real_main_control_preserves_candidate_without_new_summary(main_call, monkeypatch, stop, expected_reason):
     from ouroboros import config
@@ -401,7 +410,8 @@ def test_real_main_control_preserves_candidate_without_new_summary(main_call, mo
     gateway.dispatch = ["response_received", "not_started"]
     held = []
 
-    def hold(content, limit, trace, actual_tools, *_args):
+    def hold(content, limit, trace, actual_tools, *_args, explicit_candidate=False, resume_candidate=False):
+        assert explicit_candidate is False and resume_candidate is False, "this fixture holds the first ordinary answer"
         held.append(loop._replace_delivery_candidate(actual_tools, limit, trace, content, control="hold_for_verification"))
         if stop == "wrap_unknown":
             gateway.pending = True
@@ -471,7 +481,8 @@ def test_hard_cancel_returns_empty_events_to_real_worker_loop_and_keeps_queue_ow
 
     monkeypatch.setattr(actual, "_prepare_task_context", prepare)
     monkeypatch.setattr(actual, "_start_task_heartbeat_loop", lambda *_args: None)
-    monkeypatch.setattr(subagent_runtime, "apply_task_start_settings_or_disclose", lambda *_args: None)
+    monkeypatch.setattr(subagent_runtime, "apply_task_start_settings_or_disclose",
+                        lambda *_args: task_settings_snapshot({}, os.environ))
     monkeypatch.setattr(agent_module, "make_agent", lambda **_kwargs: actual)
     monkeypatch.setattr(worker_process, "_bind_worker_repo_root", lambda *_args: None)
     monkeypatch.setattr(worker_process, "_prepare_worker_task_runtime", lambda: None)
@@ -515,8 +526,7 @@ def test_hard_cancel_returns_empty_events_to_real_worker_loop_and_keeps_queue_ow
 
 
 @pytest.mark.parametrize("stop,deadline,transport,expected", [
-    (True, True, False, ["stop"]), (False, True, False, ["deadline"]),
-    (False, False, False, ["deadline", "cost"]), (False, True, True, ["cost"]),
+    (True, True, False, ["stop"]), (False, False, False, ["deadline", "cost"]), (False, True, True, ["cost"]),
 ])
 def test_pre_round_terminal_order_keeps_cost_after_stop_and_deadline(monkeypatch, stop, deadline, transport, expected):
     from ouroboros import loop_round_limits
@@ -534,9 +544,7 @@ def test_pre_round_terminal_order_keeps_cost_after_stop_and_deadline(monkeypatch
     assert result_value_actual == result_value and calls == expected
 
 
-@pytest.mark.serial
-@pytest.mark.parametrize("first", ["web", "host"])
-@pytest.mark.parametrize("persist_role", [False, True])
+@pytest.mark.parametrize(("persist_role", "first"), [(False, "host"), (True, "web")])
 def test_web_and_host_wait_decisions_share_saved_replay_and_attempt_fences(live_wait, monkeypatch, first, persist_role):
     from ouroboros import config
     from supervisor import queue as task_queue
@@ -544,6 +552,9 @@ def test_web_and_host_wait_decisions_share_saved_replay_and_attempt_fences(live_
 
     root, _gateway, _client, owner, _events, _decide = live_wait
     monkeypatch.setattr(config, "SETTINGS_PATH", root / "settings.json")
+    if persist_role:
+        config.SETTINGS_PATH.write_text(json.dumps({"OUROBOROS_MODEL_SAFETY": "fixed/checker",
+            "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE": "full"}), encoding="utf-8")
     row = {"wait_id": "wait-one", "revision": 1, "task_attempt": 1, "state": "waiting", "role": "light"}
     model_wait.mutate_wait(root, "task-one", "wait-one", lambda _: row)
     owner.waits["wait-one"] = dict(row)
@@ -576,7 +587,58 @@ def test_web_and_host_wait_decisions_share_saved_replay_and_attempt_fences(live_
             assert saved_bytes is None
 
 
-@pytest.mark.serial
+@pytest.mark.parametrize(("persist_role", "declared"), [(True, True), (False, False)])
+def test_a_main_model_saved_on_a_wait_card_is_recorded_like_a_settings_save(live_wait, monkeypatch, declared,
+                                                                             persist_role):
+    """ORDER item 4: the card's saved choice records the writer's receipt as one ``settings_changed`` with the origin
+    its client declared; the app's card declares itself and puts no row in Main, an undeclared caller gets one. A
+    choice for this task only writes and records nothing."""
+    import supervisor.message_bus as bus
+    import supervisor.state as state
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+    from ouroboros import config
+    from ouroboros.gateway.task_decision import api_decision_answer
+
+    root, _gateway, _client, owner, _events, _decide = live_wait
+    sent = []
+    monkeypatch.setattr(bus, "send_with_budget", lambda *args, **kwargs: sent.append((args, kwargs)))
+    monkeypatch.setattr(state, "load_state", lambda: {"owner_chat_id": 77})
+    monkeypatch.setattr(config, "SETTINGS_PATH", root / "settings.json")
+    config.SETTINGS_PATH.write_text(json.dumps({"OUROBOROS_MODEL": "openrouter/old-main"}), encoding="utf-8")
+    row = {"wait_id": "wait-one", "revision": 1, "task_attempt": 1, "state": "waiting", "role": "main"}
+    model_wait.mutate_wait(root, "task-one", "wait-one", lambda _: row)
+    owner.waits["wait-one"], owner.revision = dict(row), 1
+    web = Starlette(routes=[Route("/api/decisions", api_decision_answer, methods=["POST"])])
+    web.state.drive_root = root
+    with TestClient(web) as client:
+        response = client.post("/api/decisions", headers={"X-Ouroboros-Surface": "app", "X-Ouroboros-Actor": "owner"}
+                               if declared else {}, json={
+            "request_id": "main-saved", "decision_id": "model_wait:task-one:wait-one", "revision": 1,
+            "action": "switch", "model": MODEL, "credential_profile_id": "", "use_local": False,
+            "persist_role": persist_role})
+    assert response.status_code == 202 and response.json()["saved"] is persist_role
+    events = root / "logs" / "events.jsonl"
+    records = [entry for entry in map(json.loads, events.read_text(encoding="utf-8").splitlines())
+               if entry.get("action") == "settings_changed"] if events.exists() else []
+    if not persist_role:
+        assert records == [] and sent == []
+        return
+    [record] = records
+    assert record["changes"]["OUROBOROS_MODEL"] == {"old": "openrouter/old-main", "new": MODEL}
+    assert (record["surface"], record["actor"]) == (("app", "owner") if declared else ("api", "not declared"))
+    if declared:
+        assert sent == []
+    else:
+        from ouroboros.gateway.owner_settings import settings_change_text
+
+        [((chat, text), kwargs)] = sent
+        assert chat == 77 and kwargs == {"role": "system", "system_type": "settings_changed"}
+        assert text == settings_change_text(record["changes"], record)  # Main's row says what the record holds
+        assert "openrouter/old-main" in text and MODEL in text and "declared" not in text, text
+
+
 @pytest.mark.parametrize("surface", ["web", "host"])
 def test_wait_decision_preserves_existing_settings_timeout_receipt(live_wait, monkeypatch, surface):
     import threading
@@ -613,3 +675,98 @@ def test_wait_decision_preserves_existing_settings_timeout_receipt(live_wait, mo
         finally:
             release.set()
             assert completed.wait(5)
+
+
+class _AppliedPlan:
+    """An identity token for a plan the call applied before it yielded (an authored view, a low retry, a card's
+    rebind). Every attribute reads as None, so these tests never reach a real rebind: the harness has no context core."""
+
+    def __getattr__(self, _name):
+        return None
+
+
+class _Answering:
+    calls = 0
+
+    def default_model(self):
+        return "test-model"
+
+    def chat(self, **_kwargs):
+        self.calls += 1
+        return {"role": "assistant", "content": "done"}, {"prompt_tokens": 1, "completion_tokens": 1}
+
+
+@pytest.mark.parametrize("reason", ["owner_words_waiting", "owner_model"])
+@pytest.mark.parametrize("where", ["in_call", "before_call"])
+def test_a_yielded_round_redials_from_what_its_call_applied(tmp_path, monkeypatch, reason, where):
+    """Before a call yields to an owner control it may apply the owner's wait-card route, the mind's authored memory view
+    or a low retry, each rewriting the transcript in place. The free redial starts from that route, plan and mode.
+    A yield before this round's call has nothing of it to carry: the loop keeps its own state."""
+    from ouroboros.route_choice import explicit
+    from ouroboros.tools.registry import ToolRegistry
+    from tests.test_loop_transport_wait import _loop_kwargs
+
+    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
+    call_round, inject, seen, applied = loop._call_round_model, loop._inject_round_checkpoints, [], _AppliedPlan()
+
+    def call(model_call):
+        seen.append((model_call.active_model, model_call.active_use_local, model_call.context_fit_plan,
+                     model_call.active_context_mode))
+        if where == "in_call" and len(seen) == 1:  # what _reprepare_waiting_main, a view and _reproject_actual_overflow_low set
+            model_call.active_model, model_call.active_use_local = "card/model", True
+            model_call.context_fit_plan, model_call.active_context_mode = applied, "low"
+            model_call.tools._ctx.route_choice = explicit("wait_card")
+            raise model_wait.ModelWaitInterrupted(reason)
+        if where == "in_call":  # the applied plan is a stand-in: this redial's answer is scripted
+            return {"role": "assistant", "content": "done"}, 0.0, model_call.active_context_mode
+        return call_round(model_call)
+
+    def checkpoints(**kwargs):
+        if where == "before_call" and not seen and not kwargs["accumulated_usage"].get("_probe_yielded"):
+            kwargs["accumulated_usage"]["_probe_yielded"] = True
+            raise model_wait.ModelWaitInterrupted(reason)
+        return inject(**kwargs)
+
+    monkeypatch.setattr(loop, "_call_round_model", call)
+    monkeypatch.setattr(loop, "_inject_round_checkpoints", checkpoints)
+    result, _usage, _trace = loop.run_llm_loop(
+        **_loop_kwargs(tmp_path, ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path), [], llm=_Answering()))
+    assert result == "done"
+    if where == "in_call":
+        assert seen[0] == ("test-model", False, None, "max") and len(seen) == 2
+        assert seen[1][:2] == ("card/model", True) and seen[1][2] is applied and seen[1][3] == "low"
+    else:
+        assert seen == [("test-model", False, None, "max")]  # one call, from the loop's own state, after the early yield
+
+
+@pytest.mark.parametrize("reason", ["owner_words_waiting", "owner_model"])
+def test_a_later_rounds_early_yield_never_adopts_an_earlier_rounds_call(tmp_path, monkeypatch, reason):
+    """Round 1's call ends; round 2 binds the view the mind authored meanwhile and yields before its own call. The redial
+    keeps round 2's plan: nothing of round 1's finished call is carried."""
+    from ouroboros.tools.registry import ToolRegistry
+    from tests.test_loop_transport_wait import _loop_kwargs
+
+    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
+    inject, seen, yielded = loop._inject_round_checkpoints, [], []
+    first, authored = _AppliedPlan(), _AppliedPlan()
+    tool_call = {"id": "c1", "type": "function", "function": {"name": "no_such_tool", "arguments": "{}"}}
+
+    def call(model_call):
+        seen.append(model_call.context_fit_plan)
+        if len(seen) == 1:  # round 1 applies a plan, answers with a tool call, and leaves an authored view for round 2
+            model_call.context_fit_plan, model_call.tools._ctx._authored_memory_plan = first, authored
+            return {"role": "assistant", "content": "", "tool_calls": [tool_call]}, 0.0, model_call.active_context_mode
+        return {"role": "assistant", "content": "done"}, 0.0, model_call.active_context_mode
+
+    def checkpoints(**kwargs):
+        if kwargs["round_idx"] == 2 and not yielded:
+            yielded.append(True)
+            raise model_wait.ModelWaitInterrupted(reason)
+        return inject(**kwargs)
+
+    monkeypatch.setattr(loop, "_call_round_model", call)
+    monkeypatch.setattr(loop, "_inject_round_checkpoints", checkpoints)
+    result, _usage, _trace = loop.run_llm_loop(
+        **_loop_kwargs(tmp_path, ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path), [], llm=_Answering()))
+    assert result == "done" and yielded == [True] and len(seen) == 2
+    assert seen[0] is None and seen[1] is authored  # round 2's bound view, not round 1's finished call

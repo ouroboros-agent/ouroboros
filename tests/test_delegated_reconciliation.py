@@ -20,6 +20,7 @@ from ouroboros.config import CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION
 from ouroboros.gateways import claudexor as cx
 
 from tests._cancel_intents_shared import qenv as _qenv
+from tests._store_shared import unreadable_result
 from tests._delegated_transport_shared import (  # noqa: F401  (autouse fixture applies on import)
     _LiveRunStub,
     _event_types,
@@ -38,6 +39,8 @@ def startup_owners(tmp_path, monkeypatch):
     from supervisor import active_activity, queue, workers
 
     monkeypatch.setattr(server_maintenance, "DATA_DIR", tmp_path)
+    # Not this fixture's duty: the real child's own thread would outlive the test (it has its own tests).
+    monkeypatch.setattr(server_maintenance, "_tick_maintenance_child", lambda: None)
     monkeypatch.setattr(queue, "RUNNING", {})
     monkeypatch.setattr(queue, "PENDING", [])
     monkeypatch.setattr(workers, "WORKERS", {})
@@ -51,7 +54,9 @@ def test_the_startup_sweep_reconciles_delegated_runs_too(monkeypatch, startup_ow
     """A fresh generation has no surviving queue, direct or post-task owners.
 
     Startup must reconcile with that actual empty set, without inheriting another
-    test's queue. An in-process revival with live owners is covered separately.
+    test's queue. Liveness now arrives as the sweep's one CALLABLE source (INV-B:
+    candidates first, liveness second), so the assertion reads what it produces.
+    An in-process revival with live owners is covered separately.
     """
     import ouroboros.server_maintenance as sm
     import ouroboros.delegate_custody as dc
@@ -63,7 +68,8 @@ def test_the_startup_sweep_reconciles_delegated_runs_too(monkeypatch, startup_ow
                         lambda root, **kw: seen.setdefault("live", kw.get("running_task_ids")) or [])
     monkeypatch.setattr(sm, "_installed_skill_names", lambda: None)
     sm._startup_custody_sweep()
-    assert seen["live"] == set(), "an empty live set is the point: nothing survived the restart"
+    assert seen["live"] is sm._live_task_ids
+    assert seen["live"]() == set(), "an empty live set is the point: nothing survived the restart"
 
 
 def test_startup_revival_keeps_actual_current_owners(tmp_path, monkeypatch, startup_owners):
@@ -94,16 +100,20 @@ def test_startup_revival_keeps_actual_current_owners(tmp_path, monkeypatch, star
                         lambda root, **kw: seen.__setitem__("processes", kw["running_task_ids"]) or [])
     monkeypatch.setattr(sm, "_installed_skill_names", lambda: None)
     sm._startup_custody_sweep()
-    assert seen["processes"] == seen["delegated"] == expected
+    # ONE source, evaluated by each surface after it has read its own candidates.
+    assert seen["processes"] is seen["delegated"] is sm._live_task_ids
+    assert seen["delegated"]() == expected
     assert seen["outcomes"] == []
     assert transport.cancels == []
     assert {row.run_id for row in dc.open_runs(tmp_path)} == {f"run-{task_id}" for task_id in expected}
 
 
 def test_both_custody_surfaces_see_the_same_live_task_set(tmp_path, monkeypatch, startup_owners):
-    """The periodic sweep must hand the delegated reconciler the SAME live task set the
-    process reaper gets. Two copies of "is the owner still running" is exactly how one
-    custody surface ends up reaping while its twin does not."""
+    """The periodic sweep must hand the delegated reconciler the SAME live task source
+    the process reaper gets. Two copies of "is the owner still running" is exactly how
+    one custody surface ends up reaping while its twin does not. The source is now the
+    sweep's one CALLABLE (INV-B: each surface evaluates it after reading its own
+    candidates), and the 600 s block itself rides a daemon thread beside the 20 s one."""
     import time
     import threading
 
@@ -145,9 +155,12 @@ def test_both_custody_surfaces_see_the_same_live_task_set(tmp_path, monkeypatch,
     get_direct_activity_registry().register("native-live", 1)
     try:
         sm._periodic_supervisor_maintenance([0.0], [time.time()])
-        assert seen["processes"] == seen["delegated"] == {"t-live", "native-live"}, seen
-        assert entered.wait(2) and len(threads) == 1
-        assert threads[0].name == "terminal-maintenance" and threads[0].is_alive()
+        assert entered.wait(2)
+        assert [thread.name for thread in threads if thread.name not in {"cold-custody", "schedule-admission"}] == ["cancel_intent_sweep", "terminal_delivery_replay", "question_delivery_replay", "pause_notice_replay", "abandoned_usage_reconciliation", "post_task_synthesis_recovery", "custody-maintenance"]
+        assert threads[0].is_alive(), "the 20 s sweep is still inside its delayed work"
+        next(thread for thread in threads if thread.name == "custody-maintenance").join(5)
+        assert seen["processes"] is seen["delegated"] is sm._live_task_ids
+        assert seen["delegated"]() == {"t-live", "native-live"}, seen
     finally:
         # The actual maintenance owner finishes before monkeypatch restores its
         # root, lock and dependent functions, including when an assertion fails.
@@ -156,6 +169,7 @@ def test_both_custody_surfaces_see_the_same_live_task_set(tmp_path, monkeypatch,
             thread.join(timeout=5)
         assert all(not thread.is_alive() for thread in threads)
     assert not lock.locked(), "the real maintenance finally released its latch"
+    assert not sm._CUSTODY_SWEEP_LOCK.locked(), "so did the custody block"
 
 
 def test_an_orphaned_delegated_run_is_reconciled_when_its_owner_is_gone(tmp_path, monkeypatch):
@@ -246,7 +260,8 @@ def test_what_the_daemon_says_is_absent_is_closed_not_faulted_forever(tmp_path):
 
     class _NoSuchRun(_LiveRunStub):
         def get_run(self, rid, **_kw):
-            raise cx.ClaudexorUnavailable("run_not_found", "no such run", status_code=404)
+            from tests._shared import run_absent_in
+            raise run_absent_in("store-a")  # the owning store answers that it keeps no such run
 
     class _NoSuchProject(_LiveRunStub):
         def get_run(self, rid, **_kw):
@@ -258,10 +273,12 @@ def test_what_the_daemon_says_is_absent_is_closed_not_faulted_forever(tmp_path):
     for run_id, task in (("run-gone", "t-gone"), ("run-owns-a-dead-project", "t-also-gone")):
         dc.record_started(tmp_path, dc.RunCustody(
             run_id=run_id, task_id=task, route_id="r", model="m", project_id="prj-ours",
+            daemon_store_id="store-a",
             project_owned=run_id.endswith("project"), root_task_id=task, ledger_root=str(tmp_path)))
     dc._CUSTODY.clear()
 
     class _Router(_LiveRunStub):
+        store_identity = "store-a"
         def get_run(self, rid, **_kw):
             return (_NoSuchProject() if rid.endswith("project") else _NoSuchRun()).get_run(rid)
         def remove_project(self, pid): _NoSuchProject().remove_project(pid)
@@ -410,14 +427,16 @@ def test_a_breach_whose_cancel_was_never_verified_is_not_reported_as_cancelled(
     assert "The run was cancelled." not in out["detail"], out["detail"]
 
 
-def test_reconciliation_default_transport_is_the_ensured_owned_daemon(tmp_path, monkeypatch):
+def test_the_admitted_sweep_names_the_ensure_transport_and_nothing_defaults(tmp_path, monkeypatch):
     """Regression (v6.89.0): the startup sweep reaps the previous generation's owned
     daemon and THEN reconciled through a bare discovery-only gateway — which always
     found the corpse it had just made, so every restart's reconciliation silently
-    no-opped and open runs stayed unsettled until the next delegate_start. With real
-    work to reconcile, the default transport must be the ENSURE path (which also
-    adopts a staged runtime update the old always-running daemon never could)."""
-    from ouroboros import delegate_custody as dc
+    no-opped and open runs stayed unsettled until the next delegate_start. The
+    admitted sweep (``server_maintenance._reconcile_delegated_runs``) therefore NAMES
+    the ensure transport. Nothing defaults to it any more: the loop-exit release of
+    issue #1772 admitted a daemon through the old ``_reconcile_each`` default, so a
+    pass without an explicit factory is refused instead of starting one."""
+    from ouroboros import delegate_custody as dc, server_maintenance as sm
 
     dc.record_started(tmp_path, dc.RunCustody(
         run_id="run-orphan", task_id="t-gone", route_id="r", model="m",
@@ -433,21 +452,38 @@ def test_reconciliation_default_transport_is_the_ensured_owned_daemon(tmp_path, 
         def cancel_run(self, run_id): return {}
         def close(self): pass
 
-    def _fake_ensure():
+    def _fake_ensure(**_kw):
         ensured.append(True)
         return _EnsuredGateway()
 
-    monkeypatch.setattr(
-        "ouroboros.claudexor_daemon.ensure_owned_gateway", _fake_ensure)
+    monkeypatch.setattr("ouroboros.claudexor_daemon.ensure_owned_gateway", _fake_ensure)
+    monkeypatch.setattr("ouroboros.claudexor_daemon.read_owned_gateway",
+                        lambda **_kw: pytest.fail("the admitted sweep ensures, it does not attach"))
+    monkeypatch.setattr(sm, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(sm, "_stop_requested", lambda stop_event=None: False)
+    sm._reconcile_delegated_runs(lambda: set())
+    assert ensured, "the admitted sweep's gateway factory must go through ensure_owned_gateway"
+
+    # A bare sweep call names no factory: it ATTACHES (never ensures) and replays nothing.
+    dc.record_started(tmp_path, dc.RunCustody(
+        run_id="run-orphan-2", task_id="t-gone-2", route_id="r", model="m", ledger_root=str(tmp_path)))
+    dc._CUSTODY.clear()
+    attached = []
+    monkeypatch.setattr("ouroboros.claudexor_daemon.read_owned_gateway",
+                        lambda **_kw: attached.append(True) or _EnsuredGateway())
+    ensured.clear()
     dc.reconcile_orphaned_runs(tmp_path, set())
-    assert ensured, "the default gateway factory must go through ensure_owned_gateway"
+    assert attached and not ensured
+    with pytest.raises(ValueError):
+        dc._reconcile_each(tmp_path, [], None)  # the core still refuses a missing factory
 
     # And with NOTHING to reconcile the daemon is never started at all: the empty
     # early-return keeps the ordinary idle restart free of a daemon spawn.
     ensured.clear()
     empty = tmp_path / "empty-drive"
     empty.mkdir()
-    assert dc.reconcile_orphaned_runs(empty, set()) == []
+    assert dc.reconcile_orphaned_runs(empty, set(), gateway_factory=_fake_ensure,
+                                      replay_pending=lambda: True) == []
     assert not ensured
 
 
@@ -486,6 +522,27 @@ def test_the_kill_boundary_states_its_own_verdict_before_it_writes_it(tmp_path):
     )
     assert [row["action"] for row in outcomes] == ["left_live"]
     assert spared.cancels == []
+    dc._CUSTODY.clear()
+
+
+def test_a_signal_deaths_verdict_ends_the_dead_attempts_run_as_an_abrupt_loss(tmp_path):
+    """A worker death (ARCHITECTURE §5). A worker killed by a signal reserves no handoff for its delegated runs (the leaf
+    settles as on abrupt loss), so the kill boundary states the verdict it writes next, ``interrupted``, and the
+    still-running run is cancelled as ``owner_task_gone``; a death that keeps its handoff passes no verdict and the
+    run is left to the handoff (``tests/test_worker_crash_retry.py`` holds the two callers)."""
+    import ouroboros.delegate_custody as dc
+    from ouroboros.task_results import STATUS_INTERRUPTED
+
+    dc._CUSTODY.clear()
+    dc.record_started(tmp_path, dc.RunCustody(
+        run_id="run-signal-dead", task_id="t-signal", route_id="r", model="m",
+        project_id="p", project_owned=False, root_task_id="t-signal", ledger_root=str(tmp_path)))
+    dc._CUSTODY.clear()
+    live = _LiveRunStub(run_id="run-signal-dead")
+    outcomes = dc.reconcile_task_runs(tmp_path, "t-signal", gateway_factory=lambda: live,
+                                      deliberate_terminal=STATUS_INTERRUPTED)
+    assert [row["action"] for row in outcomes] == ["cancelled"]
+    assert live.cancels == [("run-signal-dead", "owner_task_gone")]
     dc._CUSTODY.clear()
 
 
@@ -622,11 +679,10 @@ def _panel_run(tmp_path, source="review_substrate", task_id="t-reviewed",
     return dc
 
 
-@pytest.mark.parametrize("source", ["review_substrate", "review_substrate:task_acceptance"])
-@pytest.mark.parametrize("owner,expected", [
-    ("completed", "left_live"),
-    ("failed", "left_live"),
-    ("cancelled", "cancelled"),
+@pytest.mark.parametrize(("owner", "expected", "source"), [
+    ("completed", "left_live", "review_substrate"),
+    ("failed", "left_live", "review_substrate:task_acceptance"),
+    ("cancelled", "cancelled", "review_substrate"),
 ])
 def test_a_review_panels_run_outlives_every_owner_terminal_but_cancellation(
     tmp_path, source, owner, expected,
@@ -692,10 +748,13 @@ def test_a_terminal_review_run_still_settles_through_the_sweep(tmp_path):
     dc._CUSTODY.clear()
 
 
-def test_a_pending_review_invocation_is_retained_rather_than_re_posted(tmp_path):
+def test_a_pending_review_invocation_is_left_to_its_panel_never_re_posted(tmp_path):
     """The review substrate rejoins its own pending invocation by its exact key
     (``review_session_custody``); a delegation sweep that re-POSTed it here would
-    bind a second reviewer nobody on this task asked for."""
+    bind a second reviewer nobody on this task asked for. The periodic sweep leaves
+    it alone entirely (owner Q2=A: 9 871 identical "retained" rows a day, each a
+    store commit, an fsynced append and an archive scan, were the old cost); the
+    kill path still names it once."""
     import ouroboros.delegate_custody as dc
 
     dc._CUSTODY.clear()
@@ -705,13 +764,15 @@ def test_a_pending_review_invocation_is_retained_rather_than_re_posted(tmp_path)
         route="codex", source="review_substrate.extraction")
     dc._CUSTODY.clear()
 
-    class _NeverStarts(_LiveRunStub):
-        def start_run(self, request, *, idempotency_key=""):
-            pytest.fail("the review substrate owns this invocation's rejoin")
+    for _ in range(3):
+        assert dc.reconcile_orphaned_runs(
+            tmp_path, set(), gateway_factory=lambda: pytest.fail("no sweep work opens a gateway"),
+            replay_pending=lambda: True) == []  # the admitted sweep's shape
+    assert _event_types(tmp_path).count("delegate_run_reconciled") == 0
+    assert [record["invocation_id"] for record in dc.pending_invocations(tmp_path)] == ["inv-panel"]
 
-    outcomes = dc.reconcile_orphaned_runs(tmp_path, set(), gateway_factory=_NeverStarts)
-
-    assert outcomes == [{
+    assert dc.reconcile_task_runs(  # exit does not admit: naming it opens no transport either
+            tmp_path, "t-reviewed", gateway_factory=lambda: pytest.fail("a kill path opened a gateway")) == [{
         "invocation_id": "inv-panel", "task_id": "t-reviewed",
         "action": "invocation_retained",
         "reason": "review_panel_owns_invocation"}]
@@ -719,7 +780,6 @@ def test_a_pending_review_invocation_is_retained_rather_than_re_posted(tmp_path)
     dc._CUSTODY.clear()
 
 
-@pytest.mark.serial
 @pytest.mark.parametrize("pending", [False, True], ids=["bound", "pending"])
 @pytest.mark.parametrize("captured,case", [
     (captured, case) for captured in (False, True)
@@ -777,7 +837,7 @@ def test_cancellation_uses_adopted_terminal_for_live_delegation(qenv, monkeypatc
         write_task_result(child, task_id, "failed", root_task_id=task_id, **failure)
         fields.update(child_drive_root=str(child), delegation_role="subagent")
         if case == "child_unreadable":
-            (child / "task_results" / f"{task_id}.json").write_text("{unreadable")
+            unreadable = unreadable_result(monkeypatch, task_id, root=child)
     if case == "prior_infra":
         fields.update(failure)
     write_task_result(root, task_id, "failed" if case == "prior_infra" else "running", **fields)
@@ -811,23 +871,36 @@ def test_cancellation_uses_adopted_terminal_for_live_delegation(qenv, monkeypatc
         assert transport.cancels == [] and recovered_keys == []
         assert task_id in qenv.q.RUNNING and not worker.proc.is_alive()
         assert cancel_intents.cancel_pending(root, task_id) and child.is_dir()
-        # The same open intent can finish after file access recovers; no new
-        # scheduler, flag or cancellation claim is needed.
-        write_task_result(child, task_id, "failed", root_task_id=task_id, **failure)
+        # The same open intent can finish after the child's store answers again;
+        # no new scheduler, flag or cancellation claim is needed.
+        unreadable["on"] = False
         assert qenv.tl.cancel_task_custody(task_id, deliver=False) == qenv.tl.CANCEL_ALREADY_SETTLED
         assert load_task_result(root, task_id)["status"] == "failed"
         assert transport.cancels == []
-        assert recovered_keys == (["inv-owned"] if pending else [])
+        assert recovered_keys == []  # a kill boundary never re-POSTs a pending start
         assert not cancel_intents.cancel_pending(root, task_id) and task_id not in qenv.q.RUNNING
         return
-    assert recovered_keys == (["inv-owned"] if pending else [])
+    # Exit does not admit (#1772): the kill boundary attaches and settles the runs it
+    # can see; a START_REQUESTED-only invocation is never replayed here, whatever the
+    # verdict. It stays durable and disclosed, and the admitted sweep recovers it
+    # under the same key once the owner is gone (asserted below for the cancel cases).
+    assert recovered_keys == []
     if case in {"owner_stop", "snapshot_restore"}:
         assert outcome == qenv.tl.CANCEL_CANCELLED
         assert stored["status"] == "cancelled"
-        assert transport.cancels == [(run_id, "owner_task_gone")]
-        assert status_at_cancel == ["running"], "request precedes the cancelled write"
-        # The transport still reports running: a request cannot claim physical death.
-        assert stored["delegated_runs_unreconciled"] == [run_id]
+        if pending:
+            assert transport.cancels == []
+            assert stored["delegated_runs_unreconciled"] == ["invocation:inv-owned"]
+            swept = dc.reconcile_orphaned_runs(root, set(), gateway_factory=lambda: transport,
+                                               replay_pending=lambda: True)
+            assert recovered_keys == ["inv-owned"]
+            assert [row["action"] for row in swept] == ["cancelled"]
+            assert transport.cancels == [(run_id, "owner_task_gone")]
+        else:
+            assert transport.cancels == [(run_id, "owner_task_gone")]
+            assert status_at_cancel == ["running"], "request precedes the cancelled write"
+            # The transport still reports running: a request cannot claim physical death.
+            assert stored["delegated_runs_unreconciled"] == [run_id]
     else:
         assert outcome == qenv.tl.CANCEL_ALREADY_SETTLED
         assert stored["status"] == "failed" and stored["result"] == "provider died"
@@ -852,6 +925,7 @@ def test_pending_recovery_without_owner_verdict_leaves_live_run(tmp_path, monkey
             return {"runId": "run-unknown"}
 
     gateway = Gateway(run_id="run-unknown")
-    outcomes = dc.reconcile_orphaned_runs(tmp_path, set(), gateway_factory=lambda: gateway)
+    outcomes = dc.reconcile_orphaned_runs(tmp_path, set(), gateway_factory=lambda: gateway,
+                                          replay_pending=lambda: True)
     assert recovered == [({"prompt": "original work", "model": "m"}, "inv-unknown")]
     assert [row["action"] for row in outcomes] == ["left_live"] and gateway.cancels == []

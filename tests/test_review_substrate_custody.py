@@ -159,6 +159,21 @@ def test_actor_projection_carries_bounded_disclosed_finding_rows():
     }]
     assert actors["triad-shape"]["findings_omitted"] == 0
 
+def test_actor_binding_is_attempt_identity():
+    """A changed actor reference mints a new custody attempt key (#285 class):
+    the pool row's ``subagent_id`` is part of the seat's identity."""
+    from ouroboros.review_custody import _attempt_key
+    from ouroboros.review_execution import ReviewRouteKind
+
+    request = SimpleNamespace(retry_key="", slot_messages={}, surface="multi_model_review",
+                              task_id="t", call_type="multi_model_review")
+    base = dict(slot_id="t1", model="openai/gpt-5.6-terra", effort="medium",
+                route=ReviewRouteKind.API_CHAT)
+    a = ReviewSlot(subagent_id="api-critic", **base)
+    b = ReviewSlot(subagent_id="", **base)
+    assert _attempt_key(request, a) != _attempt_key(request, b)
+
+
 def test_spent_owner_deadline_does_not_dispatch_a_review_worker(tmp_path):
     calls = []
     paid = []
@@ -363,7 +378,8 @@ def test_explicit_retry_key_replays_normally_settled_actor_without_second_dispat
             return {"content": '{"verdict":"PASS","findings":[],"summary":"done"}'}, {}
 
     ctx = SimpleNamespace(task_id="settled-retry", event_queue=None, pending_events=[])
-    slot = ReviewSlot(slot_id="slot_a", model="same/model", timeout_sec=1)
+    # Replay identity is under test, not completion inside a one-second window.
+    slot = ReviewSlot(slot_id="slot_a", model="same/model")
     first = run_review_request(
         ReviewRequest(
             surface="plan_review", goal="review", task_id="settled-retry",
@@ -371,6 +387,7 @@ def test_explicit_retry_key_replays_normally_settled_actor_without_second_dispat
         ),
         slots=[slot], drive_root=tmp_path, llm=FastLLM(), usage_ctx=ctx,
     )
+    assert first.actors[0]["operation_state"] == "settled"
     second = run_review_request(
         ReviewRequest(
             surface="plan_review", goal="review", task_id="settled-retry",
@@ -608,6 +625,7 @@ def test_review_transport_timeout_is_narrowed_by_request_deadline(tmp_path, monk
 
 def test_api_chat_retry_recomputes_transport_window(tmp_path, monkeypatch):
     from ouroboros import review_execution
+    from ouroboros.tools.scope_review_contract import SCOPE_REQUIRED_ITEMS
 
     captured = []
     transport_windows = iter((479.96, 1.0))
@@ -617,7 +635,8 @@ def test_api_chat_retry_recomputes_transport_window(tmp_path, monkeypatch):
             captured.append(kwargs["timeout"])
             if len(captured) == 1:
                 return {"content": ""}, {}
-            return {"content": '{"verdict":"PASS","findings":[],"summary":"ok"}'}, {}
+            return {"content": json.dumps([{"item": item, "verdict": "PASS", "reason": "checked"}
+                                           for item in SCOPE_REQUIRED_ITEMS])}, {}
 
     monkeypatch.setattr(
         review_execution,
@@ -644,7 +663,7 @@ def test_direct_anthropic_route_keeps_provider_default_transport(tmp_path):
 
     run_review_request(
         ReviewRequest(surface="scope", goal="review", task_id="anthropic-timeout"),
-        slots=[ReviewSlot(slot_id="slot_a", model="anthropic::claude-test", timeout_sec=0.5)],
+        slots=[ReviewSlot(slot_id="slot_a", model="anthropic::claude-test", timeout_sec=30)],
         drive_root=tmp_path,
         llm=CapturingLLM(),
     )
@@ -690,7 +709,9 @@ def test_late_error_is_not_cached_as_a_permanent_review_verdict(tmp_path):
     # run then JOINED the still-active attempt instead of retrying (same drain
     # as test_late_agent_session_preflight_failure_can_retry).
     key = _attempt_key(request, slot)
-    deadline = time.monotonic() + 5.0
+    # Bounded preparation and publication may outlive the short result window; the slot
+    # deadlines below still exercise timeout and same-operation collection.
+    deadline = time.monotonic() + 30.0
     active = True
     while time.monotonic() < deadline:
         with _ACTIVE_LOCK:
@@ -699,15 +720,34 @@ def test_late_error_is_not_cached_as_a_permanent_review_verdict(tmp_path):
             break
         time.sleep(0.01)
     assert not active
+    retry_slot = ReviewSlot(slot_id="slot_a", model="same/model", timeout_sec=30)
     second = run_review_request(
-        request,
-        slots=[ReviewSlot(slot_id="slot_a", model="same/model", timeout_sec=0.5)],
-        drive_root=tmp_path,
-        llm=ErrorThenSuccess(),
-        usage_ctx=ctx,
-    )
-    assert len(calls) >= 2
-    assert second.actors[0]["status"] == "ok"
+        request, slots=[retry_slot], drive_root=tmp_path, llm=ErrorThenSuccess(), usage_ctx=ctx,
+    ).actors[0]
+    # The settled error was not replayed: the retry is a new physical operation.
+    assert second["operation_id"] != first.actors[0]["operation_id"]
+    if second["operation_state"] == "in_flight":
+        # Its result window is not this contract. Collect THAT operation from the
+        # same-context custody written before _ACTIVE retires it.
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            with _ACTIVE_LOCK:
+                settled = key in getattr(ctx, "_review_settled_attempts", {})
+                active = key in _ACTIVE
+            if settled and not active:
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("the retried review did not settle into same-context custody")
+        request.reconcile_only = True  # collect only; never dispatch a replacement
+        collected = run_review_request(
+            request, slots=[retry_slot], drive_root=tmp_path, llm=ErrorThenSuccess(), usage_ctx=ctx,
+        ).actors[0]
+        assert collected["operation_id"] == second["operation_id"]
+        assert collected["operation_state"] == "late_settled"
+        second = collected
+    assert second["status"] == "ok"
+    assert len(calls) == 2
 
 def test_late_agent_session_failure_is_replayed_without_a_second_run(tmp_path, monkeypatch):
     import threading
@@ -838,7 +878,7 @@ def test_late_agent_session_preflight_failure_can_retry(tmp_path, monkeypatch):
     assert not active
     second = run_review_request(
         request, slots=[ReviewSlot(
-            slot_id="slot_a", model="same/model", timeout_sec=0.5,
+            slot_id="slot_a", model="same/model", timeout_sec=30,
             route=ReviewRouteKind.AGENT_SESSION,
         )], drive_root=tmp_path, llm=FakeLLM(), usage_ctx=ctx,
     )
@@ -933,19 +973,18 @@ def test_review_slots_keep_independent_logical_windows(tmp_path):
 
     request = ReviewRequest(surface="scope", goal="review", task_id="independent-windows")
     short_slot = ReviewSlot(slot_id="short", model="short/model", timeout_sec=0.05)
-    result = run_review_request(
-        request,
-        slots=[
-            short_slot,
-            ReviewSlot(slot_id="long", model="long/model", timeout_sec=0.5),
-        ],
-        drive_root=tmp_path,
-        llm=GatedShortLLM(),
-    )
-    rows = {actor["slot_id"]: actor for actor in result.actors}
-    assert rows["short"]["operation_state"] == "in_flight"
-    assert rows["long"]["status"] == "ok"
-    short_release.set()
+    try:
+        result = run_review_request(
+            request,
+            slots=[short_slot, ReviewSlot(slot_id="long", model="long/model", timeout_sec=30)],
+            drive_root=tmp_path,
+            llm=GatedShortLLM(),
+        )
+        rows = {actor["slot_id"]: actor for actor in result.actors}
+        assert rows["short"]["operation_state"] == "in_flight"
+        assert rows["long"]["status"] == "ok"
+    finally:
+        short_release.set()
     # Drain the released short worker before teardown (same drain as
     # test_explicit_retry_key_joins_worker_after_prompt_history_changes).
     key = _attempt_key(request, short_slot)

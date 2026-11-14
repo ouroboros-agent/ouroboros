@@ -64,6 +64,29 @@ def _make_skill(tmp_path: pathlib.Path, monkeypatch, manifest: str, plugin: str)
 _TRIVIAL_PLUGIN = "def register(api):\n    pass\n"
 
 
+def test_explicit_esm_preflight_parses_native_grammar_and_checks_declared_resources(tmp_path, monkeypatch):
+    from ouroboros.tools import skill_preflight as sp
+
+    ctx = _make_ctx(tmp_path)
+    skill_dir = _make_skill(tmp_path, monkeypatch, _extension_manifest(),
+        "def register(api):\n"
+        "    api.register_ui_tab('main', 'Main', render={'kind':'module', 'entry_type':'module', "
+        "'entry':'widget.js', 'assets':['data.bin']})\n")
+    (skill_dir / 'widget.js').write_text("export const where = import.meta.url; await Promise.resolve();")
+    result = json.loads(sp._handle_skill_preflight(ctx, skill='alpha'))
+    assert not result['ok']
+    assert any(row['item'] == 'widget_assets_exist' and not row['ok'] for row in result['widgets'])
+    (skill_dir / 'data.bin').write_bytes(b'\x00\xff')
+    result = json.loads(sp._handle_skill_preflight(ctx, skill='alpha'))
+    row = next(row for row in result['files'] if row['path'] == 'widget.js')
+    assert row['grammar'] == 'module'
+    assert row['ok'] and not row.get('skipped'), row
+    assert result['ok'], result
+    (skill_dir / 'widget.js').write_text('return 1;')  # valid function body, invalid module
+    result = json.loads(sp._handle_skill_preflight(ctx, skill='alpha'))
+    assert not result['ok']
+
+
 # --------------------------------------------------------------------------- F12
 
 
@@ -194,7 +217,9 @@ def test_skill_preflight_validator_env_keeps_windows_process_base_keys(tmp_path,
     replacement -- the 0x8f that kills a locale-decoded (cp1252) reader thread
     is inert here.
     """
+    from ouroboros.tools import shell_process
     from ouroboros.tools import skill_preflight as sp
+    from tests.test_tracked_tree_containment import fake_tree_read
 
     seen: dict = {}
 
@@ -202,13 +227,20 @@ def test_skill_preflight_validator_env_keeps_windows_process_base_keys(tmp_path,
         returncode = 0
         pid = 4242
 
+        def poll(self):
+            return self.returncode
+
         def communicate(self, timeout=None):
             return b"", b"\x8f\xff not utf-8"
+
+    proc, registry = _FakeProc(), set()
+    monkeypatch.setattr(shell_process, "_active_subprocesses", registry)
+    fake_tree_read(monkeypatch, proc, remains=False)  # a double has no group: its tree is measured here
 
     def _fake_popen(cmd, **kwargs):
         seen["cmd"] = list(cmd)
         seen["kwargs"] = kwargs
-        return _FakeProc()
+        return proc
 
     monkeypatch.setattr(sp, "Popen", _fake_popen)
     for key in sp._WINDOWS_BASE_ENV_KEYS:
@@ -216,6 +248,7 @@ def test_skill_preflight_validator_env_keeps_windows_process_base_keys(tmp_path,
     monkeypatch.setenv("OPENROUTER_API_KEY", "must-not-reach-the-validator")
 
     result = sp._run_check(["node", "--check", "widget.js"], cwd=tmp_path)
+    assert registry == set(), "an exited validator whose tree was measured empty is retired"
     posix_env = seen["kwargs"]["env"]
     assert set(posix_env) == {"PATH", "HOME", "LANG"}
     assert posix_env["LANG"] == "C.UTF-8"
@@ -440,7 +473,7 @@ def test_save_enabled_best_effort_disclosure_contract_is_documented():
 
     architecture = architecture_text()
     assert "best-effort" in str(save_enabled.__doc__)
-    assert "append failure is logged and never blocks the enablement change" in architecture
+    assert "skill_enabled_changed" in architecture
 
 
 def test_api_skill_toggle_records_the_owner_ui_actor(tmp_path, monkeypatch):

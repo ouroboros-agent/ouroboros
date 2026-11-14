@@ -61,19 +61,19 @@ def test_query_model_timeout_becomes_error_actor(monkeypatch, request):
     assert prompt["slot"]["route"] == "api_chat"
 
     from ouroboros.tools.review import _parse_model_response
-    from ouroboros.triad_review import parse_model_review_results
+    from ouroboros.triad_review import parse_seat_answers
 
     flattened = _parse_model_response(model, result, headers)
     assert flattened["operation_id"] == result["operation_id"]
     assert flattened["operation_state"] == "in_flight"
     assert flattened["late_result_pending"] is True
-    [record] = parse_model_review_results({"results": [flattened]}).actor_records
+    [record] = parse_seat_answers({"results": [flattened]}, {}).actor_records
     assert record.to_dict()["operation_id"] == result["operation_id"]
     assert record.to_dict()["operation_state"] == "in_flight"
     assert record.to_dict()["late_result_pending"] is True
 
 
-def test_blocking_triad_does_not_finalize_quorum_with_a_pending_reviewer(monkeypatch, tmp_path):
+def test_a_triad_does_not_finalize_quorum_with_a_pending_reviewer(monkeypatch, tmp_path):
     from ouroboros.tools import review
 
     clean = lambda model: {
@@ -98,12 +98,13 @@ def test_blocking_triad_does_not_finalize_quorum_with_a_pending_reviewer(monkeyp
     prepared = {
         "prompt": "p", "stable_prefix_len": 0,
         "models": ["m1", "m2", "m3"], "routes": [], "row_plan": {},
-        "session_task": "", "target_repo": tmp_path, "blocking_review": True,
+        "session_task": "", "target_repo": tmp_path,
     }
 
     blocked = review._dispatch_unified_review(ctx, "message", prepared)
 
-    assert blocked and "REVIEW_PENDING" in blocked
+    signal = " ".join(str(item) for item in ctx._review_advisory)
+    assert blocked is None and "REVIEW_PENDING" in signal  # the pending outcome returns to the author
     assert ctx._last_review_block_reason == "review_late_result_pending"
     [raw] = [row for row in ctx._last_triad_raw_results if row["model_id"] == "m3"]
     assert raw["operation_id"] == "op-m3"
@@ -120,7 +121,7 @@ def test_custody_lost_slot_is_named_in_pending_report(monkeypatch, tmp_path):
         lambda *_args, **_kwargs: json.dumps({"results": [{"model": "placeholder"}]}),
     )
 
-    def _lost_row(run_ctx, _model_results):
+    def _lost_row(run_ctx, _model_results, _row_plan=None):
         run_ctx._last_triad_raw_results = [{
             "slot_id": "custody_lost_slot_1",
             "status": "error",
@@ -138,13 +139,14 @@ def test_custody_lost_slot_is_named_in_pending_report(monkeypatch, tmp_path):
     prepared = {
         "prompt": "p", "stable_prefix_len": 0,
         "models": ["placeholder"], "routes": [], "row_plan": {},
-        "session_task": "", "target_repo": tmp_path, "blocking_review": True,
+        "session_task": "", "target_repo": tmp_path,
     }
 
     blocked = review._dispatch_unified_review(ctx, "message", prepared)
 
-    assert blocked and "REVIEW_PENDING" in blocked
-    assert "custody_lost_slot_1" in blocked
+    signal = " ".join(str(item) for item in ctx._review_advisory)
+    assert blocked is None and "REVIEW_PENDING" in signal
+    assert "custody_lost_slot_1" in signal
     assert ctx._last_review_block_reason == "review_late_result_pending"
 
 

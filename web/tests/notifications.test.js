@@ -5,16 +5,65 @@ import {
     DEFAULT_NOTIFY_PREFS,
     NOTIFY_PREFS_KEY,
     classifyLiveFrame,
+    createNotificationActivation,
     createNotifier,
     decideNotification,
     attentionStatusText,
+    noticeTitle,
     normalizeNotifyPrefs,
     notifyStatusText,
     readNotifyPrefs,
     writeNotifyPrefs,
 } from '../modules/notifications.js';
+import { taskReasonDetail } from '../modules/log_events.js';
+import { recordingAudio, settle } from './notification_audio_fixture.js';
 
 const ON = { ...DEFAULT_NOTIFY_PREFS, enabled: true };
+
+test('activation resolves an addressed Project independently of the sidebar and preserves question identity', async () => {
+    const calls = [];
+    const project = { id: 'older-than-sidebar', chat_id: -77, lifecycle: 'active' };
+    const activate = createNotificationActivation({
+        resolveProject: async chatId => { calls.push(['resolve', chatId]); return project; },
+        openProject: (...args) => calls.push(['project', ...args]),
+        openMain: () => calls.push(['main']),
+        unavailable: () => calls.push(['unavailable']),
+    });
+    await activate({ chatId: -77, taskId: 'author', quizId: 'question' });
+    assert.deepEqual(calls, [['resolve', -77], ['project', project,
+        { openOnly: true, taskId: 'author', quizId: 'question' }]]);
+    calls.length = 0;
+    await activate({ chatId: 1 });
+    assert.deepEqual(calls, [['main']], 'only an explicitly Main-addressed notification opens Main');
+});
+
+test('unreadable, missing, inactive and mismatched notification destinations say unavailable without navigation', async () => {
+    for (const resolveProject of [async () => { throw new Error('503'); }, async () => null,
+        async () => ({ id: 'p', chat_id: -77, lifecycle: 'tombstoned' }),
+        async () => ({ id: 'p', chat_id: -78, lifecycle: 'active' })]) {
+        const calls = [];
+        const activate = createNotificationActivation({ resolveProject,
+            openProject: () => calls.push('project'), openMain: () => calls.push('main'),
+            unavailable: () => calls.push('unavailable') });
+        await activate({ chatId: -77 });
+        assert.deepEqual(calls, ['unavailable']);
+    }
+});
+
+test('a later Main activation supersedes an older unresolved Project notification', async () => {
+    let complete;
+    const calls = [];
+    const activate = createNotificationActivation({
+        resolveProject: () => new Promise(resolve => { complete = resolve; }),
+        openProject: () => calls.push('project'), openMain: () => calls.push('main'),
+        unavailable: () => calls.push('unavailable'),
+    });
+    const earlier = activate({ chatId: -77 });
+    await activate({ chatId: 1 });
+    complete({ id: 'p', chat_id: -77, lifecycle: 'active' });
+    await earlier;
+    assert.deepEqual(calls, ['main']);
+});
 
 function fakeStorage(initial = {}) {
     const map = new Map(Object.entries(initial));
@@ -83,7 +132,7 @@ test('a waiting question is required, an optional one is model-chosen', () => {
 });
 
 test('an answered or closed question never rings', () => {
-    for (const state of ['answered', 'expired_terminal', 'superseded']) {
+    for (const state of ['answered', 'closed', 'expired_terminal', 'superseded']) {
         assert.equal(classifyLiveFrame(
             { task_id: 't1', quiz: { quiz_id: 'q', state, wait_for_answer: true } }, { kind: 'quiz' },
         ), null, state);
@@ -100,6 +149,16 @@ test('importance rides the existing proactive discriminator', () => {
     assert.equal(candidate.key, 'important:cm-9');
 });
 
+test('a Project root notice addressed to Main is important and opens Main', () => {
+    const notice = { role: 'assistant', system_type: 'main_notice', task_id: 'project-root', chat_id: 1,
+        client_message_id: 'cm-main', content: 'The Cursor account has no included usage left.' };
+    const candidate = classifyLiveFrame(notice, { kind: 'chat', isMain: true });
+    assert.equal(candidate.category, 'important');
+    assert.equal(candidate.target.chatId, 1);
+    // The same frame from a known child never rings.
+    assert.equal(classifyLiveFrame(notice, { kind: 'chat', isMain: true, isRoot: false }), null);
+});
+
 test('a managed root concludes as a log frame, and both shapes share one key', () => {
     const log = classifyLiveFrame(
         { type: 'task_done', status: 'completed', chat_id: 1 },
@@ -108,7 +167,7 @@ test('a managed root concludes as a log frame, and both shapes share one key', (
     assert.ok(log, 'a settled terminal is an ending');
     assert.equal(log.category, 'task_done');
     assert.equal(log.key, 'conclusion:t-log', 'the same key a chat-row terminal would produce');
-    assert.equal(log.body, '', 'a log frame carries diagnostics, never owner prose');
+    assert.equal(log.body, 'Done', 'a log frame says the outcome its facts give, never its diagnostics');
 
     // Other log traffic is not an event.
     assert.equal(classifyLiveFrame({ type: 'task_metrics_event', status: 'completed' },
@@ -136,6 +195,57 @@ test('a managed root concludes as a log frame, and both shapes share one key', (
         { kind: 'chat', isMain: true, isRoot: true },
     );
     assert.equal(decideNotification(viaChatRow, ON, seen).reason, 'duplicate');
+});
+
+test('a finished root\'s body is its work\'s name and outcome word on both wire shapes, never the row\'s sentence', () => {
+    const asRoot = { isMain: true, isRoot: true, taskId: 'rel' };
+    const chat = (extra) => classifyLiveFrame({ role: 'system', system_type: 'task_summary', task_id: 'rel',
+        content: 'Failed. Root task rel. A tool this task used failed and nothing recovered it.', ...extra },
+    { kind: 'chat', ...asRoot });
+    const log = (extra) => classifyLiveFrame({ type: 'task_done', chat_id: 1, ...extra }, { kind: 'log', ...asRoot });
+    assert.equal(chat({ outcome_phase: 'error', target_label: 'Publish the release notes' }).body,
+        'Publish the release notes · Failed');
+    assert.equal(log({ status: 'failed', target_label: 'Publish the release notes' }).body,
+        'Publish the release notes · Failed', 'the log-first shape names the same work and outcome');
+    assert.equal(log({ status: 'cancelled', target_label: 'Publish the release notes' }).body,
+        'Publish the release notes · Stopped');
+    // Without a name only the word and its cause: no invented "Task", no task id, never the host sentence.
+    assert.equal(chat({ outcome_phase: 'warn' }).body, 'Done with warnings');
+    // A detail-only fact (nothing examined the result) keeps the word Done and still says its cause (9 Nov 2026).
+    const unexamined = { status: 'completed', outcome_axes: { objective: { status: 'pass', warning: 'receipt_absent',
+        warnings: ['receipt_absent'] } } };
+    const cause = taskReasonDetail({ type: 'task_done', chat_id: 1, ...unexamined });
+    const body = log(unexamined).body;
+    assert.ok(cause && body.startsWith('Done: ') && `Done: ${cause}`.startsWith(body.replace(/…$/, '')), body);
+    assert.ok(!chat({ outcome_phase: 'error' }).body.includes('Root task'));
+    // Both shapes stay one event.
+    assert.equal(chat({ outcome_phase: 'done' }).key, log({ status: 'completed' }).key);
+});
+
+test('a finished root\'s body adds the cause its record holds on either wire shape', () => {
+    const asRoot = { isMain: true, isRoot: true, taskId: 'rel' };
+    const cause = 'A tool this task used failed and nothing recovered it.';
+    const chat = (extra) => classifyLiveFrame({ role: 'system', system_type: 'task_summary', task_id: 'rel',
+        outcome_phase: 'error', content: `Failed. Root task rel. ${cause}`, ...extra }, { kind: 'chat', ...asRoot });
+    const event = (extra) => ({ type: 'task_done', chat_id: 1, status: 'failed', ...extra });
+    const log = (extra) => classifyLiveFrame(event(extra), { kind: 'log', ...asRoot });
+    assert.equal(chat({ target_label: 'Alpha', reason_detail: cause }).body, `Alpha · Failed: ${cause}`);
+    assert.equal(chat({ reason_detail: cause }).body, `Failed: ${cause}`, 'without a name: the word and its cause');
+    for (const absent of [{}, { reason_detail: '' }, { reason_detail: '   ' }, { reason_detail: null }]) {
+        assert.equal(chat({ target_label: 'Alpha', ...absent }).body, 'Alpha · Failed', 'no cause: as before');
+        assert.equal(log({ target_label: 'Alpha', ...absent }).body, 'Alpha · Failed', 'no fact of a cause: none');
+    }
+    assert.equal(log({ status: 'completed', target_label: 'Alpha' }).body, 'Alpha · Done', 'a clean ending has none');
+    // The live event carries the facts, not the sentence: the body says the card's own cause over them.
+    const crashed = { target_label: 'Alpha', reason_code: 'worker_crash_signal' };
+    assert.equal(log(crashed).body, 'Alpha · Failed: The worker process running the task crashed');
+    assert.equal(log(crashed).body, `Alpha · Failed: ${taskReasonDetail(event(crashed))}`);
+    // A sentence the record holds speaks first, on either shape.
+    assert.equal(log({ ...crashed, reason_detail: cause }).body, `Alpha · Failed: ${cause}`);
+    // The one trim, after the cause joined: a long cause ends in an ellipsis at the body's length.
+    const long = chat({ target_label: 'Alpha', reason_detail: `${'x'.repeat(200)} tail` }).body;
+    assert.equal(long.length, 140);
+    assert.ok(long.startsWith('Alpha · Failed: xxx') && long.endsWith('…') && !long.includes('tail'));
 });
 
 test('only a ROOT terminal notifies; a child escalates instead', () => {
@@ -188,6 +298,18 @@ test('one turn ending is one notification, not a reply plus a terminal', () => {
     assert.equal(decideNotification(terminal, { ...ON, main_reply: true }, seen).reason, 'duplicate');
 });
 
+test('a Main turn left to run in the background rings as a finished task; an inline turn still does not', () => {
+    const ending = (owner) => classifyLiveFrame(
+        { type: 'task_done', status: 'completed', chat_id: 1, _is_direct_chat: true, ...(owner ? { execution_owner: owner } : {}) },
+        { kind: 'log', isMain: true, isRoot: true, taskId: 't-bg' },
+    );
+    const pooled = ending({ kind: 'pooled' });
+    assert.equal(pooled?.category, 'task_done', 'the pool ran its last attempt: the owner hears that the work ended');
+    assert.equal(pooled.key, 'conclusion:t-bg', 'the same key its final answer row would use, so one banner');
+    assert.equal(ending({ kind: 'direct' }), null, 'an inline conversation turn ends as a reply, not a task');
+    assert.equal(ending(null), null, 'without a carrier fact the historical origin still decides');
+});
+
 test('ordinary replies are Main-only, and progress/user frames are never events', () => {
     const main = classifyLiveFrame(
         { role: 'assistant', content: 'Here it is.', client_message_id: 'cm-1' },
@@ -235,10 +357,14 @@ test('the status line states what this client can actually do', () => {
 });
 
 test('attention status distinguishes native desktop attention from browser support', () => {
-    assert.match(attentionStatusText({ nativeAttention: true }), /system sound/);
+    assert.match(attentionStatusText({ nativeAttention: true }), /only visual attention/);
+    assert.match(attentionStatusText({ status: 'native_sound' }), /reported a sound/);
     assert.match(attentionStatusText({ supported: true }), /Browser notifications/);
     assert.match(attentionStatusText({ bridge: true }), /will be confirmed/);
     assert.match(attentionStatusText(), /no native attention bridge/);
+    // Off is said once, by the status line above; the attention line adds nothing then (U095).
+    assert.equal(attentionStatusText({ enabled: false, nativeAttention: true }), '');
+    assert.match(notifyStatusText({ enabled: false, supported: true }), /^Notifications are off/);
 });
 
 function notifierFixture({ permission = 'granted', prefs = { ...ON, task_done: true } } = {}) {
@@ -287,86 +413,251 @@ test('a granted client gets one banner per logical event, tagged for collapse', 
     assert.equal(fx.toasts.length, 0);
 });
 
-test('desktop host attention is requested once without replacing banner delivery', () => {
-    let calls = 0;
+/* A current app's system notification that did not reach the system (desktop_notifications.refused). */
+const REFUSED = { ok: false, status: 'failed', platform: 'windows', reason: 'balloon_not_submitted' };
+/* A refusal carrying a sound setting is no evidence by itself: after a definite failure the fallback tone
+   reads only the app's `shell_info()`, asked after that failure (notifications_sound.test.js), which these
+   launchers do not offer. */
+const SOUND_ON_REFUSED = { ok: false, status: 'failed', platform: 'macos', reason: 'no_center', sound_setting: 'enabled' };
+const FINISHED_ROW = { role: 'system', system_type: 'task_summary', task_id: 'native-1' };
+
+test('a current app whose system notification fell back asks its attention cue once, without its sound', async () => {
+    const calls = [];
     const notifier = createNotifier({
         storage: fakeStorage({ [NOTIFY_PREFS_KEY]: JSON.stringify(ON) }),
         notificationCtor: undefined,
         audioContextCtor: null,
         showToast: () => {},
         documentRef: fakeDocument(),
-        hostApi: { request_attention: () => { calls += 1; return { ok: true, status: 'native_sound' }; } },
+        hostApi: {
+            show_native_notification: () => REFUSED,
+            request_attention: (...args) => { calls.push(args); return { ok: true, status: 'window_only' }; },
+        },
     });
-    const result = notifier.handleFrame(
-        { role: 'system', system_type: 'task_summary', task_id: 'native-1' },
-        { kind: 'chat', isMain: true },
-    );
-    assert.equal(result.surface, 'in_app');
-    assert.equal(calls, 1);
+    assert.equal(notifier.handleFrame(FINISHED_ROW, { kind: 'chat', isMain: true }).surface, 'native');
+    await settle();
+    assert.deepEqual(calls, [[false]]);
     notifier.destroy();
 });
 
-test('banner owns sound, while silent in-app delivery still raises the window', () => {
-    let calls = 0;
-    class FakeNotification {
-        static permission = 'granted';
-        constructor() {}
+test('an app whose notify_owner predates system notifications is never asked, Sound on or off: the browser banner or the toast', async () => {
+    for (const sound of [true, false]) {
+        for (const [permission, surface] of [['granted', 'banner'], [undefined, 'in_app']]) {
+            const calls = [];
+            const banners = [];
+            const toasts = [];
+            const attention = { textContent: '' };
+            const audio = recordingAudio();
+            const notifier = createNotifier({
+                storage: fakeStorage({ [NOTIFY_PREFS_KEY]: JSON.stringify({ ...ON, sound }) }),
+                notificationCtor: permission
+                    ? class { static permission = permission; constructor(title, options) { banners.push(options); } }
+                    : undefined,
+                audioContextCtor: audio.ctor,
+                showToast: (line) => { toasts.push(line); },
+                documentRef: fakeDocument({ '[data-notify-attention-status]': [attention] }),
+                hostApi: {
+                    request_attention: (...args) => { calls.push(['request_attention', ...args]); return { ok: true }; },
+                    notify_owner: (...args) => { calls.push(['notify_owner', ...args]); return { ok: true, status: 'background', banner: true }; },
+                },
+            });
+            assert.equal(notifier.handleFrame(FINISHED_ROW, { kind: 'chat', isMain: true }).surface, surface);
+            await settle();
+            assert.deepEqual(calls, [], 'an older launcher may sound whatever it is asked: it is not called');
+            assert.equal(audio.tones.length, 0, 'no system evidence that sound is allowed: no page tone either');
+            if (permission) assert.equal(banners[0].silent, !sound, 'the browser banner keeps the Sound choice');
+            else assert.deepEqual(toasts, ['Task finished']);
+            notifier.mountSettings();
+            assert.equal(attention.textContent, '', 'no attention cue to describe');
+            notifier.destroy();
+        }
     }
-    const bannerNotifier = createNotifier({
-        storage: fakeStorage({ [NOTIFY_PREFS_KEY]: JSON.stringify(ON) }),
-        notificationCtor: FakeNotification,
-        audioContextCtor: null,
-        hostApi: { request_attention: () => { calls += 1; return { ok: true }; } },
-        documentRef: fakeDocument(),
-    });
-    assert.equal(bannerNotifier.handleFrame(
-        { role: 'system', system_type: 'task_summary', task_id: 'banner-1' },
-        { kind: 'chat', isMain: true },
-    ).surface, 'banner');
-    assert.equal(calls, 0, 'banner sound stays with the Notification API');
-    bannerNotifier.destroy();
-
-    let soundValue = null;
-    const silentNotifier = createNotifier({
-        storage: fakeStorage({ [NOTIFY_PREFS_KEY]: JSON.stringify({ ...ON, sound: false }) }),
-        notificationCtor: undefined,
-        audioContextCtor: null,
-        hostApi: { request_attention: (sound) => { soundValue = sound; return { ok: true }; } },
-        showToast: () => {},
-        documentRef: fakeDocument(),
-    });
-    assert.equal(silentNotifier.handleFrame(
-        { role: 'system', system_type: 'task_summary', task_id: 'silent-1' },
-        { kind: 'chat', isMain: true },
-    ).surface, 'in_app');
-    assert.equal(soundValue, false);
-    silentNotifier.destroy();
 });
 
-test('in-app fallback tone is used when native window attention cannot play sound', async () => {
+test('the oldest app, request_attention without notify_owner, gets only its silent window cue, Sound on or off', async () => {
+    for (const sound of [true, false]) {
+        const calls = [];
+        const toasts = [];
+        const attention = { textContent: '' };
+        const audio = recordingAudio();
+        const notifier = createNotifier({
+            storage: fakeStorage({ [NOTIFY_PREFS_KEY]: JSON.stringify({ ...ON, sound }) }),
+            notificationCtor: undefined,
+            audioContextCtor: audio.ctor,
+            showToast: (line) => { toasts.push(line); },
+            documentRef: fakeDocument({ '[data-notify-attention-status]': [attention] }),
+            // Its `false` only shows the window, on every platform (platform_layer.request_native_attention).
+            hostApi: { request_attention: (...args) => { calls.push(args); return { ok: true, status: 'window_only', sound_played: false }; } },
+        });
+        assert.equal(notifier.handleFrame(FINISHED_ROW, { kind: 'chat', isMain: true }).surface, 'in_app');
+        await settle();
+        assert.deepEqual(calls, [[false]], 'never its own sound');
+        assert.equal(audio.contexts.length + audio.tones.length, 0, 'it reports no system permission: no page tone');
+        assert.deepEqual(toasts, ['Task finished']);
+        assert.match(attention.textContent, /raise this window without a sound of its own/);
+        notifier.destroy();
+    }
+});
+
+test('with banner permission, a current app that can hide its window answers before any browser banner', async () => {
+    const calls = [];
+    const banners = [];
+    const toasts = [];
     let oscillators = 0;
+    class GrantedNotification {
+        static permission = 'granted';
+        constructor(title, options) { banners.push({ title, options }); }
+        close() {}
+    }
     class FakeAudioContext {
         constructor() { this.currentTime = 0; this.destination = {}; }
         resume() {}
-        close() {}
         createOscillator() { oscillators += 1; return { connect() {}, start() {}, stop() {} }; }
         createGain() { return { gain: { value: 0 }, connect() {} }; }
     }
-    const notifier = createNotifier({
+    const make = (notifyOwner) => createNotifier({
         storage: fakeStorage({ [NOTIFY_PREFS_KEY]: JSON.stringify(ON) }),
-        notificationCtor: undefined,
+        notificationCtor: GrantedNotification,
         audioContextCtor: FakeAudioContext,
-        hostApi: { request_attention: () => ({ ok: true, status: 'window_only', sound_played: false }) },
+        showToast: (line) => { toasts.push(line); },
+        documentRef: fakeDocument(),
+        hostApi: {
+            show_native_notification: () => REFUSED,
+            request_attention: (...args) => { calls.push(['request_attention', ...args]); return { ok: true }; },
+            notify_owner: (...args) => { calls.push(['notify_owner', ...args]); return notifyOwner(); },
+        },
+    });
+    const deliver = async (notifier, id) => {
+        const out = notifier.handleFrame({ role: 'system', system_type: 'task_summary', task_id: id }, { kind: 'chat', isMain: true });
+        await settle();
+        notifier.destroy();
+        return out.surface;
+    };
+    // Never the launcher's own sound (macOS Glass, a Windows beep): it is asked silently.
+    const asked = [['notify_owner', false, 'Task finished', '', false]];
+
+    // Hidden on purpose: the launcher's own banner (it opens the window) and no browser banner,
+    // whose focus() cannot undo a hide; the queued banner owns the sound, so no page tone.
+    assert.equal(await deliver(make(() => ({ ok: true, status: 'background', banner: true, sound_played: false })), 'h'), 'native');
+    assert.deepEqual(calls, asked);
+    assert.equal(banners.length, 0);
+    assert.equal(oscillators, 0);
+    assert.deepEqual(toasts, ['Task finished'], 'the alert waits in the window too');
+
+    // Visible: the launcher does nothing (no raise, no system sound); the browser banner owns the sound.
+    calls.length = 0;
+    toasts.length = 0;
+    assert.equal(await deliver(make(() => ({ ok: false, status: 'visible' })), 'v'), 'native');
+    assert.deepEqual(calls, asked, 'never the raise-and-sound cue for a visible window');
+    assert.equal(banners.length, 1);
+    assert.equal(banners[0].options.silent, false);
+    assert.equal(oscillators, 0, 'one sound: the banner\'s');
+    assert.equal(toasts.length, 0);
+
+    // A launcher that cannot answer: the browser banner, as before.
+    calls.length = 0;
+    assert.equal(await deliver(make(() => Promise.reject(new Error('bridge gone'))), 'r'), 'native');
+    assert.equal(banners.length, 2);
+});
+
+test('a current app takes the alert text, asked without its sound; the oldest one gets no text', async () => {
+    const calls = [];
+    const host = {
+        show_native_notification: () => REFUSED,
+        request_attention: (...args) => { calls.push(['request_attention', ...args]); return { ok: true }; },
+        notify_owner: (...args) => { calls.push(['notify_owner', ...args]); return { ok: true, status: 'background' }; },
+    };
+    const make = (hostApi, prefs = ON) => createNotifier({
+        storage: fakeStorage({ [NOTIFY_PREFS_KEY]: JSON.stringify(prefs) }),
+        notificationCtor: undefined,
+        audioContextCtor: null,
         showToast: () => {},
         documentRef: fakeDocument(),
+        hostApi,
     });
-    notifier.handleFrame(
-        { role: 'system', system_type: 'task_summary', task_id: 'window-only' },
-        { kind: 'chat', isMain: true },
-    );
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    assert.equal(oscillators, 1);
-    notifier.destroy();
+    const frame = (id) => ({ role: 'system', system_type: 'task_summary', task_id: id, content: `Done. Root task ${id}.`,
+        outcome_phase: 'done', target_label: 'Report ready' });
+    const newer = make(host, { ...ON, show_text: true });
+    newer.handleFrame(frame('text-1'), { kind: 'chat', isMain: true });
+    await settle();
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0][0], 'notify_owner');
+    assert.equal(calls[0][1], false, 'never the launcher\'s own sound (macOS Glass, a Windows beep)');
+    assert.equal(typeof calls[0][2], 'string');
+    assert.equal(calls[0][3], 'Report ready · Done');
+    newer.destroy();
+
+    calls.length = 0;
+    const private_ = make(host);
+    private_.handleFrame(frame('text-2'), { kind: 'chat', isMain: true });
+    await settle();
+    assert.equal(calls[0][3], '', 'message text stays private unless the owner turned it on');
+    private_.destroy();
+
+    calls.length = 0;
+    const older = make({ request_attention: host.request_attention }, { ...ON, show_text: true });
+    older.handleFrame(frame('text-3'), { kind: 'chat', isMain: true });
+    await settle();
+    assert.deepEqual(calls, [['request_attention', false]], 'its silent window cue only, never the text');
+    older.destroy();
+
+    calls.length = 0;
+    const alias = make({ request_attention: host.request_attention, notify_owner: host.notify_owner });
+    alias.handleFrame(frame('text-4'), { kind: 'chat', isMain: true });
+    await settle();
+    assert.deepEqual(calls, [], 'its notify_owner may show a balloon Windows sounds: never asked');
+    alias.destroy();
+    assert.match(attentionStatusText({ status: 'background' }), /instead of opening this window/);
+});
+
+test('a browser\'s permission is no evidence that sound is allowed: its in-app fallback stays quiet', async () => {
+    const tonesWith = async (notificationCtor) => {
+        const audio = recordingAudio();
+        const toasts = [];
+        const notifier = createNotifier({
+            storage: fakeStorage({ [NOTIFY_PREFS_KEY]: JSON.stringify(ON) }),
+            notificationCtor,
+            audioContextCtor: audio.ctor,
+            showToast: (line) => { toasts.push(line); },
+            documentRef: fakeDocument(),
+        });
+        notifier.handleFrame({ role: 'system', system_type: 'task_summary', task_id: 'browser' }, { kind: 'chat', isMain: true });
+        await settle();
+        notifier.destroy();
+        assert.deepEqual(toasts, ['Task finished'], 'the alert still reaches the owner');
+        return audio.tones.length;
+    };
+    assert.equal(await tonesWith(class { static permission = 'default'; }), 0, 'not yet asked is not a grant');
+    assert.equal(await tonesWith(class { static permission = 'denied'; }), 0);
+    assert.equal(await tonesWith(undefined), 0, 'nothing to read');
+    assert.equal(await tonesWith(class { static permission = 'granted'; constructor() { throw new Error('no banner here'); } }), 0,
+        'a granted banner that could not be shown says nothing of sound');
+});
+
+test('whatever the launcher answers, the page adds no tone of its own', async () => {
+    const tonesFor = async (answer) => {
+        const audio = recordingAudio();
+        const notifier = createNotifier({
+            storage: fakeStorage({ [NOTIFY_PREFS_KEY]: JSON.stringify(ON) }),
+            notificationCtor: undefined,
+            audioContextCtor: audio.ctor,
+            hostApi: { show_native_notification: () => SOUND_ON_REFUSED, request_attention: () => answer, notify_owner: () => answer },
+            showToast: () => {},
+            documentRef: fakeDocument(),
+        });
+        notifier.handleFrame({ role: 'system', system_type: 'task_summary', task_id: 'b' }, { kind: 'chat', isMain: true });
+        await settle();
+        notifier.destroy();
+        return audio.contexts.length + audio.tones.length;
+    };
+    // Windows, window hidden: the balloon is queued and the OS plays its sound.
+    assert.equal(await tonesFor({ ok: true, status: 'background', banner: true, sound_played: false }), 0);
+    // macOS, window hidden: a Dock badge; an older launcher's own sound, or none at all.
+    assert.equal(await tonesFor({ ok: true, status: 'background', banner: false, sound_played: true }), 0);
+    assert.equal(await tonesFor({ ok: true, status: 'background', banner: false, sound_played: false }), 0,
+        'no evidence the system lets Ouroboros sound: the earlier page beep is gone');
+    assert.equal(await tonesFor({ ok: true, status: 'window_only', sound_played: false }), 0);
+    assert.equal(await tonesFor(Promise.reject(new Error('bridge gone'))), 0);
 });
 
 test('a banner click focuses the window and hands the target to navigation', () => {
@@ -458,4 +749,33 @@ test('settings controls paint current state and gate on the master switch', asyn
     // An unknown key is refused rather than stored.
     await notifier.setPref('nope', true);
     assert.equal('nope' in notifier.prefs, false);
+});
+
+test('a reminder and a skill notice ring under the messages toggle, titled by their author', () => {
+    const reminder = {
+        type: 'chat', role: 'system', system_type: 'reminder', chat_id: 1, task_id: '', source: 'Ouroboros',
+        ts: '2026-10-03T12:00:01.000001+00:00',
+        content: 'Reminder · Ouroboros · written Oct 3 14:05 · for Oct 3 15:00 (UTC+3)\nCall mother',
+    };
+    const hit = classifyLiveFrame(reminder, { kind: 'chat', isMain: true });
+    assert.equal(hit.category, 'important', 'no new category and no new toggle');
+    assert.equal(hit.title, 'Reminder from Ouroboros');
+    assert.equal(hit.body, 'Call mother', 'the host signature line stays out of the banner body');
+    assert.equal(hit.key, 'important::2026-10-03T12:00:01.000001+00:00');
+    const seen = new Set();
+    assert.equal(decideNotification(hit, ON, seen).body, '', 'the words stay private until text is on');
+    assert.equal(decideNotification(hit, { ...ON, show_text: true }, seen).body, 'Call mother');
+    assert.equal(decideNotification(hit, { ...ON, important: false }, seen).reason, 'category_off');
+    const notice = classifyLiveFrame({ ...reminder, system_type: 'skill_notice', source: 'calendar',
+        content: 'Notice · calendar\nMeeting with Ivan in 15 min' }, { kind: 'chat', isMain: true });
+    assert.equal(notice.title, 'Notice from calendar');
+    assert.equal(notice.body, 'Meeting with Ivan in 15 min');
+    assert.equal(noticeTitle('skill_notice', ''), 'Notice from a skill');
+    const safety = classifyLiveFrame({ ...reminder, system_type: 'safety_notice',
+        content: "Safety Supervisor · not Ouroboros's words\nOuroboros re-issued this after the flag" },
+    { kind: 'chat', isMain: true });
+    assert.equal(safety.category, 'important', "the Supervisor's own row rides the same toggle");
+    assert.equal(safety.title, 'Safety Supervisor');
+    assert.equal(safety.body, 'Ouroboros re-issued this after the flag', 'its signature stays out of the body');
+    assert.equal(noticeTitle('reminder', 'owner'), 'Reminder from owner', 'a row the owner set is signed by the owner');
 });

@@ -11,6 +11,7 @@ from typing import Any, Dict
 
 from ouroboros.outcomes import normalize_outcome_axes
 from ouroboros.utils import utc_now_iso
+from supervisor.evolution_cleanup import carry_cleanup_fact
 
 
 def _events():
@@ -41,7 +42,15 @@ def _handle_evolution_task_done(
     rounds: Any,
 ) -> None:
     """Project one evolution terminal through the existing campaign authority."""
+    from copy import deepcopy
+    from functools import partial
+    from ouroboros.server_restart import defer_evolution_restart, release_agent_restart
 
+    request_id = defer_evolution_restart({"task_id": str(task_id or "")},
+        task_attempt=int(task.get("_attempt") or task.get("task_attempt") or evt.get("task_attempt") or 1),
+        terminal_retry=partial(_handle_evolution_task_done, ctx, evt=deepcopy(evt), task_id=task_id,
+            task=deepcopy(task), task_done_event=deepcopy(task_done_event), outcome_axes=deepcopy(outcome_axes),
+            cost=cost, rounds=rounds))
     try:
         from supervisor.evolution_lifecycle import (
             _read_evolution_campaign,
@@ -74,6 +83,10 @@ def _handle_evolution_task_done(
                 "Evolution terminal rejected for %s: %s",
                 task_id, lifecycle_result.get("reason") or "not_persisted",
             )
+            if request_id and lifecycle_result.get("reason") in {
+                "campaign_not_active", "transaction_missing", "transaction_mismatch",
+            }:
+                release_agent_restart(request_id, "evolution_" + lifecycle_result["reason"])
             return
         if lifecycle_result.get("replay"):
             return
@@ -98,7 +111,7 @@ def _handle_evolution_task_done(
         except Exception:
             log.debug("Failed to append evolution checkpoint", exc_info=True)
     except Exception:
-        log.debug("Failed to update evolution campaign state", exc_info=True)
+        log.warning("Evolution terminal remains unconfirmed for %s", task_id, exc_info=True)
         return
     finally:
         # GR3-3: runs on EVERY evolution terminal — including rejected/replay
@@ -107,6 +120,8 @@ def _handle_evolution_task_done(
         # GR4-6: the settling task is excluded from the liveness gate — its
         # RUNNING row is popped only later by _finish_task_done_dispatch.
         _events()._close_campaign_after_owner_stop(exclude_task_id=str(task_id or ""))
+        # Either cleanup above may have moved work: the terminal event the dispatcher pushes next says it live.
+        carry_cleanup_fact(getattr(ctx, "DRIVE_ROOT", None), str(task_id or ""), task_done_event)
 
     axes = normalize_outcome_axes({
         "status": task_done_event.get("status"),
@@ -126,20 +141,24 @@ def _handle_evolution_task_done(
         or objective_status in {"fail", "degraded"}
         or artifact_status in {"failed", "missing"}
     )
+    from supervisor.state import StateUnavailable, update_state
+
     if not failed_by_axes and (rounds or 0) >= 1:
-        from supervisor.state import update_state
-
-        update_state(lambda live: live.update(evolution_consecutive_failures=0))
+        try:
+            update_state(lambda live: live.update(evolution_consecutive_failures=0))
+        except StateUnavailable:
+            log.warning("evolution failure counter not reset: runtime state unavailable", exc_info=True)
     else:
-        from supervisor.state import update_state
-
         failures_box: Dict[str, int] = {}
 
         def _bump_failures(live: Dict[str, Any]) -> None:
             failures_box["n"] = int(live.get("evolution_consecutive_failures") or 0) + 1
             live["evolution_consecutive_failures"] = failures_box["n"]
 
-        update_state(_bump_failures)
+        try:
+            update_state(_bump_failures)
+        except StateUnavailable:  # the tracked row below still records the failure
+            log.warning("evolution failure counter not bumped: runtime state unavailable", exc_info=True)
         ctx.append_jsonl(
             ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
             {

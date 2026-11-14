@@ -4,23 +4,37 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Ouroboros Setup</title>
-  <script src="/static/theme.js"></script>
-  <link rel="icon" href="/static/favicon.png" type="image/png">
-  <link rel="stylesheet" href="/static/ui.css">
-  <link rel="stylesheet" href="/static/onboarding.css">
-  <link rel="stylesheet" href="/static/model_roles.css">
-  <link rel="stylesheet" href="/static/reviewer_slots.css">
+  <script src="/onboarding/static/theme.js"></script>
+  <link rel="icon" href="/onboarding/static/favicon.png" type="image/png">
+  <link rel="stylesheet" href="/onboarding/static/ui.css">
+  <link rel="stylesheet" href="/onboarding/static/style.css">
+  <link rel="stylesheet" href="/onboarding/static/settings.css">
+  <link rel="stylesheet" href="/onboarding/static/onboarding.css">
+  <link rel="stylesheet" href="/onboarding/static/model_roles.css">
 </head>
 <body>
-  <div class="onboarding-appearance">
-    <span class="theme-choice-label" id="onboarding-appearance-label">Appearance</span>
-    <div data-theme-control aria-labelledby="onboarding-appearance-label"></div>
-    <span class="theme-status" data-theme-status role="status"></span>
-  </div>
+  <header class="onboarding-top">
+    <div class="onboarding-brand">
+      <h1 class="wizard-title">Ouroboros</h1>
+      <p class="wizard-subtitle">Your accounts, your models, one Ouroboros.</p>
+    </div>
+    <div class="onboarding-appearance">
+      <span class="theme-choice-label" id="onboarding-appearance-label">Appearance</span>
+      <div data-theme-control aria-labelledby="onboarding-appearance-label"></div>
+      <span class="theme-status" data-theme-status role="status"></span>
+    </div>
+  </header>
   <div id="root"></div>
   <script>
     window.__OURO_ONBOARDING_BOOTSTRAP__ = __ONBOARDING_BOOTSTRAP__;
   </script>
-  <script type="module" src="/static/modules/onboarding_wizard.js"></script>
+  <script type="module" src="/onboarding/static/modules/onboarding_wizard.js"></script>
+  <script type="module">
+    // The wizard paints from the same translation memory as the SPA: an install with an
+    // imported pack or an existing dictionary is translated from the first screen; with
+    // nothing on disk the English source renders.
+    import { bootLanguage } from '/onboarding/static/modules/i18n.js';
+    bootLanguage();
+  </script>
 </body>
 </html>

@@ -1,7 +1,55 @@
+import { accountRows, claudexorStatus, READ_OK } from './claudexor_status_store.js';
 import { apiFetch } from './api_client.js';
-import { setInlineStatus } from './ui_helpers.js';
+import { setResult } from './ui_primitives.js';
+import { parseModelSource } from './route_editor_primitives.js';
 export const MODEL_CATALOG_TIMEOUT_MS = 25000;
 let catalogRefreshSeq = 0;
+const buttonRefreshes = new WeakMap();
+
+// Account login/status is the authority for subscription model discovery. Keep
+// one small signature of the confirmed account facts so a newly settled login
+// (or a changed account) can refresh the existing catalog without polling or
+// replacing the owner's in-memory model draft.
+export function accountCatalogRefreshKey(view) {
+    if (view?.reads?.accounts !== READ_OK) return null;
+    return JSON.stringify(accountRows(view.snapshot || {}).map((row) => ({
+        harness: row.harness,
+        profile_id: row.profile_id,
+        display_name: row.display_name,
+        enabled: row.enabled,
+        identity: {
+            email: row.identity?.email || '',
+            plan: row.identity?.plan || '',
+        },
+        verification: row.status?.verification || '',
+        availability: row.status?.availability || '',
+    })));
+}
+
+/** Own the Accounts subscription beside catalog refresh; never reload Settings. */
+export function watchAccountModelCatalog() {
+    let ready = false;
+    let lastKey = null;
+    const dispose = claudexorStatus.subscribe((view) => {
+        const next = accountCatalogRefreshKey(view);
+        if (!ready || next === null) {
+            // An unread/failed facet resets confirmation, so reconnect refreshes
+            // even unchanged accounts; an identical settled poll stays quiet.
+            lastKey = next;
+            return;
+        }
+        if (next === lastKey) return;
+        lastKey = next;
+        void refreshModelCatalog();
+    });
+    return {
+        arm() {
+            lastKey = accountCatalogRefreshKey(claudexorStatus);
+            ready = true;
+        },
+        dispose,
+    };
+}
 
 /**
  * Read provenance belongs to discovery, never to the owner's saved assignment.
@@ -41,6 +89,15 @@ export function mergeModelCatalog(previous = {}, incoming = {}) {
         items: merge('items', (item) => JSON.stringify([item.value || item.id, item.credential_profile_id || ''])),
         model_sources: merge('model_sources', (source) => source.id),
     };
+}
+
+/** Overlay successful connection-local lists on a general catalog, preserving its read provenance.
+ * An empty list replaces that source too; identical model names in other sources are unrelated. */
+export function withConnectionCatalogs(catalog = {}, connectionCatalogs = {}) {
+    return { ...catalog, items: [
+        ...(catalog.items || []).filter((item) => !Object.hasOwn(connectionCatalogs, parseModelSource(item.value || item.id).source)),
+        ...Object.values(connectionCatalogs).flat(),
+    ] };
 }
 
 /** Keep last-known native choices only for account reads that did not succeed. */
@@ -115,11 +172,12 @@ export function catalogReadNote(data = {}, { compact = false } = {}) {
         : errors.length ? `Model catalog could not be read: ${clauses}.`
             : state === 'stale' ? 'Model catalog is last known.' : state === 'partial' ? 'Some account model lists could not be read.'
                 : ['failed', 'transport'].includes(state) ? 'Model catalog could not be read.' : 'Model catalog has not been read yet.';
-    return `${reason} Existing suggestions and your selection are kept. Refresh Model Catalog in Models to retry.`;
+    return `${reason} Existing suggestions and your selection are kept. To retry, press Read again in Models.`;
 }
 
+// The catalog's result beside its Refresh button (ui.css .ui-action-row): a count ends by itself, a gap stays.
 function setCatalogStatus(statusEl, text, tone = 'muted') {
-    setInlineStatus(statusEl, text, tone);
+    setResult(statusEl, { text, tone, ends: tone === 'ok' });
 }
 
 function broadcastCatalog(data) {
@@ -148,6 +206,7 @@ export async function refreshModelCatalog({ button } = {}) {
     const statusEl = document.getElementById('settings-model-catalog-status');
     setCatalogStatus(statusEl, 'Refreshing model catalog...', 'muted');
     if (button) {
+        buttonRefreshes.set(button, refreshSeq);
         button.disabled = true;
         button.setAttribute('aria-busy', 'true');
     }
@@ -195,9 +254,35 @@ export async function refreshModelCatalog({ button } = {}) {
         return { items: [], errors: [{ provider_id: 'catalog', error: String(message) }] };
     } finally {
         clearTimeout(timeoutId);
-        if (button && refreshSeq === catalogRefreshSeq) {
+        // Global freshness governs data, not a particular button's busy lease.
+        if (button && buttonRefreshes.get(button) === refreshSeq) {
+            buttonRefreshes.delete(button);
             button.disabled = false;
             button.removeAttribute('aria-busy');
         }
     }
+}
+
+const settledPrograms = new Map(), programReads = new Map();
+export function refreshMaintenanceCatalogs(harness, evidence) {
+    const operation = evidence.id && `${evidence.id}:${evidence.finishedAt || ''}`;
+    if (operation && settledPrograms.get(harness) === operation) return;
+    let read = programReads.get(harness);
+    if (!read) {
+        document.dispatchEvent(new CustomEvent('harness-maintenance:settled', {detail: {harness}}));
+        let timeout;
+        const expired = new Promise(resolve => { timeout = setTimeout(() => resolve(false), MODEL_CATALOG_TIMEOUT_MS); });
+        read = Promise.race([expired, Promise.allSettled([claudexorStatus.refresh({includeModels: true, afterCurrent: true}), refreshModelCatalog()])
+            .then(([native, raw]) => {
+                const row = native.value?.harnesses?.find((item) => item.id === harness);
+                return native.status === 'fulfilled' && !claudexorStatus.error && row?.model_catalog
+                    && !row.models_error && !row.model_catalog.partial
+                    && raw.status === 'fulfilled' && catalogReadState(raw.value) === 'ok';
+            })]).finally(() => { clearTimeout(timeout); programReads.delete(harness); });
+        programReads.set(harness, read);
+    }
+    return read.then((succeeded) => {
+        if (succeeded && operation) settledPrograms.set(harness, operation);
+        return succeeded;
+    });
 }

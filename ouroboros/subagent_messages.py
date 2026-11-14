@@ -1,8 +1,13 @@
-"""Compact, durable identity for owner-visible subagent messages."""
+"""Compact, durable identity for owner-visible subagent and task-card messages."""
 
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, Mapping
+
+# One delegated-activity record on the progress carrier, serialized. The producer's own
+# preview bounds keep an ordinary record far below it (``delegate_activity``).
+_ACTIVITY_MAX_CHARS = 64_000
 
 
 SUBAGENT_MESSAGE_FIELDS: tuple[str, ...] = (
@@ -18,7 +23,48 @@ SUBAGENT_MESSAGE_FIELDS: tuple[str, ...] = (
     "effective_model_lane",
     "model",
     "executor_route",
+    "parent_cognitive_route",
+    "coordinator_route",
+    "coordinator_billing",
+    "coordinator_provenance",
+    "use_local_model",
+    # The effort decision (``settings_scales.choose_effort``) as three scalars: the level the
+    # child (a session row: its leaf) runs at, the parent's request, who decided.
+    "effort_level",
+    "effort_requested",
+    "effort_source",
 )
+
+# The host's two named placements of a task-keyed row inside its task's card.
+CARD_ROW_PLACEMENTS: tuple[str, ...] = ("timeline", "reviews")
+DELIVERY_KINDS = ("document", "links", "photo", "video", "quiz", "card")
+
+
+def is_conversation_card_content(row, kind, child=lambda _row: False):
+    """A host placement or a child's words, including lineage recovered from its task.
+
+    Delivered media/questions stand alone; a routing notice names its subject, not its speaker.
+    History and message dating use this same rule, with their own bounded lineage reader.
+    """
+    from ouroboros.project_dialogue import ORIGIN_ADDRESSED_NOTICE_TYPES
+
+    return row.get("card_row") in CARD_ROW_PLACEMENTS or (
+        kind not in DELIVERY_KINDS and kind not in ORIGIN_ADDRESSED_NOTICE_TYPES
+        and (is_task_card_message(row) or child(row)))
+
+
+def is_task_card_message(meta: Mapping[str, Any] | None) -> bool:
+    """Whether a delivered row belongs inside a task card, not the conversation feed.
+
+    Both are declared facts, never a reading of the text: the host's placement
+    (``card_row``) and a child task's own lineage (``delegation_role`` — the
+    child speaks to its parent, whose card shows it). They hold whether or not a
+    page has that card loaded, so neither is a new conversation message for the
+    Project unread revision (DESIGN "Unread").
+    """
+    source = meta if isinstance(meta, Mapping) else {}
+    return (source.get("card_row") in CARD_ROW_PLACEMENTS
+            or str(source.get("delegation_role") or "").strip().lower() == "subagent")
 
 
 def executor_observation_meta(
@@ -49,6 +95,32 @@ def executor_observation_meta(
     return observation
 
 
+def delegated_activity_meta(value: Any, *, task_id: str) -> Dict[str, Any]:
+    """Copy one delegated-activity record (``delegate_activity``) bound to its task's frame.
+
+    The same check at Agent emission, supervisor delivery and history replay. A record for
+    another task, without its exact run and seq range, with an unknown part or source kind,
+    or beyond the carrier bound is dropped whole; the frame text keeps the plain rendering.
+    The executor's words stay host progress: never narration, never execution evidence.
+    """
+    if not isinstance(value, Mapping) or not task_id or value.get("task_id") != task_id or value.get("v") != 1:
+        return {}
+    after, through, parts = value.get("after_seq"), value.get("through_seq"), value.get("parts")
+    source = value.get("source") if isinstance(value.get("source"), Mapping) else {}
+    if (not isinstance(value.get("run_id"), str) or not value["run_id"] or type(after) is not int
+            or type(through) is not int or not 0 <= after < through or not isinstance(parts, list)
+            or source.get("kind") not in ("run_events", "timeline_window")):
+        return {}
+    if any(not isinstance(part, Mapping) or part.get("kind") not in ("message", "thinking", "problem")
+           or not isinstance(part.get("text"), str) for part in parts):
+        return {}
+    try:
+        raw = json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return {}
+    return json.loads(raw) if len(raw) <= _ACTIVITY_MAX_CHARS else {}
+
+
 def initiator_meta(record: Mapping[str, Any] | None) -> Dict[str, Any]:
     """The turn's origin label — ``initiator`` from a task record or its ``metadata``.
 
@@ -61,7 +133,18 @@ def initiator_meta(record: Mapping[str, Any] | None) -> Dict[str, Any]:
     nested = source.get("metadata")
     metadata = nested if isinstance(nested, Mapping) else {}
     value = str(source.get("initiator") or metadata.get("initiator") or "").strip()
-    return {"initiator": value} if value else {}
+    continuation = metadata.get("continuation") or source.get("continuation")
+    admission = continuation.get("admission") if isinstance(continuation, Mapping) else None
+    # Who asked for a Continue, apart from the origin it inherits: read here, kept only on the admission that recorded it.
+    requester = {} if not isinstance(admission, Mapping) else {"continue_requester": _requester_of(admission)}
+    return {**({"initiator": value} if value else {}), **requester}
+
+
+def _requester_of(admission: Mapping[str, Any]) -> str:
+    """``owner`` or ``ouroboros`` as the admission recorded it; an undeclared or older admission stays ``unknown``."""
+    by = admission.get("by")
+    actor = str(by.get("actor") or "") if isinstance(by, Mapping) else ""
+    return actor if actor in ("owner", "ouroboros") else "unknown"
 
 
 def subagent_message_meta(
@@ -105,7 +188,25 @@ def subagent_message_meta(
         "effective_model_lane": first("effective_model_lane"),
         "model": first("model"),
         "executor_route": first("executor_route"),
+        "effort_level": first("effort_level"),
+        "effort_requested": first("effort_requested"),
+        "effort_source": first("effort_source"),
     }
+    cognitive = source.get("parent_cognitive_route") or metadata.get("parent_cognitive_route")
+    if isinstance(cognitive, Mapping):
+        meta["parent_cognitive_route"] = dict(cognitive)
+    else:
+        cognitive = {}
+    from ouroboros.subagent_runtime import cognitive_route_billing_basis
+
+    local = source.get("use_local_model", metadata.get("use_local_model", cognitive.get("use_local_model", False)))
+    cost = source.get("cost_usd", source.get("cost", metadata.get("cost_usd", metadata.get("cost"))))
+    route, billing = cognitive_route_billing_basis(first("coordinator_route") or meta["model"] or cognitive.get("model", ""),
+                                                 use_local=local, cost=cost)
+    meta.update(use_local_model=bool(local), coordinator_route=route,
+                coordinator_billing=first("coordinator_billing", "nanny_billing") or billing)
+    if first("coordinator_provenance"):
+        meta["coordinator_provenance"] = first("coordinator_provenance")
     if event:
         meta["subagent_event"] = str(event)
     return meta

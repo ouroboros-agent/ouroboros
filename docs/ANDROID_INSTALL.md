@@ -241,18 +241,21 @@ Neither result diagnoses the sensor or platform policy. Older last-known-only
 reads can report `no_last_known_fix`. An SDK test-provider fix exercises callback
 delivery but does not qualify GPS reception on a physical device.
 
-In Settings → Available subagents, each coding session has its own access choice:
-**Working files** (`workspace_write`, the default) or **Full system access** (`full`).
+In Settings → Agents, session Access offers **Full system access** (`full`, the
+default), **Working files** (`workspace_write`) and **Read only** (`readonly`).
+Explicit saved choices remain; the selected access also governs research and
+review sessions in private checking copies. Those copies retain evidence, never
+apply changes to the product, and are not OS sandboxes. Full access does not make
+untrusted code safe to execute.
+
 The tested Android kernel cannot create Codex's native sandbox, so a Codex coding
 session needs Full system access. Claude Code under root rejects its full-access
-mode; keep its working-files choice. This is saved session configuration, not an
-automatic change of harness or permissions. Working changes still live in a private
-snapshot until Ouroboros reviews and applies them; that snapshot is not a filesystem
-sandbox. The host creates an initial full-access grant only when the selected
-project has no trust record; an existing record that disables full access is
-preserved. Existing sessions on every platform keep
-Working files unless you change them. Read-only assignments remain read-only;
-Codex's readonly sandbox is not qualified on the tested Android kernel.
+mode; select Working files for that route. Unsupported profiles refuse rather
+than silently changing harness or rights. These are saved choices, not automatic
+platform defaults. The host creates a scoped full-access grant only when the
+selected project has no trust record; an explicit refusal remains. An explicitly
+readonly session stays readonly; Codex's readonly sandbox is not qualified on the
+tested Android kernel.
 
 The bridge also provides a typed `packages.install` path for an APK exposed by a
 `content://` or other readable URI. It stages bytes through Android's
@@ -367,6 +370,16 @@ upgrade from an older installation record prepares its dependencies once using
 that cache. Native compilation can take more than ten minutes; the contained
 platform operation allows up to one hour. A pending startup notice does not mean
 that preparation has failed or that the core is already ready.
+
+Android bootstrap still provisions Playwright's Chromium archives. Browser tools
+do not launch them: their first Chromium use obtains the separate reviewed pin
+from `ouroboros/chromium_runtime.py`, an additional download. A pin change is
+resolved at browser use, not by the platform-preparation fingerprint. The rooted
+userspace must meet Chromium's sandbox requirements; otherwise the call refuses.
+An administrator may explicitly accept the risk with
+`OUROBOROS_CHROMIUM_SANDBOX=off` in the runtime environment; launch warnings and
+browser-condition annotations disclose it. There is no automatic root exception
+or old-browser fallback. This browser change has not been qualified on a phone.
 
 Local Pixel qualification changed the Android 36 SDK to the ext19 archive and
 restored the previous SDK through ordinary Restart. The new core and SDK were

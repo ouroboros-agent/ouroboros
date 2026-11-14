@@ -1,6 +1,7 @@
 /** Shared frontend utilities. */
 
-import { apiFetch } from './api_client.js';
+import { apiClient } from './api_client.js';
+import { currentLanguage, fmt, isEnglish, tr } from './i18n.js';
 export { fetchJson } from './api_client.js';
 
 export function escapeHtmlText(text) {
@@ -36,6 +37,120 @@ export function safeExternalHrefAttr(value) {
         }
     } catch {}
     return '';
+}
+
+/**
+ * ` · since HH:MM` in the viewer's own 24-hour clock, for an instant the host
+ * actually recorded. A wait that began on an earlier local day carries that day
+ * too, so `since 23:50` can never be misread as tonight. A missing or
+ * unparseable value yields '': a moment is never invented or inferred.
+ */
+export function sinceLocalTime(value, now = Date.now()) {
+    const at = new Date(Date.parse(String(value ?? '').trim()));
+    if (Number.isNaN(at.getTime())) return '';
+    const clock = at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+    if (at.toDateString() === new Date(now).toDateString()) return ` · since ${clock}`;
+    return ` · since ${at.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${clock}`;
+}
+
+/**
+ * A timestamp in whole microseconds since the epoch, for ordering with `<`; NaN exactly where `Date.parse` is.
+ * `Date.parse` keeps milliseconds, and the host stamps microseconds (Python `isoformat()`, which omits a zero
+ * fraction): two writes of one stored row can land inside one millisecond. Any zone spelling or fraction length reads alike.
+ */
+export function isoMicros(value) {
+    let micros = 0;
+    const whole = String(value ?? '').replace(/(\d\d:\d\d:\d\d)\.(\d+)/, (_match, clock, digits) => {
+        micros = Number(digits.padEnd(6, '0').slice(0, 6));
+        return clock;
+    });
+    return Date.parse(whole) * 1000 + micros;
+}
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const hhmm = date => `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+// English keeps this hand format byte for byte; an install language takes its month
+// names from Intl and its two words from the catalog (web/modules/i18n.js).
+function monthName(date) {
+    if (!isEnglish()) {
+        try { return new Intl.DateTimeFormat(currentLanguage(), { month: 'short' }).format(date); } catch { /* hand list below */ }
+    }
+    return MONTHS[date.getMonth()];
+}
+// The chat's one compact clock: the local time, the day only off today (`18:46`, `Oct 16, 18:46`).
+const clockOf = (date, now) => (date.toDateString() === now.toDateString()
+    ? hhmm(date) : `${monthName(date)} ${date.getDate()}, ${hhmm(date)}`);
+function msgTimeOf(date, now) {
+    const yesterday = new Date(now);
+    yesterday.setDate(now.getDate() - 1);
+    const short = date.toDateString() === yesterday.toDateString()
+        ? `${tr('time.yesterday', 'Yesterday')}, ${hhmm(date)}` : clockOf(date, now);
+    return { short, full: `${monthName(date)} ${date.getDate()}, ${date.getFullYear()} ${tr('time.at', 'at')} ${hhmm(date)}` };
+}
+
+/** {short, full} presentation of a message timestamp, or null when unreadable. */
+export function formatMsgTime(isoStr) {
+    if (!isoStr) return null;
+    try {
+        const date = new Date(isoStr);
+        return Number.isNaN(date.getTime()) ? null : msgTimeOf(date, new Date());
+    } catch {
+        return null;
+    }
+}
+
+const readDate = (value) => {
+    const date = value ? new Date(value) : null;
+    return date && !Number.isNaN(date.getTime()) ? date : null;
+};
+export const absoluteTime = (value, zone = false) => readDate(value)?.toLocaleString(undefined, {
+    year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+    ...(zone ? { timeZoneName: 'short' } : {}),
+}) || '';
+const zoneName = (date) => {
+    try {
+        return new Intl.DateTimeFormat(undefined, { timeZoneName: 'short' }).formatToParts(date)
+            .find((part) => part.type === 'timeZoneName')?.value || '';
+    } catch { return ''; }
+};
+// The instant's own minute: local clock text repeats across a DST fallback hour.
+const minuteOf = value => Math.floor(new Date(value).getTime() / 60000);
+
+/** The host observed this end itself: the executor ending its attempt, or the supervisor recording a cancel. */
+const endObserved = (fact) => fact?.source === 'executor_terminal' || fact?.source === 'supervisor_cancel';
+
+/** A task's host-observed end and the time its notification was added are two
+ * facts (#1347); an unknown end says so rather than borrowing the second.
+ * `full` states both as absolute local dates (two different minutes that read
+ * alike carry their zone names): the tooltip, what a screen reader hears, and a
+ * details line. `short` is the row's one compact time line (owner 17.10, Q7 A):
+ * the row's own time alone when its task ended in that minute, both facts only
+ * when the minutes differ, a day only off today. */
+export function terminalTimeNote(terminalTime, addedAt, now = new Date()) {
+    const ended = endObserved(terminalTime) ? readDate(terminalTime.occurred_at) : null;
+    const added = readDate(addedAt);
+    const zone = Boolean(ended && added) && absoluteTime(ended) === absoluteTime(added) && minuteOf(ended) !== minuteOf(added);
+    const endFact = ended ? `Task ended ${absoluteTime(ended, zone)}` : 'Task end time not recorded';
+    const full = added ? `${endFact} · Notification added ${absoluteTime(added, zone)}` : endFact;
+    if (ended && added && minuteOf(ended) === minuteOf(added)) return { short: msgTimeOf(added, now).short, full };
+    const clocks = [ended, added].map((date) => (date ? clockOf(date, now) : ''));
+    const [end, at] = ended && clocks[0] === clocks[1] ? clocks.map((clock, i) => `${clock} ${zoneName([ended, added][i])}`) : clocks;
+    const short = ended
+        ? (at ? fmt('Ended {end} · added {added}', { end, added: at }) : fmt('Ended {end}', { end }))
+        : (at ? fmt('End time not recorded · added {added}', { added: at }) : fmt('End time not recorded'));
+    return { short, full };
+}
+
+/** A saved end row may be published long after its task ended. Its line keeps the
+ * row's own time and adds the note when the end falls in another minute or is
+ * unknown; live frames and rows saved before the host fact existed stay as they were.
+ * The room's expanded timeline is a details surface whose own line time is the log's
+ * long form, so the note there is the full one. */
+export function savedTerminalRowNote(row) {
+    const fact = row?.system_type === 'task_summary' ? row.terminal_time : null;
+    if (!fact || typeof fact !== 'object' || !absoluteTime(row.ts)) return '';
+    const known = endObserved(fact) && absoluteTime(fact.occurred_at);
+    return known && minuteOf(fact.occurred_at) === minuteOf(row.ts) ? '' : terminalTimeNote(fact, row.ts).full;
 }
 
 /** Bound untrusted text with a visible marker before it reaches DOM surfaces. */
@@ -124,63 +239,21 @@ export function preflightFindingText(finding) {
     return `Preflight failed — ${shown}${parts.length > 3 ? ` (+${parts.length - 3} more)` : ''}`;
 }
 
-export function topReviewFinding(entity) {
-    const findings = Array.isArray(entity?.review_findings) ? entity.review_findings : [];
-    if (!findings.length) return '';
-    const first = findings[0] || {};
-    const more = findings.length > 1 ? ` (+${findings.length - 1} more)` : '';
-    const preflight = preflightFindingText(first);
-    if (preflight) return `${preflight}${more}`;
-    const label = first.item || first.check || first.title || 'finding';
-    const verdict = first.verdict || first.severity || '';
-    const reason = first.reason || first.message || '';
-    return `${`${verdict ? `${verdict} ` : ''}${label}: ${reason}`.trim()}${more}`;
-}
-
-export function renderHubCard(item, {
-    pending = null,
-    installed = null,
-    lifecycle,
-    primaryHtml = '',
-    secondaryHtml = '',
-    badgesHtml = '',
-    metaHtml = '',
-    official = false,
-} = {}) {
-    const slug = item.slug;
-    const working = Boolean(pending) && pending.failed !== true;
-    const spinner = working ? '<span class="marketplace-working-spinner" aria-hidden="true"></span>' : '';
-    const lifecycleHint = lifecycle?.hint
-        ? `<div class="marketplace-card-state-hint">${escapeHtmlAttr(lifecycle.hint)}</div>`
-        : '';
-    const status = installed
-        ? `<span class="skills-status-chip skills-status-ok">Installed v${escapeHtmlAttr(installed.version || item.latest_version || '')}</span>`
-        : '';
-    return `
-        <article class="${working ? 'marketplace-card is-working' : 'marketplace-card'}" data-slug="${escapeHtmlAttr(slug)}">
-            <div class="marketplace-card-head">
-                <div class="marketplace-card-title">
-                    <strong>${escapeHtmlAttr(item.display_name || slug)}</strong>
-                    <span class="muted">${escapeHtmlAttr(slug)} · v${escapeHtmlAttr(item.latest_version || '—')}</span>
-                </div>
-                <div class="marketplace-card-badges">
-                    ${official ? '<span class="skills-badge skills-badge-ok">official</span>' : ''}
-                    ${status}
-                    ${badgesHtml}
-                </div>
-            </div>
-            <div class="marketplace-card-body">${escapeHtmlAttr(item.summary || item.description || '')}</div>
-            <div class="marketplace-card-state marketplace-state-${escapeHtmlAttr(lifecycle?.tone || 'muted')}">
-                <strong>${spinner}${escapeHtmlAttr(lifecycle?.label || '')}</strong>
-                ${lifecycleHint}
-            </div>
-            ${metaHtml ? `<div class="marketplace-card-meta muted">${metaHtml}</div>` : ''}
-            <div class="marketplace-card-actions">
-                <div class="marketplace-primary-action">${primaryHtml}</div>
-                ${secondaryHtml ? `<div class="marketplace-secondary-actions">${secondaryHtml}</div>` : ''}
-            </div>
-        </article>
-    `;
+/**
+ * One quiet line of publication history (what this installation sent), shown
+ * in an installed card's details. It states what was submitted — never
+ * ownership, a merge or an open pull request — and an unsafe receipt URL stays
+ * plain text without hiding the other facts.
+ */
+export function renderSubmissionHistory(submission) {
+    if (!submission || typeof submission !== 'object') return '';
+    const parts = [submission.version ? `Submitted v${escapeHtmlAttr(submission.version)}` : 'Submitted'];
+    const pr = submission.pr_number !== null ? `PR #${escapeHtmlAttr(String(submission.pr_number))}` : 'Pull request';
+    const href = safeExternalHrefAttr(submission.pr_url);
+    if (href) parts.push(`<a href="${href}" target="_blank" rel="noopener noreferrer" data-skill-external>${pr} ↗</a>`);
+    else if (submission.pr_number !== null) parts.push(pr);
+    if (submission.local_differs) parts.push('Local files differ from the submitted copy');
+    return parts.join(' · ');
 }
 
 /**
@@ -273,8 +346,9 @@ export function decodeHtmlEntities(value) {
 }
 
 export function formatUsdWhole(value) {
+    // Whole dollars with digit groups, as every other money line ("$30,034"; owner, board of 06.11).
     const num = Number(value);
-    return Number.isFinite(num) ? `$${num.toFixed(0)}` : '$0';
+    return Number.isFinite(num) ? `$${Math.round(num).toLocaleString('en-US')}` : '$0';
 }
 
 export function formatUsd2(value) {
@@ -285,14 +359,13 @@ export function formatUsd2(value) {
     return Number.isFinite(num) ? `$${num.toFixed(2)}` : '—';
 }
 
-export function allowanceLabel(spent, daily, unknownUnmetered = 0, integrityDegraded = false) {
-    // The consciousness allowance line: an absent number stays absent (never $0.00), a
-    // window with unmetered rows prints as a floor ("≥"), a quarantined ledger says so.
-    if (spent === null || spent === undefined || daily === null || daily === undefined) return '';
-    if (!Number.isFinite(Number(spent)) || !Number.isFinite(Number(daily))) return '';
-    const floor = Number(unknownUnmetered) > 0 ? '≥ ' : '';
-    const degraded = integrityDegraded ? ' (ledger integrity degraded)' : '';
-    return `${floor}${formatUsd2(spent)} / ${formatUsd2(daily)}${degraded}`;
+/** A known dollar amount: two places, four under a cent and `<$0.0001` below that, so a positive amount never
+ *  reads as the priced zero `$0.00`; absent or unreadable is the dash. */
+export function formatUsdKnown(value) {
+    if (value === null || value === undefined || value === '') return '—';
+    const num = Number(value);
+    if (!Number.isFinite(num)) return '—';
+    return num > 0 && num < 0.0001 ? '<$0.0001' : `$${num > 0 && num < 0.01 ? num.toFixed(4) : num.toFixed(2)}`;
 }
 
 export function formatUsd4(value) {
@@ -365,11 +438,49 @@ export function accountedUpperBoundWithChildren(payload) {
 // count as what the reader sees, not as their markup.
 export const MARKDOWN_HEADING_MAX_CHARS = 80;
 
+// Code is the author's literal text: a later span, heading, list, link or table
+// rule must never see inside a fence or code span. Each one is parked as a token
+// of letters and digits the text does not contain (so no later pattern can match
+// in or across it) and `restore` puts the parked text back. Parked code is
+// markup, so `holds` lets a rule that writes an attribute refuse to carry it.
+const CODE_SPAN = /(``|`)(.+?)\1/g;
+const CODE_STEM = 'OUROBOROSCODE';
+
+// The token's stem: `OUROBOROSCODE` and a fixed-width tag of capital letters that
+// follows no `OUROBOROSCODE` in the text. There are more tags of that width than
+// occurrences, so one scan finds a free tag and the stem stays short on any input
+// (lengthening it until the text lacked it cost a rescan per letter and grew every
+// token with the text).
+function codeStem(text) {
+    const after = [];
+    for (let at = text.indexOf(CODE_STEM); at >= 0; at = text.indexOf(CODE_STEM, at + 1)) after.push(at + CODE_STEM.length);
+    let width = 0;
+    while (26 ** width <= after.length) width += 1;
+    const taken = new Set(after.map((at) => text.slice(at, at + width)));
+    const tag = (n) => Array.from({ length: width }, (_, i) => String.fromCharCode(65 + (Math.floor(n / 26 ** i) % 26))).join('');
+    let free = 0;
+    while (taken.has(tag(free))) free += 1;
+    return CODE_STEM + tag(free);
+}
+
+function codeStash(text) {
+    const stem = codeStem(text);
+    const parked = [];
+    const pattern = new RegExp(`${stem}(\\d+)${stem}`, 'g');
+    return {
+        token: (value) => `${stem}${parked.push(value) - 1}${stem}`,
+        holds: (value) => String(value).includes(stem),
+        restore: (value) => String(value).replace(pattern, (_, index) => parked[Number(index)]),
+    };
+}
+
 // What the reader sees of a heading, at either stage of the pipeline. Rendered
 // text has already turned matched spans into tags (not visible) and `<`/`&` into
-// entities (one character each). Raw text is projected the way the renderer
-// would: only MATCHED span pairs and link destinations are invisible; an unmatched
-// `*`, a literal `<okay>` or a literal `&amp;` stay visible characters.
+// entities (one character each); its code spans are still parked, so `restore`
+// reveals them after link targets are gone. Raw text is projected the way the
+// renderer would: only MATCHED span pairs and link destinations are invisible; an
+// unmatched `*`, a literal `<okay>`, a literal `&amp;` and everything inside a code
+// span stay visible characters.
 // `[label](url)` → label with one forward cursor: a regex retried from every
 // unmatched `[` is quadratic on hostile input, and this runs on live frames.
 function withoutLinkTargets(text) {
@@ -386,44 +497,51 @@ function withoutLinkTargets(text) {
     return out + text.slice(i);
 }
 
-function visibleHeadingText(text, rendered) {
-    const linkless = withoutLinkTargets(text);
+function visibleHeadingText(text, rendered, restore = (value) => value) {
+    const code = rendered ? null : codeStash(text);
+    const reveal = code ? code.restore : restore;
+    const linkless = withoutLinkTargets(code ? text.replace(CODE_SPAN, (_, _tick, body) => code.token(body)) : text);
     // Past this length no span markup can bring a line under the cap; skipping the
     // span regexes keeps a hostile marker run from costing quadratic time.
-    if (linkless.length > 8 * MARKDOWN_HEADING_MAX_CHARS) return linkless;
-    if (rendered) return linkless.replace(/<[^>]*>/g, '').replace(/&[#\w]+;/g, 'x');
-    return linkless.replace(/(``|`)(.+?)\1/g, '$2').replace(/\*\*(.+?)\*\*/g, '$1').replace(/\*(.+?)\*/g, '$1').replace(/~~(.+?)~~/g, '$1');
+    if (reveal(linkless).length > 8 * MARKDOWN_HEADING_MAX_CHARS) return reveal(linkless);
+    if (rendered) return reveal(linkless).replace(/<[^>]*>/g, '').replace(/&[#\w]+;/g, 'x');
+    return reveal(linkless.replace(/\*\*(.+?)\*\*/g, '$1').replace(/\*(.+?)\*/g, '$1').replace(/~~(.+?)~~/g, '$1'));
 }
 
-function isMarkdownHeading(text, { rendered = false } = {}) {
-    return visibleHeadingText(text, rendered).length <= MARKDOWN_HEADING_MAX_CHARS;
+function isMarkdownHeading(text, { rendered = false, restore } = {}) {
+    return visibleHeadingText(text, rendered, restore).length <= MARKDOWN_HEADING_MAX_CHARS;
 }
 
-function headingOrProse(cls, text, breakAfter = false) {
-    return isMarkdownHeading(text, { rendered: true })
+function headingOrProse(cls, text, breakAfter = false, restore = undefined) {
+    return isMarkdownHeading(text, { rendered: true, restore })
         ? `<strong class="${cls}">${text}</strong>${breakAfter ? '<br>' : ''}` : text;
 }
 
-// The renderer's fence grammar (`/```(\w*)\n([\s\S]*?)```/`), line by line on the
-// ORIGINAL lines: a line ending in ``` plus a word-only info string right before
-// the newline opens a fence, whatever precedes it — trailing blanks or a CR make it
-// ordinary text, exactly as for the renderer — PROVIDED a later line closes it (the
-// renderer's regex needs the closer; an unclosed opener is ordinary text); the next
-// line containing ``` closes it. `md-js` opens nothing.
-const FENCE_OPEN = /```\w*$/;
+// One compact fence grammar for rendering and both plain previews: an optional
+// word-character language label with + # . - punctuation, then spaces/tabs and
+// LF or CRLF. A nonempty label needs a word character: a prose ``` followed only
+// by punctuation is not an opener. Nor is more prose after a blank, which could pair an inline ``` with
+// a later code fence. Prefixed/indented openers and the next-``` closer keep their
+// existing semantics; an opener without a later closer remains ordinary text.
+const FENCE_START = '```(?:(?=[\\w+#.-]*\\w)[\\w+#.-]+)?[\\t ]*\\r?';
+const FENCE_OPEN = new RegExp(FENCE_START + '$');
+export const MARKDOWN_FENCED_CODE = new RegExp(FENCE_START + '\\n([\\s\\S]*?)```', 'g');
 const FENCE_CLOSE = /```/;
 
 /**
- * Plain-text projection of ATX headings for one-line previews: the markers go,
- * and a heading (by the renderer's own visible-length rule) followed by text keeps
- * ` — ` as its separator, so a collapsed preview reads `summary — …` rather than
- * gluing the label to the sentence. A marker-led line the renderer treats as prose
- * loses only its markers; a heading already ending in a dash or colon gets no
- * second one; lines inside a code fence are code and stay untouched. CRLF and
+ * Plain-text projection of the line-anchored markers for one-line previews, run
+ * while the newlines still exist (a flattened preview can no longer tell a line
+ * start from prose). ATX headings lose their markers, and a heading (by the
+ * renderer's own visible-length rule) followed by text keeps ` — ` as its
+ * separator, so a collapsed preview reads `summary — …` rather than gluing the
+ * label to the sentence. A marker-led line the renderer treats as prose loses only
+ * its markers; a heading already ending in a dash or colon gets no second one.
+ * Bullets lose their `- `, a table row reads as its cells and a divider row
+ * disappears. Lines inside a code fence are code and stay untouched. CRLF and
  * trailing blanks are normalized. Line-by-line on purpose: a regex over the whole
  * text with a lazy or trailing-blank tail is quadratic on long whitespace runs.
  */
-export function joinMarkdownHeadings(text) {
+export function projectMarkdownLines(text) {
     const raw = String(text || '').split('\n');
     const lines = raw.map((line) => line.trimEnd());
     // Index of the next non-blank line and "a closer exists below" for every line:
@@ -441,7 +559,13 @@ export function joinMarkdownHeadings(text) {
         if (fenced) { if (FENCE_CLOSE.test(raw[index])) fenced = false; return line; }
         if (opensFence(index)) { fenced = true; return line; }
         const heading = /^#{1,6} (.*\S)$/.exec(line);
-        if (!heading) return line;
+        if (!heading) {
+            const bullet = /^- (.+)$/.exec(line);
+            if (bullet) return bullet[1];
+            const row = /^\|(.+)\|$/.exec(line);
+            const cells = row ? row[1].split('|').map((cell) => cell.trim()).join(' ') : line;
+            return /^[\s\-:|]+$/.test(cells) ? '' : cells;
+        }
         const next = nextIndex[index];
         // A visibly dash- or colon-terminated heading (`**Steps:**` included) needs no second separator.
         const visible = visibleHeadingText(heading[1], false);
@@ -450,11 +574,52 @@ export function joinMarkdownHeadings(text) {
     }).join('\n');
 }
 
+/**
+ * One plain-text projection of RECORDED free text before it joins a host cause
+ * cancellation clause. The Python twin is
+ * `ouroboros.utils.strip_markdown` followed by a whitespace split/join, and the
+ * two strip the SAME marker inventory so one stored cause reads the same in the
+ * browser card and in the host's durable chat row. Line-anchored patterns
+ * (headings, bullets) only match while the newlines are still there, so
+ * stripping precedes flattening — exactly the order the Python docstring names.
+ * The common fixture pins Markdown, empty provenance and sentence punctuation
+ * through both consumers. `max` of 0 keeps the whole text; any other value
+ * bounds it by Unicode characters with an ellipsis.
+ */
+export function plainCauseText(value, max = 160) {
+    const plain = String(value || '')
+        .replace(/```[^\n]*\n([\s\S]*?)```/g, '$1')
+        .replace(/`([^`]+)`/g, '$1')
+        .replace(/\*\*\*(.+?)\*\*\*/g, '$1')
+        .replace(/\*\*(.+?)\*\*/g, '$1')
+        .replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, '$1')
+        .replace(/(?<![\p{L}\p{N}_])_(.+?)_(?![\p{L}\p{N}_])/gu, '$1')
+        .replace(/~~(.+?)~~/g, '$1')
+        .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+        .replace(/^#{1,6}\s+/gm, '')
+        .replace(/^[*-]\s+/gm, '• ')
+        .replace(/\*\*|__|~~|`/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    const chars = Array.from(plain);
+    return max > 0 && chars.length > max ? `${chars.slice(0, max - 1).join('').trimEnd()}…` : plain;
+}
+
+const TABLE_ALIGN = [[/^:-+:$/, 'center'], [/^-+:$/, 'right'], [/^:-+$/, 'left']];
+
+// `[text](address "title")` on one line. The address has no blanks and keeps its
+// parentheses balanced one level deep (`wiki/Foo_(bar)`); an optional title in
+// quotes or parentheses follows a blank and is not part of it. Any other form is
+// not read as a link and stays the author's text, never a guessed address.
+const MARKDOWN_LINK = /(!?)\[([^\]]+)\]\([ \t]*((?:[^()\s]|\([^()\s]*\))+)(?:[ \t]+("[^"\n]*"|'[^'\n]*'|\([^()\n]*\)))?[ \t]*\)/g;
+
 export function renderMarkdown(text, { inlineHeadingBreaks = false } = {}) {
     let html = escapeHtmlText(text);
-    html = html.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
+    const code = codeStash(html);
+    html = html.replace(MARKDOWN_FENCED_CODE, (_, body) => code.token(`<pre><code>${body}</code></pre>`));
     // One pass for both span forms: a double-backtick span may contain backticks.
-    html = html.replace(/(``|`)(.+?)\1/g, '<code class="inline-code">$2</code>');
+    html = html.replace(CODE_SPAN, (match, _tick, body) => code.holds(body)
+        ? match : code.token(`<code class="inline-code">${body}</code>`));
     html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
     html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
     html = html.replace(/~~(.+?)~~/g, '<del>$1</del>');
@@ -464,15 +629,22 @@ export function renderMarkdown(text, { inlineHeadingBreaks = false } = {}) {
     // Timeline labels stay inline, but their following paragraph needs a real
     // copyable break when its surface collapses source whitespace.
     const heading = (cls) => (match, content, offset, source) => headingOrProse(
-        cls, content, inlineHeadingBreaks && ['\r', '\n'].includes(source[offset + match.length]),
+        cls, content, inlineHeadingBreaks && ['\r', '\n'].includes(source[offset + match.length]), code.restore,
     );
     html = html.replace(/^#{3,6} (.+)$/gm, heading('md-h3'));
     html = html.replace(/^## (.+)$/gm, heading('md-h2'));
     html = html.replace(/^# (.+)$/gm, heading('md-h1'));
     html = html.replace(/^- (.+)$/gm, '<span class="md-li">\u2022 $1</span>');
-    html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, function(_, text, url) {
+    // An image is never loaded (#1368); its reference stays a visible link. The
+    // title is dropped: the anchor keeps its one fixed shape.
+    // Code restored after the href was escaped would end the attribute with its
+    // own quote, and this output reaches the page unsanitized: a destination that
+    // holds parked code is no destination, and its source stays literal text.
+    html = html.replace(MARKDOWN_LINK, function(source, image, text, url, title = '') {
+        if (code.holds(url + title)) return source;
         const safe = safeExternalUrl(decodeHtmlEntities(url));
-        return '<a href="' + escapeHtmlAttr(safe) + '" target="_blank" rel="noopener noreferrer" class="md-link">' + text + '</a>';
+        return '<a href="' + escapeHtmlAttr(safe) + '" target="_blank" rel="noopener noreferrer" class="md-link'
+            + (image ? ' md-image-ref">Image: ' : '">') + text + '</a>';
     });
     html = html.replace(/((?:^\|.+\|$\n?)+)/gm, function(block) {
         const rows = block.trim().split('\n').filter(r => r.trim());
@@ -481,7 +653,10 @@ export function renderMarkdown(text, { inlineHeadingBreaks = false } = {}) {
         let headIdx = -1;
         for (let i = 0; i < rows.length; i++) { if (isSep(rows[i])) { headIdx = i; break; } }
         if (headIdx < 1) return block;
-        const parseRow = (r, tag) => '<tr>' + r.trim().replace(/^\||\|$/g, '').split('|').map(c => `<${tag}>${c.trim()}</${tag}>`).join('') + '</tr>';
+        const cells = (r) => r.trim().replace(/^\||\|$/g, '').split('|').map((c) => c.trim());
+        // The separator row's colons are the author's column alignment (GFM).
+        const align = cells(rows[headIdx]).map((c) => TABLE_ALIGN.find(([pattern]) => pattern.test(c))?.[1]);
+        const parseRow = (r, tag) => '<tr>' + cells(r).map((c, i) => `<${tag}${align[i] ? ` align="${align[i]}"` : ''}>${c}</${tag}>`).join('') + '</tr>';
         let t = '<table class="md-table">';
         for (let i = 0; i < headIdx; i++) t += '<thead>' + parseRow(rows[i], 'th') + '</thead>';
         t += '<tbody>';
@@ -489,7 +664,7 @@ export function renderMarkdown(text, { inlineHeadingBreaks = false } = {}) {
         t += '</tbody></table>';
         return '<div class="md-table-wrap">' + t + '</div>';
     });
-    return html;
+    return code.restore(html);
 }
 
 export function extractVersions(data) {
@@ -500,75 +675,42 @@ export function extractVersions(data) {
 
 export function formatDualVersion(data) {
     const { appVersion, runtimeVersion } = extractVersions(data);
-    return `app ${appVersion} | rt ${runtimeVersion}`;
+    return `App ${appVersion} · Runtime ${runtimeVersion}`;
 }
 
+const versionField = (value) => (typeof value === 'string' ? value.trim() : '');
+let versionRead = 0;
+let appVersionRead = '';
+const appVersionWatchers = new Set();
+
+/** The app version the newest landed health read reported (`loadVersion`); '' while none did. */
+export const lastAppVersion = () => appVersionRead;
+
+/** Call `watcher` when a landed health read changes `lastAppVersion()`; returns its disposer. */
+export function watchAppVersion(watcher) {
+    appVersionWatchers.add(watcher);
+    return () => appVersionWatchers.delete(watcher);
+}
+
+/**
+ * The sidebar's runtime version and About's app/runtime pair, from one `/api/health` read. app.js
+ * reads at startup and on every socket open, because a kept page outlives the core that served it.
+ * The newest read started owns both labels: an older answer is dropped even when the newer read
+ * fails, and a failed, refused or versionless answer leaves the text they already show.
+ */
 export async function loadVersion() {
-    try {
-        const resp = await apiFetch('/api/health');
-        const data = await resp.json();
-        const { runtimeVersion } = extractVersions(data);
-        const navVer = document.getElementById('nav-version');
-        if (navVer) navVer.textContent = `v${runtimeVersion}`;
-    } catch {}
-}
-
-export function initMatrixRain() {
-    const canvas = document.createElement('canvas');
-    canvas.id = 'matrix-rain';
-    document.getElementById('app').prepend(canvas);
-
-    const ctx = canvas.getContext('2d');
-    const chars = '\u30A2\u30A4\u30A6\u30A8\u30AA\u30AB\u30AD\u30AF\u30B1\u30B3\u30B5\u30B7\u30B9\u30BB\u30BD\u30BF\u30C1\u30C4\u30C6\u30C8\u30CA\u30CB\u30CC\u30CD\u30CE\u30CF\u30D2\u30D5\u30D8\u30DB\u30DE\u30DF\u30E0\u30E1\u30E2\u30E4\u30E6\u30E8\u30E9\u30EA\u30EB\u30EC\u30ED\u30EF\u30F2\u30F3ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789\u03A8\u03A9\u03A6\u0394\u039B\u039E\u03A3\u0398\u0430\u0431\u0432\u0433\u0434\u0435\u0436\u0437\u0438\u043A\u043B\u043C\u043D\u043E\u043F\u0440\u0441\u0442\u0443\u0444\u0445\u0446\u0447\u0448\u0449\u044D\u044E\u044F'.split('');
-    const fontSize = 14;
-    const motion = window.matchMedia('(prefers-reduced-motion: reduce)');
-    let timer = null;
-    let columns = [];
-    let w = 0, h = 0;
-
-    function resize() {
-        w = canvas.width = window.innerWidth;
-        h = canvas.height = window.innerHeight;
-        const colCount = Math.floor(w / fontSize);
-        while (columns.length < colCount) columns.push(Math.random() * h / fontSize | 0);
-        columns.length = colCount;
-        if (motion.matches) draw();
+    const read = ++versionRead;
+    let data = null;
+    try { data = await apiClient.health(); } catch { /* keep the labels */ }
+    const runtime = versionField(data?.runtime_version) || versionField(data?.version);
+    if (read !== versionRead || !runtime) return;
+    const versions = { runtime_version: runtime, app_version: versionField(data.app_version) };
+    if (appVersionRead !== versions.app_version) {  // the Updates page's App chip
+        appVersionRead = versions.app_version;
+        appVersionWatchers.forEach((watcher) => watcher());
     }
-    resize();
-    window.addEventListener('resize', resize);
-
-    function draw() {
-        ctx.fillStyle = 'rgba(13, 11, 15, 0.06)';
-        ctx.fillRect(0, 0, w, h);
-        ctx.fillStyle = '#ee3344';
-        ctx.font = fontSize + 'px monospace';
-
-        for (let i = 0; i < columns.length; i++) {
-            const ch = chars[Math.random() * chars.length | 0];
-            ctx.fillText(ch, i * fontSize, columns[i] * fontSize);
-            if (columns[i] * fontSize > h && Math.random() > 0.975) {
-                columns[i] = 0;
-            }
-            columns[i]++;
-        }
-    }
-
-    function syncMotion() {
-        if (timer !== null) clearInterval(timer);
-        timer = null;
-        if (document.documentElement.dataset.theme === 'light') return;
-        if (motion.matches) draw();
-        else timer = setInterval(draw, 66);
-    }
-    motion.addEventListener('change', syncMotion);
-    window.addEventListener('ouro:theme-changed', syncMotion);
-    syncMotion();
-    return () => {
-        if (timer !== null) clearInterval(timer);
-        timer = null;
-        motion.removeEventListener('change', syncMotion);
-        window.removeEventListener('ouro:theme-changed', syncMotion);
-        window.removeEventListener('resize', resize);
-        canvas.remove();
-    };
+    const nav = document.getElementById('nav-version');
+    if (nav) nav.textContent = `v${runtime}`;
+    const about = document.getElementById('about-version');
+    if (about) about.textContent = formatDualVersion(versions);
 }

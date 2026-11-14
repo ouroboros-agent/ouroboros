@@ -14,7 +14,7 @@ from tests.test_subscription_setup_browser import (
     subscription_ui as subscription_ui,
 )
 
-pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
+pytestmark = [pytest.mark.ui_browser]
 
 
 def _open_wizard(ui):
@@ -43,17 +43,16 @@ def test_wizard_navigation_restores_draft_and_back_position(subscription_ui, vie
     page.locator("#next-btn").scroll_into_view_if_needed()
     previous_position = page.evaluate("window.scrollY")
     page.click("#next-btn")
-    page.wait_for_selector("#reviewer-slots-section", state="attached")
+    page.wait_for_selector("[data-reviewers-note]", state="attached")
     assert page.evaluate("document.activeElement.matches('.step-title')")
     assert page.evaluate("window.scrollY") == 0
 
-    page.locator('[data-collapse="reviewers"] > summary').click()
-    page.evaluate("window.heldReviewers = document.querySelector('[data-collapse=reviewers]')")
+    page.evaluate("window.heldReviewers = document.querySelector('[data-reviewers-note]')")
     # Test keyboard focus retention explicitly: WebKit's native pointer click
     # intentionally does not focus a button as Chromium's does.
     page.locator('[data-review-mode="blocking"]').focus()
     page.locator('[data-review-mode="blocking"]').press("Enter")
-    assert page.evaluate("heldReviewers === document.querySelector('[data-collapse=reviewers]') && heldReviewers.open")
+    assert page.evaluate("heldReviewers === document.querySelector('[data-reviewers-note]')")
     assert page.locator('[data-review-mode="blocking"]').get_attribute("aria-pressed") == "true"
     assert page.locator('[data-review-mode="advisory"]').get_attribute("aria-pressed") == "false"
     assert page.evaluate("document.activeElement.matches('[data-review-mode=blocking]')")
@@ -83,7 +82,7 @@ def test_wizard_summary_refresh_keeps_focused_action_and_position(subscription_u
     ui["fixture"]["status"]["harnesses"][0]["models"].append({"id": "new-discovery"})
     ui["fixture"]["preview"]["model_settings"]["OUROBOROS_MODEL"] = "claudexor::codex=updated-preview"
     page.evaluate("""async () => {
-        const {claudexorStatus} = await import('/static/modules/claudexor_status_store.js');
+        const {claudexorStatus} = await import('/onboarding/static/modules/claudexor_status_store.js');
         await claudexorStatus.refresh({includeModels: true});
     }""")
     page.wait_for_function("document.querySelector('.summary-card').textContent.includes('updated-preview')")
@@ -105,7 +104,7 @@ def test_wizard_unchanged_preview_preserves_pristine_model_focus(subscription_ui
     ui["fixture"]["status"]["harnesses"][0]["models"].append({"id": "another-discovered-model"})
     with page.expect_response("**/api/model-catalog") as catalog:
         page.evaluate("""async () => {
-            const {claudexorStatus} = await import('/static/modules/claudexor_status_store.js');
+            const {claudexorStatus} = await import('/onboarding/static/modules/claudexor_status_store.js');
             await claudexorStatus.refresh({includeModels: true});
         }""")
     catalog.value.finished()
@@ -165,6 +164,41 @@ def test_wizard_local_stop_failure_preserves_edit_and_retry_feedback(subscriptio
     assert stops == ["POST", "POST"]
     assert source.input_value() == "/tmp/owner-model.gguf"
     capture(page, "wizard-local-stop-retried")
+
+
+@pytest.mark.parametrize("viewport", [(980, 780), (390, 844)])
+def test_wizard_steps_taller_than_the_window_scroll_by_wheel_and_keyboard(subscription_ui, viewport):
+    # A wizard step is a document. The app shell's fixed body must not reach it, or its footer
+    # is reachable only by the automatic scroll-into-view of a test, never by an owner.
+    page = subscription_ui["page"]
+    width, height = viewport
+    page.set_viewport_size({"width": width, "height": height})
+    _open_wizard(subscription_ui)
+    page.click("#next-btn")
+    page.wait_for_selector('[data-model-role="main"]')
+    assert page.evaluate("document.scrollingElement.scrollHeight") > height
+    footer_seen = "() => document.querySelector('#next-btn').getBoundingClientRect().bottom <= innerHeight"
+    page.mouse.move(width / 2, height / 2)
+    page.mouse.wheel(0, 20000)
+    page.wait_for_function(footer_seen, timeout=5000)
+    page.evaluate("window.scrollTo(0, 0)")
+    page.locator(".step-title").focus()
+    page.keyboard.press("End")
+    page.wait_for_function(footer_seen, timeout=5000)
+
+
+def test_wizard_saved_server_rows_bind_their_secret_controls_once(subscription_ui):
+    # The shared editor binds the rows it mounts; the card's own pass must not bind them again.
+    subscription_ui["bootstrap"]["initialState"].update(connections=[{
+        "kind": "openai-compatible", "name": "beta", "label": "Beta", "base_url": "http://127.0.0.1:1/v1",
+        "api_key": "***"}])
+    page = _open_wizard(subscription_ui)
+    row = page.locator("[data-connection-row][data-uid]")
+    key = row.locator('[data-connection-field="api_key"]')
+    assert row.locator(".secret-toggle").get_attribute("aria-controls") == key.get_attribute("id") + "-reveal"
+    edits = key.evaluate("""el => { let n = 0; el.addEventListener('input', (e) => { if (!e.isTrusted) n += 1; });
+        el.closest('[data-connection-row]').querySelector('.secret-clear').click(); return n; }""")
+    assert edits == 1
 
 
 def test_wizard_fields_have_explicit_names_help_and_shared_family(subscription_ui):

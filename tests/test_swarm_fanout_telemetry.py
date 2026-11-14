@@ -80,7 +80,7 @@ def _fanout_events(tmp_path):
 
 def test_delegated_run_fanout_emits_exact_wave_shape_under_swarm_intent(tmp_path):
     ctx = _delegating_host_ctx(
-        tmp_path, {"force_plan_source": "swarm", "root_task_id": "r-root"},
+        tmp_path, {"subagents_mode": "swarm", "root_task_id": "r-root"},
     )
     maybe_emit_delegated_run_fanout(
         ctx, run_id="run-1", route_id="codex-route", objective="o" * 300, durable=True,
@@ -104,7 +104,7 @@ def test_delegated_run_fanout_emits_exact_wave_shape_under_swarm_intent(tmp_path
 
 
 def test_delegated_run_fanout_defaults_root_to_host_task(tmp_path):
-    ctx = _delegating_host_ctx(tmp_path, {"force_plan_source": "swarm"})
+    ctx = _delegating_host_ctx(tmp_path, {"subagents_mode": "swarm"})
     maybe_emit_delegated_run_fanout(
         ctx, run_id="run-2", route_id="r", objective="o", durable=True,
     )
@@ -114,7 +114,7 @@ def test_delegated_run_fanout_defaults_root_to_host_task(tmp_path):
 def test_delegated_run_fanout_silent_without_swarm_intent(tmp_path):
     # An ordinary delegate_start on a task that never asked for a swarm emits
     # nothing — including under the non-swarm force_plan variants.
-    for metadata in ({}, {"force_plan_source": "operator"}, {"force_plan": True}):
+    for metadata in ({}, {"subagents_mode": "operator"}, {"force_plan": True}):
         ctx = _delegating_host_ctx(tmp_path, metadata)
         maybe_emit_delegated_run_fanout(
             ctx, run_id="run-x", route_id="r", objective="o", durable=True,
@@ -125,7 +125,7 @@ def test_delegated_run_fanout_silent_without_swarm_intent(tmp_path):
 def test_delegated_run_fanout_silent_when_start_uncustodied(tmp_path):
     # started_uncustodied: the custody write failed, so the started fact is not
     # attested — no telemetry.
-    ctx = _delegating_host_ctx(tmp_path, {"force_plan_source": "swarm"})
+    ctx = _delegating_host_ctx(tmp_path, {"subagents_mode": "swarm"})
     maybe_emit_delegated_run_fanout(
         ctx, run_id="run-y", route_id="r", objective="o", durable=False,
     )
@@ -188,6 +188,9 @@ def _real_delegate_start(
                 "route": {"kind": "agent_session", "target_id": target,
                           "credential_profile_id": route.profile_id},
                 "effort": route.effort,
+                # A READ-ONLY child (local_readonly_subagent): technical access alone
+                # decides the run shape now (#1609), so the session states it.
+                "access": "readonly",
             },
         })
         try:
@@ -198,7 +201,7 @@ def _real_delegate_start(
     if not actor_first_work_order:
         monkeypatch.setattr(delegate, "prepare_delegate_start_actor", explicit_transport_actor)
     if not custody_durable:
-        monkeypatch.setattr(delegate, "record_started_custody", lambda *a, **k: False)
+        monkeypatch.setattr(delegate, "record_started_custody", lambda _drive, run_id, *a, **k: (run_id, False))
     repo = tmp_path / "repo"
     repo.mkdir(exist_ok=True)
     ctx = ToolContext(
@@ -208,6 +211,10 @@ def _real_delegate_start(
     ctx.task_id = "t-nanny"
     ctx.task_depth = 1
     ctx.task_metadata = metadata
+    from ouroboros.task_results import load_task_result, write_task_result
+    root_id = str(metadata.get("root_task_id") or "")
+    if root_id and root_id != ctx.task_id and load_task_result(tmp_path, root_id) is None:  # the real root
+        write_task_result(tmp_path, root_id, "running", root_task_id=root_id)
     delegate_custody._CUSTODY.clear()
     if actor_first_work_order:
         target = "some-route=weak-model:low"
@@ -221,6 +228,7 @@ def _real_delegate_start(
                 "credential_profile_id": "",
             },
             "effort": "low",
+            "access": "readonly",   # the same read-only child (#1609)
         }
         ctx._configured_actor_bootstrap = {
             "snapshot": snapshot,
@@ -248,7 +256,7 @@ def _real_delegate_start(
 def test_delegate_start_emits_fanout_after_custody_under_swarm_intent(tmp_path, monkeypatch):
     payload = _real_delegate_start(tmp_path, monkeypatch, metadata={
         "root_task_id": "t-root", "parent_task_id": "t-root",
-        "force_plan_source": "swarm",
+        "subagents_mode": "swarm",
     })
     assert payload["status"] == "started" and payload["custody_durable"] is True
     evts = _fanout_events(tmp_path)
@@ -274,7 +282,7 @@ def test_delegate_start_uncustodied_emits_no_fanout_even_under_swarm_intent(tmp_
     payload = _real_delegate_start(
         tmp_path, monkeypatch, custody_durable=False, metadata={
             "root_task_id": "t-root", "parent_task_id": "t-root",
-            "force_plan_source": "swarm",
+            "subagents_mode": "swarm",
         },
     )
     assert payload["status"] == "started_uncustodied"
@@ -292,7 +300,7 @@ def test_actor_first_swarm_fanout_uses_frozen_work_order_after_custody(
         metadata={
             "root_task_id": "t-root",
             "parent_task_id": "t-root",
-            "force_plan_source": "swarm",
+            "subagents_mode": "swarm",
         },
         actor_first_work_order=canonical,
         coordination_context=appendix,
@@ -312,7 +320,7 @@ def test_actor_first_uncustodied_start_stays_out_of_swarm_telemetry(
         tmp_path,
         monkeypatch,
         custody_durable=False,
-        metadata={"force_plan_source": "swarm"},
+        metadata={"subagents_mode": "swarm"},
         actor_first_work_order="CANONICAL_WORK_ORDER",
         coordination_context="coordination only",
     )

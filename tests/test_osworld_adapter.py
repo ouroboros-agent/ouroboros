@@ -8,6 +8,8 @@ persistence contract, and the cu_bridge sample-60 final_answer fix.
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -108,7 +110,7 @@ def test_provider_preflight_vmware_missing_vm(tmp_path):
 
 
 def test_provider_preflight_docker_missing_cli(monkeypatch):
-    monkeypatch.setattr(rsa.shutil, "which", lambda name: None)
+    monkeypatch.setattr(shutil, "which", lambda name: None)
     failures = rsa.provider_preflight_failures("docker", "")
     assert any("docker CLI not found" in failure for failure in failures)
 
@@ -138,7 +140,7 @@ def test_prompt_declares_vm_state_grading_and_final_answer(tmp_path):
 
 def test_predict_captures_final_answer_on_done(tmp_path, monkeypatch):
     agent = _agent(tmp_path)
-    monkeypatch.setattr(rsa.subprocess, "run", _fake_run({
+    monkeypatch.setattr(subprocess, "run", _fake_run({
         "response": "Navigated to the answer page; finishing.",
         "final_answer": "Henry, Charles, Mason",
         "actions": [{"type": "done"}],
@@ -152,7 +154,7 @@ def test_predict_captures_final_answer_on_done(tmp_path, monkeypatch):
 
 def test_predict_falls_back_to_terminal_response_when_final_answer_missing(tmp_path, monkeypatch):
     agent = _agent(tmp_path)
-    monkeypatch.setattr(rsa.subprocess, "run", _fake_run({
+    monkeypatch.setattr(subprocess, "run", _fake_run({
         "response": "Done. The names are Henry and Charles.",
         "actions": ["DONE"],
     }))
@@ -163,7 +165,7 @@ def test_predict_falls_back_to_terminal_response_when_final_answer_missing(tmp_p
 
 def test_predict_records_fail_as_infeasible_terminal(tmp_path, monkeypatch):
     agent = _agent(tmp_path)
-    monkeypatch.setattr(rsa.subprocess, "run", _fake_run({
+    monkeypatch.setattr(subprocess, "run", _fake_run({
         "response": "Spotify cannot be installed here.",
         "final_answer": "TASK_INFEASIBLE",
         "actions": [{"type": "fail"}],
@@ -185,7 +187,7 @@ def test_predict_passes_disable_tools_to_ouroboros_cli(tmp_path, monkeypatch):
         seen["cmd"] = list(cmd)
         return SimpleNamespace(returncode=0, stdout=json.dumps({"response": "ok", "actions": ["WAIT"]}), stderr="")
 
-    monkeypatch.setattr(rsa.subprocess, "run", fake)
+    monkeypatch.setattr(subprocess, "run", fake)
     agent.predict("task", {}, max_steps=500)
     cmd = seen["cmd"]
     assert "--disable-tools" in cmd
@@ -207,9 +209,11 @@ def test_settings_template_follows_sprint_scaffold_defaults():
     assert template["OUROBOROS_MODEL"] == template["OUROBOROS_MODEL_LIGHT"]
     assert template["OUROBOROS_MODEL"] == template["OUROBOROS_MODEL_FALLBACKS"]
     actors = json.loads(template["OUROBOROS_SUBAGENTS"])
-    assert [row["route"]["target_id"] for row in actors["items"]] == [
-        template["OUROBOROS_MODEL"]
-    ]
+    # One actor row plus the packet review seats of the pool, all on the solve model.
+    assert {row["route"]["target_id"] for row in actors["items"]} == {template["OUROBOROS_MODEL"]}
+    assert [row for row in actors["items"] if not row.get("review_eligible")] == actors["items"][:1]
+    assert all(row["delivery"] == "packet" for row in actors["items"][1:])
+    assert "OUROBOROS_REVIEWER_SLOTS" not in template
     assert "OUROBOROS_MODEL_HEAVY" not in template
 
 
@@ -266,7 +270,7 @@ def test_preflight_verifies_server_scaffold_settings(tmp_path, monkeypatch):
 
     drifted = {"OUROBOROS_RUNTIME_MODE": "light", "OUROBOROS_SAFETY_MODE": "full",
                "OUROBOROS_MAX_WORKERS": 1, "OUROBOROS_MODEL": "openai/gpt-5.5",
-               "OUROBOROS_REVIEW_ENFORCEMENT": "advisory",
+               "OUROBOROS_REVIEW_ENFORCEMENT": "advisory", "OUROBOROS_TASK_REVIEW_MODE": "auto",
                "OUROBOROS_SUBAGENTS": rsa.single_model_subagents_setting("openai/gpt-5.5")}
 
     def fake_http(url, timeout=5):
@@ -288,13 +292,14 @@ def test_preflight_verifies_server_scaffold_settings(tmp_path, monkeypatch):
     assert not result["ok"]
     assert "OUROBOROS_RUNTIME_MODE" in joined and "OUROBOROS_SAFETY_MODE" in joined
     assert "OUROBOROS_MAX_WORKERS" in joined and "OUROBOROS_MODEL" in joined
-    # Adversarial review r2 #6: the blocking review lane is part of the scaffold gate.
-    assert "OUROBOROS_REVIEW_ENFORCEMENT" in joined
+    # The benchmark's declared result-review mode is part of the scaffold gate (#1731, O4); the retired
+    # review-enforcement key is not (the adapter reads the verdict itself).
+    assert "OUROBOROS_REVIEW_ENFORCEMENT" not in joined and "OUROBOROS_TASK_REVIEW_MODE" in joined
 
     # matching server -> ok; mismatch + explicit ablation flag -> ok but recorded
     matching.update({"OUROBOROS_RUNTIME_MODE": "pro", "OUROBOROS_SAFETY_MODE": "light",
                      "OUROBOROS_MAX_WORKERS": 4,
-                     "OUROBOROS_REVIEW_ENFORCEMENT": "blocking"})
+                     "OUROBOROS_REVIEW_ENFORCEMENT": "blocking", "OUROBOROS_TASK_REVIEW_MODE": "required"})
 
     def fake_http_ok(url, timeout=5):
         if url.endswith("/api/state"):

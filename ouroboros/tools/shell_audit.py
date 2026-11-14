@@ -1,7 +1,15 @@
-"""Post-execution custody audit helpers for shell tools."""
+"""Post-execution custody audit helpers for shell tools.
+
+The audit is observational and syntactic: it reads literal write targets from the
+argv, with no replay, rollback, interpreter or attribution proof; computed targets
+(variables, expansions) are not resolved. Path-like prose that is not a valid path
+yields no finding. A failed audit adds a bounded diagnostic and leaves the completed
+process outcome unchanged.
+"""
 
 from __future__ import annotations
 
+import json
 import pathlib
 import re
 from typing import List, TYPE_CHECKING
@@ -29,6 +37,7 @@ from ouroboros.tool_access import (
     resource_root_path,
     user_files_path_block_reason,
 )
+from ouroboros.tool_access_user_files import runtime_owned_roots
 from ouroboros.tools.shell_guards import writer_target_tokens
 from ouroboros.tools.deliverables_shell import lexical_user_files_block_reason
 from ouroboros.tools.tool_result import (
@@ -37,8 +46,9 @@ from ouroboros.tools.tool_result import (
     _published_tool_result,
     _replace_tool_result,
 )
-from ouroboros.tools.verify import check_exit_masking
+from ouroboros.tools.verify import check_exit_masking, exit_masking_note
 from ouroboros.workspace_executor import (
+    BackendPathNoMatch,
     executor_ref_from_ctx,
     map_backend_path,
     map_backend_path_lexical,
@@ -49,6 +59,7 @@ if TYPE_CHECKING:
 
 
 _UNDECLARED_OUTPUTS_MARKER = "⚠️ ARTIFACT_OUTPUT_UNDECLARED"
+_UNDECLARED_OUTPUT_META_BYTES = 2048  # the typed result's whole meta is bounded at 8 KB of ASCII-escaped JSON
 _UNDECLARED_OUTPUT_SCAN_MAX_FILES = 5000
 _UNDECLARED_OUTPUT_METADATA_COMMANDS = frozenset({"chmod", "chown", "mkdir", "rm"})
 
@@ -166,6 +177,38 @@ def _allowed_output_roots(
     return roots
 
 
+# What both notes about undeclared files say next: either door registers the file, neither is required.
+REGISTER_OUTPUT_ADVICE = (
+    "If one is a result for your human, register it (outputs=[...] on a later command captures it as it "
+    "stands; write_file root=artifact_store writes one there); otherwise nothing is needed."
+)
+
+
+def undeclared_outputs_note(paths: list[str]) -> str:
+    """The one sentence both shell tools append to a finished run: the sensor's evidence (a path the
+    run names as a write target, modified around the time it ran), never a refusal and never a proven
+    write. It names every path: the result keeps the whole list, a view may fold it."""
+    if not paths:
+        return ""
+    return (
+        f"{_UNDECLARED_OUTPUTS_MARKER}: this run names these files as write targets, and they were modified "
+        f"around the time it ran without being registered as task outputs: {', '.join(paths)}. "
+        f"{REGISTER_OUTPUT_ADVICE}"
+    )
+
+
+def undeclared_outputs_meta(paths: list[str]) -> dict:
+    """The note's typed fact for the journal row, whose text preview may cut the note away: whole
+    paths while their encoded size fits (a cut path would be a false address) and their total.
+    The result text names them all."""
+    kept: list[str] = []
+    for path in paths:
+        if len(json.dumps([*kept, path], ensure_ascii=True)) > _UNDECLARED_OUTPUT_META_BYTES:
+            break
+        kept.append(path)
+    return {"undeclared_outputs": kept, "undeclared_outputs_total": len(paths)} if paths else {}
+
+
 def _mentioned_user_file_outputs_without_declaration(
     ctx: ToolContext,
     cmd: List[str],
@@ -174,9 +217,14 @@ def _mentioned_user_file_outputs_without_declaration(
     command_start_ts: float | None = None,
     cwd: pathlib.Path | str | None = None,
 ) -> list[str]:
-    """Best-effort audit for fresh absolute user_files writes without outputs."""
+    """Best-effort audit for fresh absolute user_files writes without outputs.
+
+    A path inside a drive or checkout Ouroboros itself owns (``runtime_owned_roots``) is
+    its own data or program, never a person's file, in every runtime mode: the access
+    check below answers a different question and admits everything under unrestricted agency."""
     if outputs:
         return []
+    owned_roots = runtime_owned_roots(ctx)
     scratch_set = {str(p) for p in (scratch_abs or [])}
     mtime_floor = (
         command_start_ts - _OUTPUT_STAT_SLACK_SEC
@@ -258,7 +306,7 @@ def _mentioned_user_file_outputs_without_declaration(
                     try:
                         path = map_backend_path(executor_ref, candidate_text)
                         lexical_path = map_backend_path_lexical(executor_ref, candidate_text)
-                    except ValueError:
+                    except BackendPathNoMatch:  # A matched invalid spelling is no finding.
                         path = raw_candidate.resolve(strict=False)
                         lexical_path = raw_candidate
                 elif raw_candidate.is_absolute() or candidate_text.startswith("~"):
@@ -292,6 +340,11 @@ def _mentioned_user_file_outputs_without_declaration(
                     path_is_relative_to(output_path, root)
                     or _path_is_relative_to_casefold(output_path, root)
                     for root in user_output_roots
+                ):
+                    continue
+                if any(
+                    path_is_relative_to(output_path, root) or _path_is_relative_to_casefold(output_path, root)
+                    for root in owned_roots
                 ):
                     continue
                 lexical_reason = lexical_user_files_block_reason(lexical_output_path)
@@ -339,7 +392,12 @@ def _mentioned_user_file_outputs_without_declaration(
 
 
 def _disclose_output_audit_failure(ctx: ToolContext, result: str, error_name: str) -> str:
-    """Keep the completed process authoritative when its optional audit failed."""
+    """Keep the completed process authoritative when its optional audit failed.
+
+    Appends ARTIFACT_AUDIT_GAP naming the exception class; a typed result also
+    records that class in ``meta["output_audit_unavailable"]``. The rest of the
+    result is carried through unchanged.
+    """
     if not error_name:
         return result
     base = _published_tool_result(ctx, None)
@@ -368,11 +426,7 @@ def _masked_green_disclosure(ctx: ToolContext, result: str, cmd) -> str:
     masked, reasons = check_exit_masking([str(part) for part in (cmd or [])])
     if not masked:
         return result
-    text = (
-        f"{result}\n\nEXIT_MASKING_NOTE: exit_code=0 belongs to the last stage "
-        f"({', '.join(reasons)}); an upstream failure cannot change it — drop the "
-        "filter, use `set -o pipefail`, or check each stage."
-    )
+    text = f"{result}\n\n{exit_masking_note(reasons)}"
     base = _published_tool_result(ctx, None)
     if (
         not isinstance(base, ToolResult)
@@ -380,7 +434,7 @@ def _masked_green_disclosure(ctx: ToolContext, result: str, cmd) -> str:
         or base.text != str(result)
     ):
         # Only an exit-0 PROCESS is a laundered exit: the trusted process fact
-        # decides, never the typed status (an undeclared-output nudge or an
+        # decides, never the typed status (an undeclared-output note or an
         # artifact-registration error is still a green exit that the shape
         # laundered) and never an inspection of the text. A non-zero exit
         # already says what happened.

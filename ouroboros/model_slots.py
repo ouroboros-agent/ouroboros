@@ -25,6 +25,7 @@ PROCESSING_PREFERENCES = ("standard", "fast", "economy")
 MODEL_ROLE_SETTINGS = {
     "main": "OUROBOROS_MODEL",
     "light": "OUROBOROS_MODEL_LIGHT",
+    "safety": "OUROBOROS_MODEL_SAFETY",
     "vision": "OUROBOROS_MODEL_VISION",
     "consciousness": "OUROBOROS_MODEL_CONSCIOUSNESS",
     "deep_review": "OUROBOROS_MODEL_DEEP_SELF_REVIEW",
@@ -62,8 +63,17 @@ def normalize_model_role_options(key: str, raw: object) -> tuple[dict, str]:
             raw = json.loads(raw)
         except (ValueError, TypeError) as exc:
             raise ValueError(f"{key} must be a JSON object") from exc
-    if not isinstance(raw, dict) or set(raw) - set(MODEL_ROLE_SETTINGS):
-        raise ValueError(f"{key} must contain only known model roles")
+    if not isinstance(raw, dict):
+        raise ValueError(f"{key} must be a JSON object")
+    unknown_roles = [ascii(role) for role in raw if role not in MODEL_ROLE_SETTINGS]
+    if unknown_roles:
+        raise ValueError(
+            f"{key}: unknown model role(s): {', '.join(unknown_roles)}. "
+            f"Supported roles: {', '.join(MODEL_ROLE_SETTINGS)}. "
+            "Check the role spelling or use a compatible application version; "
+            "do not reset your settings. Packaged startup recovery: "
+            "docs/DEPLOYMENT.md#unknown-model-role-at-startup"
+        )
     def value(item: object) -> str | int:
         if key == MODEL_PROCESSING_PREFERENCES_KEY:
             return normalize_processing_preference(item)
@@ -94,6 +104,18 @@ def model_role_option(key: str, role: str, *, settings: dict | None = None) -> s
     default = 0 if key == MODEL_CONTEXT_WINDOWS_KEY else ""
     raw = (settings or {}).get(key, "") if settings is not None else runtime_setting(key, "")
     options, _canonical = normalize_model_role_options(key, raw)
+    if role == "safety":
+        # An empty Supervisor slot inherits the route's authored options as
+        # well as its model. An explicit Supervisor model ends that chain.
+        for candidate in ("safety", "light", "main"):
+            if options.get(candidate):
+                return options[candidate]
+            setting = MODEL_ROLE_SETTINGS[candidate]
+            model = (settings.get(setting, SETTINGS_DEFAULTS[setting]) if settings is not None
+                     else runtime_setting(setting, SETTINGS_DEFAULTS[setting]))
+            if str(model or "").strip():
+                break
+        return default
     family, separator, position = role.partition(":")
     if family == "fallback" and separator:
         try:
@@ -126,28 +148,65 @@ def task_model_binding(task: dict, *, context_fit_plan: object = None,
 
     Callers may pass their live owner's overrides; this pure projection never
     captures another task's ambient wait or turns an observed Auto account into a pin.
+    Owner work carrying a lead uses Auto, never Main's pin.
     """
+    from ouroboros.route_choice import LEAD_ROLE, task_lead
+    from ouroboros.supervisor_route import supervisor_binding
+
+    cognitive, supervisor_role = supervisor_binding(task)
     metadata = task.get("task_metadata", task.get("metadata", {}))
     metadata = metadata if isinstance(metadata, dict) else {}
     actor = task.get("configured_subagent", metadata.get("configured_subagent", {}))
     actor = actor if isinstance(actor, dict) else {}
     route = actor.get("route") or {}
     actor_id = str(actor.get("selected_subagent_id") or "")
-    actor_role = f"subagent:{actor_id}" if actor_id and route.get("kind") == "api_model" else "main"
+    actor_role = supervisor_role or (f"subagent:{actor_id}" if actor_id and route.get("kind") == "api_model" else "main")
+    lead_role = LEAD_ROLE if actor_role == "main" and task_lead(metadata) else ""
+    actor_role = lead_role or actor_role
+    metadata_role = metadata.get("model_role") if metadata.get("model_role") != LEAD_ROLE else ""
     role = str(task.get("model_role") or getattr(context_fit_plan, "model_role", "")
-               or metadata.get("model_role") or actor_role)
+               or lead_role or metadata_role or actor_role)
     pin = task.get("credential_profile_id")
-    if pin is None and role == actor_role and actor_role != "main":
-        pin = str(route.get("credential_profile_id") or "")
+    if pin is None and role == LEAD_ROLE:
+        pin = ""
+    elif pin is None and role == actor_role and actor_role != "main":
+        followed = str((cognitive or {}).get("follows_role") or "")  # a nanny following its parent's role: that role's current pin
+        pin = (str(model_role_option(MODEL_ACCOUNTS_KEY, followed) or "") if followed
+               else str((cognitive or route).get("credential_profile_id") or ""))
     pin = (overrides or {}).get(role, {}).get("model_account_override", pin)
     return role, pin
 
 
+def route_binding(model: str, use_local: bool, role: str, *,
+                  overrides: dict | None = None) -> tuple[str, bool, str]:
+    """The complete identity a send on ``role`` uses: model, locality and account.
+
+    A live owner choice for the role (a wait-card switch) replaces the configured
+    route exactly as the send applies it; the account is the configured pin or
+    empty Auto, never an observed Auto account, and routes without accounts have
+    none. Equal model strings with different accounts are different routes.
+    """
+    from ouroboros.provider_models import provider_for_model
+
+    chosen = (overrides or {}).get(role) or {}
+    model, use_local = str(chosen.get("model", model) or ""), bool(chosen.get("use_local", use_local))
+    account = chosen.get("model_account_override")
+    if account is None:
+        account = model_role_option(MODEL_ACCOUNTS_KEY, role) if role else ""
+    if use_local or provider_for_model(model) != "claudexor":
+        account = ""
+    return model, use_local, str(account or "").strip()
+
+
 def task_processing_preference(task: dict, *, model_role: str = "",
                               override: str | None = None) -> str:
-    """Capture the actor's intent; an unconfigured fallback preserves that intent."""
+    """Capture the actor's intent; an unconfigured fallback keeps it (a lead uses the default, never Main's)."""
     if override is not None:
         return resolve_processing_preference(override=override)
+    from ouroboros.route_choice import LEAD_ROLE
+    from ouroboros.supervisor_route import supervisor_binding
+
+    cognitive, supervisor_role = supervisor_binding(task)
     metadata = task.get("task_metadata", task.get("metadata", {}))
     metadata = metadata if isinstance(metadata, dict) else {}
     actor = task.get("configured_subagent", metadata.get("configured_subagent", {}))
@@ -158,21 +217,38 @@ def task_processing_preference(task: dict, *, model_role: str = "",
         authored = model_role_option(MODEL_PROCESSING_PREFERENCES_KEY, role)
         if authored:
             return resolve_processing_preference(override=str(authored))
-        role = (f"subagent:{actor_id}" if actor_id and (actor.get("route") or {}).get("kind") == "api_model"
-                else "main")
+        role = supervisor_role or (f"subagent:{actor_id}" if actor_id and (actor.get("route") or {}).get("kind") == "api_model"
+                                  else LEAD_ROLE if task_model_binding(task)[0] == LEAD_ROLE else "main")
+    if supervisor_role and role == supervisor_role:
+        return resolve_processing_preference(override=cognitive["processing_preference"])
     if actor_id and role == f"subagent:{actor_id}":
         # Missing in a historical snapshot means captured legacy behavior.
         return resolve_processing_preference(override=actor.get("processing_preference") or "")
     return resolve_processing_preference(role)
 
 
+def _persisted_role(role: str) -> tuple[str, str]:
+    """``role`` as a wait card persists it: ``(family, identity)``. ``/review`` with no reviewer named
+    and an empty pool run on the direct Main row (reviewer_slot_config.main_review_row): there
+    is no catalog row behind ``reviewer:main``, so its card persists as Main's own role."""
+    family, _, identity = role.partition(":")
+    return ("main", "") if (family, identity) == ("reviewer", "main") else (family, identity)
+
+
+def model_role_setting_keys(role: str) -> tuple[str, ...]:
+    """The settings key a wait card's persistence of ``role`` authors (none for a catalog row's role)."""
+    key = MODEL_ROLE_SETTINGS.get(_persisted_role(role)[0], "")
+    return (key,) if key else ()
+
+
 def apply_model_role_override(settings: dict, *, role: str, model: str,
                               credential_profile_id: str, use_local: bool) -> dict:
     """Apply explicit wait-card persistence to one role; never infer it from a model.
 
-    The gateway owns locking and writes. Referenced reviewer actors are copied
-    before editing so another reviewer or task actor keeps its prior assignment
-    and native-inspection delivery is not silently converted to packed chat.
+    The gateway owns locking and writes. A ``reviewer:<id>`` or ``subagent:<id>``
+    role names ONE catalog row by its stored id (a review pool seat's identity is
+    its row), and the override changes that row's route — its mark, delivery,
+    effort and every other field stay as the owner saved them.
     """
     from ouroboros.provider_models import provider_for_model, parse_claudexor_model
 
@@ -187,7 +263,7 @@ def apply_model_role_override(settings: dict, *, role: str, model: str,
     if pin and not subscription:
         raise ValueError("An account pin requires a managed model source")
     result = copy.deepcopy(settings)
-    family, _, identity = role.partition(":")
+    family, identity = _persisted_role(role)
     if family in MODEL_ROLE_SETTINGS:
         key = MODEL_ROLE_SETTINGS[family]
         accounts, _ = normalize_model_role_options(MODEL_ACCOUNTS_KEY, result.get(MODEL_ACCOUNTS_KEY))
@@ -216,62 +292,26 @@ def apply_model_role_override(settings: dict, *, role: str, model: str,
         result[MODEL_ACCOUNTS_KEY] = normalize_model_role_options(MODEL_ACCOUNTS_KEY, accounts)[1]
         return result
     from ouroboros.configured_subagents import normalize_configured_subagents, configured_subagents_dict
-    from ouroboros.reviewer_slot_config import reviewer_slot_save_check
 
-    routed_model = model if not use_local or model.endswith(" (local)") else f"{model} (local)"
-    slots = None
-    actor_id = identity
-    if family == "reviewer":
-        raw = result.get("OUROBOROS_REVIEWER_SLOTS")
-        if not raw:
-            from ouroboros.subscription_install_presets import preview_api_reviewer_slots
-            raw = preview_api_reviewer_slots(result)
-        slots = json.loads(raw) if isinstance(raw, str) else copy.deepcopy(raw)
-        if not result.get("OUROBOROS_REVIEWER_SLOTS") and identity != "deep_review_slot_1":
-            # The stored ABI is one triad/scope panel, not sparse overrides.
-            # Preserve its other effective rows, but do not author the independent
-            # legacy-derived deep-review placeholder on an unrelated row edit.
-            slots.pop("deep_review", None)
-        rows = [*slots.get("triad", []), *slots.get("scope", [])]
-        rows.extend(slots[name] for name, slot_id in (
-            ("advisory", "advisory_slot_1"), ("deep_review", "deep_review_slot_1"))
-                    if identity == slot_id and isinstance(slots.get(name), dict))
-        row = next((item for item in rows if item.get("slot_id", identity) == identity), None)
-        if row is None:
-            raise ValueError("The selected reviewer no longer exists")
-        actor_id = str(row.get("subagent_id") or "")
-        if not actor_id:
-            row["route"] = {"kind": "api_chat", "target_id": routed_model, "profile_id": pin}
-    elif family != "subagent":
+    if family == "lead":
+        raise ValueError("This work's model has no Settings slot; change the model for this work only.")
+    if family not in ("reviewer", "subagent"):
         raise ValueError("Unknown waiting model role")
-    if actor_id:
-        roster = configured_subagents_dict(normalize_configured_subagents(result.get("OUROBOROS_SUBAGENTS"))[0])
-        actor = next((item for item in roster["items"] if item["subagent_id"] == actor_id), None)
-        if actor is None:
-            raise ValueError("The selected task agent or referenced reviewer no longer exists")
+    routed_model = model if not use_local or model.endswith(" (local)") else f"{model} (local)"
+    roster = configured_subagents_dict(normalize_configured_subagents(result.get("OUROBOROS_SUBAGENTS"))[0])
+    actor = next((item for item in roster["items"] if item["subagent_id"] == identity), None)
+    if actor is None:
         if family == "reviewer":
-            current_route = actor["route"]
-            if (current_route.get("kind") == "api_model" and current_route.get("target_id") == routed_model
-                    and str(current_route.get("credential_profile_id") or "") == pin):
-                return result  # Replaying a saved role cannot mint duplicate roster actors.
-            actor = copy.deepcopy(actor)
-            ids = {item["subagent_id"] for item in roster["items"]}
-            base, number = f"reviewer-{identity}", 1
-            actor_id = base
-            while actor_id in ids:
-                number += 1
-                actor_id = f"{base}-{number}"
-            actor.update(subagent_id=actor_id, route={"kind": "api_model", "target_id": routed_model,
-                                                     "credential_profile_id": pin})
-            roster["items"].append(actor)
-            row["subagent_id"] = actor_id
-        else:
-            actor["route"] = {"kind": "api_model", "target_id": routed_model, "credential_profile_id": pin}
-        actor.pop("access", None)  # Native/API rows have no session access profile.
-        result["OUROBOROS_SUBAGENTS"] = normalize_configured_subagents(roster)[1]
-    if slots is not None:
-        result["OUROBOROS_REVIEWER_SLOTS"] = json.dumps(slots, ensure_ascii=False)
-        reviewer_slot_save_check(result["OUROBOROS_REVIEWER_SLOTS"], subagents_raw=result.get("OUROBOROS_SUBAGENTS"))
+            from ouroboros.reviewer_slot_config import review_pool_rows
+
+            handles = ", ".join(row.slot_id for row in review_pool_rows(result)) or "empty"
+            raise ValueError(f"The selected reviewer no longer exists (the review pool is: {handles})")
+        raise ValueError("The selected task agent no longer exists")
+    if family == "subagent" and (actor.get("route") or {}).get("kind") == "agent_session":
+        raise ValueError("This supervisor inherited cognition; switch for this task only, or select an API-model supervisor row to persist its model.")
+    actor["route"] = {"kind": "api_model", "target_id": routed_model, "credential_profile_id": pin}
+    actor.pop("access", None)  # Native/API rows have no session access profile.
+    result["OUROBOROS_SUBAGENTS"] = normalize_configured_subagents(roster)[1]
     return result
 
 
@@ -319,6 +359,12 @@ def get_light_model() -> str:
     return str(runtime_setting("OUROBOROS_MODEL_LIGHT", "") or "").strip() or _main_model()
 
 
+def get_safety_model() -> str:
+    """Safety Supervisor inherits Light, including its local route, then Main."""
+    return (str(runtime_setting("OUROBOROS_MODEL_SAFETY", "") or "").strip()
+            or slot_lane_label("light", get_light_model()))
+
+
 def get_heavy_model() -> str:
     """Return the heavy (strong acting/coding) lane slot; empty falls back to
     OUROBOROS_MODEL. Renamed from the legacy code slot."""
@@ -330,6 +376,29 @@ def get_vision_model() -> str:
     return str(runtime_setting("OUROBOROS_MODEL_VISION", "") or "").strip() or _main_model()
 
 
+_SLOT_LOCAL_FLAGS = {"main": "USE_LOCAL_MAIN", "light": "USE_LOCAL_LIGHT", "fallback": "USE_LOCAL_FALLBACK"}
+
+
+def local_lane_label(model: object, use_local: bool) -> str:
+    """``model`` labelled ``" (local)"`` when it runs on our local lane (``provider_for_model`` reads the label)."""
+    text = str(model or "").strip()
+    return f"{text} (local)" if text and use_local and not text.endswith(" (local)") else text
+
+
+def slot_lane_label(role: str, model: object) -> str:
+    """A configured slot's model as it routes: labelled local when that slot runs on our local lane.
+
+    The local flag is a separate setting, so a bare id alone does not say which lane
+    carries it. An empty vision or light slot inherits Main and Main's flag; a vision
+    slot set to a local model is stored with its label already.
+    """
+    inherits = {"vision": "OUROBOROS_MODEL_VISION", "light": "OUROBOROS_MODEL_LIGHT"}.get(role, "")
+    if inherits and not str(runtime_setting(inherits, "") or "").strip():
+        role = "main"
+    flag = str(runtime_setting(_SLOT_LOCAL_FLAGS.get(role, ""), "") or "") if role in _SLOT_LOCAL_FLAGS else ""
+    return local_lane_label(model, flag.strip().lower() in {"1", "true", "yes", "on"})
+
+
 def get_image_input_mode() -> str:
     raw = str(runtime_setting("OUROBOROS_IMAGE_INPUT_MODE", SETTINGS_DEFAULTS["OUROBOROS_IMAGE_INPUT_MODE"]) or "").strip().lower()
     return raw if raw in {"auto", "caption", "inline", "off"} else "auto"
@@ -339,14 +408,13 @@ def parse_fallback_chain() -> list[str]:
     """Parse the raw ordered cross-model fallback chain — SSOT for every consumer
     (resilience walk, pricing categorization, credentialed-model resolution).
 
-    Reads OUROBOROS_MODEL_FALLBACKS, then the legacy singular OUROBOROS_MODEL_FALLBACK
-    (env-only back-compat). No dedup, no active-model drop, and NO SETTINGS_DEFAULTS
-    injection: an EXPLICITLY empty Fallbacks slot means "no cross-model fallback". The
-    shipped default reaches a default install through apply_settings_to_env."""
-    raw = (
-        str(runtime_setting("OUROBOROS_MODEL_FALLBACKS", "") or "").strip()
-        or str(runtime_setting("OUROBOROS_MODEL_FALLBACK", "") or "").strip()
-    )
+    Reads OUROBOROS_MODEL_FALLBACKS as the settings document reads now (``route_choice``): a saved
+    blank is "no cross-model fallback" and an unauthored slot its proposal. Only a process with no
+    document, where the key is absent (never projected), reads the legacy singular
+    OUROBOROS_MODEL_FALLBACK (env-only back-compat, never a settings value). No dedup, no active-model
+    drop, and NO SETTINGS_DEFAULTS injection."""
+    modern = runtime_setting("OUROBOROS_MODEL_FALLBACKS")
+    raw = str((runtime_setting("OUROBOROS_MODEL_FALLBACK", "") if modern is None else modern) or "").strip()
     return [m.strip() for m in _parse_model_list(raw) if str(m or "").strip()]
 
 
@@ -392,9 +460,3 @@ def migrate_legacy_slot_keys(settings: dict) -> dict:
 def get_consciousness_model() -> str:
     """Return the high-horizon background-consciousness model slot."""
     return str(runtime_setting("OUROBOROS_MODEL_CONSCIOUSNESS", "") or "").strip() or _main_model()
-
-
-def get_deep_self_review_model() -> str:
-    """Return the configured deep self-review model slot."""
-    return (str(runtime_setting("OUROBOROS_MODEL_DEEP_SELF_REVIEW", "") or "").strip()
-            or str(SETTINGS_DEFAULTS["OUROBOROS_MODEL_DEEP_SELF_REVIEW"]))

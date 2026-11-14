@@ -9,37 +9,36 @@ shipped default with one loud log line. It is a string on purpose:
 default would silently swallow ``"unlimited"``. ``review_max_cycles()`` returns
 ``Optional[int]`` — ``None`` means unlimited.
 
-Per-gate meaning of the ONE number — on every gate it counts PAID cycles, and
-identical material is never re-reviewed for pay:
+Per-gate meaning of the ONE number — on every gate it counts PAID cycles; a
+usable verdict on identical material is never re-reviewed for pay unless the
+mind sends it with answers, while an explicit identical request after a settled
+wave formed no verdict is a new paid wave (running or unknown work is collected,
+never sent again):
 
-* plan review — paid reviewer-panel cycles per task (the engine consumes the
-  getter; this module only exposes it);
-* task acceptance — paid panel runs per task. The last paid result still
-  permits an author response; only an explicit task-local improvement-pass
-  limit bounds author work, independently of this paid ceiling;
-* commit gate — paid triad+scope cycles per ROOT task (the whole task tree
+* plan asks are OUTSIDE this cap (owner batch 2, Q3=A): the planning organ
+  (``tools/plan_ask``) dispatches an ask whenever the mind asks, and only its
+  budget gate and deadline bound it; nothing here counts plan asks;
+* result review (``review_change(subject="result")``) — paid result waves per
+  ROOT task, counted apart from the task's change-review waves (its own
+  ``tool_name`` on the attempt rows), so change reviews never spend it;
+* commit gate — paid review-wave cycles per ROOT task (the whole task tree
   shares one ceiling; a manual session is its own task; a follow-up task is a
   fresh root). The paid fact is recorded on the attempt row AT DISPATCH and
   the count is derived from the attempt ledger; the ceiling counts MONEY —
   every dispatched wave counts whatever its terminal, and only UNDISPATCHED
   attempts (free refusals/replays, preflight and assembly failures) stay
   outside the count, which is also the only sense in which "infra retries
-  freely" applies to the ceiling. Independently of the number, a
-  byte-identical staged diff whose last terminal is a review-VERDICT block is
-  refused for FREE from the FIRST block (``identical_diff_refused``, quoting
-  the recorded verdict); a rebuttal is content-hashed and a hash new to the
-  streak buys exactly ONE paid re-review (a rebuttal is "spent" only when it
-  bought a dispatched, verdict-answered wave). Exhaustion under blocking is a
-  free typed refusal; under advisory the outcome returns with a typed
-  disclosure for explicit author continuation, without another paid dispatch;
-* skill review — paid reviewer-panel dispatches per ceiling key (the root task
-  for task-driven review groups — shared across every skill that task reviews,
-  follow-ups start fresh — or, for the manual lane, the CURRENT content
-  snapshot: revised content restarts the manual count; a chunked oversized
-  wave is ONE cycle, not one per pack). A byte-identical skill snapshot with a
-  recorded substantive verdict under the same panel contract replays free
-  (``skill_review_cycles.py``) when the persisted review state still covers
-  it; exhaustion is the same typed event with ``surface="skill_review"``.
+  freely" applies to the ceiling. A rebuttal is content-hashed into the
+  round's identity, so a new one buys a new paid wave within the ceiling.
+  Exhaustion returns the outcome with a typed disclosure for explicit author
+  continuation, without another paid dispatch;
+* skill review (``skill_review`` → ``review_change(subject="skill")``) — paid skill waves per
+  root task for a task-driven review (shared across every skill that task reviews; a
+  follow-up starts fresh), counted apart from the task's change and result waves (its own
+  ``tool_name`` on the attempt rows); the manual lane (the Skills page, a Hub install) has
+  no task, so its ceiling is per CONTENT VERSION of the skill (owner Q23). A byte-identical
+  skill under the same rules and panel reuses its settled verdict at $0 (the ledger's reuse
+  key); exhaustion is the same typed event with ``surface="review_skill"``.
 
 Values are read from ``os.environ`` (``config.apply_settings_to_env`` projects
 saved settings there) falling back to ``SETTINGS_DEFAULTS`` — no second
@@ -60,31 +59,18 @@ from typing import Any, Optional
 
 from ouroboros.config import SETTINGS_DEFAULTS
 # The ONE typed reason/event name for "the shared cap is spent under blocking
-# enforcement" (owner D10/D27) — SSOT beside the acceptance-decision vocabulary.
+# enforcement" (owner D10/D27) — SSOT beside the other outcome reasons.
 from ouroboros.outcomes import REASON_REVIEW_CYCLES_EXHAUSTED  # noqa: F401 — re-export
 from ouroboros.utils import append_jsonl, emit_log_event, utc_now_iso
 from ouroboros.config import runtime_setting
+# The canonical "no cap" token (the UI's ∞ saves it), its aliases and the strict parser are the
+# ONE optional-bound vocabulary in ``settings_scales``, shared with the task round/lifetime limits.
+from ouroboros.settings_scales import UNLIMITED, parse_positive_or_unlimited
 
 log = logging.getLogger(__name__)
 
 REVIEW_MAX_CYCLES_KEY = "OUROBOROS_REVIEW_MAX_CYCLES"
-# Deprecated alias (task acceptance only). Kept as a settings key so an explicit
-# owner customization keeps binding; removal is a separate owner decision.
-ACCEPTANCE_PASSES_LEGACY_KEY = "OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES"
-# Canonical persisted token for "no cap"; the UI's ∞ choice saves this string.
-UNLIMITED = "unlimited"
-# "none" is deliberately NOT an alias: it reads as "no cycles" as easily as "no cap".
-UNLIMITED_ALIASES = frozenset({UNLIMITED, "inf", "∞"})
-# Legacy passes clamp, unchanged from the former config.py getter.
-
 _WARNED: set = set()
-
-
-def _warn_once(tag: str, message: str) -> None:
-    if tag in _WARNED:
-        return
-    _WARNED.add(tag)
-    log.warning(message)
 
 
 def parse_review_max_cycles(raw: Any) -> Optional[int]:
@@ -92,15 +78,7 @@ def parse_review_max_cycles(raw: Any) -> Optional[int]:
 
     Raises ``ValueError`` for anything else (empty, zero, negative, non-integer,
     unknown word) so callers decide between fail-closed default and 400."""
-    text = str(raw if raw is not None else "").strip().lower()
-    if text in UNLIMITED_ALIASES:
-        return None
-    if not text:
-        raise ValueError("empty review-cycle cap")
-    value = int(text)  # ValueError on non-integer text (incl. "true"/"1.5")
-    if value < 1:
-        raise ValueError(f"review-cycle cap must be a positive integer, got {value}")
-    return value
+    return parse_positive_or_unlimited(raw)
 
 
 def is_valid_review_max_cycles(raw: Any) -> bool:
@@ -136,11 +114,12 @@ def review_max_cycles() -> Optional[int]:
     try:
         return parse_review_max_cycles(raw)
     except (TypeError, ValueError):
-        _warn_once(
-            f"invalid:{raw!r}",
-            f"{REVIEW_MAX_CYCLES_KEY}={raw!r} is not a positive integer or "
-            f"'unlimited'; using the shipped default {default_text} (bounded).",
-        )
+        if f"invalid:{raw!r}" not in _WARNED:
+            _WARNED.add(f"invalid:{raw!r}")
+            log.warning(
+                f"{REVIEW_MAX_CYCLES_KEY}={raw!r} is not a positive integer or "
+                f"'unlimited'; using the shipped default {default_text} (bounded).",
+            )
         return default_review_max_cycles()
 
 
@@ -151,15 +130,6 @@ def review_max_cycles_source() -> str:
     else ``shipped_default``. Provenance only — never a second parse."""
     return "owner_setting" if runtime_setting(REVIEW_MAX_CYCLES_KEY, "") else "shipped_default"
 
-
-def get_acceptance_max_improvement_passes() -> Optional[int]:
-    """The paid review ceiling never limits ordinary author response work.
-
-    The deprecated ``OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES`` no longer binds at runtime:
-    a customized value is MIGRATED into the shared knob when settings load (``config``), the
-    same rename-alias shape the retention keys use. Disclosed residual: a legacy value supplied
-    only through the environment (never saved) is not migrated and no longer binds."""
-    return None
 
 def emit_review_cycles_exhausted(
     event_queue: Any, drive_root: Any, *, surface: str, task_id: str,

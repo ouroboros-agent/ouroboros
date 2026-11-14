@@ -9,7 +9,6 @@ and the disclosures (delegated runs, scoped homes) a cancelled result must carry
 from __future__ import annotations
 import json
 import types
-import pytest
 from ouroboros import cancel_intents as ci, delegate_custody as dc
 from ouroboros.task_results import (
     STATUS_CANCELLED,
@@ -25,6 +24,7 @@ from tests._cancel_intents_shared import (  # noqa: F401  (autouse fixture appli
 )
 
 from tests._cancel_intents_shared import qenv as _qenv
+from tests._shared import write_queue_document
 
 # The fixture is requested by name as a test parameter, so it is re-bound through a
 # module attribute: a direct import of a name that reappears as a parameter is an F811
@@ -44,10 +44,7 @@ def test_cancel_tool_reports_a_settled_task_instead_of_requesting(tmp_path, monk
     write_task_result(tmp_path, "settled-child", STATUS_COMPLETED, result="done")
     snap = tmp_path / "state" / "queue_snapshot.json"
     snap.parent.mkdir(parents=True, exist_ok=True)
-    snap.write_text(
-        json.dumps({"ts": utc_now_iso(), "running": [], "pending": []}),
-        encoding="utf-8",
-    )
+    write_queue_document(snap, {"ts": utc_now_iso(), "running": [], "pending": []})
     ctx = types.SimpleNamespace(
         task_depth=0, pending_events=[], event_queue=_CaptureQueue(),
         drive_root=tmp_path, task_id="parent1",
@@ -83,7 +80,6 @@ def test_finalize_on_miss_promotes_a_child_result_before_cancelling(qenv):
     assert stored["status"] == STATUS_COMPLETED
     assert stored["result"] == "the child's finished answer"
 
-@pytest.mark.serial
 def test_cancel_of_a_task_with_no_durable_result_never_fabricates_completed(qenv, monkeypatch):
     """A-F5, PROVEN class: killed inside the spawn→RUNNING-write window.
 
@@ -140,7 +136,7 @@ def test_cascade_over_a_settled_root_with_live_children_still_delivers(qenv, mon
     ]
     write_task_result(qenv.drive, "kid1", "scheduled")
 
-    assert qenv.tl.cancel_task_by_id("root-dead", cascade=True) is True
+    assert qenv.tl.cancel_task_by_id("root-dead") is True
 
     assert delivered, "a settled root with live children must still report to chat"
     (row,) = delivered
@@ -160,7 +156,7 @@ def test_cascade_mints_child_intents_and_records_scope(qenv, monkeypatch):
     ]
     ci.request_cancel(qenv.drive, "c-root", reason="stop the tree")
 
-    assert qenv.tl.cancel_task_by_id("c-root", cascade=True) is False  # custody refused
+    assert qenv.tl.cancel_task_by_id("c-root") is False  # custody refused
 
     intents = ci.active_intents(qenv.drive)
     assert "c-kid" in intents, "every captured descendant carries its own intent"
@@ -185,9 +181,8 @@ def test_watchdog_replays_a_cascade_intent_as_a_cascade(qenv, monkeypatch):
 
     qenv.tl.sweep_cancel_intents(now=1_000_000.0)
 
-    assert calls == [("casc-root", {"cascade": True})]
+    assert calls == [("casc-root", {})]
 
-@pytest.mark.serial
 def test_unreconciled_delegated_runs_are_disclosed_on_the_cancelled_result(
     qenv, monkeypatch,
 ):
@@ -338,7 +333,7 @@ def test_cascade_descendant_intent_failure_is_surfaced_not_silent(qenv, monkeypa
     ]
     real_request(qenv.drive, "d-root", reason="stop the tree")
 
-    assert qenv.tl.cancel_task_by_id("d-root", cascade=True) is True
+    assert qenv.tl.cancel_task_by_id("d-root") is True
     assert "d-kid" in calls, "custody still runs on the child this sweep"
     trail = (qenv.drive / "logs" / "supervisor.jsonl").read_text(encoding="utf-8")
     assert "cascade_descendant_intent_write_failed" in trail
@@ -368,7 +363,7 @@ def test_cascade_over_settled_root_keeps_the_intent_until_the_postcondition(qenv
         qenv.q, "cancel_task_custody",
         lambda tid, **kw: qenv.q.CANCEL_FAILED if tid == "sr1-kid" else real_custody(tid, **kw),
     )
-    assert qenv.tl.cancel_task_by_id("sr1", cascade=True) is False
+    assert qenv.tl.cancel_task_by_id("sr1") is False
     row = ci.active_intent(qenv.drive, "sr1")
     assert row is not None and row["scope"] == ci.SCOPE_CASCADE, (
         "the durable cascade intent must survive a failed sweep — it is the "
@@ -377,7 +372,7 @@ def test_cascade_over_settled_root_keeps_the_intent_until_the_postcondition(qenv
 
     # The watchdog replay converges: custody works now, postcondition settles it.
     monkeypatch.setattr(qenv.q, "cancel_task_custody", real_custody)
-    assert qenv.tl.cancel_task_by_id("sr1", cascade=True) is True
+    assert qenv.tl.cancel_task_by_id("sr1") is True
     assert ci.active_intent(qenv.drive, "sr1") is None
     assert load_task_result(qenv.drive, "sr1-kid")["status"] == STATUS_CANCELLED
     assert delivered, "the tree's summary still reaches chat"
@@ -411,7 +406,6 @@ def test_reconcile_discloses_open_runs_even_when_outcomes_are_nonempty(qenv, mon
     assert qenv.tl._reconcile_delegated_runs_on_kill(qenv.q, "rt1") == ["run-open"]
 
 
-@pytest.mark.serial
 def test_kill_path_clean_audit_clears_a_stale_unreconciled_list(qenv, monkeypatch):
     """D1b + R2: the running-kill terminal write carries the fresh audit
     UNCONDITIONALLY, so a clean audit clears a stale non-empty list left by an

@@ -2,20 +2,23 @@
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import logging
 import math
+import os
 import pathlib
 import queue as _stdqueue  # noqa: F401 — re-exported for the test suite's reap-queue isolation
-import threading
 import time  # noqa: F401 -- facade name tests read (queue.time)
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
+from supervisor.loop_load import MeasuredRLock
 from supervisor.state import (
     load_state,
     append_jsonl,  # noqa: F401 -- queue_snapshot leaf reads it via the _queue() handle
     atomic_write_text,  # noqa: F401 -- queue_snapshot leaf reads it via the _queue() handle
-    budget_remaining, EVOLUTION_BUDGET_RESERVE,
+    budget_remaining,
     reconstruct_task_cost as reconstruct_task_cost,
 )
 from supervisor.message_bus import (
@@ -27,14 +30,12 @@ from ouroboros.config import (
     DATA_DIR,
     FINALIZATION_GRACE_DEFAULT_SEC,
     get_finalization_grace_sec,
-    get_per_call_timeout_ceiling_sec,  # noqa: F401 -- queue_timeouts leaf reads it via the _queue() handle
     get_task_abs_ceiling_sec,  # noqa: F401 -- queue_timeouts leaf reads it via the _queue() handle
     get_task_idle_timeout_sec,  # noqa: F401 -- queue_timeouts leaf reads it via the _queue() handle
 )
 from ouroboros.consciousness_authority import apply_consciousness_authority, is_consciousness_origin
 from ouroboros.contracts.task_contract import attach_task_contract, build_task_contract, normalize_allowed_resources  # noqa: F401
 from ouroboros.schedule_contract import RESERVED_TEMPLATE_FIELDS, schedule_slug  # noqa: F401
-from ouroboros.skill_loader import skill_identity_collision_names  # noqa: F401
 from ouroboros.outcomes import terminal_outcome_axes
 from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso  # noqa: F401
 from supervisor.evolution_lifecycle import (  # noqa: F401 -- public queue API and lazy scheduler dependencies
@@ -68,33 +69,63 @@ HEARTBEAT_STALE_SEC: int = 120
 QUEUE_MAX_RETRIES: int = 1
 FINALIZATION_GRACE_SEC: int = FINALIZATION_GRACE_DEFAULT_SEC
 SCHEDULED_TASKS_FILE = pathlib.Path("state") / "scheduled_tasks.json"
-# BUG3: pause a campaign whose objective fails to absorb after this many reviewed cycles.
-# Mirrors the consecutive-failures threshold; keyed on the objective fingerprint, not failures.
-OBJECTIVE_REPEAT_CAP: int = 3
+
+
+# Whether THIS process owns the supervisor's live maps (``init`` ran): a process that merely
+# imports the module sees empty maps, which prove nothing (``task_settlement_liveness``).
+# OWNER_PID names that process: a child forked after ``init`` inherits INITIALIZED, not the pid.
+INITIALIZED = False
+OWNER_PID: Optional[int] = None
+QUEUE_PUBLICATION = None  # (path, encoded documents, snapshot generation, generation per document) of the last successful publication.
+
+
+def owns_live_queue(drive_root: Any) -> bool:
+    """Whether THIS process holds the live queue of ``drive_root``: a process fact, never an
+    actor's flag. A worker never does (its maps are empty or a forked copy), so it asks over the
+    bus, where only the current RUNNING attempt may open a fence (#1183)."""
+    from ouroboros.utils import in_worker_process
+
+    if in_worker_process() or not INITIALIZED or OWNER_PID != os.getpid():
+        return False  # a worker, never initialized here, or a child forked with a copy of the maps
+    try:
+        return pathlib.Path(DRIVE_ROOT).resolve() == pathlib.Path(drive_root).resolve()
+    except (OSError, TypeError, ValueError):
+        return False
 
 
 def init(drive_root: pathlib.Path) -> None:
-    global DRIVE_ROOT, FINALIZATION_GRACE_SEC, QUEUE_SNAPSHOT_PATH
+    global DRIVE_ROOT, FINALIZATION_GRACE_SEC, INITIALIZED, OWNER_PID, QUEUE_SNAPSHOT_PATH, QUEUE_PUBLICATION
+    from supervisor.queue_publication import reset as reset_publication
+
+    QUEUE_PUBLICATION = None
+    reset_publication()  # nothing marked or published by this generation, no tick publisher yet
     DRIVE_ROOT = drive_root
+    INITIALIZED, OWNER_PID = True, os.getpid()
     QUEUE_SNAPSHOT_PATH = drive_root / "state" / "queue_snapshot.json"
     FINALIZATION_GRACE_SEC = get_finalization_grace_sec()
     BUDGET_ROOT_FENCES.clear()
-    # A previous process's direct-chat turns must not outlive it in the roster.
-    from supervisor.direct_roots import clear_direct_roots
+    # A previous process's direct-chat turns must not outlive it in the roster,
+    # and this clear is the last moment their ids exist: the roster is taken over
+    # here and handed to snapshot restore below, which fences them like any other
+    # row the stop caught. Durable direct rows of an ENDED server process that the
+    # roster never listed (a crash before its tick rewrote the fragment) join the
+    # same handover, so no direct result outlives the process that ran it.
+    from supervisor.direct_roots import adopt_orphaned_direct_results, take_direct_roots
 
-    clear_direct_roots(drive_root)
+    PRIOR_DIRECT_ROOTS.clear()
+    PRIOR_DIRECT_ROOTS.update(adopt_orphaned_direct_results(drive_root, take_direct_roots(drive_root)))
 
 
 def refresh_timeouts_from_settings(settings: dict) -> None:
-    """Hot-reload the active liveness settings.
-
-    The flat wall-clock pair this once also had to absorb (soft/hard) is retired
-    in 7.0: load_settings strips the keys, so there is no stored value left to
-    accept, warn about, or lie about honoring.
-    """
+    """Hot-reload the active liveness settings."""
     global FINALIZATION_GRACE_SEC
     FINALIZATION_GRACE_SEC = get_finalization_grace_sec(settings)
 
+
+# The previous process's direct-chat roots, taken from `state/direct_roots.json`
+# by init above and consumed once by snapshot restore. A process-local handover
+# of the SAME fragment, never a second store.
+PRIOR_DIRECT_ROOTS: Dict[str, Any] = {}
 
 # Set by workers.init_queue_refs().
 PENDING: List[Dict[str, Any]] = []
@@ -102,11 +133,34 @@ RUNNING: Dict[str, Dict[str, Any]] = {}
 QUEUE_SEQ_COUNTER_REF: Dict[str, int] = {"value": 0}
 ACCEPTANCE_FENCES: Dict[str, Dict[str, Any]] = {}
 ADMISSION_RESERVATIONS: Dict[str, str] = {}
+# This generation's returning stop (planned or owner Restart) that copied PENDING for its
+# returns, under Q (``name_queue_returns``). The off-loop schedule duty reads it under Q
+# before its final enqueue: an admission after that copy would boot held for Resume.
+# Those doors always exit; the next generation's ``init_queue_refs`` starts open.
+RETURNS_NAMED: Dict[str, str] = {}
 
-# Guards PENDING/RUNNING mutations across main loop, direct chat, watchdog.
-_queue_lock = threading.RLock()
+# Guards PENDING/RUNNING mutations across main loop, direct chat, watchdog. An RLock that
+# times its outermost waits and holds for the per-minute supervisor_load row.
+_queue_lock = MeasuredRLock()
+
+
+def name_queue_returns(pending: List[Dict[str, Any]], door: str) -> List[Dict[str, Any]]:
+    """Close automatic admission, then copy the queue a returning stop names (one Q step)."""
+    with _queue_lock:
+        RETURNS_NAMED["door"] = door
+        return list(pending or [])
+
+
+def reopen_queue_returns(door: str) -> None:
+    """That door's stop raised before its exit: this generation goes on admitting, its admission lane too."""
+    from supervisor.workspace_preparation import resume_admission
+
+    with _queue_lock:
+        if RETURNS_NAMED.get("door") == door:
+            RETURNS_NAMED.clear()
+    resume_admission()
 from supervisor.task_admission import (  # noqa: E402,F401 - public queue API
-    coerce_queue_order, prefer_terminalization_retry_rows, record_scheduled_admission,
+    coerce_queue_order, enqueue_with_admission_receipt, prefer_terminalization_retry_rows,
     reject_invalid_task_depth, release_task_admission, restore_invalid_depth_admission,
     restore_terminalization_retry, restore_terminalization_retry_rows,
     reserve_task_admission,
@@ -130,6 +184,7 @@ def init_queue_refs(pending: List[Dict[str, Any]], running: Dict[str, Dict[str, 
     RUNNING = running
     QUEUE_SEQ_COUNTER_REF = seq_counter_ref
     ADMISSION_RESERVATIONS.clear()
+    RETURNS_NAMED.clear()
 
 
 def _task_priority(task_type: str) -> int:
@@ -161,28 +216,131 @@ def drain_all_pending(*, persist: bool = True) -> list:
     return drained
 
 
+# A root's billing a caller resolved before taking ``_queue_lock``: (task id, binding).
+_PREPARED_ROOT_BILLING: contextvars.ContextVar = contextvars.ContextVar("prepared_root_billing", default=None)
+
+
+def prepare_root_billing(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The whole-work binding of a ROOT about to be admitted, resolved OFF the queue lock.
+
+    The lookup may read the money ledger (its own cross-process lock; in a cold
+    process a full parse), so a caller that holds ``_queue_lock`` for its own
+    admission transaction resolves this first, inside ``prepared_root_billing``.
+    ``None`` for a child: nothing to resolve.
+    """
+    root_id = str(task.get("id") or "").strip()
+    if not root_id or str(task.get("root_task_id") or root_id) != root_id:
+        return None
+    from ouroboros.config import runtime_setting
+    from ouroboros.usage_admission import task_billing_fields
+
+    from ouroboros.usage_ledger import BillingAuthorityUnavailable
+
+    limit = float(runtime_setting("OUROBOROS_PER_TASK_COST_USD", "0") or 0)
+    try:
+        return task_billing_fields(task, root_id, limit if limit > 0 else None,
+                                   task.get("budget_drive_root") or DRIVE_ROOT, pin_initial=True,
+                                   persist_initial=False)
+    except BillingAuthorityUnavailable as exc:
+        return {"billing_authority_unavailable": exc.kind}  # admission blocks typed, never a group
+
+
+_UNRESOLVED = object()
+
+
+def _reads_subagents_settings(task: Dict[str, Any]) -> bool:
+    """A root without an explicit subagents mode reads the settings for its subagent policy."""
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    return not (task.get("parent_task_id") or metadata.get("parent_task_id")) and "subagents_mode" not in metadata
+
+
+@contextlib.contextmanager
+def prepared_root_billing(task: Dict[str, Any], *, resolved: Any = _UNRESOLVED):
+    """Resolve what a root's admission reads BEFORE the caller takes ``_queue_lock``: its billing (the money
+    ledger) and the settings its subagent policy needs. ``enqueue_task`` inside the block uses these instead of
+    reading under the caller's hold (Q spans memory only); the call shape ``enqueue_task(task, ...)`` stays the
+    same. ``resolved``: a ``prepare_root_billing`` result read before Q. The consciousness allowance window is
+    the producer's own off-lock read, passed to ``enqueue_task`` explicitly.
+    """
+    from ouroboros.config import load_settings
+
+    billing = prepare_root_billing(task) if resolved is _UNRESOLVED else resolved
+    prepared = {"billing": billing, "settings": load_settings() if _reads_subagents_settings(task) else None}
+    token = _PREPARED_ROOT_BILLING.set((str(task.get("id") or "").strip(), prepared))
+    try:
+        yield
+    finally:
+        _PREPARED_ROOT_BILLING.reset(token)
+
+
 def enqueue_task(
     task: Dict[str, Any], front: bool = False, *, restoring_snapshot: bool = False,
+    consciousness_window: Optional[Dict[str, Any]] = None, continuation: bool = False,
+    project_admission: Optional[Dict[str, Any]] = None, durable: bool = False,
 ) -> Dict[str, Any]:
     """Add task to PENDING (thread-safe: HTTP handlers enqueue concurrently
-    with the supervisor main loop, so the mutation must hold the queue lock)."""
+    with the supervisor main loop, so the mutation must hold the queue lock).
+
+    A root's whole-work binding is resolved OFF the queue lock: here before the
+    lock is taken, or earlier by a caller that holds the lock for its own
+    admission transaction (``prepared_root_billing``).
+
+    ``consciousness_window``: an allowance the caller already read OFF the queue lock
+    (the scheduler). ``continuation``: host-derived only (a follow-up row's own
+    ``continuation_of``) — a named continuation is not a spontaneous start, so it is
+    outside the consciousness concurrency cap; money (the allowance) still applies."""
     t = dict(task)
+    from ouroboros.consciousness_authority import work_kind
+    from ouroboros.server_restart import agent_restart_pending
+    from ouroboros.route_choice import capture_lead
+    metadata = t.get("metadata") if isinstance(t.get("metadata"), dict) else {}
+    metadata["work_kind"] = work_kind({"origin_message_ref": t.get("origin_message_ref"), **metadata})
+    t["metadata"] = metadata
+    if not restoring_snapshot:
+        t.pop("_project_scope_none", None)  # A caller's mark proves nothing: this admission attests absence anew.
+        t.pop("_consciousness_continuation", None)  # never a caller-supplied marker
+        if continuation:
+            t["_consciousness_continuation"] = True
+    prepared = _PREPARED_ROOT_BILLING.get()  # a caller holding Q read these off the lock (``prepared_root_billing``)
+    prepared = prepared[1] if prepared is not None and prepared[0] == str(t.get("id") or "").strip() else None
+    subagents_settings = None
+    if not restoring_snapshot and _reads_subagents_settings(t):
+        from ouroboros.config import load_settings
+        subagents_settings = prepared["settings"] if prepared is not None and prepared["settings"] else load_settings()
     attach_task_contract(apply_consciousness_authority(t))
+    from ouroboros.tool_access_roots import freeze_tool_profile
+    freeze_tool_profile(t)
     # The allowance read takes the cross-process ledger lock: read it BEFORE the queue
     # lock so a contended ledger never stalls every queue reader; only the live-root
     # count and the append must be one transaction with the lock (the window gates
     # starts — a window stale by milliseconds changes nothing).
-    consciousness_window = None
-    if not restoring_snapshot and _consciousness_root(t):
-        from ouroboros.consciousness_allowance import allowance_window
-
-        consciousness_window = allowance_window(DRIVE_ROOT)
+    if consciousness_window is None and not restoring_snapshot:
+        consciousness_window = consciousness_admission_window(t)
+    # The whole-work binding of a root may read the money ledger too (its own
+    # cross-process lock; in a cold process a full parse): resolve it here, off
+    # the queue lock, and only attach it inside. A caller whose admission
+    # transaction already holds the lock resolved it earlier (``prepared_root_billing``).
+    if prepared is not None:
+        billing = prepared["billing"]
+    else:
+        billing = None if restoring_snapshot else prepare_root_billing(t)
+    project_id = str(t.get("project_id") or "").strip()
+    # The host preparation basis survives queue snapshots and retries. Legacy
+    # tasks lacking one are checked against current authority without claiming
+    # that their historical preparation generation is known.
+    has_project_admission = project_admission is not None or "_project_admission" in t
+    project_admission = t.get("_project_admission") if project_admission is None else project_admission
     with _queue_lock:
         require_unique_id = bool(t.pop("_require_unique_task_id", False))
         require_worker_pool = bool(t.pop("_require_worker_pool", False))
         admission_token = str(t.pop("_admission_token", "") or "")
         task_id = str(t.get("id") or "").strip()
         reserved_token = str(ADMISSION_RESERVATIONS.get(task_id) or "")
+        if agent_restart_pending() and RETURNS_NAMED and not restoring_snapshot:
+            if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
+                ADMISSION_RESERVATIONS.pop(task_id, None)
+            t["_admission_blocked"] = "restart_intake_closed"
+            return t
         if reserved_token and admission_token != reserved_token:
             # A reservation owns this id until its request either enqueues or releases it.
             # Tokenless internal callers and competing ingress must not consume/collide with it.
@@ -200,8 +358,12 @@ def enqueue_task(
                 t["_admission_blocked"] = "duplicate_task_id"
                 return t
             try:
+                from ouroboros.routing_wait import is_own_admission_stub
                 from ouroboros.task_results import load_task_result
-                if load_task_result(DRIVE_ROOT, task_id, strict=True):
+                stored = load_task_result(DRIVE_ROOT, task_id, strict=True)
+                # The emitted promote stub (#1160) belongs to THIS admission token:
+                # its own enqueue reads around it, any other row still owns the id.
+                if stored and not is_own_admission_stub(stored, admission_token):
                     if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
                         ADMISSION_RESERVATIONS.pop(task_id, None)
                     t["_admission_blocked"] = "duplicate_task_id"
@@ -239,27 +401,6 @@ def enqueue_task(
         if admission_token and reserved_token != admission_token:
             t["_admission_blocked"] = "admission_reservation_lost"
             return t
-        project_id = str(t.get("project_id") or "").strip()
-        if project_id:
-            try:
-                from ouroboros.projects_registry import get_reserved_project
-
-                project = get_reserved_project(DRIVE_ROOT, project_id)
-                lifecycle = str((project or {}).get("lifecycle") or "active")
-                if project is not None and lifecycle != "active":
-                    t["_admission_blocked"] = "project_routing_fence"
-                    t["_project_lifecycle"] = lifecycle
-                    t["_project_id"] = project_id
-                    if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
-                        ADMISSION_RESERVATIONS.pop(task_id, None)
-                    return t
-            except Exception:
-                log.warning("Project admission check failed for %s", project_id, exc_info=True)
-                t["_admission_blocked"] = "project_routing_fence_lookup_failed"
-                t["_project_id"] = project_id
-                if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
-                    ADMISSION_RESERVATIONS.pop(task_id, None)
-                return t
         root_id = str(t.get("root_task_id") or "").strip()
         if root_id and not restoring_snapshot and apply_budget_root_admission_fence(t, root_id):
             if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
@@ -273,41 +414,216 @@ def enqueue_task(
             if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
                 ADMISSION_RESERVATIONS.pop(task_id, None)
             return t
+        if billing is not None:
+            if billing.get("billing_authority_unavailable"):
+                t["_admission_blocked"] = "billing_authority_unavailable"
+                return t
+            t.setdefault("metadata", {})["billing_group"] = {k: v for k, v in billing.items()
+                                                             if k.startswith("billing_group_")}
         QUEUE_SEQ_COUNTER_REF["value"] += 1
         seq = QUEUE_SEQ_COUNTER_REF["value"]
         t["priority"] = coerce_queue_order(t.get("priority"), _task_priority(str(t.get("type") or "")))
         _att = t.get("_attempt")
         t.setdefault("_attempt", int(_att) if _att is not None else 1)
         t["_queue_seq"] = -seq if front else seq
-        t["queued_at"] = utc_now_iso()
+        if restoring_snapshot:  # restored work keeps its saved queue time; a lost one stays unknown (#1805)
+            t.setdefault("queued_at", None)
+        else:
+            t["queued_at"] = utc_now_iso()
         if admission_token:
             t["_admission_owner_token"] = admission_token
-        PENDING.append(t)
+        from contextlib import nullcontext
+        from supervisor.followup_policy import scheduled_start
+        from ouroboros.project_admission import host_unscoped
+        from ouroboros.projects_registry import (
+            ProjectAdmissionError, project_admission_guard, project_admission_view,
+            task_project_membership, validate_project_admission,
+        )
+
+        lookup = "project_routing_fence_lookup_failed"  # the authority whose read failed
+        try:
+            bindings_snapshot = None
+            if task_id not in RUNNING:
+                from ouroboros.project_placement import pending_placement, refresh_pending_placement
+
+                from ouroboros.projects_registry import _load_bindings
+
+                bindings_snapshot = _load_bindings(DRIVE_ROOT, strict=True)["bindings"]
+                binding = pending_placement(DRIVE_ROOT, t, bindings_snapshot=bindings_snapshot)
+                if binding:
+                    if not refresh_pending_placement(DRIVE_ROOT, t, binding=binding):
+                        raise ProjectAdmissionError(lookup, "The moved work could not be readmitted.")
+                    project_id, project_admission = t["project_id"], t["_project_admission"]
+                    has_project_admission = True
+            if has_project_admission:
+                validate_project_admission(project_admission)
+            if project_admission is None or project_admission["project"] is None:
+                unscoped = restoring_snapshot and host_unscoped(t)
+                project_id, known_room = task_project_membership(DRIVE_ROOT, t, bindings_snapshot=bindings_snapshot)
+                if project_id and unscoped:
+                    # Host-attested absence is the admitted scope: a later binding
+                    # never retargets it (hold release applies the same rule).
+                    raise ProjectAdmissionError("project_routing_fence_changed",
+                                                "The task's original unscoped assignment changed.")
+                if project_id:
+                    t["project_id"] = project_id
+                    if project_admission is None:
+                        project_admission = project_admission_view(
+                            DRIVE_ROOT, project_id, allow_unregistered=not known_room, frozen=True)
+                        project_admission["legacy_basis"] = True
+                    elif known_room:
+                        raise ProjectAdmissionError("project_routing_fence_changed", "The registered Project is missing.")
+            if project_admission is not None and project_admission["project_id"] != project_id:
+                raise ProjectAdmissionError("project_routing_fence_changed", "The prepared Project scope changed.")
+            # Preparation/allowance reads precede these short control locks.
+            # Restoring custody is not a new admission or permission to launch.
+            lookup = "followup_control_wait"
+            with (nullcontext(True) if restoring_snapshot else scheduled_start(DRIVE_ROOT, t)) as allowed:
+                lookup = "project_routing_fence_lookup_failed"
+                if not allowed:
+                    t["_admission_blocked"] = "followup_control_wait"
+                    return t
+                with (project_admission_guard(DRIVE_ROOT, project_admission) if project_id else nullcontext(None)) as project:
+                    if project_id:
+                        # Recovery keeps the resource actually admitted, without a
+                        # transient derived-selection census or current-folder substitution.
+                        t["_project_admission"] = {key: value for key, value in project_admission.items()
+                                                   if key != "workspace_claims"}
+                        t["_project_admission"]["frozen"] = True
+                    elif not restoring_snapshot and not has_project_admission:
+                        t["_project_scope_none"] = True
+                    if subagents_settings is not None:
+                        from ouroboros.settings_integrity import record_subagents_admission
+                        record_subagents_admission(t, DRIVE_ROOT, settings=subagents_settings, project=project)
+                    if not restoring_snapshot:
+                        capture_lead(t, DRIVE_ROOT, project=project, admitted=True)
+                    PENDING.append(t)
+        except (OSError, ValueError, TypeError, RuntimeError) as exc:
+            from supervisor.schedule_occurrence import contention
+
+            t.update(_admission_blocked=getattr(exc, "reason", lookup),
+                     _admission_detail=str(exc), _project_id=project_id,
+                     _project_lifecycle=getattr(exc, "lifecycle", ""),
+                     _admission_never_admitted=True,
+                     **({"_admission_contention": True} if contention(exc) else {}))
+            if admission_token and ADMISSION_RESERVATIONS.get(task_id) == admission_token:
+                ADMISSION_RESERVATIONS.pop(task_id, None)
+            return t
         sort_pending()
+        if not restoring_snapshot:
+            # A live fresh admission is positive host evidence. Retry/resume
+            # authority belongs to its existing owner; restore never backfills.
+            t["admitted_dispatch"] = "possible" if (
+                int(t.get("_attempt") or 1) > 1 or t.get("original_task_id")
+                or t.get("timeout_retry_from") or t.get("_owner_wait_resume")
+                or t.get("_budget_pause_resume")
+                or t.get("admitted_dispatch") == "possible"
+            ) else "none"
         if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
             ADMISSION_RESERVATIONS.pop(task_id, None)
+        durable_before_reply = not restoring_snapshot and (durable or agent_restart_pending())
+    if durable_before_reply:
+        # Durable before the reply, after this function's own hold (Q spans memory only). A failed barrier
+        # withdraws the row under Q again: no accepted reply, no dispatch; a partial publication boots held for Resume.
+        if publish_queue_snapshot(reason="agent_restart_admission") is not True:
+            with _queue_lock:
+                PENDING[:] = [row for row in PENDING if row is not t]
+            publish_queue_snapshot(reason="agent_restart_admission_unconfirmed")
+            return {**t, "_admission_blocked": "restart_admission_unconfirmed"}
     return t
 
 
-def live_consciousness_root_count() -> int:
-    """Live PENDING+RUNNING roots that consciousness started (its origin marker on the
-    task metadata; subagents are their root's business). Sibling of ``queue_has_task_type``."""
-    def _counts(task: Any) -> bool:
-        return (
-            isinstance(task, dict)
-            and str(task.get("delegation_role") or "root") == "root"
-            and is_consciousness_origin(task.get("metadata"))
-        )
+def ensure_control_task_result(task_id: str) -> Dict[str, Any]:
+    """Seed absent pooled lifecycle authority for a control, never from an ID alone.
 
-    live = sum(1 for task in PENDING if _counts(task))
-    return live + sum(
-        1 for meta in RUNNING.values() if isinstance(meta, dict) and _counts(meta.get("task"))
-    )
+    Queue membership owns the facts for every admission producer (review,
+    evolution, assisted update and restore included). Keep the lock through
+    create-only publication; a concurrent worker/terminal writer wins unchanged.
+    Billing and direct-chat operations never create lifecycle rows here.
+    """
+    from ouroboros.task_results import load_task_result, resolve_task_lineage, write_task_result
+
+    with _queue_lock:
+        meta = RUNNING.get(task_id)
+        task = meta.get("task") if isinstance(meta, dict) else None
+        status = "running" if isinstance(task, dict) else "scheduled"
+        if not isinstance(task, dict):
+            task = next((row for row in PENDING if row.get("id") == task_id), None)
+        if not isinstance(task, dict) or task.get("id") != task_id or task.get("_admission_blocked"):
+            raise ValueError("control requires an admitted pooled task")
+        root = pathlib.Path(task.get("budget_drive_root") or DRIVE_ROOT)
+        existing = load_task_result(root, task_id, strict=True)
+        if existing is not None:
+            return existing
+        fields = {key: task[key] for key in (
+            "type", "chat_id", "metadata", "task_contract", "root_task_id", "parent_task_id",
+            "delegation_role", "project_id", "workspace_root", "workspace_mode", "memory_mode",
+            "drive_root", "child_drive_root", "budget_drive_root", "queued_at", "admitted_dispatch", "_admission_owner_token",
+            "origin_message_text", "origin_message_ref", "objective", "title", "suggested_name",
+            "original_task_id", "timeout_retry_from", "deadline_at", "execution_timeout_sec", "root_cost_ceiling_usd",
+            "billing_group", "task_constraint", "objective_author", "owner_corpus", "task_group_id", "task_group",
+            "reasoning_effort",
+        ) if key in task}
+        fields["root_task_id"] = resolve_task_lineage(task_id, **{
+            key: task.get(key) for key in ("metadata", "root_task_id", "parent_task_id", "delegation_role",
+                                          "original_task_id", "timeout_retry_from")})["root_task_id"]
+        fields["description"] = task.get("description") or task.get("text") or ""
+        # The host attempt key the assignment mirror and the executor's start copy write:
+        # a split root's copyback authenticates its terminal time against it (terminal_time).
+        fields["task_attempt"] = int((meta.get("attempt") if status == "running" else 0) or task.get("_attempt") or 1)
+        if status == "running":
+            fields["started_at"] = meta.get("started_at")
+        return write_task_result(root, task_id, status, create_only=True, strict_existing_dict=True, **fields)
+
+
+def live_consciousness_root_count() -> int:
+    """Count exactly the independent autonomous roots shown to the mind."""
+    return len(live_consciousness_roots())
+
+
+def counts_as_consciousness_root(task: Dict[str, Any]) -> bool:
+    """A root consciousness itself started (its origin mark), still its own work.
+
+    Unknown provenance is checked at the consciousness level, but only work the
+    mind started takes one of its task slots and its allowance: an owner-commissioned
+    root (confirmed owner account) and unmarked system or owner work never do. Wakes,
+    children and technical continuations take no slot either.
+    """
+    from ouroboros.consciousness_authority import WORK_KIND_CONSCIOUSNESS, wake_cause, work_kind
+
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    return (is_consciousness_origin(metadata) and work_kind(metadata) == WORK_KIND_CONSCIOUSNESS
+            and str(task.get("delegation_role") or "root") == "root" and not task.get("parent_task_id")
+            and not wake_cause(metadata))
+
+
+def live_consciousness_roots() -> list[dict]:
+    """Live roots by provenance; wakes, children and technical continuations consume no slot."""
+    with _queue_lock:
+        tasks = [*PENDING, *(meta.get("task") or {} for meta in RUNNING.values())]
+        counted = {}
+        for task in tasks:
+            metadata = task.get("metadata") or {}
+            task_id = str(task.get("id") or "")
+            if not task_id or task.get("_consciousness_continuation") or not counts_as_consciousness_root(task):
+                continue
+            counted[task_id] = {"task_id": task_id, "title": str(task.get("title") or task.get("suggested_name") or task_id),
+                                "consciousness_cause": str(metadata.get("consciousness_cause") or "started"),
+                                "origin_wake_task_id": str(metadata.get("origin_wake_task_id") or "")}
+        return list(counted.values())
 
 
 def _consciousness_root(task: Dict[str, Any]) -> bool:
-    return (is_consciousness_origin(task.get("metadata"))
-            and str(task.get("delegation_role") or "root") == "root")
+    return counts_as_consciousness_root(task)
+
+
+def consciousness_admission_window(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The allowance a consciousness-started root's admission reads BEFORE Q; None otherwise."""
+    if not _consciousness_root(task):
+        return None
+    from ouroboros.consciousness_allowance import allowance_window
+
+    return allowance_window(DRIVE_ROOT)
 
 
 def _consciousness_admission_block(task: Dict[str, Any], window: Optional[Dict[str, Any]] = None) -> Optional[Tuple[str, str]]:
@@ -333,7 +649,7 @@ def _consciousness_admission_block(task: Dict[str, Any], window: Optional[Dict[s
 
     max_tasks = get_consciousness_max_tasks()
     live = live_consciousness_root_count()
-    if live >= max_tasks:
+    if live >= max_tasks and not task.get("_consciousness_continuation"):
         return ("consciousness_task_limit", (
             f"{live} of {max_tasks} consciousness-started tasks already live"
             if max_tasks else "OUROBOROS_CONSCIOUSNESS_MAX_TASKS=0: consciousness never starts tasks"
@@ -347,10 +663,14 @@ def _consciousness_admission_block(task: Dict[str, Any], window: Optional[Dict[s
         if not window["limit_usd"]:
             return ("consciousness_allowance_exhausted",
                     "OUROBOROS_CONSCIOUSNESS_DAILY_USD=0: consciousness may not spend")
-        at_least = " (at least)" if window["unknown_unmetered"] else ""
+        at_least = " (at least)" if window.get("unknown_unmetered") else ""
+        known = window.get("settled_usd")
+        from ouroboros.cost_projection import uncounted_money_text  # each uncounted part by its ledger name (P8)
+        holds = f" (plus {parts}, not counted)" if (parts := uncounted_money_text(window)) else ""
+        spent = "unknown" if known is None else f"${float(known):.2f}{at_least}"
         return ("consciousness_allowance_exhausted", (
-            f"${window['accounted_usd']:.2f}{at_least} of ${window['limit_usd']:.2f} "
-            f"spent in the last 24 h; resets at {window['resets_at'] or 'unknown'}"
+            f"{spent} of ${window['limit_usd']:.2f} "
+            f"known spend in the last 24 h{holds}; resets at {window['resets_at'] or 'unknown'}"
         ))
     return None
 
@@ -442,12 +762,9 @@ from supervisor.queue_transitions import (  # noqa: E402, F401 -- intentional pu
     evolution_stop_report,
     stop_evolution_tasks,
     sweep_orphaned_budget_fences,
+    task_settlement_interlock,
+    task_settlement_liveness,
 )
-
-
-def _cancel_task_by_id_single(task_id: str) -> bool:
-    """Boolean facade for the pre-v6.82 single-task callers."""
-    return cancel_task_custody(task_id) in {CANCEL_CANCELLED, CANCEL_ALREADY_SETTLED}
 
 
 # Evolution-stop transitions (GR2-13) live in supervisor.queue_transitions
@@ -456,7 +773,8 @@ def _cancel_task_by_id_single(task_id: str) -> bool:
 
 
 def queue_deep_self_review_task(reason: str, model: str = "", force: bool = False, chat_id: Optional[int] = None,
-                                origin: Optional[Dict[str, Any]] = None) -> Optional[str]:
+                                origin: Optional[Dict[str, Any]] = None, reviewer: str = "",
+                                client_message_id: str = "") -> Optional[str]:
     """Queue a deep self-review task.
 
     ``chat_id`` targets a specific chat (e.g. the external transport chat that ran
@@ -464,39 +782,68 @@ def queue_deep_self_review_task(reason: str, model: str = "", force: bool = Fals
     instead of always defaulting to the web owner's ``owner_chat_id``. ``origin`` is
     the requester's consciousness origin (a wake-up or its tree), stamped on the
     root so the admission door and the ledger see it; empty for the owner.
+    ``reviewer`` is the one enabled catalog row the requester named (id or handle,
+    pool member or not); empty runs the Main model (decision 3A). A name that is not
+    an enabled row is refused in the requester's chat before any worker is held.
+    ``client_message_id`` is the owner's ``/review`` submission these rows answer.
     """
+    from ouroboros.task_finalization import host_operation_reply_kwargs
+
+    answers = host_operation_reply_kwargs(None, "", client_message_id)
     # Membership, not truthiness: a review asked for from the hidden partition
     # is answered there, not silently re-routed to the owner's main chat.
     target_chat_id = notification_chat_route(chat_id, load_state().get("owner_chat_id"))
     if target_chat_id is None:
         return None
+    reviewer = str(reviewer or "").strip()
+    if reviewer:
+        from ouroboros.tools.review_change import ReviewChangeArgumentError, system_review_row
+
+        try:
+            system_review_row(reviewer)
+        except ReviewChangeArgumentError as exc:
+            send_with_budget(int(target_chat_id), f"Deep self-review could not be queued: {exc}.",
+                             **answers, role="system", system_type="deep_self_review_unavailable")
+            return None
     if (not force) and queue_has_task_type("deep_self_review"):
         return None
     tid = uuid.uuid4().hex[:8]
-    admitted = enqueue_task({
+    admitted = enqueue_with_admission_receipt({
         "id": tid,
         "type": "deep_self_review",
         "chat_id": int(target_chat_id),
         "text": reason or "Deep self-review",
         "model": model,
+        "reviewer": reviewer,
         "_require_worker_pool": True,
         **({"metadata": dict(origin)} if origin else {}),
     })
     if admitted.get("_admission_blocked"):
         reason = admitted.get("_worker_pool_disabled_reason") or admitted["_admission_blocked"]
         detail = str(admitted.get("_admission_detail") or "")
-        hint = f" {detail}." if detail else " Use /restart to restore the worker pool."
+        # Restart restores a disabled worker pool and nothing else: a billing,
+        # lookup or fence refusal keeps its own reason without that advice.
+        restart = admitted["_admission_blocked"] == "worker_pool_unavailable"
+        hint = f" {detail}." if detail else " Use /restart to restore the worker pool." if restart else ""
         send_with_budget(
             int(target_chat_id),
             f"Deep self-review could not be queued: {reason}.{hint}",
-            role="system", system_type="deep_self_review_unavailable",
+            **answers, role="system", system_type="deep_self_review_unavailable",
         )
         return None
     persist_queue_snapshot(reason="deep_self_review_enqueued")
     # Typed SYSTEM row: an acknowledgement is never a task's answer, and the bench
     # trajectory reader takes the last UNTYPED outbound row as one.
-    send_with_budget(int(target_chat_id), f"🔎 Deep self-review queued: {tid} ({reason})", role="system", system_type="deep_self_review_queued")
+    send_with_budget(int(target_chat_id), f"🔎 Deep self-review queued: {tid} ({reason}; reviewer: {reviewer or 'Main'})", **answers, role="system", system_type="deep_self_review_queued")
     return tid
+
+
+def project_running() -> List[str]:
+    """The RUNNING ids the evolution idle gate waits for: every row but the conversation lane's (an owner turn, a
+    wake, a Presence turn), which base ran in the server and never let hold it."""
+    from supervisor.conversation_lane import conversation_row
+
+    return [task_id for task_id, meta in RUNNING.items() if not conversation_row(meta)]
 
 
 def get_evolution_status_snapshot(*, budget_projection: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -509,15 +856,24 @@ def get_evolution_status_snapshot(*, budget_projection: Optional[Dict[str, Any]]
     nothing, so the paused-evolution disclosure still comes from this snapshot.
     """
     st = load_state()
-    enabled = bool(st.get("evolution_mode_enabled"))
+    from supervisor.state import control_value
+
+    enabled_known, enabled = control_value(st, "evolution_mode_enabled")
+    enabled = bool(enabled)
     owner_chat_id = int(st.get("owner_chat_id") or 0)
     consecutive_failures = int(st.get("evolution_consecutive_failures") or 0)
     try:
-        remaining: Optional[float] = round(float(budget_remaining(st, strict=True, projection=budget_projection)), 2)
+        # A status snapshot is a display read: without a supplied projection it rides the last validated snapshot.
+        actual_remaining: Optional[float] = float(budget_remaining(st, strict=True, projection=budget_projection, allow_stale=True))
         accounting_available = True
     except Exception:
-        remaining = None
+        actual_remaining = None
         accounting_available = False
+    # Cents are for display; the status is classified on the amount admission itself reads.
+    remaining = None if actual_remaining is None else round(actual_remaining, 2)
+    from supervisor.worker_assignment import needs_paid_admission
+    # A reached limit blocks only paid admission: an evolution task opens on Main.
+    exhausted = actual_remaining is not None and actual_remaining <= 0 and needs_paid_admission({"metadata": {}})
     queued_task = next((t for t in PENDING if str(t.get("type") or "") == "evolution"), None)
     running_task = next(
         (
@@ -529,6 +885,7 @@ def get_evolution_status_snapshot(*, budget_projection: Optional[Dict[str, Any]]
         ),
         None,
     )
+    project = project_running()  # what the idle gate waits for: never a conversation turn
     status = "disabled"
     detail = "Evolution mode is off."
 
@@ -540,48 +897,36 @@ def get_evolution_status_snapshot(*, budget_projection: Optional[Dict[str, Any]]
         and (bool(active_tx.get("restart_required")) or not bool(active_tx.get("restart_verified")))
     )
 
-    if restart_blocked:
+    if not enabled_known:
+        status = "state_unknown"  # never read an unknown control as on or off (#1307)
+        detail = "Evolution control is unknown: runtime state is unavailable or recovering from a backup."
+    elif restart_blocked:
         status = "waiting_for_restart_verify"
-        detail = "Waiting for restart verification before the next absorbed evolution cycle."
+        detail = str(active_tx.get("restart_guidance") or "Waiting for restart verification before the next absorbed evolution cycle.")
     elif isinstance(running_task, dict):
         status = "running"
         detail = "Evolution task is running now."
     elif isinstance(queued_task, dict):
         status = "queued"
-        detail = "Evolution task is queued and waiting for a worker."
+        detail = "Evolution task is queued."
     elif not accounting_available:
         status = "accounting_unavailable"
         detail = "Cost accounting is unavailable; evolution dispatch is paused without changing the campaign."
-    elif consecutive_failures >= 3:
-        status = "paused_failures"
-        detail = (
-            f"Paused after {consecutive_failures} consecutive failures. "
-            "Use Evolve again after investigating the failure."
-        )
     elif enabled and not owner_chat_id:
         status = "waiting_for_owner_chat"
         detail = "Waiting for the first owner chat binding before scheduling evolution."
-    elif enabled and remaining is not None and remaining < EVOLUTION_BUDGET_RESERVE:
+    elif enabled and exhausted:
         status = "budget_blocked"
-        detail = (
-            f"Budget reserve active: ${remaining:.2f} remaining, "
-            f"${EVOLUTION_BUDGET_RESERVE:.0f} reserved for conversations."
-        )
-    elif enabled and (PENDING or RUNNING):
+        detail = "Global budget exhausted: no new cycle starts until the limit allows one. The campaign stays on."
+    elif enabled and (PENDING or project):
         status = "waiting_for_idle"
         detail = "Waiting for active tasks to finish before the next evolution cycle."
     elif enabled:
         status = "idle_ready"
         detail = "Idle and ready to queue the next evolution cycle."
-    elif remaining is not None and remaining < EVOLUTION_BUDGET_RESERVE and str(st.get("last_evolution_task_at") or "").strip():
-        status = "budget_stopped"
-        detail = (
-            f"Evolution auto-stopped because only ${remaining:.2f} remains, "
-            f"below the ${EVOLUTION_BUDGET_RESERVE:.0f} conversation reserve."
-        )
 
     return {
-        "enabled": enabled,
+        "enabled": enabled if enabled_known else None,
         "status": status,
         "detail": detail,
         "campaign": campaign,
@@ -594,9 +939,9 @@ def get_evolution_status_snapshot(*, budget_projection: Optional[Dict[str, Any]]
         # is float('inf'), which strict JSON cannot carry — surface None so
         # /api/state stays serializable on onboarding installs.
         "budget_remaining_usd": remaining if remaining is not None and math.isfinite(remaining) else None,
-        "budget_reserve_usd": float(EVOLUTION_BUDGET_RESERVE),
+        "budget_reserve_usd": 0.0,  # frozen field: Evolution keeps no reserve of its own (owner, 2026-11-02)
         "pending_count": len(PENDING),
-        "running_count": len(RUNNING),
+        "running_count": len(project),
         "queued_task_id": str((queued_task or {}).get("id") or ""),
         "running_task_id": str((running_task or {}).get("id") or ""),
     }
@@ -605,33 +950,49 @@ def get_evolution_status_snapshot(*, budget_projection: Optional[Dict[str, Any]]
 # v7next F1 (D08): moved spans live in their owner leaves; re-exported here
 # so this facade stays the single import surface for callers and tests.
 from supervisor.queue_schedules import (  # noqa: E402, F401 -- intentional public re-exports
-    _SKILL_SCHEDULE_SYNC_INTERVAL_SEC,
-    _last_skill_schedule_sync,
     _schedule_running_or_queued,
     _scheduled_tasks_path,
     _task_from_schedule,
     _write_scheduled_tasks,
+    SCHEDULE_ACTIONS,
+    ScheduleLockTimeout,
+    ScheduleRefused,
+    ScheduleStoreUnreadable,
     check_scheduled_tasks,
     list_scheduled_tasks,
-    remove_scheduled_task,
-    resync_skill_schedules,
-    sync_skill_schedules,
+    load_schedule_store,
+    schedule_activity_projection,
+    schedule_tool_projection,
+    schedule_lifecycle_status,
+    schedule_transaction,
+)
+from supervisor.schedule_lifecycle import (  # noqa: E402, F401 -- intentional public re-exports
+    mutate_scheduled_task,
+    patch_scheduled_task,
     upsert_scheduled_task,
 )
 from supervisor.queue_snapshot import (  # noqa: E402, F401 -- intentional public re-exports
     _kept_service_pids,
     _retained_daemon_pids,
     parse_iso_to_ts,
-    persist_queue_snapshot,
     restore_pending_from_snapshot,
+)
+from supervisor.queue_publication import (  # noqa: E402, F401 -- intentional public re-exports
+    persist_queue_snapshot,
+    publish_queue_changes,
+    publish_queue_snapshot,
+    start_queue_writer,
+    stop_queue_writer,
+    tick_publisher_started,
 )
 from supervisor.queue_timeouts import (  # noqa: E402, F401 -- intentional public re-exports
     _enforce_task_timeouts_locked,
-    _has_live_descendant,
+    _expire_pending_deadlines_locked,
     _has_pending_descendant,
     _is_descendant_of,
     _subtree_progressing,
     _task_deadline_ts,
     _task_drive_for_task,
+    enforce_due_task_timeouts,
     enforce_task_timeouts,
 )

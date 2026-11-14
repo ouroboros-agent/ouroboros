@@ -113,7 +113,12 @@ def read_verification_receipts(
 ) -> List[Dict[str, Any]]:
     try:
         path = verification_receipts_path(drive_root, task_id, create=False)
-        if not path.exists():
+        if gap_reasons is not None:
+            try:
+                path.stat()
+            except FileNotFoundError:
+                return []
+        elif not path.exists():
             return []
         if gap_reasons is None:
             # Preserve the historical all-or-nothing read used by observational
@@ -230,6 +235,9 @@ def publish_verification_receipt_union(
         content = "".join(
             json.dumps(row, ensure_ascii=False) + "\n" for row in merged
         )
+        from ouroboros.task_custody import fence_publication
+
+        fence_publication()  # after the lock wait: a closed publication generation replaces nothing
         write_text_atomic(dest, content)
         return True
     finally:
@@ -265,7 +273,7 @@ def read_verification_receipts_from_roots(
 
 
 def read_context_verification_receipts(
-    ctx: Any, task_id: str, *, fallback_root: Any = None,
+    ctx: Any, task_id: str, *, fallback_root: Any = None, gap_reasons: Optional[set[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Read an active actor's local and canonical receipt replicas."""
 
@@ -277,7 +285,7 @@ def read_context_verification_receipts(
     except Exception:
         roots.append(getattr(ctx, "budget_drive_root", None))
     roots.append(fallback_root)
-    return read_verification_receipts_from_roots(roots, task_id)
+    return read_verification_receipts_from_roots(roots, task_id, gap_reasons=gap_reasons)
 
 
 def task_verification_receipts(

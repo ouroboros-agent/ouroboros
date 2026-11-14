@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import contextlib
 import os
+import platform
 import signal
 import stat
+import sysconfig
 import threading
 import time
 from pathlib import Path
@@ -24,6 +26,16 @@ else:
 
 class PlatformSupportError(RuntimeError):
     """A platform primitive could not preserve the required safety invariant."""
+
+
+def machine_architecture() -> str:
+    """Use the interpreter build when a scrubbed Windows env hides machine()."""
+    machine = platform.machine().lower()
+    if not machine and platform.system() == "Windows":
+        machine = {"win-amd64": "amd64", "win-arm64": "arm64", "win32": "x86"}.get(
+            sysconfig.get_platform().lower(), ""
+        )
+    return machine
 
 
 def path_is_link_or_reparse(path: Path) -> bool:
@@ -176,7 +188,8 @@ def require_isolated_process_group() -> None:
 
 
 def process_alive(pid: int) -> bool:
-    if pid <= 1:
+    # A bare container server is PID 1; only PID 0 and negatives are invalid.
+    if pid <= 0:
         return False
     if IS_WINDOWS:
         # On Windows CPython, os.kill(pid, 0) is destructive: signal 0 is
@@ -361,6 +374,7 @@ __all__ = [
     "WindowsKillJob",
     "acquire_file_lock",
     "fsync_directory",
+    "machine_architecture",
     "minimal_process_environment",
     "path_is_link_or_reparse",
     "process_alive",

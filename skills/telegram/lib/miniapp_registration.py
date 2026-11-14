@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..scripts.platform_support import process_alive
+from ..scripts.platform_support import machine_architecture, process_alive
 from ..scripts.telegram_settings import owner_chat_id
 
 
@@ -28,7 +28,7 @@ def _bounded_text(value: Any, maximum: int = 200) -> str:
 
 def _platform_error() -> str:
     system = platform.system()
-    machine = platform.machine().lower()
+    machine = machine_architecture()
     arch = {
         "arm64": "arm64",
         "aarch64": "arm64",
@@ -99,7 +99,7 @@ def _seed_starting_status(api: Any) -> None:
         except (TypeError, ValueError):
             age = 999
             pid = 0
-        if -60 <= age <= 45 and process_alive(pid):
+        if -60 <= age <= 45 and pid > 1 and process_alive(pid):
             return
     _atomic_json(
         path,
@@ -167,7 +167,8 @@ def _read_status(api: Any) -> dict[str, Any]:
             and result["state"] == "starting"
             and _bounded_text(value.get("reason_code"), 64) == "registered"
         )
-        alive = registration_pending or process_alive(pid)
+        # The companion is never PID 1: it is always the server's child.
+        alive = registration_pending or (pid > 1 and process_alive(pid))
         try:
             updated_at = int(value.get("updated_at_epoch") or 0)
         except (TypeError, ValueError):
@@ -230,7 +231,8 @@ def _read_status(api: Any) -> dict[str, Any]:
     return result
 
 
-def register(api: Any) -> None:
+def register(api: Any) -> bool:
+    """Register the Mini App companion; False when this platform has none (the text bridge stays)."""
     _write_runtime_config(api)
     platform_error = _platform_error()
     if platform_error:
@@ -241,19 +243,20 @@ def register(api: Any) -> None:
                 "state": "unavailable",
                 "reason_code": "unsupported_platform",
                 "message": platform_error,
-                "platform": f"{platform.system() or 'unknown'}/{platform.machine() or 'unknown'}",
+                "platform": f"{platform.system() or 'unknown'}/{machine_architecture() or 'unknown'}",
                 "pid": 0,
                 "updated_at_epoch": int(time.time()),
             },
         )
         api.log("warning", platform_error + " Text bridge remains active.")
-        return
+        return False
     _seed_starting_status(api)
     api.register_companion_process("miniapp_gateway")
     api.log(
         "info",
         "telegram registered automatic owner-only Mini App gateway",
     )
+    return True
 
 
 __all__ = ["ConfigurationError", "_read_status", "register"]

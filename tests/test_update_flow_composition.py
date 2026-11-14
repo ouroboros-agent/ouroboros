@@ -5,11 +5,11 @@ review-object) through the MERGED machinery. Lane-internal behavior is not
 re-tested here; where a composition item is already covered verbatim by a lane
 test, that coverage is cited instead of duplicated:
 
-- B5 (advisory half): ``test_advisory_replay_reasons_drive_the_stage_cycle_to_a
-  _disclosed_pass`` (tests/test_review_cycles_dispatch.py) drives BOTH
-  free-replay reasons — identical verdict and exhausted ceiling — through the
-  real stage cycle to a disclosed advisory pass; the blocking half end-to-end
-  lives here (``test_blocking_exhaustion_end_to_end_...``).
+- B5: ``test_the_ceiling_replay_drives_the_stage_cycle_to_a_disclosed_outcome``
+  (tests/test_review_cycles_dispatch.py) drives the free replay of an exhausted
+  ceiling through the real stage cycle to an outcome returned for the author's
+  decision; the managed resolver's exhaustion end-to-end lives here
+  (``test_exhaustion_end_to_end_...``).
 - B8 (rerere immunity of M0): ``test_materialize_is_immune_to_a_poisoned_
   rerere_cache`` (tests/test_update_merge_assisted.py) poisons the rr-cache
   with a recorded WRONG resolution and proves the pinned M0 baseline (the only
@@ -84,8 +84,8 @@ def test_update_merge_size_growth_warns_locally_and_pairwise_ci_catches(tmp_path
 
     # Official line: +500 lines at the TOP of mid.py (1300 total — no debt).
     trh._git(repo, "checkout", "-qb", "official")
-    (repo / "mid.py").write_text(
-        "\n".join(["official-%d" % i for i in range(500)] + body) + "\n", encoding="utf-8"
+    (repo / "mid.py").write_bytes(
+        ("\n".join(["official-%d" % i for i in range(500)] + body) + "\n").encode("utf-8")
     )
     trh._git(repo, "add", ".")
     trh._git(repo, "commit", "-qm", "official grows the top")
@@ -93,8 +93,8 @@ def test_update_merge_size_growth_warns_locally_and_pairwise_ci_catches(tmp_path
 
     # Local fork: +400 lines at the BOTTOM (1200 total — no debt either).
     trh._git(repo, "checkout", "-q", head)
-    (repo / "mid.py").write_text(
-        "\n".join(body + ["local-%d" % i for i in range(400)]) + "\n", encoding="utf-8"
+    (repo / "mid.py").write_bytes(
+        ("\n".join(body + ["local-%d" % i for i in range(400)]) + "\n").encode("utf-8")
     )
     trh._git(repo, "add", ".")
     trh._git(repo, "commit", "-qm", "fork grows the bottom")
@@ -207,7 +207,6 @@ def test_legacy_pre_redesign_tx_boots_resumes_and_verifies(tmp_path, monkeypatch
 
 
 def test_one_managed_fixture_feeds_all_review_consumers_and_binds(tmp_path, monkeypatch):
-    import ouroboros.tools.claude_advisory_review as adv
     import ouroboros.tools.git as git_mod
     from ouroboros.tools.review_helpers import REPO_ROOT
     from ouroboros.tools.review_subject import (
@@ -215,10 +214,10 @@ def test_one_managed_fixture_feeds_all_review_consumers_and_binds(tmp_path, monk
         capture_review_diff,
         managed_review_subject,
     )
-    from ouroboros.tools.scope_review_session import (
-        ScopeBriefInputs,
-        ScopeIntentContext,
-        build_scope_session_task,
+    from ouroboros.tools.review_brief_coupling import (
+        BriefInputs,
+        BriefIntent,
+        build_retrieving_brief,
     )
 
     repo, ctx, tx = tmrs._managed_resolution_repo(tmp_path, monkeypatch)
@@ -232,24 +231,15 @@ def test_one_managed_fixture_feeds_all_review_consumers_and_binds(tmp_path, monk
     # Triad + scope api packets read the SHARED capture — byte-identical artifact.
     assert capture_review_diff(ctx, repo) == delta
 
-    # Advisory (worktree surface, HAPPY path — not the oversize skip): same
-    # delta content, scoped to delta ∪ conflict anchors, managed and not early.
-    diff_text, context_paths, early, managed = adv._advisory_review_diff(
-        pathlib.Path(repo), ctx, None
-    )
-    assert managed is True and early is None
-    assert "resolved by the agent" in diff_text
-    assert "released official change" not in diff_text
-    assert {"conflict.txt", "resolver_note.txt"} <= set(context_paths or [])
-
-    # Both SESSION deliveries inline the same artifact.
+    # Both retrieving deliveries (a packet seat's session task, the two-part
+    # brief) inline the same artifact.
     triad_task = build_triad_session_task(subject=subject, **tmrs._SESSION_SECTIONS)
-    scope_task, _manifest = build_scope_session_task(repo, ScopeBriefInputs(
+    brief_text, _manifest = build_retrieving_brief(repo, BriefInputs(
         commit_message="land the update",
-        intent=ScopeIntentContext(goal="g", scope="s"),
+        intent=BriefIntent(goal="g", scope="s"),
         governance_repo_dir=pathlib.Path(REPO_ROOT), managed_subject=subject,
     ))
-    for task_text in (triad_task, scope_task):
+    for task_text in (triad_task, brief_text):
         assert "AUTHORITATIVE review subject" in task_text
         assert "resolved by the agent" in task_text
 
@@ -324,7 +314,7 @@ def test_dirty_work_survives_the_full_managed_clean_update(tmp_path, monkeypatch
     assert (repo / "a.txt").read_text() == "owner dirty work\n"
     assert (repo / "untracked.txt").read_text() == "scratch\n"
     assert (repo / "remote.txt").read_text() == "official\n"  # the update landed
-    assert not tds._git(repo, "stash", "list").stdout.strip()
+    assert tx["stash_sha"] in tds._git(repo, "stash", "list", "--format=%H").stdout
     assert update_merge.read_update_tx() == {}
 
 
@@ -379,7 +369,7 @@ def test_conflicting_restore_after_full_flow_is_disclosed_not_dropped(tmp_path, 
 
 def test_managed_flow_runs_the_hermetic_suite_once_per_head(tmp_path, monkeypatch):
     import ouroboros.tools.git as git_mod
-    from tests.test_advisory_preflight import _stub_preflight_lanes
+    from tests.test_git_review_preflight_gate import _stub_preflight_lanes
 
     repo, ctx, tx = tmrs._managed_resolution_repo(tmp_path, monkeypatch)
     drive = tmp_path / "data"
@@ -402,9 +392,9 @@ def test_managed_flow_runs_the_hermetic_suite_once_per_head(tmp_path, monkeypatc
     # B11 first half: no evidence covers the candidate tree yet -> the managed
     # mandate forces the pre-commit run even under skip_tests + doc-only.
     assert git_mod._managed_candidate_needs_proof(ctx) is True
-    outcome = git_mod._advisory_and_tests_gate(
+    outcome = git_mod._preflight_and_tests_gate(
         ctx, "land the managed resolution", 0.0,
-        classification_paths=["docs/x.md"], advisory_paths=None,
+        classification_paths=["docs/x.md"],
         skip_advisory_pre_review=True, skip_tests=True,
     )
     assert outcome is None
@@ -450,7 +440,7 @@ def test_managed_phase_writes_merge_onto_fresh_tx_not_stale_snapshot(
     that durable telemetry, remains the reuse authority."""
     from ouroboros.commit_admission import run_tests_preflight_with_proof
     from ouroboros.tools.review_helpers import _run_review_preflight_tests
-    from tests.test_advisory_preflight import _stub_preflight_lanes
+    from tests.test_git_review_preflight_gate import _stub_preflight_lanes
 
     repo, head, plan, tx = tua._materialized_conflict_tx(tmp_path, monkeypatch)
     meta = tua._authority_metadata(tx)
@@ -499,14 +489,14 @@ def test_managed_phase_writes_merge_onto_fresh_tx_not_stale_snapshot(
 
 
 # ---------------------------------------------------------------------------
-# B5 (blocking half) + exhaustion chain — the REAL authorized resolver hits the
-# paid-cycle ceiling: free typed refusal (money never bought again), the staged
-# merge survives the refusal, and the orphan-terminal rollback preserves the
-# attempt on the deterministic retry branch.
+# B5 + exhaustion chain — the REAL authorized resolver hits the paid-cycle
+# ceiling: a free replay of the outcome (money never bought again, nothing
+# refused or unstaged), the staged merge stays as it was, and the orphan-terminal
+# rollback preserves the attempt on the deterministic retry branch.
 # ---------------------------------------------------------------------------
 
 
-def test_blocking_exhaustion_end_to_end_rolls_back_and_preserves_retry_pointer(
+def test_exhaustion_end_to_end_replays_rolls_back_and_preserves_retry_pointer(
     tmp_path, monkeypatch,
 ):
     import ouroboros.tools.git as git_mod
@@ -514,7 +504,7 @@ def test_blocking_exhaustion_end_to_end_rolls_back_and_preserves_retry_pointer(
 
     repo, head, plan, tx = tua._materialized_conflict_tx(tmp_path, monkeypatch)
     drive = tmp_path / "data"
-    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
+    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")  # retired: read by nothing
     monkeypatch.setenv(KEY, "1")
     monkeypatch.setattr(git_mod, "commit_review_contract_fingerprint", lambda: "cf-1")
     ctx = SimpleNamespace(
@@ -534,13 +524,13 @@ def test_blocking_exhaustion_end_to_end_rolls_back_and_preserves_retry_pointer(
         ctx, "resolve", 0.0, pre_fingerprint={"fingerprint": "fp-new"}, review_rebuttal="",
     )
 
-    assert outcome is not None and outcome["block_reason"] == "review_cycles_exhausted"
-    assert "REVIEW_CYCLES_EXHAUSTED" in outcome["message"]
+    assert outcome is not None and "status" not in outcome and outcome["replay_reason"] == "review_cycles_exhausted"
+    assert "REVIEW_CYCLES_EXHAUSTED" in outcome["advisory_replay"]
     exhausted = _events(drive, "review_cycles_exhausted")
     assert exhausted and exhausted[-1]["surface"] == "commit_gate"
-    assert exhausted[-1]["enforcement"] == "blocking"
-    # The refusal path repaired the REAL merge state for the resolver: the
-    # staged managed merge survives the typed refusal.
+    assert exhausted[-1]["enforcement"] == "advisory"
+    # Nothing was refused or unstaged: the REAL staged managed merge of the
+    # resolver is as it was.
     assert update_merge._merge_head_sha() == plan["target_sha"]
     assert (repo / "a.txt").read_text() == "the resolver's precious resolution\n"
 
@@ -604,24 +594,21 @@ def test_binding_mismatch_is_infra_never_streak_or_anchor(tmp_path, monkeypatch)
     assert attempt_block_class(legacy) == "infra"
     assert attempt_block_class(recorded) == "infra"
     # An identical resubmit is NOT refused for free off the mismatch rows…
-    for enforcement in ("blocking", "advisory"):
-        monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", enforcement)
-        assert git_mod._free_cycle_gate(
-            ctx, "msg", 0.0, pre_fingerprint={"fingerprint": "fp-1"}, review_rebuttal="",
-        ) is None
+    assert git_mod._free_cycle_gate(
+        ctx, "msg", 0.0, pre_fingerprint={"fingerprint": "fp-1"}, review_rebuttal="",
+    ) is None
     # …while the dispatched waves both count toward the money ceiling.
     assert count_paid_review_cycles(ctx, root_task_id="root-1") == 2
 
 
 def test_dispatched_infra_terminal_counts_money_but_never_identity(tmp_path, monkeypatch):
     """B7: one dispatched infra terminal (quorum failure after a paid dispatch)
-    counts a paid cycle — and ONLY the ceiling, never the identical-diff
-    refusal, can stop the next attempt."""
+    counts a paid cycle — and ONLY the spent ceiling turns the next attempt into
+    a free replay."""
     import ouroboros.tools.git as git_mod
     from ouroboros.review_state import CommitAttemptRecord, make_repo_key, update_state, _utc_now
     from ouroboros.tools.commit_gate import count_paid_review_cycles
 
-    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
     monkeypatch.setattr(git_mod, "commit_review_contract_fingerprint", lambda: "cf-1")
     monkeypatch.setattr(git_mod, "run_cmd", lambda *a, **k: "")
     monkeypatch.setattr(git_mod, "_authorized_managed_update_resolver", lambda ctx: False)
@@ -647,12 +634,12 @@ def test_dispatched_infra_terminal_counts_money_but_never_identity(tmp_path, mon
     assert git_mod._free_cycle_gate(
         ctx, "msg", 0.0, pre_fingerprint={"fingerprint": "fp-1"}, review_rebuttal="",
     ) is None
-    # With the ceiling at the money already spent, ONLY exhaustion refuses.
+    # With the ceiling at the money already spent, ONLY exhaustion replays.
     monkeypatch.setenv(KEY, "1")
     outcome = git_mod._free_cycle_gate(
         ctx, "msg", 0.0, pre_fingerprint={"fingerprint": "fp-1"}, review_rebuttal="",
     )
-    assert outcome is not None and outcome["block_reason"] == "review_cycles_exhausted"
+    assert outcome is not None and outcome["replay_reason"] == "review_cycles_exhausted"
 
 
 # ---------------------------------------------------------------------------
@@ -742,12 +729,12 @@ def test_zero_result_panel_preserves_withheld_seat_records(monkeypatch):
     prepared = {
         "prompt": "p", "stable_prefix_len": 0, "models": ["session-1"],
         "routes": ["agent_session"], "row_plan": {}, "session_task": "t",
-        "target_repo": ".", "blocking_review": True,
+        "target_repo": ".",
     }
 
     blocked = review_mod._dispatch_unified_review(ctx, "msg", prepared)
 
-    assert blocked and "no results from any model" in blocked
+    assert blocked is None and any("no results from any model" in str(item) for item in ctx._review_advisory)
     assert ctx._last_review_block_reason == "infra_failure"
     # The withheld seat identities survived into the durable channel the gate
     # records (previously only the degraded-reason string survived).
@@ -927,17 +914,16 @@ def test_postcommit_site_skips_phase_write_loudly_on_a_corrupt_marker(tmp_path, 
     assert "phase" in skipped[0]["patch_keys"]
 
 
-def test_ctx_proof_survives_the_advisory_to_commit_boundary(tmp_path, monkeypatch):
-    """F2(c): the proof pinned by the ADVISORY recording site is consulted by
+def test_ctx_proof_survives_the_preflight_to_commit_boundary(tmp_path, monkeypatch):
+    """F2(c): the proof pinned by the commit gate's test preflight is consulted by
     the COMMIT-side gates through the same task ctx (one ctx spans every tool
-    call of a task); both recording sites are bound to the shared helper."""
+    call of a task); the recording site is bound to the shared helper."""
     import inspect
 
-    import ouroboros.tools.claude_advisory_review as adv_mod
     import ouroboros.tools.git as git_mod
     from ouroboros.commit_admission import run_tests_preflight_with_proof
     from ouroboros.tools.review_helpers import _run_review_preflight_tests
-    from tests.test_advisory_preflight import _stub_preflight_lanes
+    from tests.test_git_review_preflight_gate import _stub_preflight_lanes
 
     repo, head, plan, tx = tua._materialized_conflict_tx(tmp_path, monkeypatch)
     meta = tua._authority_metadata(tx)
@@ -945,18 +931,14 @@ def test_ctx_proof_survives_the_advisory_to_commit_boundary(tmp_path, monkeypatc
     ctx = SimpleNamespace(task_id="resolver", task_metadata=meta, repo_dir=str(repo),
                           emit_progress_fn=lambda *_a, **_k: None)
 
-    # The advisory's test consumer lets the runner mint the actual proof.
+    # The gate's test consumer lets the runner mint the actual proof.
     assert run_tests_preflight_with_proof(ctx, runner=_run_review_preflight_tests) is None
     proof = ctx._preflight_test_proof
     assert proof and len(lanes) == 2
     tree = proof.tree
-    # Both gates run their pytest preflight through the commit-admission SSOT,
+    # The gate runs its pytest preflight through the commit-admission SSOT,
     # whose helper owns the green-run -> proof binding (Q3=A extraction).
-    for site_src in (
-        inspect.getsource(adv_mod._advisory_pre_sdk_gate),
-        inspect.getsource(git_mod._advisory_and_tests_gate),
-    ):
-        assert "run_tests_preflight_with_proof" in site_src
+    assert "run_tests_preflight_with_proof" in inspect.getsource(git_mod._preflight_and_tests_gate)
     assert "record_managed_tests_proof(ctx)" in inspect.getsource(
         run_tests_preflight_with_proof)
 

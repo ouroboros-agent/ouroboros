@@ -1,27 +1,22 @@
 """Subagent lane, cap, and metadata helpers.
 
-THE OWNER-FACING AXES ARE THREE, AND EVERYTHING ELSE IS DERIVED.
+A parent declares the WORK: ``write_surface`` (what the child may DO) and the
+Available-subagents row (WHO runs it, ``subagent_id``); it may also ask for the
+child's reasoning ``effort``. Model, route and TOOL profile are consequences of
+the row plus the owner's settings and what is live at the moment the child
+starts. The CREDENTIAL profile is NOT derived here at all (see the
+DelegationRoute pin and the rotation note below): it is Claudexor's choice, and
+the applied one comes back on the engine receipt.
 
-A parent declares the WORK: ``write_surface`` (what the child may DO),
-``model_lane`` (how good the answer must be) and ``executor`` (where it runs).
-Model, effort, route and TOOL profile are consequences of those three plus the
-owner's settings and what is live at the moment the child starts — never a second
-thing the parent can ask for. The CREDENTIAL profile is NOT derived here at all
-(see the DelegationRoute pin and the rotation note below): it is Claudexor's
-choice, and the applied one comes back on the engine receipt.
-
-``effort`` used to be a fourth public parameter and broke that twice. It was a
-second knob for the question ``model_lane`` already answers, so ``model_lane:
-light`` with ``effort: max`` was a request nobody could resolve (it pinned the
-cheapest model to the strongest reasoning and no rule reconciled them). And a
-harness route carries its OWN effort, so a parent asking ``low`` against a route
-pinned to ``xhigh`` had no rule for who wins. It is removed rather than ranked
-against the lane (BIBLE P2: remove the class). The owner still controls effort
-exactly as before, through ``config.resolve_effort(task_type)``. The ONE
-caller-facing strength axis lives elsewhere: a plan review order may declare
-its reviewer panel's effort as the default rung of each row's ladder
-(``plan_task.reviewer_effort`` → ``plan_review_runtime.plan_review_slots``);
-that is a review panel, not a subagent.
+Effort follows ONE rule (``settings_scales.choose_effort``): a level encoded in
+the row's model name, else the owner's pin (the row's ``effort``), else the
+parent's request clamped into the owner's effort range (Cyber Pro: unclamped,
+and a request beats a pin), else this room's primary clamped into its helper bounds. The decision is
+taken at dispatch, recorded as ``{requested, applied, source}`` on the child
+record (``SubagentDispatch.effort_fact``) and disclosed to the child, the parent
+and the chat; for a session row it is the delegated LEAF's level, while the
+nanny's own rounds inherit the parent's. A plan review order
+(``plan_task.reviewer_effort``) is the same rule over the reviewer rows.
 """
 
 from __future__ import annotations
@@ -47,8 +42,8 @@ log = logging.getLogger(__name__)
 # v6.87.7, where they named a TOPOLOGY — "fan out across the configured reviewer
 # slots" — smuggled in through a strength parameter. Nothing in the product ever
 # asked for them: every review surface (commit, plan, acceptance, skill) reads its
-# slots straight from config through get_review_models/get_scope_review_models and
-# runs them on the review substrate, never through schedule_subagent. They are
+# seats from the review pool (reviewer_slot_config.review_pool_slots) and runs
+# them on the review substrate, never through schedule_subagent. They are
 # removed rather than kept as aliases (BIBLE P2: remove the class). Durable records
 # that still carry the old values stay readable — build_subagent_envelope already
 # coerces an unknown stored lane instead of raising.
@@ -94,25 +89,6 @@ def lane_is_weaker(lane: str, than: str) -> bool:
     return lane_rank(lane) < lane_rank(than)
 
 
-# The third axis. POWER is the lane, AUTHORITY is the write surface, and this is
-# WHO RUNS THE CHILD — the SUBSTRATE its cognition burns (metered API tokens vs. an
-# already-paid subscription session hosted by Claudexor). It is deliberately not a
-# harness name: Ouroboros asks for a capability and lets the owner's configuration
-# decide which harness answers, so a harness identity never reaches core (AGENTS.md).
-# `harness` is a pin, not a preference — when the configured harness is unavailable
-# the request is refused rather than silently re-routed onto metered spend the caller
-# did not ask for.
-SUBAGENT_EXECUTORS: tuple[str, ...] = ("auto", "harness", "native")
-
-
-def normalize_subagent_executor(value: Any) -> str:
-    executor = str(value or "auto").strip().lower()
-    if executor not in SUBAGENT_EXECUTORS:
-        allowed = ", ".join(SUBAGENT_EXECUTORS)
-        raise ValueError(f"executor must be one of: {allowed}")
-    return executor
-
-
 @dataclass(frozen=True)
 class DelegatedRunShape:
     """The complete run shape a child's own authority entitles it to.
@@ -130,28 +106,37 @@ class DelegatedRunShape:
     mode: str
     isolation: str = ""
     delegated: bool = False
+    # Technical rights without write authority (#1609): the run executes in a
+    # private checking copy whose results are evidence, never a candidate patch.
+    investigation: bool = False
 
 
-def delegated_run_shape(acting: bool, access: str = "workspace_write") -> DelegatedRunShape:
-    """The run shape for an acting (mutating) child, or for a read-only one.
+def delegated_run_shape(acting: bool, access: str = "workspace_write", mode: str | None = None) -> DelegatedRunShape:
+    """The run shape a child's captured technical access entitles it to.
 
-    A MUTATING child runs ``live`` in the host's private execution snapshot;
-    captured changes still require explicit integration. The selected immutable
-    session supplies its captured access; old snapshots keep workspace_write.
-    This changes the harness's OS powers, not the task's assignment or write target.
-    In place is also the ONE shape where Claudexor would otherwise hand the
-    harness the operator's real ``$HOME`` — which holds the daemon control token — so
-    ``delegated`` travels with it, inseparably, in the same record.
+    TECHNICAL access alone decides the shape. A ``workspace_write``/``full`` run
+    executes ``live`` in a private host copy; ``acting`` decides only what that
+    copy is FOR: an acting child's captured changes await explicit integration,
+    while a non-acting one (research, an external reviewer) is an evidence-only
+    ``investigation`` whose copy is never applied and creates no apply duty.
+    The selected immutable session supplies its captured access; old snapshots
+    keep workspace_write. This changes the harness's OS powers, not the task's
+    assignment or write target. In place is also the ONE shape where Claudexor
+    would otherwise hand the harness the operator's real ``$HOME`` — which holds
+    the daemon control token — so ``delegated`` travels with it, inseparably.
 
-    A READ-ONLY child has nothing to write back, so it runs in Claudexor's default
-    envelope, which is scoped already and needs no marker: that is one transport with
-    one derived difference, not a second pipeline.
+    An explicitly READ-ONLY run has nothing to write back, so it runs in
+    Claudexor's default envelope, which is scoped already and needs no marker:
+    one transport with one derived difference, not a second pipeline.
     """
-    if acting and access != "readonly":
-        if access not in SESSION_ACCESS_PROFILES:
-            raise ValueError("Delegated session access must be workspace_write or full")
-        return DelegatedRunShape(access=access, mode="agent", isolation="live", delegated=True)
-    return DelegatedRunShape(access="readonly", mode="ask")
+    if mode not in (None, "ask", "plan", "agent"):
+        raise ValueError("mode must be ask, plan or agent")
+    if access != "readonly" and access not in SESSION_ACCESS_PROFILES:
+        raise ValueError("Delegated session access must be readonly, workspace_write or full")
+    if access == "readonly" or mode in ("ask", "plan"):
+        return DelegatedRunShape(access="readonly", mode=mode or "ask")
+    return DelegatedRunShape(access=access, mode="agent", isolation="live", delegated=True,
+                             investigation=not acting)
 
 
 def delegated_execution_workspace_root(
@@ -247,11 +232,11 @@ def get_subagent_harness() -> DelegationRoute | None:
     route = parse_subagent_harness(raw)
     if route is None and raw and raw.lower() != "off":
         # A non-empty value that parses to nothing ("=opus") is a typo, not a
-        # decision — silently equal to "never configured" it moved ALL delegation
-        # onto metered API children with no trace. Say so where the operator looks.
+        # decision; silently equal to "never configured" it would leave no trace.
+        # Say so where the operator looks.
         log.warning(
             "OUROBOROS_SUBAGENT_HARNESS is set but unparseable (%r) — "
-            "delegation is OFF until it reads harness[=model][:effort]", raw,
+            "the review session fallback is OFF until it reads harness[=model][:effort]", raw,
         )
     if route is None:
         return None
@@ -298,7 +283,7 @@ class SubagentExecutorResolution:
 
 
 def resolve_subagent_executor(
-    requested: Any = "auto",
+    requested: Any,
     *,
     route: DelegationRoute | None = None,
     unavailable_reason: str = "",
@@ -306,122 +291,34 @@ def resolve_subagent_executor(
 ) -> SubagentExecutorResolution:
     """The execution rule table. Pure — health facts are inputs, never probed here.
 
+    The executor is WHO RUNS THE CHILD: the substrate its cognition burns (metered
+    API tokens vs. an already-paid session hosted by Claudexor), never a harness name.
+
     | requested | state                    | behaviour                                  |
     |-----------|--------------------------|--------------------------------------------|
-    | auto      | harness not configured   | native child                               |
-    | auto      | configured and healthy   | nanny on the harness                       |
-    | auto      | every profile exhausted  | native + LOUD typed fallback (D28)         |
-    | auto      | otherwise unavailable    | native child WITH a visible marker         |
-    | harness   | unavailable              | typed blocker — never silently spend API $ |
+    | harness   | healthy                  | nanny on the harness                       |
+    | harness   | unavailable or exhausted | typed blocker — never silently spend API $ |
     | native    | any                      | native child                               |
 
-    The executor AXIS — the module-level ``SUBAGENT_EXECUTORS`` vocabulary and its
-    ``normalize_subagent_executor`` schema normalizer — belongs to the
-    ``schedule_subagent`` schema work, which owns where the value ENTERS the system.
-    This module deliberately does not define a second copy of either name: two
-    top-level definitions of the same name in one module merge CLEANLY in git and
-    then silently shadow each other. The guard below is a local fail-closed floor over
-    the three cases this table actually specifies, so an unrecognized executor raises
-    here instead of quietly behaving like ``auto``.
+    ``harness`` is a pin, not a preference: an exhausted route blocks WITH its reset
+    time, so the caller can weigh waiting. An ambiguous ``auto`` is no longer a
+    request (owner D23: it never host-routes); a row-less child runs natively.
     """
-    executor = str(requested or "auto").strip().lower()
-    if executor not in ("auto", "harness", "native"):
-        raise ValueError("executor must be one of: auto, harness, native")
+    executor = str(requested or "").strip().lower()
+    if executor not in ("harness", "native"):
+        raise ValueError("executor must be one of: harness, native")
     if executor == "native":
         return SubagentExecutorResolution(executor, "native", None, "requested_native")
     if route is None:
-        reason = "harness_not_configured"
-        if executor == "harness":
-            return SubagentExecutorResolution(executor, "blocked", None, reason)
-        return SubagentExecutorResolution(executor, "native", None, reason)
+        return SubagentExecutorResolution(executor, "blocked", None, "harness_not_configured")
     if reset_at:
         # EVERY profile of the route is spent (the readiness predicate only reports a
-        # reset when none has room left). Owner decision D28: `auto` FALLS BACK TO THE
-        # METERED API, loudly — a typed decision made HERE, at the one point that costs
-        # nothing yet, never a silent drift and never a wait. It used to dispatch the
-        # child as a NANNY anyway, whose very first `delegate_start` was then refused
-        # with this same fact: a spent dispatch, and the child left to improvise a
-        # fallback in prose. Exhaustion heals on a timer, so `reset_at` rides along —
-        # the child can say "I could have waited until X" and the parent can read it.
-        #
-        # An explicit `harness` request is the opposite answer and stays untouched: a
-        # PIN exists precisely to avoid metered spend, so it blocks WITH the reset time.
+        # reset when none has room left).
         return SubagentExecutorResolution(
-            executor,
-            "blocked" if executor == "harness" else "native",
-            route,
-            "subscription_window_exhausted",
-            reset_at,
-        )
+            executor, "blocked", route, "subscription_window_exhausted", reset_at)
     if unavailable_reason:
-        return SubagentExecutorResolution(
-            executor,
-            "blocked" if executor == "harness" else "native",
-            route,
-            unavailable_reason,
-        )
+        return SubagentExecutorResolution(executor, "blocked", route, unavailable_reason)
     return SubagentExecutorResolution(executor, "harness", route, "harness_ready")
-
-
-def probe_subagent_executor(
-    requested: Any = "auto", *, shape: DelegatedRunShape | None = None,
-) -> SubagentExecutorResolution:
-    """Impure companion to the pure table: gather the health facts, then apply it.
-
-    Kept separate so the rule table itself stays a pure function of stated facts. No
-    route configured means no daemon call at all — the ordinary install pays nothing
-    for an axis it does not use. ``shape`` defaults to the read-only shape: a caller
-    that states nothing is asking for the narrowest run there is.
-    """
-    route = get_subagent_harness()
-    if route is None:
-        return resolve_subagent_executor(requested, route=None)
-    from ouroboros.claudexor_daemon import ensure_owned_gateway
-    from ouroboros.gateways.claudexor import ClaudexorUnavailable
-
-    run_shape = shape if shape is not None else delegated_run_shape(False)
-    gateway = None
-    try:
-        gateway = ensure_owned_gateway()
-        unavailable, reset_at = route_health(
-            gateway, route.route_id, run_shape, route_model=route.model,
-            pinned_profile=route.profile_id,
-        )
-    except ClaudexorUnavailable as exc:
-        return resolve_subagent_executor(
-            requested, route=route, unavailable_reason=exc.code,
-            reset_at=str(getattr(exc, "reset_at", "") or ""),
-        )
-    finally:
-        if gateway is not None:
-            gateway.close()
-    return resolve_subagent_executor(
-        requested, route=route, unavailable_reason=unavailable, reset_at=reset_at,
-    )
-
-
-def dispatch_executor_resolution(task: Mapping[str, Any]) -> SubagentExecutorResolution:
-    """The executor axis of ONE dispatch: the typed rule table fed with live health.
-
-    The whole shape, from the one owner of it: health is checked against the run
-    this child would really start — a mutating child probes the `workspace_write`
-    + delegated shape, a read-only one the narrow default — not against a profile
-    string reassembled by the caller. `native` asks the daemon nothing. Tolerant
-    of stored garbage: the schema refused anything invalid at schedule time, so an
-    unknown STORED executor is stale data, not an argument error.
-    """
-    requested = str(task.get("requested_executor") or "auto").strip().lower() or "auto"
-    if requested not in SUBAGENT_EXECUTORS:
-        requested = "auto"
-    if requested == "native":
-        return resolve_subagent_executor("native")  # nothing to ask the daemon
-    from ouroboros.contracts.task_constraint import normalize_task_constraint
-    from ouroboros.tool_access import predicted_subagent_profile
-
-    constraint = normalize_task_constraint(task.get("task_constraint"))
-    surface = str(getattr(constraint, "surface", "") or "")
-    shape = delegated_run_shape(predicted_subagent_profile(write_surface=surface) == "acting_subagent")
-    return probe_subagent_executor(requested, shape=shape)
 
 
 @dataclass(frozen=True)
@@ -443,11 +340,10 @@ class SubagentLaneResolution:
     resolved_from: str = ""
     # WHERE `resolved_from` came from: "requested" (the request named a lane),
     # "inherited" (the request said `auto` and the parent's lane answered), or
-    # "policy" (the request said `auto` and a dispatch policy answered — today the
-    # light-lane default for harness-dispatched nannies). `effective_lane` may
-    # still land elsewhere (an unconfigured slot resolves to Main); the provenance
-    # names the DECISION source, never the slot outcome, so the two facts stay
-    # separately readable on the durable delta.
+    # "configured_subagent" (a configured catalog row decided the model). Older
+    # durable deltas may still read "policy" (the retired light-lane nanny default).
+    # `effective_lane` may still land elsewhere (an unconfigured slot resolves to
+    # Main); the provenance names the DECISION source, never the slot outcome.
     provenance: str = ""
 
     @property
@@ -561,7 +457,6 @@ def resolve_subagent_lane(
     requested_lane: str,
     *,
     parent_lane: str = "",
-    policy_default_lane: str = "",
 ) -> SubagentLaneResolution:
     """Resolve a subagent's effective lane + model.
 
@@ -592,24 +487,10 @@ def resolve_subagent_lane(
 
     ``parent_lane`` is the caller's OWN effective lane; empty means "no lane on
     record", which is the root agent, and the root runs Main.
-
-    ``policy_default_lane`` is a DISPATCH policy's answer for an omitted lane —
-    consulted only when the request says ``auto``, because an explicit lane always
-    wins (the parent that names a lane has made the declaration this default
-    exists to substitute for). Today's one policy: a harness-dispatched child is
-    a NANNY whose own rounds are custody chores around a $0 delegated run, so it
-    defaults to ``light`` instead of inheriting the parent's expensive lane (the
-    poltergeist tree paid $87 of opus rounds for exactly this inheritance); it
-    still raises itself with ``switch_model`` for real acceptance judgment. The
-    provenance field records which source answered, so the durable delta can
-    tell a policy default from an inheritance.
     """
     requested = normalize_subagent_model_lane(requested_lane)
     if requested != "auto":
         resolved_from, provenance = requested, "requested"
-    elif policy_default_lane:
-        resolved_from = normalize_subagent_model_lane(policy_default_lane)
-        provenance = "policy"
     else:
         resolved_from, provenance = intended_lane(requested, parent_lane), "inherited"
     effective = resolved_from
@@ -627,71 +508,6 @@ def resolve_subagent_lane(
         use_local_model=_use_local_for_lane(effective, model),
         resolved_from=resolved_from,
         provenance=provenance,
-    )
-
-
-def preflight_native_fallback_lane(task: Mapping[str, Any]) -> SubagentLaneResolution:
-    """The lane a preflight-falsified harness child runs NATIVE on (F10/sol #2).
-
-    The B2 light-lane default is a policy about HARNESS-dispatched nannies —
-    their own rounds are custody chores around a $0 delegated run. A child the
-    delegate-visibility preflight just demoted to native executes the work
-    ITSELF on metered tokens, so the policy must not survive the demotion: the
-    lane re-resolves exactly as a native dispatch would have (explicit request,
-    else parent inheritance — never policy-light), and the recorded model follows
-    that lane. Effort remains the task-type-derived pre-wire setting.
-    """
-    requested_lane = str(task.get("requested_model_lane") or task.get("model_lane") or "auto")
-    try:
-        requested_lane = normalize_subagent_model_lane(requested_lane)
-    except ValueError:
-        requested_lane = "auto"
-    return resolve_subagent_lane(
-        requested_lane, parent_lane=str(task.get("parent_model_lane") or ""))
-
-
-def preflight_native_fallback_dispatch(
-    task: Mapping[str, Any], dispatch: "SubagentDispatch", reason: str,
-) -> "SubagentDispatch":
-    """The preflight's harness→native fallback, with the lane RE-RESOLVED (F10).
-
-    The falsified dispatch resolved its lane under the harness policy (auto ⇒
-    light). Keeping it would run a native child of a heavy parent on policy-light,
-    so the delta is rebuilt from the re-resolved lane axes, unchanged scheduling
-    effort, executor reduction, and preflight reason. The caller
-    (``agent.preflight_delegate_visibility``)
-    re-stamps the record and envelope; ``agent._prepare_task_context`` re-syncs
-    the metadata projection and the ToolContext model override off them.
-    """
-    import dataclasses
-
-    lane = preflight_native_fallback_lane(task)
-    derived_effort = dispatch.delta.derived_effort
-    reasons: List[str] = []
-    if lane.reduced:
-        reasons.append(f"lane_slot_unavailable={lane.resolved_from}")
-    reasons.append(reason)
-    delta = dataclasses.replace(
-        dispatch.delta,
-        resolved_lane=lane.resolved_from,
-        effective_lane=lane.effective_lane,
-        lane_provenance=lane.provenance,
-        effective_effort=derived_effort,
-        effective_executor="native",
-        reduction_reasons=tuple(reasons),
-        reason=derive_capability_reason(reasons),
-        reduced=True,
-    )
-    return dataclasses.replace(
-        dispatch,
-        lane=lane,
-        executor="native",
-        route="",
-        delta=delta,
-        executor_resolution=dataclasses.replace(
-            dispatch.executor_resolution,
-            executor="native", reason=reason, reset_at="",
-        ),
     )
 
 
@@ -724,11 +540,8 @@ class CapabilityDelta:
     # The effective lane is measured against this, never against a bare `auto`.
     resolved_lane: str = "main"
     effective_lane: str = "main"
-    # WHERE the resolved lane came from — "requested" / "inherited" / "policy"
-    # (see SubagentLaneResolution.provenance). Additive disclosure: a policy
-    # default (light-lane nanny) is not a REDUCTION relative to itself, so the
-    # reduction phrases stay quiet about it — this field is what keeps the
-    # decision source readable on the durable record anyway.
+    # WHERE the resolved lane came from (see SubagentLaneResolution.provenance):
+    # additive disclosure, never a reduction by itself.
     lane_provenance: str = ""
     derived_effort: str = ""
     effective_effort: str = ""
@@ -817,26 +630,53 @@ def lane_delta_phrase(delta: Mapping[str, Any]) -> str:
 # be overwritten by "what was given" — the asymmetry `requested_model_lane` /
 # `effective_model_lane` already had, extended to every axis.
 SUBAGENT_INTENT_FIELDS: tuple[str, ...] = (
+    "delegated_mode",
     "requested_model_lane",
     "parent_model_lane",
+    # The parent's effort request (``schedule_subagent(effort=…)``; "" = none): dispatch
+    # decides the level inside the owner's range and records the fact beside it.
+    "requested_effort",
     # An ADMISSION fact carried as intent (F9): the lane an applicable
     # non-advisory `require_lane` delegation constraint verified this child
-    # against at schedule time. The dispatch consults it to suppress the
-    # harness light-lane policy default — a lane the gate enforced must not be
-    # policy-overridden between admission and dispatch.
+    # against at schedule time — the admission's durable evidence. No dispatch
+    # policy remains that could land the child elsewhere.
     "required_model_lane",
     "requested_executor",
+    # A writer's explicit placement (``schedule_subagent(workspace="in_place")``, owner 25.10 Q2-A).
+    "workspace",
+    # A session child's selected task documents for its first start (DELEGATED_ADMISSION §3a):
+    # the relpaths, reuse/new, and the one new-import intent saved when the parent chose new.
+    "attachment_paths",
+    "attachment_import",
+    "document_import_intent",
+    # A read-only child's explicit ``input_files``, retained at schedule time (DELEGATED_ADMISSION §3b):
+    # the receipt its first input names and its first session start verifies. [] records an explicit none.
+    "prepared_input_files",
+    # A parent's widening of its child's memory view by field (``schedule_subagent(memory_view=…)``); the child's start checks it.
+    "memory_view",
+    # The parent's resolved resource intent is required to preserve folderless scratch versus an explicit folder
+    # through schedule admission; it is an authority fact, not a dispatch-derived decision.
+    "resource_intent",
 )
+
+
+def subagent_intent_fields(source: Mapping[str, Any]) -> Dict[str, Any]:
+    """Carry declared intent through task projections without deciding or defaulting it.
+
+    Producers own normalization; admission owns ``required_model_lane``. Missing
+    fields remain missing, and dispatch writes its decisions under separate keys.
+    """
+    return {key: source[key] for key in SUBAGENT_INTENT_FIELDS if key in source}
+
 
 # Fields a stored subagent record may still carry from a schema that no longer
 # exists. They are IGNORED at dispatch and the reason is written onto the record;
 # a load never fails over one (BIBLE P1: no silent loss, and no crash either).
 LEGACY_SUBAGENT_FIELDS: Dict[str, str] = {
     "reasoning_effort": (
-        "effort is not a subagent axis: it is derived from the owner's configured "
-        "effort for this task type, because a public effort was a second knob for "
-        "the question model_lane already answers (a plan review order declares its "
-        "panel's strength through plan_task.reviewer_effort instead)"
+        "a stored reasoning_effort written before the dispatch record existed is not a "
+        "request: the dispatch decides the effort inside the owner's range (a parent's "
+        "request rides requested_effort) and writes the level it decided here"
     ),
 }
 
@@ -854,6 +694,11 @@ SUBAGENT_RESOLUTION_FIELDS: tuple[str, ...] = (
     "model",
     "use_local_model",
     "reasoning_effort",
+    # The effort decision (``choose_effort``): the level applied, the parent's request and
+    # who decided — the child's own level, or the delegated LEAF's for a session row.
+    "effort_level",
+    "effort_requested",
+    "effort_source",
     "effective_executor",
     "executor_route",
     "tool_profile",
@@ -890,6 +735,9 @@ class SubagentDispatch:
     executor_resolution: SubagentExecutorResolution | None = None
     legacy_ignored: Dict[str, str] = field(default_factory=dict)
     availability: Dict[str, Any] = field(default_factory=dict)
+    # ``settings_scales.effort_fact``: {requested, applied, source}. For a session row the
+    # LEAF's decision (the nanny's own loop runs ``effort``, the parent's level).
+    effort_fact: Dict[str, str] = field(default_factory=dict)
 
     @property
     def blocked(self) -> bool:
@@ -908,11 +756,15 @@ class SubagentDispatch:
         keys off the task, so an added axis is one edit here instead of a field-by-
         field mapping repeated in four modules that drift apart one release later.
         """
+        fact = self.effort_fact or {"requested": "", "applied": self.effort, "source": "auto"}
         fields = {
             "effective_model_lane": self.lane.effective_lane,
             "model": self.lane.model,
             "use_local_model": self.lane.use_local_model,
             "reasoning_effort": self.effort,
+            "effort_level": str(fact.get("applied") or ""),
+            "effort_requested": str(fact.get("requested") or ""),
+            "effort_source": str(fact.get("source") or ""),
             "effective_executor": self.executor,
             "executor_route": self.route,
             "tool_profile": self.profile,
@@ -950,56 +802,30 @@ def resolve_subagent_dispatch(
         # Durable-data tolerance: the schema refused anything invalid when it was
         # asked for, so an unknown STORED lane is stale, not an argument error.
         requested_lane = "auto"
-    requested_executor = str(task.get("requested_executor") or "auto")
-    try:
-        requested_executor = normalize_subagent_executor(requested_executor)
-    except ValueError:
-        requested_executor = "auto"
-
-    # The executor axis lands on p34's typed rule table (H1: one resolver, one
-    # vocabulary, `blocked` a typed third outcome), fed with LIVE route health at
-    # this same dispatch moment. The p2-era `harness_delegation_route()` stub and
-    # its tuple-returning twin resolver are deleted rather than kept beside it.
-    # Resolved BEFORE the lane, because the lane's policy default depends on the
-    # EFFECTIVE executor: a harness-dispatched child whose request said `auto`
-    # defaults to the LIGHT lane (its own rounds are custody chores around a $0
-    # delegated run — poltergeist phase B), while an explicit lane always wins
-    # and a native child keeps inheriting its parent's lane unchanged.
-    executor_resolution = dispatch_executor_resolution(task)
+    # A row-less child (none is minted by the host today; the silence diagnostic was
+    # retired 09.11.2026) has no configured route, so it runs natively and asks the daemon nothing: an
+    # ambiguous `auto` never host-routes (owner D23), and the legacy subagent-harness
+    # key is read only for migration. A stored `harness` pin has no route to honor and
+    # blocks through the table, as a pin must.
+    stored_executor = str(task.get("requested_executor") or "").strip().lower()
+    requested_executor = stored_executor if stored_executor in ("harness", "native") else "auto"
+    executor_resolution = resolve_subagent_executor(
+        "harness" if requested_executor == "harness" else "native")
     executor = executor_resolution.executor
-    route = executor_resolution.route.route_id if executor_resolution.route else ""
-    # F9 (sol #1): a lane the ADMISSION gate enforced (`require_lane` delegation
-    # constraint, stamped as `required_model_lane`) wins over the dispatch
-    # policy default — the admission verified this child against that lane, and
-    # the auto+harness ⇒ light policy silently landing it elsewhere would break
-    # admission→dispatch consistency. With the policy suppressed, `auto`
-    # inherits the parent's lane, which is exactly the lane the gate matched.
-    required_lane = str(task.get("required_model_lane") or "").strip().lower()
-    if required_lane not in SUBAGENT_MODEL_LANES or required_lane == "auto":
-        required_lane = ""
     lane = resolve_subagent_lane(
-        requested_lane, parent_lane=str(task.get("parent_model_lane") or ""),
-        policy_default_lane=(
-            "light" if executor == "harness" and not required_lane else ""),
-    )
-    # Only a REDUCTION belongs in the delta. The table also names the ordinary
-    # outcomes (`requested_native`, `harness_ready`) and the no-preference case
-    # (`auto` with no route configured, D28: nothing was asked for, no delta) —
-    # none of which took anything away from the request.
-    executor_reason = executor_resolution.reason
-    if executor_reason in ("requested_native", "harness_ready") or (
-        requested_executor == "auto" and executor_reason == "harness_not_configured"
-    ):
-        executor_reason = ""
-    from ouroboros.config import resolve_effort
+        requested_lane, parent_lane=str(task.get("parent_model_lane") or ""))
+    from ouroboros.runtime_mode_policy import effort_range_binds
+    from ouroboros.settings_scales import choose_effort, effort_fact
 
-    derived_effort = resolve_effort(task_type or str(task.get("type") or "task"))
+    # A row-less child: request or primary, clamped into this room's helper bounds.
+    derived_effort, effort_source = choose_effort(
+        task.get("requested_effort"), binds=effort_range_binds(task.get("metadata")))
 
     reasons: List[str] = []
     if lane.reduced:
         reasons.append(f"lane_slot_unavailable={lane.resolved_from}")
-    if executor_reason:
-        reasons.append(executor_reason)
+    if executor_resolution.blocked:
+        reasons.append(executor_resolution.reason)
 
     # A record that carries its own capability_delta was ALREADY resolved once:
     # the stored reasoning_effort is the residue record_fields() wrote — which now
@@ -1038,11 +864,12 @@ def resolve_subagent_dispatch(
         # exact route/request adaptation and reports it through usage.request_wire.
         effort=derived_effort,
         executor=executor,
-        route=route if executor == "harness" else "",
+        route="",
         profile=profile_from_task_constraint(constraint),
         delta=delta,
         executor_resolution=executor_resolution,
         legacy_ignored=legacy_ignored,
+        effort_fact=effort_fact(task.get("requested_effort"), derived_effort, effort_source),
     )
 
 
@@ -1113,8 +940,8 @@ def build_subagent_envelope(
             if str(effective_lane or "").strip() else ""
         ),
         "model": str(model or ""),
-        # DERIVED at dispatch (`resolve_subagent_dispatch`), not requested: no parent
-        # can ask for an effort. Empty means the child has not been dispatched.
+        # DECIDED at dispatch (`resolve_subagent_dispatch`) inside the owner's range; the
+        # parent's request rides `requested_effort`. Empty means the child has not been dispatched.
         "reasoning_effort": str(reasoning_effort or ""),
         "executor": str(executor or ""),
         # `executor` is the REQUEST (empty means "not requested"); this is who
@@ -1186,6 +1013,14 @@ def actual_substrate(evidence: Mapping[str, Any] | None) -> str:
     if _count("delegated_runs_started"):
         return SUBSTRATE_HARNESS_ATTEMPTED
     return SUBSTRATE_NATIVE_ONLY
+
+
+def effort_result_fields(task: Mapping[str, Any]) -> Dict[str, str]:
+    """The dispatch's effort decision (``record_fields``) as the task carries it, for every
+    task-result write — running, completion, exception: the parent's projections and the
+    terminal chat frame read it from the result, not from the worker's memory."""
+    return {key: task[key] for key in ("effort_level", "effort_requested", "effort_source")
+            if isinstance(task.get(key), str)}
 
 
 def substrate_result_fields(envelope: Mapping[str, Any]) -> Dict[str, Any]:
@@ -1340,8 +1175,6 @@ def envelope_from_task(
 # v7next F2 (D07): moved spans live in their owner leaves; re-exported here
 # so this facade stays the single import surface for callers and tests.
 from ouroboros.subagent_route_health import (  # noqa: E402, F401 -- intentional public re-exports
-    _cooldown_active,
     _exhausted_window,
-    _model_scope_matches,
     route_health,
 )

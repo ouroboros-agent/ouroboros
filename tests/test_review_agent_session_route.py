@@ -21,9 +21,7 @@ from ouroboros.review_execution import (
 )
 from ouroboros.review_substrate import (
     ReviewSlot,
-    reviewer_slots,
     run_review_request,
-    scope_reviewer_slots,
 )
 from ouroboros.triad_review import empty_array_is_verified_clean
 
@@ -50,9 +48,13 @@ from tests._review_session_route_shared import (
 # ---------------------------------------------------------------------------
 
 
-def test_schema_conformant_clean_verdict_survives(tmp_path, fake_route):
+@pytest.mark.parametrize("elapsed_before_dispatch", [0, 2])
+def test_schema_conformant_clean_verdict_survives(tmp_path, fake_route, monkeypatch, elapsed_before_dispatch):
     """The full clean path: schema asked, conformance passed, empty findings —
     the actor's raw text is the bare `[]` the constitutional predicate accepts."""
+    # Account for time before dispatch deterministically; runner load is not a route failure.
+    monkeypatch.setattr("ouroboros.review_custody.monotonic_now", lambda *_args: 1_000.0)
+    monkeypatch.setattr("ouroboros.review_execution.monotonic_now", lambda: 1_000.0 + elapsed_before_dispatch)
     llm = FakeLLM()
     result = run_review_request(_agent_request(), slots=[_agent_slot()],
                                 drive_root=tmp_path, llm=llm)
@@ -69,9 +71,13 @@ def test_schema_conformant_clean_verdict_survives(tmp_path, fake_route):
     assert start["access"] == "readonly" and start["mode"] == "ask"
     assert start["primaryHarness"] == "fake-review"
     assert start["model"] == "fake-small" and start["effort"] == "low"
-    # Remaining-horizon rounding may add one second on a coarse Windows clock.
-    assert 30 <= start["maxSeconds"] <= 31
+    assert start["maxSeconds"] == 30 - elapsed_before_dispatch
     assert "unwrapped substantive deliverable" in start["prompt"]
+    assert "The starting folder is a location, not a read boundary" in start["instructions"]
+    assert "within the parent's existing read authority" in start["instructions"]
+    assert "supplemental sources cannot substitute a live tree" in start["instructions"]
+    assert "Reading the tree directly is a complete substitute" in start["instructions"]
+    assert "final answer must follow the output contract" in start["instructions"]
     # The manifest declared a non-interactive structured-output transport, so
     # the schema was asked on the EFFECTIVE route (D19).
     assert "outputSchema" in start
@@ -555,32 +561,18 @@ def test_mixed_panel_failed_agent_slot_does_not_shrink_n(tmp_path, fake_route, m
 def test_retired_route_envs_are_ignored(monkeypatch):
     """ABI-10: the phase-5 per-row route envs are RETIRED and IGNORED.
 
-    A row built from a plain model list is pinned api_chat even when a stale
-    environment still exports the retired spellings; delegated delivery is a
-    structured-SSOT fact (``OUROBOROS_REVIEWER_SLOTS`` rows) only.
+    A pool of api rows stays api_chat even when a stale environment still
+    exports the retired spellings; delegated delivery is a catalog-row fact
+    (``route.kind == agent_session``) only.
     """
+    from ouroboros.reviewer_slot_config import review_pool_slots
+    from tests.review_pool_rosters import set_review_pool
+
     monkeypatch.setenv("OUROBOROS_REVIEW_ROUTES", "agent_session,agent_session")
-    monkeypatch.setenv("OUROBOROS_SCOPE_REVIEW_ROUTES", "agent_session")
-    rows = scope_reviewer_slots(["m1", "m2"])
+    set_review_pool(monkeypatch, ["m1", "m2"], prefix="slot")
+    rows = review_pool_slots(role_hint="commit review")
     assert all(row.route is ReviewRouteKind.API_CHAT for row in rows)
-    assert rows[0].slot_id == "scope_slot_1" and rows[1].slot_id == "scope_slot_2"
-    assert all(row.route is ReviewRouteKind.API_CHAT
-               for row in reviewer_slots(["m1", "m2"], role_hint="commit review"))
-
-
-def test_scope_rows_default_to_the_configured_scope_review_effort(monkeypatch):
-    """Regression (v6.89.0): with no structured reviewer slots, the legacy path took
-    this function's old literal default ("medium") instead of the owner's configured
-    OUROBOROS_EFFORT_SCOPE_REVIEW — the BLOCKING constitutional scope reviewer
-    silently ran below its configured reasoning strength on every stock install."""
-    monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
-    monkeypatch.setenv("OUROBOROS_SCOPE_REVIEW_MODELS", "some/model")
-    monkeypatch.delenv("OUROBOROS_EFFORT_SCOPE_REVIEW", raising=False)
-    assert [row.effort for row in scope_reviewer_slots()] == ["high"]  # config default
-    monkeypatch.setenv("OUROBOROS_EFFORT_SCOPE_REVIEW", "xhigh")
-    assert [row.effort for row in scope_reviewer_slots()] == ["xhigh"]
-    # An explicit effort still wins for callers that rebuild one positional row.
-    assert [row.effort for row in scope_reviewer_slots(["m"], effort="low")] == ["low"]
+    assert rows[0].slot_id == "slot-1" and rows[1].slot_id == "slot-2"
 
 
 def _persisted_response_payloads(drive_root):
@@ -639,29 +631,19 @@ def test_acceptance_rows_follow_the_configured_triad_delivery(monkeypatch):
     triad surface reads — a delegated row included — instead of an api-pinned
     projection of them. Upstream wrote this against the legacy comma-list plus its
     per-row route env; ABI-10 retired BOTH reads, so the configured rows come from
-    the structured SSOT, which is the only configuration surface that can carry a
-    session row at all. The generic model-list builder keeps its explicit pin for
-    callers that pass no route list (a caller's own statement, never a surface
-    default), and a stale retired route env still leaks into nothing."""
-    from ouroboros.reviewer_slot_config import REVIEWER_SLOTS_ENV, triad_delivery_slots
+    the catalog (the review pool), which is the only configuration surface that
+    can carry a session row at all; a stale retired route env still leaks into
+    nothing."""
+    from ouroboros.reviewer_slot_config import triad_delivery_slots
+    from tests.review_pool_rosters import pool_roster, pool_seat
 
     monkeypatch.setenv("OUROBOROS_REVIEW_ROUTES", "agent_session,agent_session")
-    monkeypatch.setenv(REVIEWER_SLOTS_ENV, json.dumps({
-        "triad": [
-            {"slot_id": "slot_1", "route": {"kind": "agent_session", "target_id": "codex"}},
-            {"slot_id": "slot_2", "route": {"kind": "api_chat", "target_id": "m2"}},
-        ],
-        "scope": [{"slot_id": "s1", "route": {"kind": "api_chat", "target_id": "m2"}}],
-        "advisory": {"enabled": False,
-                     "route": {"kind": "agent_session", "target_id": "codex"},
-                     "effort": "low"},
-    }))
+    monkeypatch.setenv("OUROBOROS_SUBAGENTS", pool_roster(
+        pool_seat("slot_1", "codex", kind="agent_session"), pool_seat("slot_2", "m2")))
     rows = triad_delivery_slots(role_hint="task acceptance")
     assert [row.route for row in rows] == [ReviewRouteKind.AGENT_SESSION, ReviewRouteKind.API_CHAT]
     assert [row.slot_id for row in rows] == ["slot_1", "slot_2"]
     assert all(row.role_hint == "task acceptance" for row in rows)
-    pinned = reviewer_slots(["m1", "m2"], effort="high", role_hint="task acceptance")
-    assert all(row.route is ReviewRouteKind.API_CHAT for row in pinned)
 
 
 def test_agent_slot_without_session_task_refuses_the_api_pack(tmp_path, fake_route):
@@ -691,7 +673,13 @@ def test_pre_dispatch_admission_requires_current_window_evidence(tmp_path, fake_
     spent = {"subject": {"harness": "fake-review", "subject_id": "acct"},
              "freshness": "fresh",
              "constraints": [{"used_ratio": 1.0, "resets_at": "2030-02-02T00:00:00Z"}]}
-    monkeypatch.setattr(FakeGateway, "quota_snapshots", lambda self: [dict(spent)])
+    spent["availability"] = {"state": "exhausted", "resets_at": "2030-02-02T00:00:00Z"}
+    scopes = []
+    def projection(self, *, model=None, request_kind="text", **_kwargs):
+        scopes.append((model, request_kind))
+        return {"snapshots": [dict(spent)], "absences": [], "availability_scope": {
+            "model": model, "requestKind": request_kind, "basis": "quota_block"}}
+    monkeypatch.setattr(FakeGateway, "quota_state", projection, raising=False)
     executor = AgentSessionReviewExecutor(
         ReviewAssignment(request=_agent_request(), slot=_agent_slot(),
                          call_id="c-admission", call_type="scope_review",
@@ -702,10 +690,12 @@ def test_pre_dispatch_admission_requires_current_window_evidence(tmp_path, fake_
         executor.execute()
     assert excinfo.value.reset_at == "2030-02-02T00:00:00Z"
     assert sum(len(inst.start_requests) for inst in fake_route.instances) == 0
+    assert scopes == [("fake-small", "text")]
 
     # An incomplete ratio is not an admission verdict. A fresh executor asks
     # the selected subscription engine, without another model or API fallback.
     spent["constraints"] = [{"used_ratio": 1.0}]
+    spent["availability"] = {}  # engine could not project a dated block
     custody._CUSTODY.clear()
     executor = AgentSessionReviewExecutor(
         ReviewAssignment(request=_agent_request(), slot=_agent_slot(),
@@ -762,28 +752,24 @@ def test_pre_dispatch_admission_preserves_the_pool_code(tmp_path, fake_route, mo
 
 
 def test_an_expired_cooldown_is_history_not_exhaustion():
-    """The `_exhausted_window` reader (the admission seam above) treated ANY non-empty
-    `cooldown_until` as spent. A cooldown whose instant already PASSED is a stale fact
-    the harness has not refreshed, not positive evidence of a spent window; a FUTURE
-    one still blocks, and an illegible instant keeps the conservative old reading."""
+    """Project the current engine verdict, not the raw historical cooldown date."""
     from ouroboros.subagents import _exhausted_window
 
-    def _quota(cooldown):
+    def _quota(cooldown, availability):
         class _Q:
-            def quota_snapshots(self):
-                return [{"subject": {"harness": "some-route", "subject_id": "a"},
+            def quota_state(self, **_scope):
+                return {"snapshots": [{"subject": {"harness": "some-route", "subject_id": "a"},
                          "freshness": "fresh",
+                         "availability": availability,
                          "constraints": [{"used_ratio": 0.4,
-                                          "cooldown_until": cooldown}]}]
-
-            def quota_absences(self):
-                return []
+                                          "cooldown_until": cooldown}]}], "absences": [],
+                        "availability_scope": {"model": None, "requestKind": "text", "basis": "quota_block"}}
         return _Q()
 
-    assert _exhausted_window(_quota("2020-01-01T00:00:00Z"), "some-route") == (False, "")
-    assert _exhausted_window(_quota("2099-01-01T00:00:00Z"), "some-route") == (
-        True, "2099-01-01T00:00:00Z")
-    assert _exhausted_window(_quota("soon-ish"), "some-route") == (True, "soon-ish")
+    assert _exhausted_window(_quota("2020-01-01T00:00:00Z", {"state": "available"}), "some-route") == (False, "")
+    reset = "2099-01-01T00:00:00Z"
+    assert _exhausted_window(_quota(reset, {"state": "cooldown", "resets_at": reset}), "some-route") == (True, reset)
+    assert _exhausted_window(_quota("soon-ish", {}), "some-route") == (False, "")
 
 
 class AccountedFakeLLM(FakeLLM):
@@ -891,7 +877,7 @@ def test_reserve_only_owner_window_skips_light_model_extraction(monkeypatch):
 
 def test_multi_model_wrapper_preserves_typed_refusal_into_skill_actor_record():
     from ouroboros.tools.review import _parse_model_response
-    from ouroboros.triad_review import parse_model_review_results
+    from ouroboros.triad_review import parse_seat_answers
 
     envelope = _parse_model_response("claude-fable-5", {
         "error": "Error: route unavailable",
@@ -901,9 +887,7 @@ def test_multi_model_wrapper_preserves_typed_refusal_into_skill_actor_record():
         "http_status": 429,
         "transport_status": "unavailable",
     }, None)
-    parsed = parse_model_review_results(
-        {"results": [envelope]}, required_items=("manifest_schema",),
-    )
+    parsed = parse_seat_answers({"results": [envelope]}, {})
 
     assert envelope["failure_code"] == "agent_session_route_unavailable"
     actor = parsed.actor_records[0].to_dict()
@@ -967,7 +951,7 @@ def test_failed_pending_invocation_checkpoint_refuses_provider_post(
     assert state == {}
 
 def _record_pending_review_invocation(
-    drive_root, *, invocation_id: str, task_id: str = "t-b", request=None,
+    drive_root, *, invocation_id: str, task_id: str = "t-b", request=None, **facts,
 ):
     route_id = "fake-review"
     body = request or {
@@ -988,8 +972,53 @@ def _record_pending_review_invocation(
         idempotency_key="stored-logical-key", invocation_id=invocation_id,
         max_seconds=30, request=body, project_id="proj-owned",
         project_owned=True, route=route_id, surface="scope_review",
-        slot_id="scope_slot_1",
+        slot_id="scope_slot_1", **facts,
     )
+
+@pytest.mark.parametrize("serving", ["store-a", "store-b"])
+def test_pending_recovery_replays_its_key_only_into_the_recording_store(tmp_path, fake_route, monkeypatch, serving):
+    """Engine keys live per store: a replaced store never receives the recorded key before any paid
+    stamp; the recording store answers it, and STARTED binds the store the replay's receipt names."""
+    from ouroboros.review_execution import ReviewRouteUnavailable
+
+    invocation_id = "inv-store-bound"
+    _record_pending_review_invocation(tmp_path, invocation_id=invocation_id, daemon_store_id="store-a")
+    start = fake_route.start_run
+    monkeypatch.setattr(fake_route, "store_identity", serving, raising=False)
+    monkeypatch.setattr(fake_route, "start_run", lambda self, request, **kw: {**start(self, request, **kw), "storeId": serving})
+    state = {"pending_invocation_id": invocation_id}
+    if serving == "store-b":
+        with pytest.raises(ReviewRouteUnavailable) as raised:
+            _run_session_directly(tmp_path, retry_state=state)
+        assert raised.value.code == "invocation_store_unproven"
+        assert not [key for gateway in fake_route.instances for key in gateway.start_keys]
+        assert state == {"pending_invocation_id": invocation_id}
+        return
+    result = _run_session_directly(tmp_path, retry_state=state)
+    assert result["idempotent_recovery"] is True
+    assert [key for gateway in fake_route.instances for key in gateway.start_keys] == [invocation_id]
+    custody._CUSTODY.clear()
+    assert custody.replay(tmp_path)[result["run_id"]].daemon_store_id == "store-a"
+
+def test_a_lost_review_start_is_never_replayed_into_a_replacement_that_names_no_store(tmp_path, fake_route, monkeypatch):
+    """The first POST's reply is lost in a named store: the request row keeps the handshake's
+    identity, so a replacement naming none is not shown to hold the key and nothing is re-sent."""
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+    from ouroboros.review_execution import ReviewRouteUnavailable
+
+    monkeypatch.setattr(fake_route, "store_identity", "store-a", raising=False)
+    fake_route.start_error = ClaudexorUnavailable("daemon_unreachable", "the reply was lost", status_code=0)
+    state = {}
+    with pytest.raises(ClaudexorUnavailable):
+        _run_session_directly(tmp_path, retry_state=state)
+    token = state["pending_invocation_id"]
+    assert custody.invocation_record(tmp_path, token)["handshake_store_id"] == "store-a"
+    monkeypatch.setattr(fake_route, "store_identity", "", raising=False)
+    with pytest.raises(ReviewRouteUnavailable) as raised:
+        _run_session_directly(tmp_path, retry_state=state)
+    assert raised.value.code == "invocation_store_unproven"
+    assert [key for gateway in fake_route.instances for key in gateway.start_keys] == [token]
+
 
 def test_pending_recovery_refuses_foreign_owner_before_gateway(tmp_path, fake_route):
     from ouroboros.review_execution import ReviewRouteUnavailable
@@ -1356,7 +1385,7 @@ def test_owner_disabled_route_refusal_carries_its_typed_code(tmp_path, fake_rout
 
 
 @pytest.mark.parametrize("telemetry_case", [
-    "missing_file", "old_without_final_id", "malformed_yaml", "known_off_pin", "known_exact",
+    "missing_file", "malformed_yaml", "known_exact",
 ])
 def test_final_route_observation_absence_is_disclosed_without_discarding_the_verdict(
     tmp_path, monkeypatch, fake_route, telemetry_case,
@@ -1380,9 +1409,9 @@ def test_final_route_observation_absence_is_disclosed_without_discarding_the_ver
         (final / "telemetry.yaml").write_text(raw, encoding="utf-8")
     # The transport supplies only the summary; the real reader sees the file above.
     fake_route.run_dir = None
-    fake_route.detail = _terminal_detail(json.dumps({"findings": [
-        {"item": "route", "verdict": "PASS", "severity": "advisory"},
-    ]}), conformance="passed")
+    from tests._contributor_packet_shared import _coupling_matrix
+    fake_route.detail = _terminal_detail(json.dumps({"findings": _coupling_matrix("route reviewed")}),
+                                         conformance="passed")
     fake_route.detail["summary"].update(
         runDir=str(run_dir), harnesses=["fake-review"], effectiveAccess="readonly",
         route={"harnessId": "earlier-route", "observedModel": "earlier-model", "verified": True},

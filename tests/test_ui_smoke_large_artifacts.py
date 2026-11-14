@@ -47,15 +47,32 @@ def _native_file_api(port, read_sizes):
         response.read = read
         return response
 
+    from ouroboros.launcher_background import DesktopApi
+
+    # MainApi's real base, and `background` as a headless launch leaves it (no window, no indicator).
+    # Its class body also reads the shell facts: deterministic and empty here, no download reads them.
     namespace = {"actual_port": port, "pathlib": pathlib, "shutil": shutil,
                  "tempfile": tempfile, "base64": base64, "log": logging.getLogger(__name__),
+                 "DesktopApi": DesktopApi, "background": None, "_shell_facts": lambda: {},
                  "urllib": SimpleNamespace(parse=urllib.parse, request=SimpleNamespace(urlopen=open_recorded))}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(source), "exec"), namespace)
     return namespace["MainApi"](), sha256(source.read_bytes()).hexdigest()
 
 
+def test_native_download_harnesses_build_the_launchers_real_bridge_class():
+    """Default lane, no browser or window: both opt-in download harnesses execute MainApi's real class
+    body, so a name it newly reads at class time fails here instead of only inside a browser run."""
+    from tests.test_widget_stream_download_ui import native_file_api
+
+    launcher = Path(__file__).resolve().parents[1] / "launcher.py"
+    for harness in (_native_file_api, native_file_api):
+        api, digest = harness(0, [])
+        assert type(api).__name__ == "MainApi" and callable(api.download_file_to_downloads)
+        assert api.shell_info()["native_notifications"]["status"] == "unavailable", "headless: no adapter"
+        assert digest == sha256(launcher.read_bytes()).hexdigest()
+
+
 @pytest.mark.ui_browser
-@pytest.mark.serial
 def test_large_attachment_returns_through_real_document_handler_and_download(
     direct_server_with_data, monkeypatch, tmp_path,
 ):
@@ -155,7 +172,8 @@ def test_large_attachment_returns_through_real_document_handler_and_download(
             assert page.locator(".attach-badge").count() == 28
             page.locator("#chat-input").fill("Return the large attached dataset as a downloadable document.")
             page.locator("#chat-send").click()
-            card = page.locator(".chat-file-card").filter(has_text="large-delivery.bin")
+            # The delivered document, not the owner's own attachment card of the same name.
+            card = page.locator(".chat-bubble.assistant .chat-file-card").filter(has_text="large-delivery.bin")
             card.wait_for(state="visible", timeout=60_000)
             assert calls and len(document_frames) == 1
             frame = document_frames[0]

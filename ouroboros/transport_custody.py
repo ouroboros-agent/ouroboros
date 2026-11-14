@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import ipaddress
 import logging
 import socket
@@ -9,6 +11,52 @@ from typing import Any
 from urllib.parse import urlsplit
 
 log = logging.getLogger(__name__)
+
+# Two separate scopes carry a Main send's physical attempts. ``single_physical_send`` is the caller's strict one-send
+# claim: ``claim(reservation)`` writes ahead at the dispatch boundary and the lanes run no repair of their own.
+# ``track_physical_attempts`` keeps durable custody while retries stay with their owners (wire, image, context):
+# ``tracker(reservation)`` before each dispatch, ``tracker.attempt_ended(capture, error)`` at its end. Both may bind one
+# attempt at once; a tracker authorizes no retry.
+_SINGLE_SEND = contextvars.ContextVar("single_physical_send", default=None)
+_ATTEMPT_TRACKER = contextvars.ContextVar("physical_attempt_tracker", default=None)
+
+
+@contextlib.contextmanager
+def single_physical_send(claim):
+    token = _SINGLE_SEND.set(claim)
+    try:
+        yield
+    finally:
+        _SINGLE_SEND.reset(token)
+
+
+def single_send_claim() -> Any:
+    return _SINGLE_SEND.get()
+
+
+def single_physical_send_active() -> bool:
+    return _SINGLE_SEND.get() is not None
+
+
+@contextlib.contextmanager
+def track_physical_attempts(tracker):
+    token = _ATTEMPT_TRACKER.set(tracker)
+    try:
+        yield
+    finally:
+        _ATTEMPT_TRACKER.reset(token)
+
+
+def physical_attempt_tracker() -> Any:
+    return _ATTEMPT_TRACKER.get()
+
+
+def report_attempt_end(capture: Any, error: Any) -> None:
+    """Hand the bound tracker one attempt's end, as ``_record_attempt_capture`` records it; the capture taken before
+    dispatch (``reserved``, no error) is not an end."""
+    tracker = _ATTEMPT_TRACKER.get()
+    if tracker is not None and (error is not None or capture.state != "reserved"):
+        tracker.attempt_ended(capture, error)
 
 
 class ProviderNotDispatched(RuntimeError):
@@ -145,6 +193,51 @@ def _capture_on_chain(error: BaseException) -> Any:
     return capture
 
 
+def stream_incomplete_on_chain(error: BaseException, *, exclude_rejected: bool = False) -> bool:
+    """Read the stream fact; terminal local rejection keeps its separate policy."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while isinstance(current, BaseException) and id(current) not in seen:
+        seen.add(id(current))
+        if getattr(current, "stream_incomplete", False):
+            return not (exclude_rejected and getattr(current, "stream_rejected", False))
+        current = transport_exception_cause(current)
+    return False
+
+
+def outcome_unknown_on_chain(error: BaseException) -> bool:
+    """Whether the response is incomplete or has no terminal provider fact.
+
+    Provider-independent: a generic API exception, or a wrapper whose explicit
+    cause carries the capture, reads exactly like the typed Claudexor error.
+    A received price can settle money while the response remains incomplete.
+    """
+    return (stream_incomplete_on_chain(error, exclude_rejected=True)
+            or getattr(_capture_on_chain(error), "state", None) in {"dispatched", "unresolved"})
+
+
+def attempt_end_known(capture: Any, error: BaseException | None) -> bool:
+    """Whether an ended attempt can never answer later, so a further send cannot overlap it.
+
+    It never left the host, its response came back (an unpriced one too: money is not the
+    response), its provider or engine answered with a typed status before any model output,
+    or its failure settled. No answer, a declared timeout, an abandoned receiver, a typed
+    unknown outcome or a stream cut after output stay unknown. Never a retry decision.
+    """
+    if capture is None:
+        return False
+    if capture.state == "released" or error is None:
+        return True
+    receipt = getattr(error, "stream_receipt", None)
+    quiet = isinstance(receipt, dict) and receipt.get("model_output_received") is False
+    if (getattr(error, "receiver_abandoned", False) or getattr(error, "explicit_timeout", False)
+            or getattr(error, "code", "") == "model_outcome_unknown"
+            or (stream_incomplete_on_chain(error, exclude_rejected=True) and not quiet)):
+        return False
+    status = capture.provider_status_code
+    return capture.state == "settled" or (type(status) is int and status >= 400)
+
+
 def _requests_protocol_death(exc: BaseException) -> Any:
     """The innermost typed death inside a requests body-disconnect wrapper, or None.
 
@@ -207,13 +300,22 @@ def is_retryable_transport_death(exc: BaseException) -> bool:
     and — the classifier's locality gate — NOT a local provider or a loopback
     route, whose dead server is not a network fault worth paying for again. A
     missing capture proves nothing and fails closed.
+
+    Running turns, Presence included, use shared configured-route recovery
+    (``loop_transport.new_generation_after_unknown``). This predicate serves
+    ``loop_llm_call``'s explicit low-level repeat API and retained old records,
+    a compatibility surface, not production Presence policy. Each opted-in
+    repeat has its own attempt and unknown cost; ``TRANSPORT_DEATHS_KEY`` binds
+    the count/failure to its round. Budget/deadline still bind, and an open
+    record permits only a typed-death repeat or free pre-dispatch redial.
     """
     if is_pre_dispatch_transport_failure(exc):
         return False  # the free released class: the two predicates are never both true
     capture = _capture_on_chain(exc)
     if (
         capture is None
-        or str(getattr(capture, "state", "") or "") not in ("dispatched", "unresolved")
+        or str(getattr(capture, "state", "") or "") not in ("dispatched", "unresolved", "settled")
+        or not outcome_unknown_on_chain(exc)
         or str(getattr(capture, "provider", "") or "") == "local"
         or bool(getattr(capture, "route_is_loopback", False))
     ):
@@ -234,7 +336,7 @@ def is_retryable_transport_death(exc: BaseException) -> bool:
     return False
 
 
-def release_pre_dispatch_attempt(reservation: Any, exc: BaseException) -> bool:
+def release_pre_dispatch_attempt(reservation: Any, exc: BaseException, *, expected_revision: int | None = None) -> bool:
     """Release a marked attempt only after a typed pre-dispatch transport fact."""
     if not is_pre_dispatch_transport_failure(exc):
         return False
@@ -245,6 +347,7 @@ def release_pre_dispatch_attempt(reservation: Any, exc: BaseException) -> bool:
             reservation,
             "released",
             _allow_dispatched_release=True,
+            _expected_revision=expected_revision,
             reason=f"before_dispatch_failed:{type(exc).__name__}",
         )
     except Exception:
@@ -253,23 +356,53 @@ def release_pre_dispatch_attempt(reservation: Any, exc: BaseException) -> bool:
     return True
 
 
+def _provider_error_type(error: BaseException, capture: Any) -> str:
+    """The provider's own error type: an explicit ``type`` on the error or its causes (Claudexor's
+    vendorCode), else the capture's value unless that is only an exception class name on the chain,
+    which ``_provider_exception_facts`` substitutes for the classifier as provenance, not a vendor code."""
+    names: set = set()
+    seen: set = set()
+    current: Any = error
+    while isinstance(current, BaseException) and id(current) not in seen:
+        seen.add(id(current))
+        names.add(type(current).__name__)
+        explicit = getattr(current, "type", None)
+        if isinstance(explicit, str) and explicit.strip():
+            return explicit.strip()
+        current = transport_exception_cause(current)
+    captured = str(getattr(capture, "provider_error_type", "") or "")
+    return "" if captured in names else captured
+
+
 def attempt_custody_event_fields(error: BaseException) -> dict:
     """Additive custody binding for durable error events (nanny-leaf S3).
 
     The physical-attempt capture already rides the exception; without these
     fields the durable ``llm_api_error`` row cannot be joined to the attempt
     ledger, and the transport class of a wrapped cause (ConnectError vs
-    RemoteProtocolError) is unrecoverable after the fact. Bounded type names
-    only — never raw cause text.
+    RemoteProtocolError) is unrecoverable after the fact. A failed stream adds
+    its decoder's typed facts: generation id, whether model output had arrived,
+    and an explicit provider timeout. Bounded type names and identifiers only —
+    never raw cause text.
     """
     capture = _capture_on_chain(error)
     fields: dict = {}
     if capture is not None:
         fields["physical_attempt_id"] = str(getattr(capture, "attempt_id", "") or "")
         fields["attempt_custody_state"] = str(getattr(capture, "state", "") or "")
-        provider_error_type = str(getattr(capture, "provider_error_type", "") or "")
-        if provider_error_type:
-            fields["provider_error_type"] = provider_error_type
+        if stream_incomplete_on_chain(error):
+            fields["stream_incomplete"] = True
+    provider_error_type = _provider_error_type(error, capture)
+    if provider_error_type:
+        fields["provider_error_type"] = provider_error_type
+    receipt = getattr(error, "stream_receipt", None)
+    receipt = receipt if isinstance(receipt, dict) else {}
+    if isinstance(receipt.get("generation_id"), str) and receipt["generation_id"]:
+        fields["generation_id"] = receipt["generation_id"]
+    if receipt.get("model_output_received") is True:
+        fields["model_output_received"] = True
+    if getattr(error, "explicit_timeout", False) is True:
+        fields["explicit_timeout"] = True
     # The same walk the death predicate uses: the explicit ``__cause__`` chain,
     # plus — at every link including the error itself, because the requests lane
     # raises its ConnectionError bare — the typed death requests keeps in

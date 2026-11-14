@@ -5,36 +5,42 @@ client. This tests the real network gate without exposing a test server on LAN.
 """
 from __future__ import annotations
 
-import os
 import json
-from pathlib import Path
+import os
 import re
 import shutil
+from pathlib import Path
 
 import pytest
 
 from tests import test_widget_stream_download_ui as widget_fixture
+from tests._shared import producer_evidence_dir
 from tests.test_author_ui_kit import EXAMPLE, _copy_installed_runtime
 
-pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
+pytestmark = [pytest.mark.ui_browser]
 REPO = Path(__file__).resolve().parents[1]
 
 _HOST = """<!doctype html><html><head><meta charset="utf-8">
+<script src="/static/theme.js"></script>
 <link rel="stylesheet" href="/static/ui.css"><link rel="stylesheet" href="/static/style.css">
 </head><body><h1>Installed author controls</h1><div id="consumers"></div>
 <script type="module">
 import {mountModuleWidget, mountRouteIframeWidget} from '/static/modules/widget_module.js';
 window.handlers = new Set(); window.disposers = {}; window.disposed = 0;
+// Each mount mints its lease for a live tab: the module tab, or the route page's tab for any own route.
+const live = (await (await fetch('/api/widgets')).json()).ui_tabs.filter(row => row.skill === 'export_widget');
 window.addEventListener('message', event => { if (event.data?.fixtureDisposed) window.disposed++; });
 window.mountExample = async (id, kind) => {
   const card = document.createElement('section'); card.dataset.widgetKey = id;
   card.innerHTML = '<h2></h2><div class="widgets-card-status"></div><div class="mount"></div>';
   card.querySelector('h2').textContent = id;
   document.getElementById('consumers').append(card);
-  const mount = card.querySelector('.mount'), tab = {skill:'export_widget', ws_prefix:'ext:export_widget:'};
+  const row = live.find(row => row.tab_id === (kind === 'module' ? 'module' : 'page'));
+  const mount = card.querySelector('.mount'), tab = {skill:'export_widget', ws_prefix:'ext:export_widget:',
+    tab_id: row.tab_id, generation: row.generation};
   window.disposers[id] = kind === 'module'
-    ? await mountModuleWidget(mount, tab, {entry:'widget.js', height:420}, null, window.handlers)
-    : mountRouteIframeWidget(mount, tab, {route:kind, height:420});
+    ? await mountModuleWidget(mount, tab, {entry:'widget.js', height:420, appearance:'host'}, null, window.handlers)
+    : await mountRouteIframeWidget(mount, tab, {route:kind, height:420});
 };
 await mountExample('module-old', 'module');
 await mountExample('page-old', 'page');
@@ -55,7 +61,11 @@ def register(api):
 
 
 def _style_document(installed, document):
-    """Use each real product document's stylesheet order and real primitives."""
+    """A synthetic reference page: one product document's stylesheet links, in order, and the real primitives.
+
+    Its root has neither `ouro-ui` nor `data-theme`, so it shows the base recipes an author area receives,
+    not the product document's themed capsules.
+    """
     source = (installed / "web" / document).read_text(encoding="utf-8")
     links = "\n".join(re.findall(r'<link\b[^>]*rel="stylesheet"[^>]*>', source))
     assert '/static/ui.css' in links, "the shared layer must serve both product documents"
@@ -77,6 +87,7 @@ def author_kit_server(tmp_path, monkeypatch):
     import uvicorn
     from starlette.responses import HTMLResponse
     from starlette.routing import Mount, Route
+
     from ouroboros import server_auth
     from ouroboros.server_web import NoCacheStaticFiles
     from tests import _extension_loader_shared as extension_fixture
@@ -102,13 +113,15 @@ def author_kit_server(tmp_path, monkeypatch):
     requests = []
     original_config = uvicorn.Config
 
-    def configured(app, **kwargs):
-        app.router.routes.extend([
+    def configured(gated, **kwargs):
+        # widget_server already puts its app behind the real gate (leases); add the product mounts behind it.
+        gated.app.router.routes.extend([
+            # The product mounts: the core's builtin tree under /onboarding/static, the interface at /static.
+            Mount("/onboarding/static", NoCacheStaticFiles(directory=installed / "web")),
             Mount("/static", NoCacheStaticFiles(directory=installed / "web")),
             Route("/style-spa", lambda request: HTMLResponse(_style_document(installed, "index.html"))),
             Route("/style-wizard", lambda request: HTMLResponse(_style_document(installed, "onboarding_template.html"))),
         ])
-        gated = server_auth.NetworkAuthGate(app)
 
         async def simulated_peer(scope, receive, send):
             if scope["type"] not in {"http", "websocket"}:
@@ -173,6 +186,7 @@ def test_author_kit_authenticated_mount_and_lifetime(author_kit_server, tmp_path
         try:
             context = browser.new_context(viewport={"width": 1100, "height": 850}, accept_downloads=True)
             page = context.new_page()
+            page.emulate_media(color_scheme="dark")
             errors = []
             style_mismatches = []
             browser_requests = []
@@ -187,6 +201,22 @@ def test_author_kit_authenticated_mount_and_lifetime(author_kit_server, tmp_path
             page.get_by_role("button", name="Unlock", exact=True).click()
             page.wait_for_function("window.ready === true")
             module, route, custom = [_frame(page, name) for name in ("module-old", "page-old", "custom")]
+            for frame in (module, route):
+                frame.locator('.ui-control').first.wait_for()
+            module_node = page.locator('[data-widget-key="module-old"] iframe').element_handle()
+            assert route.evaluate("window.kitCspViolations") == []
+            assert module.evaluate("document.documentElement.dataset.theme") == "dark"
+            page.evaluate("() => window.ouroTheme.set('light')")
+            module.locator('html[data-theme="light"]').wait_for(state="attached")
+            assert page.evaluate(
+                "node => document.querySelector('[data-widget-key=\\\"module-old\\\"] iframe') === node",
+                module_node,
+            )
+            assert module.evaluate(
+                "getComputedStyle(document.querySelector('.ui-control')).backgroundColor"
+            ) == "rgb(245, 246, 248)"
+            page.evaluate("() => window.ouroTheme.set('dark')")
+            module.locator('html[data-theme="dark"]').wait_for(state="attached")
             for frame in (module, route):
                 frame.get_by_role("button", name="Preview", exact=True).wait_for()
                 assert frame.get_by_label("Title", exact=True).input_value() == "My notes"
@@ -214,7 +244,8 @@ def test_author_kit_authenticated_mount_and_lifetime(author_kit_server, tmp_path
                 assert element.get_attribute("allow") == "autoplay; fullscreen; clipboard-write"
             assert not page.locator(".widgets-card-status").all_text_contents()[0].strip()
 
-            # Compare actual renderer controls under the real two documents' CSS.
+            # Compare the author frames' controls with each synthetic reference page by the listed
+            # computed metrics: not byte identity with, nor themed parity to, the product documents.
             style_pages = [context.new_page() for _ in range(2)]
             for style_page, name in zip(style_pages, ("spa", "wizard")):
                 style_page.goto(server["url"] + "/style-" + name)
@@ -303,7 +334,7 @@ def test_author_kit_authenticated_mount_and_lifetime(author_kit_server, tmp_path
             }""")
             page.wait_for_function("window.handlers.size === 1")
             page.evaluate("() => handlers.forEach(handler => handler({type:'ext:export_widget:tick', data:{value:'delivered'}}))")
-            module.wait_for_function("document.getElementById('root').dataset.event === 'delivered'")
+            module.locator('#root[data-event="delivered"]').wait_for(state="attached")
             with page.expect_download() as download:
                 module.get_by_role("button", name="Export example", exact=True).click()
             assert Path(download.value.path()).read_text(encoding="utf-8") == "author kit export"
@@ -313,8 +344,14 @@ def test_author_kit_authenticated_mount_and_lifetime(author_kit_server, tmp_path
             failed = _frame(page, "unavailable")
             failed.get_by_text("Controls unavailable: HTTP 503", exact=True).wait_for()
             assert route.get_by_role("button", name="Preview", exact=True).is_visible()
-            evidence = Path(os.environ.get("OUROBOROS_UI_EVIDENCE_OUT", str(tmp_path / "evidence")))
+            evidence = producer_evidence_dir(tmp_path / "evidence", "author-ui-kit",
+                                             env="OUROBOROS_UI_EVIDENCE_OUT")
             evidence.mkdir(parents=True, exist_ok=True)
+            page.evaluate("() => window.ouroTheme.set('light')")
+            module.locator('html[data-theme="light"]').wait_for(state="attached")
+            module.locator('body').screenshot(
+                path=str(evidence / f"author-kit-{browser_name}-module-light.png")
+            )
             for key in ("module-old", "page-old", "custom", "module-new", "page-new", "unavailable"):
                 card = page.locator(f'[data-widget-key="{key}"]')
                 card.scroll_into_view_if_needed()

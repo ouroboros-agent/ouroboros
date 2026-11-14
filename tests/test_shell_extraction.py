@@ -51,11 +51,9 @@ _MOVED_OWNERS = {
     "_snapshot_declared_outputs": shell_outputs,
     "_get_changed_files": shell_effects,
     "_get_diff_stat": shell_effects,
-    "_protected_runtime_dirty_paths": shell_effects,
     "_record_scratch_fingerprints": shell_effects,
     "_resolve_git_root": shell_effects,
     "_resolve_scratch_abs": shell_effects,
-    "_restore_protected_runtime_paths": shell_effects,
     "_scratch_safety_reason": shell_effects,
     "_shallow_listing": shell_effects,
     "_status_snapshot": shell_effects,
@@ -110,8 +108,34 @@ def test_shell_catalog_schema_bytes_and_handler_owners_are_stable():
     # run_script accepts any installed file interpreter; its temporary file
     # lives in an ignored workspace directory or the existing task drive.
     # Workflow scope: explicit saved-setting references and lazy-output guidance.
+    # run_command states its real contract: only a bare builtin as cmd[0] is
+    # refused, a background child stalls the call and is never tracked after it
+    # (tests/test_run_command_schema_truth.py). Rolled once more: the sentence no
+    # longer says the child is never STOPPED, which is false where the timeout kill
+    # still reaches the exited shell's process group (Linux). Rolled again for
+    # source-addressed delivery (owner Q4): both tools gain the additive
+    # `view_head_chars`/`view_tail_chars` first-view request (the complete output
+    # stays an exact readable source either way); the handlers' **kwargs bind them.
+    # Both cwd descriptions now say Docker backend aliases inside active_workspace
+    # are accepted (#1515); restoring only those two strings reproduces 47e50519….
+    # Rolled for owner decision 2A (issue #1772): a background child now lives until the
+    # TASK ends and is then ended by scope (tests/test_run_command_schema_truth.py);
+    # start_service with keep_alive=true is the path that outlives the task. Rolled again
+    # (whole review, 2026-10-13): that task-end promise names its limit, local POSIX runs
+    # only (Windows has no census; a Docker backend's children live in its container),
+    # paid for inside the same description. Rolled for #1797 (owner decisions 18 Oct): both
+    # outputs descriptions say a refused declaration stops the call before it starts and that
+    # only outputs accept a relative '../', judged by resolved location. Rolled for the
+    # tool-reuse sprint (20.10): run_script says the selected cwd is not on Python's
+    # import path and that a reusable script lives in a skill payload run with run_command.
+    # Rolled for the R1 platform-wait refusal: both timeout_sec descriptions say only the task's deadline or budget
+    # narrows a timeout and that one this platform cannot wait on is refused. Rolled for #2916: both outputs
+    # descriptions say an eligible path is captured even if this run left it unchanged, and that outside Cyber
+    # Pro a system_repo file is eligible only while it has uncommitted changes. Audit 08.11 item12 names what
+    # stop-by-pid/name reaches; cmd already describes argv. Result review adds capture after failure only for
+    # outputs the command created or changed. This pin covers both contributions' composed descriptions.
     assert hashlib.sha256(schema_bytes).hexdigest() == (
-        "87606208e795ede931339a7ba106fd0cf795fae314e1bc02cafaba6af8c62660"
+        "5616a38354c302a9e984fa2ca29446ff44a1b224335598ff30770ee1931ead0b"
     )
     original = json.loads(schema_bytes)
     for schema in original:
@@ -124,9 +148,12 @@ def test_shell_catalog_schema_bytes_and_handler_owners_are_stable():
         "Use for multi-line diagnostics or harness helpers; generated script files live under the task drive. "
         "The underlying command result echoes the resolved cwd."
     )
+    # The reconstruction keeps run_command's CURRENT description (the 2A background-child
+    # sentence and its local-POSIX limit, the process-stop fact of audit 08.11 item 12), so this
+    # derived digest rolled with the one above.
     assert hashlib.sha256(json.dumps(original, sort_keys=True, ensure_ascii=False,
                                     separators=(",", ":")).encode()).hexdigest() == (
-        "a85e03bfc1a9834116b3ada4ce86638a56a1fec267e289e23a5a8f31e8a12f60"
+        "626c01b93f859e8487d972665c5aed91fce33dd52f35b523ecfae59a7cdc2186"
     )
     assert {
         entry.name: (entry.handler.__module__, entry.handler.__name__)
@@ -147,15 +174,3 @@ def test_shell_facade_reexports_every_moved_identity():
     owned = {name for module in _LEAVES for name in vars(module)}
     owned |= set(vars(shell_audit))
     assert set(_MOVED_OWNERS) <= owned
-
-
-def test_shell_extraction_size_bounds_have_meaningful_headroom():
-    counts = {
-        module.__name__: len(
-            pathlib.Path(module.__file__).read_text(encoding="utf-8").splitlines()
-        )
-        for module in (shell, *_LEAVES)
-    }
-    assert counts["ouroboros.tools.shell"] <= 800
-    assert all(count <= 1000 for count in counts.values())
-    assert counts["ouroboros.tools.shell_outputs"] <= 1000

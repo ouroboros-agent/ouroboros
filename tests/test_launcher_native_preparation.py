@@ -7,7 +7,6 @@ from types import SimpleNamespace
 
 import pytest
 
-pytestmark = pytest.mark.serial
 
 
 @pytest.fixture
@@ -21,16 +20,16 @@ def lifecycle(monkeypatch, tmp_path):
     monkeypatch.setattr(launcher, '_external_host_update', tmp_path / 'native-hook')
     monkeypatch.setattr(launcher, '_external_host_result', {})
     monkeypatch.setattr(launcher, 'PORT_FILE', tmp_path / 'port')
-    monkeypatch.setattr(launcher, '_pre_generation_cleanup', lambda port: [])
-    monkeypatch.setattr(launcher, '_poll_port_file', lambda **kw: 8765)
+    monkeypatch.setattr(launcher, '_pre_generation_cleanup', lambda: [])
+    monkeypatch.setattr(launcher, '_await_generation_endpoint', lambda *a, **kw: 1)
     monkeypatch.setattr(launcher, '_update_server_process_record_port', lambda *a: None)
     monkeypatch.setattr(launcher, '_cleanup_recorded_server_group_for_pid', lambda *a: None)
-    monkeypatch.setattr(launcher, '_read_port_file', lambda: 8765)
+    monkeypatch.setattr(launcher, '_generation_port', None)
     yield launcher, shutdown
     shutdown.set()
 
 
-def test_preparation_finishes_before_any_http_readiness_budget(lifecycle, monkeypatch):
+def test_preparation_finishes_before_any_http_readiness_probe(lifecycle, monkeypatch):
     launcher, shutdown = lifecycle
     entered, release, spawned = threading.Event(), threading.Event(), threading.Event()
     calls, result = [], []
@@ -47,8 +46,8 @@ def test_preparation_finishes_before_any_http_readiness_budget(lifecycle, monkey
         spawned.set()
         return process
 
-    def health(port, timeout, abort_event=None):
-        assert spawned.is_set(), 'HTTP clock was consumed by native preparation'
+    def health(port, timeout=None, abort_event=None, proc=None):
+        assert spawned.is_set(), 'HTTP readiness probing started before native preparation ended'
         calls.append(('http', timeout))
         return True
 
@@ -56,7 +55,7 @@ def test_preparation_finishes_before_any_http_readiness_budget(lifecycle, monkey
     monkeypatch.setattr(launcher, 'start_agent', start)
     monkeypatch.setattr(launcher, '_wait_for_server', health)
     thread = threading.Thread(target=launcher.agent_lifecycle_loop)
-    waiter = threading.Thread(target=lambda: result.append(launcher._await_server_ready(8765, shutdown, thread)))
+    waiter = threading.Thread(target=lambda: result.append(launcher._await_server_ready(1, shutdown, thread)))
     thread.start()
     try:
         assert entered.wait(2)
@@ -67,8 +66,8 @@ def test_preparation_finishes_before_any_http_readiness_budget(lifecycle, monkey
         assert waiter.is_alive() and not calls and not result
         release.set()
         waiter.join(3)
-        assert result == [(True, 8765)]
-        assert calls[0] == 'spawn' and ('http', 15) in calls
+        assert result == [(True, 1)]
+        assert calls[0] == 'spawn' and ('http', None) in calls, 'the launcher probes its own child without a clock'
     finally:
         release.set(); shutdown.set()
         if waiter.ident is not None:
@@ -135,7 +134,7 @@ def test_preparation_shutdown_reaps_actual_detached_child_before_launcher_exit(t
             assert not thread.is_alive(), 'Launcher exited before native owned cleanup'
         monkeypatch.setattr(launcher, '_kill_orphaned_children', final_cleanup)
         with pytest.raises(SystemExit) as stopped:
-            launcher._run_headless_main('http://127.0.0.1:8765', 8765, thread)
+            launcher._run_headless_main('http://127.0.0.1:1', 1, thread)
         assert stopped.value.code == 0
         assert not thread.is_alive()
         assert result == [{'status': 'cancelled'}]
@@ -171,11 +170,12 @@ def test_native_budget_stays_total_across_shutdown_observation_slices(monkeypatc
     assert waits == pytest.approx([0.2, 0.2, 0.1]) and cleanup == ['reap', 'close']
 
 
-def test_no_native_hook_preserves_http_timeout_and_bound_port(lifecycle, monkeypatch):
+def test_no_native_hook_reports_the_port_the_generation_proved(lifecycle, monkeypatch):
+    """The UI waits for the lifecycle thread's proof, never a guessed port or a stale file."""
     launcher, shutdown = lifecycle
     monkeypatch.setattr(launcher, '_external_host_update', None)
-    monkeypatch.setattr(launcher, '_read_port_file', lambda: 9876)
-    calls = []
-    monkeypatch.setattr(launcher, '_wait_for_server', lambda port, **kw: calls.append((port, kw['timeout'])) or port == 9876)
-    assert launcher._await_server_ready(8765, shutdown, SimpleNamespace(is_alive=lambda: True)) == (True, 9876)
-    assert calls == [(8765, 15), (9876, 45)]
+    monkeypatch.setattr(launcher, '_wait_for_server', lambda *a, **kw: pytest.fail('the UI wait probes no port'))
+    monkeypatch.setattr(launcher, '_generation_port', 9876)
+    assert launcher._await_server_ready(1, shutdown, SimpleNamespace(is_alive=lambda: True)) == (True, 9876)
+    monkeypatch.setattr(launcher, '_generation_port', None)
+    assert launcher._await_server_ready(1, shutdown, SimpleNamespace(is_alive=lambda: False)) == (False, 1)

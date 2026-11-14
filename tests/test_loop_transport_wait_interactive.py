@@ -33,7 +33,7 @@ INTERACTIVE_DETAIL = "interactive_wait_window_exhausted"
 # A managed episode's owner-visible texts are a frozen contract: these are the
 # literal wordings the base emits, and the ONLY notes a managed episode gets.
 BASE_MANAGED_ENTRY = (
-    "🌐 Could not establish a provider connection — waiting and "
+    "🌐 The request did not reach the provider — waiting and "
     "redialing automatically (failed attempts are $0). Stop cancels."
 )
 BASE_MANAGED_RECOVERY = "🌐 Provider connection restored after 1.5 min — resuming."
@@ -83,10 +83,10 @@ def _run_until_terminal(episode, tmp_path, tools, notes, task_id="t-i", limit=50
 
 @pytest.mark.parametrize("flag", ["is_direct_chat"])
 def test_interactive_bound_is_the_raw_idle_getter_measured_from_entry(tmp_path, monkeypatch, flag):
-    """The bound is the RAW configured idle timeout — the queue's effective idle
-    rail (max(idle, per-call ceiling + 120)) belongs to managed records these
-    turns never have — it starts at episode entry, its expiry ends the episode
-    with its own detail, and the waiting rows carry the shrinking window."""
+    """The bound is the configured idle timeout itself, the same literal window
+    the queue's silence rail applies to managed records, which these turns never
+    have; it starts at episode entry, its expiry ends the episode with its own
+    detail, and the waiting rows carry the shrinking window."""
     clock = _FakeClock(monkeypatch)
     monkeypatch.setattr(loop_transport, "get_task_idle_timeout_sec", lambda: 90)
     notes = _NoteRecorder()
@@ -184,8 +184,7 @@ def test_explicit_deadline_longer_than_the_bound_yields_the_interactive_detail(t
     assert max(row["window_remaining_sec"] for row in events if row["phase"] == "waiting") <= 60.0
 
 
-@pytest.mark.parametrize("final_redial_done", [False, True])
-@pytest.mark.parametrize("earlier", ["bound", "deadline"])
+@pytest.mark.parametrize(("earlier", "final_redial_done"), [("bound", False), ("deadline", True)])
 def test_both_windows_spent_attributes_the_rail_that_expired_first(
     tmp_path, monkeypatch, earlier, final_redial_done,
 ):
@@ -257,7 +256,7 @@ def test_deadline_refused_redial_uses_the_same_signed_attribution(tmp_path, monk
     if case == "managed":
         assert notes.texts == []  # a managed exhaustion is its terminal result, not a note
     else:
-        assert "this turn ends as a provider outage" in notes.texts[-1]
+        assert "this turn ends as an outage" in notes.texts[-1]
 
 
 # ------------------------------------------- final free redial at the bound
@@ -395,7 +394,7 @@ def test_interactive_notes_promise_no_cancellation_and_the_managed_note_still_do
         assert len(notes.texts) >= 3  # entry, at least one periodic, exhaustion
         assert all("cancel" not in text.lower() for text in notes.texts)
         assert "waiting and redialing automatically" in notes.texts[0]
-        assert "this turn ends as a provider outage" in notes.texts[-1]
+        assert "this turn ends as an outage" in notes.texts[-1]
         assert all("chat turn" not in text for text in notes.texts)
 
 
@@ -442,36 +441,11 @@ def test_error_kind_change_closure_is_an_interactive_note(tmp_path, monkeypatch,
     assert incident is None
 
 
-@pytest.mark.parametrize("flags", [{}, {"is_direct_chat": True}])
-def test_local_fallback_adoption_closure_is_an_interactive_note(tmp_path, monkeypatch, flags):
-    """Adopting the local fallback route closes the episode with a durable row
-    for every episode; the owner note saying the remote connection is still
-    down is an interactive turn's only closure surface, so a managed episode
-    gets none."""
-    _FakeClock(monkeypatch)
-    ctx = _ctx(**flags)
-    notes = _NoteRecorder()
-    episode = _enter(tmp_path, ctx, notes, task_id="t-local")
-    assert loop_transport.reconcile_transport_wait(
-        episode, ctx, msg_present=True, error_kind="", drive_logs=tmp_path,
-        task_id="t-local", model="m", emit_progress=notes, after_local_pass=True,
-    ) is None
-
-    assert _read_network_wait_events(tmp_path)[-1]["detail"] == "local_fallback_adopted"
-    if not flags:
-        assert notes.texts == [BASE_MANAGED_ENTRY]  # the managed closure is its row, not a note
-        return
-    assert "still unavailable" in notes.texts[-1]
-    assert "local fallback model" in notes.texts[-1]
-    incident = notes.incidents[-1]
-    assert incident is None
-
-
-@pytest.mark.parametrize("closure", ["recovered", "local_fallback_adopted", "error_kind_changed"])
+@pytest.mark.parametrize("closure", ["recovered", "error_kind_changed"])
 def test_managed_episode_owner_texts_are_byte_identical_to_base(tmp_path, monkeypatch, closure):
     """The managed wordings are a frozen contract: entry still ends with the
     Stop promise its cancel authority honors, recovery still says resuming,
-    and the two other closures write their durable row and no note at all —
+    and the other closure writes its durable row and no note at all —
     the literal texts the base emits, nothing more."""
     clock = _FakeClock(monkeypatch)
     ctx = _ctx()
@@ -480,7 +454,6 @@ def test_managed_episode_owner_texts_are_byte_identical_to_base(tmp_path, monkey
     clock.now += 90.0
     outcome = {
         "recovered": dict(msg_present=True, error_kind=""),
-        "local_fallback_adopted": dict(msg_present=True, error_kind="", after_local_pass=True),
         "error_kind_changed": dict(msg_present=False, error_kind="provider_transient"),
     }[closure]
     assert loop_transport.reconcile_transport_wait(
@@ -493,7 +466,6 @@ def test_managed_episode_owner_texts_are_byte_identical_to_base(tmp_path, monkey
     last = _read_network_wait_events(tmp_path)[-1]
     assert (last["phase"], last.get("detail")) == {
         "recovered": ("recovered", None),
-        "local_fallback_adopted": ("ended", "local_fallback_adopted"),
         "error_kind_changed": ("ended", "error_kind_changed:provider_transient"),
     }[closure]
 

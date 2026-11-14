@@ -1,6 +1,8 @@
 """Managed-update CANDIDATE primitives: private-index tree serialization, the
 pinned mechanical-merge baseline's merge flags, the deterministic failed-update
-preservation branch, and the single-run tests-evidence contract (Q10).
+preservation branch, the single-run tests-evidence contract (Q10), and the assisted
+resolver's workers (the pool start it is owed, the apply flow's readiness proof, boot
+recovery's import barrier and its unwind).
 
 Split out of ``supervisor.update_merge`` by the module-size discipline; the
 import direction is one-way (``update_merge`` imports THIS module and re-exports
@@ -13,7 +15,9 @@ Depends on ``git_ops`` via the module object (``_g.X``) so monkeypatched
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional, Tuple
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from supervisor import git_ops as _g
 
@@ -51,7 +55,7 @@ def _git_run(
     if extra_env:
         env.update(extra_env)
     rc, out, err = _g._run_git_process_bounded(
-        cmd, timeout=timeout, cwd=cwd or _g.REPO_DIR, env=env, text=True,
+        cmd, timeout=timeout, cwd=cwd or _g.REPO_DIR, env=_g.host_git_env(env), text=True,
     )
     return rc, str(out or "").strip(), str(err or "").strip()
 
@@ -59,6 +63,25 @@ def _git_run(
 def _rev_parse(ref: str) -> str:
     rc, out, _e = _g.git_capture(["git", "rev-parse", "--verify", f"{ref}^{{commit}}"])
     return out if rc == 0 else ""
+
+
+def capture_update_step(cmd: List[str], *, first: bool = False) -> Tuple[int, str, str]:
+    """One physical tree step; retain Git's refusal and its proven effect boundary."""
+    import subprocess
+    from supervisor import update_merge
+    from supervisor.git_ops_reset import _index_lock_refused
+
+    rc, out, error = _g.git_capture(cmd, repair_index=False)
+    if rc:
+        tx = update_merge.active_update_tx()
+        if tx:
+            tx["git_failure"] = {
+                "cmd": " ".join(cmd), "returncode": rc, "stderr": error,
+                "before_tree_effects": bool(first and not tx.get("stash_sha")
+                    and _index_lock_refused(cmd, subprocess.CompletedProcess(cmd, rc, out, error))),
+            }
+            update_merge.write_update_tx(tx)
+    return rc, out, error
 
 
 def _merge_head_sha() -> str:
@@ -151,10 +174,13 @@ def live_unmerged_paths() -> Optional[List[str]]:
     """The live repo's unmerged (conflicted) paths; ``None`` when Git itself
     failed (an unreadable inventory must never masquerade as "no conflicts" —
     callers keep their previous list or fail safe)."""
-    rc_u, unmerged_out, _ue = _g.git_capture(["git", "diff", "--name-only", "--diff-filter=U"])
-    if rc_u != 0:
+    rc_u, unmerged_out, _ue = _g._run_git_process_bounded(
+        ["git", "diff", "--name-only", "--diff-filter=U", "-z"],
+        timeout=_GIT_RUN_TIMEOUT_SEC, cwd=_g.REPO_DIR, text=False,
+    )
+    if rc_u != 0 or not isinstance(unmerged_out, bytes):
         return None
-    return [ln.strip() for ln in unmerged_out.splitlines() if ln.strip()]
+    return [os.fsdecode(path) for path in unmerged_out.split(b"\0") if path]
 
 
 def _staged_blobs_batch(paths: List[bytes]) -> Tuple[Optional[Dict[bytes, bytes]], bytes]:
@@ -340,12 +366,13 @@ def record_managed_tests_evidence(
     the authorized host runner after its mandatory suite actually ran green;
     it does not replace resolver authorization. Returns the tree sha, or ''.
 
-    AUTHORITY NOTE (synthesis F2): the durable ``tests_evidence`` copy written
-    here is FORENSIC/telemetry only. The tx marker is a plain writable file the
-    authorized resolver's shell can reach, so the single-run gates
-    (``_managed_candidate_needs_proof`` / ``_managed_post_commit_tests_gate``)
-    consult ONLY the process-held record on the task ctx (see
-    ``record_managed_tests_proof``), never this file."""
+    AUTHORITY NOTE: the durable ``tests_evidence`` copy written here is
+    FORENSIC/telemetry only. The single-run gates (``_managed_candidate_needs_proof``
+    / ``_managed_post_commit_tests_gate``) consult the runner's process-held
+    record (``record_managed_tests_proof``), and the runner itself may reuse an
+    unsigned receipt of a complete run — never this file. Synthesis F2's premise
+    that a resolver-writable file must not count was retired by owner decision
+    3A: the receipt is ordinary writable state too and authenticates no one."""
     if not force and os.environ.get("OUROBOROS_PRE_PUSH_TESTS", "1") != "1":
         return ""
     from supervisor import update_merge as _um
@@ -477,9 +504,9 @@ def update_tx_phase_or_keep(base_tx: Dict[str, Any], patch: Dict[str, Any]) -> D
 
 def managed_tests_evidence_covers(committed_tree: str) -> bool:
     """True when the durable tx carries a green-suite record for EXACTLY this
-    tree. FORENSIC surface only (synthesis F2): the tx marker is
-    resolver-writable, so the single-run gates never consult this — they read
-    the process-held ctx record pinned by ``record_managed_tests_proof``."""
+    tree. FORENSIC surface only: the single-run gates never consult this —
+    they read the process-held ctx record pinned by ``record_managed_tests_proof``
+    (which the runner may have taken from an unsigned receipt)."""
     if not committed_tree:
         return False
     from supervisor import update_merge as _um
@@ -540,118 +567,152 @@ def stash_local_changes_for_update(attempt_id: str) -> Tuple[str, str, str]:
     # later. The caller fail-closes if the tree still reports dirty.
     return "ok", "", ""
 
+
+@dataclass(frozen=True)
+class StashRestoreResult:
+    """Effect, not a success-shaped note: only complete outcomes may clear a tx."""
+
+    status: Literal["not_needed", "restored", "preserved", "incomplete"]
+    note: str = ""
+    evidence: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def complete(self) -> bool:
+        return self.status != "incomplete"
+
+
+def _stash_recovery_note(stash_sha: str) -> str:
+    return (f"the original local changes remain in stash {stash_sha[:12]} "
+            "and current files should be inspected before "
+            f"recovering with `git stash apply {stash_sha}`")
+
+
 def restore_update_stash(
-    stash_sha: str, context: str = "", on_applied=None
-) -> Tuple[bool, str]:
-    """Apply-then-drop the exact update stash entry (matched by SHA).
+    stash_sha: str, context: str = "", *, before_cleanup=None,
+) -> StashRestoreResult:
+    """Apply the exact stash object; NEVER automatically drop an update stash.
 
-    On an apply conflict the partial apply is reset away and the stash entry is
-    KEPT, so local work is never lost — the returned note tells the owner the
-    exact `git stash apply` command. Restoring onto the pre-update tree (the
-    rollback path) always applies cleanly because the stash was taken there.
-    apply+drop (NOT pop) keeps this crash-idempotent: dying between apply and
-    drop leaves the entry in place for the replay. ``on_applied`` runs between
-    the successful apply and the drop so the caller can persist a durable
-    "restored" marker that survives a crash in that window."""
+    Transaction callers record intent before entering here and retain diagnostics
+    through ``before_cleanup`` before resetting a failed partial apply. Cleanup is
+    allowed only after a clean starting tree and is itself verified. A missing list
+    entry says nothing about restoration: the exact object is the carrier.
+    """
     if not stash_sha:
-        return True, ""
-    rc_l, listing, list_error = _g.git_capture(["git", "stash", "list", "--format=%H %gd"])
-    if rc_l != 0:
-        return False, list_error or "could not list stash entries"
-    ref = ""
-    for line in listing.splitlines():
-        sha, _sep, name = line.strip().partition(" ")
-        if sha == stash_sha and name:
-            ref = name
-            break
-    if not ref:
-        return True, (
-            "stash entry not found in the stash list (already consumed after a "
-            "verified restore, or dropped externally)"
-        )
-    # Apply by EXACT SHA (git stash apply accepts any stash-shaped commit): a
-    # concurrent stash push/drop can shift the stash@{n} selector between the
-    # list and the apply, and a selector-based apply would then touch someone
-    # else's entry.
-    rc_p, _po, apply_error = _g.git_capture(["git", "stash", "apply", stash_sha])
-    if rc_p == 0:
-        if on_applied is not None:
-            try:
-                on_applied()
-            except Exception:
-                _g.log.warning("restore_update_stash on_applied hook failed", exc_info=True)
-        # Drop needs a selector, and selectors shift under concurrent stash
-        # traffic. Drop ONLY when the list is byte-identical to the pre-apply
-        # snapshot (nothing external happened) and the selector still names our
-        # exact SHA; otherwise keep the entry — an undropped own entry is
-        # harmless litter, a dropped foreign entry is someone's lost work.
-        rc_l2, listing2, _le2 = _g.git_capture(["git", "stash", "list", "--format=%H %gd"])
-        drop_ref = ""
-        if rc_l2 == 0 and listing2 == listing:
-            for line in listing2.splitlines():
-                sha2, _sep2, name2 = line.strip().partition(" ")
-                if sha2 == stash_sha and name2:
-                    drop_ref = name2
-                    break
-        if drop_ref:
-            _g.git_capture(["git", "stash", "drop", drop_ref])
-        else:
-            _g.log.info("stash entry %s kept (list changed during restore)", stash_sha[:12])
-        from supervisor.update_merge import _log_supervisor
+        return StashRestoreResult("not_needed")
+    if _rev_parse(stash_sha) != stash_sha:
+        return StashRestoreResult("incomplete", f"could not verify update stash {stash_sha}")
+    recovery = _stash_recovery_note(stash_sha)
+    rc_s, dirty, status_error = _g.git_capture(["git", "status", "--porcelain"])
+    if rc_s != 0:
+        return StashRestoreResult("incomplete", f"could not inspect current files: {status_error}; {recovery}")
+    if dirty:
+        return StashRestoreResult("preserved", f"local changes are present, so the stash was NOT auto-applied; {recovery}")
+    rc, stdout, stderr = _g.git_capture(["git", "stash", "apply", stash_sha])
+    evidence = {"apply_returncode": rc, "stdout": stdout, "stderr": stderr}
+    if rc == 0:
+        return StashRestoreResult("restored", "local changes restored; the update stash was retained", evidence)
+    conflicts = live_unmerged_paths()
+    evidence["conflict_paths"] = conflicts
+    if conflicts:
+        import json
 
-        _log_supervisor({
-            "type": "managed_update_stash_restored",
-            "context": context,
-            "stash_sha": stash_sha,
-        })
-        return True, "local changes restored"
-    _g.git_capture(["git", "reset", "--hard", "HEAD"])
-    _g.git_capture(["git", "clean", "-fd"])
-    note = (
-        "local changes could not be restored automatically "
-        f"({(apply_error or '').strip() or 'conflict with the updated tree'}); they are "
-        f"preserved in git stash entry {stash_sha[:12]} — recover with "
-        f"`git stash apply {stash_sha}`"
-    )
-    from supervisor.update_merge import _log_supervisor
+        problem = "conflicting paths: " + ", ".join(json.dumps(path, ensure_ascii=False) for path in conflicts)
+    elif conflicts is None:
+        problem = "git stash apply failed; the conflict inventory could not be read"
+    else:
+        problem = "git stash apply failed without tracked conflicts (untracked collisions are not in that inventory)"
+    diagnostics = "\n".join(part for part in (stdout, stderr) if part)
+    note = f"{problem}; {recovery}" + (f"\nGit diagnostics:\n{diagnostics}" if diagnostics else "")
+    if before_cleanup is not None:
+        before_cleanup({"status": "cleanup_pending", "note": note, **evidence})
+    cleanup = {}
+    for name, cmd in (("reset", ["git", "reset", "--hard", "HEAD"]),
+                      ("clean", ["git", "clean", "-fd"])):
+        code, out, err = _g.git_capture(cmd)
+        cleanup[name] = {"returncode": code, "stdout": out, "stderr": err}
+        if code != 0:
+            return StashRestoreResult("incomplete", f"{note}\nPartial-apply cleanup failed at {name}: {err or out}",
+                                      {**evidence, "cleanup": cleanup})
+    rc_s, dirty, status_error = _g.git_capture(["git", "status", "--porcelain"])
+    evidence["cleanup"] = {**cleanup, "verified_clean": rc_s == 0 and not dirty}
+    if rc_s != 0 or dirty:
+        return StashRestoreResult("incomplete", f"{note}\nPartial-apply cleanup was not verified: {status_error or dirty}", evidence)
+    return StashRestoreResult("preserved", note, evidence)
 
-    _log_supervisor({
-        "type": "managed_update_stash_restore_failed",
-        "context": context,
-        "stash_sha": stash_sha,
-        "error": (apply_error or "").strip(),
-    })
-    return False, note
 
-def restore_stash_with_marker(tx: Dict[str, Any], context: str) -> str:
-    """Marker-guarded stash restore for every tx-clearing path: skips when a prior
-    attempt already restored (a crash between apply and drop must not let a REPLAY
-    conflict against the already-restored copy and reset it away), and persists the
-    ``stash_restored`` marker between apply and drop. Returns the disclosure note."""
+def restore_stash_with_marker(tx: Dict[str, Any], context: str) -> StashRestoreResult:
+    """One recovery owner for all completion paths, with write-ahead custody.
+
+    ``stash_restore`` is schema-2 evidence: old strict readers refuse it. Legacy
+    ``stash_restored`` still means a successful recorded apply, never its intent.
+    An interrupted apply/cleanup is NOT replayed: once the store works again the
+    saved backup is handed back with an honest unknown-outcome note, preserving
+    both the current files and any subsequent owner edits. A fresh restore does not start
+    while this checkout's ``index.lock`` exists; the caller's transaction keeps the work gated.
+    """
+    from supervisor import update_merge as _um
+
     stash_sha = str(tx.get("stash_sha") or "")
-    if not stash_sha or bool(tx.get("stash_restored")):
-        return ""
-    # Restoring onto a DIRTY tree is never safe: a conflicting apply's cleanup
-    # (reset --hard + clean -fd) would wipe whatever made the tree dirty — late
-    # human edits in an abort-unwind, an operator's work on a diverged head.
-    # Rollback/finalize call this on verified-clean trees, so this guard only
-    # fires where the destructive cleanup would actually cost something.
-    rc_s, dirty, _se = _g.git_capture(["git", "status", "--porcelain"])
-    if rc_s != 0 or dirty.strip():
-        return (
-            "local changes are present, so the stashed work was NOT auto-applied; it is "
-            f"preserved in git stash entry {stash_sha[:12]} — recover with "
-            f"`git stash apply {stash_sha}`"
+    record = tx.get("stash_restore") or {}
+    if not stash_sha:
+        return StashRestoreResult("not_needed")
+    if not record and tx.get("stash_restored"):
+        return StashRestoreResult("restored")  # existing schema-1 success evidence
+
+    def persist(value: Dict[str, Any]) -> None:
+        updated = {**tx, "stash_restore": {"context": context, "stash_sha": stash_sha, **value}}
+        if value["status"] == "restored":
+            updated["stash_restored"] = True
+        _um.write_update_tx(updated)
+        tx.update(updated)  # never publish an in-memory success before the write
+
+    try:
+        if record.get("status") in {"restored", "preserved"}:
+            result = StashRestoreResult(record["status"], record.get("note", ""), record.get("evidence", {}))
+        elif record:
+            if _rev_parse(stash_sha) != stash_sha:
+                return StashRestoreResult("incomplete", f"interrupted restore: could not verify stash {stash_sha}")
+            result = StashRestoreResult(
+                "preserved", "the automatic restore was interrupted; its result is unconfirmed and current files were left unchanged; "
+                + _stash_recovery_note(stash_sha)
+                + ("\n" + record["note"] if record.get("note") else ""),
+                {"interrupted": record},
+            )
+            persist({"status": result.status, "note": result.note, "evidence": result.evidence})
+        elif (_g._git_dir() / "index.lock").exists():
+            # `git stash apply` needs that lock: starting now would only spend this one-shot
+            # restore on Git's refusal. Nothing is recorded; the transaction waits. The next start
+            # resets the tree and applies the stash itself, so a manual apply (and any edit over it)
+            # would only be set aside again: no manual apply is suggested.
+            return StashRestoreResult("incomplete", (
+                f"Git's index lock is held, so restoring the local changes waits for it; they stay in update "
+                f"stash {stash_sha[:12]}, which is kept. Once the lock is resolved, quit and reopen the app "
+                "(or restart the server process); startup then applies that stash. Do not apply it by hand."))
+        else:
+            persist({"status": "applying"})
+            result = restore_update_stash(stash_sha, context, before_cleanup=persist)
+            persist({"status": result.status, "note": result.note, "evidence": result.evidence})
+    except Exception as exc:
+        _g.log.warning("update stash recovery could not be recorded", exc_info=True)
+        return StashRestoreResult(
+            "incomplete", f"automatic stash recovery remains unconfirmed ({type(exc).__name__}: {exc}); "
+            "current files must not be reset or re-applied; " + _stash_recovery_note(stash_sha),
         )
-
-    def _mark() -> None:
-        from supervisor import update_merge as _um
-
-        tx["stash_restored"] = True
-        _um.write_update_tx(tx)
-
-    _restored, note = restore_update_stash(stash_sha, context=context, on_applied=_mark)
-    return note
+    if not result.complete:
+        return result
+    event = {"type": "managed_update_stash_restored" if result.status == "restored" else "managed_update_stash_restore_failed",
+             "context": context, "stash_sha": stash_sha, "restore_status": result.status,
+             "stash_note": result.note, **result.evidence}
+    # The existing event is the durable disclosure after the marker is removed.
+    # A failed append retains the terminal marker; retrying it never repeats Git.
+    try:
+        recorded = _um._log_supervisor(event)
+    except Exception:
+        recorded = False
+        _g.log.warning("update stash recovery event failed", exc_info=True)
+    if not recorded:
+        return StashRestoreResult("incomplete", result.note + "; recovery event could not be saved", result.evidence)
+    return result
 
 
 def destructive_apply_guard(branch: str, pre_update_sha: str) -> str:
@@ -686,7 +747,12 @@ def project_version_carriers(target_sha: str, *, cwd: Optional[str] = None) -> T
     "resolve" it). Returns ``(ok, note, error)``; ok=False means the projection
     could not be completed and the caller must NOT freeze the half-projected
     tree as a merge commit or an M0 baseline (typed failure over silent drift).
-    A target without a VERSION blob mandates nothing (ok=True, empty note)."""
+    A target without a VERSION blob mandates nothing (ok=True, empty note).
+
+    A development-marker target's download links are its README's, written back here:
+    the running body owns this projection, so a body older than the marker rule projects
+    the marker onto them and commits unpublished URLs into its local merge, and only this
+    next projection repairs that. Official refs and fast-forwards never carry it."""
     workdir = str(cwd or _g.REPO_DIR)
     rc_tv, target_blob, _tve = _git_run(["git", "rev-parse", f"{target_sha}:VERSION"], cwd=workdir)
     if rc_tv != 0 or not target_blob:
@@ -705,9 +771,12 @@ def project_version_carriers(target_sha: str, *, cwd: Optional[str] = None) -> T
         return False, note, f"conflict inventory unreadable: {u_error}"
     unmerged = {ln.strip() for ln in unmerged_out.splitlines() if ln.strip()}
     try:
-        from ouroboros.tools.release_sync import sync_release_metadata
+        from ouroboros.tools.release_sync import published_download_version, sync_release_metadata
 
-        changed_carriers = list(sync_release_metadata(workdir) or [])
+        # A marker target's links are not derived from VERSION: they stay its published release.
+        rc_r, target_readme, _re = _git_run(["git", "show", f"{target_sha}:README.md"], cwd=workdir)
+        changed_carriers = list(sync_release_metadata(
+            workdir, published_version=published_download_version(target_readme) if rc_r == 0 else "") or [])
     except Exception as exc:
         return False, note, f"carrier token sync failed: {type(exc).__name__}: {exc}"
     addable = [p for p in changed_carriers if p not in unmerged]
@@ -758,3 +827,111 @@ def project_version_carriers(target_sha: str, *, cwd: Optional[str] = None) -> T
     if desyncs:
         return False, note, "carriers still desynced after token sync: " + "; ".join(desyncs)
     return True, note, ""
+
+
+# The assisted resolver's workers. Its whole-pool start (``workers.spawn_workers``): slot 0, the conversation
+# lane's spare, and slot 1, the resolver's own project slot. Inside the marker window no project slot grows
+# (``worker_pool_lifecycle._spawn_worker_slot``), so this start, on an empty pool, is the resolver's only one.
+RESOLVER_POOL = 2
+
+
+def resolver_slot_owed() -> bool:
+    """Whether the whole-pool start owes a resolver its project slot: a resolver-held update is in flight (its
+    durable transaction in an assisted phase), as at a boot whose recovery resumes it; base's one boot worker
+    was that slot. Unknown owes nothing: an unreadable transaction recovers nothing either."""
+    from supervisor.update_merge import _ASSISTED_PHASES, active_update_tx
+
+    try:
+        return str((active_update_tx() or {}).get("phase") or "") in _ASSISTED_PHASES
+    except Exception:
+        return False
+
+
+def ensure_assisted_resolver_ready(expected_sha: str, timeout_sec: float = 90.0) -> bool:
+    """Prove every child of the resolver's start imported the exact clean tree before conflicts go live.
+
+    The whole-pool start (``RESOLVER_POOL``) is the one start the marker window allows, on an empty pool while
+    this tree is still clean. The project slot's own ``worker_ready`` at the expected sha proves the resolver
+    (assignment gives queued work to project slots alone; the lane's spare proves nothing here), and no marker
+    lands while another child of this start still imports: each live one reported its own row too."""
+    from supervisor import workers
+    from supervisor.queue import _queue_lock
+    from supervisor.worker_pool_lifecycle import _worker_events_since, is_project_slot
+
+    with _queue_lock:
+        if workers.WORKERS:
+            return False  # update quiescence must leave no ambiguous prior generation
+    events_cursor = workers.events_log_cursor()
+    try:
+        if not workers.ensure_worker_pool_started(n=RESOLVER_POOL, allow_disabled_restart=True):
+            return False
+    except Exception:
+        _g.log.warning("assisted resolver worker start failed", exc_info=True)
+        return False
+    deadline = time.monotonic() + max(float(timeout_sec), 0.1)
+    while time.monotonic() < deadline:
+        with _queue_lock:
+            live = {str(worker.proc.pid): is_project_slot(worker) for worker in workers.WORKERS.values()
+                    if worker.proc.pid and worker.proc.is_alive()}
+        if not any(live.values()):
+            return False  # the resolver's project child is gone
+        ready = {str(row.get("pid") or "") for row in _worker_events_since(events_cursor, "worker_ready")
+                 if str(row.get("git_sha") or "") == expected_sha}
+        if set(live) <= ready:  # a stopped child imports nothing more
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _boot_resolver_ready(timeout_sec: float) -> bool:
+    """Whether, within ``timeout_sec``, no live custodied child of the boot's start still imports (the readiness
+    seam opened each on its own ``worker_ready``) and the resolver's project slot is ready among them. A pool
+    with no child has nothing to wait for: the resolver's enqueue starts one, as before."""
+    from supervisor import workers
+    from supervisor.queue import _queue_lock
+    from supervisor.worker_pool_lifecycle import is_project_slot, is_worker_slot, worker_ready
+
+    deadline = time.monotonic() + max(float(timeout_sec), 0.1)
+    while True:
+        with _queue_lock:
+            children = [slot for slot in workers.WORKERS.values() if is_worker_slot(slot)]
+            importing = any(slot.proc.is_alive() and not worker_ready(slot) for slot in children)
+            resolver = any(is_project_slot(slot) and worker_ready(slot) for slot in children)
+        if not importing and (resolver or not children):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def refuse_unready_boot_resolver(timeout_sec: float = 0.0) -> Dict[str, Any]:
+    """Boot recovery's gate before it re-materializes the conflicts: ``{}`` once the resolver can resume, else the
+    update unwound and told to the owner, never left stalled as an ongoing resolution.
+
+    The wait is the readiness seam's own (its ceiling from a child's birth, plus its teardown): a slow child inside
+    the ceiling is waited for, and one past it the seam has already stopped. Unwinding is the apply flow's refusal
+    at boot: the children stop before the tree changes, then the boot rollback restores the pre-update checkout and
+    the owner's stashed work, keeping custody for the restart ``server._boot_managed_update_tasks`` requests; that
+    function also sends the owner the returned note."""
+    from supervisor.worker_pool_lifecycle import WORKER_READY_CEILING_SEC
+
+    wait = float(timeout_sec) or float(WORKER_READY_CEILING_SEC) + 10.0
+    if _boot_resolver_ready(wait):
+        return {}
+    from supervisor import workers
+    from supervisor.update_merge import _log_supervisor, rollback_managed_update_on_boot
+
+    blockers = workers.kill_workers_for_update(
+        result_reason="Assisted update resolver did not become ready after the restart.",
+        terminal_status="interrupted")
+    ok, msg = rollback_managed_update_on_boot("assisted_resolver_unready")
+    _log_supervisor({"type": "managed_update_assisted_resolver_unready", "ok": ok, "msg": msg, "wait_sec": wait,
+                     **({"blockers": blockers} if blockers else {})})
+    cause = ("the conflicting update could not resume after the restart: its workers were not all ready "
+             f"within {wait:.0f} s")
+    note = (f"{cause}, so it was rolled back before its conflicts were staged again ({msg}). "
+            "Apply the update again to retry." if ok else
+            f"{cause}, and its rollback did not finish ({msg}). Quit and reopen Ouroboros to retry the recovery.")
+    # Workers whose stop is unproven are disclosed with the outcome, never a veto on the rollback.
+    return {"finalized": False, "rolled_back": ok, "msg": msg, "stash_note": note,
+            **({"blockers": list(blockers)} if blockers else {})}

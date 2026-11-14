@@ -128,3 +128,49 @@ def test_generation_change_during_join_cannot_control_replacement(timed_out):
         events.dispatch_event(frame, t.ctx)
     assert t.spawned == [] and newer.busy_task_id == "new-task" and not newer.reaping
     assert load_task_result(t.root, "old-task")["result"] == "Saved old answer"
+
+
+class StopAfterRetirement(BaseException):
+    pass
+
+
+@pytest.mark.parametrize("replacement", [False, True])
+def test_captured_timeout_job_closes_only_its_dead_local_invocation(timed_out, monkeypatch, replacement):
+    from ouroboros.task_results import load_task_result, write_task_result
+    from supervisor import task_reaper
+
+    t = timed_out
+    # The REAL timeout producer already captured t.job, removed RUNNING and
+    # cleared the slot's busy id. The retained fake Process is positively dead.
+    assert t.job["meta"]["task"]["id"] == "old-task"
+    assert "old-task" not in t.q.RUNNING and t.old.busy_task_id is None
+    t.old.proc.pid, t.old.proc.exitcode = 880001, -9
+    t.old.process_birth = "owned-worker-birth"
+    claim = {"tool": "local-tool", "state": "claimed", "task_id": "old-task",
+             "root_task_id": "old-task", "local_owner": {
+                 "pid": 880001, "process_birth": "owned-worker-birth", "task_attempt": 1}}
+    write_task_result(t.root, "old-task", "running", launch_handoffs={"op": claim})
+    monkeypatch.setattr("supervisor.worker_pool_lifecycle.kill_worker_tree", lambda *_a, **_kw: None)
+    monkeypatch.setattr(t.workers, "_reconcile_confirmed_dead_review_owner", lambda *_a: None)
+    # Stop after the real retirement seam, before unrelated terminal copyback.
+    monkeypatch.setattr("ouroboros.tools.services.archive_task_service_logs",
+                        lambda *_a, **_kw: (_ for _ in ()).throw(StopAfterRetirement()))
+    if replacement:
+        new = SimpleNamespace(wid=7, busy_task_id="old-task", reaping=False,
+                              proc=SimpleNamespace(is_alive=lambda: True), process_birth="new-birth")
+        t.workers.WORKERS[7] = new
+        t.q.RUNNING["old-task"] = {"task": {"id": "old-task", "_attempt": 2},
+                                    "worker_id": 7, "attempt": 2}
+        task_reaper.reap_timed_out_task(t.job)
+        assert load_task_result(t.root, "old-task").get("launch_handoffs", {}) == {"op": claim}
+        assert t.workers.WORKERS[7] is new and new.busy_task_id == "old-task"
+    else:
+        with pytest.raises(StopAfterRetirement):
+            task_reaper.reap_timed_out_task(t.job)
+        from ouroboros import custody_owed
+        assert load_task_result(t.root, "old-task")["launch_handoffs"] == {"op": claim}, "the locked door only owes"
+        assert custody_owed.drain() == 0
+        row = load_task_result(t.root, "old-task")
+        assert not row.get("launch_handoffs", {}), row
+        assert row["retired_tool_invocations"]["op"]["effect_outcome"] == "unknown"
+        assert row["retired_tool_invocations"]["op"]["replay_authorized"] is False

@@ -1,0 +1,736 @@
+"""Continuation of a finished delegated run: ``delegate_start``'s ``continue_from=<run_id>``.
+
+A delegated run stops for many reasons — its wall-clock cap, a vendor
+subscription limit, a crash of the harness or of this host, a cancel, a
+question its route could not ask mid-run — and the work it did is worth
+finishing. This module is the ONE gate such a start passes, the ONE author of
+the facts that bind the new run to its predecessor and the owner of the
+same-tree hand-over. HOW the new run remembers the old one belongs to the
+engine (``continueFrom``: the same native session, a session moved to another
+account, or an evidence packet); the host decides only WHETHER this task may
+continue that run and WHAT the continuing child is told.
+
+Four floor invariants, read from durable custody (each refusal is typed and a
+definite no-run):
+
+1. own task line — the run is this task's, or this task is its host-confirmed
+   automatic retry successor (``delegate_shared.retry_result_status``), or a
+   root the owner's Continue created from the run's tree root (the recorded
+   ``continued_by`` binding, ``owner_continue.recorded_continuation``); room or
+   folder equality grants nothing, and a review panel's run is never a task's;
+2. terminal — the run's terminal is observed (its money may still settle) and no
+   successor already continues it (one writer at a time);
+3. no pending-ambiguous apply — an apply intent without a disposition means
+   the tree MAY already carry its patch;
+4. authority does not widen — native access is not wider than the run's
+   recorded access, and a writing run writes for the target the old run held.
+   An omitted ``access`` keeps that recorded access (``inherited_access``),
+   so a continuation never refuses itself; an explicit one is the caller's.
+
+Everything else is a FACT, never a refusal: the cause (any terminal cause), an
+unread result, the patch disposition, another actor, route or configuration, a
+changed or partially verified work order. The facts reach the parent in the
+started payload and the continuing child in its PROMPT
+(``continuation_prompt``) — never in ``instructions``, which a resumed vendor
+session may keep from its first request. For the same reason every ordinary
+continuation's prompt restates THIS run's access and workspace binding once it
+is provisioned (``with_run_binding``, #2513); the persisted access line scopes
+such facts to one run.
+
+Same tree: while the predecessor's private execution snapshot is undisposed,
+the successor runs IN it (same path, same baseline, no new snapshot) and its
+own capture (``capture_id``) is the one cumulative patch. Its STARTED row
+supersedes the predecessor's capture (``delegate_custody._supersede``); the
+claim re-checks the predecessor under the snapshot's one disposition lock, the
+lock every apply/reject takes, so a hand-over and a disposition never
+interleave, and a superseded predecessor can be neither applied nor rejected.
+"""
+
+from __future__ import annotations
+
+import logging
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, NamedTuple, Optional, Tuple
+
+from ouroboros import delegate_custody as custody
+
+log = logging.getLogger(__name__)
+
+# The engine's start-schema key: present in ``GET /v2/agent-capabilities``
+# ``runControlKeys`` exactly when the serving engine can continue a run.
+ENGINE_CONTINUE_KEY = "continueFrom"
+CARRIER_PREFERENCES = ("auto", "packet")
+
+REFUSAL_SOURCE_UNKNOWN = "continuation_source_unknown"
+REFUSAL_SOURCE_NOT_OWNED = "continuation_source_not_owned"
+REFUSAL_SOURCE_NOT_TERMINAL = "continuation_source_not_terminal"
+REFUSAL_SUPERSEDED = "continuation_superseded"
+REFUSAL_APPLY_AMBIGUOUS = "continuation_apply_ambiguous"
+REFUSAL_AUTHORITY_WIDENED = "continuation_authority_widened"
+REFUSAL_TARGET_MISMATCH = "continuation_target_mismatch"
+REFUSAL_SNAPSHOT_MISSING = "continuation_snapshot_missing"
+REFUSAL_SNAPSHOT_RELEASED = "continuation_snapshot_released"
+REFUSAL_ENGINE_UNSUPPORTED = "continuation_engine_unsupported"
+
+_ACCESS_RANK = {"readonly": 0, "workspace_write": 1, "full": 2}
+# Advice for the continuing child: one sentence per fact that no longer refuses.
+_ADVICE = {
+    "result_unread": ("Your previous final result was never read to its end by your supervisor: put "
+                      "everything it must know into your final answer of this run."),
+    "executor_changed": ("This run may use a different actor, route or configuration than the previous "
+                         "one: trust what the workspace and recorded results show over remembered details."),
+    "work_order_changed": ("Your supervisor's configured assignment differs from the one the previous run "
+                           "was bound to: where they differ, the current assignment and this prompt govern."),
+    "work_order_partial": ("The previous run's assignment was delivered only partially and its source ranges "
+                           "are not fully verified: ask for any part you need instead of guessing it."),
+}
+
+
+class AdoptedSnapshot(NamedTuple):
+    """The predecessor's undisposed execution snapshot, reused as this run's root."""
+
+    snapshot_id: str
+    baseline_sha: str
+    path: str
+    adopted_from: str
+    excluded_untracked: tuple = ()  # the snapshot's own exclusions, for the start receipt
+    restore: bool = False  # its checkout was released (or left half-made): the hand-over checks it out again
+
+
+class ContinuationStart(NamedTuple):
+    """Everything one continuation start contributes beyond an ordinary start."""
+
+    facts: Dict[str, Any] = {}       # parent-facing: the started payload's ``continuation``
+    prompt: str = ""                 # wire prompt: host facts + the caller's continuation text
+    request: Dict[str, Any] = {}     # wire keys: ``continueFrom`` (+ ``continueCarrier``)
+    custody: Dict[str, Any] = {}     # START_REQUESTED/STARTED: lineage + same-tree capture identity
+    snapshot: Optional[AdoptedSnapshot] = None
+    note: str = ""                   # the caller's text, for the prompt once the run is bound
+    words: str = ""                  # my human's rows no START body of the line holds (``continuation_words``)
+    folder: str = ""                 # a plan-thread turn's: its thread's folder, as the engine names it ("" when it does not)
+
+
+NO_CONTINUATION = ContinuationStart()
+CUSTODY_KEYS = ("continuation_of", "capture_id", "snapshot_task_id", "thread_id",
+                "execution_mode", "effective_access", "authority_ceiling", "promotion")
+
+
+def _task_line(ctx: Any, drive: Any, state: Dict[str, Any], entry: Any) -> str:
+    """How this task holds the run: ``own``, ``retry_successor``, ``owner_continue`` or ""."""
+    reader = str(getattr(ctx, "task_id", "") or "")
+    if not reader or not entry.task_id or entry.review_owned:
+        return ""
+    if reader == entry.task_id:
+        return "own"
+    from ouroboros.delegate_shared import retry_result_status
+
+    status, _entry, predecessor = retry_result_status(ctx, drive, entry.run_id, state=state)
+    if status == custody.OWNED and predecessor:
+        return "retry_successor"
+    from ouroboros.owner_continue import recorded_continuation
+
+    return "owner_continue" if recorded_continuation(drive, entry.root_task_id or entry.task_id, reader) else ""
+
+
+# ``owner_continue.continuation_eligibility`` refusals a later fact may still turn into an offer: a budget whose close
+# is not recorded yet, a deadline that cannot be read, a non-completed end (or a rail's) whose cause is neither an owner
+# stop, a hard limit nor a recorded technical cause (a reconciliation may still record one). An ordinary completed row
+# is ``author_finished`` before that test. ``every_offer`` holds them as offers; the registration reading does not.
+_UNDECIDED_OFFERS = frozenset({"execution_budget_unknown", "deadline_unknown", "interruption_cause_unrecorded"})
+
+
+def still_continuable(drive: Any, entry: Any, live_task_ids=None, *, recoverable_handles=(),
+                      every_offer: bool = False) -> bool:
+    """Retain a registration until its owner line and every root's Continue offer end.
+
+    Each root of the recorded Continue chain (the original root and every
+    successor it admitted) can be offered Continue after a technical break, so
+    the offer is read at every settled member the walk reaches, not only at the
+    run's own root; child tasks never carry an offer. An author's stop is offered Continue, but that offer adds
+    no hold here: its line keeps a finished root's ordinary retention (every other check below still applies),
+    and its successor's work order says so. An admitted claim is followed below, like any other.
+    ``every_offer`` is the stricter reading a managed document's release needs (``delegate_documents``): any
+    offer holds, an author's stop included, and so does one whose eligibility a later fact may still decide
+    (``_UNDECIDED_OFFERS``); the registration reading above never passes it.
+
+    The sweep supplies its live census and exact reserved handles. Addressed result
+    reads validate retry and Continue edges; missing/changed evidence keeps the
+    registration. This observation grants no continuation or execution authority.
+    """
+    if entry.review_owned or not entry.run_id:
+        return False
+    if ((entry.task_id, entry.run_id, entry.invocation_id) in recoverable_handles
+            or (entry.task_id, entry.run_id, "") in recoverable_handles):
+        return True
+    if live_task_ids is None or not entry.task_id:
+        return True
+    from types import SimpleNamespace
+    from ouroboros.owner_continue import AUTHOR_STOP_CAUSE, continuation_offer, recorded_continuation
+    from ouroboros.task_status import SETTLED_STATUSES, load_effective_task_result
+    from supervisor import queue
+    from supervisor.queue_transitions import _live_retry_target_locked
+    from supervisor.task_ownership import TaskOwnershipRead, prepare_retry_chain
+
+    def resolved(row: Any) -> bool:
+        # A timeout-retried task is rewritten `interrupted` naming its retry
+        # (task_reaper); its line continues in that retry, followed below.
+        return bool(row) and (row.get('status') in SETTLED_STATUSES or (
+            row.get('status') == 'interrupted' and bool(row.get('superseded_by'))
+            and row.get('superseded_by') == row.get('retry_task_id')))
+
+    live = set(live_task_ids)
+    reads = TaskOwnershipRead(drive)
+    root = entry.root_task_id or entry.task_id
+    pending, seen = [entry.task_id, root], set()
+    try:
+        local_queue = queue.owns_live_queue(drive)
+        if local_queue:
+            with queue._queue_lock:
+                live.update(str(row.get('id') or '') for row in queue.PENDING)
+                live.update(queue.ADMISSION_RESERVATIONS)
+        while pending:
+            task_id = pending.pop()
+            if task_id in seen:
+                continue
+            seen.add(task_id)
+            if task_id in live:
+                return True
+            current = reads.load(task_id)
+            if not resolved(current):
+                return True
+            if local_queue and queue.task_has_live_ownership(task_id, ownership=reads):
+                return True
+            prepare_retry_chain(queue, task_id, reads.load)
+            # The supplied census also covers reserved/recoverable tasks absent
+            # from the process's queue maps. Their durable rows bind retry edges.
+            census = SimpleNamespace(PENDING=[dict(row, id=tid) for tid, row in reads.rows.items()
+                                             if tid in live], RUNNING={},
+                                     QUEUE_MAX_RETRIES=queue.QUEUE_MAX_RETRIES)
+            with queue._queue_lock:
+                leaf, _ = _live_retry_target_locked(census, task_id, results=reads)
+            if leaf in live or any(not resolved(row) for row in reads.rows.values()):
+                return True
+            if leaf != task_id:
+                pending.append(leaf)
+            claim = current.get('continued_by')
+            if claim:
+                successor = claim.get('successor_task_id') if isinstance(claim, dict) else ''
+                if (not successor or successor in seen
+                        or not recorded_continuation(drive, task_id, successor)):
+                    return True
+                pending.append(successor)
+            else:  # the offer exactly as the task card reads it (a retry leaf's end)
+                offer = continuation_offer(load_effective_task_result(drive, task_id, materialize_artifacts=False)
+                                           or current, task_id)
+                if offer['eligible'] and (every_offer or offer.get('cause') != AUTHOR_STOP_CAUSE):
+                    return True
+                if every_offer and offer.get('refusal') in _UNDECIDED_OFFERS:
+                    return True
+        return not reads.unchanged(reads.rows)
+    except Exception:
+        log.debug('Registration continuation authority unavailable for %s', entry.run_id, exc_info=True)
+        return True
+
+
+def bind_continuation(ctx: Any, drive: Any, run_id: str, *, actor: Dict[str, Any], route: Any,
+                      authority: Any, target_root: str,
+                      canonical_work_order_fingerprint: str = "", plan_promotion: bool = False) -> Tuple[Dict[str, Any], str, str]:
+    """``(facts, refusal_code, detail)``: the four floors, from durable custody only.
+
+    Nothing here reads the engine, so a daemon that is gone cannot turn an
+    unknown run into an admitted one; ``facts`` is complete only when
+    ``refusal_code`` is empty.
+    """
+    from ouroboros.delegate_custody_current import run
+
+    rid = str(run_id or "").strip()
+    if custody.custody_log_unreadable(drive):
+        return {}, REFUSAL_SOURCE_UNKNOWN, (
+            f"The custody log cannot be read, so run {rid!r} cannot be proven this task's or settled.")
+    entry = run(drive, rid)
+    if entry is None:
+        return {}, REFUSAL_SOURCE_UNKNOWN, (
+            f"No durable custody record names run {rid!r} on this drive; a continuation binds to a "
+            "run this task can prove it holds.")
+    from ouroboros.delegate_plan import promotion_permitted
+
+    promoted = plan_promotion and promotion_permitted(
+        ctx, entry, authority, target_root, str(actor.get("authority_fingerprint") or ""))
+    if plan_promotion and not promoted:
+        return {}, REFUSAL_AUTHORITY_WIDENED, "Plan implementation requires its starter and the recorded, still-current authority ceiling."
+    line = _task_line(ctx, drive, {rid: entry}, entry)
+    if not line:
+        return {}, REFUSAL_SOURCE_NOT_OWNED, (
+            f"Run {rid} belongs to task {entry.task_id or 'unknown'}"
+            + (" (a review panel's run)" if entry.review_owned else "")
+            + ", and this task is neither its owner, its confirmed retry successor, nor a root the "
+            "owner's Continue created from its task tree.")
+    if entry.terminal_state not in custody.TERMINAL_STATES:  # execution ended; money may still be pending (#1969)
+        return {}, REFUSAL_SOURCE_NOT_TERMINAL, (
+            f"Run {rid} has no observed terminal on its custody rows (state {entry.terminal_state or 'not observed'!r}): "
+            "it may still be live. Wait on it with delegate_wait or cancel it and verify the receipt; "
+            "never start a second writer over a run that may still be running.")
+    if entry.superseded_by:
+        return {}, REFUSAL_SUPERSEDED, (
+            f"Run {rid} was already continued by run {entry.superseded_by}, which holds its snapshot and "
+            "work now; continue from that run instead.")
+    if entry.patch_apply_pending:
+        return {}, REFUSAL_APPLY_AMBIGUOUS, (
+            f"Run {rid} has a pending apply intent with no disposition: the tree MAY already carry its patch. "
+            "Resolve it through integrate_delegated_patch(acknowledge_ambiguous=true) before continuing.")
+    this_access = str(getattr(authority, "access", "") or "")
+    if (entry.access not in _ACCESS_RANK or this_access not in _ACCESS_RANK
+            or _ACCESS_RANK[this_access] > _ACCESS_RANK[entry.access]) and not promoted:
+        return {}, REFUSAL_AUTHORITY_WIDENED, (
+            f"Run {rid} ran with access {entry.access or 'unrecorded'!r}; this start derives "
+            f"{this_access or 'unrecorded'!r}. A continuation may keep or lower native access, never widen it"
+            + ("; omit access to keep the run's own." if entry.access in _ACCESS_RANK else "."))
+    if this_access != "readonly" and (not entry.target_root or entry.target_root != str(target_root or "")):
+        return {}, REFUSAL_TARGET_MISMATCH, (
+            f"Run {rid} wrote for {entry.target_root or 'an unrecorded target'}; this task's present target is "
+            f"{target_root or 'unrecorded'}. A writing continuation writes for the target the prior run held.")
+    ref = entry.resource_ref if isinstance(entry.resource_ref, dict) else {}
+    needs_disposition = bool(entry.snapshot_id or (
+        ref.get("workspace_kind") == "directory" and ref.get("strategy") == "copy"))
+    advice: List[str] = []
+    if custody.output_unread(entry):  # read facts, not money
+        advice.append("result_unread")
+    if (not entry.selected_subagent_id or entry.selected_subagent_id != str(actor.get("selected_subagent_id") or "")
+            or entry.route_id != str(getattr(route, "route_id", "") or "")
+            or entry.config_fingerprint != str(actor.get("config_fingerprint") or "")):
+        advice.append("executor_changed")
+    canonical = str(canonical_work_order_fingerprint or "")
+    if canonical and canonical != entry.work_order_fingerprint:
+        advice.append("work_order_changed")
+    if str(custody.work_order_source_verification(entry).get("status") or "") == "cannot_verify":
+        advice.append("work_order_partial")
+    facts: Dict[str, Any] = {
+        "continuation_of": rid,
+        "cause": entry.terminal_reason or entry.terminal_state,
+        "prior_terminal_state": entry.terminal_state,
+        "prior_terminal_reason": entry.terminal_reason,
+        "prior_owner_task_id": entry.task_id,
+        "task_line": line,
+        "prior_patch_disposition": entry.patch_disposed or ("undisposed" if needs_disposition else "not_applicable"),
+        "prior_target_root": entry.target_root,
+        "prior_access": entry.access,
+        "prior_baseline_sha": entry.baseline_sha,
+        "prior_output": custody.output_disposition(entry),
+        "prior_actor": entry.selected_subagent_id,
+        "prior_route": entry.route_id,
+        "prior_work_order_fingerprint": entry.work_order_fingerprint,
+        "advice": advice,
+    }
+    return facts, "", ""
+
+
+def inherited_access(ctx: Any, run_id: Any) -> Optional[str]:
+    """The lowering an omitted ``access`` takes on ``continue_from``: the run's recorded access.
+
+    The selected snapshot only ever lowers (``validate_subagent_snapshot``), so the start
+    runs at the narrower of today's captured profile and the continued run's, and the
+    task's own authority still shapes it (``_derive_authority``). ``full``, an unrecorded
+    access or unreadable custody inherits nothing: the floors above answer those.
+    """
+    from ouroboros.configured_subagents import SESSION_ACCESS_LOWERING
+    from ouroboros.delegate_custody_current import run
+
+    drive = custody.custody_root(ctx)
+    try:
+        entry = None if custody.custody_log_unreadable(drive) else run(drive, str(run_id or "").strip())
+    except Exception:
+        log.debug("Continued run's access unavailable for %s", run_id, exc_info=True)
+        return None
+    access = str(getattr(entry, "access", "") or "")
+    return access if access in SESSION_ACCESS_LOWERING else None
+
+
+def _adopted_snapshot(entry: Any, authority: Any) -> Tuple[Optional[AdoptedSnapshot], str, str]:
+    """The predecessor's undisposed snapshot a WRITING continuation runs in, or a refusal."""
+    from ouroboros.configured_subagents import SESSION_ACCESS_PROFILES
+
+    if (str(getattr(authority, "access", "") or "") not in SESSION_ACCESS_PROFILES
+            or not entry.snapshot_id or entry.patch_disposed):
+        return None, "", ""
+    try:
+        from ouroboros.subagent_worktrees import checkout_whole, find_execution_snapshot
+
+        record = find_execution_snapshot(entry.snapshot_id) or {}
+    except Exception as exc:
+        record = {"error": f"{type(exc).__name__}: {exc}"}
+    # A checkout released after its saved capture comes back at the hand-over from commit C.
+    if (not record.get("path") or not entry.execution_root or not entry.baseline_sha
+            or not (Path(entry.execution_root).exists() or record.get("result_sha"))):
+        return None, REFUSAL_SNAPSHOT_MISSING, (
+            f"Run {entry.run_id}'s private snapshot {entry.snapshot_id} is gone or unreadable "
+            f"({record.get('error') or 'no registry entry or directory'}), so its work cannot be continued in "
+            "the same tree. Apply or reject its captured patch with integrate_delegated_patch, then continue "
+            "again: the next continuation starts from a fresh snapshot of the target.")
+    return AdoptedSnapshot(entry.snapshot_id, entry.baseline_sha, entry.execution_root, entry.run_id,
+                           tuple(record.get("excluded_untracked") or ()), not checkout_whole(record)), "", ""
+
+
+def continuation_prompt(facts: Dict[str, Any], caller_text: str, run_binding: str = "", words: str = "") -> str:
+    """The continuing child's prompt: carrier-neutral host facts, then the caller's text.
+
+    The engine puts its own notice (which carrier, what stopped) in front; this
+    block states only what the host knows about the tree and the old result,
+    ``run_binding`` this run's access and workspace (``with_run_binding``), and
+    ``words`` my human's rows no start of the line holds, a paragraph of their own
+    between the binding and the caller's text (``continuation_words``).
+    """
+    rid, workspace = facts.get("continuation_of"), str(facts.get("workspace") or "")
+    disposition = str(facts.get("prior_patch_disposition") or "")
+    if workspace == "same_snapshot":
+        tree = ("You continue in the SAME private snapshot the previous run worked in (same path, same "
+                "baseline): everything it changed there is still there, and one cumulative patch of the whole "
+                "work is captured when you finish."
+                + (" Its checkout was restored from the saved result, so files Git ignores that the result never "
+                   "added (environments, build outputs) and its .review-evidence/ files are not here; that "
+                   "evidence stays retained beside its capture." if facts.get("checkout") == "recreated" else ""))
+    elif disposition == "applied":
+        tree = ("Its captured changes were APPLIED to the target, so the tree you start from contains them: "
+                "do not redo or re-apply that work.")
+    elif disposition == "rejected":
+        tree = "Its captured changes were REJECTED: the tree you start from does NOT contain them."
+    elif disposition == "evidence_retained":
+        tree = ("It was an evidence-only investigation in a private copy: none of its changes are in the tree "
+                "you start from; they are retained as evidence.")
+    elif disposition == custody.NO_CHANGES:
+        tree = "Its result held exactly the files its private copy started from: it changed no files to look for."
+    elif disposition == "undisposed":
+        tree = ("Its captured changes are NOT in the tree you start from: they wait for your supervisor's "
+                "decision, so do not assume them.")
+    elif str(facts.get("prior_access") or "readonly") == "readonly":
+        tree = "It was read-only: it changed no files."
+    else:
+        tree = ("It wrote DIRECTLY into the target: the tree you start from already contains whatever it "
+                "changed. Do not redo or re-apply that work.")
+    reason = facts.get("prior_terminal_reason")
+    lines = [
+        f"HOST FACTS FOR THIS CONTINUATION OF RUN {rid}: that run settled {facts.get('prior_terminal_state')}"
+        + (f" (reason {reason})" if reason else "") + f" and is not running. {tree}",
+        "Check the workspace as it is NOW before repeating a step; a step that was cut off may or may not "
+        "have taken effect.",
+        *(_ADVICE[code] for code in facts.get("advice") or () if code in _ADVICE),
+    ]
+    text = "\n".join(lines)
+    if run_binding:
+        text += "\n\nTHIS RUN'S ACCESS AND WORKSPACE (current host facts of this turn):" + run_binding
+    if words:
+        text += "\n\n" + words
+    note = str(caller_text or "").strip()
+    return f"{text}\n\n{note}" if note else text
+
+
+def continuation_words(ctx: Any, root: Any, run_id: str) -> str:
+    """The continuation tail: my human's rows of the starter's set (a continuation is a handoff: the room read
+    live) whose identity stands in no recorded START body of ``run_id`` and its ``continuation_of`` line (the
+    stamps' reference tokens, under either reference a row has printed), under the session heading with the
+    host's closing line (``subagent_work_order.unseen_words_section``). A body that cannot be read holds no row:
+    every row rides (a duplicate is the cheaper error). A row a live frame delivered rides once too: the host
+    cannot know whether the engine resumes the native session that holds that frame. "" when nothing is owed."""
+    from ouroboros.subagent_work_order import CONTINUATION_TAIL_FACT, unseen_words_section
+
+    bodies = line_start_bodies(root, run_id)
+    return unseen_words_section(ctx, "\n".join(bodies) if bodies is not None else "", CONTINUATION_TAIL_FACT)
+
+
+def line_start_bodies(root: Any, run_id: str) -> Optional[List[str]]:
+    """The recorded START bodies (prompt and instructions, as POSTed) of ``run_id`` and of every run its
+    ``continuation_of`` line names; ``None`` when any of them cannot be read."""
+    from ouroboros.delegate_custody_current import run as current_run
+    from ouroboros.delegate_invocation import invocation_record
+
+    bodies: List[str] = []
+    seen: set = set()
+    while run_id and run_id not in seen:
+        seen.add(run_id)
+        try:
+            entry = current_run(root, run_id)
+            request = (invocation_record(root, entry.invocation_id) or {}).get("request") if entry else None
+        except Exception:  # noqa: BLE001 — an unreadable body is one typed answer: None
+            log.warning("START body of run %s unreadable; every row rides", run_id, exc_info=True)
+            return None
+        if not isinstance(request, dict):
+            return None
+        bodies.append(f"{request.get('prompt') or ''}\n{request.get('instructions') or ''}")
+        run_id = str(entry.continuation_of or "")
+    return bodies
+
+
+def with_run_binding(start: ContinuationStart, authority: Any, binding: str, workdir: str,
+                     inputs: str = "") -> ContinuationStart:
+    """Restate THIS run's access and workspace in an ordinary continuation's prompt (#2513).
+
+    The engine's ``auto`` carrier may resume a native session that keeps an earlier
+    request's instructions, whose binding named another run's root, scratch and access
+    (a fresh snapshot, a lowering, in place after a copy). Every ordinary continuation,
+    not only a changed root, so carries the exact text its own instructions got from the
+    same renderers after provisioning, or, where none applies, the directory it starts
+    in, plus this run's own selected ``input_files`` note, if any.
+    A plan-thread turn (no ``workspace`` fact) keeps its own contract, plus my human's rows its line
+    lacks (``words``) and that note, even when the caller's text is empty. A turn owing either, or a
+    promotion (whose access the thread's first instructions do not hold), restates this turn's typed
+    access, without inventing a new binding or cwd; one owing none is returned untouched, as a fresh
+    start (``NO_CONTINUATION``, no facts) always is.
+    """
+    from ouroboros.delegate_start_instructions import access_instruction, no_copy_binding_instruction
+
+    if not start.facts:
+        return start
+    if "workspace" not in start.facts:
+        if not (start.words or inputs or start.facts.get("promotion")):
+            return start
+        current = access_instruction(authority.access, investigation=authority.investigation).strip() if authority else ""
+        return start._replace(prompt="\n\n".join(part for part in (start.prompt, start.words, current, inputs) if part))
+    current = (access_instruction(authority.access, investigation=authority.investigation)
+               + (binding or no_copy_binding_instruction(workdir)) + inputs)
+    return start._replace(prompt=continuation_prompt(start.facts, start.note, current, start.words))
+
+
+def engine_continues(gateway: Any) -> bool:
+    """Does the serving engine accept ``continueFrom`` (its run-start schema lists it)?"""
+    keys = (gateway.agent_capabilities() or {}).get("runControlKeys")
+    return isinstance(keys, list) and ENGINE_CONTINUE_KEY in keys
+
+
+def start_binding(ctx: Any, drive: Any, token: str, *, gateway: Any, actor: Dict[str, Any], route: Any,
+                  authority: Any, target_root: str, invocation_id: str, text: str, source_binding: Dict[str, Any],
+                  coordination_context: str = "", carrier: Any = None,
+                  canonical_work_order_fingerprint: str = "", requested_mode=None, override_plan_readiness=None,
+                  plan_answers=None) -> Tuple[ContinuationStart, Optional[Any]]:
+    """``(continuation, refusal)`` for ONE start: the floors, the engine bit, the tree.
+
+    Decided before any snapshot or registration exists; a refusal is a definite
+    no-run recorded as a start-blocked evidence row. The caller's continuation
+    text is the configured session's coordination note, else the start prompt —
+    never the canonical work order, which the old session (or the engine's
+    evidence packet) already holds; my human's rows no start of the line holds
+    ride beside it (``continuation_words``).
+    """
+    from ouroboros.delegate_custody_current import runs as current_runs
+    from ouroboros.delegate_evidence import record_start_blocked
+    from ouroboros.delegate_shared import _fail
+
+    prior = current_runs(drive, "run_id=?", (token,)).get(token)
+    plan_turn = prior is not None and prior.mode == "plan"
+    facts, code, detail = bind_continuation(
+        ctx, drive, token, actor=actor, route=route, authority=authority, target_root=target_root,
+        canonical_work_order_fingerprint=canonical_work_order_fingerprint,
+        plan_promotion=plan_turn and requested_mode == "agent")
+    if not code and override_plan_readiness is not None and not plan_turn:
+        code, detail = "plan_override_conflict", "override_plan_readiness requires a recorded plan predecessor."
+    if not code and plan_turn:
+        from ouroboros.delegate_plan import continuation
+        from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+        try:
+            if route.route_id != prior.route_id or route.profile_id != prior.profile_id:
+                raise ClaudexorUnavailable("plan_thread_route_mismatch", "Use the plan thread's recorded route and account.")
+            bound = continuation(ctx, drive, prior, gateway, authority, actor, invocation_id, text,
+                override=override_plan_readiness, answers=plan_answers, carrier=carrier)
+            if bound.snapshot:
+                from ouroboros.delegate_source_coverage import inherit_source_obligations
+
+                inherit_source_obligations(prior, source_binding)
+            return bound._replace(words=continuation_words(ctx, drive, token)), None
+        except ClaudexorUnavailable as exc:
+            code, detail = exc.code, str(exc)
+    adopted = None
+    if not code:  # the subscript keeps a missing row's KeyError
+        adopted, code, detail = _adopted_snapshot(current_runs(drive, "run_id=?", (token,))[token], authority)
+    if not code and not engine_continues(gateway):
+        code, detail = REFUSAL_ENGINE_UNSUPPORTED, (
+            f"The serving Claudexor engine {getattr(gateway, 'engine_version', '') or '(unknown version)'} does "
+            "not accept continueFrom, so the stopped run cannot be continued here. Start a plain new run whose "
+            "prompt carries the remaining work, or continue after the engine is updated.")
+    if code:
+        record_start_blocked(ctx, str(getattr(ctx, "task_id", "") or ""), code)
+        return NO_CONTINUATION, _fail("delegate_start", code, detail, continue_from=token, definitely_unrun=True)
+    entry = current_runs(drive, "run_id=?", (token,))[token]
+    preference = str(carrier or "")
+    facts.update(workspace="same_snapshot" if adopted else "fresh", carrier_preference=preference or "auto",
+                 **({"checkout": "recreated"} if adopted and adopted.restore else {}))
+    record = {"continuation_of": token}
+    if adopted:
+        from ouroboros.delegate_source_coverage import inherit_source_obligations
+
+        inherit_source_obligations(entry, source_binding)
+        record.update(capture_id=invocation_id, snapshot_task_id=entry.snapshot_task_id or entry.task_id)
+    caller = coordination_context if bool(actor.get("compiled_work_order")) else text
+    request = {"continueFrom": token, **({"continueCarrier": preference} if preference else {})}
+    if authority.access == "readonly" and entry.access != "readonly":
+        from ouroboros.workspace_preflight import _route_row, route_grants_auxiliary_roots
+
+        # Omission inherits the writer's live execution and auxiliary grants. Replace
+        # the whole object with the ordinary read-only shape; scope still names the
+        # current source, not the writer's private, possibly unapplied snapshot.
+        execution = {"isolation": "envelope", "delegated": False}
+        if route_grants_auxiliary_roots(_route_row(gateway, route.route_id)):
+            execution["auxiliaryWritableRoots"] = []
+        request["execution"] = execution
+    return ContinuationStart(
+        facts=facts, prompt=continuation_prompt(facts, caller),
+        request=request,
+        custody=record, snapshot=adopted, note=caller, words=continuation_words(ctx, drive, token)), None
+
+
+def replayed_custody(record: Dict[str, Any]) -> ContinuationStart:
+    """A retry replays its recorded lineage; its body already carries the wire keys."""
+    from copy import deepcopy
+
+    return ContinuationStart(custody={key: deepcopy(record[key]) for key in CUSTODY_KEYS if key in record})
+
+
+def retry_matches_caller_text(record: Dict[str, Any], text: str) -> bool:
+    """A continuation's recorded prompt is host facts plus the caller's text, so its
+    retry names the caller's own text, whose digest the start recorded as its brief."""
+    from hashlib import sha256
+
+    return bool(record.get("continuation_of")) and str(record.get("work_order_fingerprint") or "") == sha256(
+        str(text).encode("utf-8")).hexdigest()
+
+
+def _handover_refusal(drive: Any, row: Dict[str, Any]) -> Dict[str, Any]:
+    """Re-check the predecessor at the claim, under the snapshot's disposition lock."""
+    from ouroboros.delegate_custody_current import run
+
+    rid, invocation = str(row.get("continuation_of") or ""), str(row.get("invocation_id") or "")
+    prior = run(drive, rid)
+    if prior is None or prior.terminal_state not in custody.TERMINAL_STATES:
+        return {"reason": REFUSAL_SOURCE_NOT_TERMINAL, "detail": f"Run {rid} has no observed terminal."}
+    if prior.superseded_by:
+        return {"reason": REFUSAL_SUPERSEDED, "head": prior.superseded_by,
+                "detail": f"Run {rid} was continued by run {prior.superseded_by} meanwhile; continue from it."}
+    if prior.patch_disposed or prior.snapshot_id != str(row.get("snapshot_id") or ""):
+        return {"reason": REFUSAL_SNAPSHOT_RELEASED, "detail": (
+            f"Run {rid}'s snapshot was {prior.patch_disposed or 'rebound'} meanwhile; continue again "
+            "(a fresh snapshot of the target is used once its patch is disposed).")}
+    if prior.patch_apply_pending:
+        return {"reason": REFUSAL_APPLY_AMBIGUOUS, "detail": f"Run {rid} has a pending apply intent."}
+    rival = next((str(item.get("invocation_id") or "") for item in custody.pending_invocations(drive)
+                  if str(item.get("continuation_of") or "") == rid and item.get("capture_id")
+                  and str(item.get("invocation_id") or "") != invocation), "")
+    if rival:
+        return {"reason": REFUSAL_SUPERSEDED, "pending_invocation_id": rival,
+                "detail": f"Another continuation of run {rid} ({rival}) is already pending."}
+    return {}
+
+
+@contextmanager
+def snapshot_handover(drive: Any, row: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
+    """Hold the snapshot's ONE disposition lock while the hand-over is re-checked
+    and its START_REQUESTED row written; yields the refusal ({} = proceed)."""
+    from ouroboros.delegate_custody_current import run
+    from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
+
+    prior = run(drive, str(row.get("continuation_of") or ""))
+    if prior is None:
+        yield {"reason": REFUSAL_SOURCE_UNKNOWN, "detail": "The continued run has no custody record."}
+        return
+    lock_path = custody.disposition_lock_path(drive, prior)
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = acquire_exclusive_file_lock(lock_path, timeout_sec=20.0, owner_aware_stale=True)
+    except Exception as exc:
+        fd, busy = None, f" ({type(exc).__name__}: {exc})"
+    else:
+        busy = ""
+    if fd is None:
+        yield {"reason": "continuation_handover_busy",
+               "detail": f"The continued run's snapshot lock is held or unavailable{busy}; retry after it completes."}
+        return
+    try:
+        refusal = _handover_refusal(drive, row)
+        from ouroboros.subagent_worktrees import find_execution_snapshot, recreate_snapshot_checkout
+
+        # A released checkout, or the remnant of an interrupted release or restore, is checked out again.
+        released = (find_execution_snapshot(str(row.get("snapshot_id") or "")) or {}).get("checkout_released")
+        if not refusal and (released or not Path(str(row.get("execution_root") or "")).exists()):
+            try:
+                recreate_snapshot_checkout(str(row.get("snapshot_id") or ""))
+            except Exception as exc:
+                refusal = {"reason": REFUSAL_SNAPSHOT_MISSING,
+                           "detail": f"The continued run's checkout could not be restored from its saved result "
+                                     f"({type(exc).__name__}: {exc}); nothing was started."}
+        yield refusal
+    finally:
+        release_exclusive_file_lock(lock_path, fd)
+
+
+def disposition_refusal(drive: Any, entry: Any) -> str:
+    """Why a run's captured patch may not be applied or rejected because of a hand-over."""
+    if entry is None:
+        return ""
+    if entry.superseded_by:
+        return (f"⚠️ INTEGRATE_DELEGATED_SUPERSEDED: run {entry.run_id} was continued by run "
+                f"{entry.superseded_by} in the same snapshot; its work is part of that run's cumulative "
+                "capture. Dispose that run instead; nothing was changed.")
+    pending = next((str(item.get("invocation_id") or "") for item in custody.pending_invocations(drive)
+                    if str(item.get("continuation_of") or "") == entry.run_id and item.get("capture_id")), "")
+    if pending:
+        return (f"⚠️ INTEGRATE_DELEGATED_CONTINUATION_PENDING: a continuation of run {entry.run_id} "
+                f"(invocation {pending}) may be running in its snapshot. Wait for that start to settle "
+                "(or retry it with retry_of) before disposing; nothing was changed.")
+    return ""
+
+
+def terminal_continuity(run_id: str, summary: Dict[str, Any]) -> Dict[str, Any]:
+    """The engine's continuation facts for a terminal payload: its ``resumable``
+    block as sent, and one line per continued try. An older engine reports
+    neither, and the payload then carries neither."""
+    facts: Dict[str, Any] = {}
+    if isinstance(summary.get("resumable"), dict):
+        facts["resumable"] = summary["resumable"]
+    names = custody.held_run_names({"summary": summary}, run_id)  # a run held by its job id
+    lines = [_receipt_line(names, row) for row in summary.get("continuity") or () if isinstance(row, dict)]
+    if lines:
+        facts["continuity"] = lines
+    return facts
+
+
+def _receipt_line(names: frozenset, row: Dict[str, Any]) -> str:
+    """One continued try: carrier, accounts, memory, attested model, and every non-default flag."""
+    source = row.get("from") if isinstance(row.get("from"), dict) else {}
+    target = row.get("to") if isinstance(row.get("to"), dict) else {}
+    parts = [f"try {row.get('tryIndex')} ({row.get('attemptId') or '?'}): {row.get('carrier') or '?'} "
+             f"after {row.get('cause') or '?'}"
+             + (f" of run {source.get('runId')}" if source.get("runId") and str(source["runId"]) not in names else ""),
+             f"profile {source.get('profileId') or '?'} -> {target.get('profileId') or '?'}",
+             f"memory {row.get('memory') or 'unknown'}",
+             f"model {row.get('observedModel') or 'unattested'}"]
+    if row.get("modelMismatch"):
+        parts.append("MODEL MISMATCH")
+    if row.get("workspace") == "different_root":
+        parts.append("different root")
+    if row.get("identityCheck") not in (None, "matched_before_effects", "not_applicable"):
+        parts.append(f"identity {row.get('identityCheck')}")
+    if row.get("inputDelivery") == "uncertain":
+        parts.append("last input may not have been delivered")
+    if row.get("instructions") == "vendor_snapshot":
+        parts.append("instructions: vendor snapshot")
+    if isinstance(row.get("reingestedTokens"), int):
+        parts.append(f"re-read {row['reingestedTokens']} tokens")
+    return "; ".join(parts)
+
+
+__all__ = [
+    "AdoptedSnapshot",
+    "ContinuationStart",
+    "NO_CONTINUATION",
+    "bind_continuation",
+    "continuation_prompt",
+    "continuation_words",
+    "disposition_refusal",
+    "engine_continues",
+    "inherited_access",
+    "line_start_bodies",
+    "replayed_custody",
+    "retry_matches_caller_text",
+    "snapshot_handover",
+    "start_binding",
+    "terminal_continuity",
+    "with_run_binding",
+]

@@ -16,6 +16,14 @@ import pytest
 
 import ouroboros.tools.search as search_module
 from ouroboros.tools.search import _web_search
+from tests._usage_store_testing import ledger_rows
+
+
+@pytest.fixture(autouse=True)
+def _anthropic_sdk_present(monkeypatch):
+    """These tests fake the Anthropic search call; the helper still imports the optional
+    SDK first, so its presence is chosen here, not inherited from the interpreter."""
+    monkeypatch.setitem(sys.modules, "anthropic", sys.modules.get("anthropic") or types.ModuleType("anthropic"))
 
 
 # ---------------------------------------------------------------------------
@@ -123,15 +131,23 @@ def test_responses_flex_refusal_reprices_standard_and_keeps_original_intent(ctx,
     error.body = {"error": {"code": "resource_unavailable", "param": "service_tier"}}
     mock_openai.responses.create.side_effect = [error, _FakeStream([
         _make_event("response.output_text.delta", delta="answer"), _make_completed_event()])]
-    result = json.loads(_web_search(ctx, "same query"))
+    result = json.loads(_web_search(ctx, "same query", reasoning_effort="high"))
     assert result["answer"] == "answer"
     assert [call.kwargs["service_tier"] for call in mock_openai.responses.create.call_args_list] == ["flex", "default"]
     assert [request.processing_preference for request in prepared] == ["economy", "economy"]
     assert prepared[0].candidate_raw_sha256 != prepared[1].candidate_raw_sha256
     with ua._locked(holds[0].drive_root):
-        records = ua._read_records_locked_cached(holds[0].drive_root)
+        records = ledger_rows(holds[0].drive_root)
     matching = [row for row in records if row.get("candidate_raw_sha256") == prepared[0].candidate_raw_sha256]
     assert matching[-1]["state"] == "released"
+    for request in prepared:
+        assert request.effort == {
+            "requested": "high", "sent": {"reasoning": {"effort": "high"}},
+            "sent_state": "explicit", "sent_source": "host_candidate",
+            "reported": None, "report_source": None,
+        }
+        attempt_rows = [row for row in records if row.get("candidate_raw_sha256") == request.candidate_raw_sha256]
+        assert all(row["effort"] == request.effort for row in attempt_rows)
 
 
 def test_web_search_uses_official_openai_responses(monkeypatch):
@@ -178,7 +194,8 @@ def test_web_search_uses_official_openai_responses(monkeypatch):
         search_module._web_search(request_ctx, "latest news", model="gpt-5.2")
     )
 
-    assert result == {"answer": "fresh answer", "answer_type": "summary", "sources": [], "backend": "openai_responses"}
+    assert {key: result[key] for key in ("answer", "answer_type", "sources", "backend")} == {"answer": "fresh answer", "answer_type": "summary", "sources": [], "backend": "openai_responses"}
+    assert result["legs_tried"][0]["model"] == "gpt-5.2"
     assert calls["api_key"] == "openai-key"
     assert calls["base_url"] is None
     assert calls["kwargs"]["model"] == "gpt-5.2"
@@ -401,13 +418,19 @@ def test_streaming_emits_progress_on_search(ctx, patch_env, mock_openai):
                     item_id="m1", output_index=1, sequence_number=4, logprobs=[]),
         _make_completed_event(200, 80),
     ]
-    mock_openai.responses.create.return_value = _FakeStream(events)
+    order = []
+    ctx.emit_progress_fn.side_effect = lambda text: order.append(text)
+
+    def create(**kwargs):
+        order.append("<dispatch>")
+        return _FakeStream(events)
+
+    mock_openai.responses.create.side_effect = create
 
     result = _web_search(ctx, "test query")
 
-    ctx.emit_progress_fn.assert_called_once()
-    call_text = ctx.emit_progress_fn.call_args[0][0]
-    assert "test query" in call_text
+    # The attempt is said before dispatch; only the stream's own web_search_call is search evidence.
+    assert order == ["🔍 Trying OpenAI web search: test query", "<dispatch>", "🔍 Searching: test query"]
 
     data = json.loads(result)
     assert data["answer"] == "Hello world"
@@ -516,11 +539,11 @@ def test_streaming_sanitizes_progress_and_cited_sources(ctx, patch_env, mock_ope
 
     result = json.loads(_web_search(ctx, f"query {leaked_secret}"))
 
-    progress_text = ctx.emit_progress_fn.call_args[0][0]
+    rows = [call.args[0] for call in ctx.emit_progress_fn.call_args_list]
     serialized = json.dumps(result)
-    assert leaked_secret not in progress_text
+    assert [row.split(":")[0] for row in rows] == ["🔍 Trying OpenAI web search", "🔍 Searching"]
+    assert all(leaked_secret not in row and "***REDACTED***" in row for row in rows)
     assert leaked_secret not in serialized
-    assert "***REDACTED***" in progress_text
     assert "***REDACTED***" in serialized
 
 
@@ -641,11 +664,7 @@ def test_fallback_read_timeout_keeps_its_dispatched_attempt_unresolved(
     result = json.loads(_web_search(ctx, "fallback timeout"))
 
     assert result["reason_code"] == "provider_outcome_unknown"
-    rows = [
-        json.loads(line)
-        for line in (tmp_path / ua.LEDGER_REL).read_text().splitlines()
-        if line.strip()
-    ]
+    rows = ledger_rows(tmp_path)
     final_states = {}
     for row in rows:
         final_states[row["attempt_id"]] = row["state"]
@@ -800,7 +819,8 @@ def test_terminal_openrouter_status_allows_next_backend(ctx, monkeypatch):
 
     result = json.loads(_web_search(ctx, "terminal OpenRouter query"))
 
-    assert result == {"answer": "recovered", "backend": "anthropic_server_tool"}
+    assert result["answer"] == "recovered" and result["backend"] == "anthropic_server_tool"
+    assert [leg["outcome"] for leg in result["legs_tried"]] == ["failed", "succeeded"]
 
 
 def test_explicit_web_503_allows_one_safe_retry(ctx, patch_env, monkeypatch):
@@ -871,7 +891,8 @@ def test_streaming_no_progress_without_search_events(ctx, patch_env, mock_openai
 
     result = _web_search(ctx, "simple query")
 
-    ctx.emit_progress_fn.assert_not_called()
+    # An attempt without a web_search_call event never claims that a search ran.
+    assert [call.args[0] for call in ctx.emit_progress_fn.call_args_list] == ["🔍 Trying OpenAI web search: simple query"]
     data = json.loads(result)
     assert data["answer"] == "Direct answer"
 
@@ -906,4 +927,50 @@ def test_streaming_progress_fires_only_once(ctx, patch_env, mock_openai):
 
     _web_search(ctx, "multi-search query")
 
-    assert ctx.emit_progress_fn.call_count == 1
+    assert [call.args[0] for call in ctx.emit_progress_fn.call_args_list] == [
+        "🔍 Trying OpenAI web search: multi-search query", "🔍 Searching: multi-search query"]
+
+
+def test_direct_search_dispatch_failure_releases_same_unsent_reservation(ctx, patch_env, mock_openai, monkeypatch):
+    from ouroboros import usage_accounting as ua
+    from ouroboros.usage_ledger import UsageLockUnavailable
+    reservations = []
+    original = search_module.reserve_attempt
+    def reserve(request):
+        result = original(request)
+        reservations.append(result)
+        return result
+    monkeypatch.setenv("OUROBOROS_WEBSEARCH_BACKEND", "openai")
+    monkeypatch.setattr(search_module, "reserve_attempt", reserve)
+    def refused(*args, **kwargs):
+        raise UsageLockUnavailable("synthetic kernel failure", reason="kernel_refused")
+    monkeypatch.setattr(search_module, "mark_dispatched", refused)
+    with pytest.raises(ua.PhysicalAttemptPreparationFailed) as error:
+        _web_search(ctx, "one query")
+    assert error.value.physical_attempt_capture.state == "released"
+    mock_openai.responses.create.assert_not_called()
+    assert len(reservations) == 1
+    with ua._locked(reservations[0].drive_root):
+        records = ledger_rows(reservations[0].drive_root)
+    chain = [row for row in records if row["attempt_id"] == reservations[0].attempt_id]
+    assert [row["state"] for row in chain] == ["released"]
+
+
+def test_direct_search_failed_cleanup_retains_reservation_and_refuses_fallback(ctx, patch_env, mock_openai, monkeypatch):
+    from ouroboros import usage_accounting as ua
+    original = search_module._responses_search_candidate
+    def candidate(*args, **kwargs):
+        target, payload, request, before = original(*args, **kwargs)
+        def fail(held):
+            raise RuntimeError("synthetic preparation failure")
+        return target, payload, request, fail
+    monkeypatch.setattr(search_module, "_responses_search_candidate", candidate)
+    def release(*args, **kwargs):
+        raise ua.UsageLockUnavailable("synthetic failed cleanup", reason="contention")
+    monkeypatch.setattr(ua, "release_attempt", release)
+    monkeypatch.setattr(search_module, "_web_search_openrouter", lambda *a, **k: pytest.fail("competing fallback"))
+    monkeypatch.setattr(search_module, "_web_search_anthropic", lambda *a, **k: pytest.fail("competing fallback"))
+    with pytest.raises(ua.PhysicalAttemptPreparationFailed) as error:
+        _web_search(ctx, "one query")
+    assert error.value.physical_attempt_capture.state == "reserved"
+    mock_openai.responses.create.assert_not_called()

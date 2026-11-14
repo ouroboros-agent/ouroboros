@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import pathlib
 import re
 import subprocess
-
+import time
+import zipfile
 
 # Capability deltas are disclosures, not a second verdict vocabulary. Most
 # describe a supported fallback (strict parsing, transcript extraction, or a
@@ -165,7 +167,7 @@ def _call_payload(call_ref: dict, drive_root: pathlib.Path) -> dict:
 def _api_model_identity(model: str) -> str:
     from ouroboros.provider_models import normalize_model_identity
 
-    return normalize_model_identity(str(model or "").removeprefix("openrouter::"))
+    return normalize_model_identity(str(model or ""))  # one identity across route spellings
 
 
 def _receipt_payloads(
@@ -241,6 +243,7 @@ def _session_evidence(
     receipt: dict,
     mismatches: list[str],
 ) -> None:
+    from ouroboros.gateways.claudexor_identity import validated_catalog_match
     from ouroboros.subagents import parse_subagent_harness
 
     expected = parse_subagent_harness(str(route.get("target_id") or ""))
@@ -252,10 +255,23 @@ def _session_evidence(
             f"{expected_harness or 'invalid'}->{delegated_route or 'absent'}"
         )
     expected_model = str(getattr(expected, "model", "") or "")
+    attempt = usage.get("observed_attempt")
+    attempt = attempt if isinstance(attempt, dict) else {}
+    match = validated_catalog_match(attempt.get("observed_model_catalog_match"), attempt)
+    if any(attempt.get(key) != actual for key, actual in (
+        ("model", observed_model), ("harness_id", delegated_route),
+        ("profile_id", usage.get("applied_profile")),
+    )):
+        match = None
+    if match:
+        receipt["observed"]["observed_model_catalog_match"] = match
+    compared_model = match["id"] if match else observed_model
     if expected_model and observed_model:
-        if _api_model_identity(expected_model) == _api_model_identity(observed_model):
-            receipt["model_verification"] = "exact"
-        elif any(char.isspace() for char in observed_model):
+        exact = (expected_model == compared_model if match else
+                 _api_model_identity(expected_model) == _api_model_identity(observed_model))
+        if exact:
+            receipt["model_verification"] = "catalog_match" if match else "exact"
+        elif not match and any(char.isspace() for char in observed_model):
             receipt["model_verification"] = "observed_display_label"
             mismatches.append(
                 f"model_identity_unverified:{surface}:{slot_id}:"
@@ -264,7 +280,7 @@ def _session_evidence(
         else:
             receipt["model_verification"] = "mismatch"
             mismatches.append(
-                f"model_mismatch:{surface}:{slot_id}:{expected_model}->{observed_model}"
+                f"model_mismatch:{surface}:{slot_id}:{expected_model}->{compared_model}"
             )
     elif expected_model:
         receipt["model_verification"] = "absent"
@@ -335,9 +351,8 @@ def bind_execution_receipts(
 ) -> tuple[list[dict], list[str], list[dict]]:
     """Bind configured, dispatched and observed facts for every reviewer slot."""
     requested: dict[tuple[str, str], dict] = {}
-    for surface, key in (("triad", "triad_slots"), ("scope", "scope_slots")):
-        for row in resolved_config.get(key) or []:
-            requested[(surface, str(row.get("slot_id") or ""))] = dict(row)
+    for row in resolved_config.get("pool_slots") or []:
+        requested[("pool", str(row.get("slot_id") or ""))] = dict(row)
 
     keys = [(surface, str(actor.get("slot_id") or "")) for surface, actor in actors]
     key_set = set(keys)
@@ -501,9 +516,20 @@ def finalize_contributor_outcome(
     """Turn execution-receipt drift into the contributor lane's typed outcome.
 
     Nothing about WHICH files the proposal touches is consulted: the lane always
-    executes the target base's review machinery (owner decision 2026-08-19), so
-    there is no per-proposal trust downgrade left to apply.
+    executes the installed body's review flow and rules, never the proposal's
+    copy (D31), so there is no per-proposal trust downgrade left to apply.
+
+    Drift fails an otherwise-passing run closed. A run that is already blocked
+    keeps its own cause, message and exit code as the headline — a stop before
+    or during dispatch always leaves seats without receipts, a symptom of that
+    cause — and carries the mismatches beside it (#1568).
     """
+    if mismatches and outcome.get("status") == "blocked" and str(outcome.get("block_reason") or ""):
+        note = (f"{len(mismatches)} execution-receipt mismatch(es) are recorded beside this "
+                "result (execution_receipt_mismatches).")
+        message = str(outcome.get("message") or "")
+        return exit_code or 3, {**outcome, "message": f"{message} {note}" if message else note,
+                                "execution_receipt_mismatches": mismatches}
     if mismatches:
         original_block_reason = str(outcome.get("block_reason") or "")
         original_message = str(outcome.get("message") or "")
@@ -522,3 +548,195 @@ def finalize_contributor_outcome(
             **({"original_message": original_message} if original_message else {}),
         }
     return exit_code, outcome
+
+
+# The wrapper's exit vocabulary and the contributor profile the packet declares
+# (``run_external_review`` pins the same literals).
+CONTRIBUTOR_PROFILE = "external_pr_readiness"
+EXIT_CLASS = {0: "passed", 1: "genuine_review_block", 3: "infrastructure"}
+
+
+def _json_text(value) -> str:
+    return json.dumps(value, indent=2, ensure_ascii=False, default=str)
+
+
+def _write_json(path: pathlib.Path, value) -> None:
+    path.write_text(_json_text(value) + "\n", encoding="utf-8")
+
+
+_NATIVE_SEPARATORS = tuple(sep for sep in (os.sep, os.altsep) if sep)
+
+
+def _public_text(text: str, replacements: list[tuple[str, str]]) -> str:
+    """Machine-local roots become their placeholders. A value that IS a path under
+    one of them (one line, the root then a separator) also gets posix separators,
+    so the packet reads the same on every OS; other text keeps its characters."""
+    is_path = "\n" not in text and any(
+        raw and text.startswith(raw) and text[len(raw):len(raw) + 1] in ("", *_NATIVE_SEPARATORS)
+        for raw, _replacement in replacements
+    )
+    for raw, replacement in replacements:
+        if raw:
+            text = text.replace(raw, replacement)
+    if is_path:
+        for sep in _NATIVE_SEPARATORS:
+            text = text.replace(sep, "/")
+    return text
+
+
+def replace_public_paths(value, replacements: list[tuple[str, str]]):
+    if isinstance(value, dict):
+        return {
+            str(key): replace_public_paths(item, replacements)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [replace_public_paths(item, replacements) for item in value]
+    if isinstance(value, str):
+        return _public_text(value, replacements)
+    return value
+
+
+def public_projection(value, *, replacements: list[tuple[str, str]]):
+    """Apply the runtime secret scrubber and remove machine-local path prefixes."""
+    from ouroboros.observability import redact_projection
+
+    redacted = redact_projection(value).value
+    return replace_public_paths(redacted, replacements)
+
+
+def contributor_result(exit_code: int) -> str:
+    """The exit code is the whole input: no proposal fact downgrades a result."""
+    if exit_code != 0:
+        return "BLOCKED" if exit_code == 1 else "INCOMPLETE"
+    return "READY_FOR_INTEGRATION"
+
+
+def write_contributor_packet(
+    *,
+    output_dir: pathlib.Path,
+    snapshot: dict,
+    resolved_config: dict,
+    outcome: dict,
+    exit_code: int,
+    evidence_refs: list[dict],
+    cost_report: dict,
+    elapsed_sec: float,
+    seats: list[dict],
+    review_record: dict,
+    execution_receipts: list[dict],
+    execution_mismatches: list[str],
+    session_transcripts: list[dict],
+    degraded_reasons: list[str],
+    replacements: list[tuple[str, str]],
+) -> pathlib.Path:
+    result = contributor_result(exit_code)
+    telemetry_limitations = [
+        f"{item.get('surface')}:{item.get('slot_id')}:observed_model_is_display_label"
+        for item in execution_receipts
+        if item.get("model_verification") == "observed_display_label"
+    ]
+    public_transcripts = public_projection(session_transcripts, replacements=replacements)
+    for item in public_transcripts:
+        transcript = str(item.get("transcript") or "")
+        item["chars"] = len(transcript)
+        item["sha256"] = hashlib.sha256(
+            transcript.encode("utf-8", "replace")
+        ).hexdigest()
+    public_snapshot = {
+        key: value
+        for key, value in snapshot.items()
+        if key not in ("patch", "installed_head_sha")
+    }
+    evidence = {
+        "schema_version": 3,
+        "review_profile": CONTRIBUTOR_PROFILE,
+        "result": result,
+        "complete": exit_code == 0,
+        "exit_code": exit_code,
+        "exit_class": EXIT_CLASS.get(exit_code, "unknown"),
+        "reviewed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "snapshot": public_snapshot,
+        "review_config": resolved_config,
+        "review_execution": {
+            "receipts": execution_receipts,
+            "mismatches": execution_mismatches,
+            "consistent": not execution_mismatches,
+            "telemetry_limitations": telemetry_limitations,
+            "session_transcript_artifacts": [
+                {key: value for key, value in item.items() if key != "transcript"}
+                for item in public_transcripts
+            ],
+            "effort_note": (
+                "Configured effort is recorded under configured slots. Applied effort "
+                "is null unless the execution route exposes it."
+            ),
+        },
+        "review_completeness": {
+            "contract": "production_pool_quorum_plus_coupling",
+            "degraded_reasons": list(degraded_reasons),
+        },
+        "advisory": {
+            "included": False,
+            "reason": "excluded_by_external_pr_readiness_profile",
+        },
+        "release_metadata": {
+            "contributor_version_bump_required": False,
+            "owner": "maintainer_final_landing",
+            "final_production_review_required": True,
+        },
+        "trust": {
+            "execution_receipts_consistent": not execution_mismatches,
+            # Diagnostic evidence only, never a gate (D31).
+            "review_substrate_changed": snapshot.get("review_substrate_changed", []),
+            "installed_body_execution": {
+                "statement": (
+                    "The installed body's review flow and rules ran this review: the "
+                    "wrapper ran from a clean checkout that does not contain the "
+                    "proposal, and the review operation froze base..head as a subject "
+                    "it only reads (D31)."
+                ),
+                "executing_checkout_head": snapshot.get("installed_head_sha"),
+                "rules_source": (review_record.get("checklist") or {}).get("rules_source"),
+            },
+            "note": (
+                "Contributor evidence is not merge authorization or cryptographic "
+                "proof of execution."
+            ),
+        },
+        "production_outcome": outcome,
+        "review_record": review_record,
+        "raw_evidence_refs": evidence_refs,
+        "cost_report": cost_report,
+        "budget": {
+            "run_cap_usd": (resolved_config.get("data_isolation") or {}).get("run_cap_usd"),
+            "authority": "isolated_review_ledger",
+            "note": ("The run cap is the whole global limit of a ledger that starts empty and sees no "
+                     "host spend or concurrent host work; agent-session seats are recorded at settlement."),
+        },
+        "elapsed_sec": round(elapsed_sec, 1),
+    }
+    public_evidence = public_projection(evidence, replacements=replacements)
+    public_seats = public_projection(list(seats), replacements=replacements)
+
+    evidence_path = output_dir / "review-evidence.json"
+    outcome_path = output_dir / "outcome.json"
+    full_output_path = output_dir / "full-output.txt"
+    _write_json(evidence_path, public_evidence)
+    _write_json(outcome_path, public_projection({"exit_code": exit_code, "outcome": outcome},
+                                                 replacements=replacements))
+    sep = "=" * 80
+    full_output = "\n".join([
+        sep, "CONTRIBUTOR REVIEW EVIDENCE", sep,
+        _json_text(public_evidence),
+        sep, "REVIEW POOL SEAT RECORDS (ledger rows with retained answers, full, redacted)", sep,
+        _json_text(public_seats),
+        sep, "AGENT SESSION TRANSCRIPTS (full, redacted)", sep,
+        _json_text(public_transcripts),
+    ])
+    full_output_path.write_text(full_output + "\n", encoding="utf-8")
+    packet_path = output_dir / "review-packet.zip"
+    with zipfile.ZipFile(packet_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in (evidence_path, outcome_path, full_output_path):
+            archive.write(path, arcname=path.name)
+    return packet_path

@@ -1,8 +1,17 @@
+import { acceptanceGroupWithIncident, acceptanceIncidentFromTaskDetail } from './acceptance_incident_presentation.js';
+export { acceptanceIncidentFromTaskDetail } from './acceptance_incident_presentation.js';
 import { setInertCardPresentation } from './task_phase_chip.js';
-import { escapeHtmlAttr } from './utils.js';
-import { taskSourceDownloadUrl } from './api_client.js';
+import { escapeHtmlAttr, sinceLocalTime } from './utils.js';
+import { isStoreMigrating, taskSourceDownloadUrl } from './api_client.js';
 import { harnessIdentityMarkup } from './harness_presentation.js';
 import { reconcileReviewMarkup } from './review_dom_patch.js';
+import {
+    actorAnswered, actorAwaiting, actorUnresolved, authorDoctrineLines, formatReviewProjection, seatAdviser, seatOwed,
+} from './review_record_card.js';
+import { planRecordEngaged, planRecordGroup } from './plan_record_presentation.js';
+import { renderOpinionReviews, reviewViews } from './review_opinions.js';
+import { getTaskReviewHistory } from './api_client.js';
+export { formatReviewProjection } from './review_record_card.js';
 
 const escapeHtmlText = escapeHtmlAttr;
 
@@ -10,6 +19,7 @@ const SURFACE_ORDER = new Map([
     ['skill', 0],
     ['plan', 1],
     ['task_acceptance', 2],
+    ['review_record', 3],
 ]);
 
 const ACTIVE_STATES = new Set(['queued', 'running', 'open', 'working', 'pending']);
@@ -40,6 +50,12 @@ const finiteCount = (value) => {
     const number = Number(value);
     return Number.isFinite(number) && number >= 0 ? Math.trunc(number) : null;
 };
+// A roster with an unanswered slot reports how far it got, never a bare verdict;
+// a slot that is neither answered nor awaited keeps the warning tone.
+const heldProgress = (lead, roster, answered, awaited = actorAwaiting) => {
+    const unavailable = roster.filter((actor) => !awaited(actor) && !answered(actor)).length;
+    return [`${lead} · ${roster.filter(answered).length} of ${roster.length} answered${unavailable ? ` · ${unavailable} unavailable` : ''}`, unavailable ? 'warn' : ''];
+};
 
 export function setReviewAnchor(record, enabled, writePhase) {
     if (!record || (record.historicalUnavailable || record.historicalUnconfirmed) || Boolean(record.reviewAnchor) === enabled) return false;
@@ -47,13 +63,11 @@ export function setReviewAnchor(record, enabled, writePhase) {
     setInertCardPresentation(record, enabled);
     if (enabled) {
         record.titleEl.textContent = record.suggestedName || 'Reviews';
-        record.inlineTypingEl.style.display = 'none';
     } else {
         writePhase(record, 'working');
         if (!record.suggestedName && !record.lastHumanHeadline) {
-            record.titleEl.textContent = 'Working...';
+            record.titleEl.textContent = '';  // the chip says Working; the title waits for a name (#1369)
         }
-        record.inlineTypingEl.style.display = '';
     }
     return true;
 }
@@ -100,12 +114,12 @@ function reviewTone(state, verdict, lifecycleStatus = '') {
         : statusTone(state, verdict);
 }
 
-function lifecycleMeta(status) {
+export function lifecycleMeta(status) {
     const token = text(status).toLowerCase();
     return lifecycleFailure(token) ? `lifecycle ${token}` : '';
 }
 
-function hasSemanticVerdict(verdict) {
+export function hasSemanticVerdict(verdict) {
     const token = text(verdict).toLowerCase();
     return Boolean(token)
         && !ACTIVE_STATES.has(token)
@@ -149,6 +163,7 @@ function normalizeSkillAttempt(attempt, defaults = {}, ordinal = 0) {
     if (!attempt || typeof attempt !== 'object') return null;
     const skill = text(attempt.skill || defaults.skill);
     const jobId = text(attempt.job_id || attempt.jobId);
+    const recordId = text(attempt.record_id || attempt.recordId);
     const id = attemptIdentity(attempt, [
         text(attempt.content_hash), text(attempt.review_round),
         text(attempt.snapshot_attempt), String(ordinal + 1),
@@ -196,7 +211,7 @@ function normalizeSkillAttempt(attempt, defaults = {}, ordinal = 0) {
         executions: normalizedExecutions(attempt.executions, attempt.execution),
         execution: attempt.execution && typeof attempt.execution === 'object' ? attempt.execution : null,
         lifecycleOnly,
-        detailRef: skill && jobId ? { surface: 'skill', skill, jobId } : null,
+        detailRef: skill && jobId ? { surface: 'skill', skill, jobId, ...(recordId ? { recordId } : {}) } : null,
         detailText: '',
     };
 }
@@ -397,21 +412,31 @@ export function classifyReviewLifecyclePointer(row) {
     };
 }
 
-function planAttempt(wave, index, isCurrent) {
+function planAttempt(wave, index, isCurrent, live) {
     if (!wave || typeof wave !== 'object') return null;
     const fingerprint = text(wave.request_fingerprint);
     const id = attemptIdentity(wave, `${fingerprint || 'wave'}:${wave.cycle_index ?? index + 1}`);
     if (!id) return null;
     const verdict = text(wave.aggregate || 'UNKNOWN');
     const superseded = Boolean(wave.superseded) || !isCurrent;
-    // Gate closure and physical reviewer custody are independent. A partial
-    // wave can remain in flight after the author selects a different plan.
-    const state = wave.custody_pending === true ? 'running' : superseded ? 'superseded' : 'terminal';
+    // Gate closure and physical reviewer custody are independent: a partial wave can stay in flight after the
+    // author selects a different plan — but only while its own task still runs to collect it; afterwards it is a gap.
+    const custodyPending = wave.custody_pending === true;
+    const state = custodyPending && live ? 'running' : superseded ? 'superseded' : 'terminal';
+    const roster = (Array.isArray(wave.actors) ? wave.actors : [])
+        .filter((actor) => actor && typeof actor === 'object');
+    // A wave whose reviewers may still answer reports how far it got; a settled wave
+    // whose reviewers were too few for a verdict reports the same counts in the neutral
+    // tone (the stored DEGRADED word is the host's placeholder and never paints).
+    const settledNoQuorum = !custodyPending && verdict === 'DEGRADED';
+    const [progress, heldTone] = custodyPending || settledNoQuorum ? heldProgress(
+        custodyPending && roster.some(actorUnresolved) && !roster.some(actorAwaiting) ? 'unresolved' : (custodyPending && live ? 'in progress' : 'no verdict'), roster, (actor) => actor.ok === true) : ['', ''];
     return {
         id,
         surface: 'plan',
         state,
-        tone: statusTone(state, verdict),
+        progress,
+        tone: settledNoQuorum ? 'neutral' : heldTone || statusTone(state, custodyPending ? '' : verdict),
         verdict,
         timestamp: text(wave.reviewed_at || wave.ts || wave.timestamp || wave.closed_at),
         ordinal: index,
@@ -511,20 +536,27 @@ function planFindingLines(wave) {
 
 function planActorAvailabilityLines(wave) {
     // The bug report's own bar: a result that was never received must say so
-    // explicitly instead of contributing silently-zero findings.
+    // explicitly instead of contributing silently-zero findings. A row names the model and
+    // quotes the engine's sentence; failure code and slot id stay in the task detail and Logs.
     const lines = [];
     for (const actor of (Array.isArray(wave.actors) ? wave.actors : [])) {
         if (!actor || typeof actor !== 'object' || actor.ok !== false) continue;
-        const identity = [text(actor.slot_id), text(actor.model)].filter(Boolean).join(' · ') || 'reviewer';
-        const cause = text(actor.failure_code) || text(actor.error) || 'no parseable verdict';
-        lines.push(`Reviewer unavailable: ${identity} — ${cause}`);
+        const model = text(actor.model) || 'reviewer';
+        const cause = text(actor.reported_cause).split(/\s+/).join(' ');
+        const carried = finiteCount(actor.carried_findings) ? '; its earlier finding is still listed' : '';
+        if (actorAwaiting(actor)) lines.push(`${model} · awaiting${sinceLocalTime(actor.awaiting_since)}`);
+        else if (actorUnresolved(actor)) lines.push(`${model} · no answer${cause ? ` — "${cause}"` : ''}${sinceLocalTime(actor.awaiting_since)}`);
+        else if (text(actor.operation_state) === 'not_dispatched') lines.push(`${model} · not sent${carried}`);
+        else lines.push(`${model} · unavailable${cause ? ` — "${cause}"` : ''}${carried ? ` · did not answer${carried}` : ''}`);
     }
     return lines;
 }
 
 function planWaveDetail(wave) {
     const lines = [
-        wave.aggregate ? `Verdict: ${wave.aggregate}` : '',
+        wave.custody_pending === true
+            ? 'Verdict: none (wave held open)'
+            : (text(wave.aggregate) === 'DEGRADED' ? 'Verdict: none — fewer reviewers answered than needed' : (wave.aggregate ? `Verdict: ${wave.aggregate}` : '')),
         wave.closed != null ? `Closed: ${wave.closed ? 'yes' : 'no'}` : '',
         wave.paid != null ? `Reviewer panel dispatched: ${wave.paid ? 'yes' : 'no'}` : '',
         wave.quorum_unreachable ? 'Quorum unavailable' : '',
@@ -532,6 +564,14 @@ function planWaveDetail(wave) {
         wave.reason ? `Reason: ${text(wave.reason)}` : '',
     ];
     const counts = wave.counts && typeof wave.counts === 'object' ? wave.counts : {};
+    // A panel ordered weaker than the owner's setting says so seat by seat (typed fact; the
+    // verdict token is never recoloured), on compact waves too since compaction keeps the fact.
+    const weaker = wave.ordered_weaker && typeof wave.ordered_weaker === 'object'
+        ? Object.entries(wave.ordered_weaker).filter(([, row]) => row && typeof row === 'object') : [];
+    if (weaker.length) {
+        lines.push(`Reviewers ordered weaker than your setting: ${weaker
+            .map(([sid, row]) => `${sid} ${text(row.effort) || '?'} (setting ${text(row.owner_effort) || '?'})`).join(', ')}`);
+    }
     if (wave.compact) {
         // A compacted wave keeps counts while its finding bodies moved to the
         // immutable wave artifact; name that remainder instead of rendering a
@@ -559,15 +599,8 @@ function planWaveDetail(wave) {
     }
     if (wave.findings_texts_truncated) lines.push('Some finding texts were truncated at capture.');
     if (wave.spec_body_truncated) lines.push('Spec body was truncated at capture.');
-    const author = wave.author_disposition;
-    if (author && typeof author === 'object' && text(author.disposition)) {
-        lines.push(
-            `Author ${author.action === 'stop' ? 'stop' : 'finish'}: ${text(author.disposition)}${text(author.reviewer_signal) ? ` · reviewer signal=${text(author.reviewer_signal)}` : ''}`
-            + `${text(author.rationale) ? ` · ${text(author.rationale)}` : ''}`
-            + `${text(author.subject_hash) ? ` · subject_hash=${text(author.subject_hash)}` : ''}`
-            + `${text(author.source) ? ` · source=${text(author.source)}` : ''}`,
-        );
-    }
+    const authorLine = authorDispositionText(wave.author_disposition);
+    if (authorLine) lines.push(authorLine);
     return lines.filter(Boolean).join('\n');
 }
 
@@ -629,6 +662,7 @@ function legacyPlanReviewGroup(owner, stateRecord) {
 
 export function planReviewGroupFromTaskDetail(detail, ownerTaskId = '') {
     const owner = text(ownerTaskId || detail?.task_id);
+    if (owner && planRecordEngaged(detail?.plan_record)) return planRecordGroup(owner, detail.plan_record, detail);
     const stateRecord = detail?.plan_review_state;
     if (!owner || !stateRecord || typeof stateRecord !== 'object') return null;
     if (stateRecord.schema_version === 1) return legacyPlanReviewGroup(owner, stateRecord);
@@ -640,8 +674,13 @@ export function planReviewGroupFromTaskDetail(detail, ownerTaskId = '') {
     const authorSubject = current.author_subject;
     const author = authorDispositionText(authorSubject?.author_disposition);
     const reviewFingerprint = author ? text(authorSubject.review_fingerprint) : currentFingerprint;
+    // The critic reviewed the EARLIER plan when the author selected a revised one: the group
+    // is labelled as that plan's review and the selected plan is named unreviewed — the same
+    // `historical_critic` fact the gate projection carries, never a synthesized verdict.
+    const historicalCritic = Boolean(author) && Boolean(reviewFingerprint) && reviewFingerprint !== currentFingerprint;
     const authorDecisionText = author ? [author,
         `Critic plan: ${reviewFingerprint}`,
+        historicalCritic ? `The verdict shown is the earlier plan's review; the selected plan ${currentFingerprint} has no verdict of its own` : '',
         authorSubject.source_ref?.path ? `Current plan source: ${text(authorSubject.source_ref.root)}:${text(authorSubject.source_ref.path)}` : '',
         authorSubject.source_ref?.sha256 ? `Source sha256=${text(authorSubject.source_ref.sha256)}` : '',
     ].filter(Boolean).join('\n') : '';
@@ -663,7 +702,7 @@ export function planReviewGroupFromTaskDetail(detail, ownerTaskId = '') {
         .map((wave, index) => planAttempt(
             wave,
             index,
-            index === currentWaveIndex,
+            index === currentWaveIndex, text(detail?.status).toLowerCase() === 'running',
         ))
         .filter(Boolean);
     let currentAttempt = currentWaveIndex >= 0
@@ -703,16 +742,21 @@ export function planReviewGroupFromTaskDetail(detail, ownerTaskId = '') {
         state = activeAttempts.some((attempt) => attempt.state === 'running') ? 'running' : 'queued';
         activeCount = activeAttempts.length;
     }
+    // The group header speaks for its CURRENT wave: a progress phrase while that wave
+    // has unanswered slots, the recorded verdict once every slot is collected.
+    const progress = text(currentAttempt?.progress);
     return {
         id: `plan:${owner}`,
         surface: 'plan',
-        label: 'Plan review',
+        label: historicalCritic ? 'Plan review · earlier plan' : 'Plan review',
+        historicalCritic,
         subject: '',
         presentationOwnerTaskId: owner,
         subjectTaskId: owner,
         initiatorTaskId: owner,
         state,
-        tone: statusTone(state, currentVerdict),
+        progress,
+        tone: progress ? currentAttempt.tone : statusTone(state, currentVerdict),
         verdict: currentVerdict,
         summary: text(current.reason || currentAttempt?.summary),
         authorDecisionText,
@@ -723,92 +767,29 @@ export function planReviewGroupFromTaskDetail(detail, ownerTaskId = '') {
     };
 }
 
-function compactCoverage(coverage) {
-    if (!coverage || typeof coverage !== 'object') return '';
-    return Object.entries(coverage)
-        .filter(([, value]) => value !== '' && value !== null && value !== undefined)
-        .map(([key, value]) => `${key}=${String(value)}`)
-        .join(', ');
-}
-
-export function formatReviewProjection(projection) {
-    const panels = Array.isArray(projection?.panels) ? projection.panels : [];
-    const lines = [];
-    panels.forEach((panel, panelIndex) => {
-        if (!panel || typeof panel !== 'object') return;
-        const quorum = panel.quorum && typeof panel.quorum === 'object' ? panel.quorum : {};
-        const panelId = String(panel.panel_id || `panel-${panelIndex + 1}`);
-        lines.push(
-            `Review panel ${panelId}: ${String(panel.surface || 'review')} · authority=${String(panel.authority || 'unspecified')} · verdict=${String(panel.aggregate_signal || 'UNKNOWN')} · transport=${String(panel.transport_status || 'unknown')} · parse=${String(panel.parse_status || 'unknown')} · quorum=${String(quorum.contributed ?? 0)}/${String(quorum.configured ?? 0)} (required ${String(quorum.required ?? 0)}) · enforcement=${String(panel.enforcement_impact || 'unknown')}${panel.single_reviewer_no_diversity ? ' · single-reviewer (no diversity)' : ''}${panel.dialogue && panel.dialogue.status ? ` · dialogue=${String(panel.dialogue.status)}` : ''}${panel.superseded ? ' · superseded' : ''}`,
-        );
-        if (panel.reason) lines.push(`Panel reason: ${String(panel.reason)}`);
-        const coverage = compactCoverage(panel.coverage);
-        if (coverage) lines.push(`Panel coverage: ${coverage}`);
-        const binding = [
-            panel.candidate_hash ? `candidate_hash=${String(panel.candidate_hash)}` : '',
-            panel.evidence_revision ? `evidence_revision=${String(panel.evidence_revision)}` : '',
-            panel.fence_hash ? `fence_hash=${String(panel.fence_hash)}` : '',
-            panel.binding_hash ? `binding_hash=${String(panel.binding_hash)}` : '',
-        ].filter(Boolean);
-        if (binding.length) lines.push(`Panel binding: ${binding.join(' · ')}`);
-        (Array.isArray(panel.actors) ? panel.actors : []).forEach((actor) => {
-            if (!actor || typeof actor !== 'object') return;
-            const slotId = String(actor.slot_id || '?');
-            lines.push(
-                `Reviewer ${slotId}: role=${String(actor.actor_role || 'reviewer')} · provider=${String(actor.provider || 'unknown')} · model=${String(actor.model || 'unknown')} · transport=${String(actor.transport_status || 'unknown')} · parse=${String(actor.parse_status || 'unknown')} · verdict=${String(actor.semantic_verdict || 'none')}${actor.outcome_tier ? ` · outcome_tier=${String(actor.outcome_tier)}` : ''}${actor.dialogue_status ? ` · dialogue=${String(actor.dialogue_status)}` : ''} · quorum=${actor.quorum_contribution ? 'contributes' : 'abstains'} · enforcement=${String(actor.enforcement_impact || 'unknown')}`,
-            );
-            const actorCoverage = compactCoverage(actor.coverage);
-            if (actorCoverage) lines.push(`Reviewer ${slotId} coverage: ${actorCoverage}`);
-            if (actor.reason) lines.push(`Reviewer ${slotId} reason: ${String(actor.reason)}`);
-            if (Array.isArray(actor.findings)) {
-                for (const finding of actor.findings) {
-                    if (!finding || typeof finding !== 'object') continue;
-                    const label = [text(finding.severity), text(finding.verdict)]
-                        .filter(Boolean).join(' ') || 'finding';
-                    const title = text(finding.item) || text(finding.summary) || '(no item)';
-                    const summaryText = text(finding.summary);
-                    const body = [
-                        `[${label}]${text(finding.id) ? ` ${text(finding.id)}` : ''} ${title}`,
-                        summaryText && summaryText !== title ? `summary: ${summaryText}` : '',
-                        text(finding.reason) ? `reason: ${text(finding.reason)}` : '',
-                        text(finding.evidence) ? `evidence: ${text(finding.evidence)}` : '',
-                        text(finding.recommendation) ? `fix: ${text(finding.recommendation)}` : '',
-                    ].filter(Boolean).join(' — ');
-                    lines.push(`Reviewer ${slotId} finding: ${body}`);
-                }
-                const omitted = finiteCount(actor.findings_omitted);
-                if (omitted) lines.push(`Reviewer ${slotId} findings omitted: ${omitted}`);
-            }
-            // P1: name the durable full copy unconditionally — bounded rows,
-            // per-string truncation markers and pre-findings-era projections
-            // all resolve through the same observability call.
-            const callId = text(actor.response_ref?.call_id);
-            if (callId) {
-                lines.push(`Reviewer ${slotId} full response: observability call ${callId}`);
-            }
-        });
-    });
-    return lines.join('\n');
-}
-
 function authorDispositionText(author, label = '') {
-    if (!author || typeof author !== 'object' || !text(author.disposition)) return '';
+    if (!author || typeof author !== 'object' || (!text(author.disposition) && !text(author.action))) return '';
     const actionLabel = label || `Author ${author.action === 'stop' ? 'stop' : 'finish'}`;
     return [
-        `${actionLabel}: ${text(author.disposition)}`,
+        `${actionLabel}${text(author.disposition) ? `: ${text(author.disposition)}` : ''}`,
         text(author.reviewer_signal) ? `reviewer signal=${text(author.reviewer_signal)}` : '',
         text(author.rationale),
         text(author.subject_hash) ? `subject_hash=${text(author.subject_hash)}` : '',
         text(author.source) ? `source=${text(author.source)}` : '',
+        ...authorDoctrineLines(author),
     ].filter(Boolean).join(' · ');
 }
 
+/** Read-only: a task-acceptance record stored before the result review replaced that machine. */
 export function taskAcceptanceGroupFromTaskDetail(detail, ownerTaskId = '') {
     const owner = text(ownerTaskId || detail?.task_id);
     const projection = detail?.review_projection;
     const panels = (Array.isArray(projection?.panels) ? projection.panels : [])
         .filter((panel) => text(panel?.surface) === 'task_acceptance');
-    if (!owner || !panels.length) return null;
+    const incident = acceptanceIncidentFromTaskDetail(detail);
+    // A local preparation failure produces NO panel: the group has to exist on
+    // the incident alone, or the owner sees nothing at all.
+    if (!owner || (!panels.length && !incident)) return null;
     const acceptanceDecision = detail?.outcome_axes?.review?.acceptance_decision
         || detail?.review_status?.acceptance_decision;
     const decisionAuthor = acceptanceDecision?.author_disposition;
@@ -824,6 +805,13 @@ export function taskAcceptanceGroupFromTaskDetail(detail, ownerTaskId = '') {
         }, 'Author stance (unbound)');
     const attempts = panels.map((panel, index) => {
         const verdict = text(panel?.aggregate_signal || 'UNKNOWN');
+        const roster = (Array.isArray(panel?.actors) ? panel.actors : []).filter((actor) => actor && typeof actor === 'object');
+        const awaited = roster.some(actorAwaiting);
+        // An awaited panel is activity only while its own task still runs to collect it; afterwards an unanswered
+        // slot is a recorded gap. A settled panel without a verdict says so in words; DEGRADED stays in its detail.
+        const live = awaited && text(detail?.status).toLowerCase() === 'running' && !panel?.superseded && index === panels.length - 1;
+        const held = { FAIL: 'FAIL', PASS: live ? 'PASS so far' : 'PASS' }[verdict.toUpperCase()] || (live ? 'in progress' : 'no verdict');
+        const [progress, heldTone] = awaited || verdict.toUpperCase() === 'DEGRADED' ? heldProgress(held, roster, (actor) => text(actor.transport_status) === 'success') : ['', ''];
         // The host composed this sentence; the card prints it verbatim and
         // leads the detail with it, because the renderer shows detailText over
         // summary. The panel's own verdict and identity are untouched.
@@ -834,8 +822,10 @@ export function taskAcceptanceGroupFromTaskDetail(detail, ownerTaskId = '') {
                 panel.task_attempt == null ? '' : `task-attempt:${panel.task_attempt}`,
                 panel.panel_index == null ? '' : `panel-index:${panel.panel_index}`].filter(Boolean).join(':'),
             surface: 'task_acceptance',
-            state: panel?.superseded ? 'superseded' : 'terminal',
-            tone: statusTone('terminal', verdict),
+            state: live ? 'running' : (panel?.superseded ? 'superseded' : 'terminal'),
+            progress,
+            tone: !awaited || held === 'FAIL' ? statusTone('terminal', verdict)
+                : (heldTone || (live ? 'working' : (held === 'PASS' ? statusTone('terminal', verdict) : 'neutral'))),
             verdict,
             timestamp: text(panel?.ts || panel?.timestamp),
             ordinal: index,
@@ -853,31 +843,77 @@ export function taskAcceptanceGroupFromTaskDetail(detail, ownerTaskId = '') {
                 authorDispositionText(panel.author_disposition), 'Cost unavailable'].filter(Boolean).join('\n'),
         };
     });
-    const latest = attempts.at(-1);
+    return acceptanceGroupWithIncident({ owner, attempts, incident, authorDecisionText, statusTone });
+}
+
+/** The task's own review-ledger records (panels carrying `record_id`), one attempt per record, oldest first. */
+export function reviewRecordGroupFromTaskDetail(detail, ownerTaskId = '') {
+    const owner = text(ownerTaskId || detail?.task_id);
+    const projection = detail?.review_projection;
+    const panels = (Array.isArray(projection?.panels) ? projection.panels : []).filter((panel) => text(panel?.record_id));
+    const gaps = (Array.isArray(projection?.gaps) ? projection.gaps : []).filter((gap) => gap && typeof gap === 'object');
+    // Only a record or a gap makes a group: a count of older records alone (`review_records_omitted`,
+    // unknown once the index rotated) is no review of this task.
+    if (!owner || (!panels.length && !gaps.length)) return null;
+    const live = text(detail?.status).toLowerCase() === 'running';
+    const attempts = panels.map((panel, index) => {
+        const verdict = text(panel.aggregate_signal) || 'UNKNOWN';
+        // A pending record whose counted seats are still owed reports how far it got, like a stored panel:
+        // in progress while its task runs, no verdict once it ended; NOT_PERFORMED stays in Record facts.
+        const counted = (Array.isArray(panel.actors) ? panel.actors : []).filter((actor) => actor && typeof actor === 'object' && !seatAdviser(actor));
+        const owed = text(panel.record_state) === 'pending' && counted.some((actor) => seatOwed(actor, panel));
+        const [progress, heldTone] = owed
+            ? heldProgress(live ? 'in progress' : 'no verdict', counted, actorAnswered, (actor) => seatOwed(actor, panel)) : ['', ''];
+        return {
+            id: `record:${text(panel.record_id)}`, panel, surface: 'review_record', state: owed && live ? 'running' : 'terminal', progress,
+            // NOT_PERFORMED, QUORUM_FAILED and NOT_DISPATCHED reached no verdict: a warning, never a quiet neutral.
+            tone: owed ? (heldTone || (live ? 'working' : 'neutral')) : ({ PASS: 'done', FAIL: 'error' }[verdict] || 'warn'),
+            verdict, timestamp: text(panel.ts), ordinal: index, live,
+            label: `${text(panel.surface) || 'review'} record ${text(panel.record_id)}`, summary: text(panel.reason),
+            superseded: false, replayed: false, revised: false, initiatorTaskId: owner,
+            executions: executionsFromReviewRecord(panel), execution: null, detailRef: null,
+            detailText: [formatReviewProjection({ panels: [panel] }), text(panel.source_ref?.path) ? `Full record: ${text(panel.source_ref.path)}` : ''].filter(Boolean).join('\n'),
+        };
+    });
+    for (const gap of gaps) attempts.push({
+        id: `gap:${text(gap.record_id) || text(gap.review_gap)}`, surface: 'review_record', state: 'terminal', tone: 'warn', verdict: 'could not be read',
+        label: 'Review record unavailable', summary: 'This saved review could not be read. The readable reviews beside it are unaffected.',
+        gap: true, gapReason: text(gap.review_gap), detailText: formatReviewProjection({ gaps: [gap] }), executions: [],
+    });
+    const latest = attempts.at(-1) || { tone: 'neutral', verdict: '', summary: '' };
     return {
-        id: `task_acceptance:${owner}`,
-        surface: 'task_acceptance',
-        label: 'Task acceptance',
-        subject: '',
-        presentationOwnerTaskId: owner,
-        subjectTaskId: owner,
-        initiatorTaskId: owner,
-        state: 'terminal',
-        tone: statusTone('terminal', latest?.verdict),
-        verdict: text(latest?.verdict),
-        summary: text(latest?.summary),
-        authorDecisionText,
-        activeCount: 0,
-        attemptCount: attempts.length,
-        countIsAuthoritative: true,
-        attempts,
+        // Earlier records exist ('1+' or a count) or may exist in a rotated index ('unknown'); 0 says none.
+        historyTask: owner, historyMore: ![0, undefined, null, ''].includes(projection.review_records_omitted),
+        historyCertain: projection.review_records_omitted !== 'unknown',
+        id: `review_record:${owner}`, surface: 'review_record', label: 'Review records', subject: '',
+        presentationOwnerTaskId: owner, subjectTaskId: owner, initiatorTaskId: owner,
+        state: 'terminal', progress: '', tone: latest.tone, verdict: latest.verdict, summary: latest.summary,
+        warning: '', authorDecisionText: '', activeCount: 0, attemptCount: attempts.length,
+        // Older records stay in the ledger: the count is exact only when the projection says none exist.
+        countIsAuthoritative: projection.review_records_omitted === 0, attempts,
+        // The task's own settled adoptions, joined with each record's landed commit; a source without the
+        // field leaves what an earlier read said (absent is unknown, never "none adopted").
+        ...(Array.isArray(detail?.body_adoptions) ? { adoptions: detail.body_adoptions } : {}),
     };
+}
+
+// One row per adoption at its highest revision across two reads: a history row read before a later outcome settled
+// cannot take that adoption back, nor drop one the other read named.
+function mergeAdoptions(prior, incoming) {
+    const revision = (row) => (Number.isSafeInteger(row?.revision) ? row.revision : 0);
+    const rows = new Map();
+    for (const row of [...prior, ...incoming]) {
+        const id = text(row?.adoption_id) || JSON.stringify(row);
+        if (!(revision(rows.get(id)) > revision(row))) rows.set(id, row);
+    }
+    return [...rows.values()];
 }
 
 export function reviewGroupsFromTaskDetail(detail, ownerTaskId = '') {
     return [
         planReviewGroupFromTaskDetail(detail, ownerTaskId),
         taskAcceptanceGroupFromTaskDetail(detail, ownerTaskId),
+        reviewRecordGroupFromTaskDetail(detail, ownerTaskId),
     ].filter(Boolean);
 }
 
@@ -953,7 +989,7 @@ export function mergeReviewGroup(store, incoming) {
                 && (attempt.state === 'queued' || attempt.state === 'running')
             ) {
                 mergedById.set(id, {
-                    ...attempt, state: 'superseded', tone: 'neutral', superseded: true,
+                    ...attempt, state: 'superseded', tone: 'neutral', superseded: true, progress: '',
                 });
             }
         }
@@ -994,13 +1030,14 @@ export function mergeReviewGroup(store, incoming) {
         attempts: order.map((id) => mergedById.get(id)).filter(Boolean),
         attemptCount: Math.max(prior.attemptCount || 0, incoming.attemptCount || 0, mergedById.size),
     };
+    if (Array.isArray(prior.adoptions) && Array.isArray(incoming.adoptions)) merged.adoptions = mergeAdoptions(prior.adoptions, incoming.adoptions);
     if (staleActiveRegression) {
         merged.state = prior.state;
         merged.verdict = prior.verdict;
         merged.summary = prior.summary;
         merged.activeCount = prior.activeCount;
         merged.lifecycleStatus = prior.lifecycleStatus;
-        merged.tone = reviewTone(merged.state, merged.verdict, merged.lifecycleStatus);
+        merged.tone = prior.progress ? prior.tone : reviewTone(merged.state, merged.verdict, merged.lifecycleStatus);
     }
     const activeAttempts = merged.attempts.filter(
         (attempt) => attempt.state === 'queued' || attempt.state === 'running',
@@ -1011,7 +1048,7 @@ export function mergeReviewGroup(store, incoming) {
     if (activeAttempts.length) {
         const active = activeAttempts.at(-1);
         merged.state = activeAttempts.some((attempt) => attempt.state === 'running') ? 'running' : 'queued';
-        merged.tone = 'working';
+        merged.tone = (active.progress && active.tone) || 'working';
         merged.verdict = active.verdict || (merged.lifecycleOnly ? '' : merged.state);
         merged.summary = active.summary || merged.summary;
         merged.activeCount = activeAttempts.length;
@@ -1087,6 +1124,8 @@ export function mergeReviewGroup(store, incoming) {
         merged.attempts,
         incoming.initiatorTaskId || prior.initiatorTaskId,
     );
+    // The progress phrase belongs to the attempt the header speaks for.
+    if ('progress' in merged) merged.progress = text((activeAttempts.at(-1) || merged.attempts.at(-1))?.progress);
     if (JSON.stringify(prior) === JSON.stringify(merged)) return prior;
     store.set(merged.id, merged);
     return merged;
@@ -1110,14 +1149,52 @@ function reviewRevision(value) {
     return /^[0-9a-f]{64}$/.test(revision) ? revision : null;
 }
 
-// Revisions are opaque SHA-256 tokens; one distinct token may trail a live GET.
-export function createReviewHydrator({ fetchDetail, applyDetail, onState = () => {} } = {}) {
-    const states = new Map();
+// One queue for every card's review detail on the page (issue #1771): a room with
+// many review owners otherwise opened one GET per owner at once and starved the
+// browser's few connections per host (WebKit: 6), videos included. Newest request
+// first: a room opens at its newest cards, and an expansion is the latest ask. A
+// read keeps its slot until it settles; one whose response never comes is aborted
+// at the slot's bound and fails like any lost read (its card offers Retry), so a dead
+// connection neither stalls every card's details nor stays open beside the next
+// reads. A closed owner's queued reads never start; an owner away (its room off
+// the screen) starts none until it is back.
+export const REVIEW_DETAIL_READS = 2;
+export const REVIEW_DETAIL_SLOT_MS = 30000;
+const detailQueue = [];
+let detailReads = 0;
+function drainDetailReads() {
+    while (detailReads < REVIEW_DETAIL_READS) {
+        let index = detailQueue.length - 1;
+        while (index >= 0 && detailQueue[index].away()) index -= 1;
+        if (index < 0) return;
+        const [job] = detailQueue.splice(index, 1);
+        detailReads += 1;
+        const abort = new AbortController();
+        const lost = new Promise((_resolve, reject) => abort.signal.addEventListener('abort',
+            () => reject(new Error('review detail read lost its connection')), { once: true }));
+        const timer = setTimeout(() => abort.abort(), REVIEW_DETAIL_SLOT_MS);
+        Promise.race([new Promise(resolve => resolve(job.read(abort.signal))), lost]).then(job.resolve, job.reject)
+            .finally(() => { clearTimeout(timer); detailReads -= 1; drainDetailReads(); });
+    }
+}
+const queueDetailRead = (owner, read, away) => new Promise((resolve, reject) => {
+    detailQueue.push({ owner, read, resolve, reject, away });
+    drainDetailReads();
+});
 
+// Revisions are opaque SHA-256 tokens; one distinct token may trail a live GET. An owner away (`suspend`, a room that
+// left the screen) draws nothing: what a read already sent returns, its status, a retry and the owner's settling wait
+// for `resume`, in order.
+export function createReviewHydrator({ fetchDetail, applyDetail, onState = () => {}, onSettled = () => {} } = {}) {
+    const states = new Map();
+    let held = null;  // while away, what waits for the return
+    const later = (fn) => (held ? new Promise((resolve) => held.push(() => resolve(fn()))) : fn());
     const start = (taskId, state, revision, onDomWrite) => {
+        clearTimeout(state.migrationTimer); state.migrationTimer = null;
         const generation = ++state.generation;
         state.inFlightRevision = revision;
-        const write = typeof onDomWrite === 'function' ? onDomWrite : (mutate) => mutate();
+        const draw = typeof onDomWrite === 'function' ? onDomWrite : (mutate) => mutate();
+        const write = (mutate) => later(() => draw(mutate));
         // First load/retry announces; routine refresh over applied content stays quiet.
         const notify = (status) => {
             state.lastStatus = status;
@@ -1126,7 +1203,7 @@ export function createReviewHydrator({ fetchDetail, applyDetail, onState = () =>
         const request = Promise.resolve()
             .then(() => {
                 if (!state.everApplied || state.lastStatus === 'error') notify('loading');
-                return fetchDetail(taskId);
+                return queueDetailRead(states, (signal) => fetchDetail(taskId, { signal }), () => held !== null);
             })
             .then((detail) => {
                 // The strict seam rejects failures; null means genuinely absent (404).
@@ -1139,12 +1216,18 @@ export function createReviewHydrator({ fetchDetail, applyDetail, onState = () =>
                 notify('idle');
                 return applied;
             })
-            .catch(() => {
+            .catch(error => {
+                if (states.get(taskId) !== state) return false;
+                if (isStoreMigrating(error)) {
+                    notify('loading');
+                    state.migrationTimer = setTimeout(() => later(() => start(taskId, state, revision, onDomWrite)), 700);
+                    return false;
+                }
                 notify('error');
                 return false;
             })
             .finally(() => {
-                if (state.inFlight !== request || state.generation !== generation) return;
+                if (states.get(taskId) !== state || state.inFlight !== request || state.generation !== generation) return;
                 state.inFlight = null;
                 state.inFlightRevision = null;
                 const pending = state.pending;
@@ -1152,12 +1235,18 @@ export function createReviewHydrator({ fetchDetail, applyDetail, onState = () =>
                 if (pending && pending.revision !== state.appliedRevision) {
                     start(taskId, state, pending.revision, pending.onDomWrite);
                 }
+                later(() => onSettled(taskId));
             });
         state.inFlight = request;
         return request;
     };
 
     return {
+        // Saved Review: errors await Retry; a successful empty/404 permits fallback.
+        ready(taskId) {
+            const state = states.get(taskId);
+            return !state || (!state.inFlight && !state.migrationTimer && state.lastStatus !== 'error');
+        },
         hydrate(taskIdValue, revisionValue = null, { onDomWrite = null } = {}) {
             const taskId = text(taskIdValue);
             if (!taskId) return Promise.resolve(false);
@@ -1182,10 +1271,7 @@ export function createReviewHydrator({ fetchDetail, applyDetail, onState = () =>
                 if (revision !== null && revision === state.pending?.revision) {
                     return state.inFlight.then(() => state.inFlight || false);
                 }
-                if (
-                    revision !== null
-                    && revision !== state.inFlightRevision
-                ) {
+                if (revision !== null && revision !== state.inFlightRevision) {
                     state.pending = { revision, onDomWrite };
                     return state.inFlight.then(() => state.inFlight || false);
                 }
@@ -1200,28 +1286,25 @@ export function createReviewHydrator({ fetchDetail, applyDetail, onState = () =>
                 if (state) state.appliedRevision = null;
                 return;
             }
-            // A full DOM rebuild discards the projection that an applied
-            // revision hydrated, but it must retain and join any physical GET
-            // already in flight. Reset only the applied presentation receipt.
+            // Reset the presentation receipt after rebuild; keep joining any physical GET.
             for (const state of states.values()) state.appliedRevision = null;
         },
+        suspend() { held ||= []; },
+        resume() {
+            const owed = held || [];
+            held = null;
+            for (const fn of owed) fn();
+            drainDetailReads();
+        },
         clear() {
+            held = null;
+            for (const state of states.values()) clearTimeout(state.migrationTimer);
             states.clear();
+            for (const [index, job] of [...detailQueue.entries()].reverse()) {
+                if (job.owner === states) detailQueue.splice(index, 1)[0].reject(new Error('review detail read cancelled'));
+            }
         },
     };
-}
-
-function attemptMeta(attempt) {
-    return [
-        attempt.timestamp,
-        attempt.verdict || (attempt.lifecycleOnly
-            ? (['queued', 'running'].includes(attempt.state) ? attempt.state : 'review verdict unavailable')
-            : ''),
-        lifecycleMeta(attempt.lifecycleStatus),
-        attempt.superseded ? 'superseded' : '',
-        attempt.replayed ? 'replay' : '',
-        attempt.revised ? 'revised snapshot' : '',
-    ].filter(Boolean).join(' · ');
 }
 
 /**
@@ -1286,113 +1369,16 @@ export function reviewReferenceFromRow(row) {
 }
 
 export function renderReviewsSection(groupsInput, disclosure = {}) {
-    const groups = orderedReviewGroups(groupsInput);
-    // A failed FIRST hydration has no groups to hang the error on: the shell
-    // renders anyway and stays mounted through the retry's own loading pass
-    // (hadHydrateError) so the recovery control cannot unmount mid-flight. A
-    // quiet first-load zero-group loading pass stays invisible (every card
-    // expand hydrates, most tasks have no reviews).
-    const hydrateStatus = text(disclosure.hydrateStatus);
-    const emptyShell = !groups.length && (
-        hydrateStatus === 'error'
-        || (hydrateStatus === 'loading' && disclosure.hadHydrateError === true)
-    );
-    if (!groups.length && !emptyShell) return '';
-    const expandedGroups = disclosure.expandedGroups instanceof Set ? disclosure.expandedGroups : new Set();
-    const expandedAttempts = disclosure.expandedAttempts instanceof Set ? disclosure.expandedAttempts : new Set();
-    const sectionExpanded = disclosure.sectionExpanded === true;
-    const { groupCount, activeCount } = reviewGroupCounts(groups);
-    const countText = groupCount
-        ? `${groupCount}${activeCount ? ` · ${activeCount} active` : ''}`
-        : '—';
-    const groupHtml = groups.map((group) => {
-        const groupExpanded = expandedGroups.has(group.id);
-        const shown = group.countIsAuthoritative ? `${group.attemptCount}` : `${group.attempts.length} shown`;
-        const attempts = group.attempts.map((attempt) => {
-            const attemptKey = `${group.id}:${attempt.id}`;
-            const attemptExpanded = expandedAttempts.has(attemptKey);
-            const skillRef = attempt.detailRef?.surface === 'skill' ? attempt.detailRef : null;
-            const detailAttrs = skillRef
-                ? ` data-skill-review-skill="${escapeHtmlAttr(skillRef.skill)}" data-skill-review-job="${escapeHtmlAttr(skillRef.jobId)}"`
-                : '';
-            const source = attempt.detailRef?.surface === 'task_acceptance' ? attempt.detailRef : null;
-            const fullSource = source ? (source.url
-                ? `<a class="btn btn-default" href="${escapeHtmlAttr(source.url)}" download>Download full applied review</a>`
-                : '<span>Full applied review unavailable.</span>') : '';
-            const detail = skillRef ? '' : `<span>${escapeHtmlText(attempt.detailText || attempt.summary || 'No additional detail projected.')}</span>${fullSource ? `<div>${fullSource}</div>` : ''}`;
-            const executions = reviewExecutionEvidenceList(attempt.executions, attempt.execution);
-            const executionMarkup = executions.map((execution) => (
-                harnessIdentityMarkup(execution.harness, {
-                    channel: execution.channel,
-                    label: execution.label,
-                    className: 'chat-review-execution-identity',
-                }) + (execution.model
-                    ? `<span class="chat-review-execution-model">${escapeHtmlText(execution.model)}</span>`
-                    : '')
-            )).join('');
-            const attemptInitiator = (
-                attempt.initiatorTaskId
-                && attempt.initiatorTaskId !== group.presentationOwnerTaskId
-                && attempt.initiatorTaskId !== group.initiatorTaskId
-            )
-                ? `<div class="chat-review-initiator">Initiated by task ${escapeHtmlText(attempt.initiatorTaskId)}</div>`
-                : '';
-            return `
-                <div class="chat-review-attempt ${escapeHtmlAttr(attempt.tone)}${attempt.superseded ? ' superseded' : ''}" data-review-attempt="${escapeHtmlAttr(attemptKey)}">
-                    <div class="chat-review-attempt-main">
-                        <span class="chat-review-attempt-label">${escapeHtmlText(attempt.label)}</span>
-                        <span class="chat-review-attempt-meta">${escapeHtmlText(attemptMeta(attempt))}</span>
-                        ${executionMarkup ? `<span class="chat-review-execution">${executionMarkup}</span>` : ''}
-                    </div>
-                    ${attemptInitiator}
-                    <button type="button" class="chat-review-detail-toggle" data-review-attempt-toggle="${escapeHtmlAttr(attemptKey)}" aria-expanded="${attemptExpanded ? 'true' : 'false'}">${attemptExpanded ? 'Hide details' : 'Show details'}</button>
-                    <div class="chat-review-attempt-detail" data-review-attempt-detail="${escapeHtmlAttr(attemptKey)}"${detailAttrs} aria-busy="false"${attemptExpanded ? '' : ' hidden'}>${detail}</div>
-                </div>`;
-        }).join('');
-        const initiator = group.initiatorTaskId && group.initiatorTaskId !== group.presentationOwnerTaskId
-            ? `<div class="chat-review-initiator">Initiated by task ${escapeHtmlText(group.initiatorTaskId)}</div>`
-            : '';
-        return `
-            <div class="chat-review-group ${escapeHtmlAttr(group.tone)}" data-review-group="${escapeHtmlAttr(group.id)}">
-                <button type="button" class="chat-review-group-toggle" data-review-group-toggle="${escapeHtmlAttr(group.id)}" aria-expanded="${groupExpanded ? 'true' : 'false'}">
-                    <span class="chat-review-group-main">
-                        <span class="chat-review-group-label">${escapeHtmlText(group.label)}</span>
-                        ${group.subject ? `<span class="chat-review-subject">${escapeHtmlText(group.subject)}</span>` : ''}
-                    </span>
-                    <span class="chat-review-group-meta">${escapeHtmlText([group.verdict || (group.lifecycleOnly
-                        ? (['queued', 'running'].includes(group.state) ? group.state : 'review verdict unavailable')
-                        : group.state), lifecycleMeta(group.lifecycleStatus), shown].filter(Boolean).join(' · '))}</span>
-                </button>
-                <div class="chat-review-attempts"${groupExpanded ? '' : ' hidden'}>
-                    <div class="chat-review-group-cost">Cost unavailable</div>
-                    ${group.authorDecisionText ? `<div class="chat-review-attempt-detail" data-review-author-decision><span>${group.surface === 'plan' ? 'Plan' : 'Task'} author decision</span><br><span>${escapeHtmlText(group.authorDecisionText)}</span></div>` : ''}
-                    ${initiator}${attempts}
-                </div>
-            </div>`;
-    }).join('');
-    // Section-level hydration truth (typed controller state, no per-attempt
-    // FSM): a first load announces itself, a failed refresh names itself and
-    // offers Retry instead of silently presenting stale-or-missing detail.
-    // The message rides inside a <span>: the keyed status node is patched in
-    // place across loading↔error, and the DOM patcher syncs text only through
-    // childless-element innerHTML — a bare text node beside the Retry button
-    // would survive the transition stale.
-    const hydrateHtml = hydrateStatus === 'loading'
-        ? '<div class="skill-review-loading" data-review-hydrate-status role="status" aria-live="polite"><span>Loading review details…</span></div>'
-        : (hydrateStatus === 'error'
-            ? '<div class="skill-review-error" data-review-hydrate-status role="alert"><span>Review details failed to refresh — shown data may be incomplete. </span><button type="button" class="skill-review-retry" data-review-hydrate-retry>Retry</button></div>'
-            : '');
-    // The status node sits OUTSIDE the collapsible groups container: a failed
-    // refresh stays visible on a collapsed section and the keyed node survives
-    // loading↔error transitions. Disclosure stays user-owned — nothing expands.
-    return `
-        <section class="chat-live-reviews" data-review-section data-expanded="${sectionExpanded ? '1' : '0'}">
-            <button type="button" class="chat-review-section-toggle" data-review-section-toggle aria-expanded="${sectionExpanded ? 'true' : 'false'}">
-                <span>Reviews</span><span class="chat-review-section-count">${escapeHtmlText(countText)}</span>
-            </button>
-            ${hydrateHtml}<div class="chat-review-groups"${sectionExpanded ? '' : ' hidden'}>${groupHtml}</div>
-        </section>`;
+    return renderOpinionReviews(orderedReviewGroups(groupsInput), disclosure, {
+        executions: (attempt, { showModel = true } = {}) => reviewExecutionEvidenceList(attempt.executions, attempt.execution).map(execution =>
+            harnessIdentityMarkup(execution.harness, { channel: execution.channel, label: execution.label, className: 'chat-review-execution-identity' })
+            + (showModel && execution.model ? `<span class="chat-review-execution-model">${escapeHtmlText(execution.model)}</span>` : '')).join(''),
+    });
 }
+
+// The controls a reader can hold focus on, each named by the attribute that identifies it across updates.
+const FOCUS_KEYS = ['reviewGroupToggle', 'reviewReadUrl', 'reviewHistory', 'reviewHydrateRetry', 'reviewAttemptDetail'];
+const focusSelector = (key, value) => `[data-${key.replace(/[A-Z]/g, (char) => `-${char.toLowerCase()}`)}${value === '' ? '' : `="${value}"`}]`;
 
 /**
  * Interactive Reviews renderer. Chat owns disclosure and hydration callbacks;
@@ -1403,67 +1389,88 @@ export function createReviewPresentationController({
     summary,
     disclosure,
     onHydrate = () => {},
-    onLoadSkillDetail = () => {},
+    onRead = () => {},
     onDomWrite = (mutate) => mutate(),
 } = {}) {
     const groups = new Map();
     const state = disclosure || {};
     if (!(state.expandedGroups instanceof Set)) state.expandedGroups = new Set();
-    if (!(state.expandedAttempts instanceof Set)) state.expandedAttempts = new Set();
     if (state.sectionExpanded !== true) state.sectionExpanded = false;
 
+    // Keyed reconciliation keeps a focused control in place; a node an update had to replace hands
+    // focus to its successor (the same group, source, facts or action), never to the page.
     const focusedControl = () => {
         const active = host?.ownerDocument?.activeElement;
         if (!active || !host?.contains?.(active)) return null;
-        if (active.matches?.('[data-review-section-toggle]')) return { kind: 'section', key: '' };
-        if (active.dataset?.reviewGroupToggle) return { kind: 'group', key: active.dataset.reviewGroupToggle };
-        if (active.dataset?.reviewAttemptToggle) return { kind: 'attempt', key: active.dataset.reviewAttemptToggle };
-        const detail = active.closest?.('[data-review-attempt-detail]');
-        if (detail?.dataset?.reviewAttemptDetail) {
-            return { kind: 'attempt', key: detail.dataset.reviewAttemptDetail };
-        }
-        return null;
+        const owner = active.closest?.(FOCUS_KEYS.map((key) => focusSelector(key, '')).join(',')) || active;
+        const key = FOCUS_KEYS.find((name) => Object.hasOwn(owner.dataset || {}, name));
+        if (key) return { key, value: owner.dataset[key], node: active, summary: active.matches?.('summary') === true };
+        const facts = active.closest?.('[data-review-facts]');
+        return facts ? { key: 'reviewFacts', value: facts.dataset.reviewFacts, node: active, summary: true } : null;
     };
-
     const restoreFocus = (focused) => {
-        if (!focused) return;
-        let target = null;
-        if (focused.kind === 'section') target = host.querySelector?.('[data-review-section-toggle]');
-        const attribute = focused.kind === 'group'
-            ? 'reviewGroupToggle'
-            : (focused.kind === 'attempt' ? 'reviewAttemptToggle' : '');
-        if (attribute) {
-            target = Array.from(host.querySelectorAll?.(`[data-${focused.kind === 'group' ? 'review-group-toggle' : 'review-attempt-toggle'}]`) || [])
-                .find((candidate) => candidate.dataset?.[attribute] === focused.key);
-        }
-        target?.focus?.();
+        if (!focused || focused.node?.isConnected) return;
+        const value = String(focused.value ?? '').replaceAll('"', '\\"');
+        const target = host.querySelector?.(focusSelector(focused.key, value));
+        (focused.summary ? target?.querySelector?.('summary') || target : target)?.focus?.();
     };
 
     const render = () => onDomWrite(() => {
         if (!host || !summary) return;
         const focused = focusedControl();
-        const { groupCount, activeCount } = reviewGroupCounts(groups);
+        const { activeCount } = reviewGroupCounts(groups);
+        const groupCount = reviewViews(orderedReviewGroups(groups)).length;
         const failedEmpty = groupCount === 0 && (
             state.hydrateStatus === 'error'
             || (state.hydrateStatus === 'loading' && state.hadHydrateError === true)
         );
         summary.hidden = groupCount === 0 && !failedEmpty;
-        summary.textContent = groupCount
-            ? `Reviews ${groupCount}${activeCount ? ` · ${activeCount} active` : ''}`
-            : (failedEmpty ? 'Reviews' : '');
-        const reconciled = reconcileReviewMarkup(host, renderReviewsSection(groups, state));
-        const active = host?.ownerDocument?.activeElement;
-        if (!reconciled || !active || !host.contains?.(active)) restoreFocus(focused);
-        for (const detail of host.querySelectorAll?.('[data-review-attempt-detail]') || []) {
-            if (
-                !detail?.hidden
-                && detail.dataset?.skillReviewSkill
-                && detail.dataset?.skillReviewJob
-            ) onLoadSkillDetail(detail);
+        // The door's words are its one text node, before the chevron its card draws (chat.js), as a status chip's are.
+        let words = summary.firstChild;
+        if (words?.nodeType !== 3) words = summary.insertBefore(summary.ownerDocument.createTextNode(''), words || null);
+        const said = groupCount ? `Reviews ${groupCount}${activeCount ? ` · ${activeCount} active` : ''}` : (failedEmpty ? 'Reviews' : '');
+        if (words.data !== said) words.data = said;
+        summary.setAttribute?.('aria-expanded', state.sectionExpanded ? 'true' : 'false');
+        const history = [...groups.values()].find(group => group.historyTask);
+        if (history) {
+            state.historyTask = history.historyTask;
+            state.historyCertain = history.historyCertain !== false;
+            if (state.historyOffset === undefined) state.historyMore = history.historyMore;
         }
+        reconcileReviewMarkup(host, renderReviewsSection(groups, state));
+        restoreFocus(focused);
     });
 
-    host?.addEventListener('click', (event) => {
+    summary?.addEventListener?.('click', () => {
+        state.sectionExpanded = !state.sectionExpanded;
+        render();
+        if (state.sectionExpanded) onHydrate();
+    });
+    host?.addEventListener('click', async (event) => {
+        const read = event.target?.closest?.('[data-review-read-url]');
+        if (read) {
+            const url = read.dataset.reviewReadUrl;
+            // The reader names the file by the source's words, never a path a model chose. A reviewer's answer
+            // reads as Markdown (its Source view and Download keep the exact text); saved detail stays plain text.
+            const markdown = read.dataset.reviewReadKind === 'markdown';
+            const filename = `${String(read.dataset.reviewReadName || 'Saved review').replace(/[\\/:]+/g, '-')}.${markdown ? 'md' : 'txt'}`;
+            onRead({ filename, mime: markdown ? 'text/markdown' : 'text/plain', kind: markdown ? 'markdown' : 'text', source: { durable: url }, reader: { url },
+                provenance: read.dataset.reviewReadSha ? `Saved source ${read.dataset.reviewReadSha}` : 'Saved review text' }, read, event);
+            return;
+        }
+        const history = event.target?.closest?.('[data-review-history]');
+        if (history) {
+            if (state.historyLoading) return;
+            state.historyLoading = true; state.historyError = false; render();
+            try {
+                const page = await getTaskReviewHistory(state.historyTask, state.historyOffset || 0);
+                const incoming = reviewGroupsFromTaskDetail(page, state.historyTask);
+                for (const group of incoming) mergeReviewGroup(groups, group);
+                state.historyOffset = page.next_offset;
+                state.historyMore = page.next_offset !== null && page.next_offset !== undefined;
+            } catch { state.historyError = true; }
+            state.historyLoading = false; render(); return;
+        }
         const hydrateRetry = event.target?.closest?.('[data-review-hydrate-retry]');
         if (hydrateRetry) {
             // A failed pass never records an applied revision, so a plain
@@ -1476,41 +1483,14 @@ export function createReviewPresentationController({
             }
             return;
         }
-        const retry = event.target?.closest?.('[data-skill-review-retry]');
-        if (retry) {
-            const detail = retry.closest?.('[data-review-attempt-detail]');
-            if (detail?.dataset?.skillReviewSkill && detail?.dataset?.skillReviewJob) {
-                onLoadSkillDetail(detail, { retry: true });
-                detail.setAttribute?.('tabindex', '-1');
-                detail.focus?.();
-            }
-            return;
-        }
-        const sectionToggle = event.target?.closest?.('[data-review-section-toggle]');
-        if (sectionToggle) {
-            state.sectionExpanded = !state.sectionExpanded;
-            render();
-            if (state.sectionExpanded) onHydrate();
-            return;
-        }
         const groupToggle = event.target?.closest?.('[data-review-group-toggle]');
-        if (groupToggle) {
-            const groupId = groupToggle.dataset.reviewGroupToggle || '';
-            if (!groupId) return;
-            if (state.expandedGroups.has(groupId)) state.expandedGroups.delete(groupId);
-            else state.expandedGroups.add(groupId);
-            render();
-            if (state.expandedGroups.has(groupId)) onHydrate();
-            return;
-        }
-        const attemptToggle = event.target?.closest?.('[data-review-attempt-toggle]');
-        if (!attemptToggle) return;
-        const attemptKey = attemptToggle.dataset.reviewAttemptToggle || '';
-        if (!attemptKey) return;
-        const opening = !state.expandedAttempts.has(attemptKey);
-        if (opening) state.expandedAttempts.add(attemptKey);
-        else state.expandedAttempts.delete(attemptKey);
+        if (!groupToggle) return;
+        const groupId = groupToggle.dataset.reviewGroupToggle || '';
+        if (!groupId) return;
+        if (state.expandedGroups.has(groupId)) state.expandedGroups.delete(groupId);
+        else state.expandedGroups.add(groupId);
         render();
+        if (state.expandedGroups.has(groupId)) onHydrate();
     });
 
     return {

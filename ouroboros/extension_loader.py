@@ -8,26 +8,13 @@ disable/reload can tear them down and purge modules cleanly.
 
 from __future__ import annotations
 
-import copy
-import functools  # noqa: F401
 import importlib
 import importlib.util
-import inspect  # noqa: F401
-import hashlib  # noqa: F401
-import json  # noqa: F401
 import logging
 import os
 import pathlib
-import re  # noqa: F401
-import secrets  # noqa: F401
-import shutil
 import sys
 import threading
-import time  # noqa: F401
-import urllib.request  # noqa: F401
-import uuid  # noqa: F401
-from dataclasses import dataclass, field  # noqa: F401
-from types import ModuleType  # noqa: F401
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from ouroboros.contracts.plugin_api import (
@@ -39,7 +26,9 @@ from ouroboros.contracts.plugin_api import (
     available_capabilities,  # noqa: F401
     capability_available,  # noqa: F401
 )
+from ouroboros.deployment_extensions import discloses_failure, failure_words
 from ouroboros.event_bus import get_global_event_bus
+from ouroboros.extension_contributions import stage_contributions
 from ouroboros.extension_companion import CompanionDescriptor, get_global_supervisor, is_server_process  # noqa: F401
 from ouroboros.extension_ui_validation import (
     _assert_ws_message_type,  # noqa: F401
@@ -50,7 +39,7 @@ from ouroboros.extension_ui_validation import (
 )
 from ouroboros.gateway.host_service import AUTH_TOKEN_FILENAME  # noqa: F401
 from ouroboros.provider_models import MODEL_PROVIDER_CREDENTIAL_KEYS  # noqa: F401
-from ouroboros.extension_isolated_deps import _isolated_python_site_dirs, async_isolated_site_dirs_scope, isolated_site_dirs_scope, is_skill_cache_path  # noqa: F401
+from ouroboros.extension_isolated_deps import _isolated_python_site_dirs, async_isolated_site_dirs_scope, invalidate_import_caches, isolated_site_dirs_scope, is_skill_cache_path  # noqa: F401
 from ouroboros.extension_child_catalog import (
     _out_of_process_handler_proxy,  # noqa: F401
     _stage_out_of_process_surfaces,
@@ -68,6 +57,8 @@ from ouroboros.extension_import_staging import (
     _purge_extension_bytecode,  # noqa: F401
     _stage_extension_import_tree,
     _sweep_stale_extension_imports,
+    extension_import_identity,
+    release_extension_import_tree,
 )
 from ouroboros.extension_liveness import (
     _apply_deps_block,  # noqa: F401
@@ -94,12 +85,16 @@ from ouroboros.extension_reconcile_queue import (
     announce_extension_state_change as _announce_extension_state_change,
 )
 from ouroboros.extension_registry_state import (
-    # The two live read-projections stay importable as ``extension_loader.<name>``
-    # (gateway/widgets.py, gateway/extensions.py, tests/test_gateway_widgets.py);
-    # their bodies belong to the module that owns ``_ui_tabs``/``_extensions``.
+    # The one-lock live reads stay importable as ``extension_loader.<name>`` (gateway/widgets.py,
+    # gateway/extensions.py, extension_process_runner.py, skill_lifecycle_actions.py, tests);
+    # their bodies belong to the module that owns ``_ui_tabs``/``_extensions`` and the surface maps.
+    list_companion_names,  # noqa: F401 — facade re-export (extraction contract)
+    list_routes,  # noqa: F401 — facade re-export (extraction contract)
+    list_ws_handlers,  # noqa: F401 — facade re-export (extraction contract)
     live_module_sources,  # noqa: F401 — facade re-export (extraction contract)
     live_widget_projection,  # noqa: F401 — facade re-export (extraction contract)
-    _ExtensionLoadFailure,
+    snapshot,  # noqa: F401 — facade re-export (extraction contract)
+    _ExtensionLoadFailure,  # noqa: F401 — facade re-export (extraction contract)
     _ExtensionRegistrations,  # noqa: F401 — facade re-export (extraction contract)
     _PluginAPIConfig,
     _extension_modules,
@@ -107,14 +102,17 @@ from ouroboros.extension_registry_state import (
     _lifecycle_lock_for,
     _lifecycle_locks,  # noqa: F401
     _load_failures,
+    record_load_failure,
     _lock,
     _record_companion_name,  # noqa: F401
-    _routes,
-    _settings_sections,
+    _routes,  # noqa: F401 — facade re-export (extraction contract)
+    SURFACE_KINDS,
+    realtime_load_refusal,
+    _settings_sections,  # noqa: F401 — facade re-export (extraction contract)
     _tools,
-    _ui_tabs,
+    _ui_tabs,  # noqa: F401 — facade re-export (extraction contract)
     _unloading,
-    _ws_handlers,
+    _ws_handlers,  # noqa: F401 — facade re-export (extraction contract)
     extension_generation_digest,  # noqa: F401 — ABI-9 dispatch-provenance API
     get_tool_stamped as _registry_get_tool_stamped,
 )
@@ -132,7 +130,8 @@ from ouroboros.extension_surface_names import (
     extension_surface_name,  # noqa: F401
     parse_extension_surface_name,  # noqa: F401
 )
-from ouroboros.skill_loader import _SKILL_DIR_CACHE_NAMES, _sanitize_skill_name, LoadedSkill, SkillPayloadUnreadable, compute_content_hash, discover_skills, find_skill, grant_status_for_skill, requested_core_setting_keys, skill_conflict_status, skill_review_gate, skill_state_dir, skill_state_dir_path  # noqa: F401
+from ouroboros.skill_loader import _SKILL_DIR_CACHE_NAMES, _sanitize_skill_name, LoadedSkill, SkillPayloadUnreadable, compute_content_hash, discover_skills, discover_selected_skill_candidates, discover_skill_identity, find_skill, grant_status_for_skill, requested_core_setting_keys, skill_conflict_status, skill_review_gate, skill_state_dir, skill_state_dir_path  # noqa: F401
+from ouroboros.skill_loader import _skill_location_inventory
 from ouroboros.skill_token import SkillToken  # noqa: F401
 from ouroboros.tools.skill_exec import _scrub_env  # noqa: F401
 from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso  # noqa: F401
@@ -208,9 +207,12 @@ def _publish_out_of_process_registration(
         runtime_skill_dir=skill.skill_dir,
         dependency_site_dirs_enabled=dependency_site_dirs_enabled,
         plugin_api_generation=plugin_api_generation or negotiation.generation,
+        loaded_skill=skill,
     ))
     try:
         _stage_out_of_process_surfaces(api, skill, catalog)
+        if current_hash is not None:
+            stage_contributions(api, skill, current_hash)
         for name in names:
             if name not in declared:
                 raise ExtensionRegistrationError(
@@ -262,7 +264,8 @@ def _run_unload_callback(skill_name: str, callback: Callable[[], Any], timeout_s
         return
     if errors:
         exc = errors[0]
-        log.warning("extension %s unload callback failed", skill_name, exc_info=(type(exc), exc, exc.__traceback__))
+        log.warning("extension %s unload callback failed: %s", skill_name, failure_words(skill_name, exc),
+                    exc_info=(type(exc), exc, exc.__traceback__) if discloses_failure(skill_name) else False)
 
 
 def _finalize_extension_reconcile(
@@ -323,17 +326,27 @@ def reconcile_extension(
         from ouroboros.config import get_skills_repo_path
 
         resolved_repo_path = get_skills_repo_path() if repo_path is None else repo_path
-        peers = list(skills) if skills is not None else discover_skills(
-            drive_root, repo_path=resolved_repo_path
+        locations = None if skills is not None else _skill_location_inventory(drive_root, repo_path=resolved_repo_path)
+        peers = list(skills) if skills is not None else discover_skill_identity(
+            drive_root, skill_name, repo_path=resolved_repo_path, locations=locations
         )
         if selected_skill is not None:
             peers = [item for item in peers if item.name != selected_skill.name]
             peers.append(selected_skill)
+        safe_name = _sanitize_skill_name(skill_name)
+        # The subject resolved for THIS reconcile IS the selected authority:
+        # letting the liveness read re-resolve it would hash the same payload a
+        # second time inside one request without making anything fresher.
+        subject = selected_skill or next(
+            (item for item in peers if item.name == safe_name), None
+        )
         state = runtime_state_for_skill_name(
             skill_name,
             drive_root,
             repo_path=resolved_repo_path,
-            skills=peers,
+            skills=peers if skills is not None else None,
+            selected_skill=subject,
+            locations=locations,
         )
         loaded_present = bool(state.get("loaded_present"))
         was_live = bool(state.get("live_loaded"))
@@ -344,7 +357,9 @@ def reconcile_extension(
                 skill_name,
                 drive_root,
                 repo_path=resolved_repo_path,
-                skills=peers,
+                skills=peers if skills is not None else None,
+                selected_skill=subject,
+                locations=locations,
             )
             loaded_present = bool(state.get("loaded_present"))
             was_live = bool(state.get("live_loaded"))
@@ -352,6 +367,20 @@ def reconcile_extension(
             state["action"] = "extension_load_error"
             _revert_enabled_after_load_error(revert_enabled_on_error, drive_root, skill_name, state)
             _finalize_extension_reconcile(state, drive_root, skill_name, reason="reconcile_load_error", health_stamp=health_stamp)
+            return state
+        if was_live and subject is not None:
+            with _lock:
+                bundle = _extensions.get(skill_name)
+            if bundle and bundle.runtime_identity:
+                was_live = bundle.runtime_identity == extension_import_identity(subject)
+            if was_live and bundle and bundle.catalog_identity is not None:
+                from ouroboros.extension_process_runner import extension_catalog_identity
+                was_live = bundle.catalog_identity == extension_catalog_identity(subject, drive_root, settings_reader)
+        if (state.get("reason") != "disabled" and not (was_live and state.get("desired_live"))
+                and (refusal := realtime_load_refusal(skill_name))):
+            # Keep the old publication; reconcile retries after the call (not a load failure).
+            state.update(reason=refusal, action="extension_reload_pending")
+            _finalize_extension_reconcile(state, drive_root, skill_name, reason=refusal, health_stamp=health_stamp)
             return state
         if state.get("reason") == "missing" or state.get("reason") == "not_extension":
             if loaded_present:
@@ -384,8 +413,7 @@ def reconcile_extension(
             _finalize_extension_reconcile(state, drive_root, skill_name, reason="already_live", health_stamp=health_stamp)
             return state
 
-        safe_name = _sanitize_skill_name(skill_name)
-        loaded = next((item for item in peers if item.name == safe_name), None)
+        loaded = subject
         if loaded is None:
             state["reason"] = "missing"
             state["action"] = "extension_inactive"
@@ -398,19 +426,14 @@ def reconcile_extension(
                 loaded,
                 settings_reader,
                 drive_root=drive_root,
-                skills=peers,
+                skills=skills if skills is not None else None,
                 repo_path=resolved_repo_path,
             )
         except Exception as exc:  # an unexpected raise must still revert enable + record
-            log.exception("extension %s reconcile load raised", skill_name)
-            err = f"skill {skill_name!r} load failure: {type(exc).__name__}: {exc}"
+            log.error("extension %s reconcile load raised", skill_name, exc_info=discloses_failure(skill_name))
+            err = f"skill {skill_name!r} load failure: {failure_words(skill_name, exc)}"
         if err:
-            with _lock:
-                _load_failures[skill_name] = _ExtensionLoadFailure(
-                    content_hash=loaded.content_hash,
-                    skill_dir=str(loaded.skill_dir.resolve()),
-                    error=err,
-                )
+            record_load_failure(skill_name, loaded, err)
             state["reason"] = "load_error"
             state["load_error"] = err
             state["action"] = "extension_load_error"
@@ -421,7 +444,7 @@ def reconcile_extension(
             skill_name,
             drive_root,
             repo_path=resolved_repo_path,
-            skills=peers,
+            skills=skills if skills is not None else None,
         )
         refreshed["action"] = "extension_loaded"
         _finalize_extension_reconcile(refreshed, drive_root, skill_name, reason="loaded", health_stamp=health_stamp)
@@ -452,7 +475,6 @@ def ensure_companions_running(
     drive_root = pathlib.Path(drive_root)
     state = runtime_state_for_skill_name(
         skill_name, drive_root, repo_path=repo_path,
-        skills=[selected_skill] if selected_skill is not None else None,
     )
     if not state.get("desired_live"):
         supervisor.stop_skill(skill_name)
@@ -476,8 +498,17 @@ def ensure_companions_running(
     if not names:
         return {"action": "no_registered_companions", "started": [], "missing": []}
 
-    snapshot_keys = set((supervisor.snapshot() or {}).keys())
-    missing = [name for name in names if f"{skill_name}:{name}" not in snapshot_keys]
+    runtimes = supervisor.snapshot() or {}
+    missing = [name for name in names if f"{skill_name}:{name}" not in runtimes]
+    # A retained failed start / unconfirmed stop is owned but not running: never
+    # report it as already running, and publish nothing until its death settles it.
+    retained = {
+        name: str(runtime.get("retiring"))
+        for name in names
+        if (runtime := runtimes.get(f"{skill_name}:{name}")) and runtime.get("retiring")
+    }
+    if retained:
+        return {"action": "retained_unresolved", "started": [], "missing": missing, "retained": retained}
     if not missing:
         return {"action": "already_running", "started": [], "missing": []}
 
@@ -559,6 +590,13 @@ def load_extension(
     """
     if drive_root is None:
         raise TypeError("load_extension requires explicit drive_root")
+    with _lifecycle_lock_for(skill.name):  # a live call's skill refuses an automatic reload
+        return realtime_load_refusal(skill.name) or _load_extension_locked(
+            skill, settings_reader, drive_root=drive_root, skills=skills, repo_path=repo_path,
+            _force_in_process=_force_in_process)
+
+
+def _load_extension_locked(skill, settings_reader, *, drive_root, skills, repo_path, _force_in_process):
     if not skill.manifest.is_extension():
         return f"skill {skill.name!r} is not type=extension"
     if skill.load_error:
@@ -583,6 +621,8 @@ def load_extension(
         skills=skills,
         repo_path=repo_path,
     )
+    if runtime_state["reason"] == "deployment_untrusted":  # nothing of it is imported, cataloged or launched
+        return f"skill {skill.name!r} does not run on this service: {runtime_state['load_error']}"
     if runtime_state["reason"] == "skill_conflict":
         conflict_names = list((runtime_state.get("conflict") or {}).get("skills") or [])
         return (
@@ -593,13 +633,11 @@ def load_extension(
     gate = runtime_state.get("review_gate") or skill.review.gate_for(current_hash)
     if not gate.get("executable_review", False):
         return (
-            f"skill {skill.name!r} must carry a fresh executable review "
+            f"skill {skill.name!r} has no current executable review authority "
             f"(status={skill.review.status!r}, "
             f"stale={skill.review.is_stale_for(current_hash)}, "
             f"reason={gate.get('blocking_reason')})"
         )
-    if runtime_state["reason"] == "disabled":
-        return f"skill {skill.name!r} is disabled"
     # ABI-1: negotiate the manifest against this host's PluginAPI BEFORE any
     # plugin import or out-of-process catalog. Absent field -> the LEGACY
     # generation (grandfathered on its existing hash-bound PASS); a declared
@@ -620,7 +658,7 @@ def load_extension(
     state_dir = skill_state_dir(drive_root, skill.name)
     child_in_process_load = _force_in_process and os.environ.get("OUROBOROS_EXTENSION_PROCESS_CHILD") == "1"
     if not child_in_process_load:
-        _sweep_stale_extension_imports(drive_root, skill.name)
+        _sweep_stale_extension_imports(drive_root, skill.name, keep_hashes=(current_hash,))
     try:
         from ouroboros.skill_dependencies import auto_install_specs_for_skill
 
@@ -631,7 +669,9 @@ def load_extension(
     if auto_specs:
         deps_reason = _deps_block_reason(pathlib.Path(drive_root), skill)
         if deps_reason:
-            return f"skill {skill.name!r} cannot load until isolated dependencies are ready: {deps_reason}"
+            from ouroboros.skill_dependencies import dependency_sentence
+
+            return dependency_sentence(deps_reason)  # the same sentence liveness shows for this code
 
     # Core settings and privileged host capabilities require hash-bound grants.
     grant_status = grant_status_for_skill(pathlib.Path(drive_root), skill)
@@ -659,6 +699,7 @@ def load_extension(
                     drive_root=pathlib.Path(drive_root),
                     repo_dir=pathlib.Path(__file__).resolve().parents[1],
                     skills_repo_path=skill.skill_dir.parent,
+                    settings_reader=settings_reader,
                 )
                 # ABI-9: surfaces AND companions publish as ONE staged
                 # snapshot; the seam routes any failure to dispose+unload.
@@ -673,16 +714,20 @@ def load_extension(
                     current_hash=current_hash,
                     plugin_api_generation=negotiation.generation,
                 )
+                with _lock:
+                    bundle = _extensions[skill.name]
+                    bundle.runtime_identity = extension_import_identity(skill)
+                    bundle.catalog_identity = catalog.get("_cache_identity")
                 return None
         except Exception as exc:
             unload_extension(skill.name)
-            log.exception("extension %s failed to catalog out-of-process", skill.name)
-            return f"skill {skill.name!r} out-of-process catalog failure: {type(exc).__name__}: {exc}"
+            log.error("extension %s failed to catalog out-of-process", skill.name, exc_info=discloses_failure(skill.name))
+            return f"skill {skill.name!r} out-of-process catalog failure: {failure_words(skill.name, exc)}"
     staged_import_root: Optional[pathlib.Path] = None
     module_key = _module_key(skill.name)
     api: Optional[PluginAPIImpl] = None
     try:
-        importlib.invalidate_caches()
+        invalidate_import_caches()
         staged_import_root, entry_path = _stage_extension_import_tree(
             skill,
             state_dir=state_dir,
@@ -722,10 +767,12 @@ def load_extension(
                 runtime_skill_dir=(staged_import_root / "skill") if staged_import_root is not None else None,
                 dependency_site_dirs_enabled=bool(auto_specs),
                 plugin_api_generation=negotiation.generation,
+                loaded_skill=skill,
             ))
             if current_execution_mode() is ExecutionMode.IN_PROCESS:
                 api._disclose_model_capable_dispatch("register", "register")
             register(api)
+            stage_contributions(api, skill, current_hash)
             # ABI-9: nothing register() staged is visible yet; publish the
             # whole snapshot atomically (validate -> swap -> attach; deferred
             # side effects attach only after the swap).
@@ -737,6 +784,8 @@ def load_extension(
             with _lock:
                 _extension_modules[skill.name] = module
                 bundle = _extensions.get(skill.name)
+                if bundle:
+                    bundle.runtime_identity = staged_import_root.name
                 for tool_name in list(bundle.tools if bundle else []):
                     if tool_name in _tools:
                         _tools[tool_name]["skills_repo_path"] = str(skill.skill_dir.parent)
@@ -748,17 +797,17 @@ def load_extension(
         if api is not None:
             api._abort_registration()
         unload_extension(skill.name)
-        return f"skill {skill.name!r} registration error: {exc}"
+        return f"skill {skill.name!r} registration error: {failure_words(skill.name, exc, typed=False)}"
     except Exception as exc:
         if api is not None:
             api._abort_registration()
         unload_extension(skill.name)
-        log.exception("extension %s failed to load", skill.name)
-        return f"skill {skill.name!r} load failure: {type(exc).__name__}: {exc}"
+        log.error("extension %s failed to load", skill.name, exc_info=discloses_failure(skill.name))
+        return f"skill {skill.name!r} load failure: {failure_words(skill.name, exc)}"
     finally:
         if skill.name not in _extensions:
             if staged_import_root is not None:
-                shutil.rmtree(staged_import_root, ignore_errors=True)
+                release_extension_import_tree(staged_import_root)
     return None
 
 
@@ -822,16 +871,9 @@ def _unload_extension_locked(skill_name: str) -> None:
             companion_names = list(bundle.companion_names) if bundle else []
             supervised_futures = list(bundle.supervised_futures) if bundle else []
             if bundle:
-                for key in bundle.tools:
-                    _tools.pop(key, None)
-                for key in bundle.routes:
-                    _routes.pop(key, None)
-                for key in bundle.ws_handlers:
-                    _ws_handlers.pop(key, None)
-                for key in bundle.ui_tabs:
-                    _ui_tabs.pop(key, None)
-                for key in bundle.settings_sections:
-                    _settings_sections.pop(key, None)
+                for kind, live, _label in SURFACE_KINDS:
+                    for key in getattr(bundle, kind):
+                        live.pop(key, None)
         for future in supervised_futures:
             try:
                 future.cancel()
@@ -846,12 +888,11 @@ def _unload_extension_locked(skill_name: str) -> None:
         for callback in callbacks:
             _run_unload_callback(skill_name, callback)
         prefix = _module_key(skill_name)
-        # Copy keys before mutating sys.modules.
-        for mod_name in list(sys.modules.keys()):
+        for mod_name in list(sys.modules):
             if mod_name == prefix or mod_name.startswith(prefix + "."):
                 sys.modules.pop(mod_name, None)
         if import_root is not None:
-            shutil.rmtree(import_root, ignore_errors=True)
+            release_extension_import_tree(import_root)
     finally:
         with _lock:
             _unloading.discard(skill_name)
@@ -863,27 +904,36 @@ def reload_all(
     *,
     repo_path: str | None = None,
 ) -> Dict[str, Any]:
-    """Refresh all extension liveness and return ``skill: error_or_None``."""
+    """Refresh all extension liveness and return ``skill: error_or_None``; the measured window counts the
+    ``skills`` it discovered (hashes and catalog runs are counted where they happen)."""
+    from ouroboros.context_timing import counted
     from ouroboros.extension_health import fresh_code_stamp, record_health_for_runtime_state
 
     skills = discover_skills(drive_root, repo_path=repo_path)
+    counted("skills", len(skills))
     health_stamp = fresh_code_stamp()
     skill_names = {s.name for s in skills if s.manifest.is_extension()}
     with _lock:
         loaded_names = set(_extensions.keys())
+    # Also reclaim removed payloads after a process restart (empty registry).
+    state_skills = pathlib.Path(drive_root) / "state" / "skills"
+    cached_names = {p.name for p in state_skills.iterdir() if (p / "__extension_imports").is_dir()} if state_skills.is_dir() else set()
     results: Dict[str, Any] = {}
-    for gone in loaded_names - skill_names:
+    for gone in (loaded_names | cached_names) - skill_names:
         try:
+            if refusal := realtime_load_refusal(gone):
+                results[gone] = refusal
+                continue
             unload_extension(gone)
             _sweep_stale_extension_imports(drive_root, gone)
         except Exception as exc:
-            log.exception("Extension reload cleanup failed for %s; continuing", gone)
-            results[gone] = f"{type(exc).__name__}: {exc}"
+            log.error("Extension reload cleanup failed for %s; continuing", gone, exc_info=discloses_failure(gone))
+            results[gone] = failure_words(gone, exc)
     for skill in skills:
         if not skill.manifest.is_extension():
             continue
         try:
-            _sweep_stale_extension_imports(drive_root, skill.name)
+            _sweep_stale_extension_imports(drive_root, skill.name, keep_hashes=(skill.content_hash,))
             state = reconcile_extension(
                 skill.name,
                 drive_root,
@@ -898,18 +948,9 @@ def reload_all(
                 log.error("Extension reload failed for %s: %s", skill.name, load_error)
             results[skill.name] = load_error or (None if state.get("desired_live") else state.get("reason"))
         except Exception as exc:
-            log.exception("Extension reload failed for %s; continuing", skill.name)
-            error = f"{type(exc).__name__}: {exc}"
-            try:
-                skill_dir = str(skill.skill_dir.resolve())
-            except OSError:
-                skill_dir = str(skill.skill_dir)
-            with _lock:
-                _load_failures[skill.name] = _ExtensionLoadFailure(
-                    content_hash=skill.content_hash,
-                    skill_dir=skill_dir,
-                    error=error,
-                )
+            log.error("Extension reload failed for %s; continuing", skill.name, exc_info=discloses_failure(skill.name))
+            error = failure_words(skill.name, exc)
+            record_load_failure(skill.name, skill, error)
             results[skill.name] = error
             try:
                 record_health_for_runtime_state(drive_root, skill.name, {
@@ -924,55 +965,9 @@ def reload_all(
     return results
 
 
-def snapshot() -> Dict[str, Any]:
-    """Return a read-only snapshot of live extension surfaces."""
-    with _lock:
-        return {
-            "extensions": sorted(_extensions.keys()),
-            "tools": sorted(_tools.keys()),
-            "routes": sorted(_routes.keys()),
-            "ws_handlers": sorted(_ws_handlers.keys()),
-            "ui_tabs": [
-                dict(copy.deepcopy(value), key=key)
-                for key, value in sorted(_ui_tabs.items())
-            ],
-            # Settings sections follow the same host-surfaced shape as UI tabs.
-            "settings_sections": [
-                dict(copy.deepcopy(value), key=key)
-                for key, value in sorted(_settings_sections.items())
-            ],
-        }
-
-
 def get_tool(name: str) -> Optional[Dict[str, Any]]:
     """The registered tool, if any (ABI-9: legacy descriptors digest-stamped)."""
     return _registry_get_tool_stamped(name)
-
-
-def list_ws_handlers() -> Dict[str, Any]:
-    with _lock:
-        return {k: dict(v) for k, v in _ws_handlers.items()}
-
-
-def list_routes() -> Dict[str, Any]:
-    with _lock:
-        return {k: dict(v) for k, v in _routes.items()}
-
-
-def list_companion_names() -> List[str]:
-    """Return host-spawnable companion names across loaded extensions.
-
-    Excludes the ``task:`` (supervised-task) and ``worker-skip:`` markers; used by
-    the out-of-process catalog so the host can spawn the declared companions.
-    """
-    with _lock:
-        names: List[str] = []
-        for bundle in _extensions.values():
-            for raw in bundle.companion_names:
-                name = str(raw or "")
-                if name and not name.startswith(("task:", "worker-skip:")):
-                    names.append(name)
-        return names
 
 
 __all__ = [

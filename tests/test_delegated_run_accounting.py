@@ -18,7 +18,9 @@ from ouroboros import (
 from tests._delegated_transport_shared import (  # noqa: F401  (autouse fixture applies on import)
     _owned_gateway_uses_each_test_transport,
     _plain_ctx,
+    _select_transport_access,
 )
+from tests._usage_store_testing import ledger_rows
 
 
 def test_a_subscription_session_settles_at_zero_and_keeps_the_projection_final(tmp_path):
@@ -35,7 +37,7 @@ def test_a_subscription_session_settles_at_zero_and_keeps_the_projection_final(t
     disclosed = tmp_path / "disclosed"
     record_subscription_session("s-free", drive_root=disclosed, route="r", task_id="t1",
                                 root_task_id="t1", spend_usd=0.0)
-    rows = [json.loads(l) for l in (disclosed / "state" / "usage_attempts.jsonl").read_text().splitlines()]
+    rows = ledger_rows(disclosed)
     row = next(r for r in rows if r.get("kind") == "subscription_session")
     assert row["cost_usd"] == 0.0 and row["cost_final"] is True
     assert usage_projection(disclosed)["cost_final"] is True
@@ -43,7 +45,7 @@ def test_a_subscription_session_settles_at_zero_and_keeps_the_projection_final(t
     charged = tmp_path / "charged"
     record_subscription_session("s-billed", drive_root=charged, route="r", task_id="t1",
                                 root_task_id="t1", spend_usd=4.10)
-    rows = [json.loads(l) for l in (charged / "state" / "usage_attempts.jsonl").read_text().splitlines()]
+    rows = ledger_rows(charged)
     row = next(r for r in rows if r.get("kind") == "subscription_session")
     assert row["cost_usd"] == 4.10, "a real charge must ride the ledger as money"
     assert row["cost_final"] is True
@@ -51,7 +53,7 @@ def test_a_subscription_session_settles_at_zero_and_keeps_the_projection_final(t
     unknown = tmp_path / "unknown"
     record_subscription_session("s-quiet", drive_root=unknown, route="r", task_id="t1",
                                 root_task_id="t1")
-    rows = [json.loads(l) for l in (unknown / "state" / "usage_attempts.jsonl").read_text().splitlines()]
+    rows = ledger_rows(unknown)
     row = next(r for r in rows if r.get("kind") == "subscription_session")
     assert row["cost_final"] is False, "an undisclosed spend is not a proven zero"
     assert row["pricing_known"] is False
@@ -78,7 +80,10 @@ def test_a_session_is_not_counted_as_a_physical_provider_call(tmp_path):
     assert breakdown["subscription_sessions"] == 1
 
 
-def test_the_agent_facing_cost_tells_the_same_story_as_the_ledger(tmp_path, monkeypatch):
+@pytest.mark.parametrize("spend_field, expected, final", [
+    ({"spendUsd": 4.10}, 4.10, True), ({}, None, False), ({"spendUsd": 0.0}, 0.0, True),
+])
+def test_the_agent_facing_cost_tells_the_same_story_as_the_ledger(tmp_path, monkeypatch, spend_field, expected, final):
     """`_terminal_payload` is what the nanny RELAYS to its parent, so it must not
     contradict the row. It used to hardcode `$0.00 / final` — the exact shape the
     settlement fix exists to eliminate — so a billed run settled honestly in the ledger
@@ -105,19 +110,16 @@ def test_the_agent_facing_cost_tells_the_same_story_as_the_ledger(tmp_path, monk
         ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
         ctx.task_id = "t-a"
         ctx.task_metadata = {"root_task_id": "t-a"}
-        out = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=1))
+        out = json.loads(delegate._read_run(ctx, "run-1"))
         delegate._CUSTODY.clear()
         return out
 
-    billed = _wait_with_spend({"spendUsd": 4.10})["cost"]
-    assert billed["cost_usd"] == 4.10, "a billed run must not be relayed as free"
-    assert "BILLED" in billed["note"]
-
-    undisclosed = _wait_with_spend({})["cost"]
-    assert undisclosed["cost_usd"] is None and undisclosed["cost_final"] is False
-
-    free = _wait_with_spend({"spendUsd": 0.0})["cost"]
-    assert free["cost_usd"] == 0.0 and free["cost_final"] is True
+    # These are independent physical runs, not three contradictory replies
+    # for an already-settled identity whose retained source remains authoritative.
+    cost = _wait_with_spend(spend_field)["cost"]
+    assert cost["cost_usd"] == expected and cost["cost_final"] is final
+    if expected:
+        assert "BILLED" in cost["note"], "a billed run must not be relayed as free"
 
 
 def test_settlement_reads_the_harnesss_own_spend_field(tmp_path, monkeypatch):
@@ -152,15 +154,14 @@ def test_settlement_reads_the_harnesss_own_spend_field(tmp_path, monkeypatch):
     ctx.task_id = "t-a"
     ctx.task_metadata = {"root_task_id": "t-a"}
 
-    json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=1))
+    json.loads(delegate._read_run(ctx, "run-1"))
     delegate._CUSTODY.clear()
 
-    rows = [json.loads(line) for line
-            in (tmp_path / "state" / "usage_attempts.jsonl").read_text().splitlines()]
+    rows = ledger_rows(tmp_path)
     row = next(r for r in rows if r.get("kind") == "subscription_session")
     assert row["cost_usd"] == 4.10, "the harness's reported spend must reach the ledger"
     assert row["cost_final"] is True
-    assert retired == ["prj-ours"], "a registration we created is retired on settle"
+    assert retired == [], "settlement keeps the registration for the owner's continuation"
 
 
 def test_d29_applied_credential_profile_reaches_the_durable_record(tmp_path, monkeypatch):
@@ -267,10 +268,9 @@ def _settled_run(tmp_path, monkeypatch, summary, observed=None):
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     ctx.task_id = "t-a"
     ctx.task_metadata = {"root_task_id": "t-a"}
-    payload = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=1))
+    payload = json.loads(delegate._read_run(ctx, "run-1"))
     delegate._CUSTODY.clear()
-    rows = [json.loads(line) for line
-            in (tmp_path / "state" / "usage_attempts.jsonl").read_text().splitlines()]
+    rows = ledger_rows(tmp_path)
     events = [json.loads(line) for line
               in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()]
     return (payload,
@@ -303,7 +303,7 @@ def _waited_run(tmp_path, monkeypatch, summary, requested_model="m", observed=No
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     ctx.task_id = "t-a"
     ctx.task_metadata = {"root_task_id": "t-a"}
-    payload = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=1))
+    payload = json.loads(delegate._read_run(ctx, "run-1"))
     delegate._CUSTODY.clear()
     return payload
 
@@ -328,6 +328,8 @@ def test_the_terminal_payload_carries_the_applied_model_and_the_mismatch_delta(t
         "requested": "model sonnet",
         "effective": "model claude-opus-5",
         "reason": "session_route_resolves_its_own_model",
+        "note": "The engine names the model it ran by its own alias; the names differ, capabilities were "
+                "not compared. A disclosure, not a failure.",
     }]
 
     # Agreement (or aliases matching exactly): no delta is invented.
@@ -403,6 +405,9 @@ def test_no_receipt_on_a_failed_settlement_and_one_after_the_successful_retry(tm
                 requested_model="sonnet")
     assert subagent_last_delegation() == {}, "receipt minted on a FAILED settlement"
 
+    # The terminal owner retries settlement independently of an already-ready
+    # foreground answer. No extra runtime or second physical run is created.
+    custody_mod.release_task_runs(tmp_path / "w1", "t-a")
     _waited_run(tmp_path / "w1", monkeypatch,
                 {"state": "succeeded", "spendUsd": 0.0, "model": "claude-opus-5"},
                 requested_model="sonnet")
@@ -472,7 +477,6 @@ def test_an_estimated_spend_is_not_a_settled_one(tmp_path, monkeypatch):
     # must be a definite False rather than whatever silence happened to produce.
     ({"state": "succeeded"}, None, False, False, False),
     ({"state": "succeeded", "spendUsd": 0, "spendEstimated": True}, 0.0, False, True, True),
-    ({"state": "succeeded", "spendUsd": 4.10, "spendEstimated": True}, 4.10, False, True, True),
     ({"state": "succeeded", "spendUsd": 0}, 0.0, True, True, False),
     ({"state": "succeeded", "spendUsd": 4.10}, 4.10, True, True, False),
 ])
@@ -517,24 +521,36 @@ def test_an_unreported_token_count_is_unknown_not_zero(tmp_path, monkeypatch):
     assert silent["cached_tokens"] is None, "and the third field obeys the same sentence"
 
     _, real_zero, _ = _settled_run(tmp_path / "zero", monkeypatch, {
-        "state": "succeeded", "spendUsd": 0, "inputTokens": 0, "outputTokens": 0,
-        "cachedInputTokens": 0})
+        "state": "succeeded", "spendUsd": 0, "inputTokens": 0, "outputTokens": 0, "cachedInputTokens": 0,
+        "inputTokenUsage": {"total_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0}})
     assert real_zero["prompt_tokens"] == 0 and real_zero["completion_tokens"] == 0, \
         "a disclosed zero is a fact and must survive as 0, not become None"
     assert real_zero["cached_tokens"] == 0
 
+    # A harness's own counters differ in meaning (this one counts the uncached rest, 10, beside
+    # 34.8M cache reads); the ledger's input axes are its normalized split, a direct call's meaning.
+    harness = {"inputTokens": 10, "outputTokens": 5, "cachedInputTokens": 34808493}
     _, counted, _ = _settled_run(tmp_path / "counted", monkeypatch, {
-        "state": "succeeded", "spendUsd": 0, "inputTokens": 10, "outputTokens": 5,
-        "cachedInputTokens": 34808493})
-    assert (counted["prompt_tokens"], counted["completion_tokens"]) == (10, 5)
-    assert counted["cached_tokens"] == 34808493, \
+        "state": "succeeded", "spendUsd": 0, **harness,
+        "inputTokenUsage": {"total_tokens": 34808503, "cache_read_tokens": 34808493, "cache_write_tokens": None}})
+    assert (counted["prompt_tokens"], counted["completion_tokens"]) == (34808503, 5)
+    assert counted["cached_tokens"] == 34808493 and counted["cache_write_tokens"] is None, \
         "a reported cache hit is real usage and must reach the ledger, not be dropped"
-    # It reaches the reader that renders it, and is NOT folded into the grand total —
-    # required, because cached is a SUBSET of input for some harnesses and disjoint for
-    # others, so a sum across them means nothing.
+    assert counted["harness_tokens"] == {"prompt_tokens": 10, "cached_tokens": 34808493}
+    # It reaches the reader that renders it, and is NOT folded into the grand total:
+    # cached is a part of the whole input, which the total already counts.
     bucket = ua.usage_breakdown(tmp_path / "counted")
     assert bucket["cached_tokens"] == 34808493
-    assert bucket["total_tokens"] == 15
+    assert bucket["total_tokens"] == 34808508
+
+    _, unsplit, _ = _settled_run(tmp_path / "unsplit", monkeypatch, {"state": "succeeded", "spendUsd": 0, **harness})
+    assert unsplit["prompt_tokens"] is None and unsplit["cached_tokens"] is None, \
+        "without the split the input is unknown, never a harness counter of another meaning"
+    assert unsplit["completion_tokens"] == 5 and unsplit["harness_tokens"] == counted["harness_tokens"]
+    from supervisor.state import reconstruct_task_cost
+    task = reconstruct_task_cost("t-a", fields=True, drive_root=tmp_path / "unsplit")
+    assert task["prompt_tokens"] is None and task["completion_tokens"] == 5, "the task total keeps unknown, never 0"
+    assert reconstruct_task_cost("t-a", fields=True, drive_root=tmp_path / "counted")["prompt_tokens"] == 34808503
 
 
 def test_the_start_request_asks_for_the_substrate_it_claims(tmp_path, monkeypatch):
@@ -558,6 +574,9 @@ def test_the_start_request_asks_for_the_substrate_it_claims(tmp_path, monkeypatc
             return {"runId": "run-1"}
         def close(self): pass
 
+    # A READ-ONLY child (the stub serves readonly only): technical access alone decides
+    # the run shape now (#1609); the billing substrate asked for is the same either way.
+    _select_transport_access(monkeypatch, "readonly")
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
     delegate._CUSTODY.clear()
@@ -588,6 +607,7 @@ def test_a_202_handle_without_a_run_id_is_a_live_run_not_a_failure(tmp_path, mon
         def start_run(self, request, *, idempotency_key=""): return {"jobId": "job-42"}   # 202: no runId yet
         def close(self): pass
 
+    _select_transport_access(monkeypatch, "readonly")   # a read-only child (#1609)
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
     delegate._CUSTODY.clear()
@@ -600,10 +620,11 @@ def test_a_202_handle_without_a_run_id_is_a_live_run_not_a_failure(tmp_path, mon
 
 def test_a_failed_ledger_write_leaves_the_session_retryable(tmp_path, monkeypatch):
     """The ledger lock can time out under worker concurrency. That is a transient, not a
-    decision — marking custody settled would burn the only chance to record the row."""
+    decision: an explicit wait retries owed money even when output is already retained."""
     import ouroboros.tools.delegate as delegate
     import ouroboros.usage_accounting as ua
     from ouroboros.gateways import claudexor as gw
+    from ouroboros.tools.delegate_terminal_evidence import retained_terminal_result
     from ouroboros.tools.registry import ToolContext
 
     retired = []
@@ -618,6 +639,7 @@ def test_a_failed_ledger_write_leaves_the_session_retryable(tmp_path, monkeypatc
     def _boom(*a, **k):
         raise ua.UsageAccountingError("usage accounting lock unavailable")
 
+    record_session = ua.record_subscription_session
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
     monkeypatch.setattr(ua, "record_subscription_session", _boom)
     delegate._CUSTODY.clear()
@@ -629,10 +651,24 @@ def test_a_failed_ledger_write_leaves_the_session_retryable(tmp_path, monkeypatc
     ctx.task_id = "t-a"
     ctx.task_metadata = {"root_task_id": "t-a"}
 
-    json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=1))
+    failed = json.loads(delegate._read_run(ctx, "run-1"))
+    assert failed["output_delivery"]["complete"] and not failed["settlement"]["settled"]
     assert custody.settled is False, "a lost write must stay retryable"
-    # Retirement is INDEPENDENT of the ledger write: the round-2 commit claimed
-    # this while the fixture owned no project, so deleting the call stayed
-    # green — a leak per failed settle, and a halted run never settles again.
-    assert retired == ["prj-ours"], "owned registration retired even on failure"
+    pending = dcust.replay(tmp_path)["run-1"]
+    assert not pending.settled and not pending.ledger_recorded
+    assert not [row for row in ledger_rows(tmp_path) if row.get("kind") == "subscription_session"]
+    assert retired == [], "failed accounting must preserve the continuation's project"
+    monkeypatch.setattr(ua, "record_subscription_session", record_session)
+    assert not retained_terminal_result(ctx, "run-1")["settlement"]["settled"], "a plain read does not retry money"
+    ready = json.loads(delegate._read_run(ctx, "run-1"))
+    assert ready["output_delivery"]["complete"] and ready["settlement"]["settled"]
+    assert ready["settlement"]["ledger_recorded"] and not ready["settlement"]["project_retired"]
+    custody = dcust.replay(tmp_path)["run-1"]
+    assert custody.settled and custody.ledger_recorded
+    assert custody.project_id == "prj-ours" and custody.project_owned
+    sessions = [row for row in ledger_rows(tmp_path) if row.get("kind") == "subscription_session"]
+    assert len(sessions) == 1 and sessions[0]["cost_final"] is True
+    dcust.release_task_runs(tmp_path, "t-a", gateway_factory=_Stub)
+    assert [row for row in ledger_rows(tmp_path) if row.get("kind") == "subscription_session"] == sessions
+    assert retired == [], "successful retry still defers retirement to the owner-line sweep"
     delegate._CUSTODY.clear()

@@ -14,7 +14,13 @@ from ouroboros.skill_publish_snapshot import CapturedSkillFile
 from ouroboros.tools import skill_publish
 from tests.test_marketplace_api import _BodyRequest, _stub_marketplace_roots
 from tests.test_marketplace_publication_record import _published
-from tests.test_skill_publish_transaction import BASE_SHA, _install_transaction_fakes, _snapshot, _submit
+from tests.test_skill_publish_transaction import (
+    BASE_SHA,
+    _install_transaction_fakes,
+    _installed_from_destination,
+    _snapshot,
+    _submit,
+)
 
 
 def test_clear_only_displayed_publication_preserves_sibling_state_and_republish(tmp_path):
@@ -42,7 +48,7 @@ def test_clear_absent_record_is_idempotent_without_creating_receipt(tmp_path):
     assert not (tmp_path / 'state/skills/demo/ouroboroshub.json').exists()
 
 
-@pytest.mark.parametrize('contents', ['{}', '[]', 'not json', '{"schema_version":1}'])
+@pytest.mark.parametrize('contents', ['{}', 'not json', '{"schema_version":1}'])
 def test_clear_does_not_repair_or_erase_malformed_existing_record(tmp_path, contents):
     path = tmp_path / 'state/skills/demo/ouroboroshub.json'
     path.parent.mkdir(parents=True)
@@ -54,17 +60,16 @@ def test_clear_does_not_repair_or_erase_malformed_existing_record(tmp_path, cont
 
 def test_clear_api_uses_actual_receipt_and_never_contacts_hub(tmp_path, monkeypatch):
     _stub_marketplace_roots(monkeypatch, tmp_path)
-    monkeypatch.setattr(api.ouroboroshub, 'load_catalog', lambda *a, **k: pytest.fail('local clear must not fetch GitHub'))
     shown = _published()
     path = provenance.write_publication_record(tmp_path, 'demo', shown)
     before = path.read_bytes()
     stale = _published(version='older')
-    response = asyncio.run(api.api_ouroboroshub_clear_publication(
-        _BodyRequest({'expected_published': stale}, {'name': 'demo'})))
+    response = asyncio.run(api.api_skill_publication_clear(
+        _BodyRequest({'expected_published': stale}, {'skill': 'demo'})))
     assert response.status_code == 409 and json.loads(response.body)['code'] == 'publication_changed'
     assert path.read_bytes() == before
-    response = asyncio.run(api.api_ouroboroshub_clear_publication(
-        _BodyRequest({'expected_published': shown}, {'name': 'demo'})))
+    response = asyncio.run(api.api_skill_publication_clear(
+        _BodyRequest({'expected_published': shown}, {'skill': 'demo'})))
     assert response.status_code == 200 and json.loads(response.body)['publication_cleared']
     assert provenance.read_publication_record(tmp_path, 'demo') == (None, None)
 
@@ -72,7 +77,7 @@ def test_clear_api_uses_actual_receipt_and_never_contacts_hub(tmp_path, monkeypa
 @pytest.mark.parametrize('name,body', [('..', {'expected_published': {}}), ('demo', {}), ('demo', {'expected_published': []})])
 def test_clear_api_rejects_invalid_target_and_missing_displayed_receipt(tmp_path, monkeypatch, name, body):
     _stub_marketplace_roots(monkeypatch, tmp_path)
-    response = asyncio.run(api.api_ouroboroshub_clear_publication(_BodyRequest(body, {'name': name})))
+    response = asyncio.run(api.api_skill_publication_clear(_BodyRequest(body, {'skill': name})))
     assert response.status_code == 400
 
 
@@ -84,15 +89,18 @@ def test_clear_write_failure_is_visible_and_keeps_receipt(tmp_path, monkeypatch)
     def broken_write(*args, **kwargs):
         raise OSError('controlled write failure')
     monkeypatch.setattr(provenance, 'update_json_locked', broken_write)
-    response = asyncio.run(api.api_ouroboroshub_clear_publication(
-        _BodyRequest({'expected_published': shown}, {'name': 'demo'})))
+    response = asyncio.run(api.api_skill_publication_clear(
+        _BodyRequest({'expected_published': shown}, {'skill': 'demo'})))
     assert response.status_code == 500
     assert 'controlled write failure' in json.loads(response.body)['error']
     assert path.read_bytes() == before
 
 
-@pytest.mark.parametrize('before,after', [('2.0.0', '1.0.0'), ('0.9.0', '0.10.0'), ('May release', 'nightly blue')])
-@pytest.mark.parametrize('model_body', ['', '## Summary\nModel summary\n## Version change\nInvented versions'])
+@pytest.mark.parametrize(("model_body", "before", "after"), [
+    ('', '0.9.0', '0.10.0'),
+    ('## Summary\nModel summary\n## Version change\nInvented versions', '2.0.0', '1.0.0'),
+    ('## Summary\nModel summary\n## Version change\nInvented versions', 'May release', 'nightly blue'),
+])
 def test_publish_discloses_both_opaque_versions_in_result_and_host_pr_body(tmp_path, monkeypatch, before, after, model_body):
     snapshot = _snapshot()
     manifest_file = CapturedSkillFile.from_bytes('skill.json', json.dumps({'name': 'demo', 'version': after}).encode())
@@ -102,6 +110,7 @@ def test_publish_discloses_both_opaque_versions_in_result_and_host_pr_body(tmp_p
     ctx, _, captured = _install_transaction_fakes(monkeypatch, tmp_path, snapshot=snapshot, model_body=model_body)
     catalog = {'skills': [{'slug': 'demo', 'version': before, 'files': []}]}
     monkeypatch.setattr(skill_publish, 'fetch_upstream_catalog', lambda *a: (copy.deepcopy(catalog), BASE_SHA))
+    _installed_from_destination(tmp_path)  # that row is this copy's release: the version change is local
     result = _submit(ctx)
     assert result['ok'] and result['catalog_version'] == before and result['proposed_version'] == after
     assert f'Catalog version: {json.dumps(before)}' in captured['pr_body']

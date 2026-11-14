@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ouroboros"
-version = "7.4.0"
+version = "7.10.2a0"
 description = "Self-creating AI agent with constitution, background consciousness, and persistent identity"
 readme = "README.md"
 license = {text = "MIT"}
@@ -32,7 +32,7 @@ dependencies = [
     # Runtime self-update and install paths execute ``sys.executable -m pip``.
     # uv-created source/tool environments do not seed pip unless it is declared.
     "pip",
-    "httpx",
+    "httpx[socks]>=0.28",  # SOCKS transport plus socks5h URL support (HTTPX 0.28+).
     # Native process command/tree observations for shared-daemon custody on Windows.
     "psutil>=7.2; sys_platform == 'win32'",
     # Runtime custom-tool calls are validated against the exact projected schema.
@@ -43,7 +43,7 @@ dependencies = [
     "starlette",
     "python-multipart",
     "Pillow>=10.0",
-    "pypdf>=4.0",
+    "pypdf>=7.0",
     "uvicorn[standard]",
     "websockets",
     "pytest>=7.0",
@@ -54,7 +54,9 @@ dependencies = [
     # dependencies because the packaged hermetic commit gate invokes them.
     "pytest-xdist>=3.5",
     "pytest-timeout>=2.1",
-    "mcp>=1.6,<2.0",
+    # Security floor: CVE-2026-116686 ($ref fetch in tool-result validation) and
+    # CVE-2026-116685 (cross-origin redirects) are fixed in the 1.x line at 1.30.0.
+    "mcp>=1.30,<2.0",
     "PyYAML>=6.0",
     "croniter",
     # Upper-bounded: tree-sitter 0.25.x + language-pack 1.x changed the grammar/
@@ -70,7 +72,7 @@ dependencies = [
 
 [project.scripts]
 ouroboros = "ouroboros.cli:main"
-ouroboros-web = "server:main"
+ouroboros-web = "server:executable_main"
 
 [project.urls]
 Homepage = "https://github.com/razzant/ouroboros"
@@ -84,6 +86,11 @@ desktop = [
     "pywebview==5.4",
     "pythonnet==3.0.5; platform_system == 'Windows'",
     "clr_loader==0.2.7.post0; platform_system == 'Windows'",
+]
+# Built against the AppImage's GTK3/girepository-1.0 baseline, in both Pythons.
+linux-desktop = [
+    "PyGObject==3.46.0; sys_platform == 'linux'",
+    "pycairo==1.26.1; sys_platform == 'linux'",
 ]
 local-model = ["llama-cpp-python"]
 build = ["pyinstaller>=6.0"]
@@ -110,14 +117,16 @@ python_functions = ["test_*"]
 # Default local pytest excludes token-burning integration/browser suites.
 addopts = "-q --tb=short -m 'not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet' --durations=25 --durations-min=1.0"
 markers = [
+    "required_provider: required live canaries, derived from ProviderCanary.credential_required",
+    "optional_provider: optional live qualification, outside release prerequisites",
     "integration: real external-surface suites excluded from default local runs — the CI provider-contract lane (requires real provider API keys: OPENROUTER_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY / MINIMAX_API_KEY / DEEPSEEK_API_KEY / CLOUDRU_FOUNDATION_MODELS_API_KEY / GIGACHAT_CREDENTIALS; opt in via `pytest -m integration`) AND the KEYLESS tests/system_e2e/ scenario lane (real isolated servers, no provider keys; additionally env-gated on OUROBOROS_E2E_DEEP)",
     "browser: launches real Playwright Chromium; excluded from default local runs, opt in via `pytest -m browser`",
     "ui_browser: launches the real Ouroboros web UI in host/direct mode; excluded from default local runs",
     "ui_browser_docker: launches UI smoke checks against Docker runtime; excluded from default local runs",
     "portable_detail: portable/build artifact detail checks; excluded from default local runs",
-    "serial: real subprocess / real port / mutable module-global test — run in a serial pass, excluded from the `-n auto` parallel pass via `-m 'not serial'` (see .github/workflows/ci.yml AND the hermetic commit gate ouroboros/preflight_runner.py, which runs the same two-pass split)",
+    "serial: names the host resource a test cannot isolate — `serial(\"<resource>\")`: its tests take turns on one worker of the xdist pass (`xdist_group(\"serial:<resource>\")`, tests/conftest.py); `serial(\"exclusive\")` runs alone in the one-process pass after it (ci.yml and the hermetic commit gate ouroboros/preflight_runner.py); DEVELOPMENT 'Parallel CI and the serial marker'",
     "skill_smoke: real-network OuroborosHub official-skill install + review-flow smoke; excluded from default local runs, opt in via `pytest -m skill_smoke` (canonical lane description: docs/DEVELOPMENT.md 'Pytest marker lanes')",
-    "size_ratchet: repository size gates against the live repo (manifest exactness, shrink-only pairwise transition, MAX_TOTAL_FUNCTIONS) — a BLOCKING lane only in official-repository CI; excluded from default local runs, which surface the same validator findings as warnings (canonical lane description: docs/DEVELOPMENT.md 'Pytest marker lanes')",
+    "size_ratchet: per-module line/UTF-8 byte and per-function length gates against the live repo (manifest exactness, shrink-only pairwise transition) — a BLOCKING lane only in official-repository CI; excluded from default local runs, which surface the same validator findings as warnings (canonical lane description: docs/DEVELOPMENT.md 'Pytest marker lanes')",
 ]
 
 [tool.setuptools]

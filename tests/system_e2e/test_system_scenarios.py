@@ -11,11 +11,15 @@ lands WITH its phases and must survive the domain transplants unchanged:
   answers a WS chat frame with an assistant reply, runs one scripted stub task to
   completion, and leaves a sane durable ``task_results/<id>.json`` behind.
 * S2 — review organ: a scripted task drives ``commit_reviewed`` over a doc-only diff
-  with the advisory pre-review explicitly skipped (audited bypass) and BLOCKING
-  enforcement, the stub answers the triad packet and retrieving scope reviewer with
-  all-clean verdicts, and the commit lands in the isolated clone. Landing under
-  ``blocking`` makes the git log itself the proof that both review organs ran and
-  passed — under advisory a failed review would still commit.
+  with the preflight explicitly skipped (``preflight: skipped``), the stub answers the
+  triad packet and retrieving scope reviewer with all-clean verdicts, the clean outcome
+  returns before Git like every outcome, and the scripted author's explicit
+  continuation on its reference lands the commit in the isolated clone. A landed commit
+  alone proves no verdict (an author may go on over a FAIL), so the scenario reads the
+  review evidence itself: the returned outcome named no critical finding, nothing was
+  recorded as gone over (no ``review_advisory_override``), the durable commit_gate
+  record answers PASS to both questions, and the landing names that record's one paid
+  attempt.
 * S3 — egress hardening (plan: "дыра ANTHROPIC_API_KEY — закрыть в Ф4 первой"): a
   poisoned parent env, a live keyless server tree, and a /proc environ probe of every
   process in it — no planted or real credential value is visible to any child.
@@ -29,9 +33,9 @@ sockets: the scenario manifest (gen/verify in BOTH directions), the stub's branc
 classification (review-organ branch BEFORE the finalization check), the prompt-marker
 literals against the tree's source, the ReplayModel binding/consumption contract, and
 the keyless/egress hardening (roast F21). The ``mock`` lane spawns real isolated
-servers; every scenario test carries BOTH ``integration`` and ``serial`` markers (so
-neither the default local run, nor either CI pytest pass, nor the CI-shape battery
-picks it up) AND the ``OUROBOROS_E2E_DEEP=mock`` env gate. Run it with::
+servers; every scenario carries ``integration`` (excluding both default pytest
+passes) and the ``OUROBOROS_E2E_DEEP=mock`` gate. Scenarios sharing resources also
+carry ``serial``; isolated scenarios may run concurrently. Run it with::
 
     OUROBOROS_E2E_DEEP=mock pytest tests/system_e2e/ -o addopts="" -q
 
@@ -57,7 +61,8 @@ import pytest
 from ouroboros.settings_defaults import SETTINGS_DEFAULTS, settings_env_keys
 from tests.system_e2e.harness import (
     _CREDENTIAL_SHAPE_RE,
-    ACCEPTANCE_KEYS_MARKER,
+    KEYLESS_PACKET_ROWS,
+    KEYLESS_REVIEW_ROWS,
     LANE_MOCK,
     MARKER_SOURCES,
     MOCK_SLUG,
@@ -65,7 +70,7 @@ from tests.system_e2e.harness import (
     REPO_ROOT,
     REVIEWER_SLOT_MARKER,
     SCENARIOS,
-    SCOPE_USER_MARKER,
+    TWO_PART_SURFACE,
     STRIPPED_PROVIDER_ENV_KEYS,
     TRIAD_USER_MARKER,
     ArtifactOracle,
@@ -74,7 +79,7 @@ from tests.system_e2e.harness import (
     ScriptedStubModel,
     assert_settings_keyless,
     classify_call,
-    keyless_reviewer_slots,
+    keyless_review_catalog,
     keyless_settings,
     proc_environ,
     process_tree_pids,
@@ -92,6 +97,7 @@ from tests.system_e2e.harness import (
     write_settings_file,
     ws_url,
 )
+from tests.system_e2e.test_system_scenarios_w3a import _HoldingStubModel, _land_on_returned_pass
 
 # ===========================================================================
 # Default lane: harness self-contracts. No server, no model, no egress.
@@ -149,16 +155,18 @@ def test_every_scenario_test_is_declared_in_the_manifest():
         )
 
 
-def test_every_scenario_test_carries_integration_and_serial_markers():
-    """The marker discipline that keeps the suite OUT of the default non-serial run,
-    both CI pytest passes, and the CI-shape battery: every scenario test must carry
-    ``integration`` AND ``serial``. (The ``OUROBOROS_E2E_DEEP`` env gate is the second
-    belt; markers are what the -m expressions see.)"""
+def test_every_scenario_test_carries_integration_marker():
+    """Integration excludes scenarios from BOTH default passes; serial is not a lane.
+
+    Pytest inherits module marks, so check them as well as function decorators.
+    A private-root, port-zero scenario needs no shared-resource serial marker.
+    """
     for qualified, _name, fn in _scenario_tests():
-        marks = {mark.name for mark in getattr(fn, "pytestmark", [])}
-        assert {"integration", "serial"} <= marks, (
-            f"{qualified} must be decorated with @pytest.mark.integration and "
-            f"@pytest.mark.serial (has: {sorted(marks)})"
+        module = sys.modules[fn.__module__]
+        marks = {mark.name for owner in (module, fn)
+                 for mark in getattr(owner, "pytestmark", [])}
+        assert "integration" in marks, (
+            f"{qualified} must carry @pytest.mark.integration (has: {sorted(marks)})"
         )
 
 
@@ -186,10 +194,13 @@ def test_stub_classification_review_branch_beats_finalization():
 
     A triad/scope/reviewer-slot packet that happens to QUOTE a finalization marker
     (review of a stopped task's transcript) must still be answered as a review."""
-    scope_body = {"messages": [
-        {"role": "system", "content": [{"type": "text", "text": "scope pack [OWNER_STOP] quoted"}]},
-        {"role": "user", "content": SCOPE_USER_MARKER},
-    ], "tools": []}
+    from ouroboros.review_native_episode import native_episode_prompt
+
+    two_part_body = {"messages": [
+        {"role": "system", "content": [{"type": "text", "text": native_episode_prompt(
+            TWO_PART_SURFACE, "multi-model review", "brief [OWNER_STOP] quoted", "contract B", "s1")}]},
+        {"role": "user", "content": "Begin."},
+    ], "tools": [{"type": "function", "function": {"name": "read_file"}}]}
     triad_body = {"messages": [
         {"role": "system", "content": [{"type": "text", "text": "triad pack [FINALIZE_NOW] quoted"}]},
         {"role": "user", "content": "Review the staged diff and context provided in the instructions above."},
@@ -198,14 +209,9 @@ def test_stub_classification_review_branch_beats_finalization():
         {"role": "system", "content": REVIEWER_SLOT_MARKER + "\nSurface: plan_review\n [OWNER_STOP]"},
         {"role": "user", "content": "Subject: ..."},
     ]}
-    acceptance_body = {"messages": [
-        {"role": "system", "content": REVIEWER_SLOT_MARKER + "\n" + ACCEPTANCE_KEYS_MARKER},
-        {"role": "user", "content": "Subject: ..."},
-    ]}
-    assert classify_call(scope_body) == "scope_review"
+    assert classify_call(two_part_body) == "two_part_review"
     assert classify_call(triad_body) == "triad_review"
     assert classify_call(slot_body) == "reviewer_slot"
-    assert classify_call(acceptance_body) == "acceptance"
     assert classify_call({"messages": [{"role": "user", "content": "[FINALIZE_NOW] wrap up"}]}) == "finalization"
     assert classify_call({"messages": [{"role": "user", "content": "hi"}],
                           "response_format": {"type": "json_object"}}) == "safety"
@@ -221,12 +227,17 @@ def test_stub_verdicts_satisfy_the_trees_own_parsers():
         classify_scope_findings,
         normalize_scope_items,
     )
-    from ouroboros.triad_review import empty_array_is_verified_clean
+    from ouroboros.review_native_episode import native_episode_prompt
+    from ouroboros.triad_review import empty_array_is_verified_clean, two_part_payload
 
-    _kind, scope_message = scripted_completion(
-        {"messages": [{"role": "user", "content": SCOPE_USER_MARKER}]}, 1, lambda _b: None, "x")
-    items, errors = normalize_scope_items(json.loads(scope_message["content"]))
-    assert not errors, f"stub scope verdict rejected by normalize_scope_items: {errors}"
+    kind, two_part_message = scripted_completion(
+        {"messages": [{"role": "system", "content": native_episode_prompt(
+            TWO_PART_SURFACE, "multi-model review", "brief", "contract B", "s1")}]}, 1, lambda _b: None, "x")
+    assert kind == "two_part_review"
+    payload = two_part_payload(json.loads(two_part_message["content"]))
+    assert payload is not None and payload["change"] == [] and payload["change_clean"] is True
+    items, errors = normalize_scope_items(payload["coupling"])
+    assert not errors, f"stub coupling verdict rejected by normalize_scope_items: {errors}"
     assert {item["item"] for item in items} == set(SCOPE_REQUIRED_ITEMS)
     critical, advisory = classify_scope_findings(items)
     assert critical == [] and advisory == []
@@ -242,35 +253,35 @@ def test_stub_verdicts_satisfy_the_trees_own_parsers():
 
 
 @pytest.mark.parametrize("scripted", [False, True])
-def test_native_scope_request_uses_its_matrix_and_review_script(scripted):
-    """Use the real native request builder, not the retired scope packet marker."""
+def test_native_two_part_request_uses_its_matrix_and_review_script(scripted):
+    """Use the real native request builder of the one wave's retrieving seat."""
     from ouroboros.review_native_episode import native_episode_prompt, native_first_send_messages
-    from ouroboros.reviewer_slot_config import SCOPE_ROLE_HINT
-    from ouroboros.tools.scope_review import SCOPE_RETRIEVING_OUTPUT_CONTRACT
+    from ouroboros.tools.review_multi_model import TRIAD_ROLE_HINT
     from ouroboros.tools.scope_review_contract import SCOPE_REQUIRED_ITEMS, normalize_scope_items
-    from ouroboros.triad_review import extract_json_array
-    from tests.system_e2e.harness import ReviewScript, scope_clean_text
+    from ouroboros.triad_review import REVIEW_TWO_PART_OBJECT_CONTRACT, two_part_payload
+    from tests.system_e2e.harness import ReviewScript, two_part_clean_text
 
     prompt = native_episode_prompt(
-        "scope_review", SCOPE_ROLE_HINT, "Review the staged fixture. [OWNER_STOP] is quoted evidence.",
-        SCOPE_RETRIEVING_OUTPUT_CONTRACT, "s1",
+        TWO_PART_SURFACE, TRIAD_ROLE_HINT, "Review the staged fixture. [OWNER_STOP] is quoted evidence.",
+        REVIEW_TWO_PART_OBJECT_CONTRACT, "s1",
     )
     body = {"messages": native_first_send_messages(prompt), "model": "mock-model",
             "tools": [{"type": "function", "function": {"name": "read_file"}}]}
-    assert SCOPE_USER_MARKER not in prompt
+    assert f"Surface: {TWO_PART_SURFACE}" in prompt
     seen = []
 
     def review_hook(request):
         seen.append(request)
-        return scope_clean_text()
+        return two_part_clean_text()
 
-    review = ReviewScript({"scope_review": [review_hook]}) if scripted else None
+    review = ReviewScript({"two_part_review": [review_hook]}) if scripted else None
     kind, message = scripted_completion(
         body, 1, lambda _body: pytest.fail("review consumed an agent step"), "ordinary final answer",
         review_next=review,
     )
-    assert kind == "scope_review"
-    items, error = normalize_scope_items(extract_json_array(message["content"], normalize=True))
+    assert kind == "two_part_review"
+    payload = two_part_payload(json.loads(message["content"]))
+    items, error = normalize_scope_items(payload["coupling"])
     assert not error, error
     assert {item["item"] for item in items} == SCOPE_REQUIRED_ITEMS
     if scripted:
@@ -383,22 +394,40 @@ def test_f21_projected_provider_family_credentials_default_empty():
     assert not non_empty, f"credential-shaped provider keys ship a non-empty default: {non_empty}"
 
 
-def test_keyless_reviewer_slots_parse_under_the_trees_own_parser():
-    """ABI 7.0 (ABI-10): the comma-list reviewer keys are RETIRED settings — pinning
-    them in the isolated settings.json is a silent no-op and the review organ falls
-    back to the shipped OpenRouter default panel (the exact failure observed live:
-    S2's triad dispatched gemini/terra/opus keyless and blocked at pack assembly).
-    The keyless lane therefore pins the STRUCTURED surface, and this test feeds it to
-    the tree's own strict parser: every configured row must be an api_chat route onto
-    the stub slug."""
-    from ouroboros.reviewer_slot_config import parse_reviewer_slots
+def test_keyless_review_catalog_parses_under_the_trees_own_parser(monkeypatch):
+    """The comma-list reviewer keys and the review lanes are RETIRED settings —
+    pinning them in the isolated settings.json is a silent no-op, and a catalog that
+    was never configured reads the factory reviewers: live OpenRouter routes that
+    dispatch keyless and block at pack assembly (the exact failure observed live: S2's
+    triad dispatched gemini/terra/opus). The keyless lane therefore pins catalog rows
+    marked Reviewer, and this test feeds them to the tree's own strict catalog parser:
+    every row must be an API route onto the stub slug, marked Reviewer, in a catalog
+    that delegates nothing."""
+    from ouroboros import configured_subagents
 
-    config = parse_reviewer_slots(keyless_reviewer_slots())
-    assert config.source == "structured"
-    assert len(config.triad) >= 1 and len(config.scope) >= 1
-    for row in (*config.triad, *config.scope):
-        assert row.kind == "api_chat", row
-        assert row.target_id == MOCK_SLUG, row
+    # The catalog row fields of the review pool (package A's parser accepts them).
+    monkeypatch.setattr(configured_subagents, "_ROW_KEYS",
+                        configured_subagents._ROW_KEYS | {"review_eligible"})
+    raw = keyless_review_catalog()
+    config = configured_subagents.parse_configured_subagents(raw)
+    assert config is not None and config.enabled is False
+    assert len(config.items) == 3
+    for row in config.items:
+        assert row.route.kind == "api_model" and row.route.target_id == MOCK_SLUG, row
+        assert row.enabled, row
+    assert all(item["review_eligible"] is True for item in json.loads(raw)["items"])
+    # The panel is mixed by construction: the packet rows deliver as packets (contract
+    # A), the last row keeps the catalog default — a native episode (contract B) — so
+    # one wave exercises both delivery classes. A row's delivery is read from its
+    # ``delivery`` field alone.
+    assert [row.subagent_id for row in config.items] == list(KEYLESS_REVIEW_ROWS)
+    assert [row.delivery for row in config.items] == [
+        configured_subagents.REVIEW_DELIVERY_PACKET if row_id in KEYLESS_PACKET_ROWS
+        else configured_subagents.REVIEW_DELIVERY_NATIVE for row_id in KEYLESS_REVIEW_ROWS]
+    assert 0 < len(KEYLESS_PACKET_ROWS) < len(KEYLESS_REVIEW_ROWS)
+    distinct = configured_subagents.parse_configured_subagents(keyless_review_catalog(distinct_models=True))
+    assert [row.route.target_id for row in distinct.items] == [
+        f"{MOCK_SLUG}-t{i}" for i in (1, 2, 3)]
 
 
 def test_f21_every_runtime_credential_env_read_is_stripped_from_the_keyless_child():
@@ -479,9 +508,11 @@ def test_replay_model_untagged_prompt_binds_to_root_and_last_tag_wins():
 
 def test_replay_model_review_calls_never_consume_the_fixture():
     model = _replay({("root", "mock-model", 1): {"final": "done"}})
-    kind, _ = model._answer({"messages": [{"role": "user", "content": SCOPE_USER_MARKER}],
-                             "model": "mock-model"}, 1)
-    assert kind == "scope_review"
+    from ouroboros.review_native_episode import native_episode_prompt
+
+    kind, _ = model._answer({"messages": [{"role": "system", "content": native_episode_prompt(
+        TWO_PART_SURFACE, "multi-model review", "brief", "contract B", "s1")}], "model": "mock-model"}, 1)
+    assert kind == "two_part_review"
     kind, _ = model._answer({"messages": [{"role": "user", "content": "x"}],
                              "response_format": {"type": "json_object"},
                              "model": "mock-model"}, 2)
@@ -526,6 +557,24 @@ def test_interface_stubs_refuse_instantiation_until_their_lanes_land():
         PlaywrightUIClient()
 
 
+def test_artifact_oracle_reads_current_children_and_ignores_retired_files(tmp_path):
+    from tests._store_shared import seed_result
+
+    for task_id, parent in (("parent", ""), ("child", "parent"),
+                            ("grandchild", "child"), ("unrelated", "other")):
+        seed_result(tmp_path, task_id, {"status": "completed", "parent_task_id": parent,
+                                        "result": f"durable {task_id}"})
+    oracle = ArtifactOracle(tmp_path)
+    assert oracle.task_result("child")["result"] == "durable child"
+    assert oracle.child_task_ids("parent") == ["child"]
+    assert oracle.child_task_ids("absent") == []
+    retired = tmp_path / "task_results" / "phantom.json"
+    retired.parent.mkdir(exist_ok=True)
+    retired.write_text(json.dumps({"task_id": "phantom", "parent_task_id": "parent"}))
+    assert oracle.child_task_ids("parent") == ["child"]
+    assert oracle.child_task_ids("child") == ["grandchild"]
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits are meaningless on Windows")
 def test_settings_file_is_created_secret_safe(tmp_path):
     """0600-before-content (carried over from the v7_wip cancellation harness)."""
@@ -560,8 +609,8 @@ S2_SCRIPT = [
     {"tool": "commit_reviewed", "arguments": {
         "commit_message": S2_COMMIT_MESSAGE,
         "paths": [S2_DOC_PATH],
-        # Audited advisory-only skip (recorded as `bypassed` in the ledger) — the
-        # scenario's subject is the triad+scope organ, not the advisory pre-review.
+        # The explicit skip is recorded as `preflight: skipped` on the commit's review
+        # record — the scenario's subject is the triad+scope organ, not the preflight.
         "skip_advisory_review": True,
         # The post-commit hermetic pytest is out of scope for a smoke that proves the
         # review organ; the skip is recorded in the commit attempt.
@@ -569,11 +618,12 @@ S2_SCRIPT = [
         "goal": "Land a doc-only smoke note through the full triad+scope review organ.",
         "scope": f"{S2_DOC_PATH} only.",
     }},
+    # ... and the test appends the author's landing on the returned clean outcome
+    # (``_land_on_returned_pass``): every outcome, a PASS too, returns before Git.
 ]
 
 
 @pytest.mark.integration
-@pytest.mark.serial
 def test_s1_boot_identity_ws_chat_and_task_contract(e2e_clone, tmp_path_factory):
     require_lane(LANE_MOCK)
     root = tmp_path_factory.mktemp("s1")
@@ -602,12 +652,12 @@ def test_s1_boot_identity_ws_chat_and_task_contract(e2e_clone, tmp_path_factory)
             result = server.wait_task(task_id, timeout=300)
             assert result.get("status") == "completed", result
 
-            # Durable truth, not the HTTP answer: task_results/<id>.json.
+            # Durable truth, independently of HTTP: the current-facts SQLite store.
             stored = wait_durable_result(oracle, task_id)
             assert stored.get("task_id") == task_id, stored
             assert stored.get("status") == "completed", stored
             assert str(stored.get("result") or "").strip(), "durable result text is empty"
-            json.loads(oracle.task_result_bytes(task_id))  # bytes on disk are valid JSON
+            assert (server.data_root / "state" / "current.sqlite").is_file()
 
             # The queue drained and the stub actually drove the loop.
             assert wait_until(lambda: task_id not in oracle.running_ids(), 60)
@@ -646,62 +696,94 @@ def test_s1_boot_identity_ws_chat_and_task_contract(e2e_clone, tmp_path_factory)
 
 
 @pytest.mark.integration
-@pytest.mark.serial
 def test_s2_commit_reviewed_triad_and_scope_pass_on_doc_only_diff(e2e_clone, tmp_path_factory):
     require_lane(LANE_MOCK)
     root = tmp_path_factory.mktemp("s2")
-    with ScriptedStubModel(S2_SCRIPT) as stub:
+    landing: dict = {}  # the outcome the author landed on, or why the script could not land it
+    script = [*S2_SCRIPT, _land_on_returned_pass(
+        S2_SCRIPT[1], "I read the clean triad+scope review of the smoke note and land exactly it.", landing)]
+    with _HoldingStubModel(script) as stub:
         settings = keyless_settings(
             stub,
             # The review organ needs the self-modification surface: advanced runtime
-            # (light restricts repo writes), BLOCKING enforcement so the landed commit
-            # PROVES the organ passed rather than being waved through.
+            # (light restricts repo writes).
             OUROBOROS_RUNTIME_MODE="advanced",
-            OUROBOROS_REVIEW_ENFORCEMENT="blocking",
         )
         server = start_server(e2e_clone, root, settings)
         try:
+            serving_head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(e2e_clone),
+                                          check=True, capture_output=True, text=True).stdout.strip()
             task_id = submit_running(
                 server,
                 "Write the smoke note and land it through commit_reviewed, then finish.",
             )
             result = server.wait_task(task_id, timeout=600)
             assert result.get("status") == "completed", result
+            assert "E2E_SCRIPT_ERROR" not in str(result), (result, landing)
 
             oracle = ArtifactOracle(server.data_root)
             stored = wait_durable_result(oracle, task_id)
             assert stored.get("status") == "completed", stored
+            assert stub.script_consumed(), "S2 script was not fully consumed"
 
-            # The review organ ran: the stub answered triad AND retrieving scope review.
+            # The review organ ran: the stub answered the packet seats AND the
+            # retrieving two-part seat of the one wave.
             kinds = stub.kinds()
             assert "triad_review" in kinds, kinds
-            assert "scope_review" in kinds, kinds
+            assert "two_part_review" in kinds, kinds
 
-            # The commit LANDED in the isolated clone — under blocking enforcement this
-            # is only reachable through PASS verdicts from both organs.
+            # The commit LANDED on the root's body candidate (#1539: an ordinary author
+            # never commits the checkout the server imports) through the author's
+            # continuation on the returned outcome, and is recorded as reviewed there;
+            # the serving clone did not move.
+            rows = [row for path in sorted(server.data_root.rglob("state/private_copies/*.json"))
+                    if not path.name.startswith(".")
+                    for row in [json.loads(path.read_text(encoding="utf-8"))] if row.get("kind") == "body_candidate"]
+            assert len(rows) == 1 and rows[0]["task_id"] == task_id, rows
             log_output = subprocess.run(
-                ["git", "log", "-n", "5", "--format=%s"],
+                ["git", "log", "-n", "5", "--format=%H %s", rows[0]["branch"]],
                 cwd=str(e2e_clone), check=True, capture_output=True, text=True,
             ).stdout
-            assert S2_COMMIT_MESSAGE in log_output, log_output
+            tip, subject = log_output.splitlines()[0].split(" ", 1)
+            assert subject == S2_COMMIT_MESSAGE and tip in rows[0]["reviewed_commits"], (log_output, rows)
             committed_doc = subprocess.run(
-                ["git", "show", f"HEAD:{S2_DOC_PATH}"],
+                ["git", "show", f"{tip}:{S2_DOC_PATH}"],
                 cwd=str(e2e_clone), check=False, capture_output=True, text=True,
             )
             assert committed_doc.returncode == 0, "smoke doc is not in the committed tree"
+            serving = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(e2e_clone),
+                                     check=True, capture_output=True, text=True).stdout.strip()
+            assert serving == serving_head and not (e2e_clone / S2_DOC_PATH).exists()
 
-            # Durable review evidence lives in the task's FORKED drive root
-            # (state/headless_tasks/<id>/data — headless-task isolation on this tree):
-            # the audited advisory bypass and the scope round.
+            # Durable review evidence: the scope round lives in the task's FORKED drive
+            # root (state/headless_tasks/<id>/data — headless-task isolation on this
+            # tree); the commit's review record (canonical data root, read from both)
+            # carries the explicit skip as a fact, never an audited bypass (3A).
             task_oracle = oracle.task_drive(task_id)
             assert task_oracle.data_root != oracle.data_root, (
                 "task drive root missing — headless drive layout changed?")
-            runs = task_oracle.advisory_review().get("advisory_runs") or []
-            bypassed = [r for r in runs if isinstance(r, dict) and r.get("status") == "bypassed"]
-            assert bypassed, f"no bypassed advisory run in the task ledger: {runs!r}"
-            assert bypassed[0].get("commit_message") == S2_COMMIT_MESSAGE, bypassed[0]
-            assert task_oracle.events("advisory_review_bypassed"), "bypass event missing"
-            assert task_oracle.events("scope_review_complete"), "scope completion event missing"
+            records = task_oracle.review_ledger_records() + oracle.review_ledger_records()
+            skipped = [r for r in records if r.get("surface") == "commit_gate"
+                       and (r.get("preflight") or {}).get("status") == "skipped"]
+            assert skipped, f"no commit_gate record with preflight skipped: {records!r}"
+            # The one wave's durable record answers both questions (the brief of two parts).
+            assert skipped[-1]["verdict"]["per_question"] == {"change": "PASS", "coupling": "PASS"}, skipped[-1]
+            assert skipped[-1]["verdict"]["aggregate"] == "PASS", skipped[-1]["verdict"]
+
+            # The landing went over nothing: the outcome the call returned before Git named
+            # no critical finding and was that record's; no review_advisory_override was
+            # recorded (the event a FAIL or a missing verdict leaves when work goes on past
+            # it); the one paid attempt is what the author's unpaid landing names.
+            returned = landing["returned"]
+            assert not returned["review_outcome"]["critical_findings"] and returned["review_outcome"]["paid"], returned
+            assert returned["review_reference"]["review_record_id"] == skipped[-1]["record_id"], (returned, skipped[-1])
+            assert not task_oracle.events("review_advisory_override") and not oracle.events("review_advisory_override")
+            attempts = [a for a in task_oracle.advisory_review().get("attempts") or []
+                        if isinstance(a, dict) and a.get("task_id") == task_id]
+            assert sum(bool(a.get("paid")) for a in attempts) == 1, attempts
+            landed = [a for a in attempts if a["status"] == "succeeded"]
+            assert len(landed) == 1 and not landed[0]["paid"], attempts
+            assert landed[0]["author_disposition"]["review_reference"] == returned["review_reference"], landed[0]
         finally:
             server.stop()
 
@@ -724,7 +806,6 @@ S3_PLANTED = {
 
 
 @pytest.mark.integration
-@pytest.mark.serial
 @pytest.mark.skipif(sys.platform != "linux", reason="/proc environ probe is Linux-only")
 def test_s3_poisoned_parent_credentials_never_reach_the_server_tree(
         e2e_clone, tmp_path_factory, monkeypatch):
@@ -813,7 +894,6 @@ S4_SNAPSHOT_PATHS = (S4_PROTECTED_PATH, "BIBLE.md")
 
 
 @pytest.mark.integration
-@pytest.mark.serial
 def test_s4_protected_path_write_denial_has_zero_side_effects(e2e_clone, tmp_path_factory):
     require_lane(LANE_MOCK)
     root = tmp_path_factory.mktemp("s4")
@@ -863,7 +943,6 @@ def test_s4_protected_path_write_denial_has_zero_side_effects(e2e_clone, tmp_pat
 
 
 @pytest.mark.integration
-@pytest.mark.serial
 def test_s5_public_task_projections_carry_honest_only_cost_names(e2e_clone, tmp_path_factory):
     require_lane(LANE_MOCK)
     root = tmp_path_factory.mktemp("s5")

@@ -9,6 +9,7 @@ import hashlib
 import json
 import re
 import runpy
+import zipfile
 from functools import partial
 from pathlib import Path
 from typing import Iterable
@@ -47,16 +48,31 @@ DOWNLOAD_LABELS = {
     "android-arm64": "Experimental Android ARM64 USB setup (.tar.gz)",
     "android-apk": "Android publisher-signed reference APK (see setup guide)",
 }
+# The release job's needs apart from the optional Android build. The proof
+# records each job's actual GitHub conclusion; a missing one is an error,
+# never a pass.
 RELEASE_GATES = (
     "full-test",
+    "integration-test",
+    "system-e2e-mock",
+    "release-preflight",
+    "build",
+    "windows-proof",
     "marker-guards",
     "ui-smoke",
     "docker-ui-smoke",
     "docker-portable-test",
     "skill-smoke",
-    "packaged-artifact-smoke",
-    "android-build",
+    "lint",
+    "test-verdict",
 )
+JOB_RESULTS = ("success", "failure", "cancelled", "skipped")
+# Owner decision 1A of 2026-10-21: every gate must succeed; nothing is waived by tag.
+# A test that failed once and passed on its retry in the same job (FLAKY) and a
+# failure the owner accepted as not a product bug (ACCEPTED) are already green
+# inside their lanes; the run's `test-verdict` table names them and the notes
+# disclose them. A FAILED or never-run test in that table refuses the release.
+NOTES_FLAKY_SHOWN = 30
 COMMON_SMOKE_CHECKS = frozenset(
     {
         "embedded_repo_bundle",
@@ -107,6 +123,24 @@ REQUIRED_SMOKE_CHECKS = {
     }),
     "android-apk": frozenset({"apk_signature", "apk_package_version"}),
 }
+# Windows signing is selected by configuration: without a signer thumbprint the
+# ZIP ships explicitly unsigned; with one, the receipt must name that verified
+# signer, carry these checks and hash exactly the catalogued executables before
+# and after signing, or the whole release stops.
+AUTHENTICODE_PROOF_ID = "windows-x64"
+AUTHENTICODE_SMOKE_CHECKS = frozenset(
+    {"authenticode_signer", "timestamp", "signed_payload_archive_match"}
+)
+WINDOWS_SIGNING_CATALOG = json.loads(
+    (Path(__file__).resolve().parent / "windows_signing_catalog.json").read_text(encoding="utf-8")
+)
+# Like Windows signing, configuration selects the macOS state: a signed stable
+# build must prove both stapled tickets and Gatekeeper acceptance of the
+# copied-out app or the release stops; every other build is not_notarized.
+NOTARIZATION_PROOF_ID = "macos-arm64"
+NOTARIZATION_SMOKE_CHECKS = frozenset(
+    {"stapled_app", "stapled_dmg", "gatekeeper_app", "gatekeeper_dmg"}
+)
 
 
 def sha256_file(path: Path) -> str:
@@ -158,9 +192,62 @@ def command_locate(args: argparse.Namespace) -> None:
         "name": artifact.name,
         "sha256": sha256_file(artifact),
     }
+    # A handed-over archive is checked against its producer job's output
+    # before anything extracts or executes it.
+    if args.expect_sha256 is not None and values["sha256"] != args.expect_sha256:
+        raise ValueError(
+            f"{artifact.name} has SHA-256 {values['sha256']}, not the "
+            f"{args.expect_sha256 or '(missing)'} digest its producer job recorded"
+        )
     if args.github_output:
         _append_github_output(args.github_output, values)
     print(json.dumps(values, sort_keys=True))
+
+
+def _signed_files(records: object) -> list[dict]:
+    """Each catalogued executable exactly once, with distinct hashes before and
+    after signing; an upstream-pinned file must have been signed from its pin."""
+    catalog = {entry["path"]: entry for entry in WINDOWS_SIGNING_CATALOG["files"]}
+    if not isinstance(records, list) or not all(
+        isinstance(row, dict) and set(row) == {"path", "unsignedSha256", "sha256"}
+        and all(isinstance(value, str) for value in row.values())
+        for row in records
+    ):
+        raise ValueError("Windows signing record must give path, unsignedSha256 and sha256 per file")
+    paths = [row["path"] for row in records]
+    if sorted(paths) != sorted(catalog):
+        raise ValueError(f"Windows signing record covers {paths}, not exactly the catalogued {list(catalog)}")
+    for row in records:
+        pin = catalog[row["path"]].get("upstreamSha256")
+        if not all(re.fullmatch(r"[0-9a-f]{64}", row[key]) for key in ("unsignedSha256", "sha256")) or (
+            row["unsignedSha256"] == row["sha256"]
+        ):
+            raise ValueError(f"Windows signing record for {row['path']} lacks distinct SHA-256 digests")
+        if pin and row["unsignedSha256"] != pin:
+            raise ValueError(
+                f"{row['path']} was signed from SHA-256 {row['unsignedSha256']}, not the catalogued upstream {pin}"
+            )
+    return sorted(records, key=lambda row: list(catalog).index(row["path"]))
+
+
+def _archived_signed_files(artifact: Path, record: str) -> list[dict]:
+    """The signing job's record, bound to the bytes the final ZIP holds."""
+    files = _signed_files(json.loads(record or "null"))
+    try:
+        with zipfile.ZipFile(artifact) as archive:
+            for row in files:
+                digest = hashlib.sha256()
+                with archive.open(row["path"]) as member:
+                    for chunk in iter(lambda: member.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                if digest.hexdigest() != row["sha256"]:
+                    raise ValueError(
+                        f"{row['path']} in {artifact.name} has SHA-256 {digest.hexdigest()}, "
+                        f"not the signed {row['sha256']}"
+                    )
+    except (KeyError, zipfile.BadZipFile) as exc:
+        raise ValueError(f"{artifact.name} does not hold every catalogued executable: {exc}") from exc
+    return files
 
 
 def command_record_smoke(args: argparse.Namespace) -> None:
@@ -181,6 +268,20 @@ def command_record_smoke(args: argparse.Namespace) -> None:
         "releaseTag": args.tag,
         "checks": sorted(set(args.check)),
     }
+    if args.proof_id == AUTHENTICODE_PROOF_ID:
+        receipt["authenticode"] = {"status": "unsigned"}
+        if args.authenticode_thumbprint:
+            receipt["authenticode"] = {
+                "status": "signed",
+                "signerThumbprint": args.authenticode_thumbprint.upper(),
+                "publisher": args.authenticode_publisher,
+                "files": _archived_signed_files(args.artifact, args.authenticode_files),
+                "pythonUpstream": WINDOWS_SIGNING_CATALOG["pythonUpstream"],
+            }
+        elif args.authenticode_files:
+            raise ValueError("signed Windows file hashes need the verified signer")
+    if args.proof_id == NOTARIZATION_PROOF_ID:
+        receipt["notarization"] = {"status": args.macos_notarization or "not_notarized"}
     _write_json(args.output, receipt)
 
 
@@ -197,11 +298,92 @@ def _read_release_description(readme: Path, version: str) -> tuple[str, str]:
     raise ValueError(f"README Version History has no exact row for {version}")
 
 
+def _gate_results(pairs: list[str]) -> dict[str, str]:
+    """Return every gate's actual conclusion; each must have succeeded."""
+    results: dict[str, str] = {}
+    for pair in pairs:
+        name, _, result = pair.partition("=")
+        if name not in RELEASE_GATES or name in results or result not in JOB_RESULTS:
+            raise ValueError(f"invalid release gate result: {pair!r}")
+        results[name] = result
+    missing = [name for name in RELEASE_GATES if name not in results]
+    if missing:
+        raise ValueError(f"missing release gate results: {missing}")
+    ordered = {name: results[name] for name in RELEASE_GATES}
+    for name, result in ordered.items():
+        if result != "success":
+            raise ValueError(f"release gate {name} concluded {result}, not success")
+    return ordered
+
+
+def _test_verdict(path: Path) -> dict[str, list[dict]]:
+    """The run's FLAKY and ACCEPTED tests from `tests/ci_evidence.py run-verdict`.
+
+    Green gates and a FAILED or never-run row cannot both be true: the table is refused.
+    """
+    table = _load_json(path)
+    rows = {}
+    for key in ("flaky", "accepted", "failed", "not_run"):
+        value = table.get(key)
+        if not isinstance(value, list) or not all(isinstance(row, dict) and isinstance(row.get("nodeid"), str)
+                                                  for row in value):
+            raise ValueError(f"test verdict {path} has no valid {key!r} list")
+        rows[key] = value
+    if rows["failed"] or rows["not_run"]:
+        raise ValueError(f"test verdict lists {len(rows['failed'])} failed and "
+                         f"{len(rows['not_run'])} never-run tests; the release is refused")
+    return {"flaky": rows["flaky"], "accepted": rows["accepted"]}
+
+
 def _load_json(path: Path) -> dict:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         raise ValueError(f"expected a JSON object in {path}")
     return value
+
+
+def _authenticode_state(smoke: dict, checks: list, signer_thumbprint: str) -> dict:
+    state = smoke.get("authenticode")
+    claimed = AUTHENTICODE_SMOKE_CHECKS & set(checks)
+    if not signer_thumbprint:
+        if state != {"status": "unsigned"} or claimed:
+            raise ValueError(
+                "Windows signing is not configured, but the windows-x64 receipt "
+                "does not record an unsigned archive"
+            )
+        return state
+    expected = signer_thumbprint.upper()
+    state = state if isinstance(state, dict) else {}
+    publisher = state.get("publisher")
+    if (
+        state.get("status") != "signed"
+        or state.get("signerThumbprint") != expected
+        or not isinstance(publisher, str)
+        or not publisher.strip()
+    ):
+        raise ValueError(
+            f"windows-x64 receipt does not record a signature by the configured certificate {expected}"
+        )
+    missing = AUTHENTICODE_SMOKE_CHECKS - claimed
+    if missing:
+        raise ValueError(f"windows-x64 receipt is missing signing checks: {sorted(missing)}")
+    if state.get("pythonUpstream") != WINDOWS_SIGNING_CATALOG["pythonUpstream"]:
+        raise ValueError("windows-x64 receipt does not name the catalogued upstream Python")
+    return {"status": "signed", "signerThumbprint": expected, "publisher": publisher,
+            "files": _signed_files(state.get("files")), "pythonUpstream": state["pythonUpstream"]}
+
+
+def _notarization_state(smoke: dict, checks: list) -> dict:
+    state = smoke.get("notarization")
+    claimed = NOTARIZATION_SMOKE_CHECKS & set(checks)
+    if state == {"status": "notarized"} and claimed == NOTARIZATION_SMOKE_CHECKS:
+        return state
+    if state == {"status": "not_notarized"} and not claimed:
+        return state
+    raise ValueError(
+        "macos-arm64 receipt does not record a consistent notarization state: a notarized "
+        f"DMG needs the checks {sorted(NOTARIZATION_SMOKE_CHECKS)}, an unnotarized one claims none"
+    )
 
 
 def _proof_files(
@@ -212,6 +394,7 @@ def _proof_files(
     tag: str,
     android_build_result: str,
     android_attestation_result: str,
+    windows_signer_thumbprint: str,
 ) -> tuple[list[dict], dict]:
     archives = {
         path.name: path for path in _release_assets(directory, RELEASE_ASSET_SUFFIXES)
@@ -278,16 +461,21 @@ def _proof_files(
                 or not isinstance(sbom.get("serialNumber"), str)
             ):
                 raise ValueError(f"SBOM is not CycloneDX JSON: {sbom_path}")
-            records.append(
-                {
-                    "proofId": proof_id,
-                    "name": artifact.name,
-                    "size": artifact.stat().st_size,
-                    "sha256": digest,
-                    "smokeReceipt": smoke_path.name,
-                    "sbom": sbom_path.name,
-                }
-            )
+            record = {
+                "proofId": proof_id,
+                "name": artifact.name,
+                "size": artifact.stat().st_size,
+                "sha256": digest,
+                "smokeReceipt": smoke_path.name,
+                "sbom": sbom_path.name,
+            }
+            if proof_id == AUTHENTICODE_PROOF_ID:
+                record["authenticode"] = _authenticode_state(
+                    smoke, checks, windows_signer_thumbprint
+                )
+            if proof_id == NOTARIZATION_PROOF_ID:
+                record["notarization"] = _notarization_state(smoke, checks)
+            records.append(record)
         except (OSError, ValueError) as exc:
             if proof_id not in ANDROID_DOWNLOAD_IDS:
                 raise
@@ -310,6 +498,24 @@ def _checksum_targets(directory: Path, records: Iterable[dict]) -> list[Path]:
     return sorted(paths, key=lambda path: path.name)
 
 
+def _verdict_lines(verdict: dict[str, list[dict]], repository: str) -> list[str]:
+    """Release-note lines for the run's FLAKY and ACCEPTED tests (none: no lines)."""
+    lines = []
+    flaky, accepted = verdict["flaky"], verdict["accepted"]
+    if accepted:
+        lines.extend(["", "Known failures the project owner accepted as not product bugs "
+                      "(each issue stays open until it is fixed):"])
+        lines.extend(f"- `{row['nodeid']}` — [#{row.get('issue')}](https://github.com/{repository}/issues/{row.get('issue')})"
+                     for row in accepted)
+    if flaky:
+        lines.extend(["", f"{len(flaky)} test(s) failed once and passed on their retry in the same job (flaky):"])
+        lines.extend(f"- `{row['nodeid']}`" + (f" ({row['label']})" if row.get("label") else "")
+                     for row in flaky[:NOTES_FLAKY_SHOWN])
+        if len(flaky) > NOTES_FLAKY_SHOWN:
+            lines.append(f"- … and {len(flaky) - NOTES_FLAKY_SHOWN} more, listed in `release-evidence.json`.")
+    return lines
+
+
 def _release_notes(
     *,
     version: str,
@@ -321,6 +527,7 @@ def _release_notes(
     records: Iterable[dict],
     android: dict,
     run_url: str,
+    verdict: dict[str, list[dict]],
 ) -> str:
     short_commit = commit[:12]
     verify_base = (
@@ -359,6 +566,40 @@ def _release_notes(
             repository=repository,
         )
         lines.append(f"- **{label}:** [{name}]({url})")
+    authenticode = records_by_id[AUTHENTICODE_PROOF_ID]["authenticode"]
+    if authenticode["status"] == "signed":
+        python = authenticode["pythonUpstream"]
+        lines.extend([
+            "",
+            "Windows: `Ouroboros.exe` and the bundled interpreter's `python.exe` and `pythonw.exe` "
+            f"(CPython {python['pythonVersion']} from python-build-standalone {python['release']}) "
+            "carry timestamped Authenticode signatures "
+            f"from **{authenticode['publisher']}** (certificate SHA-1 "
+            f"`{authenticode['signerThumbprint']}`); `release-evidence.json` lists each file's "
+            "SHA-256 before and after signing. This release signs no other file in the ZIP, "
+            "no Python environment later created from that interpreter and no code that later "
+            "Git updates bring, and SmartScreen or antivirus may still warn while the "
+            "publisher's reputation builds.",
+        ])
+    else:
+        lines.extend([
+            "",
+            "Windows: this ZIP is unsigned. The release was built without a configured "
+            "code-signing certificate, so Windows reports an unknown publisher; check the "
+            "download against `SHA256SUMS` and its attestations below.",
+        ])
+    if records_by_id[NOTARIZATION_PROOF_ID]["notarization"]["status"] == "notarized":
+        lines.extend([
+            "",
+            "macOS: Apple notarized both the app and the DMG, each carries its stapled "
+            "ticket, and Gatekeeper accepted the app copied out of the DMG before publication.",
+        ])
+    else:
+        lines.extend([
+            "",
+            "macOS: this DMG is not notarized by Apple, so on macOS 15 and later open the "
+            "app once, then choose Open Anyway in System Settings → Privacy & Security.",
+        ])
     if android["status"] != "verified":
         lines.extend([
             "",
@@ -382,11 +623,15 @@ def _release_notes(
         "",
         "## Release proof",
         "",
-        f"This release was built from [`{short_commit}`](https://github.com/{repository}/commit/{commit}).",
-        "The release workflow passed the full test matrix, UI and Docker smoke tests, skill smoke tests, and packaged artifact smoke tests before publication.",
+        f"This release was built from [`{short_commit}`](https://github.com/{repository}/commit/{commit}) "
+        f"by [this workflow run]({run_url}).",
+        "The release workflow passed the full test matrix, required provider integration, "
+        "system E2E, UI and Docker smoke tests, skill smoke tests, and packaged artifact "
+        "smoke tests before publication.",
+        *_verdict_lines(verdict, repository),
         "",
         "- `SHA256SUMS` covers every installable platform artifact, its SBOM, and its smoke receipt.",
-        "- `release-evidence.json` binds the tag, commit, workflow run, artifact hashes, SBOMs, and smoke receipts.",
+        "- `release-evidence.json` binds the tag, commit, workflow run, each release job's actual conclusion, artifact hashes, SBOMs, and smoke receipts.",
         "- Each installable platform artifact has GitHub build provenance and a CycloneDX SBOM attestation.",
         f"- Verify build provenance with `{verify_base}`.",
         f"- Verify the CycloneDX attestation with `{verify_base} --predicate-type https://cyclonedx.org/bom`.",
@@ -409,6 +654,13 @@ def command_assemble(args: argparse.Namespace) -> None:
     release_date, description = _read_release_description(args.readme, version)
     if not re.fullmatch(r"[0-9a-f]{40}", args.commit):
         raise ValueError("commit must be a full lowercase Git SHA")
+    # Set but malformed is a broken configuration, never an unsigned release.
+    if args.windows_signer_thumbprint and not re.fullmatch(
+        r"[0-9A-Fa-f]{40}", args.windows_signer_thumbprint
+    ):
+        raise ValueError("ESIGNER_CERT_SHA1 is set but is not a 40-hex SHA-1 thumbprint")
+    gates = _gate_results(args.gate_result)
+    verdict = _test_verdict(args.test_verdict)
     records, android = _proof_files(
         args.directory,
         version,
@@ -416,6 +668,7 @@ def command_assemble(args: argparse.Namespace) -> None:
         tag=args.tag,
         android_build_result=args.android_build_result,
         android_attestation_result=args.android_attestation_result,
+        windows_signer_thumbprint=args.windows_signer_thumbprint,
     )
     checksum_targets = _checksum_targets(args.directory, records)
     checksums = "".join(
@@ -425,7 +678,8 @@ def command_assemble(args: argparse.Namespace) -> None:
 
     generated_at = args.generated_at or dt.datetime.now(dt.timezone.utc).isoformat()
     evidence = {
-        "schemaVersion": 1,
+        # 3: gates carry actual job conclusions; the run's FLAKY and ACCEPTED tests are recorded.
+        "schemaVersion": 3,
         "kind": "build_time_release_proof",
         "product": "Ouroboros",
         "version": version,
@@ -437,8 +691,13 @@ def command_assemble(args: argparse.Namespace) -> None:
         },
         "workflow": {
             "runUrl": args.run_url,
-            "gates": [{"name": name, "status": args.android_build_result
-                       if name == "android-build" else "passed"} for name in RELEASE_GATES],
+            "gates": [
+                *({"name": name, "status": status} for name, status in gates.items()),
+                # Verified above from every selected asset's bound receipt.
+                {"name": "packaged-artifact-smoke", "status": "passed"},
+                {"name": "android-build", "status": args.android_build_result},
+            ],
+            "testVerdict": verdict,
         },
         "experimentalAndroid": android,
         "generatedAt": generated_at,
@@ -472,6 +731,7 @@ def command_assemble(args: argparse.Namespace) -> None:
             records=records,
             android=android,
             run_url=args.run_url,
+            verdict=verdict,
         ),
         encoding="utf-8",
     )
@@ -520,6 +780,7 @@ def build_parser() -> argparse.ArgumentParser:
     locate = commands.add_parser("locate", help="locate and hash one built archive")
     locate.add_argument("--directory", type=Path, default=Path("dist"))
     locate.add_argument("--github-output", type=Path)
+    locate.add_argument("--expect-sha256", help="fail unless the archive has this digest")
     locate.set_defaults(func=command_locate)
 
     smoke = commands.add_parser("record-smoke", help="write a passed smoke receipt")
@@ -529,6 +790,11 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--commit", required=True)
     smoke.add_argument("--tag", required=True)
     smoke.add_argument("--check", action="append", default=[])
+    smoke.add_argument("--authenticode-thumbprint", default="")
+    smoke.add_argument("--authenticode-publisher", default="")
+    # The windows-sign job's signed_files output: JSON rows of path, unsignedSha256, sha256.
+    smoke.add_argument("--authenticode-files", default="")
+    smoke.add_argument("--macos-notarization", choices=("notarized", "not_notarized"))
     smoke.set_defaults(func=command_record_smoke)
 
     assemble = commands.add_parser("assemble", help="assemble the release proof capsule")
@@ -544,6 +810,12 @@ def build_parser() -> argparse.ArgumentParser:
     assemble.add_argument("--notes-output", type=Path, required=True)
     assemble.add_argument("--android-build-result", choices=("success", "failure", "cancelled", "skipped", "not_run"), default="not_run")
     assemble.add_argument("--android-attestation-result", choices=("success", "failure", "not_run"), default="not_run")
+    # Required, possibly empty: the release states which Windows mode it expects.
+    assemble.add_argument("--windows-signer-thumbprint", required=True)
+    # One per RELEASE_GATES job, its actual result: ``--gate-result full-test=failure``.
+    assemble.add_argument("--gate-result", action="append", default=[], metavar="JOB=RESULT")
+    # The `test-verdict` job's table (tests/ci_evidence.py run-verdict): FLAKY and ACCEPTED rows go to the notes.
+    assemble.add_argument("--test-verdict", type=Path, required=True)
     assemble.add_argument("--github-output", type=Path)
     assemble.set_defaults(func=command_assemble)
 

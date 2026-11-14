@@ -131,6 +131,10 @@ def _next_manifest(
                 checked_rationale = checked_candidate.band_paths.get(path) if checked_candidate is not None else None
                 band_paths[path] = rationales.get(path, checked_rationale)
                 unused.discard(path)
+        # An entry whose module now sits at 1501-1600 lines is kept with its
+        # reason; the validator accepts it there and the module usually returns.
+        for path in sorted(inventory.above_band_paths & set(previous.band_paths)):
+            band_paths[path] = previous.band_paths[path]
         current = SizeRatchetManifest(
             baseline_source_sha=previous.baseline_source_sha,
             giant_paths=inventory.giant_paths,

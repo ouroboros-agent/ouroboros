@@ -2,6 +2,16 @@
 (async () => {
     const root = document.getElementById('root');
     const embedded = document.getElementById('author-kit-source');
+    let themeOff = () => {};
+    const dispose = () => { themeOff(); themeOff = () => {}; };
+    if (typeof window.OuroborosWidget?.onTheme === 'function') {
+        themeOff = window.OuroborosWidget.onTheme((theme) => {
+            document.documentElement.dataset.theme = theme;
+        });
+    }
+    if (typeof window.__ouroWidgetOnDispose === 'function') {
+        window.__ouroWidgetOnDispose(dispose);
+    }
     // Author layout and readable native colors also work before the kit loads.
     const style = document.createElement('style');
     if (root.dataset.styleNonce) style.nonce = root.dataset.styleNonce;

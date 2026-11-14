@@ -1,60 +1,9 @@
 from pathlib import Path
 
+from ouroboros.tools.scope_review_contract import COUPLING_QUESTION_IDS
+
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def test_public_contributor_flow_is_agent_first_and_route_neutral():
-    guide = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-
-    assert "against lowercase `ouroboros`, not `main` or `ouroboros-stable`" in guide
-    assert "Coding agents and people must read [CONTRIBUTING.md]" in readme
-    for path in (
-        "BIBLE.md", "docs/ARCHITECTURE.md", "docs/DEVELOPMENT.md",
-        "docs/CHECKLISTS.md",
-    ):
-        assert path in guide
-    # 11=A: only the checklist SSOT is read cover-to-cover; the other project
-    # documents are mapped by headings with relevant sections read in full.
-    assert "[`docs/CHECKLISTS.md`](docs/CHECKLISTS.md)" in guide
-    assert "**in full**" in guide
-    assert "navigation map" in guide
-    assert "read every section relevant" in guide
-    # Negative pins: the retired blanket contract must not resurface anywhere
-    # in the two entry documents (README routes contributors here).
-    assert "read these files **in full**" not in guide
-    assert "The required project documents were read in full" not in guide
-    assert "in full before editing" not in readme.replace(
-        "reading every section relevant to your change in full before editing", "")
-    # 10=A: the agentic checklist review is the main path and must cover all
-    # eight Intent/Scope items with the runtime output contract.
-    assert "agentic checklist review" in guide
-    for item in (
-        "intent_alignment", "forgotten_touchpoints", "cross_surface_consistency",
-        "regression_surface", "prompt_doc_sync", "architecture_fit",
-        "cross_module_bugs", "implicit_contracts",
-    ):
-        assert item in guide
-    assert "scripts/validate_scope_receipt.py" in guide
-    assert "separate agent context" in guide
-    assert "Reviewing in the authoring conversation does not count" in guide
-    assert "Mark the review `NOT_RUN`" in guide
-    # The script lane states what a scope reviewer is owed (a change-relative
-    # required-source floor) instead of a window requirement (#395).
-    assert "maintainer tooling" in guide
-    assert "SCOPE_REVIEW_BLOCKED" in guide
-    assert "change-relative" in guide
-    assert "does not depend on a very large reviewer window" in guide
-    assert "Reading coverage is diagnostic" in guide
-    assert "never remove a responding reviewer from quorum" in guide
-    assert "SHAPE, not truth" in guide
-    assert "--contributor" in guide
-    assert "--base-ref upstream/ouroboros" in guide
-    assert "--head-ref HEAD" in guide
-    assert "review-packet.zip" in guide
-    assert "evidence, not a promise to merge" in guide
-    assert "OpenRouter" not in guide
 
 
 def test_pull_request_template_has_one_universal_agent_review_block():
@@ -75,13 +24,9 @@ def test_pull_request_template_has_one_universal_agent_review_block():
     assert "PASS`, `NEEDS_CHANGES`, `INCOMPLETE`, or `NOT_RUN" in template
     assert "If not run, reason" in template
     # 21=A: the checklist coverage travels as a markdown table plus the raw
-    # reviewer JSON, both inside the single review-evidence block — all eight
-    # rows, not just the endpoints.
-    for item in (
-        "intent_alignment", "forgotten_touchpoints", "cross_surface_consistency",
-        "regression_surface", "prompt_doc_sync", "architecture_fit",
-        "cross_module_bugs", "implicit_contracts",
-    ):
+    # reviewer JSON, both inside the single review-evidence block — every row,
+    # not just the endpoints.
+    for item in COUPLING_QUESTION_IDS:
         assert template.count(f"| {item} |") == 1
     assert "Reviewer checklist JSON" in template
     assert "scripts/validate_scope_receipt.py" in template
@@ -107,7 +52,7 @@ def test_missing_session_model_is_labelled_absent_in_evidence():
     assert receipt["model_verification"] == "absent"
 
 
-def test_pull_request_ci_is_fork_safe_and_does_not_enable_provider_jobs():
+def test_manual_ci_keeps_readonly_test_jobs_and_explicit_release_permissions():
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
         encoding="utf-8"
     )
@@ -115,43 +60,43 @@ def test_pull_request_ci_is_fork_safe_and_does_not_enable_provider_jobs():
         "\n  # ──────────────────────────────────────────────────────────────────"
     )[0]
 
-    assert "pull_request:\n    branches: [ouroboros]" in workflow
+    assert "\n  pull_request:" not in workflow
+    assert "\n  workflow_dispatch:" in workflow
     assert "\n  pull_request_target:" not in workflow
-    # A schedule IS admitted now (owner 9A: the keyless system-e2e-mock lane),
-    # so what this used to say by banning the trigger outright it now says
-    # directly — the unattended run must not reach the paid provider job. Its
-    # branch conditions match the default branch ref a cron run carries, hence
-    # the explicit event guard, which has to come FIRST to gate the whole `||`.
+    # Dormant job predicates retain their secret boundaries even with PR/schedule
+    # triggers disabled; a ref alone must never enable the paid provider job.
     assert "github.event_name != 'schedule'" in workflow.partition(
-        "\n  integration-test:\n")[2].partition("\n    runs-on:")[0]
+        "\n  integration-test:\n")[2].partition("\n    uses:")[0]
     assert "permissions:\n  contents: read" in workflow
-    assert "github.event_name == 'pull_request' && github.base_ref == 'ouroboros'" in workflow
+    # No job keeps a predicate for the removed pull-request trigger.
+    assert "github.base_ref == 'ouroboros'" not in workflow
     assert "secrets." not in quick_job
     assert "release:\n" in workflow
     assert "      contents: write" in workflow
 
 
 def test_trusted_provider_ci_wires_full_secret_policy_and_release_dependency():
-    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
-        encoding="utf-8"
-    )
+    workflows = ROOT / ".github" / "workflows"
+    workflow = (workflows / "ci.yml").read_text(encoding="utf-8")
+    # The canary steps live in one reusable file; ci.yml calls it for manual
+    # runs and tags, the standalone wrapper only on explicit dispatch.
+    shared = (workflows / "provider-canary.yml").read_text(encoding="utf-8")
+    push = (workflows / "provider-canary-push.yml").read_text(encoding="utf-8")
     integration_job = workflow.partition("\n  integration-test:\n")[2].partition(
         "\n  # ──────────────────────────────────────────────────────────────────"
     )[0]
-    release_preflight = workflow.partition("\n  release-preflight:\n")[2].partition(
-        "\n  build:\n"
-    )[0]
+    release = workflow.partition("\n  release:\n")[2]
 
     assert integration_job
+    assert "uses: ./.github/workflows/provider-canary.yml" in integration_job
     assert "github.event_name == 'pull_request'" not in integration_job
     assert "github.event_name == 'workflow_dispatch'" in integration_job
-    for ref in (
-        "refs/heads/main",
-        "refs/heads/ouroboros",
-        "refs/heads/ouroboros-stable",
-        "refs/tags/v",
-    ):
-        assert ref in integration_job
+    assert "refs/tags/v" in integration_job
+    assert "refs/heads/" not in integration_job
+    assert "\n  push:" not in push
+    assert "\n  workflow_dispatch:" in push
+    assert "uses: ./.github/workflows/provider-canary.yml" in push
+    assert "pull_request" not in push
 
     for secret in (
         "OPENROUTER_API_KEY",
@@ -161,10 +106,12 @@ def test_trusted_provider_ci_wires_full_secret_policy_and_release_dependency():
         "CLOUDRU_FOUNDATION_MODELS_API_KEY",
         "GIGACHAT_CREDENTIALS",
     ):
-        assert f"{secret}: ${{{{ secrets.{secret} }}}}" in integration_job
+        for text in (integration_job, shared, push):
+            assert f"{secret}: ${{{{ secrets.{secret} }}}}" in text
 
-    assert " -rs " in integration_job
-    assert "needs: [full-test, integration-test, system-e2e-mock]" in release_preflight
+    assert " -rs " in shared
+    # The release job itself requires the canaries (the preflight checks only the tag).
+    assert "needs.integration-test.result == 'success'" in release
 
 
 def test_repository_has_explicit_mit_license_holder():

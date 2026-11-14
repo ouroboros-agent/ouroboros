@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { bindTabStrip, renderTabStrip } from '../modules/page_header.js';
-import { bindDialogFocus, bindMenu, bindPopoverPosition } from '../modules/ui_interactions.js';
+import { bindDialogFocus, bindEnterSubmit, bindMenu, bindPopoverPosition } from '../modules/ui_interactions.js';
 
 // Small event/geometry double, following the existing DOM tests. Native Tab
 // traversal, hit testing and the real confirm markup are checked in the browser.
@@ -64,13 +64,20 @@ class Node extends Events {
     append(...nodes) { for (const node of nodes) { node.parent = this; this.children.push(node); } }
     getClientRects() { return this.isConnected && !this.closest('[hidden]') ? [this.rect] : []; }
     getBoundingClientRect() { return this.rect; }
+    // The laid-out size, as a browser reports it without the element's own transform.
+    get offsetWidth() { return this.rect.width ?? 0; }
+    get offsetHeight() { return this.rect.height ?? 0; }
     focus() { if (this.isConnected) this.ownerDocument.activeElement = this; }
 }
 function environment() {
     const doc = new Events();
+    class Observer { observe() {} disconnect() {} }
     doc.defaultView = Object.assign(new Events(), {
         innerWidth: 320, innerHeight: 240,
-        getComputedStyle: (node) => ({ visibility: node.visibility || 'visible' }),
+        ResizeObserver: Observer, MutationObserver: Observer,
+        requestAnimationFrame: () => 1, cancelAnimationFrame() {},
+        getComputedStyle: (node) => ({ visibility: node.visibility || 'visible',
+            scrollPaddingInlineStart: node.scrollPadding || '0px', scrollPaddingInlineEnd: node.scrollPadding || '0px' }),
     });
     doc.body = new Node(doc, 'body');
     doc.activeElement = doc.body;
@@ -122,12 +129,42 @@ test('native activation has one owner; external select is silent and never steal
     assert.equal(controller.select('three'), true);
     assert.equal(doc.activeElement, tabs[0]);
     assert.deepEqual(changed, ['two']);
+    strip.setAttribute('inert', '');
+    assert.equal(controller.select('one'), true, 'programmatic route selection succeeds while drawer closes over inert page');
+    strip.emit('click', { target: tabs[2] });
+    assert.equal(tabs[0].getAttribute('aria-selected'), 'true', 'user clicks on an inert strip are ignored');
+    strip.removeAttribute('inert');
     assert.equal(controller.select('unknown'), false);
     controller.destroy();
     assert.equal(controller.select('one', { focus: true }), false);
     strip.emit('click', { target: tabs[0] });
     assert.equal(strip.listenerCount(), 0);
     assert.deepEqual(changed, ['two']);
+});
+
+test('external tab selection works under a hidden or inert page without activating or focusing it', () => {
+    for (const attribute of ['hidden', 'inert']) {
+        const { doc, node, strip, tabs, changed, controller } = tabFixture();
+        const page = node('main', { [attribute]: '' });
+        page.append(strip);
+        const before = doc.activeElement;
+        assert.equal(controller.select('two'), true);
+        assert.equal(tabs[1].getAttribute('aria-selected'), 'true');
+        assert.equal(doc.activeElement, before);
+        assert.equal(controller.select('three', { focus: true }), false);
+        strip.emit('click', { target: tabs[2] });
+        strip.emit('keydown', { target: tabs[1], key: 'ArrowRight' });
+        assert.deepEqual(changed, []);
+        assert.equal(tabs[1].getAttribute('aria-selected'), 'true');
+        for (const attr of ['hidden', 'inert', 'aria-disabled']) {
+            tabs[2].setAttribute(attr, attr === 'aria-disabled' ? 'true' : '');
+            assert.equal(controller.select('three'), false);
+            tabs[2].removeAttribute(attr);
+        }
+        tabs[2].disabled = true;
+        assert.equal(controller.select('three'), false);
+        controller.destroy();
+    }
 });
 
 test('tab keys skip disabled/hidden choices, ignore nested strips and modifiers', () => {
@@ -191,6 +228,16 @@ test('restored/offscreen tab scrolls only its strip, and hidden-page resize obse
     resize();
     assert.equal(strip.scrollLeft, 150);
     assert.equal(disconnected, true);
+});
+
+test('revealed tabs keep the strip padding clear of the edge fade', () => {
+    const { strip, tabs, controller } = tabFixture();
+    strip.clientWidth = 200; strip.clientLeft = 0; strip.scrollLeft = 0;
+    strip.scrollPadding = '16px'; strip.rect = {left: 20, right: 220};
+    tabs[2].rect = {left: 300, right: 370};
+    controller.select('three');
+    assert.equal(strip.scrollLeft, 166);
+    controller.destroy();
 });
 
 function dialogFixture() {
@@ -264,6 +311,16 @@ test('a removed trigger is never focused on close; nested dialog owns its own ke
     assert.equal(doc.activeElement, input);
 });
 
+test('a returnFocus function is read at close: an opener a repaint replaced is still given focus', () => {
+    const { doc, node, trigger, dialog, input } = dialogFixture();
+    let current = trigger;
+    const dispose = bindDialogFocus(dialog, { initialFocus: input, returnFocus: () => current });
+    trigger.isConnected = false;  // the page under the dialog repainted its rows
+    current = node('button'); doc.body.append(current);
+    dispose();
+    assert.equal(doc.activeElement, current);
+});
+
 function menuFixture() {
     const { doc, node } = environment();
     const anchor = node('button');
@@ -283,6 +340,7 @@ test('menu fits a short/narrow viewport and keyboard wraps over enabled actions'
     assert.equal(menu.css.get('--ui-popup-left'), '142px');
     assert.equal(menu.css.get('--ui-popup-top'), '104px');
     assert.equal(menu.css.get('--ui-popup-max-height'), '196px');
+    assert.equal(menu.css.get('--ui-popup-origin'), '153px 100px', 'opening above its anchor, it grows from the anchor\'s middle at its foot');
     assert.equal(doc.activeElement, options[0]);
     menu.emit('keydown', { target: options[0], key: 'ArrowUp' });
     assert.equal(doc.activeElement, options[2]);
@@ -324,6 +382,10 @@ test('scroll inside the menu stays open; scrolling the page closes without a foc
     doc.defaultView.emit('scroll', { target: menu });
     doc.defaultView.emit('scroll');
     assert.deepEqual(closed, [], 'a queued event without movement does not close a just-opened menu');
+    // A row lifting under its long-press menu grows about its middle: the feed reflowing under it keeps the menu.
+    anchor.rect = { left: 274.5, right: 315.5, top: 207.8, bottom: 238.2, width: 41, height: 30.4 };
+    doc.defaultView.emit('scroll');
+    assert.deepEqual(closed, [], 'a lifted anchor has not moved');
     anchor.rect = { ...anchor.rect, top: anchor.rect.top - 10 };
     doc.defaultView.emit('scroll');
     assert.deepEqual(closed, ['scroll']);
@@ -395,6 +457,7 @@ test('popup uses visual viewport bounds and point coordinates without an input o
     const binding = bindPopoverPosition(popup, { point: { x: 300, y: 230 } });
     assert.equal(popup.css.get('--ui-popup-left'), '152px');
     assert.equal(popup.css.get('--ui-popup-top'), '122px');
+    assert.equal(popup.css.get('--ui-popup-origin'), '120px 80px', 'it grows from the press, clamped to its own box');
     binding.destroy();
     assert.equal(doc.defaultView.listenerCount() + doc.defaultView.visualViewport.listenerCount(), 0);
 });
@@ -412,4 +475,91 @@ test('a resized page cannot make an offscreen input grant more popup height than
         assert.equal(popup.css.get('--ui-popup-top'), '8px');
     }
     binding.destroy();
+});
+
+test('a popup opening above its anchor stays below the screen\'s top inset and scrolls within what is left', () => {
+    // Telegram fullscreen over a short keyboard (this PR): a 250 px visual viewport whose top 93 px are the device's and
+    // Telegram's band (ui.css --ui-popup-inset-top resolves it); "+" stands near the bottom.
+    const { doc, node } = environment();
+    doc.defaultView.visualViewport = Object.assign(new Events(), { offsetLeft: 0, offsetTop: 0, width: 390, height: 250 });
+    const style = doc.defaultView.getComputedStyle;
+    let inset = '93px';
+    doc.defaultView.getComputedStyle = (element) => ({ ...style(element),
+        getPropertyValue: (name) => (name === '--ui-popup-inset-top' ? inset : '') });
+    const plus = node('button');
+    plus.rect = { left: 36, right: 80, top: 204, bottom: 248, width: 44, height: 44 };
+    const menu = node('div', { role: 'menu' });
+    menu.rect = { width: 200, height: 170 };
+    doc.body.append(plus, menu);
+    const binding = bindPopoverPosition(menu, { anchor: plus });
+    assert.equal(menu.css.get('--ui-popup-max-height'), '99px', 'what lies between the band and "+"');
+    menu.rect.height = 99;  // the stylesheet's max-height: it scrolls inside
+    binding.reposition();
+    assert.equal(menu.css.get('--ui-popup-top'), '101px', 'band 93 + margin 8, never inside the band');
+    // No inset (a browser, expanded Telegram): the same place it always had.
+    inset = '0px';
+    menu.rect.height = 170;
+    binding.reposition();
+    assert.equal(menu.css.get('--ui-popup-max-height'), '192px');
+    menu.rect.height = 170;
+    binding.reposition();
+    assert.equal(menu.css.get('--ui-popup-top'), '30px');
+    binding.destroy();
+});
+
+function messageFieldFixture() {
+    const { node } = environment();
+    const field = node('textarea');
+    const send = node('button');
+    let sent = 0;
+    send.click = () => { sent += 1; };
+    const dispose = bindEnterSubmit(field, send);
+    const press = (init = {}) => field.emit('keydown', { key: 'Enter', ...init });
+    return { field, send, dispose, press, sent: () => sent };
+}
+
+test('a message field sends on Enter through its button; Shift+Enter keeps the line break', () => {
+    const { field, press, sent } = messageFieldFixture();
+    assert.equal(field.enterKeyHint, 'send', 'the touch keyboard labels the key Send');
+    assert.equal(press().defaultPrevented, true);
+    assert.equal(sent(), 1);
+    assert.equal(press({ shiftKey: true }).defaultPrevented, undefined, 'the native line break stays');
+    assert.equal(sent(), 1);
+    // The composer's existing chords keep sending.
+    for (const chord of ['ctrlKey', 'metaKey', 'altKey']) press({ [chord]: true });
+    assert.equal(sent(), 4);
+    assert.equal(field.emit('keydown', { key: 'a' }).defaultPrevented, undefined);
+    assert.equal(sent(), 4);
+});
+
+test('composition, a held key and an unavailable field or button send nothing', () => {
+    const { field, send, dispose, press, sent } = messageFieldFixture();
+    // Chromium/Firefox mark the composing keydown; WebKit ends the composition
+    // first and marks the committing Enter only with keyCode 229.
+    assert.equal(press({ isComposing: true }).defaultPrevented, undefined);
+    assert.equal(press({ keyCode: 229 }).defaultPrevented, undefined);
+    assert.equal(press({ repeat: true }).defaultPrevented, true, 'a held key adds no line breaks');
+    assert.equal(press({ defaultPrevented: true, preventDefault() {} }).defaultPrevented, true);
+    assert.equal(sent(), 0);
+    send.disabled = true;
+    assert.equal(press().defaultPrevented, true, 'an empty or pending message is not turned into a line');
+    send.disabled = false;
+    send.isConnected = false;
+    press();
+    send.isConnected = true;
+    assert.equal(sent(), 0);
+    for (const state of ['disabled', 'readOnly', 'isConnected']) {
+        const previous = field[state];
+        field[state] = state === 'isConnected' ? false : true;
+        assert.equal(press().defaultPrevented, undefined, state);
+        field[state] = previous;
+    }
+    assert.equal(sent(), 0);
+    press();
+    assert.equal(sent(), 1);
+    dispose();
+    assert.equal(field.listenerCount(), 0);
+    assert.equal(field.enterKeyHint, undefined);
+    press();
+    assert.equal(sent(), 1);
 });

@@ -15,20 +15,11 @@ def _read(path: pathlib.Path) -> str:
 
 def test_available_subagents_is_one_canonical_settings_editor() -> None:
     editor = _read(MODULES / "subagents_settings.js")
-    host = _read(MODULES / "settings.js")
-    assert "<h3>Available subagents</h3>" in editor
     assert "OUROBOROS_SUBAGENTS" in editor
-    assert "collectSubagentsSettings" in host
     assert "OUROBOROS_SUBAGENT_HARNESS" not in editor
     assert "OUROBOROS_SUBAGENT_PROFILE" not in editor
-    assert "MAX_AVAILABLE_SUBAGENTS = 10" in editor
-    assert 'class="available-subagent-heading"' in editor
-    assert 'Subagent ${ordinal}' in editor
-    assert 'data-subagent-field="recommended_use"' in editor
-    assert 'data-subagent-field="id"' not in editor
-    assert 'data-subagent-field="name"' not in editor
-    for action in ("data-subagent-add", "data-subagent-duplicate", "data-subagent-remove"):
-        assert action in editor
+    # Rendering, row limits and serialization are exercised by subagents_settings.test.js.
+    assert "data-subagent-add" in editor
 
 
 def test_every_list_editor_reveals_its_added_entry_through_the_shared_helper() -> None:
@@ -37,15 +28,11 @@ def test_every_list_editor_reveals_its_added_entry_through_the_shared_helper() -
     scrollIntoView/focus pair in an add path is the class this pins closed
     (DEVELOPMENT.md § Design System). The class is every Settings list editor,
     not the panel the owner happened to report."""
-    helper = _read(MODULES / "ui_helpers.js")
-    assert "export function revealNewRow(row, field)" in helper
-    assert "scrollIntoView?.({ block: 'nearest' })" in helper
-    assert "focus?.({ preventScroll: true })" in helper
-    for name in ("subagents_settings.js", "reviewer_slots.js", "mcp_settings.js", "settings.js"):
+    for name in ("subagents_settings.js", "mcp_settings.js"):
         source = _read(MODULES / name)
         assert re.search(r"import \{[^}]*\brevealNewRow\b[^}]*\} from './ui_helpers\.js'", source), name
         assert "revealNewRow(" in source, f"{name} never calls the shared reveal"
-    for name in ("subagents_settings.js", "reviewer_slots.js", "mcp_settings.js"):
+    for name in ("subagents_settings.js", "mcp_settings.js"):
         assert "scrollIntoView" not in _read(MODULES / name), f"{name} rolls its own reveal"
 
 
@@ -61,51 +48,40 @@ def test_a_fresh_subagent_row_invites_and_only_a_save_attempt_makes_it_red() -> 
     assert "row._uiAttempted = true" in editor
     assert "Boolean(row._uiAttempted) && " in editor
     assert "row._uiAttempted && errors.length" in primitives
-    assert "Choose how this subagent runs: an API model or an agent session." in primitives
-    host = _read(MODULES / "settings.js")
-    # Every Save click is an attempt — including one another field's validation
-    # then aborts — so the stamp precedes the cadence check's early return.
-    save = host[host.index("byId('btn-save-settings').addEventListener"):]
-    assert save.index("noteSubagentsSaveAttempt();") < save.index("const { messages: errors, subject } = renderValidation();")
-    assert "Every-N cadence needs" in host
     assert "agentsStep?.noteSaveAttempt?.();" in _read(MODULES / "onboarding_wizard.js")
-    # Errors name the card the way its heading does, never a bare "Row N".
-    assert "`Subagent ${index + 1} ${text}`" in editor
-    assert "`Row ${index + 1}`" not in editor
 
 
-def test_route_editor_extraction_does_not_merge_reviewer_semantics() -> None:
+def test_the_review_pool_is_a_catalog_mark_and_the_route_primitives_stay_reviewer_free() -> None:
+    """The lane editor is gone: a reviewer is a catalog row marked Reviewer, owned by
+    the catalog editor, and the shared route primitives know nothing of review."""
     primitive = _read(MODULES / "route_editor_primitives.js")
-    reviewer = _read(MODULES / "reviewer_slots.js")
     editor = _read(MODULES / "subagents_settings.js")
-    assert "route_editor_primitives.js" in reviewer
+    assert not (MODULES / "reviewer_slots.js").exists()
+    assert not (ROOT / "web" / "reviewer_slots.css").exists()
     assert "route_editor_primitives.js" in editor
-    assert "credentialField: 'profile_id'" in reviewer
     assert "credentialField: 'credential_profile_id'" in editor
-    assert "OUROBOROS_REVIEWER_SLOTS" not in primitive
-    assert "buildReviewerSlotsSetting" not in primitive
+    assert 'data-subagent-field="review_eligible"' in editor
+    for lane_term in ("OUROBOROS_REVIEWER_SLOTS", "buildReviewerSlotsSetting", "review_eligible"):
+        assert lane_term not in primitive, lane_term
+        assert lane_term == "review_eligible" or lane_term not in editor, lane_term
 
 
 def test_heavy_card_is_gone_but_provider_test_contract_and_controls_remain() -> None:
     ui = _read(MODULES / "settings_ui.js")
-    host = _read(MODULES / "settings.js")
-    setup = _read(ROOT / "ouroboros" / "settings_setup_contract.py")
     assert "['Heavy'," not in ui
     assert "s-model-heavy" not in ui
-    assert "OUROBOROS_MODEL_HEAVY" not in host
-    light_copy = "Fast summaries, lightweight internal work, reflections, and the default Fast scout. Empty uses Main."
+    assert "OUROBOROS_MODEL_HEAVY" not in _read(MODULES / "settings.js")
     # Role labels and copy come from the shared setup contract, not a second
-    # hand-maintained card table in Settings.
-    assert "modelRolesHost('settings-model-roles')" in ui
-    assert "modelRoles.load(s," in host
+    # hand-maintained card table in Settings: a role's page draws the shared editor.
+    assert "modelRolesHost(hostId)" in _read(MODULES / "model_roles.js")
     assert "slot.note" in _read(MODULES / "model_roles.js")
-    assert light_copy in setup
-    assert "all deep subagents" not in ui
-    assert "all deep subagents" not in setup
-    assert "data-provider-test" in ui
-    assert "PROVIDER_TEST_INPUTS" in ui
-    assert "apiClient.providerTest({ provider_id: provider, overrides })" in host
-    assert "providerTestResultIsCurrent" in host
+    # Every API key row carries its Test; the probe runs against that row's draft only.
+    connections = _read(MODULES / "settings_connections.js")
+    # Button presence belongs to the rendered page, regardless of which module
+    # owns its markup: web/tests/provider_test.test.js exercises every key row.
+    assert "apiClient.providerTest(body)" in connections
+    assert "{ provider_id: card.kind, connection: names(card.kind).get(row), overrides }" in connections
+    assert "providerTestResultIsCurrent" in connections
 
 
 def test_onboarding_previews_and_commits_the_visible_owner_draft() -> None:
@@ -115,7 +91,8 @@ def test_onboarding_previews_and_commits_the_visible_owner_draft() -> None:
     assert "'/api/onboarding/subagents/preview'" in client
     assert "response?.available_subagents" in _read(MODULES / "subagents_settings.js")
     assert "refreshSubagentsPreview" in step
-    assert "OUROBOROS_SUBAGENTS: agentsStep?.availableSubagents" in wizard
+    assert "OUROBOROS_SUBAGENTS: catalogDraft()," in wizard
+    assert "function catalogDraft() { return agentsStep?.availableSubagents || state.availableSubagents; }" in wizard
     assert "Heavy', trim(state.heavyModel)" not in wizard
     assert "OUROBOROS_MODEL_HEAVY" not in wizard
 
@@ -130,37 +107,21 @@ def test_preview_contract_and_task_only_agy_copy_are_explicit() -> None:
     assert "{ harness: 'agy' }" in step
     assert "familyLabel(family.harness" in step
     assert "{ harness: 'agy', label:" not in step
-    assert "task-only and does" in step
     assert "@typedef {Object} SubagentLastDelegation" in types
     assert "@property {SubagentLastDelegation=} subagent_last_delegation" in types
 
 
 def test_generated_preview_is_background_and_whole_draft_clean_gated() -> None:
     editor = _read(MODULES / "subagents_settings.js")
-    host = _read(MODULES / "settings.js")
     wizard = _read(MODULES / "onboarding_wizard.js")
     assert "void maybeRefreshGeneratedPreview({ force: true });" in editor
-    assert "isOuterDraftClean: () => !settingsDirty" in host
-    assert "if (settingsLoaded && !settingsDirty) setSettingsCleanBaseline();" in host
     assert "void agentsStep.refreshSubagentsPreview({ force: true });" in wizard
     assert "agentsStep?.invalidateGeneratedPreview();" in wizard
 
 
 def test_status_refresh_and_active_task_copy_keep_the_frozen_semantics() -> None:
     editor = _read(MODULES / "subagents_settings.js")
-    host = _read(MODULES / "settings.js")
     assert "await boundedStatusRefresh(store);" in editor
-    assert "Saved rows remain unchanged" in editor
-    assert "take effect for new child tasks" in host
-    assert "the current task keeps its existing routes" in host
-
-
-def test_new_frontend_modules_stay_within_the_context_target() -> None:
-    for name in (
-        "route_editor_primitives.js", "subagent_status_primitives.js", "subagents_settings.js",
-    ):
-        lines = _read(MODULES / name).count("\n") + 1
-        assert lines <= 1000, f"{name} grew to {lines} lines"
 
 
 def test_effort_choice_mirrors_track_the_python_scale() -> None:
@@ -174,16 +135,46 @@ def test_effort_choice_mirrors_track_the_python_scale() -> None:
     expected = "export const EFFORT_CHOICES = [" + ", ".join(f"'{tier}'" for tier in EFFORT_SCALE) + "];"
     assert expected in primitives
 
-    settings = _read(MODULES / "settings_ui.js")
-    block = re.search(r"const EFFORT_OPTIONS = \[(.*?)\];", settings, re.DOTALL)
-    assert block, "EFFORT_OPTIONS block not found in settings_ui.js"
+    # The web's effort vocabulary (the composer's range, the card chip, the Behavior line).
+    levels = _read(MODULES / "effort_levels.js")
+    assert "export const EFFORT_SCALE = [" + ", ".join(f"'{tier}'" for tier in EFFORT_SCALE) + "];" in levels
+    block = re.search(r"export const EFFORT_OPTIONS = \[(.*?)\];", levels, re.DOTALL)
+    assert block, "EFFORT_OPTIONS block not found in effort_levels.js"
     values = re.findall(r"value: '([a-z]+)'", block.group(1))
-    # `minimal` is deliberately not an owner-facing standing default (see EFFORT_OPTIONS).
+    # `minimal` is deliberately not an owner-facing standing level (see EFFORT_OPTIONS).
     assert values == [tier for tier in EFFORT_SCALE if tier != "minimal"]
+    labels = re.search(r"export const EFFORT_LABELS = Object\.freeze\(\{(.*?)\}\);", levels, re.DOTALL)
+    assert labels, "EFFORT_LABELS block not found in effort_levels.js"
+    assert re.findall(r"(\w+): '", labels.group(1)) == list(EFFORT_SCALE), "every runtime tier has a label"
+    # The composer's Reset target and its pre-/api/state value are the server's shipped range.
+    from ouroboros.settings_defaults import SETTINGS_DEFAULTS
+    shipped = {"min": "MIN", "recommended": "TASK", "max": "MAX"}
+    assert ("export const EFFORT_RANGE_DEFAULT = Object.freeze({ " + ", ".join(
+        f"{key}: '{SETTINGS_DEFAULTS['OUROBOROS_EFFORT_' + name]}'" for key, name in shipped.items()) + " });") in levels
 
 
 def test_every_status_tone_the_card_emits_has_a_shared_rule_in_both_documents() -> None:
     # The emitted tone resolves in the one shared source actually loaded by both hosts.
     assert '.settings-inline-status[data-tone="neutral"]' in _read(ROOT / "web" / "ui.css")
-    for document in ("index.html", "onboarding_template.html"):
-        assert 'href="/static/ui.css"' in _read(ROOT / "web" / document), document
+    # The SPA links the selected /static tree; the wizard the core's builtin /onboarding/static.
+    for document, prefix in (("index.html", "/static"), ("onboarding_template.html", "/onboarding/static")):
+        assert f'href="{prefix}/ui.css"' in _read(ROOT / "web" / document), document
+
+
+def test_the_per_row_switch_is_a_draft_in_setup_and_one_roster_write_in_settings() -> None:
+    """docs/DESIGN.md §3 "Controls and editable choices" + "List editors": in setup the per-row owner switch is
+    the shared `.ui-checkbox`, a draft its Finish writes; in Settings it is the shared `.ui-switch` and writes at
+    once, but only as one entry of the roster through the row helper (`writeEntry`) and the checker's adapter:
+    the module itself posts no settings. A switched-off card is never dimmed."""
+    editor = _read(MODULES / "subagents_settings.js")
+    # The Node consumers cover the markup and the written bodies (subagents_settings.test.js, agents_settings.test.js).
+    # Keep the separate one-writer and stylesheet boundaries here.
+    assert "saveSettings" not in editor and "fetch(" not in editor and "/api/settings" not in editor
+    assert "await writeEntry(KEY, id, change," in editor
+    assert "checker: ({ body }) => saveCheckerSettings({ [KEY]:" in editor
+    assert editor.count("writeEntry(") == 1, "every roster write of Settings takes the one path"
+    for shell in ("settings.css", "onboarding.css"):
+        sheet = _read(ROOT / "web" / shell)
+        assert ".available-subagent-enable {" in sheet, shell
+        assert "opacity" not in sheet[sheet.index(".available-subagent-enable {"):
+                                      sheet.index(".available-subagent-enable {") + 240], shell

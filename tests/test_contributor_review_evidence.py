@@ -1,9 +1,42 @@
 """Receipt-honesty regressions for the contributor review lane."""
 
 import hashlib
+import pathlib
 
 
-def test_receipt_mismatch_preserves_the_original_block_cause():
+def test_packet_path_fields_are_posix_under_their_placeholders_on_every_os(monkeypatch):
+    """A Windows run writes the packet a POSIX run writes: a path field under a
+    replaced root reads ``$REVIEW_DRIVE/observability/...``, while free text keeps
+    its own characters (a transcript's ``\\d`` is not a separator)."""
+    from scripts import contributor_review_evidence as evidence
+
+    win = pathlib.PureWindowsPath
+    drive, repo, home = win("D:/a/_temp/drive"), win("D:/a/ouroboros"), win("C:/Users/runneradmin")
+    replacements = sorted([(str(drive), "$REVIEW_DRIVE"), (str(repo), "$REPO"), (str(home), "$HOME")],
+                          key=lambda item: len(item[0]), reverse=True)
+    monkeypatch.setattr(evidence, "_NATIVE_SEPARATORS", ("\\", "/"), raising=False)
+    packet = evidence.public_projection({
+        "prompt_ref": {"manifest_ref": {"path": str(drive / "observability" / "calls" / "review" / "t1_prompt.json")}},
+        "review_record": {"path": str(drive / "state" / "r1.json"), "subject": {"root": str(repo)}},
+        "review_data_root": str(drive),
+        "transcript": f"read {repo / 'README.md'}\nmatch \\d+ then {drive}",
+    }, replacements=replacements)
+    assert packet == {
+        "prompt_ref": {"manifest_ref": {"path": "$REVIEW_DRIVE/observability/calls/review/t1_prompt.json"}},
+        "review_record": {"path": "$REVIEW_DRIVE/state/r1.json", "subject": {"root": "$REPO"}},
+        "review_data_root": "$REVIEW_DRIVE",
+        "transcript": "read $REPO\\README.md\nmatch \\d+ then $REVIEW_DRIVE",
+    }
+
+    monkeypatch.setattr(evidence, "_NATIVE_SEPARATORS", ("/",), raising=False)
+    assert evidence.public_projection(
+        {"path": "/tmp/drive/odd\\name.json", "root": "/tmp/drive"},
+        replacements=[("/tmp/drive", "$REVIEW_DRIVE")],
+    ) == {"path": "$REVIEW_DRIVE/odd\\name.json", "root": "$REVIEW_DRIVE"}
+
+
+def test_receipt_mismatch_keeps_the_original_block_cause_as_the_headline():
+    """#1568: a stop leaves seats without receipts; that symptom rides beside the cause."""
     from scripts.contributor_review_evidence import finalize_contributor_outcome
 
     exit_code, outcome = finalize_contributor_outcome(
@@ -17,11 +50,43 @@ def test_receipt_mismatch_preserves_the_original_block_cause():
     )
 
     assert exit_code == 3
-    assert outcome["block_reason"] == "execution_receipt_mismatch"
-    assert outcome["original_block_reason"] == "tests_preflight_blocked"
-    assert outcome["original_message"] == (
-        "Focused preflight failed: test_example.py::test_case"
+    assert outcome["block_reason"] == "tests_preflight_blocked"
+    assert outcome["message"] == (
+        "Focused preflight failed: test_example.py::test_case 1 execution-receipt mismatch(es) "
+        "are recorded beside this result (execution_receipt_mismatches)."
     )
+    assert outcome["execution_receipt_mismatches"] == ["response_receipt_absent:triad:slot_1"]
+    assert "original_block_reason" not in outcome
+
+
+def test_a_genuine_block_beside_receipt_drift_stays_a_reviewer_verdict():
+    from scripts.contributor_review_evidence import EXIT_CLASS, contributor_result, finalize_contributor_outcome
+
+    finding = {"severity": "critical", "item": "cross_module_bugs", "text": "real defect"}
+    exit_code, outcome = finalize_contributor_outcome(
+        outcome={"status": "blocked", "block_reason": "critical_findings",
+                 "message": "Reviewers found a critical defect.", "combined_findings": [finding]},
+        exit_code=1,
+        mismatches=["model_absent:pool:s2", "custody_unproven:pool:s3"],
+    )
+    assert (exit_code, contributor_result(exit_code), EXIT_CLASS[exit_code]) == (1, "BLOCKED", "genuine_review_block")
+    assert outcome["block_reason"] == "critical_findings" and outcome["combined_findings"] == [finding]
+    assert outcome["execution_receipt_mismatches"] == ["model_absent:pool:s2", "custody_unproven:pool:s3"]
+
+
+def test_a_late_result_block_keeps_its_same_commit_instruction():
+    from scripts.contributor_review_evidence import contributor_result, finalize_contributor_outcome
+
+    instruction = ("⚠️ REVIEW_PENDING: physical reviewer work remains in flight. Retry the same commit to "
+                   "reconcile that exact paid wave; no second dispatch is allowed.")
+    exit_code, outcome = finalize_contributor_outcome(
+        outcome={"status": "blocked", "block_reason": "review_late_result_pending", "message": instruction},
+        exit_code=3,
+        mismatches=[f"session_settlement_unproven:pool:s{i}" for i in range(4)],
+    )
+    assert (exit_code, contributor_result(exit_code)) == (3, "INCOMPLETE")
+    assert outcome["block_reason"] == "review_late_result_pending"
+    assert outcome["message"].startswith(instruction) and "4 execution-receipt mismatch(es)" in outcome["message"]
 
 
 def test_shared_project_receipts_bind_final_retirement_after_all_slots_settle(tmp_path):
@@ -30,7 +95,7 @@ def test_shared_project_receipts_bind_final_retirement_after_all_slots_settle(tm
     from scripts.contributor_review_evidence import bind_execution_receipts
 
     config = {
-        "triad_slots": [{
+        "pool_slots": [{
             "slot_id": slot_id,
             "route": {
                 "kind": "agent_session",
@@ -39,7 +104,6 @@ def test_shared_project_receipts_bind_final_retirement_after_all_slots_settle(tm
             },
             "effort": "high",
         } for slot_id in ("slot_1", "slot_2")],
-        "scope_slots": [],
     }
     actors = []
     for index, slot_id in enumerate(("slot_1", "slot_2"), start=1):
@@ -76,7 +140,7 @@ def test_shared_project_receipts_bind_final_retirement_after_all_slots_settle(tm
                 },
             },
         )
-        actors.append(("triad", {
+        actors.append(("pool", {
             "slot_id": slot_id, "status": "responded",
             "prompt_ref": prompt_ref, "response_ref": response_ref,
         }))

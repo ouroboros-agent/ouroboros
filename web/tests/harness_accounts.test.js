@@ -25,6 +25,7 @@ import {
     refreshActionLabel,
     runtimeActionLabel,
     serviceBannerLine,
+    renderAgentsServiceBanner,
     startLogin,
     unreadFacets,
     harnessFamilyMarkup,
@@ -63,6 +64,12 @@ test('account actions stack at the app shell compact breakpoint', () => {
         grid-template-columns: minmax(0, 1fr);
         grid-template-areas: "main" "meta" "actions";`),
     'account actions must drop below status before the persistent sidebar squeezes the row');
+});
+
+test('service Diagnostics shares the touch hit area and token keyboard focus', () => {
+    assert.match(renderAgentsServiceBanner(), /class="settings-disclosure ui-hit-area"/);
+    const css = readFileSync(new URL('../style.css', import.meta.url), 'utf8');
+    assert.match(css, /\.settings-disclosure:focus-visible\s*\{\s*outline: 2px solid var\(--focus-accent-border\);\s*outline-offset: 2px;/);
 });
 
 test('managed runtime keeps one contextual Connect intent across install, repair, and update', () => {
@@ -107,7 +114,9 @@ test('a slow first read says it is checking, and an idle daemon is not dressed a
         { checking: true },
     );
     assert.equal(known.tone, 'ok');
-    assert.ok(known.text.includes('3.3.13'));
+    // The verdict leads; the engine version is the quiet fact beside it.
+    assert.equal(known.text, 'Claudexor ready');
+    assert.equal(known.version, 'engine 3.3.13');
 
     const idle = daemonStatusLine({ daemon: { state: 'stale', runtime: { state: 'ready', version: '3.3.13' } } });
     assert.equal(idle.tone, 'muted', 'a lazy daemon is not a warning');
@@ -159,7 +168,7 @@ test('the login card explains foreground runtime preparation and retries the sam
 // If the upstream shape drifts, regenerate this file from the schema; the JS
 // must consume whatever the schema emits.
 const CREDENTIAL_PROFILES_RESPONSE = JSON.parse(readFileSync(
-    fileURLToPath(new URL('./fixtures/credential_profiles_response.json', import.meta.url)),
+    fileURLToPath(new URL('./fixtures/credential_profiles_response_unified.json', import.meta.url)),
     'utf-8',
 ));
 
@@ -173,7 +182,7 @@ test('both verification statuses are honest: vendor is trusted, local is neutral
         verification: 'passed', verification_source: 'vendor', last_verified_at: '2099-08-03T10:00:00Z',
     } });
     assert.equal(vendor.tone, 'ok');
-    assert.equal(vendor.label, 'Verified live');
+    assert.equal(vendor.label, 'Login verified');
     // The raw ISO instant left the badge entirely (owner: a row must never lead
     // with a timestamp); accountMetaLine humanizes it on line 2 instead.
     assert.doesNotMatch(vendor.label, /\d{4}-\d{2}-\d{2}/);
@@ -315,25 +324,26 @@ test('typed quota gaps are exact-subject, neutral, and distinct in words', () =>
     ] }).tone, 'muted');
 
     assert.deepEqual(quotaSummary([], 'claude', 'claude-default', {
-        fallbackSubjectIds: [''],
         absences: [{
             subject: { harness: 'claude', subject_id: '' }, reason: 'auth_revoked',
         }],
     }), { label: 'Usage unavailable', exhausted: false, resetsAt: '', tone: 'muted' },
-    'a legacy snapshot alias must never borrow another subject\'s auth absence');
+    'an unprofiled subject\'s auth absence is never `<harness>-default`\'s');
 
-    const exactGapOverAlias = quotaSummary([{
+    const exactGapBesideUnprofiled = quotaSummary([{
         subject: { harness: 'claude', subject_id: '' }, freshness: 'fresh',
         constraints: [{ used_ratio: 0.5 }],
+    }, {
+        subject: { harness: 'claude', subject_id: 'claude-default' }, freshness: 'fresh',
+        constraints: [{ used_ratio: 0.25 }],
     }], 'claude', 'claude-default', {
-        fallbackSubjectIds: [''],
         absences: [{
             subject: { harness: 'claude', subject_id: 'claude-default' },
             reason: 'auth_revoked',
         }],
     });
-    assert.equal(exactGapOverAlias.label, '50% used · Usage unavailable · sign-in revoked');
-    assert.equal(exactGapOverAlias.tone, 'muted',
+    assert.equal(exactGapBesideUnprofiled.label, '25% used · Usage unavailable · sign-in revoked');
+    assert.equal(exactGapBesideUnprofiled.tone, 'muted',
         'the exact auth verdict remains explicit in words without a second warning state');
 
     assert.equal(quotaSummary([], 'claude', 'proton4', { absences: [{
@@ -448,7 +458,7 @@ test('the groups rebuild wraps in preserveCardFocus so a family-mounted login ca
     const source = readFileSync(new URL('../modules/harness_accounts.js', import.meta.url), 'utf8');
     const wrap = source.indexOf('preserveCardFocus(host, () => {');
     assert.ok(wrap >= 0, 'renderRows must wrap its rebuild in preserveCardFocus');
-    const rebuild = source.indexOf('host.innerHTML = accountGroups(');
+    const rebuild = source.indexOf('host.innerHTML =', wrap);
     const repaint = source.indexOf('state.loginCard?.render();');
     const close = source.indexOf('\n    });', wrap);
     assert.ok(wrap < rebuild && rebuild < repaint && repaint < close,
@@ -582,17 +592,17 @@ test('the POLLED snapshot ENVELOPE is read, so the login poll can actually termi
     assert.equal(jobStateSummary({ job: envelope }).terminal, false);
 });
 
-test('account rows consume the REAL schema shape: array of {profile,status,identity} wrappers + harnessAccounts array', () => {
+test('account rows consume the REAL schema shape: array of {profile,status,identity} wrappers', () => {
     // The status endpoint nests the daemon body under payload.profiles.
     const rows = accountRows({ profiles: CREDENTIAL_PROFILES_RESPONSE });
-    assert.equal(rows.length, 2);  // one native pseudo-row + one registered profile
+    assert.equal(rows.length, 2);  // the migrated default login + one registered profile
 
-    const native = rows.find((row) => row.kind === 'native');
-    assert.equal(native.harness, 'codex');  // read from harness_id (snake_case), not harnessId
-    // A native login detected locally is still only local_store evidence.
-    assert.equal(verificationBadge(native).label, 'Signed in — not verified live');
+    const migrated = rows.find((row) => row.profile_id === 'codex-default');
+    assert.equal(migrated.harness, 'codex');  // read from harness_id (snake_case), not harnessId
+    // A login detected locally is still only local_store evidence.
+    assert.equal(verificationBadge(migrated).label, 'Signed in — not verified live');
 
-    const profile = rows.find((row) => row.kind === 'profile');
+    const profile = rows.find((row) => row.profile_id === 'koshak');
     // Read from the NESTED wrapper.profile.* snake_case fields, not a flat map.
     assert.equal(profile.harness, 'codex');
     assert.equal(profile.profile_id, 'koshak');
@@ -600,7 +610,7 @@ test('account rows consume the REAL schema shape: array of {profile,status,ident
     assert.equal(profile.identity.email, 'koshak@example.com');
     // The vendor-verified status flows straight through from wrapper.status.
     assert.equal(verificationBadge(profile).tone, 'ok');
-    assert.equal(verificationBadge(profile).label, 'Verified live');
+    assert.equal(verificationBadge(profile).label, 'Login verified');
 });
 
 test('the invented flat camelCase shape yields NOTHING (guards against the regression)', () => {
@@ -626,19 +636,14 @@ test('DTO end-to-end: EMPTY and MULTI-ACCOUNT schema-parsed bodies', () => {
         'utf-8',
     ));
     const rows = accountRows({ profiles: MULTI });
-    // 2 native pseudo-rows + 3 profiles, per harness.
-    assert.equal(rows.length, 5);
-    assert.deepEqual(rows.filter((r) => r.kind === 'profile').map((r) => `${r.harness}:${r.profile_id}`),
-        ['codex:koshak', 'codex:backup', 'claude:main']);
+    // The 3 named profiles; its 2 pre-unified native rows are never projected (#244).
+    assert.deepEqual(rows.map((r) => `${r.kind}:${r.harness}:${r.profile_id}`),
+        ['profile:codex:koshak', 'profile:codex:backup', 'profile:claude:main']);
     // Mixed verification renders each truth on its own row.
-    const byId = Object.fromEntries(rows.filter((r) => r.kind === 'profile')
-        .map((r) => [r.profile_id, verificationBadge(r)]));
+    const byId = Object.fromEntries(rows.map((r) => [r.profile_id, verificationBadge(r)]));
     assert.equal(byId.koshak.tone, 'ok');                       // vendor-verified
     assert.equal(byId.backup.label, 'Signed in — not verified live');
     assert.equal(byId.main.tone, 'error');                      // vendor said failed
-    // A claude native row with no login shows "not logged in", not a lie.
-    const claudeNative = rows.find((r) => r.kind === 'native' && r.harness === 'claude');
-    assert.equal(verificationBadge(claudeNative).label, 'Not signed in');
 });
 
 test('the attach command is DEMOTED: never a card face, only a due fallback', () => {
@@ -723,20 +728,21 @@ test('the live state line renders plain words and NOTHING on a terminal job', ()
 
 test('accountLoginConfirmed reads the exact harness+profile row from live status', () => {
     const payload = { profiles: {
-        harnessAccounts: [
-            { harness_id: 'codex', native_login_detected: true, identity: {} },
-            { harness_id: 'claude', native_login_detected: false, identity: {} },
-        ],
+        harnessAccounts: [{ harness_id: 'claude', native_login_detected: true, identity: {} }],
         profiles: [
+            { profile: { harness_id: 'codex', profile_id: 'codex-default' },
+              status: { verification: 'passed', verification_source: 'local_store' }, identity: {} },
             { profile: { harness_id: 'codex', profile_id: 'koshak' },
               status: { verification: 'passed', verification_source: 'vendor' }, identity: {} },
         ],
     } };
-    // The default account (empty profile id) is confirmed by the daemon's own
-    // local-store detection — the same evidence the row badge renders.
-    assert.equal(accountLoginConfirmed(payload, 'codex', ''), true);
+    // A migrated default login is its own named row, confirmed by the daemon's
+    // local-store verdict — the same evidence the row badge renders.
+    assert.equal(accountLoginConfirmed(payload, 'codex', 'codex-default'), true);
+    // No empty-id row exists, whatever an old client's carrier says.
+    assert.equal(accountLoginConfirmed(payload, 'codex', ''), false);
     assert.equal(accountLoginConfirmed(payload, 'claude', ''), false);
-    // A named profile is judged by ITS row, never the native pseudo-row.
+    // A named profile is judged by ITS row, never a sibling.
     assert.equal(accountLoginConfirmed(payload, 'codex', 'koshak'), true);
     assert.equal(accountLoginConfirmed(payload, 'codex', 'other'), false);
     assert.equal(accountLoginConfirmed({}, 'codex', ''), false);
@@ -814,11 +820,13 @@ test('a 409 repeat is typed too: the server is authoritative over the double-sub
 test('confirmLoginLive re-polls live account status briefly instead of trusting one stale read', async () => {
     // First poll: the account still looks logged out (the stale window).
     // Second poll: the login shows up — confirmed, loop ends early.
-    const cold = { profiles: { harnessAccounts: [{ harness_id: 'codex', native_login_detected: false }], profiles: [] } };
-    const warm = { profiles: { harnessAccounts: [{ harness_id: 'codex', native_login_detected: true }], profiles: [] } };
+    const row = (verification) => ({ profiles: { profiles: [{ profile: { harness_id: 'codex', profile_id: 'codex-default' },
+        status: { verification } }] } });
+    const cold = row('not_run');
+    const warm = row('passed');
     let polls = 0;
     const slept = [];
-    const confirmed = await confirmLoginLive('codex', '', {
+    const confirmed = await confirmLoginLive('codex', 'codex-default', {
         readStatus: async () => (++polls >= 2 ? warm : cold),
         attempts: 4, delayMs: 7, sleepImpl: async (ms) => { slept.push(ms); },
     });
@@ -830,7 +838,7 @@ test('confirmLoginLive re-polls live account status briefly instead of trusting 
     // Still cold after every attempt: unconfirmed, with the last payload so
     // the caller can render the rows it actually saw.
     let coldPolls = 0;
-    const unconfirmed = await confirmLoginLive('codex', '', {
+    const unconfirmed = await confirmLoginLive('codex', 'codex-default', {
         readStatus: async () => { coldPolls += 1; return cold; },
         attempts: 3, delayMs: 1, sleepImpl: async () => {},
     });
@@ -839,7 +847,7 @@ test('confirmLoginLive re-polls live account status briefly instead of trusting 
     assert.deepEqual(unconfirmed.payload, cold);
 
     // A card closed mid-check aborts without a verdict.
-    const stale = await confirmLoginLive('codex', '', {
+    const stale = await confirmLoginLive('codex', 'codex-default', {
         readStatus: async () => cold,
         attempts: 3, delayMs: 1, sleepImpl: async () => {}, isStale: () => true,
     });
@@ -917,7 +925,7 @@ test('a settled verdict silences the live status line, so the card never says bo
     const settled = { ...pending, verdict: { kind: 'success', reason: '' } };
     const html = loginCardHtml(settled, 0);
     assert.ok(!html.includes('data-login-state'));
-    assert.ok(html.includes('Connected.'));
+    assert.ok(html.includes('Signed in.'));
     // Same while the live re-check is deciding.
     assert.ok(!loginCardHtml({ ...pending, confirming: true }, 0).includes('data-login-state'));
 });
@@ -962,7 +970,7 @@ test("a settled non-success verdict carries the engine's own explanation", () =>
     assert.ok(loginCardHtml({ ...nested, verdict: { kind: 'failure', reason: 'launch_failed' } }, 0)
         .includes('data-login-detail'));
 
-    // Never beside "Connected." (a stale message must not contradict success),
+    // Never beside "Signed in." (a stale message must not contradict success),
     // and never while the job is unsettled (the status line owns the card).
     assert.ok(!loginCardHtml({ ...nested, verdict: { kind: 'success', reason: '' } }, 0)
         .includes('data-login-detail'));
@@ -1078,8 +1086,9 @@ test('the verify-race incident, composed end to end: recheck runs out and the ca
     assert.equal(verdict.reason, 'auth_not_ready');
 
     // 2. The bounded live re-check never sees the row appear.
-    const cold = { profiles: { harnessAccounts: [{ harness_id: 'codex', native_login_detected: false }], profiles: [] } };
-    const check = await confirmLoginLive('codex', '', {
+    const cold = { profiles: { profiles: [{ profile: { harness_id: 'codex', profile_id: 'codex-default' },
+        status: { verification: 'not_run' } }] } };
+    const check = await confirmLoginLive('codex', 'codex-default', {
         fetchImpl: async () => fakeResponse(200, cold),
         attempts: 2, delayMs: 1, sleepImpl: async () => {},
     });
@@ -1250,7 +1259,7 @@ test('a harness with no row only says "no account connected" once the store was 
     // NOT READ says nobody asked. It may not name a CAUSE the row cannot
     // see: a runtime awaiting repair and a foreign daemon on the stale port
     // arrive here as the same unread facet, and the tab's banner owns the why.
-    assert.match(bareRowStatusText('not_read'), /daemon was never asked/);
+    assert.equal(bareRowStatusText('not_read'), 'Not checked yet', 'only that it has not happened yet');
     assert.doesNotMatch(bareRowStatusText('not_read'), /is not running/);
     assert.match(bareRowStatusText('failed'), /did not answer/);
     assert.match(bareRowStatusText('transport'), /request did not complete/);
@@ -1334,7 +1343,7 @@ function storeWithReads(reads, extra = {}) {
                 daemon: { state: 'running', engine_version: '3.3.13', runtime: {} },
                 config_dir: '/home/agent',
                 harnesses: [{ id: 'codex' }],
-                profiles: { harnessAccounts: [{ harness_id: 'codex', native_login_detected: true }], profiles: [] },
+                profiles: { profiles: [], harnessAccounts: [], accountPools: [] },
                 quota: [],
                 reads,
                 ...extra,
@@ -1408,11 +1417,12 @@ test('the ONE banner names the SECOND gap, instead of dropping it silently', asy
 });
 
 test("the LEGACY wire's global refusal blames no facet and quotes no facet's error", async () => {
-    // Today's producer: no `reads` stamp, one global `unreachable`, and the
+    // An older producer: no `reads` stamp, one global `unreachable`, and the
     // successful catalog + account data sitting in the very same payload. The
     // round-one fix turned that into three per-facet failures and hung the
     // QUOTA probe's error off the ACCOUNTS sentence — an accusation aimed at a
-    // read that had succeeded. (Golden payload: fixtures/status_quota_refused.)
+    // read that had succeeded. (Today's producer stamps every facet instead:
+    // fixtures/status_quota_refused.)
     const legacy = createClaudexorStatusStore({
         fetchImpl: async () => ({
             ok: true,
@@ -1424,7 +1434,7 @@ test("the LEGACY wire's global refusal blames no facet and quotes no facet's err
                 },
                 config_dir: '/home/agent',
                 harnesses: [{ id: 'claude' }],
-                profiles: { harnessAccounts: [{ harness_id: 'claude', native_login_detected: true }], profiles: [] },
+                profiles: { profiles: [], harnessAccounts: [], accountPools: [] },
                 quota: [],
             }),
         }),
@@ -1445,11 +1455,11 @@ test("the LEGACY wire's global refusal blames no facet and quotes no facet's err
 
 test('each row projection is gated by ITS OWN facet, and a stale value says it is last known', () => {
     const row = {
-        harness: 'codex', profile_id: '', kind: 'native', identity: {},
+        harness: 'codex', profile_id: 'codex-default', kind: 'profile', identity: {},
         status: { verification: 'passed', verification_source: 'vendor', last_verified_at: '2099-08-09' },
     };
     const payload = { quota: [{
-        subject: { harness: 'codex', subject_id: '' },
+        subject: { harness: 'codex', subject_id: 'codex-default' },
         freshness: 'fresh',
         constraints: [{ used_ratio: 1.0, resets_at: '2099-08-09T12:00:00Z' }],
     }] };
@@ -1458,14 +1468,21 @@ test('each row projection is gated by ITS OWN facet, and a stale value says it i
     // the account and its status, line 2 the humanized metadata (D-10).
     const fresh = accountRowFacts(row, payload, { accountsRead: 'ok', quotaRead: 'ok' });
     assert.equal(fresh.badge.tone, 'ok');
-    assert.equal(fresh.badge.label, 'Verified live');
-    // Honest naming (unified-accounts sprint): the retired "Default CLI
-    // login" claimed a separate account TYPE; an identity-less legacy
-    // pseudo-row is simply the default account.
-    assert.equal(fresh.name, 'Default account');
+    assert.equal(fresh.badge.label, 'Login verified');
+    // Honest naming: the retired "Default CLI login" claimed a separate
+    // account TYPE; an identity-less migrated default row is named by its id.
+    assert.equal(fresh.name, 'codex-default');
     assert.equal(fresh.quota.exhausted, true);
     assert.match(fresh.quota.label, /^Limit reached/);
     assert.match(fresh.meta, /Limit reached/);
+    // Line 2 is facts: only the spent window takes the warning's hue; a plan id is said in the owner's words (U094, U102).
+    const planned = accountRowFacts({ ...row, identity: { plan: 'self_serve_business_usage_based', email: 'a@b.c' } }, payload,
+        { accountsRead: 'ok', quotaRead: 'ok' });
+    assert.deepEqual(planned.metaParts.filter((part) => part.tone).map((part) => part.tone), ['warn']);
+    assert.match(planned.metaParts.find((part) => part.tone).text, /^Limit reached/);
+    assert.ok(planned.metaParts.some((part) => part.text === 'Business usage-based' && !part.tone));
+    assert.doesNotMatch(planned.meta, /self_serve/);
+    assert.equal(planned.meta, planned.metaParts.map((part) => part.text).join(' · '));
 
     // The QUOTA read refused: nothing may be claimed about the window, so the
     // remembered percentage is not re-shown as current — and the row stops
@@ -1476,12 +1493,13 @@ test('each row projection is gated by ITS OWN facet, and a stale value says it i
     assert.equal(staleQuota.quota.exhausted, false);
     assert.equal(staleQuota.quota.label, 'Limits not checked');
     assert.match(staleQuota.meta, /Limits not checked/);
+    assert.ok(staleQuota.metaParts.every((part) => !part.tone), 'an unread window paints nothing');
 
     // The ACCOUNTS read refused: the row is memory of an account, so its
     // verification claim is dated — and the window, read fine, is not.
     const staleAccount = accountRowFacts(row, payload, { accountsRead: 'failed', quotaRead: 'ok' });
     assert.match(staleAccount.badge.label, /last known/);
-    assert.equal(staleAccount.badge.tone, 'muted', 'no green "Verified live" over a read that never landed');
+    assert.equal(staleAccount.badge.tone, 'muted', 'no green "Login verified" over a read that never landed');
     assert.equal(staleAccount.quota.exhausted, true);
     assert.doesNotMatch(staleAccount.quota.label, /last known/);
 
@@ -1521,7 +1539,7 @@ function mountSection() {
     // `harness-daemon-status` were the pre-tab markup; building them here let
     // the refusal below "reach the owner" through a node production no longer
     // has, so an empty, silently unmounted panel passed as a warning shown.
-    for (const id of ['agents-service-banner', 'harness-login-card',
+    for (const id of ['agents-service-banner', 'agents-service-version', 'harness-login-card',
         'btn-harness-refresh']) elements[id] = fakeElement(id);
     const doc = {
         hidden: false,
@@ -1602,7 +1620,7 @@ test('Settings destroy detaches locally, and explicit Connect recreates the disp
             daemon: { state: 'running', engine_version: '3.3.13', runtime: {} },
             config_dir: '/home/agent',
             harnesses: [{ id: 'codex' }],
-            profiles: { harnessAccounts: [{ harness_id: 'codex', native_login_detected: false }], profiles: [] },
+            profiles: { profiles: [], harnessAccounts: [], accountPools: [] },
             quota: [],
         }),
         doc,
@@ -1808,6 +1826,85 @@ test('a staged update does not claim the engine is serving when nothing answered
     assert.match(daemonStatusLine(broken, {}).text, /[Aa]gent accounts were not read/);
 });
 
+test('a lower pin under a newer engine is never promised to activate', () => {
+    // Planned restarts keep a newer engine on a lower pin (server_restart), so
+    // "will activate after the daemon next restarts" would be false: the line
+    // names what serves, what is pinned, and which stops expose the older pin.
+    const runtime = { state: 'newer_serving', target_version: '4.3.0', staged_version: '' };
+    const read = { daemon: { state: 'running', engine_version: '4.3.1', runtime },
+                   reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' } };
+    const line = daemonStatusLine(read, {});
+    assert.equal(line.tone, 'warn');
+    assert.match(line.text, /^Engine 4\.3\.1 keeps serving; this Ouroboros version pins older Claudexor 4\.3\.0\./);
+    assert.match(line.text, /After Restart Claudexor, Panic or an engine exit, 4\.3\.0 may refuse data a newer engine served\./);
+    assert.ok(!/activate|staged|ready/.test(line.text), line.text);
+    // A facet gap: the serving claim yields to the facets; the pin fact stays.
+    const gap = daemonStatusLine({ ...read, reads: { catalog: 'ok', accounts: 'failed', quota: 'ok' } }, {});
+    assert.ok(!/keeps serving/.test(gap.text), gap.text);
+    assert.match(gap.text, /[Aa]gent accounts were not read/);
+    assert.match(gap.text, /pins older Claudexor 4\.3\.0/);
+    // Recovery-only facts still ride the line, which never turns green; the action stays plain Connect.
+    const recovering = daemonStatusLine({ ...read, daemon: { ...read.daemon, servingMode: 'recovery_only' } }, {});
+    assert.equal(recovering.tone, 'warn');
+    assert.match(recovering.text, /Recovery only; product work is not admitted/);
+    assert.equal(runtimeActionLabel(read), 'Connect');
+});
+
+test('the displayed lower-pin banner keeps the warning beside failed facets', async () => {
+    const daemon = { state: 'running', engine_version: '4.3.1',
+        runtime: { state: 'newer_serving', target_version: '4.3.0' } };
+    const cases = [
+        { catalog: 'ok', accounts: 'failed', quota: 'ok' },
+        { catalog: 'failed', accounts: 'failed', quota: 'failed' },
+        { catalog: 'not_read', accounts: 'not_read', quota: 'not_read' },
+    ];
+    for (const reads of cases) {
+        const store = storeWithReads(reads, { daemon });
+        await store.refresh();
+        try {
+            const line = serviceBannerLine(store);
+            assert.match(line.text, /pins older Claudexor 4\.3\.0/);
+            assert.match(line.text, /4\.3\.0 may refuse data a newer engine served/);
+            assert.match(line.text, /Last observed engine 4\.3\.1/);
+            assert.doesNotMatch(line.text, /keeps serving|activate|Claudexor ready/);
+            assert.equal(line.text.match(/pins older Claudexor/g)?.length, 1);
+            if (Object.values(reads).includes('failed')) assert.match(line.text, /could not be read/);
+            assert.notEqual(line.tone, 'ok');
+        } finally { store.dispose(); }
+    }
+});
+
+test('a failed request keeps the last observed lower-pin warning without claiming service', async () => {
+    let reject = false;
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => {
+            if (reject) throw new Error('network unavailable');
+            return { ok: true, status: 200, json: async () => ({
+                daemon: { state: 'running', engine_version: '4.3.1',
+                    runtime: { state: 'newer_serving', target_version: '4.3.0' } },
+                reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' },
+                harnesses: [{ id: 'codex' }],
+                profiles: { harnessAccounts: [], profiles: [] }, quota: [],
+            }) };
+        },
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    try {
+        await store.refresh();
+        assert.match(serviceBannerLine(store).text, /keeps serving/);
+        reject = true;
+        await store.refresh();
+        const line = serviceBannerLine(store);
+        assert.match(line.text, /Could not read/);
+        assert.match(line.text, /network unavailable/);
+        assert.match(line.text, /Last observed engine 4\.3\.1/);
+        assert.match(line.text, /pins older Claudexor 4\.3\.0/);
+        assert.match(line.text, /may refuse data a newer engine served/);
+        assert.doesNotMatch(line.text, /keeps serving|activate|Claudexor ready/);
+        assert.equal(line.tone, 'error');
+    } finally { store.dispose(); }
+});
+
 test('a facet that failed without the aggregate hearing it is still reported', () => {
     // An envelope in the wrong shape is a FAILED read, not an exception, so the
     // daemon goes on reporting `running`. A status line that trusted the
@@ -1982,7 +2079,9 @@ test('a wake error reaches the banner and expires only when the daemon is proven
         await store.refresh();
         assert.ok(!/Could not start the agent daemon/i.test(banner()),
             'the stale wake error outlived the daemon that came up anyway');
-        assert.match(banner(), /3\.3\.14/);
+        assert.equal(banner(), 'Claudexor ready');
+        assert.equal(elements['agents-service-version'].textContent, 'engine 3.3.14');
+        assert.equal(elements['agents-service-version'].hidden, false);
 
         // …and a refusal that lands while the daemon is ALREADY answering is
         // moot and never shown (the failure is real; it stopped mattering).
@@ -2011,6 +2110,7 @@ test('the refresh button routes the click through the same predicate as its labe
     const store = createClaudexorStatusStore({
         fetchImpl: async (url, init = {}) => {
             requests.push(`${init.method || 'GET'} ${url}`);
+            if (url.endsWith('/quota/refresh')) return fakeResponse(200, { snapshots: [], absences: [], refreshed_at: null });
             if ((init.method || 'GET') === 'POST') return fakeResponse(200, WAKE_UP);
             return fakeResponse(200, statusBody);
         },
@@ -2031,12 +2131,13 @@ test('the refresh button routes the click through the same predicate as its labe
             'a sleeping daemon was only re-read, so the button could not help');
 
         // Daemon live (the wake committed an answering reading) -> the press
-        // stays a plain re-read, and the label agrees.
+        // refreshes quota and re-reads status, and the label agrees.
         statusBody = WAKE_UP;
         requests.length = 0;
         await click();
         assert.ok(requests.every((r) => !r.includes('/api/claudexor/wake')),
             'a live daemon was provisioned by a button that says Refresh');
+        assert.ok(requests.includes('POST /api/claudexor/quota/refresh'));
         assert.ok(requests.some((r) => r.startsWith('GET ')), 'the live press did not re-read');
         assert.equal(elements['btn-harness-refresh'].textContent, 'Refresh');
     } finally {
@@ -2136,4 +2237,72 @@ test('the family markup mounts a per-family login host under its header (3=A)', 
     // The login card appears where the owner clicked: directly under the
     // family header, above the account rows — not after every family.
     assert.ok(headIdx < loginIdx && loginIdx < rowsIdx);
+});
+
+test('a refused facet read keeps the engine stop and heap facts in the service banner', () => {
+    const reads = { catalog: 'ok', accounts: 'ok', quota: 'failed' };
+    const store = {
+        reads,
+        facet: (name) => reads[name],
+        error: '',
+        snapshot: { daemon: { state: 'running', engine_version: '3.22.1', runtime: {},
+            last_exit: { classification: 'heap_exhausted', phase: 'serving', exit_signal: 6 },
+            memory: { heapUsedBytes: 3 * 2 ** 30, heapLimitBytes: 16 * 2 ** 30 } } },
+        loading: false,
+        everSettled: true,
+        unavailableNote: (facet, { subject = '' } = {}) =>
+            statusUnavailableNote(reads[facet], { error: '', facet, subject }),
+    };
+    const line = serviceBannerLine(store);
+    const facts = (view) => Object.fromEntries(view.facts || []);
+    assert.match(line.text, /Your subscription limits could not be read/);
+    // A refused quota read beside a serving engine is no stop: the stop it recovered from and the heap are
+    // Diagnostics, never words of the line (the engine's own state decides, not the line's tone).
+    assert.doesNotMatch(line.text, /Last stop|Heap/);
+    assert.equal(facts(line)['Last stop'], 'heap exhausted while serving (signal 6)');
+    assert.match(facts(line).Heap, /headroom 13\.0 GiB/);
+    // A healthy read is ready: the stop it recovered from moves to Diagnostics, once, never twice.
+    reads.quota = 'ok';
+    const healthy = serviceBannerLine(store);
+    assert.equal(healthy.text, 'Claudexor ready');
+    assert.equal(facts(healthy)['Last stop'], 'heap exhausted while serving (signal 6)');
+    assert.equal(healthy.facts.filter(([label]) => label === 'Last stop').length, 1);
+    // Without recorded facts the banner and its Diagnostics carry none.
+    reads.quota = 'failed';
+    store.snapshot.daemon.last_exit = null;
+    store.snapshot.daemon.memory = null;
+    const bare = serviceBannerLine(store);
+    assert.doesNotMatch(bare.text, /Last stop|Heap/);
+    assert.deepEqual(bare.facts.map(([label]) => label).filter((label) => /Last stop|Heap/.test(label)), []);
+});
+
+test('daemon status appends observed stop and measured heap without changing readiness', () => {
+    const payload = { daemon: { state: 'running', engine_version: '3.22.1',
+        last_exit: { classification: 'heap_exhausted', phase: 'serving', exit_signal: 6 },
+        memory: { heapUsedBytes: 3 * 2 ** 30, heapLimitBytes: 16 * 2 ** 30 },
+    } };
+    const line = daemonStatusLine(payload);
+    const facts = (view) => Object.fromEntries(view.facts || []);
+    assert.equal(line.tone, 'ok');
+    // Ready: the stop it recovered from and the heap are Diagnostics, not the verdict's words.
+    assert.equal(line.text, 'Claudexor ready');
+    assert.equal(facts(line)['Last stop'], 'heap exhausted while serving (signal 6)');
+    assert.equal(facts(line).Heap, '3.0 of 16.0 GiB; headroom 13.0 GiB');
+    payload.daemon.memory.heapUsedBytes = null;
+    assert.equal(facts(daemonStatusLine(payload)).Heap, 'limit 16.0 GiB; use unknown');
+    assert.doesNotMatch(JSON.stringify(daemonStatusLine(payload).facts), /headroom|0\.0 of/);
+    payload.daemon.memory = null;
+    payload.daemon.last_exit = null;
+    assert.deepEqual(daemonStatusLine(payload), { tone: 'ok', text: 'Claudexor ready', version: 'engine 3.22.1', facts: [] });
+    payload.daemon.state = 'stale';
+    payload.daemon.last_exit = { classification: 'unclassified', phase: 'startup', exit_code: 1 };
+    assert.match(daemonStatusLine(payload).text, /Last stop: unclassified during startup \(exit code 1\)/);
+    // The stop names its own engine and time, so an old engine's crash is not read as the current one's.
+    payload.daemon.last_exit = { classification: 'heap_exhausted', phase: 'serving', exit_signal: 6,
+        engine_version: '3.22.0', observed_at: '2026-10-07T19:34:11Z' };
+    assert.match(daemonStatusLine(payload).text,
+        /Last stop: heap exhausted while serving \(signal 6\) · engine 3\.22\.0, seen 2026-10-07 19:34 UTC/);
+    // The host writes utc_now_iso(), i.e. an explicit +00:00 offset.
+    payload.daemon.last_exit.observed_at = '2026-10-08T13:55:07.625130+00:00';
+    assert.match(daemonStatusLine(payload).text, /seen 2026-10-08 13:55 UTC/);
 });

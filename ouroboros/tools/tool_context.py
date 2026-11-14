@@ -54,6 +54,9 @@ class ToolContext:
     drive_root: pathlib.Path
     branch_dev: str = "ouroboros"
     system_repo_dir: Optional[pathlib.Path] = None
+    # Set only while a body candidate is bound (``body_candidate.bind``): the checkout
+    # the server actually runs, when ``repo_dir``/``system_repo_dir`` name the candidate.
+    serving_repo_dir: Optional[pathlib.Path] = None
     workspace_root: Optional[pathlib.Path] = None
     workspace_mode: str = ""
     memory_mode: str = ""
@@ -67,14 +70,21 @@ class ToolContext:
     # drain seam; ``None`` while the turn still acts only on the message that
     # started it.
     last_owner_delivery: Optional[Dict[str, Any]] = None
+    # This turn's own routing acts whose wait ended unconfirmed (``{action,
+    # client_message_id, routing_token, target}``): later acting rounds read their
+    # exact receipts and report an outcome once it is recorded.
+    unconfirmed_routing_acts: List[Dict[str, str]] = field(default_factory=list)
     executor_ref: Dict[str, Any] = field(default_factory=dict)
     pending_events: List[Dict[str, Any]] = field(default_factory=list)
     current_chat_id: Optional[int] = None
     current_task_type: Optional[str] = None
     pending_restart_reason: Optional[str] = None
+    pending_restart_request: Optional[Dict[str, Any]] = None
     last_push_succeeded: bool = False
     last_reviewed_commit_sha: str = ""
-    emit_progress_fn: Callable[[str], None] = field(default=lambda _: None)
+    # The real binder accepts keyword facts (``narration=True`` for a tool that relays
+    # the model's own words); an unbound context must swallow them the same way.
+    emit_progress_fn: Callable[[str], None] = field(default=lambda _text, **_kw: None)
 
     # LLM-driven model/effort switch.
     active_model_override: Optional[str] = None
@@ -99,6 +109,9 @@ class ToolContext:
     # Budget tracking for usage events.
     event_queue: Optional[Any] = None
     task_id: Optional[str] = None
+    # The agent binds lifecycle authority; standalone tool invocations only
+    # carry attribution. Missing managed authority must never become standalone.
+    task_lifecycle_bound: bool = False
 
     # Conversation messages for safety checks.
     messages: Optional[List[Dict[str, Any]]] = None
@@ -113,7 +126,7 @@ class ToolContext:
     # Task depth for fork-bomb protection.
     task_depth: int = 0
 
-    # True inside handle_chat_direct, not a queued worker task.
+    # The task began as direct chat; stays True after a pool handoff (current carrier: task_carrier).
     is_direct_chat: bool = False
     # Pre-commit review state.
     _review_advisory: List[Any] = field(default_factory=list)
@@ -128,7 +141,9 @@ class ToolContext:
         room = project_room_lens_dir(self)
         if room is not None:
             return room
-        return pathlib.Path(self.repo_dir)
+        from ouroboros.tool_access import folderless_scratch_dir
+
+        return folderless_scratch_dir(self) or pathlib.Path(self.repo_dir)
 
     def is_workspace_mode(self) -> bool:
         return (

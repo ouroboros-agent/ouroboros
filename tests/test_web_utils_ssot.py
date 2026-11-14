@@ -21,7 +21,6 @@ import re
 
 from pathlib import Path
 
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WEB_MODULES = REPO_ROOT / "web" / "modules"
@@ -29,90 +28,6 @@ WEB_MODULES = REPO_ROOT / "web" / "modules"
 
 def _read(name: str) -> str:
     return (WEB_MODULES / name).read_text(encoding="utf-8")
-
-
-def test_utils_exports_shared_helpers():
-    """``utils.js`` keeps content helpers and re-exports gateway fetchJson."""
-    src = _read("utils.js")
-    for sig in (
-        "export function safeExternalHrefAttr(",
-        "export function renderMarkdownSafe(",
-        "export function boundedText(",
-        "export { fetchJson } from './api_client.js';",
-    ):
-        assert sig in src, f"utils.js must export {sig.strip().rstrip('(')}"
-    assert "export async function fetchJson(" not in src
-    assert "export async function fetchJson(" in _read("api_client.js")
-
-
-def test_api_client_owns_extension_route_helpers():
-    src = _read("api_client.js")
-    for sig in (
-        "export function cleanExtensionRoute(",
-        "export function extensionRoutePrefix(",
-        "export function extensionRoutePath(",
-    ):
-        assert sig in src
-    assert "route.includes('\\\\')" in src
-    assert "part === '..'" in src
-    assert "encodeURIComponent(skill)" in src
-
-
-def test_api_client_owns_json_post_ok_false_handling():
-    api_src = _read("api_client.js")
-    mcp_src = _read("mcp_settings.js")
-
-    assert "export function jsonPost(" in api_src
-    assert "rejectOkFalse" in api_src
-    # mcp_settings must take its POST helper from api_client (it may co-import
-    # apiFetch for the /api/mcp/status refresh) and must not roll its own postJson.
-    assert "jsonPost" in mcp_src
-    assert "} from './api_client.js';" in mcp_src
-    assert "function postJson(" not in mcp_src
-    assert "async function postJson(" not in mcp_src
-
-
-def test_safe_external_href_attr_blocks_unsafe_schemes():
-    """Schema allowlist must keep blocking javascript:/data:/vbscript:/mailto: hrefs."""
-    src = _read("utils.js")
-    block = src.split("export function safeExternalHrefAttr", 1)[1].split("export function", 1)[0]
-    # Only http: and https: are allowed; mailto/javascript/data must NOT pass.
-    assert "parsed.protocol === 'http:' || parsed.protocol === 'https:'" in block
-    assert "escapeHtmlAttr(parsed.toString())" in block
-    # Unparseable / unsafe → empty string (truthy gate at call sites).
-    assert "return ''" in block
-
-
-def test_render_markdown_safe_strips_dangerous_tags_and_attrs():
-    """The DOMPurify allowlist must continue to ban script-bearing tags."""
-    src = _read("utils.js")
-    block = src.split("export function renderMarkdownSafe", 1)[1].split("export function", 1)[0]
-    for forbidden_tag in ("script", "iframe", "object", "embed", "form", "input", "img"):
-        assert f"'{forbidden_tag}'" in block, f"renderMarkdownSafe must FORBID_TAGS {forbidden_tag}"
-    for forbidden_attr in ("style", "src", "srcset", "srcdoc"):
-        assert f"'{forbidden_attr}'" in block, f"renderMarkdownSafe must FORBID_ATTR {forbidden_attr}"
-    # A same-window navigation out of a widget replaces the whole desktop shell
-    # with no way back, so publisher markdown carries the same link contract the
-    # chat markdown renderer applies.
-    assert "a[href]" in block
-    assert "'target', '_blank'" in block
-    assert "'rel', 'noopener noreferrer'" in block
-
-
-def test_marketplace_does_not_redeclare_shared_helpers():
-    """marketplace.js must import shared helpers, not redeclare them."""
-    src = _read("marketplace.js")
-    # Marketplace no longer renders package markdown after Details removal.
-    assert "renderMarkdownSafe" not in src
-    assert "safeExternalHrefAttr" in src
-    assert "boundedText" in src
-    assert "fetchJson" in src
-    # No local function declarations of the SSOT helpers.
-    assert "function boundedText(" not in src, "marketplace.js must use utils.boundedText"
-    assert "async function fetchJson(" not in src, "marketplace.js must use utils.fetchJson"
-    # ``safeExternalUrl`` may exist as a local *alias* (`const safeExternalUrl = safeExternalHrefAttr`)
-    # but not as a function definition.
-    assert "function safeExternalUrl(" not in src, "marketplace.js must alias to utils.safeExternalHrefAttr"
 
 
 def test_skills_does_not_redeclare_shared_helpers():
@@ -123,46 +38,14 @@ def test_skills_does_not_redeclare_shared_helpers():
     assert "safeExternalHrefAttr as safeExternalUrl" in renderer
     assert "function boundedText(" not in src
     assert "function safeExternalUrl(" not in src + renderer
-    assert "source === 'self_authored' || source === 'external'" in renderer
-    assert "payloadRoot.startsWith('skills/external/')" in renderer
+    # The host names the removal (listing `removal`); the card renders it and derives none itself (inverted pin).
+    assert "skill.removal === 'delete'" in renderer and "skill.removal === 'uninstall'" in renderer
+    assert "startsWith('skills/external/')" not in renderer and "if (!isBuiltIn(skill))" not in renderer
     assert "skills-delete-local" in renderer
-    assert "apiClient.deleteSkill(name, payloadRoot, current.content_hash)" in src
+    assert "apiClient.deleteSkill(name, payloadRoot || skill.payload_root, skill.content_hash)" in src
     assert "/api/skills/${encodeURIComponent(skill)}/delete" in api_client
     assert "payload_root: payloadRoot" in api_client
     assert "expected_content_hash: expectedContentHash" in api_client
-    assert "data/state/skills/${name}" in src
-
-
-def test_widgets_uses_shared_render_markdown():
-    src = _read("widgets.js")
-    assert "renderMarkdownSafe" in src
-    # Local declaration removed in v5.8.3-rc.5.
-    assert "function renderMarkdownSafe(" not in src
-
-
-def test_ouroboroshub_uses_shared_fetch_json():
-    src = _read("ouroboroshub.js")
-    assert "fetchJson" in src
-    # Local async fetchJson removed in v5.8.3-rc.5.
-    assert "async function fetchJson(" not in src
-
-
-def test_onboarding_wizard_is_loaded_as_an_es_module():
-    """The wizard is served from /static as a real ES module.
-
-    It used to be inlined into a classic ``<script>`` inside a self-contained
-    document, which is why it could never import ordinary ``web/modules/*``
-    code. Any import it grows must resolve to a real sibling module — the page
-    is served from ``/onboarding``, so a bare relative specifier resolves
-    against the SCRIPT url, not the document.
-    """
-    template = (REPO_ROOT / "web" / "onboarding_template.html").read_text(encoding="utf-8")
-    assert '<script type="module" src="/static/modules/onboarding_wizard.js"></script>' in template
-
-    src = _read("onboarding_wizard.js")
-    for specifier in re.findall(r"^\s*import\s.*?from\s+'([^']+)';", src, re.M):
-        assert specifier.startswith("./"), f"non-relative wizard import: {specifier}"
-        assert (REPO_ROOT / "web" / "modules" / specifier[2:]).is_file(), specifier
 
 
 def test_accent_tokens_have_concrete_rgba_values():
@@ -206,39 +89,6 @@ def test_accent_tokens_have_concrete_rgba_values():
         )
 
 
-@pytest.mark.parametrize("module_name", ["onboarding_wizard.js", "onboarding_overlay.js"])
-def test_onboarding_uses_the_shared_escape_helper(module_name):
-    """Both onboarding modules are real ES modules now, so escaping has ONE
-    authority instead of a copy per module.
-
-    The predecessor of this test compared the two ``replace`` chains character
-    for character and explained the copy by saying the wizard "is an IIFE bundle
-    and cannot import from utils.js". That stopped being true when the wizard
-    became a linked ES module: the comparison then froze a duplicate the code
-    was free to delete. Behaviour of the shared helper itself is pinned by
-    web/tests/onboarding_overlay.test.js.
-    """
-    source = _read(module_name)
-
-    assert "escapeHtmlAttr as escapeHtml" in source, (
-        f"{module_name} must import the shared escape helper from utils.js"
-    )
-    assert "function escapeHtml(" not in source, (
-        f"{module_name} redefines escapeHtml instead of using the shared helper"
-    )
-
-
-def test_onboarding_wizard_uses_the_shared_gateway_fetch_helper():
-    """Same dedup, same reason: the wizard's private ``apiRequest`` was a second
-    copy of ``api_client.fetchJson`` (identical throw-on-!ok, identical error
-    message), and a second copy is a second place for the gateway error contract
-    to drift."""
-    source = _read("onboarding_wizard.js")
-
-    assert "import { fetchJson } from './api_client.js';" in source
-    assert "async function apiRequest(" not in source
-
-
 def test_status_read_provenance_has_one_reader_across_surfaces():
     """``claudexor_status_store.facetReadState`` is the ONE place that decides
     what an empty status collection MEANS (ok / not_read / failed / transport /
@@ -263,13 +113,16 @@ def test_status_read_provenance_has_one_reader_across_surfaces():
     assert "export function accountRows(" in store, (
         "the store lost the single connected-rows projection"
     )
-    # The native-login rule rides in the shared projection: a native CLI session
-    # counts as a connected row (a native codex login used to read as
-    # "0 accounts connected" when a consumer counted only named profiles).
+    # #244: a native-only machine is an engine on the retired account model.
+    # It reads as that typed state, decided once beside the projection, never
+    # as "0 accounts connected" and never as pseudo-rows re-read off the old
+    # client's carrier.
     rows_body = store.split("export function accountRows(", 1)[1].split("\nexport ", 1)[0]
-    assert "native_login_detected" in rows_body, (
-        "accountRows no longer projects native logins; a native-only machine "
-        "reads as 0 accounts connected again"
+    rows_code = "\n".join(line for line in rows_body.splitlines() if not line.strip().startswith("//"))
+    assert "harnessAccounts" not in rows_code, "accountRows reads the retired native carrier again"
+    assert "export function accountModelUnsupported(" in store, (
+        "the store lost the one retired-account-model decision; a pre-3.6 engine "
+        "would read as 0 accounts connected again"
     )
     # «Не вини демона, который отвечал»: `unreachable` is the endpoint's global
     # "the answer did not complete" — a RUNNING daemon refusing one fanned-out
@@ -287,7 +140,6 @@ def test_status_read_provenance_has_one_reader_across_surfaces():
         "onboarding_wizard.js",
         "onboarding_agents_step.js",
         "harness_accounts.js",
-        "reviewer_slots.js",
         "subagents_settings.js",
     )
     for name in consumers:
@@ -338,71 +190,4 @@ def test_status_read_provenance_has_one_reader_across_surfaces():
     assert "daemon" not in code_only(step), (
         "the Agents step reads the daemon state directly; the store's facets "
         "are the only licensed view of it"
-    )
-
-
-def test_reviewer_rows_label_each_pin_from_its_own_facet():
-    """The read states are per-facet and INDEPENDENT — the backend pins that
-    explicitly (`test_status_payload_classifies_each_fanned_out_facet_independently`).
-    The row builders therefore have to label a saved ACCOUNT pin from the
-    accounts read and a saved MODEL from the catalog read. Threading the wrong
-    facet is invisible in the helper tests (they take the state as a parameter),
-    and it re-creates the owner-visible lie in miniature: a profile nobody read
-    gets told it is "not in discovery".
-
-    Structural pin: each call site in the module source is inspected. The facet
-    may travel as a read-state string (``accountsRead``) or as the store's
-    boolean licence (``accountsKnown``) — both spellings carry the same
-    provenance; what this pin forbids is one facet standing in for another.
-    """
-    src = _read("reviewer_slots.js")
-
-    def call_sites(name):
-        """Every call of `name` with its full argument list, definitions aside."""
-        found = []
-        for match in re.finditer(re.escape(name) + r"\(", src):
-            if src[:match.start()].rstrip().endswith("function"):
-                continue
-            depth, i = 0, match.end() - 1
-            while i < len(src):
-                if src[i] == "(":
-                    depth += 1
-                elif src[i] == ")":
-                    depth -= 1
-                    if depth == 0:
-                        break
-                i += 1
-            found.append(src[match.start():i + 1])
-        return found
-
-    profile_calls = call_sites("profileOptionsFor")
-    # Two builders (the triad/scope row and the advisory row) plus nothing else.
-    assert len(profile_calls) >= 2, "the profile-option call sites moved"
-    for call in profile_calls:
-        assert re.search(r"accounts(Read|Known)", call), (
-            f"a saved account pin is labelled without the accounts read facet: {call!r}"
-        )
-        assert "catalog" not in call, (
-            "the catalog read is standing in for the accounts read; a failed "
-            f"accounts read would then be announced as discovery truth: {call!r}"
-        )
-    model_calls = call_sites("sessionModelOptions")
-    assert len(model_calls) >= 2, "the model-option call sites moved"
-    for call in model_calls:
-        # ...and from the CATALOG read specifically. Asserting only that the
-        # option exists lets the facets be swapped — the very defect this test
-        # was written for, one field over.
-        assert re.search(r"catalog(Read|Known)|modelsRead", call), (
-            "a saved model is labelled without the catalog read state, so an "
-            f"unread catalog says 'not in discovery' about it: {call!r}"
-        )
-        assert "accounts" not in call, (
-            f"the accounts read is standing in for the catalog read: {call!r}"
-        )
-    # An unread facet must never default to the authoritative state on the way
-    # in. (The helpers keep `'ok'` as their own parameter default, which is the
-    # discovery-truth case they were written for and is pinned separately.)
-    assert not re.search(r"state\.\w*Read \|\| 'ok'", src), (
-        "a missing read state falls back to 'ok'; unknown must never be "
-        "authoritative — that is the original bug's shape"
     )

@@ -1,16 +1,23 @@
-"""Every typed worker event — literal or module-constant typed — must have a supervisor handler.
+"""Every typed worker event — literal, module-constant typed or built by a function — must have a supervisor handler.
 
-The supervisor drops an event whose type is not in EVENT_HANDLERS: it is
-downgraded to a truncated ``unknown_worker_event`` repr in supervisor.jsonl
-(see ``dispatch_event``), so its payload is lost to every typed consumer.
+The supervisor drops an event whose type is not in EVENT_HANDLERS: it decays
+to a content-free ``unknown_worker_event`` row in supervisor.jsonl (see
+``dispatch_event``), so its payload is lost to every typed consumer.
 v6.69.0 registered one branch of review_helpers' if/else and missed the
 other; this scan closes the class: it walks the emitter call sites and
-asserts each literal event type is either registered or on the explicit
-allowlist below, with a reason.
+asserts each event type is either registered or on the explicit allowlist
+below, with a reason. ``presence_result`` was the frame a dict-literal-only
+scan could not see: ``pending_events.append(build_presence_result_event(...))``.
 """
 
 import ast
+import gc
 import pathlib
+from types import MappingProxyType
+from typing import Mapping, NamedTuple
+
+import pytest
+from tests._source_scan import parse
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
@@ -85,18 +92,51 @@ def _call_name(func):
     return ""
 
 
-def _emitted_types():
-    emitted = {}
+def _runtime_trees():
+    """Read current runtime source; callers own the trees, with no global cache."""
     files = [REPO / "server.py"]
     files += list((REPO / "ouroboros").rglob("*.py"))
     files += list((REPO / "supervisor").rglob("*.py"))
     trees = {}
-    for path in files:
-        try:
-            trees[path] = ast.parse(path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-    constants = _string_constants(trees.values())
+    collecting = gc.isenabled()
+    gc.disable()  # AST nodes are acyclic; avoid a full heap walk between files.
+    try:
+        for path in files:
+            try:
+                trees[path] = parse(path.read_text(encoding="utf-8"))
+            except (OSError, SyntaxError):
+                continue
+    finally:
+        if collecting:
+            gc.enable()
+    return trees
+
+
+def _builder_returns(trees, constants):
+    """Function name -> event types of the dict literals it returns: one hop, by name, and not a dataflow
+    analyser. A dict assigned to a local and put later stays out of its reach, as it does for the literal scan."""
+    builders = {}
+    for tree in trees.values():
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for inner in ast.walk(node):
+                    if isinstance(inner, ast.Return):
+                        event_type = _dict_type(inner.value, constants)
+                        if event_type:
+                            builders.setdefault(node.name, set()).add(event_type)
+    return builders
+
+
+def _emitted_types(trees=None, constants=None, *, commands=False):
+    """Supervisor events, or with ``commands`` the supervisor->worker input commands.
+
+    A put into a worker's ``in_q`` is answered by ``worker_main``, never by a
+    supervisor handler: it is neither an event nor an allowlist excuse.
+    """
+    trees = _runtime_trees() if trees is None else trees
+    constants = _string_constants(trees.values()) if constants is None else constants
+    emitted = {}
+    builders = _builder_returns(trees, constants)
     for path, tree in trees.items():
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
@@ -105,7 +145,11 @@ def _emitted_types():
             if isinstance(node.func, ast.Attribute):
                 attr = node.func.attr
                 receiver = _receiver_name(node.func).lower()
-                if attr == "append" and "pending_events" in receiver:
+                if receiver.endswith("in_q"):  # a worker's input queue: commands only
+                    candidates = node.args if commands and attr in ("put", "put_nowait") else []
+                elif commands:
+                    candidates = []
+                elif attr == "append" and "pending_events" in receiver:
                     candidates = node.args
                 elif attr in ("put", "put_nowait"):
                     # Receiver-AGNOSTIC (the narrow name hints missed a real
@@ -114,18 +158,19 @@ def _emitted_types():
                     # literal string `type` is scanned. A non-supervisor queue
                     # that happens to match falls to the reasoned allowlist.
                     candidates = node.args
-            if _call_name(node.func) in _WRAPPER_FUNCS:
+            if not commands and _call_name(node.func) in _WRAPPER_FUNCS:
                 candidates = node.args
             for arg in candidates:
-                event_type = _dict_type(arg, constants)
-                if event_type:
-                    emitted.setdefault(event_type, []).append(
-                        f"{path.relative_to(REPO)}:{node.lineno}"
+                built = builders.get(_call_name(arg.func), ()) if isinstance(arg, ast.Call) else ()
+                for event_type in {_dict_type(arg, constants), *built} - {None}:
+                    emitted.setdefault(event_type, []).append(  # one spelling on every OS
+                        f"{path.relative_to(REPO).as_posix()}:{node.lineno}"
                     )
-    return emitted
+    return MappingProxyType({kind: tuple(sites) for kind, sites in emitted.items()})
 
 
-def _registered_types():
+def _registered_types(trees=None):
+    trees = _runtime_trees() if trees is None else trees
     registered = set()
     for name in (
         "supervisor/events.py",
@@ -133,7 +178,7 @@ def _registered_types():
         "supervisor/events_chat_delivery.py",
         "supervisor/telemetry_events.py",
     ):
-        tree = ast.parse((REPO / name).read_text(encoding="utf-8"))
+        tree = trees[REPO / name]
         for node in ast.walk(tree):
             if not isinstance(node, ast.Assign):
                 continue
@@ -148,12 +193,29 @@ def _registered_types():
                     for key in node.value.keys
                     if isinstance(key, ast.Constant)
                 }
-    return registered
+    return frozenset(registered)
 
 
-def test_every_emitted_literal_type_has_a_handler():
-    emitted = _emitted_types()
-    registered = _registered_types()
+class EventIndex(NamedTuple):
+    emitted: Mapping[str, tuple[str, ...]]
+    commands: Mapping[str, tuple[str, ...]]
+    registered: frozenset[str]
+
+
+@pytest.fixture(scope="session")
+def event_index():
+    """Read this candidate once; share only immutable facts, never mutable ASTs."""
+    trees = _runtime_trees()
+    constants = _string_constants(trees.values())
+    return EventIndex(
+        _emitted_types(trees, constants),
+        _emitted_types(trees, constants, commands=True),
+        _registered_types(trees),
+    )
+
+
+def test_every_emitted_literal_type_has_a_handler(event_index):
+    emitted, registered = event_index.emitted, event_index.registered
     # Sanity: the scan sees real emitters and the registry parse worked.
     assert "task_done" in emitted
     assert "task_done" in registered
@@ -170,21 +232,53 @@ def test_every_emitted_literal_type_has_a_handler():
     )
 
 
-def test_allowlist_entries_stay_emitted():
+def test_the_scan_sees_an_event_a_function_builds(event_index):
+    """The pooled final's frame reached the dispatcher unregistered because only dict literals were read."""
+    assert "ouroboros/agent_task_pipeline.py" in " ".join(event_index.emitted["presence_result"])
+    source = (
+        'def build_frame(task):\n'
+        '    return {"type": "built_by_a_function", "task_id": task}\n'
+        'def emit(ctx, q, task):\n'
+        '    ctx.pending_events.append(build_frame(task))\n'
+        '    q.put_nowait(build_frame(task))\n'
+        '    q.put(unrelated(task))\n'
+    )
+    path = REPO / "server.py"  # any repository path: only its relative form is reported
+    assert list(_emitted_types({path: ast.parse(source)}, {})) == ["built_by_a_function"]
+    assert len(_emitted_types({path: ast.parse(source)}, {})["built_by_a_function"]) == 2
+
+
+def test_the_scan_reports_a_site_in_one_spelling_on_every_os(monkeypatch):
+    """Windows reported ``ouroboros\\agent_task_pipeline.py:935`` and the witness above, which reads the POSIX
+    spelling, failed there only (post-merge run 41792459443). A Windows-spelled checkout keeps that visible here."""
+    windows_checkout = pathlib.PureWindowsPath("D:/a/ouroboros/ouroboros")
+    monkeypatch.setitem(globals(), "REPO", windows_checkout)
+    tree = ast.parse('def emit(q):\n    q.put({"type": "spelled_once"})\n')
+    sites = _emitted_types({windows_checkout / "ouroboros" / "agent_task_pipeline.py": tree}, {})
+    assert sites["spelled_once"] == ("ouroboros/agent_task_pipeline.py:2",)
+
+
+def test_allowlist_entries_stay_emitted(event_index):
     """An allowlist row for a type nobody emits any more is stale."""
-    emitted = _emitted_types()
+    emitted = event_index.emitted
     stale = ALLOWLIST - set(emitted)
     assert not stale, f"ALLOWLIST rows no longer emitted anywhere: {stale}"
 
 
-def test_previously_dropped_types_are_registered():
+def test_worker_input_commands_are_not_supervisor_events(event_index):
+    """The idle probe goes in on ``in_q``; only its answer is a supervisor event."""
+    commands, emitted, registered = event_index.commands, event_index.emitted, event_index.registered
+    assert "worker_quiescence" in commands and "worker_quiescence" not in emitted
+    assert "worker_quiescence" not in registered | ALLOWLIST
+    assert "worker_quiescent" in emitted and "worker_quiescent" in registered
+
+
+def test_previously_dropped_types_are_registered(event_index):
     """The concrete v6.69.0-class omissions stay fixed."""
-    registered = _registered_types()
+    registered = event_index.registered
     for event_type in (
         "review_wave_budget_partial_unknown",
         "task_message_injected",
-        "advisory_suspect_result",
-        "advisory_contract_warning",
         "plan_task_deadline_skip",
     ):
         assert event_type in registered, event_type

@@ -9,15 +9,69 @@ module owns that translation and the client whose auth the library refreshes.
 
 from __future__ import annotations
 
+import contextvars
 import json
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 
+from ouroboros.deadline_utils import physical_dispatch_timeout
+from ouroboros.model_concurrency import limit_physical_send
+
+from ouroboros.event_usage import REPORTED_TOKENS_KEY, token_count
 from ouroboros.llm_attempt import (
     _attempt_request,
     _candidate_before_dispatch,
     _execute_candidate,
     _physical_candidate,
+    attach_processing_receipt,
+    bound_reply_allowance,
 )
+
+log = logging.getLogger(__name__)
+
+# True only while one accounted ``client.chat`` runs on its sender thread.
+_ACCOUNTED_SEND: contextvars.ContextVar[bool] = contextvars.ContextVar("gigachat_accounted_send", default=False)
+
+
+def _bound_library_request(request: Any) -> None:
+    """httpx request hook: narrow each library request of an accounted send as it starts (#572).
+
+    The library takes its socket timeout (the caller's, else its own default) when
+    it builds its HTTP clients and sends none per request, while one
+    ``client.chat`` may make several requests: an OAuth token request, the chat
+    request and, after a 401, another token request and the same sealed bytes
+    again. Each keeps that timeout narrowed to the caller's bounds left as it
+    starts; a spent window or a Stop refuses it before its bytes. The value bounds
+    each socket wait (connect, write, every read), not a request's total wall time.
+    Requests outside an accounted send are untouched.
+    """
+    if not _ACCOUNTED_SEND.get():
+        return
+    import httpx
+
+    request.extensions["timeout"] = physical_dispatch_timeout(
+        httpx.Timeout(**request.extensions["timeout"])).as_dict()
+
+
+def _bind_library_requests(client: Any) -> Any:
+    """Hook the private HTTP clients the library builds lazily, ``_client`` and ``_auth_client``.
+
+    Consumer-proven on the pinned ``gigachat`` 0.2.3 only. A synthetic stand-in
+    without them keeps its construction timeout. A library client without them is
+    logged as a gap: caller deadlines then narrow none of its socket timeouts.
+    """
+    bound = 0
+    for name in ("_client", "_auth_client"):
+        http = getattr(client, name, None)
+        hooks = getattr(http, "event_hooks", None)
+        if isinstance(hooks, dict):
+            if _bound_library_request not in hooks.get("request", ()):
+                http.event_hooks = {**hooks, "request": [*hooks.get("request", ()), _bound_library_request]}
+            bound += 1
+    if bound < 2 and type(client).__module__.split(".")[0] == "gigachat":
+        log.warning("GigaChat library client %s exposes %d of 2 HTTP clients: caller deadlines do not narrow "
+                    "the socket timeouts of the rest, which keep their construction values", type(client).__name__, bound)
+    return client
 
 
 class _GigaChatLaneMixin:
@@ -44,6 +98,11 @@ class _GigaChatLaneMixin:
             "scope": str(target.get("scope") or "GIGACHAT_API_PERS"),
             "verify_ssl_certs": bool(target.get("verify_ssl_certs", True)),
         }
+        from ouroboros.net_transport import extra_ca_bundle
+
+        bundle = extra_ca_bundle()
+        if bundle:
+            kwargs["ca_bundle_file"] = bundle
         for source, destination in (
             ("api_key", "credentials"), ("user", "user"), ("password", "password"),
             ("base_url", "base_url"),
@@ -70,10 +129,17 @@ class _GigaChatLaneMixin:
         exchanges these for a short-lived access token and refreshes it
         automatically, so caching the client across calls is safe. Any other
         ``GIGACHAT_*`` setting present in the environment (e.g.
-        ``GIGACHAT_PROFANITY_CHECK``) is picked up by the library itself.
+        ``GIGACHAT_PROFANITY_CHECK``) is picked up by the library itself —
+        except transport retries: ``max_retries=0`` is passed explicitly (an
+        init argument outranks ``GIGACHAT_MAX_RETRIES``), because one
+        ``client.chat`` is one accounted physical attempt and a retry belongs
+        to the host's own ladder, re-prepared and re-measured. The library's
+        re-send after a 401 (token reset, then the same call) has no switch;
+        it repeats the sealed bytes of the same attempt.
         A caller-supplied per-request ``timeout`` becomes part of the cache key
         (the library takes it at construction), so the safety-supervisor timeout
-        SSOT bounds this lane too (v6.54.3)."""
+        SSOT bounds this lane too (v6.54.3); each request of a send is further
+        narrowed to the caller's absolute bounds (``_bound_library_request``)."""
         credentials = str(target.get("api_key") or "")
         user = str(target.get("user") or "")
         password = str(target.get("password") or "")
@@ -81,10 +147,13 @@ class _GigaChatLaneMixin:
         base_url = str(target.get("base_url") or "")
         verify = bool(target.get("verify_ssl_certs", True))
         timeout_key = float(timeout) if timeout and timeout > 0 else None
-        cache_key = (credentials, user, password, scope, base_url, verify, timeout_key)
+        from ouroboros.net_transport import extra_ca_bundle
+
+        cache_key = (credentials, user, password, scope, base_url, verify, timeout_key, extra_ca_bundle())
 
         if cache_key not in self._gigachat_clients:
-            self._gigachat_clients[cache_key] = self._new_gigachat_client(target, timeout=timeout)
+            self._gigachat_clients[cache_key] = _bind_library_requests(
+                self._new_gigachat_client(target, timeout=timeout, max_retries=0))
         return self._gigachat_clients[cache_key]
 
     @staticmethod
@@ -99,11 +168,12 @@ class _GigaChatLaneMixin:
             for block in content:
                 if isinstance(block, dict):
                     if str(block.get("type") or "") in ("image_url", "image"):
-                        # Explicit placeholder instead of a silent drop: the
-                        # model (and the transcript reader) must know an image
-                        # was present but not deliverable on this lane.
-                        caption = str(block.get("_caption") or "").strip()
-                        parts.append(f"[image omitted: model has no vision{f' — {caption}' if caption else ''}]")
+                        # Explicit marker instead of a silent drop: the model
+                        # (and the transcript reader) must know an image was
+                        # present but our lane, not the model, could not carry it.
+                        from ouroboros.llm_messages import own_lane_image_marker
+
+                        parts.append(own_lane_image_marker("GigaChat", str(block.get("_caption") or "").strip()))
                         continue
                     parts.append(str(block.get("text", "")))
                 else:
@@ -220,6 +290,7 @@ class _GigaChatLaneMixin:
         # no_proxy (a macOS fork-safety flag for the OpenAI/requests paths) does
         # not apply here.
         del no_proxy
+        target["requested_reasoning_effort"] = reasoning_effort
 
         client = self._get_gigachat_client(target, timeout=timeout)
 
@@ -242,11 +313,25 @@ class _GigaChatLaneMixin:
         # hidden reasoning and return empty content/tool_calls when
         # reasoning_effort is sent. Keep the native path deterministic.
 
-        candidate = _physical_candidate(payload)
+        from ouroboros.send_clock import stamp_clock_note
+
+        # This lane bypasses the wire finalizer, so its Main clock line joins here,
+        # before measurement and sealing. The library's transport retries are off
+        # (``_get_gigachat_client``); its one re-send after a 401 repeats these
+        # sealed bytes inside the same attempt and claims no fresher clock.
+        candidate = bound_reply_allowance(target, _physical_candidate(stamp_clock_note(payload)))
         request = _attempt_request(target, candidate, source="llm.gigachat")
+
+        def send():
+            token = _ACCOUNTED_SEND.set(True)
+            try:
+                return client.chat(candidate)
+            finally:
+                _ACCOUNTED_SEND.reset(token)
+
         completion = _execute_candidate(
             request,
-            lambda: client.chat(candidate),
+            limit_physical_send(target, send),
             _candidate_before_dispatch(candidate, request),
         )
         return self._normalize_gigachat_response(completion, target)
@@ -302,11 +387,21 @@ class _GigaChatLaneMixin:
             "resolved_model": str(target.get("usage_model") or target.get("resolved_model") or ""),
             "cost": None,
             "cost_final": False,
+            # The counters above keep their billing shape; events read what was REPORTED (#1578).
+            REPORTED_TOKENS_KEY: {name: token_count(getattr(usage_obj, attr, None)) for name, attr in (
+                ("prompt_tokens", "prompt_tokens"), ("completion_tokens", "completion_tokens"),
+                ("cached_tokens", "precached_prompt_tokens"))},
         }
+        # The provider's cut marker survives normalization: consolidation refuses
+        # a clipped correction by usage.response_finish_reason on every lane.
+        finish_reason = getattr(first, "finish_reason", None) if first is not None else None
+        if isinstance(finish_reason, str) and finish_reason.strip():
+            usage["response_finish_reason"] = finish_reason.strip()[:64]
 
         if target.get("processing_preference"):
             from ouroboros._usage_response import processing_receipt
 
             usage["processing"] = processing_receipt(
                 "gigachat", usage, requested=target["processing_preference"])
+        attach_processing_receipt(target, usage)
         return message, usage

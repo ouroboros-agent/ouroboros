@@ -1,11 +1,29 @@
 import { escapeHtmlAttr, escapeHtmlText as escapeHtml } from './utils.js';
+import { tr, fmt } from './i18n.js';
+import { hostRowDisplayText } from './host_notice_text.js';
+import { strokeIcon } from './page_icons.js';
 import { showToast } from './toast.js';
-import { downloadViaHostBridge, normalizeTone, openViaHostBridge } from './ui_helpers.js';
+import { copyTextToClipboard, downloadViaHostBridge, normalizeTone, openViaHostBridge } from './ui_helpers.js';
 import { MAX_LINK_ACTIONS } from './api_types.js';
 import { apiFetch, taskArtifactDownloadUrl } from './api_client.js';
 import { bindMenu } from './ui_interactions.js';
 import { stampHistoryNode } from './chat_history_replay.js';
 import { isFileDrag } from './chat_activity.js';
+import { buildAttachmentBlock } from './chat_attachments.js';
+import { createDocumentReader, documentReaderKind } from './document_reader.js';
+import { createChatCards } from './chat_cards.js';
+import { recordCardSource } from './message_actions.js';
+
+// Player controls draw the house stroke vectors; each button's aria-label names its
+// current action and is rewritten with the icon whenever the state flips.
+const SPEAKER_PATH = '<path d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z"></path>';
+const MEDIA_ICONS = {
+    play: strokeIcon('<polygon points="6 3 20 12 6 21 6 3"></polygon>', 16),
+    pause: strokeIcon('<rect x="14" y="4" width="4" height="16" rx="1"></rect><rect x="6" y="4" width="4" height="16" rx="1"></rect>', 16),
+    volume: strokeIcon(`${SPEAKER_PATH}<path d="M16 9a5 5 0 0 1 0 6"></path><path d="M19.364 18.364a9 9 0 0 0 0-12.728"></path>`, 16),
+    muted: strokeIcon(`${SPEAKER_PATH}<line x1="22" x2="16" y1="9" y2="15"></line><line x1="16" x2="22" y1="9" y2="15"></line>`, 16),
+    fullscreen: strokeIcon('<path d="M8 3H5a2 2 0 0 0-2 2v3"></path><path d="M21 8V5a2 2 0 0 0-2-2h-3"></path><path d="M3 16v3a2 2 0 0 0 2 2h3"></path><path d="M16 21h3a2 2 0 0 0 2-2v-3"></path>', 16),
+};
 
 const MIME_RE = /^[A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+$/;
 const BASE64_RE = /^[A-Za-z0-9+/=\s]+$/;
@@ -48,6 +66,11 @@ function fileExtension(filename) {
     return match ? match[1].slice(0, 10).toUpperCase() : 'FILE';
 }
 
+// A card the reader opens names what it does: Read a document, View an image.
+function readLabelHtml(kind) {
+    return `<span class="chat-file-more is-read">${escapeHtml(kind === 'image' ? tr('media.view', 'View') : tr('media.read', 'Read'))}</span>`;
+}
+
 function formatDuration(seconds) {
     const total = Number.isFinite(Number(seconds)) ? Math.max(0, Math.floor(Number(seconds))) : 0;
     const hours = Math.floor(total / 3600);
@@ -77,7 +100,8 @@ export function showTaskIncidentToast(msg) {
     // a wait is a warning, an exhaustion or a cancellation fault is the alarm.
     // No tone on the frame (older producers, cancellation_fault) keeps the
     // alarm tone; the text is never parsed for it.
-    return showToast(String(msg?.content || msg?.text || incident), normalizeTone(msg?.toast_tone || 'error', 'error'));
+    const text = String(msg?.content || msg?.text || incident);
+    return showToast(hostRowDisplayText({ ...msg, text }), normalizeTone(msg?.toast_tone || 'error', 'error'), { haptic: false });
 }
 
 // Best-effort teardown of temporary uploads after a failed send; lives with
@@ -115,9 +139,30 @@ export function safeHttpUrl(value) {
     }
 }
 
+// Host-held source attribution belongs to the voice line, never the author's words.
+export function decorateContactSource(bubble, contact) {
+    const sender = bubble.querySelector('.sender');
+    if (!sender || !contact?.task_id || !contact.binding_id || !contact.source_event_id) return;
+    const href = safeHttpUrl(contact.url);
+    const source = document.createElement(href ? 'a' : 'span');
+    source.dataset.contactSource = contact.task_id;
+    // A label stored before its connector stopped doubling its word reads once ("Telegram · Telegram · …").
+    source.textContent = String(contact.label || tr('Connected place')).split(' · ').filter((part, i, all) => part !== all[i - 1]).join(' · ');
+    source.title = fmt('Source work: {task_id}', { task_id: contact.task_id });
+    if (href) {
+        source.className = 'md-link';
+        source.href = href;
+        source.target = '_blank';
+        source.rel = 'noopener noreferrer';
+    }
+    const separator = document.createElement('span');
+    separator.textContent = ' · ';
+    sender.append(separator, source);
+}
+
 export function bindComposerFileTargets({ page, inputArea, input, stagePendingFiles }) {
-    // The two implicit routes a file takes into the composer beside the
-    // paperclip: an image pasted into the textarea, and a file dropped
+    // The two implicit routes a file takes into the composer beside
+    // "+" → Attach file: an image pasted into the textarea, and a file dropped
     // anywhere on the page. Both end in the caller's local stager, so
     // nothing uploads before Send, and the drop target is the whole page
     // while only the input area shows the active state.
@@ -174,12 +219,14 @@ export function bindComposerFileTargets({ page, inputArea, input, stagePendingFi
 }
 
 export function createChatMedia({
-    chatSessionId,
     durableChatMediaUrl,
     formatMsgTime,
     insertMessageNode,
     senderLabel,
     stampNodeTimestamp,
+    onDomWrite = (mutate) => mutate(),
+    replies = null,
+    composer = () => null,
 }) {
     const disposers = new Set();
     const resourceOwners = new Map();
@@ -192,15 +239,26 @@ export function createChatMedia({
     const fileGroups = new Map();
     let fileDialog = null;
     let dialogFile = null;
+    let dialogOwner = null;  // the card's item (buildGallery may move it to an earlier group): releasing it or its holder closes the dialog
+    // An overlay a row's action opened over the room (Share's sheet): it closes with the room's reader (closeTransient),
+    // with its row (release) and with the room (reset, destroy).
+    const transients = new Map();  // close -> its row
     let destroyed = false;
+    // Living cards are delivered rows too: Copy takes their fallback text, Reply their row address, Share the card
+    // itself (chat_cards.js), with this room's hold on its sheet.
+    const cards = createChatCards({ frameNode: bubbleFrameNode, composer, onDomWrite, decorate(bubble, msg, text, describe) {
+        attachCopyControl(bubble, () => bubble.dataset.rowWords ?? text);  // a replaced card's words are its new ones
+        if (describe) recordCardSource(bubble, describe, (close) => holdTransient(bubble, close));
+        replies?.decorate(bubble, msg);
+    } });
+
+    // A disposer owned like a listener (a late answer's end too): its owner's release, reset or destroy runs it.
+    function own(dispose, owner) { disposers.add(dispose); resourceOwners.set(dispose, owner); return dispose; }
 
     function listen(target, type, handler, options, owner = target) {
         if (!target) return () => {};
         target.addEventListener(type, handler, options);
-        const dispose = () => target.removeEventListener(type, handler, options);
-        disposers.add(dispose);
-        resourceOwners.set(dispose, owner);
-        return dispose;
+        return own(() => target.removeEventListener(type, handler, options), owner);
     }
 
     function later(handler, delay, owner = null) {
@@ -217,11 +275,7 @@ export function createChatMedia({
 
     function messageSender(msg, role) {
         return role === 'user'
-            ? senderLabel('user', false, '', {
-                source: msg.source || '',
-                senderLabel: msg.sender_label || '',
-                senderSessionId: msg.sender_session_id || '',
-            }, chatSessionId)
+            ? senderLabel('user', false, '', { source: msg.source || '', senderLabel: msg.sender_label || '' })
             : 'Ouroboros';
     }
 
@@ -239,7 +293,10 @@ export function createChatMedia({
             ${bodyHtml}
             ${timeHtml}
         `;
+        decorateContactSource(bubble, msg.presence_contact || msg.quiz?.presence_contact);
         stampNodeTimestamp(bubble, rawTs);
+        // The row's address makes a delivered photo, file, link card or question a reply target (CONTRACTS K6).
+        if (msg.row_address) bubble.dataset.rowAddress = String(msg.row_address);
         if (msg.history_id) bubble.dataset.historyId = msg.history_id;
         if (msg.history_position) {
             bubble.dataset.historySource = msg.history_position.source;
@@ -248,10 +305,19 @@ export function createChatMedia({
         return bubble;
     }
 
-    function bubbleFrameNode(msg, node) {
+    // A Main question's Project reference joins `Ouroboros` on the voice line (DESIGN "Quiz card").
+    function bubbleFrameNode(msg, node, { voice = [] } = {}) {
         const bubble = bubbleFrame(msg, '');
+        // The frame's own sender and time, read before the node joins them.
+        const sender = bubble.querySelector('.sender');
         const time = bubble.querySelector('.msg-time');
-        if (time) bubble.insertBefore(node, time); else bubble.append(node);
+        if (time) time.before(node); else bubble.append(node);
+        if (voice.length) {
+            const wrap = document.createElement('div');
+            wrap.className = 'chat-bubble-voice';
+            if (sender) { sender.before(wrap); wrap.append(sender); } else bubble.append(wrap);
+            wrap.append(...voice);
+        }
         return bubble;
     }
 
@@ -292,11 +358,17 @@ export function createChatMedia({
         const base64 = cleanBase64(msg.file_base64);
         const raw = String(msg.download_url || '');
         let canonical = '';
-        try { canonical = taskArtifactDownloadUrl(msg.task_id, decodeURIComponent(raw.split('/').at(-1))); } catch {}
+        try {
+            const url = new URL(raw, 'https://artifact.invalid');
+            canonical = taskArtifactDownloadUrl(msg.task_id, decodeURIComponent(url.pathname.split('/').at(-1)),
+                url.searchParams.get('relpath') || '');
+        } catch {}
         const durable = raw && (raw === canonical || FILE_URL_RE.test(raw)) ? raw : '';
         return {
             base64,
             durable,
+            // The reader takes only the delivered copy: inline bytes or the immutable artifact route.
+            reader: base64 ? { base64 } : durable && durable === canonical ? { url: durable } : null,
             bridge: compatMediaUrl(msg?.download_url_compat) || durable,
             src: base64 ? `data:${mime};base64,${base64}` : durable,
         };
@@ -335,55 +407,109 @@ export function createChatMedia({
         downloadBlob(await sourceBlob(source, mime), filename);
     }
 
+    // A photo's Open, its menu's and the reader's: a durable photo rides the host-bridge helper
+    // with BOTH addresses (bridge form for the launcher gate, canonical for browsers); a data:
+    // display keeps window.open, whose shell interceptor saves the bytes.
+    async function openImage(sourceRef, display, filename) {
+        if (!sourceRef.durable) {
+            window.open(display, '_blank', 'noopener');
+            return true;
+        }
+        try {
+            await openViaHostBridge(sourceRef.bridge || sourceRef.durable, filename, { browserUrl: sourceRef.durable });
+            return true;
+        } catch (error) {
+            showToast(`Could not open image: ${error?.message || error}`, 'error');
+            return false;
+        }
+    }
+
+    // A photo's Copy, its menu's and the reader's: the image itself on the clipboard.
+    async function copyImage(sourceRef, mime) {
+        try {
+            if (!navigator.clipboard?.write || typeof ClipboardItem !== 'function') {
+                throw new Error('copying images is not available here. Use Open in new tab or Download.');
+            }
+            const blob = await sourceBlob(sourceRef, mime);
+            await navigator.clipboard.write([new ClipboardItem({ [blob.type || mime]: blob })]);
+            showToast('Image copied.', 'ok');
+            return true;
+        } catch (error) {
+            showToast(`Could not copy image: ${error?.message || error}`, 'error');
+            return false;
+        }
+    }
+
+    // The card's Open and Download, shared by the file dialog and the document reader; a photo
+    // (`display`) keeps its own Open, and an image in the reader the photo's Copy.
+    const fileActions = {
+        async open(file) {
+            if (file.display) return openImage(file.source, file.display, file.filename);
+            try {
+                await openViaHostBridge(file.source.bridge || file.source.durable, file.filename, { browserUrl: file.source.durable });
+                return true;
+            } catch (error) {
+                showToast(`Could not open file: ${error?.message || error}`, 'error');
+                return false;
+            }
+        },
+        async download(file) {
+            try {
+                await downloadSource(file.source, file.filename, file.mime);
+                return true;
+            } catch (error) {
+                showToast(`Could not download file: ${error?.message || error}`, 'error');
+                return false;
+            }
+        },
+        copy: (file) => copyImage(file.source, file.mime),
+    };
+    const reader = createDocumentReader({ actions: fileActions, formatSize: humanSize });
+
+    // The reader over the chat for a card or photo tile; it is the one transient, so a file dialog closes first.
+    function openReader(file, owner, trigger, event) {
+        closeFileDialog();
+        return reader.open(file, { owner, returnFocus: trigger, pointer: event?.detail > 0 });
+    }
+
     function ensureFileDialog() {
         if (fileDialog) return fileDialog;
         fileDialog = document.createElement('dialog');
         fileDialog.className = 'chat-file-dialog';
         fileDialog.innerHTML = `
             <form method="dialog" class="chat-file-dialog-panel">
-                <div class="chat-file-dialog-title"></div>
+                <div class="chat-file-dialog-title" data-i18n-authored></div>
                 <div class="chat-file-dialog-actions">
-                    <button type="button" data-file-action="open">Open</button>
-                    <button type="button" data-file-action="download">Download</button>
-                    <button type="button" data-file-action="close">Close</button>
+                    <button type="button" class="btn btn-default" data-file-action="open">Open</button>
+                    <button type="button" class="btn btn-default" data-file-action="download">Download</button>
+                    <button type="button" class="btn btn-default" data-file-action="close">Close</button>
                 </div>
             </form>`;
         document.body.appendChild(fileDialog);
-        const close = () => {
-            dialogFile = null;
-            if (typeof fileDialog.close === 'function') fileDialog.close();
-            else fileDialog.removeAttribute('open');
-        };
-        listen(fileDialog.querySelector('[data-file-action="close"]'), 'click', close);
-        listen(fileDialog, 'cancel', close);
+        listen(fileDialog.querySelector('[data-file-action="close"]'), 'click', closeFileDialog);
+        listen(fileDialog, 'cancel', closeFileDialog);
         listen(fileDialog.querySelector('[data-file-action="open"]'), 'click', async () => {
-            if (!dialogFile?.source.durable) return;
-            try {
-                await openViaHostBridge(
-                    dialogFile.source.bridge || dialogFile.source.durable,
-                    dialogFile.filename,
-                    { browserUrl: dialogFile.source.durable },
-                );
-                close();
-            } catch (error) {
-                showToast(`Could not open file: ${error?.message || error}`, 'error');
-            }
+            if (dialogFile?.source.durable && await fileActions.open(dialogFile)) closeFileDialog();
         });
         listen(fileDialog.querySelector('[data-file-action="download"]'), 'click', async () => {
-            if (!dialogFile) return;
-            try {
-                await downloadSource(dialogFile.source, dialogFile.filename, dialogFile.mime);
-                close();
-            } catch (error) {
-                showToast(`Could not download file: ${error?.message || error}`, 'error');
-            }
+            if (dialogFile && await fileActions.download(dialogFile)) closeFileDialog();
         });
         return fileDialog;
     }
 
-    function openFileDialog(file) {
+    function closeFileDialog() {
+        dialogFile = null;
+        dialogOwner = null;
+        if (!fileDialog) return;
+        if (typeof fileDialog.close === 'function') fileDialog.close();
+        else fileDialog.removeAttribute('open');
+    }
+
+    function openFileDialog(file, owner = null) {
+        reader.close({ restoreFocus: false });
         const dialog = ensureFileDialog();
         dialogFile = file;
+        dialogOwner = owner;
         dialog.querySelector('.chat-file-dialog-title').textContent = file.filename;
         const open = dialog.querySelector('[data-file-action="open"]');
         open.hidden = !file.source.durable;
@@ -410,17 +536,41 @@ export function createChatMedia({
             time.textContent = `${formatDuration(current)} / ${formatDuration(duration)}`;
         };
         const syncPlay = () => {
-            play.textContent = media.paused ? '▶' : '❚❚';
-            play.setAttribute('aria-label', media.paused ? 'Play' : 'Pause');
+            play.innerHTML = media.paused ? MEDIA_ICONS.play : MEDIA_ICONS.pause;
+            play.setAttribute('aria-label', media.paused ? tr('media.play', 'Play') : tr('media.pause', 'Pause'));
         };
-        const toggle = async () => {
+        let playIntent = 0;
+        const isCurrentPlay = (intent) => intent === playIntent && playerRegistry.has(media);
+        const requestPlay = async (restart = false) => {
+            const intent = ++playIntent;
             try {
-                if (media.paused) await media.play();
-                else media.pause();
-                syncPlay();
+                if (media.error) {
+                    const position = restart ? 0 : media.currentTime;
+                    const rate = media.playbackRate;
+                    // A failed resource stays failed until explicitly reloaded. Keep
+                    // load and play in this user gesture, never in an error retry loop.
+                    media.load();
+                    media.playbackRate = rate;
+                    if (Number.isFinite(position) && position > 0) media.currentTime = position;
+                }
+                if (restart) media.currentTime = 0;
+                await media.play();
+                if (isCurrentPlay(intent)) syncPlay();
             } catch (error) {
-                showToast(`Could not play media: ${error?.message || error}`, 'error');
+                if (isCurrentPlay(intent)) {
+                    // WebKit can leave a rejected play unpaused; restore the
+                    // control without initiating another attempt.
+                    if (media.error) media.pause();
+                    syncPlay();
+                    showToast(`Could not play media: ${error?.message || error}`, 'error');
+                }
             }
+        };
+        const toggle = () => {
+            if (media.paused || media.error) return requestPlay();
+            playIntent += 1;
+            media.pause();
+            syncPlay();
         };
         listen(play, 'click', toggle);
         if (!audio) listen(media, 'click', toggle);
@@ -447,15 +597,11 @@ export function createChatMedia({
             media.playbackRate = Number(rates.value) || 1;
             speed.textContent = `×${media.playbackRate}`;
         });
-        if (repeat) listen(repeat, 'click', async () => {
-            media.currentTime = 0;
-            try { await media.play(); } catch {}
-            syncPlay();
-        });
+        if (repeat) listen(repeat, 'click', () => requestPlay(true));
         if (mute) listen(mute, 'click', () => {
             media.muted = !media.muted;
-            mute.textContent = media.muted ? '🔇' : '🔊';
-            mute.setAttribute('aria-label', media.muted ? 'Unmute' : 'Mute');
+            mute.innerHTML = media.muted ? MEDIA_ICONS.muted : MEDIA_ICONS.volume;
+            mute.setAttribute('aria-label', media.muted ? tr('media.unmute', 'Unmute') : tr('media.mute', 'Mute'));
         });
         if (fullscreen) listen(fullscreen, 'click', async () => {
             try {
@@ -484,38 +630,47 @@ export function createChatMedia({
             ? `<audio preload="metadata" src="${escapeHtmlAttr(src)}"></audio>`
             : `<video preload="metadata" src="${escapeHtmlAttr(src)}" playsinline></video>`;
         const videoControls = audio ? '' : `
-            <button type="button" data-media-action="speed" aria-label="Cycle playback speed">×1</button>
-            <select class="chat-media-rate-menu" aria-label="Playback speed">
+            <button type="button" class="btn btn-default btn-sm" data-media-action="speed" aria-label="${escapeHtmlAttr(tr('media.cycle_speed', 'Cycle playback speed'))}">×1</button>
+            <select class="chat-media-rate-menu" aria-label="${escapeHtmlAttr(tr('media.playback_speed', 'Playback speed'))}">
                 ${SPEEDS.map((rate) => `<option value="${rate}">×${rate}</option>`).join('')}
             </select>
-            <button type="button" data-media-action="repeat" aria-label="Repeat">↻</button>
-            <button type="button" data-media-action="mute" aria-label="Mute">🔊</button>
-            <button type="button" data-media-action="fullscreen" aria-label="Enter fullscreen">⛶</button>`;
+            <button type="button" class="btn btn-default btn-sm" data-media-action="repeat" aria-label="${escapeHtmlAttr(tr('media.repeat', 'Repeat'))}">↻</button>
+            <button type="button" class="btn btn-default btn-sm" data-media-action="mute" aria-label="${escapeHtmlAttr(tr('media.mute', 'Mute'))}">${MEDIA_ICONS.volume}</button>
+            <button type="button" class="btn btn-default btn-sm" data-media-action="fullscreen" aria-label="${escapeHtmlAttr(tr('media.enter_fullscreen', 'Enter fullscreen'))}">${MEDIA_ICONS.fullscreen}</button>`;
         return `<div class="chat-media-player${audio ? ' is-audio' : ''}">
             ${title ? `<div class="chat-media-title">${escapeHtml(title)}</div>` : ''}
             <div class="chat-media-stage">${media}</div>
             <div class="chat-media-controls">
-                <button type="button" data-media-action="play" aria-label="Play">▶</button>
-                <input class="chat-media-progress" type="range" min="0" max="100" value="0" step="0.1" aria-label="Media progress">
+                <button type="button" class="btn btn-default btn-sm" data-media-action="play" aria-label="${escapeHtmlAttr(tr('media.play', 'Play'))}">${MEDIA_ICONS.play}</button>
+                <input class="chat-media-progress" type="range" min="0" max="100" value="0" step="0.1" aria-label="${escapeHtmlAttr(tr('media.progress', 'Media progress'))}">
                 <span class="chat-media-time">0:00 / 0:00</span>
                 ${videoControls}
-                <button type="button" data-media-action="download" aria-label="Download media">↓</button>
+                <button type="button" class="btn btn-default btn-sm" data-media-action="download" aria-label="${escapeHtmlAttr(tr('media.download_media', 'Download media'))}">↓</button>
             </div>
         </div>`;
     }
 
     function photoActionsHtml() {
         return `<details class="chat-photo-actions">
-            <summary aria-label="Photo actions" aria-haspopup="menu" aria-expanded="false">•••</summary>
-            <div class="chat-photo-menu ui-popup" role="menu" aria-label="Photo actions" hidden>
-                <button type="button" role="menuitem" data-photo-action="open">Open in new tab</button>
-                <button type="button" role="menuitem" data-photo-action="download">Download</button>
-                <button type="button" role="menuitem" data-photo-action="copy">Copy to clipboard</button>
+            <summary class="btn btn-float btn-sm" aria-label="${escapeHtmlAttr(tr('media.photo_actions', 'Photo actions'))}" aria-haspopup="menu" aria-expanded="false">•••</summary>
+            <div class="chat-photo-menu ui-popup" role="menu" aria-label="${escapeHtmlAttr(tr('media.photo_actions', 'Photo actions'))}" hidden>
+                <button type="button" role="menuitem" data-photo-action="view">${escapeHtml(tr('media.view', 'View'))}</button>
+                <button type="button" role="menuitem" data-photo-action="open">${escapeHtml(tr('media.open_in_new_tab', 'Open in new tab'))}</button>
+                <button type="button" role="menuitem" data-photo-action="download">${escapeHtml(tr('media.download', 'Download'))}</button>
+                <button type="button" role="menuitem" data-photo-action="copy">${escapeHtml(tr('media.copy_to_clipboard', 'Copy to clipboard'))}</button>
             </div>
         </details>`;
     }
 
-    function wirePhotoActions(item, source, sourceRef, filename, mime) {
+    // A photo tile: the image is its own button, which opens it in the reader; `•••` keeps the explicit
+    // actions and View, the same opener, for a photo so small that `•••` covers it.
+    function photoHtml(src, alt, attrs = '') {
+        return `<button type="button" class="chat-photo-open" aria-haspopup="dialog"><img class="chat-photo" src="${escapeHtmlAttr(src)}" alt="${escapeHtmlAttr(alt)}"${attrs}></button>
+            ${photoActionsHtml()}`;
+    }
+
+    // `item` is the tile itself, not its bubble: buildGallery may move it into an earlier bubble's grid.
+    function wirePhotoActions(item, source, sourceRef, filename, mime, { title = '', meta = '' } = {}) {
         const action = (name) => item.querySelector(`[data-photo-action="${name}"]`);
         const details = item.querySelector('.chat-photo-actions');
         const trigger = details.querySelector('summary');
@@ -537,44 +692,26 @@ export function createChatMedia({
             } });
         });
         listen(menu, 'click', (event) => {
-            if (event.target.closest('[data-photo-action]')) binding?.close({ restoreFocus: true });
+            const action = event.target.closest('[data-photo-action]');
+            // View hands focus to the reader; revealing a clipped summary here moves the feed.
+            if (action) binding?.close({ restoreFocus: action.dataset.photoAction !== 'view' });
         }, { capture: true }, item);
         const disposeMenu = () => { binding?.destroy(); menu.remove(); };
         disposers.add(disposeMenu);
         resourceOwners.set(disposeMenu, item);
 
-        // A durable photo rides the host-bridge helper with BOTH addresses
-        // (bridge form for the launcher gate, canonical for browsers); a data:
-        // display keeps window.open, whose shell interceptor saves the bytes.
-        const openPhoto = () => {
-            if (sourceRef.durable) {
-                openViaHostBridge(sourceRef.bridge || sourceRef.durable, filename, { browserUrl: sourceRef.durable })
-                    .catch((error) => showToast(`Could not open image: ${error?.message || error}`, 'error'));
-                return;
-            }
-            window.open(source, '_blank', 'noopener');
-        };
-        listen(item.querySelector('.chat-photo'), 'click', openPhoto);
-        listen(action('open'), 'click', openPhoto, undefined, item);
+        // The tile and the menu's View show the image in the reader, from the very source it displays;
+        // focus goes back to whichever opened it.
+        const tile = item.querySelector('.chat-photo-open');
+        const file = { kind: 'image', src: source, display: source, source: sourceRef, filename, mime, title, meta, canOpen: true };
+        listen(tile, 'click', (event) => openReader(file, item, tile, event), undefined, item);
+        listen(action('view'), 'click', (event) => openReader(file, item, trigger, event), undefined, item);
+        listen(action('open'), 'click', () => openImage(sourceRef, source, filename), undefined, item);
         listen(action('download'), 'click', async () => {
             try { await downloadSource(sourceRef, filename, mime); }
             catch (error) { showToast(`Could not download image: ${error?.message || error}`, 'error'); }
         }, undefined, item);
-        listen(action('copy'), 'click', async () => {
-            try {
-                const blob = await sourceBlob(sourceRef, mime);
-                if (navigator.clipboard?.write && typeof ClipboardItem === 'function') {
-                    await navigator.clipboard.write([new ClipboardItem({ [blob.type || mime]: blob })]);
-                } else if (navigator.clipboard?.writeText) {
-                    await navigator.clipboard.writeText(source);
-                } else {
-                    throw new Error('Clipboard access is unavailable');
-                }
-                showToast('Image copied.', 'ok');
-            } catch (error) {
-                showToast(`Could not copy image: ${error?.message || error}`, 'error');
-            }
-        }, undefined, item);
+        listen(action('copy'), 'click', () => copyImage(sourceRef, mime), undefined, item);
     }
 
     function buildMediaBubble(msg) {
@@ -602,13 +739,13 @@ export function createChatMedia({
         const filename = `image.${mime.split('/')[1]?.split('+')[0] || 'png'}`;
         const body = `<div class="message"><div class="chat-gallery-grid">
             <figure class="chat-gallery-item">
-                <img class="chat-photo" src="${escapeHtmlAttr(source)}" alt="Photo attachment">
-                ${photoActionsHtml()}
+                ${photoHtml(source, 'Photo attachment')}
                 ${caption ? `<figcaption>${escapeHtml(caption)}</figcaption>` : ''}
             </figure>
         </div></div>`;
         const bubble = bubbleFrame(msg, body);
-        wirePhotoActions(bubble, source, mediaSourceRef(msg, source), filename, mime);
+        wirePhotoActions(bubble.querySelector('.chat-gallery-item'), source, mediaSourceRef(msg, source), filename, mime,
+            { title: caption, meta: fileExtension(filename) });
         return bubble;
     }
 
@@ -616,13 +753,18 @@ export function createChatMedia({
         if (destroyed) return null;
         const mime = cleanMime(msg.mime, 'application/octet-stream');
         const source = fileSource(msg, mime);
-        const filename = String(msg.filename || 'file').replace(/[\r\n]+/g, ' ').slice(0, 200);
+        // The type is read from the whole name; only its display is cut.
+        const fullName = String(msg.filename || 'file').replace(/[\r\n]+/g, ' ');
+        const filename = fullName.slice(0, 200);
         const caption = String(msg.caption || '');
         const explicitSize = msg.size_bytes !== null && msg.size_bytes !== undefined
             && msg.size_bytes !== '' && Number.isFinite(Number(msg.size_bytes));
         const size = explicitSize ? Number(msg.size_bytes)
             : source.base64 ? base64Bytes(source.base64) : null;
-        const meta = [fileExtension(filename), humanSize(size)].filter(Boolean).join(' · ');
+        const meta = [fileExtension(fullName), humanSize(size)].filter(Boolean).join(' · ');
+        // Only the delivered copy opens in the reader (a raster image too); any other address keeps the file dialog.
+        const readable = source.reader ? documentReaderKind(fullName, mime) : '';
+        const more = readable ? readLabelHtml(readable) : '<span class="chat-file-more" aria-hidden="true">•••</span>';
         let content;
         if (mime.startsWith('audio/') && source.src) {
             content = playerHtml({ audio: true, src: source.src, title: filename });
@@ -630,13 +772,13 @@ export function createChatMedia({
             const preview = mime.startsWith('image/') && source.src
                 ? `<img class="chat-file-thumb" src="${escapeHtmlAttr(source.src)}" alt="">`
                 : '<span class="chat-file-glyph" aria-hidden="true">▤</span>';
-            content = `<button type="button" class="chat-file-card" ${source.src ? '' : 'disabled'}>
+            content = `<button type="button" class="btn btn-default chat-file-card" aria-haspopup="dialog" ${source.src ? '' : 'disabled'}>
                 ${preview}
                 <span class="chat-file-copy">
                     <span class="chat-file-name">${escapeHtml(filename)}</span>
                     <span class="chat-file-meta">${escapeHtml(meta)}</span>
                 </span>
-                <span class="chat-file-more" aria-hidden="true">•••</span>
+                ${more}
             </button>`;
         }
         const body = `<div class="message"><div class="chat-file-grid">
@@ -649,7 +791,13 @@ export function createChatMedia({
             });
         } else {
             const card = bubble.querySelector('.chat-file-card');
-            if (card && source.src) listen(card, 'click', () => openFileDialog({ source, filename, mime }));
+            // The item, not the bubble: a grouped file moves into an earlier bubble's grid.
+            const item = bubble.querySelector('.chat-file-item');
+            const file = { source, filename, mime, meta, kind: readable, reader: source.reader, src: source.src, size,
+                canOpen: Boolean(source.durable) };
+            if (card && source.src) listen(card, 'click', (event) => (readable
+                ? openReader(file, item, card, event)
+                : openFileDialog(file, item)));
         }
         return bubble;
     }
@@ -724,7 +872,7 @@ export function createChatMedia({
             if (!existing.querySelector('.chat-group-title')) {
                 const title = document.createElement('div');
                 title.className = 'chat-group-title';
-                title.textContent = kind === 'photos' ? 'Multiple images' : 'Multiple files';
+                title.textContent = kind === 'photos' ? tr('media.multiple_images', 'Multiple images') : tr('media.multiple_files', 'Multiple files');
                 grid.before(title);
             }
             stampNodeTimestamp(existing, msg.ts || '', { anchor: true });
@@ -740,6 +888,26 @@ export function createChatMedia({
         return true;
     }
 
+    // The owner's attachments sit above the caption inside the bubble addMessage is
+    // building (DESIGN "Chat attachments"), from these same atoms and disposers; an
+    // empty caption leaves no empty text row (the node stays, hidden, as the anchor
+    // other bubble decorations are placed against).
+    function mountAttachments(bubble, views, caption) {
+        const block = destroyed ? null : buildAttachmentBlock({
+            listen, own, photoHtml, wirePhotoActions, playerHtml, wirePlayer, openFileDialog, openReader, readLabelHtml,
+            humanSize, fileExtension, release, onDomWrite,
+        }, views);
+        const message = block && bubble?.querySelector('.message');
+        if (!message) return false;
+        message.before(block);
+        message.hidden = !caption;
+        bubble.classList.add('has-attachments');
+        // Several photos or a player take the media width; one photo or a card shrinks to fit.
+        bubble.classList.toggle('has-wide-media', Boolean(block.querySelector('.is-multiple')
+            || block.querySelector('.chat-attachment-player')));
+        return true;
+    }
+
     // D12: the standard "two squares" copy icon, always visible on the bubble.
     // Explicit closing tags (no self-closing) keep lightweight DOM stubs happy.
     const COPY_ICON_SVG = '<svg viewBox="0 0 16 16" width="14" height="14" fill="none"'
@@ -749,45 +917,29 @@ export function createChatMedia({
         + '<path d="M10.5 2.5h-6a2 2 0 0 0-2 2v6"></path></svg>';
 
     function attachCopyControl(bubble, rawText) {
-        if (!bubble || !String(rawText || '')) return null;
+        const words = () => String((typeof rawText === 'function' ? rawText() : rawText) || '');
+        if (!bubble || !words()) return null;
         const button = document.createElement('button');
         button.type = 'button';
-        button.className = 'chat-message-copy';
+        button.className = 'chat-message-copy ui-hit-area';
         button.innerHTML = COPY_ICON_SVG;
-        button.title = 'Copy';
-        button.setAttribute('aria-label', 'Copy message');
-        const writeFallback = () => {
-            const area = document.createElement('textarea');
-            area.className = 'chat-copy-fallback';
-            area.value = String(rawText);
-            area.setAttribute('readonly', '');
-            document.body.appendChild(area);
-            try {
-                area.select();
-                const copied = typeof document.execCommand === 'function'
-                    && document.execCommand('copy') === true;
-                if (!copied) throw new Error('Clipboard access is unavailable');
-            } finally {
-                area.remove();
-            }
-        };
+        button.title = tr('code.copy', 'Copy');
+        button.setAttribute('aria-label', tr('media.copy_message', 'Copy message'));
         listen(button, 'click', async () => {
             let ok = true;
             try {
-                if (navigator.clipboard?.writeText) {
-                    try { await navigator.clipboard.writeText(String(rawText)); }
-                    catch { writeFallback(); }
-                } else writeFallback();
+                // The shared write keeps a keyboard owner on Copy and finds the open modal's selection field.
+                await copyTextToClipboard(words(), { anchor: button });
             } catch {
                 ok = false;
             }
             button.textContent = ok ? '✓' : '✗';
-            button.title = ok ? 'Message copied' : 'Copy failed';
-            button.setAttribute('aria-label', ok ? 'Message copied' : 'Copy failed');
+            button.title = ok ? tr('media.message_copied', 'Message copied') : tr('media.copy_failed', 'Copy failed');
+            button.setAttribute('aria-label', ok ? tr('media.message_copied', 'Message copied') : tr('media.copy_failed', 'Copy failed'));
             later(() => {
                 button.innerHTML = COPY_ICON_SVG;
-                button.title = 'Copy';
-                button.setAttribute('aria-label', 'Copy message');
+                button.title = tr('code.copy', 'Copy');
+                button.setAttribute('aria-label', tr('media.copy_message', 'Copy message'));
             }, 1500, button);
         });
         // The bubble class reserves a timestamp gutter under the icon (style.css).
@@ -823,17 +975,44 @@ export function createChatMedia({
         groupingWrappers.clear();
         photoGroups.clear();
         fileGroups.clear();
-        dialogFile = null;
+        closeTransient();
         if (fileDialog) {
             try { fileDialog.remove(); } catch {}
             fileDialog = null;
         }
     }
 
+    // The chat left the screen: the reader or file dialog a card opened closes, nothing else; a room another place
+    // replaces (`pause`) also pauses what plays, each player keeping its place.
+    function closeTransient(pause = false) {
+        closeTransients();
+        reader.close({ restoreFocus: false });
+        closeFileDialog();
+        if (pause) for (const player of playerRegistry) { try { player.pause(); } catch {} }
+    }
+
     // Release only the evicted page's subtree; other media and copy controls
     // keep their listeners, playback, focus and outstanding user actions.
+    /** Hold `close` for an overlay opened from `owner` (a row of this room); returns its release. */
+    function holdTransient(owner, close) {
+        transients.set(close, owner);
+        return () => transients.delete(close);
+    }
+
+    function closeTransients(owns = () => true) {
+        for (const [close, owner] of [...transients]) {
+            if (!owns(owner)) continue;
+            transients.delete(close);
+            try { close(); } catch {}
+        }
+    }
+
     function release(root) {
+        reader.release(root);
+        cards.release(root);
         const owns = (node) => node === root || root?.contains?.(node);
+        closeTransients(owns);
+        if (dialogOwner && owns(dialogOwner)) closeFileDialog();  // no actions on a released message's file
         for (const [dispose, owner] of resourceOwners) if (owns(owner)) {
             try { dispose(); } catch {}
             resourceOwners.delete(dispose);
@@ -857,6 +1036,8 @@ export function createChatMedia({
     function destroy() {
         if (destroyed) return;
         reset();
+        cards.destroy();
+        reader.destroy();
         destroyed = true;
     }
 
@@ -865,7 +1046,6 @@ export function createChatMedia({
         isMyThread,
         hideTypingIndicatorOnly,
         syncChatStatus,
-        incrementUnreadIfNeeded,
         seenMessageKeys,
         rememberMessageKey,
         chatMediaMessageKey,
@@ -874,6 +1054,8 @@ export function createChatMedia({
         applyQuizStateFrame,
         messagesRoot,
         deliverContentMutation = (mutate) => mutate(),
+        // A live question or its lifecycle changed what waits for the owner: the caller re-reads the state.
+        onQuestionFrame = () => {},
     }) {
         const keysFor = (msg, legacy) => ({ legacy, exact: msg.history_id ? `history:${msg.history_id}` : legacy });
         function alreadyRendered(msg, keys) {
@@ -922,13 +1104,31 @@ export function createChatMedia({
         }
         function appendQuizMessage(msg) {
             const quizId = String((msg.quiz && msg.quiz.quiz_id) || msg.quiz_id || '');
-            const key = `quiz:${msg.task_id || ''}:${quizId}`;
+            const keys = keysFor(msg, `quiz:${msg.task_id || ''}:${quizId}`);
             // The decision controller updates the existing keyed card, keeping
-            // drafts/focus when targeted detail and ordinary history overlap.
+            // drafts/focus when targeted detail and ordinary history overlap. A
+            // card first shown live gains the row history names, as media does.
             const bubble = buildQuizCard ? buildQuizCard(msg) : null;
-            if (!bubble) return false;
-            rememberMessageKey(key);
+            if (!bubble) { alreadyRendered(msg, keys); return false; }
+            rememberBubble(bubble, keys);
             return insertMessageNode(bubble) !== false;
+        }
+        function appendCardMessage(msg) {
+            const keys = keysFor(msg, `card:${msg.card?.card_id || ''}`);
+            if (alreadyRendered(msg, keys)) return false;
+            const bubble = cards.buildCard(msg);
+            if (!bubble) return false;
+            rememberBubble(bubble, keys);
+            return insertMessageNode(bubble) !== false;
+        }
+        // One replayed delivery row (a file, photo, video, link card, question or living card), drawn before final
+        // handling: a mid-task delivery cannot finish its task card. False for any other row.
+        const replayed = { document: appendDocumentBubble, links: appendLinksMessage, quiz: appendQuizMessage,
+            card: appendCardMessage, photo: appendMediaBubble, video: appendMediaBubble };
+        function appendDelivery(msg) {
+            const append = Object.hasOwn(replayed, msg?.msg_type || '') ? replayed[msg.msg_type] : null;
+            if (append) append(msg);
+            return Boolean(append);
         }
         // Media frames carry no activity identity: hide the dots row but keep
         // the authoritative active set intact; sync derives the header from it.
@@ -936,32 +1136,44 @@ export function createChatMedia({
             if (!isMyThread(msg)) return;
             hideTypingIndicatorOnly();
             syncChatStatus();
-            if (deliverContentMutation(() => append(msg))) incrementUnreadIfNeeded(msg);
+            deliverContentMutation(() => append(msg));
         };
         for (const type of ['photo', 'video']) onWs(type, deliver(appendMediaBubble));
         onWs('document', deliver(appendDocumentBubble));
         onWs('links', deliver(appendLinksMessage));
-        onWs('quiz', deliver(appendQuizMessage));
+        const question = deliver(appendQuizMessage);
+        onWs('quiz', (msg) => { question(msg); if (isMyThread(msg)) onQuestionFrame(msg); });
+        onWs('card', deliver(appendCardMessage));
+        // A shown card changed (a new body or a recorded press): the existing row only, no unread bump.
+        onWs('card_state', (msg) => deliverContentMutation(() => cards.applyCardState(msg)));
+        onWs('extension_lifecycle', cards.lifecycle);
+        onWs('open', cards.reconnect);
+        onWs('message', cards.relay);
         if (applyQuizStateFrame && messagesRoot) {
             // Lifecycle updates address an EXISTING card by quiz_id — no
             // thread routing, no unread bump, never a new bubble.
-            onWs('quiz_state', (msg) => deliverContentMutation(
-                () => applyQuizStateFrame(messagesRoot(), msg),
-            ));
+            onWs('quiz_state', (msg) => {
+                deliverContentMutation(() => applyQuizStateFrame(messagesRoot(), msg));
+                onQuestionFrame(msg);
+            });
         }
-        return { appendMediaBubble, appendDocumentBubble, appendLinksMessage, appendQuizMessage };
+        return { appendDelivery, appendMediaBubble, appendDocumentBubble, appendLinksMessage, appendQuizMessage, appendCardMessage };
     }
 
     return {
+        openReview: openReader,
         buildMediaBubble,
         buildDocumentBubble,
         buildLinksMessage,
         buildGallery,
         bubbleFrameNode,
         attachCopyControl,
+        mountAttachments,
         wireDeliveries,
         reset,
         release,
+        closeTransient,
+        holdTransient,
         destroy,
     };
 }

@@ -18,7 +18,7 @@ import pytest
 
 from ouroboros import consciousness_authority as ca
 
-AVAILABLE = {"status": "available", "limit_usd": 20.0, "accounted_usd": 4.0, "remaining_usd": 16.0,
+AVAILABLE = {"status": "available", "limit_usd": 20.0, "settled_usd": 4.0, "accounted_usd": 4.0, "remaining_usd": 16.0,
              "unknown_unmetered": 0, "resets_at": ""}
 
 
@@ -78,15 +78,19 @@ def test_max_tasks_zero_means_consciousness_never_starts_tasks(door, monkeypatch
 def test_an_exhausted_allowance_refuses_with_the_window_facts(door, monkeypatch):
     queue, pending, _running = door
     monkeypatch.setattr("ouroboros.consciousness_allowance.allowance_window", lambda root, now=None: {
-        **AVAILABLE, "status": "exhausted", "accounted_usd": 21.5, "remaining_usd": 0.0,
+        **AVAILABLE, "status": "exhausted", "settled_usd": 21.5, "accounted_usd": 25.5, "remaining_usd": 0.0,
+        "reserved_usd": 1.0, "unresolved_upper_bound_usd": 3.0,
         "unknown_unmetered": 1, "resets_at": "2026-09-17T08:00:00+00:00"})
     refused = queue.enqueue_task(_root("c1"))
     assert refused["_admission_blocked"] == "consciousness_allowance_exhausted"
+    # Known spend decides and is called spent; each uncounted part is named beside it (#1487, P8).
     assert refused["_admission_detail"] == (
-        "$21.50 (at least) of $20.00 spent in the last 24 h; resets at 2026-09-17T08:00:00+00:00")
+        "$21.50 (at least) of $20.00 known spend in the last 24 h (plus $1.00 reserved for calls not yet sent; "
+        "up to $3.00 for calls without a known price, not counted); resets at 2026-09-17T08:00:00+00:00")
     assert pending == []
     monkeypatch.setattr("ouroboros.consciousness_allowance.allowance_window", lambda root, now=None: {
-        **AVAILABLE, "status": "exhausted", "limit_usd": 0.0, "accounted_usd": 0.0, "remaining_usd": 0.0})
+        **AVAILABLE, "status": "exhausted", "limit_usd": 0.0, "settled_usd": 0.0, "accounted_usd": 0.0,
+        "remaining_usd": 0.0})
     zero = queue.enqueue_task(_root("c2"))
     assert zero["_admission_blocked"] == "consciousness_allowance_exhausted"
     assert "OUROBOROS_CONSCIOUSNESS_DAILY_USD=0" in zero["_admission_detail"]
@@ -109,7 +113,7 @@ def test_subagents_and_owner_work_pass_the_door_untouched(door, monkeypatch):
     assert "_admission_blocked" not in queue.enqueue_task(child)
     assert child["metadata"]["initiator"] == "consciousness"  # the label rides; the door ignores children
     owner = {"id": "o1", "type": "task", "text": "owner work", "chat_id": 1, "delegation_role": "root",
-             "metadata": {"client_message_id": "cm-1"}}
+             "metadata": {"client_message_id": "cm-1", "work_kind": "owner"}}
     assert "_admission_blocked" not in queue.enqueue_task(owner)
     assert [t["id"] for t in pending] == ["kid", "o1"]
     assert queue.live_consciousness_root_count() == 0

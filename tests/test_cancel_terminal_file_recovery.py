@@ -1,12 +1,12 @@
 """Cancellation completes interrupted file publication before delivery and cleanup."""
-import json
 from types import SimpleNamespace
 
 import pytest
 
 from ouroboros import cancel_intents, headless
 from ouroboros.task_results import load_task_result, write_task_result
-from tests._cancel_intents_shared import qenv  # noqa: F401
+from tests._cancel_intents_shared import qenv, settled_off_loop  # noqa: F401
+from tests._store_shared import read_result, result_signature
 
 
 @pytest.fixture
@@ -57,7 +57,7 @@ def test_cancel_prepares_early_terminal_before_cleanup_and_real_dispatch(split, 
     monkeypatch.setattr(headless, "finalize_task_artifacts", finalize)
     cancel_intents.request_cancel(s.drive, s.task["id"], reason="owner", allow_settled_target=True)
     assert s.q.cancel_task_custody(s.task["id"]) == s.q.CANCEL_ALREADY_SETTLED
-    assert finalized == [s.task["id"]] and not s.child.exists()
+    assert finalized == [s.task["id"]] and s.child.exists()
     for event in s.frames:
         dispatch_event(event, s.ctx)
     assert [e["status"] for e in s.pushed if e.get("type") == "task_done"] == ["completed"]
@@ -69,6 +69,9 @@ def test_cancel_prepares_early_terminal_before_cleanup_and_real_dispatch(split, 
 
     parent = SimpleNamespace(task_id="parent", drive_root=s.drive, budget_drive_root=s.drive, task_metadata={})
     assert "The child answer" in _get_task_result(parent, s.task["id"])
+    assert stored["child_ref_promotion"]["pending_refs"], "cancel and task_done do not wait for historical transfer"
+    headless.retry_child_task_refs(s.drive, s.child, s.task["id"])
+    assert settled_off_loop(s.drive, s.task["id"], s.child)
 
 
 def test_cancel_file_outage_retains_intent_and_retries_dead_worker(split, monkeypatch):
@@ -80,10 +83,47 @@ def test_cancel_file_outage_retains_intent_and_retries_dead_worker(split, monkey
     with monkeypatch.context() as fault:
         fault.setattr(headless, "write_task_result", lambda *_a, **_kw: (_ for _ in ()).throw(OSError("disk full")))
         assert s.q.cancel_task_custody(s.task["id"]) == s.q.CANCEL_FAILED
+        assert not s.state["alive"], "the worker is already dead while file publication is unresolved"
+        from supervisor.events_runtime_controls import _drive_cancel_task_event
+
+        _drive_cancel_task_event({"task_id": s.task["id"]}, s.ctx)
+        assert s.sent == [], "cancel_task drives its intent without writing a chat notice"
     assert s.child.is_dir() and s.frames == [] and s.task["id"] in s.q.RUNNING
     assert cancel_intents.cancel_pending(s.drive, s.task["id"])
     assert s.q.cancel_task_custody(s.task["id"]) == s.q.CANCEL_ALREADY_SETTLED
-    assert s.state["kills"] == 1 and not s.child.exists()
+    assert s.state["kills"] == 1 and s.child.exists()
+    assert load_task_result(s.drive, s.task["id"])["result"] == "Retained child answer"
+    headless.retry_child_task_refs(s.drive, s.child, s.task["id"])
+    assert settled_off_loop(s.drive, s.task["id"], s.child)
+
+
+@pytest.mark.parametrize("cascade", [False, True])
+def test_owner_http_stop_over_a_dead_worker_retains_pending_intent(split, monkeypatch, cascade):
+    """A dead worker with unresolved file publication keeps its recorded Stop pending."""
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from ouroboros.gateway.tasks import api_task_cancel
+
+    s = split
+    write_task_result(s.child, s.task["id"], "completed", result="Retained child answer")
+    write_task_result(s.drive, s.task["id"], "running")  # a settled row would be completion-wins
+    app = Starlette(routes=[Route("/api/tasks/{task_id}/cancel", api_task_cancel, methods=["POST"])])
+    app.state.drive_root = s.drive
+    with monkeypatch.context() as fault, TestClient(app) as client:
+        fault.setattr(headless, "write_task_result", lambda *_a, **_kw: (_ for _ in ()).throw(OSError("disk full")))
+        response = client.post(f"/api/tasks/{s.task['id']}/cancel", json={"cascade": True} if cascade else {})
+    assert not s.state["alive"], "the worker is already dead while file publication is unresolved"
+    assert response.status_code == 202, response.text
+    intent = cancel_intents.active_intent(s.drive, s.task["id"])
+    assert response.json() == {
+        "ok": True, "task_id": s.task["id"], "cancel_state": "pending", "stop_policy": "immediate",
+        "request_id": intent["request_id"], "reason_code": "teardown_unconfirmed",
+        **({"cascade": True} if cascade else {}),
+    }
+    assert cancel_intents.cancel_pending(s.drive, s.task["id"])
+    assert s.q.cancel_task_custody(s.task["id"]) == s.q.CANCEL_ALREADY_SETTLED
     assert load_task_result(s.drive, s.task["id"])["result"] == "Retained child answer"
 
 
@@ -92,13 +132,14 @@ def test_genuinely_ready_current_survives_cancel_byte_identical(split, monkeypat
     write_task_result(s.child, s.task["id"], "completed", result="Accepted answer",
                       review_projection={"panels": [{"panel_id": "paid-PASS", "actors": []}]})
     assert not headless.prepare_terminal_task_files(s.drive, s.task)["error"]
-    before = (s.drive / "task_results" / f'{s.task["id"]}.json').read_bytes()
+    headless.retry_child_task_refs(s.drive, s.child, s.task["id"])
+    before = result_signature(s.drive, s.task["id"])
     write_task_result(s.child, s.task["id"], "completed", result="Stale replica")
     monkeypatch.setattr(headless, "prepare_terminal_task_files", lambda *_a: pytest.fail("accepted CURRENT recopied"))
     cancel_intents.request_cancel(s.drive, s.task["id"], reason="owner", allow_settled_target=True)
     assert s.q.cancel_task_custody(s.task["id"]) == s.q.CANCEL_ALREADY_SETTLED
-    assert (s.drive / "task_results" / f'{s.task["id"]}.json').read_bytes() == before
-    assert json.loads(before)["result"] == "Accepted answer" and not s.child.exists()
+    assert result_signature(s.drive, s.task["id"]) == before
+    assert read_result(s.drive, s.task["id"])["result"] == "Accepted answer" and settled_off_loop(s.drive, s.task["id"], s.child)
 
 
 def test_reconciled_terminal_without_checkpoint_still_needs_real_file_adoption(split):
@@ -118,4 +159,41 @@ def test_reconciled_terminal_without_checkpoint_still_needs_real_file_adoption(s
     assert not headless.prepare_terminal_task_files(s.drive, s.task)["error"]
     adopted = load_task_result(s.drive, s.task["id"])
     assert headless.terminal_task_files_ready(s.drive, s.task, adopted)
-    assert adopted["result"] == projected["result"] and (s.drive / "observability").is_dir()
+    assert adopted["result"] == projected["result"] and not (s.drive / "observability").exists()
+    assert adopted["child_ref_promotion"]["pending_refs"]
+    retained = headless.retry_child_task_refs(s.drive, s.child, s.task["id"])
+    assert not retained["child_ref_promotion"]["pending_refs"] and (s.drive / "observability").is_dir()
+
+
+def test_settled_failed_native_capture_is_not_reprepared(split, monkeypatch):
+    """A settled failed capture stays failed during later dead-worker recovery."""
+    task = {
+        "id": "failed-native",
+        "type": "task",
+        "chat_id": 5,
+        "workspace_root": str(split.drive / "workspace"),
+    }
+    write_task_result(
+        split.drive,
+        task["id"],
+        "failed",
+        result="The worker failed before capture completed",
+        artifact_status="failed",
+        artifact_error="native capture failed",
+        native_capture_pending=True,
+    )
+    finalizer_calls = []
+    monkeypatch.setattr(
+        headless,
+        "finalize_task_artifacts",
+        lambda *_args, **_kwargs: finalizer_calls.append(True),
+    )
+
+    report = headless.prepare_terminal_task_files(split.drive, task)
+    stored = load_task_result(split.drive, task["id"])
+
+    assert report["error"] == ""
+    assert finalizer_calls == []
+    assert stored["status"] == "failed"
+    assert stored["artifact_status"] == "failed"
+    assert stored["native_capture_pending"] is True

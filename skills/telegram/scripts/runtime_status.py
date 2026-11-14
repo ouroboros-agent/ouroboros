@@ -12,7 +12,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from platform_support import path_is_link_or_reparse
+from platform_support import machine_architecture, path_is_link_or_reparse
 
 
 STATUS_SCHEMA = 2
@@ -22,6 +22,7 @@ HEARTBEAT_INTERVAL_SEC = 10.0
 _STATES = {
     "starting",
     "waiting_owner",
+    "waiting_token",
     "reconnecting",
     "verifying",
     "syncing_menu",
@@ -145,7 +146,7 @@ class RuntimeStatus:
             "last_ready_at_epoch": self._last_ready_at_epoch,
             "attempt": self._attempt,
             "next_retry_at_epoch": self._next_retry_at_epoch,
-            "platform": f"{platform.system().lower()}-{platform.machine().lower()}",
+            "platform": f"{platform.system().lower()}-{machine_architecture()}",
         }
         if self._public_url:
             payload["public_url"] = self._public_url

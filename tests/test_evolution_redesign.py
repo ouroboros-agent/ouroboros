@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import pytest
 from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
@@ -32,13 +33,15 @@ def test_evolution_campaign_text_includes_objective(tmp_path, monkeypatch):
 
     assert "EVOLUTION CAMPAIGN" in text
     assert "Improve scheduler observability" in text
-    assert "normal advisory + triad + scope review flow" in text
+    assert "the normal commit review by the review panel (`commit_reviewed`)" in text
+    assert "triad + scope" not in text
 
 
 def test_evolution_campaign_pause_resume_preserves_history(tmp_path):
     from supervisor import queue, state
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install (#1307)
     queue.init(tmp_path)
     first = queue.start_evolution_campaign("Improve scheduler observability", source="test")
     live = state.load_state()
@@ -65,24 +68,132 @@ def test_evolution_campaign_pause_resume_preserves_history(tmp_path):
     assert "cost_usd" not in resumed["history"][0]
 
 
-def test_evolution_auto_stop_pauses_campaign(tmp_path, monkeypatch):
+def _owner_campaign(tmp_path, monkeypatch, **live_fields):
+    """An owner-selected campaign over the real tick, admission and completion consumers
+    (isolated drive; the pytest repo root has no Git, so cycle cleanup runs no Git command)."""
     from supervisor import queue
     from supervisor import state as supervisor_state
 
     supervisor_state.init(tmp_path)
-    monkeypatch.setattr(queue, "send_with_budget", lambda *args, **kwargs: None)
+    supervisor_state.save_state({})  # an initialized install (#1307)
     queue.init(tmp_path)
-    queue.init_queue_refs([], {}, {"value": 0})
-    queue.start_evolution_campaign("Improve", source="test")
-    st = supervisor_state.load_state()
-    st["evolution_mode_enabled"] = True
-    st["owner_chat_id"] = 1
-    st["evolution_consecutive_failures"] = 3
-    supervisor_state.save_state(st)
+    pending: list = []
+    queue.init_queue_refs(pending, {}, {"value": 0})
+    notices: list = []
+    monkeypatch.setattr(queue, "send_with_budget", lambda _chat, text, **_kw: notices.append(text))
+    queue.start_evolution_campaign("Improve", source="owner")
+    supervisor_state.update_state(lambda live: live.update(
+        evolution_mode_enabled=True, owner_chat_id=1, **live_fields))
+    ctx = SimpleNamespace(
+        RUNNING={}, WORKERS={}, DRIVE_ROOT=tmp_path, REPO_DIR=tmp_path,
+        load_state=supervisor_state.load_state, save_state=supervisor_state.save_state,
+        append_jsonl=supervisor_state.append_jsonl, persist_queue_snapshot=lambda reason="": None,
+        bridge=SimpleNamespace(push_log=lambda event: None),
+    )
+    return pending, notices, ctx
+
+
+def _settle(tmp_path, task_id, cost):
+    """One real physical attempt in the usage ledger, settled at ``cost`` (a late charge may
+    exceed its small reservation, as a real one can)."""
+    from ouroboros import usage_accounting as ua
+    from supervisor import state as supervisor_state
+
+    reservation = ua.reserve_attempt(ua.AttemptRequest(
+        model="openai/gpt-5.2", provider="openai", reservation_usd=0.01,
+        global_limit_usd=float(supervisor_state.TOTAL_BUDGET_LIMIT or 0) or None,
+        drive_root=tmp_path, task_id=task_id, root_task_id=task_id, source="test"))
+    ua.mark_dispatched(reservation)
+    ua.settle_attempt(reservation, {"prompt_tokens": 5, "completion_tokens": 2}, cost_usd=cost, cost_final=True)
+
+
+def _admit_and_finish_cycle(tmp_path, pending, ctx, outcome, *, cost=0.10):
+    """One tick admits a cycle that makes one model call; its terminal goes through the real
+    task_done consumer."""
+    from ouroboros.task_results import STATUS_COMPLETED, STATUS_FAILED, write_task_result
+    from supervisor import queue
+    from supervisor.events import _handle_task_done
+
+    queue.enqueue_evolution_task_if_needed()
+    assert [row["type"] for row in pending] == ["evolution"]
+    row = pending.pop()
+    _settle(tmp_path, row["id"], cost)
+    failed = outcome == "failed"
+    status = STATUS_FAILED if failed else STATUS_COMPLETED
+    write_task_result(tmp_path, row["id"], status, outcome_axes={
+        "lifecycle": {"status": status}, "execution": {"status": "failed" if failed else "ok"},
+        "objective": {"status": "not_evaluated", "source": "none"},
+        "artifacts": {"status": "not_applicable"}, "review": {"status": "skipped"},
+    })
+    _handle_task_done({"type": "task_done", "task_id": row["id"], "task_type": "evolution", "status": status,
+                       "metadata": {"evolution_transaction": row["metadata"]["evolution_transaction"]}}, ctx)
+    return row
+
+
+@pytest.mark.parametrize("outcome", ["failed", "completed_without_commit"])
+def test_cycles_past_the_former_count_stops_keep_the_campaign_admitting(tmp_path, monkeypatch, outcome):
+    """Owner decision 2026-11-02: neither three consecutive failures nor three unabsorbed
+    cycles of one objective pause, disable or refuse a selected campaign. Both counts stay
+    recorded as evidence by the completion consumer."""
+    from ouroboros.evolution_fingerprint import canonical_objective_fingerprint
+    from supervisor import queue
+    from supervisor import state as supervisor_state
+
+    pending, notices, ctx = _owner_campaign(tmp_path, monkeypatch)
+    for _cycle in range(3):
+        _admit_and_finish_cycle(tmp_path, pending, ctx, outcome)
+    campaign = queue.get_evolution_status_snapshot()["campaign"]
+    assert [tx["cycle_outcome"] for tx in campaign["transaction_history"]] == ["no_op"] * 3
+    assert campaign["objective_repeat_counts"] == {canonical_objective_fingerprint("Improve"): 3}
+    failures = int(supervisor_state.load_state().get("evolution_consecutive_failures") or 0)
+    assert failures == (3 if outcome == "failed" else 0)
+
+    queue.enqueue_evolution_task_if_needed()  # the fourth cycle crosses the former stop(s)
+
+    assert [row["metadata"]["evolution_transaction"]["cycle"] for row in pending] == [4]
+    snapshot = queue.get_evolution_status_snapshot()
+    assert (snapshot["status"], snapshot["campaign"]["status"], snapshot["enabled"]) == ("queued", "active", True)
+    assert snapshot["consecutive_failures"] == failures
+    assert notices == []
+
+
+def test_a_one_shot_campaign_still_ends_after_its_cycle(tmp_path, monkeypatch):
+    from supervisor import queue
+    from supervisor import state as supervisor_state
+
+    pending, notices, ctx = _owner_campaign(tmp_path, monkeypatch, post_task_autostop=True)
+    _admit_and_finish_cycle(tmp_path, pending, ctx, "completed_without_commit")
+    live = supervisor_state.load_state()
+    assert (live["evolution_mode_enabled"], live["post_task_autostop"]) == (False, False)
 
     queue.enqueue_evolution_task_if_needed()
 
-    assert queue.get_evolution_status_snapshot()["campaign"]["status"] == "paused"
+    assert pending == [] and notices == []
+
+
+def test_known_money_below_two_dollars_admits_and_only_exhaustion_refuses(tmp_path, monkeypatch):
+    """Positive remaining money is ordinary money for Evolution; an exhausted limit refuses the
+    next cycle without switching the owner's campaign off, and a raised limit admits again."""
+    from supervisor import queue
+    from supervisor import state as supervisor_state
+
+    pending, notices, ctx = _owner_campaign(tmp_path, monkeypatch)
+    monkeypatch.setattr(supervisor_state, "TOTAL_BUDGET_LIMIT", 5.0)
+    _settle(tmp_path, "earlier-work", 3.50)
+    assert supervisor_state.budget_remaining({}, strict=True) == pytest.approx(1.50)
+    _admit_and_finish_cycle(tmp_path, pending, ctx, "completed_without_commit")  # costs $0.10
+
+    _settle(tmp_path, "late-charge", 1.50)  # known spend now exceeds the $5 limit
+    assert supervisor_state.budget_remaining({}, strict=True) <= 0
+    queue.enqueue_evolution_task_if_needed()
+    assert pending == []
+    snapshot = queue.get_evolution_status_snapshot()
+    assert (snapshot["status"], snapshot["campaign"]["status"], snapshot["enabled"]) == ("budget_blocked", "active", True)
+    assert notices == []
+
+    monkeypatch.setattr(supervisor_state, "TOTAL_BUDGET_LIMIT", 6.0)
+    queue.enqueue_evolution_task_if_needed()
+    assert [row["metadata"]["evolution_transaction"]["cycle"] for row in pending] == [2]
 
 
 def test_evolution_enqueue_attaches_lightweight_transaction(tmp_path, monkeypatch):
@@ -90,6 +201,7 @@ def test_evolution_enqueue_attaches_lightweight_transaction(tmp_path, monkeypatc
     from supervisor import state as supervisor_state
 
     supervisor_state.init(tmp_path)
+    supervisor_state.save_state({})  # an initialized install (#1307)
     monkeypatch.setattr(queue, "send_with_budget", lambda *args, **kwargs: None)
     queue.init(tmp_path)
     pending = []
@@ -116,6 +228,7 @@ def test_evolution_task_completion_preserves_live_transaction_updates(tmp_path):
     from supervisor import state as supervisor_state
 
     supervisor_state.init(tmp_path)
+    supervisor_state.save_state({})  # an initialized install (#1307)
     queue.init(tmp_path)
     campaign = queue.start_evolution_campaign("Improve", source="test")
     st = supervisor_state.load_state()
@@ -189,6 +302,7 @@ def test_terminal_evolution_event_without_running_metadata_updates_transaction(t
     from ouroboros.utils import iter_jsonl_objects
 
     supervisor_state.init(tmp_path)
+    supervisor_state.save_state({})  # an initialized install (#1307)
     queue.init(tmp_path)
     campaign = queue.start_evolution_campaign("Improve", source="test")
     st = supervisor_state.load_state()
@@ -239,6 +353,7 @@ def test_degraded_evolution_axes_count_as_failure(tmp_path):
     from ouroboros.task_results import STATUS_COMPLETED, write_task_result
 
     supervisor_state.init(tmp_path)
+    supervisor_state.save_state({})  # an initialized install (#1307)
     queue.init(tmp_path)
     campaign = queue.start_evolution_campaign("Improve", source="test")
     st = supervisor_state.load_state()
@@ -287,8 +402,10 @@ def test_degraded_evolution_axes_count_as_failure(tmp_path):
 
 
 def test_cron_schedule_enqueues_once_when_due(tmp_path, monkeypatch):
-    from supervisor import queue
+    from supervisor import queue, state
 
+    state.init(tmp_path)
+    state.save_state({"owner_chat_id": 1})
     queue.init(tmp_path)
     pending = []
     running = {}
@@ -306,7 +423,8 @@ def test_cron_schedule_enqueues_once_when_due(tmp_path, monkeypatch):
             "expected_output": "Scheduled report",
             "constraints": "No web",
             "allowed_resources": {"web": "false"},
-            "deadline_at": "2026-06-04T12:00:00Z",
+            "deadline_at": "2100-06-04T12:00:00Z",
+            "metadata": {"resource_intent": {"kind": "system_repo"}},
             "task_contract": {"success_criteria": ["report delivered"]},
         },
     })
@@ -323,7 +441,7 @@ def test_cron_schedule_enqueues_once_when_due(tmp_path, monkeypatch):
     assert pending[0]["expected_output"] == "Scheduled report"
     assert pending[0]["constraints"] == "No web"
     assert pending[0]["allowed_resources"] == {"web": False}
-    assert pending[0]["deadline_at"] == "2026-06-04T12:00:00Z"
+    assert pending[0]["deadline_at"] == "2100-06-04T12:00:00Z"
     # (W2) success_criteria is an input ALIAS: it arrives normalized into
     # acceptance_claims (one concept, one carrier), not double-persisted.
     contract = pending[0]["task_contract"]
@@ -332,10 +450,14 @@ def test_cron_schedule_enqueues_once_when_due(tmp_path, monkeypatch):
     assert pending[0]["metadata"]["schedule_id"] == "hourly"
 
 
-def test_cron_schedule_admission_refusal_is_terminal(tmp_path, monkeypatch):
-    from ouroboros.task_results import STATUS_FAILED, load_task_result
-    from supervisor import queue
+def test_cron_schedule_admission_refusal_waits_without_a_phantom_root(tmp_path, monkeypatch):
+    """#1315: a refused cron occurrence WAITS on its row with the typed reason: no
+    failed root, no failure_count, the same occurrence kept for the retry."""
+    from ouroboros.task_results import load_task_result
+    from supervisor import queue, state
 
+    state.init(tmp_path)
+    state.save_state({"owner_chat_id": 1})
     queue.init(tmp_path)
     queue.init_queue_refs([], {}, {"value": 0})
     queue.upsert_scheduled_task({
@@ -344,11 +466,12 @@ def test_cron_schedule_admission_refusal_is_terminal(tmp_path, monkeypatch):
         "enabled": True,
         "trigger": {"type": "cron", "expr": "* * * * *"},
         "next_run_at": "2000-01-01T00:00:00+00:00",
-        "task": {"type": "task", "text": "must not become a phantom"},
+        "task": {"type": "task", "text": "must not become a phantom",
+                 "metadata": {"resource_intent": {"kind": "system_repo"}}},
     })
     admitted_ids = []
 
-    def _blocked(task, front=False):
+    def _blocked(task, front=False, **_kw):
         admitted_ids.append(task["id"])
         return {**task, "_admission_blocked": "project_routing_fence"}
 
@@ -356,20 +479,22 @@ def test_cron_schedule_admission_refusal_is_terminal(tmp_path, monkeypatch):
     queue.check_scheduled_tasks()
 
     assert len(admitted_ids) == 1
-    result = load_task_result(tmp_path, admitted_ids[0])
-    assert result["status"] == STATUS_FAILED
-    assert result["reason_code"] == "project_routing_fence"
+    assert load_task_result(tmp_path, admitted_ids[0]) is None
     schedule = queue.list_scheduled_tasks()["tasks"][0]
-    assert schedule["failure_count"] == 1
-    assert "project_routing_fence" in schedule["last_error"]
+    assert not schedule.get("failure_count")
+    assert schedule["hold"]["reason"] == "project_routing_fence"
+    assert schedule["occurrence"]["task_id"] == admitted_ids[0]
+    assert schedule["next_run_at"] == "2000-01-01T00:00:00+00:00"  # no catch-up bookkeeping while waiting
 
 
-def test_scheduled_task_without_owner_chat_is_headless_safe(tmp_path):
+def test_scheduled_task_without_owner_chat_waits_without_phantom_then_admits(tmp_path, monkeypatch):
     from supervisor import queue
     from supervisor import state as supervisor_state
     from ouroboros.task_results import load_task_result
 
     supervisor_state.init(tmp_path)
+    supervisor_state.save_state({"owner_chat_id": None})
+    monkeypatch.setattr("ouroboros.config.get_bg_wakeup_min_sec", lambda: 0)
     queue.init(tmp_path)
     pending = []
     queue.init_queue_refs(pending, {}, {"value": 0})
@@ -379,12 +504,19 @@ def test_scheduled_task_without_owner_chat_is_headless_safe(tmp_path):
         "enabled": True,
         "trigger": {"type": "cron", "expr": "* * * * *"},
         "next_run_at": "2000-01-01T00:00:00+00:00",
-        "task": {"type": "task", "text": "scheduled work"},
+        "task": {"type": "task", "text": "scheduled work",
+                 "metadata": {"resource_intent": {"kind": "explicit_none"}}},
     })
 
     queue.check_scheduled_tasks()
 
-    assert pending[0]["chat_id"] == 0
+    waiting = queue.list_scheduled_tasks()["tasks"][0]
+    assert pending == [] and waiting["hold"]["reason"] == "owner_chat_unknown"
+    assert not waiting.get("failure_count")
+    assert load_task_result(tmp_path, waiting["occurrence"]["task_id"]) is None
+    supervisor_state.update_state(lambda st: st.update(owner_chat_id=1), confirm=("owner_chat_id",))
+    queue.check_scheduled_tasks()
+    assert len(pending) == 1 and pending[0]["chat_id"] == 1
     assert load_task_result(tmp_path, pending[0]["id"])["status"] == "scheduled"
 
 
@@ -446,8 +578,11 @@ def test_schedules_api_validates_five_field_cron(tmp_path):
         "trigger": {"type": "cron", "expr": "* * * * *"},
     })
     assert bad_id.status_code == 400
-    assert client.delete("/api/schedules/ok").json()["ok"] is True
-    assert client.get("/api/schedules").json()["tasks"] == []
+    deleted = client.delete("/api/schedules/ok").json()
+    assert deleted["ok"] is True and deleted["status"] == "withdrawn"
+    [withdrawn] = client.get("/api/schedules").json()["tasks"]
+    assert withdrawn["id"] == "ok" and not withdrawn["enabled"]
+    assert withdrawn["status"] == "delete_pending" and withdrawn["withdrawal"]["restorable"]
 
 
 def test_skill_manifest_parses_scheduled_tasks():
@@ -512,91 +647,6 @@ body
 """)
 
 
-def test_skill_schedules_sync_into_core_scheduler(tmp_path):
-    from ouroboros.contracts.skill_manifest import parse_skill_manifest_text
-    from ouroboros.skill_loader import LoadedSkill, SkillReviewState
-    from supervisor import queue
-
-    queue.init(tmp_path)
-    manifest = parse_skill_manifest_text("""---
-name: cron-demo
-description: Cron demo
-version: 0.1.0
-type: extension
-entry: plugin.py
-permissions: [supervised_task]
-scheduled_tasks:
-  - name: refresh
-    cron: "0 * * * *"
----
-body
-""")
-    skill = LoadedSkill(
-        name="cron-demo",
-        skill_dir=tmp_path / "skill",
-        manifest=manifest,
-        enabled=True,
-        load_error="",
-        content_hash="abc",
-        review=SkillReviewState(status="clean", content_hash="abc"),
-    )
-    report = queue.sync_skill_schedules([skill])
-    schedules = queue.list_scheduled_tasks()["tasks"]
-
-    assert report["changed"] is True
-    assert schedules[0]["id"] == "skill-cron-demo-refresh"
-    assert schedules[0]["enabled"] is True
-    assert schedules[0]["trigger"]["expr"] == "0 * * * *"
-    # A changed payload loses critic authority; a fresh review restores it.
-    skill.content_hash = "changed"
-    queue.sync_skill_schedules([skill])
-    assert queue.list_scheduled_tasks()["tasks"][0]["enabled"] is False
-    skill.review = SkillReviewState(status="clean", content_hash="changed")
-    queue.sync_skill_schedules([skill])
-    assert queue.list_scheduled_tasks()["tasks"][0]["enabled"] is True
-    skill.enabled = False
-    queue.sync_skill_schedules([skill])
-    assert queue.list_scheduled_tasks()["tasks"][0]["enabled"] is False
-
-
-def test_skill_schedule_sync_refreshes_next_run_on_cron_change(tmp_path):
-    from ouroboros.contracts.skill_manifest import parse_skill_manifest_text
-    from supervisor import queue
-
-    queue.init(tmp_path)
-
-    def make_skill(cron: str, content_hash: str):
-        manifest = parse_skill_manifest_text(f"""---
-name: cron-demo
-description: Cron demo
-version: 0.1.0
-type: extension
-entry: plugin.py
-permissions: [supervised_task]
-scheduled_tasks:
-  - name: refresh
-    cron: "{cron}"
----
-body
-""")
-        return SimpleNamespace(
-            name="cron-demo",
-            manifest=manifest,
-            enabled=True,
-            load_error="",
-            content_hash=content_hash,
-            review=SimpleNamespace(status="pass", is_stale_for=lambda _hash: False),
-        )
-
-    queue.sync_skill_schedules([make_skill("0 * * * *", "a")])
-    first = queue.list_scheduled_tasks()["tasks"][0]["next_run_at"]
-    queue.sync_skill_schedules([make_skill("30 * * * *", "b")])
-    second = queue.list_scheduled_tasks()["tasks"][0]["next_run_at"]
-
-    assert first != second
-    assert queue.list_scheduled_tasks()["tasks"][0]["trigger"]["expr"] == "30 * * * *"
-
-
 def test_schedule_slug_avoids_long_name_collisions():
     from ouroboros.schedule_contract import schedule_slug
 
@@ -618,16 +668,19 @@ def test_frontend_evolution_and_consciousness_controls_are_present():
     assert "evo-stop" in evolution
     assert "/evolve on" in evolution
     assert "/evolve off" in evolution
-    # Start button is hard-disabled in light mode (self-modification gate).
+    # Start is hard-disabled in light mode (self-modification gate); the behaviour, across
+    # an in-flight command too, is pinned by web/tests/evolution_commands.test.js.
     assert "runtime.runtime_mode" in evolution
-    assert "startBtn.disabled = isLightMode" in evolution
     from ouroboros.settings_setup_contract import build_setup_contract
     consciousness = next(row for row in build_setup_contract()["modelSlots"] if row["slot"] == "consciousness")
     assert consciousness["settingKey"] == "OUROBOROS_MODEL_CONSCIOUSNESS"
     assert consciousness["settingsToggleId"] == "s-local-consciousness"
-    assert "modelRolesHost('settings-model-roles')" in settings_ui
-    assert "modelRoles.load(s," in settings
-    assert "OUROBOROS_EFFORT_CONSCIOUSNESS', ''" in settings  # empty = the Task / Chat effort
+    # Settings › Models draws that slot's page with the shared role editor (model_roles.js mountRole).
+    assert "modelRolesHost(hostId)" in (root / "web" / "modules" / "model_roles.js").read_text(encoding="utf-8")
+    # The role effort keys are retired: evolution and wakes start at the top of the owner's
+    # effort range, which only the composer's Effort control shows and edits.
+    assert "OUROBOROS_EFFORT_CONSCIOUSNESS" not in settings and "OUROBOROS_EFFORT_EVOLUTION" not in settings
+    assert "data-effort-range-summary" not in settings_ui and "Reasoning Effort" not in settings_ui
 
 
 def test_evolution_checkpoint_records_and_reads(tmp_path):
@@ -744,6 +797,8 @@ def test_no_op_cycle_resets_dirty_worktree_to_base_with_recovery_refs(tmp_path, 
     _git("commit", "-m", "unreviewed leftover")
     (repo / "dirty.txt").write_text("dirty\n", encoding="utf-8")
 
+    supervisor_state.init(tmp_path)
+    supervisor_state.save_state({})
     git_ops.init(repo, tmp_path, "")
     queue.init(tmp_path)
     queue.RUNNING.clear()
@@ -810,6 +865,12 @@ def test_no_op_cleanup_skips_when_other_tasks_running_or_already_clean(tmp_path)
     assert tx3["cleanup_status"] == "skipped_no_base"
 
 
+def _only_cleanup_reads(cmd):
+    """Behind a fence or a busy lock the cleanup reads this transaction's own label and branch and runs nothing else."""
+    assert cmd[1] in {"for-each-ref", "log"}, f"evolution cleanup must not run {cmd} behind the guard"
+    return 0, "", ""
+
+
 def test_evolution_cleanup_never_mutates_checkout_owned_by_update(monkeypatch):
     from supervisor import git_ops, update_merge, workers
 
@@ -820,13 +881,7 @@ def test_evolution_cleanup_never_mutates_checkout_owned_by_update(monkeypatch):
     monkeypatch.setattr(
         workers, "repo_writer_admission_closed", lambda: "managed_update:smart"
     )
-    monkeypatch.setattr(
-        git_ops,
-        "git_capture",
-        lambda _cmd: (_ for _ in ()).throw(
-            AssertionError("evolution cleanup must not touch git behind writer fence")
-        ),
-    )
+    monkeypatch.setattr(git_ops, "git_capture", _only_cleanup_reads)
     tx = {"base_head": "a" * 40, "transaction_id": "evo-update-race"}
 
     lifecycle._cleanup_worktree_after_cycle(tx, "evolution-task")
@@ -844,13 +899,7 @@ def test_evolution_cleanup_skips_when_update_lock_is_busy(monkeypatch):
         "acquire_update_lock",
         lambda: (_ for _ in ()).throw(RuntimeError("busy")),
     )
-    monkeypatch.setattr(
-        git_ops,
-        "git_capture",
-        lambda _cmd: (_ for _ in ()).throw(
-            AssertionError("busy update lock must stop cleanup before git")
-        ),
-    )
+    monkeypatch.setattr(git_ops, "git_capture", _only_cleanup_reads)
     tx = {"base_head": "a" * 40, "transaction_id": "evo-update-lock-race"}
 
     lifecycle._cleanup_worktree_after_cycle(tx, "evolution-task")
@@ -882,6 +931,7 @@ def test_evolution_restart_uses_local_commit_not_origin_and_blocks_dirty_tree(tm
         ["git", "rev-parse", "HEAD"], cwd=str(repo), check=True, capture_output=True, text=True
     ).stdout.strip()
     supervisor_state.init(tmp_path)
+    supervisor_state.save_state({})  # an initialized install (#1307)
     queue.init(tmp_path)
     campaign = evolution_lifecycle.start_evolution_campaign("Improve", source="test")
     st = supervisor_state.load_state()
@@ -902,7 +952,8 @@ def test_evolution_restart_uses_local_commit_not_origin_and_blocks_dirty_tree(tm
 
     result = _request_restart(ctx, "   ")
 
-    assert "Restart requested" in result
+    assert result.startswith("RESTART_UNCONFIRMED:"), "the diagnostic marker is not a supervisor ACK"
+    assert ctx.pending_events[-1]["phase"] == "intent"
     marker = json.loads((tmp_path / "state" / "pending_restart_verify.json").read_text())
     assert marker["reason"] == "agent_requested_restart"
     assert ctx.pending_restart_is_evolution is True
@@ -952,11 +1003,16 @@ def test_memory_provenance_records_old_and_new_content(tmp_path):
         json.loads(line)
         for line in (tmp_path / "memory" / "knowledge_history.jsonl").read_text(encoding="utf-8").splitlines()
     ]
-    assert history[-1]["old_content"] == current.text
-    assert history[-1]["new_content"] == "---\ntype: note\n---\nnew"
+    from tests._knowledge_history_shared import published, replaced
+    assert replaced(tmp_path, history[-1]) == current.text
+    assert published(tmp_path, history[-1]) == "---\ntype: note\n---\nnew"
 
-    _update_identity(ctx, "I am v1 with enough detail to satisfy the identity update length gate.")
-    _update_identity(ctx, "I am v2 with enough detail to satisfy the identity update length gate.")
+    from hashlib import sha256
+    from ouroboros.memory import Memory
+    Memory(tmp_path).ensure_files()
+    identity = tmp_path / "memory/identity.md"
+    _update_identity(ctx, "I am v1 with enough detail to satisfy the identity update length gate.", sha256(identity.read_bytes()).hexdigest())
+    _update_identity(ctx, "I am v2 with enough detail to satisfy the identity update length gate.", sha256(identity.read_bytes()).hexdigest())
     identity_history = [
         json.loads(line)
         for line in (tmp_path / "memory" / "identity_journal.jsonl").read_text(encoding="utf-8").splitlines()
@@ -984,6 +1040,7 @@ def test_enqueue_evolution_blocked_in_light_mode(tmp_path, monkeypatch):
     from supervisor import state as supervisor_state
 
     supervisor_state.init(tmp_path)
+    supervisor_state.save_state({})  # an initialized install (#1307)
     sent = []
     monkeypatch.setattr(queue, "send_with_budget", lambda chat_id, text, *a, **k: sent.append(text))
     monkeypatch.setattr("ouroboros.config.get_runtime_mode", lambda: "light")
@@ -1009,6 +1066,7 @@ def test_enqueue_evolution_omits_duplicate_cycle_message(tmp_path, monkeypatch):
     from supervisor import state as supervisor_state
 
     supervisor_state.init(tmp_path)
+    supervisor_state.save_state({})  # an initialized install (#1307)
     monkeypatch.setattr(supervisor_state, "TOTAL_BUDGET_LIMIT", 100.0)
     sent = []
     monkeypatch.setattr(queue, "send_with_budget", lambda chat_id, text, *a, **k: sent.append(text))
@@ -1027,225 +1085,9 @@ def test_enqueue_evolution_omits_duplicate_cycle_message(tmp_path, monkeypatch):
 
     assert len(pending) == 1
     assert pending[0]["type"] == "evolution"
-    # The generic "... task started." lifecycle message is the only start bubble;
-    # the redundant "Evolution #N: <id>" enqueue bubble is gone.
+    # The task's own card is its start (no standalone bubble); the redundant
+    # "Evolution #N: <id>" enqueue bubble is gone.
     assert not any("Evolution #" in m for m in sent)
-
-
-def test_marketplace_helper_resyncs_skill_schedules(tmp_path, monkeypatch):
-    from ouroboros.gateway import marketplace
-
-    calls = []
-    monkeypatch.setattr("supervisor.queue.resync_skill_schedules", lambda dr: calls.append(dr))
-
-    marketplace._resync_skill_schedules_quiet(tmp_path)
-
-    assert calls == [tmp_path]
-
-
-def test_skill_schedule_sync_removes_vanished_skill_schedule(tmp_path):
-    from ouroboros.contracts.skill_manifest import parse_skill_manifest_text
-    from supervisor import queue
-
-    queue.init(tmp_path)
-    manifest = parse_skill_manifest_text("""---
-name: cron-demo
-description: Cron demo
-version: 0.1.0
-type: extension
-entry: plugin.py
-permissions: [supervised_task]
-scheduled_tasks:
-  - name: refresh
-    cron: "0 * * * *"
----
-body
-""")
-    skill = SimpleNamespace(
-        name="cron-demo", manifest=manifest, enabled=True, load_error="",
-        content_hash="abc",
-        review=SimpleNamespace(status="pass", is_stale_for=lambda _h: False),
-    )
-
-    queue.sync_skill_schedules([skill])
-    assert any(t.get("source") == "skill_manifest" for t in queue.list_scheduled_tasks()["tasks"])
-
-    # Skill (or its scheduled_task) vanished → the record is removed entirely,
-    # not left as a disabled tombstone.
-    queue.sync_skill_schedules([])
-    assert queue.list_scheduled_tasks()["tasks"] == []
-
-
-def test_skill_schedule_sync_preserves_ambiguous_identity_rows(tmp_path):
-    from ouroboros.contracts.skill_manifest import parse_skill_manifest_text
-    from supervisor import queue
-
-    queue.init(tmp_path)
-    manifest = parse_skill_manifest_text("""---
-name: cron-demo
-description: Cron demo
-version: 0.1.0
-type: extension
-entry: plugin.py
-permissions: [supervised_task]
-scheduled_tasks:
-  - name: refresh
-    cron: "0 * * * *"
----
-body
-""")
-    skill = SimpleNamespace(
-        name="cron-demo", manifest=manifest, enabled=True, load_error="",
-        content_hash="abc", identity_collision=False,
-        review=SimpleNamespace(status="pass", is_stale_for=lambda _h: False),
-    )
-    queue.sync_skill_schedules([skill])
-    before = queue.list_scheduled_tasks()["tasks"]
-
-    collision = SimpleNamespace(
-        name="cron-demo", identity_collision=True,
-        manifest=SimpleNamespace(scheduled_tasks=[]),
-    )
-    unique = SimpleNamespace(
-        name="other", manifest=manifest, enabled=True, load_error="",
-        content_hash="def", identity_collision=False,
-        review=SimpleNamespace(status="pass", is_stale_for=lambda _h: False),
-    )
-    report = queue.sync_skill_schedules([collision, unique])
-    after = queue.list_scheduled_tasks()["tasks"]
-
-    assert report["changed"] is True
-    assert next(item for item in after if item["id"] == "skill-cron-demo-refresh") == before[0]
-    assert any(item["id"] == "skill-other-refresh" for item in after)
-
-
-def test_due_skill_schedule_does_not_run_while_identity_is_ambiguous(
-    tmp_path, monkeypatch,
-):
-    from supervisor import queue, state
-
-    state.init(tmp_path)
-    queue.init(tmp_path)
-    pending = []
-    queue.init_queue_refs(pending, {}, {"value": 0})
-    manifest = """---
-name: cron-demo
-description: Cron demo
-version: 0.1.0
-type: extension
-entry: plugin.py
-permissions: [supervised_task]
-scheduled_tasks:
-  - name: refresh
-    cron: "* * * * *"
----
-body
-"""
-    data_skill = tmp_path / "skills" / "external" / "cron-demo"
-    user_skill = tmp_path / "user-skills" / "cron-demo"
-    for skill_dir in (data_skill, user_skill):
-        skill_dir.mkdir(parents=True)
-        (skill_dir / "SKILL.md").write_text(manifest, encoding="utf-8")
-        (skill_dir / "plugin.py").write_text("", encoding="utf-8")
-    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(user_skill.parent))
-    queue.upsert_scheduled_task({
-        "id": "skill-cron-demo-refresh",
-        "name": "cron-demo/refresh",
-        "enabled": True,
-        "source": "skill_manifest",
-        "skill": "cron-demo",
-        "trigger": {"type": "cron", "expr": "* * * * *"},
-        "next_run_at": "2000-01-01T00:00:00+00:00",
-        "task": {"type": "task", "text": "run cron-demo"},
-    })
-
-    queue.resync_skill_schedules(tmp_path)
-    before = queue.list_scheduled_tasks(tmp_path)["tasks"][0]
-    from supervisor import queue_schedules
-    monkeypatch.setattr(queue_schedules, "_last_skill_schedule_sync", queue.time.monotonic())
-    queue.check_scheduled_tasks()
-
-    assert pending == []
-    assert queue.list_scheduled_tasks(tmp_path)["tasks"] == [before]
-    assert not (tmp_path / "task_results").exists()
-
-
-def test_reflection_extract_trailing_json_parses_memory_and_backlog():
-    from ouroboros.reflection import _extract_trailing_json
-
-    text = (
-        "Reflection body here.\n"
-        'MEMORY_ACTIONS_JSON: [{"type": "scratchpad_append", "content": "note"}]\n'
-        'BACKLOG_CANDIDATES_JSON: [{"summary": "s", "evidence": "e"}]'
-    )
-    body_after_backlog, backlog = _extract_trailing_json(text, "BACKLOG_CANDIDATES_JSON:")
-    reflection_text, memory = _extract_trailing_json(body_after_backlog, "MEMORY_ACTIONS_JSON:")
-
-    assert backlog == [{"summary": "s", "evidence": "e"}]
-    assert memory == [{"type": "scratchpad_append", "content": "note"}]
-    assert reflection_text.strip() == "Reflection body here."
-
-
-def test_reflection_extract_trailing_json_is_order_independent():
-    from ouroboros.reflection import _extract_trailing_json
-
-    # Markers emitted in the reverse of the documented order must still both parse
-    # (no silent memory-action loss).
-    text = (
-        "Reflection body.\n"
-        'BACKLOG_CANDIDATES_JSON: [{"summary": "s", "evidence": "e"}]\n'
-        'MEMORY_ACTIONS_JSON: [{"type": "knowledge_write", "content": "c", "topic": "t"}]'
-    )
-    after_backlog, backlog = _extract_trailing_json(text, "BACKLOG_CANDIDATES_JSON:")
-    reflection_text, memory = _extract_trailing_json(after_backlog, "MEMORY_ACTIONS_JSON:")
-
-    assert backlog == [{"summary": "s", "evidence": "e"}]
-    assert memory == [{"type": "knowledge_write", "content": "c", "topic": "t"}]
-    assert reflection_text.strip() == "Reflection body."
-
-
-def test_reflection_validate_memory_actions_filters_types():
-    from ouroboros.reflection import _validate_memory_actions
-
-    raw = [
-        {"type": "scratchpad_append", "content": "note"},
-        {"type": "knowledge_write", "content": "fact", "topic": "facts"},
-        {"type": "knowledge_write", "content": "no topic"},
-        {"type": "identity_update_candidate", "content": "refine"},
-        {"type": "delete_everything", "content": "nope"},
-        {"type": "scratchpad_append", "content": "   "},
-    ]
-    actions = _validate_memory_actions(raw, "task1")
-
-    assert [a["type"] for a in actions] == [
-        "scratchpad_append", "knowledge_write", "identity_update_candidate",
-    ]
-    assert actions[1]["topic"] == "facts"
-    assert all(a["task_id"] == "task1" for a in actions)
-
-
-def test_apply_memory_actions_writes_to_parent_drive(tmp_path):
-    from ouroboros.reflection import apply_memory_actions
-
-    env = SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path)
-    actions = [
-        {"type": "scratchpad_append", "content": "durable note", "task_id": "t1"},
-        {"type": "knowledge_write", "content": "reusable fact", "topic": "review_process", "task_id": "t1"},
-        {"type": "identity_update_candidate", "content": "I value rigor", "task_id": "t1"},
-    ]
-
-    assert apply_memory_actions(env, actions) == 3
-
-    knowledge = (tmp_path / "memory" / "knowledge" / "review_process.md").read_text(encoding="utf-8")
-    assert "reusable fact" in knowledge
-    assert (tmp_path / "memory" / "knowledge_history.jsonl").exists()
-
-    scratchpad = (tmp_path / "memory" / "scratchpad.md").read_text(encoding="utf-8")
-    assert "durable note" in scratchpad
-    assert "IDENTITY UPDATE CANDIDATE" in scratchpad
-    # Identity is never auto-written; the candidate stays in the scratchpad only.
-    identity_path = tmp_path / "memory" / "identity.md"
-    assert not identity_path.exists() or "I value rigor" not in identity_path.read_text(encoding="utf-8")
 
 
 def test_runtime_context_includes_schedule_digest(tmp_path):

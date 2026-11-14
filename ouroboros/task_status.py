@@ -1,20 +1,29 @@
-"""Effective task status helpers shared by tools and gateways."""
+"""Effective task status helpers shared by tools and gateways.
+
+Only pooled execution owners enter worker-boot orphan inference; direct,
+presence and unknown owners are never inferred dead from a later worker boot.
+"""
 
 from __future__ import annotations
 
 import logging
 import pathlib
+from functools import lru_cache, partial
 import time
 from datetime import datetime, timezone
-from types import SimpleNamespace
+from contextlib import nullcontext
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
+from ouroboros.observability import timed_phase
+from ouroboros.finalization_timing import cached_finalization_children
 from ouroboros.headless import (
     ARTIFACT_STATUS_FAILED,
     ARTIFACT_STATUS_FINALIZING,
     ARTIFACT_STATUS_MISSING,
     ARTIFACT_STATUS_PENDING,
-    ARTIFACT_STATUS_READY,
+    ARTIFACT_STATUS_READY as ARTIFACT_STATUS_READY,
+    ARTIFACT_TERMINAL_STATUSES,
+    task_requires_workspace_capture,
 )
 from ouroboros.outcomes import (
     EXECUTION_FAILED,
@@ -23,7 +32,13 @@ from ouroboros.outcomes import (
     infra_failed_axes,
     normalize_outcome_axes,
 )
-from ouroboros.post_task_checkpoint import project_replica_task_result_fields
+from ouroboros.budget_pause import LIVE_PAUSE_STATES
+from ouroboros.post_task_checkpoint import (
+    _TERMINAL_ACCOUNTING_SCRUB_FIELDS,
+    project_replica_task_result_fields,
+)
+from ouroboros.task_reads import TaskReads
+from ouroboros.task_store import select_lineage
 from ouroboros.task_results import (
     STATUS_CANCEL_REQUESTED,
     STATUS_CANCELLED,
@@ -35,11 +50,11 @@ from ouroboros.task_results import (
     STATUS_RUNNING,
     STATUS_SCHEDULED,
     cancellation_blocks_child_result,
-    list_task_results,
     load_task_result,
     validate_task_id,
 )
-from ouroboros.utils import iter_jsonl_objects, read_json_dict
+from ouroboros.queue_observation import QUEUE_ALIVE_FRESH_SEC, load_queue_document, queue_stamp
+from ouroboros.utils import iter_jsonl_objects
 
 log = logging.getLogger(__name__)
 
@@ -66,13 +81,6 @@ NONTERMINAL_STATUSES: frozenset[str] = frozenset({
     STATUS_INTERRUPTED,
 })
 SETTLED_STATUSES: frozenset[str] = FINAL_STATUSES
-ARTIFACT_TERMINAL_STATUSES: frozenset[str] = frozenset({
-    ARTIFACT_STATUS_READY,
-    ARTIFACT_STATUS_FAILED,
-    "ready_with_changes",
-    "ready_no_changes",
-    "missing",
-})
 ARTIFACT_NONTERMINAL_STATUSES: frozenset[str] = frozenset({
     ARTIFACT_STATUS_PENDING,
     ARTIFACT_STATUS_FINALIZING,
@@ -138,17 +146,9 @@ def _fail_nonterminal_artifact_bundle(bundle: Dict[str, Any], message: str) -> D
 
 
 def _child_drive_candidates(result: Dict[str, Any]) -> List[pathlib.Path]:
-    paths: List[pathlib.Path] = []
-    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
-    for source in (result, metadata):
-        for key in ("child_drive_root", "headless_child_drive_root", "drive_root"):
-            text = str(source.get(key) or "").strip()
-            if not text:
-                continue
-            path = pathlib.Path(text)
-            if path not in paths:
-                paths.append(path)
-    return paths
+    from ouroboros.task_custody import child_drive_candidates  # the one child-root vocabulary
+
+    return child_drive_candidates(result)
 
 
 # Legacy mirrored disposition/sha fields stripped from every effective read; the
@@ -213,36 +213,31 @@ def _project_child_result_disposition(
 
 
 def _load_queue_snapshot(drive_root: pathlib.Path) -> Dict[str, Any]:
-    path = pathlib.Path(drive_root) / "state" / "queue_snapshot.json"
-    if not path.exists():
-        return {"_snapshot_missing": True}
-    data = read_json_dict(path)
-    if not isinstance(data, dict):
-        return {"_snapshot_invalid": True}
-    return data
+    return load_queue_document(drive_root)
 
 
-# GR7-1a freshness bound for the live-ownership twin. The supervisor persists
-# the snapshot on every main-loop pass (nominally 0.5s apart), so a snapshot
-# this old means the writer is gone or badly wedged — the twin can no longer
-# trust it to prove a DEAD worker. Sized well above 2× the nominal tick to
-# absorb ordinary loop hitches (task_done processing, git ops) without turning
-# every cancel into a fail-open pass.
-_SNAPSHOT_OWNERSHIP_FRESH_SEC = 10.0
+# GR7-1a freshness bound for the live-ownership twin. The supervisor refreshes
+# queue.alive inside this bound (``queue_publication.QUEUE_ALIVE_REFRESH_SEC``), so a
+# stamp this old means the writer is gone or badly wedged — the twin can no longer
+# trust it to prove a DEAD worker. Sized well above the refresh cadence to absorb
+# ordinary loop hitches (task_done processing, git ops) without turning every
+# cancel into a fail-open pass. One bound for publisher and readers.
+_SNAPSHOT_OWNERSHIP_FRESH_SEC = QUEUE_ALIVE_FRESH_SEC
 
 
-def queue_snapshot_observation(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+def queue_snapshot_observation(snapshot: Dict[str, Any], *, boot: bool = False) -> Dict[str, Any]:
     """Date the existing queue observation, without asserting current capacity.
 
     Context, scheduling receipts and cancellation observations share the same
     freshness bound as live ownership. Counts belong to the captured snapshot;
     even a fresh observation is not a reservation or a continuously live view.
     """
-    observation = {"source": "state/queue_snapshot.json", "ts": snapshot.get("ts"),
+    stamp = queue_stamp(snapshot, boot=boot)
+    observation = {"source": "state/queue_snapshot.json", "ts": stamp.get("ts"),
                    "age_sec": None, "freshness": "unknown", "fresh": False}
     if snapshot.get("_snapshot_missing") or snapshot.get("_snapshot_invalid"):
         return observation
-    raw = str(snapshot.get("ts") or "").strip().replace("Z", "+00:00")
+    raw = str(stamp.get("ts") or "").strip().replace("Z", "+00:00")
     try:
         parsed = datetime.fromisoformat(raw)
         stamped = (parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).timestamp()
@@ -257,6 +252,118 @@ def queue_snapshot_observation(snapshot: Dict[str, Any]) -> Dict[str, Any]:
 def _snapshot_is_stale(snapshot: Dict[str, Any]) -> bool:
     """Missing, unreadable or old observations cannot prove a dead worker."""
     return not queue_snapshot_observation(snapshot)["fresh"]
+
+
+def execution_owner_record(drive_root: Any, task: Dict[str, Any], kind: str) -> Dict[str, Any]:
+    """Bind the actual execution class to its existing task-result attempt.
+
+    Assignment replaces this fact when an inline turn resumes in the pool; it
+    is ownership provenance, never a process-death or replay authorization. A
+    direct turn lives only inside the server process that runs it, so its record
+    also names that process generation (``direct_roots.owner_process_ended``). A
+    Presence turn runs on a thread of whichever process admitted it (the Host, or
+    an initiating tool's worker): its record names that controller, so its end is
+    a fact rather than a guess (``presence_recovery.attempt_ended``).
+    """
+    record = {"kind": kind, "data_root": str(pathlib.Path(drive_root).resolve()),
+              "task_id": str(task.get("id") or task.get("task_id") or ""),
+              "task_attempt": int(task.get("_attempt") or task.get("task_attempt") or 0)}
+    if kind == "direct":
+        from ouroboros.process_custody import current_custody_session_id
+
+        record["process"] = current_custody_session_id()
+    elif kind == "presence":
+        from ouroboros.review_operation import controller_identity
+
+        record["controller"] = controller_identity()
+    # The carrier facts beside the origin (``task_carrier``): a pooled attempt is a
+    # project-lane worker's; a conversation-lane admission stamped its lane and
+    # executor on the task before this record is (re)bound, and they travel with
+    # the kind. A legacy record names neither (additive; old rows decode).
+    from ouroboros.task_carrier import EXECUTOR_WORKER, EXECUTORS, LANE_CONVERSATION, LANE_PROJECT
+
+    prior = task.get("_execution_owner") if isinstance(task.get("_execution_owner"), dict) else {}
+    if kind == "pooled":
+        record.update(lane=LANE_PROJECT, executor=EXECUTOR_WORKER)
+    else:
+        if prior.get("lane") in {LANE_PROJECT, LANE_CONVERSATION}:
+            record["lane"] = prior["lane"]
+        if prior.get("executor") in EXECUTORS:
+            record["executor"] = prior["executor"]
+    return record
+
+
+@lru_cache(maxsize=64)
+def _resolved_root(root: str) -> pathlib.Path:
+    """A data root's resolved path, once per process: a page observes each of its tasks, and
+    resolving walks every component of the path (an ``lstat`` each, a GIL hand-off each)."""
+    return pathlib.Path(root).resolve()
+
+
+def task_execution_observation(
+    drive_root: Any, result: Dict[str, Any], *, queue_snapshot: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Recorded ownership and a separately dated positive live observation.
+
+    Missing inline evidence is unknown, never pooled death. Local observations
+    are root-bound. The direct fragment lists addressable turns, not every live
+    stack, so absence cannot settle a task. No observation authorizes replay.
+    ``queue_ownership`` is the queue's custody of a row, not admission to run: the
+    effective read adds a PENDING row's ``dispatch`` from its ``current_stop``.
+    """
+    root = _resolved_root(str(drive_root))
+    tid = str(result.get("task_id") or result.get("id") or "")
+    owner = result.get("execution_owner")
+    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+    kind, reason = "unknown", "execution_owner_unavailable"
+    if isinstance(owner, dict):
+        if (owner.get("data_root") == str(root) and owner.get("task_id") == tid
+                and owner.get("task_attempt") == (result.get("task_attempt") or result.get("_attempt") or 0)
+                and owner.get("kind") in {"pooled", "direct", "presence"}):
+            kind, reason = owner["kind"], "live_execution_unobserved"
+        else:
+            reason = "execution_owner_binding_mismatch"
+    elif owner is None:
+        # A consumed exact Resume proves the pool took over, unlike origin.
+        pause = result.get("budget_pause") if isinstance(result.get("budget_pause"), dict) else {}
+        grant = pause.get("grant") if isinstance(pause.get("grant"), dict) else {}
+        if pause.get("state") == "resumed" or grant.get("consumed_at"):
+            kind = "pooled"
+        elif result.get("_is_direct_chat") or metadata.get("source") == "presence":
+            kind = "presence" if isinstance(metadata.get("presence"), dict) else "direct"
+        else:
+            kind = "pooled"  # legacy managed-task rows keep their existing custody path
+        reason = "legacy_execution_owner"
+    observation = {"kind": kind, "state": "unknown", "source": "task_result", "reason": reason}
+    if str(result.get("status") or "").lower() in FINAL_STATUSES:
+        return {**observation, "state": "terminal", "reason": "recorded_terminal"}
+    if kind == "unknown":
+        return observation
+    snapshot = queue_snapshot if queue_snapshot is not None else _load_queue_snapshot(root)
+    queue_seen = queue_snapshot_observation(snapshot)
+    queued, _task = _queue_task_status(snapshot, tid)
+    # The queue never owns a Presence turn's carried body: it runs in a conversation-lane carrier (or the
+    # disclosed degraded executor), whose liveness is observed locally (below) or proven by its
+    # controller, never by a snapshot row a dead carrier left published. A pooled or direct row keeps
+    # the queue-ownership reading (restore relies on it to dedup a live direct root's running row), and so
+    # does a moved turn's saved work the queue keeps: parked, or continued on a project slot (#2566).
+    carried = queued == STATUS_RUNNING and (_task.get("_execution_owner") or {}).get("lane") == "conversation"
+    if queue_seen["fresh"] and queued in {STATUS_RUNNING, STATUS_SCHEDULED} and (kind != "presence" or not carried):
+        return {**observation, **queue_seen, "kind": "pooled", "state": "active",
+                "reason": "queue_ownership", "status": queued}
+    try:
+        from ouroboros.presence_runner import presence_turn_is_live
+        from supervisor.active_activity import get_direct_activity_registry
+
+        if presence_turn_is_live(tid, drive_root=root):
+            return {**observation, "kind": "presence", "state": "active", "source": "local_presence", "reason": "local_execution"}
+        entry = get_direct_activity_registry().get(tid)
+        actor_root = getattr(getattr(getattr(entry, "actor", None), "env", None), "drive_root", None)
+        if actor_root is not None and _resolved_root(str(actor_root)) == root:
+            return {**observation, "kind": "direct", "state": "active", "source": "local_direct", "reason": "local_execution"}
+    except Exception:
+        pass  # absence of a positive witness is never a negative observation
+    return {**observation, "queue_snapshot": queue_seen}
 
 
 def task_has_live_queue_ownership(drive_root: pathlib.Path, task_id: str) -> bool:
@@ -290,6 +397,28 @@ def task_has_live_queue_ownership(drive_root: pathlib.Path, task_id: str) -> boo
         return True
 
 
+def task_subtree_has_live_queue_rows(drive_root: pathlib.Path, task_id: str) -> bool:
+    """Worker-side twin of the owner Stop's live-subtree check for a settled root.
+
+    A RUNNING or PENDING snapshot row whose ``root_task_id`` is the target is a
+    live member of its tree (the target's own row is the ownership half above):
+    an ended root's helpers still spend. Fail-OPEN exactly like
+    ``task_has_live_queue_ownership``: only a FRESH snapshot without such a row
+    answers False.
+    """
+    try:
+        snapshot = _load_queue_snapshot(pathlib.Path(drive_root))
+        if snapshot.get("_snapshot_missing") or snapshot.get("_snapshot_invalid") or _snapshot_is_stale(snapshot):
+            return True
+        target = str(task_id or "").strip()
+        return any(isinstance(row, dict) and isinstance(row.get("task"), dict)
+                   and str(row["task"].get("root_task_id") or "") == target
+                   and str(row.get("id") or row["task"].get("id") or "") != target
+                   for lane in ("running", "pending") for row in snapshot.get(lane) or [])
+    except Exception:
+        return True
+
+
 def _queue_task_status(snapshot: Dict[str, Any], task_id: str) -> tuple[str, Dict[str, Any]]:
     if snapshot.get("_snapshot_missing") or snapshot.get("_snapshot_invalid"):
         return "unknown", {}
@@ -314,7 +443,7 @@ def observe_cancellation_target(
 ) -> Dict[str, Any]:
     """Read separate source facts about the resolved target, never cancel authority.
 
-    The result file, queue snapshot and custody rows are separate observations;
+    The stored result, queue snapshot and custody rows are separate observations;
     their own timestamps/freshness survive. A failed liveness probe is UNKNOWN,
     never the fail-open ownership hint used to admit an actual cancellation.
     """
@@ -349,7 +478,8 @@ def observe_cancellation_target(
 
             evidence = task_execution_evidence(drive_root, target)
             keys = ("delegated_runs_started", "delegated_runs_settled", "delegated_runs_succeeded",
-                    "delegated_runs_failed", "subscription_cost_usd", "subscription_cost_estimated")
+                    "delegated_runs_failed", "subscription_cost_usd", "subscription_cost_estimated",
+                    "subscription_cost_partial")
             observation["delegated_execution"] = ({"evidence_read_failed": True} if evidence.get("evidence_read_failed")
                                                    else {key: evidence[key] for key in keys if key in evidence})
         except Exception:
@@ -401,26 +531,44 @@ class _EventsTailIndex:
         return self._worker_boot
 
 
+def _still_orphan_at_write(drive_root: pathlib.Path, task_id: str, observed: tuple, applied: List[bool], existing: Dict[str, Any],
+                           fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Projector for the reconciler's terminal write (bound with ``partial``): the decision was taken
+    outside the row lock, so a presence retry that went live meanwhile, or a row that moved on (requeued,
+    restarted as a new attempt even under the same status, settled by another writer), cancels the write:
+    ``observed`` is the row's attempt basis plus ``updated_at`` at decision time. ``applied`` gets True
+    only on a real write."""
+    from ouroboros.task_custody import attempt_basis
+
+    execution = task_execution_observation(drive_root, existing)
+    inferred_orphan = fields.get("reason_code") in {"orphaned_running_after_worker_restart", "interrupted_retry_lost"}
+    if execution["state"] == "active" or (inferred_orphan and execution["kind"] != "pooled"):
+        return None
+    if (attempt_basis(existing), existing.get("updated_at")) != observed \
+            or str(existing.get("status") or "").lower() not in {STATUS_RUNNING, STATUS_INTERRUPTED}:
+        return None
+    applied.append(True)
+    return fields
+
+
 def _is_stale_orphan_running_task(
     drive_root: pathlib.Path,
     task_id: str,
     result: Dict[str, Any],
     events_index: Optional[_EventsTailIndex] = None,
     queue_snapshot: Optional[Dict[str, Any]] = None,
+    *, boot: bool = False,
 ) -> bool:
-    # Direct-chat actors are deliberately absent from PENDING/RUNNING.  The
-    # process-local registry is the authoritative owner for that execution;
-    # queue snapshots and pooled worker_boot rows cannot prove it dead.
-    try:
-        from supervisor.active_activity import get_direct_activity_registry
-
-        if get_direct_activity_registry().get(str(task_id or "")) is not None:
-            return False
-    except Exception:
-        # This helper is also imported by worker-side readers where the server's
-        # direct registry is not available.  Absence of that optional observation
-        # is not itself evidence of liveness, so retain the existing pooled path.
-        pass
+    observation = task_execution_observation(
+        drive_root, {**result, "task_id": task_id}, queue_snapshot=queue_snapshot,
+    )
+    if observation["state"] == "active" or observation["kind"] != "pooled":
+        return False
+    pause = result.get("budget_pause") if isinstance(result.get("budget_pause"), dict) else {}
+    if pause.get("state") in LIVE_PAUSE_STATES:
+        # Unconsumed Resume belongs to pause custody, which revokes/reparks it
+        # after confirmed worker death. A generic orphan must not spend that grant.
+        return False
     status = str(result.get("status") or "").lower()
     # ``interrupted`` is the transient pre-requeue marker (A.11): a record still
     # carrying it with no queued retry after a worker restart is the same orphan
@@ -456,9 +604,7 @@ def _is_stale_orphan_running_task(
             queue_snapshot if isinstance(queue_snapshot, dict)
             else _load_queue_snapshot(pathlib.Path(drive_root))
         )
-        if snapshot.get("_snapshot_missing") or snapshot.get("_snapshot_invalid"):
-            return False
-        if _snapshot_is_stale(snapshot):
+        if not queue_snapshot_observation(snapshot, boot=boot)["fresh"]:
             return False
     except Exception:
         return False
@@ -469,22 +615,49 @@ def _is_stale_orphan_running_task(
     return bool(latest_worker_boot and latest_worker_boot > latest_task_event)
 
 
-def _normalize_workspace_artifact_status(result: Dict[str, Any]) -> Dict[str, Any]:
+PRESENCE_ATTEMPT_LOST = "presence_attempt_lost"
+PRESENCE_ATTEMPT_LOST_NOTICE = ("PRESENCE_ATTEMPT_LOST: this Presence turn's executor ended without a terminal result; "
+                                "whether its reply or tools took effect is unknown, and it is never re-run.")
+
+
+def _project_lost_attempt(merged: Dict[str, Any], reason: str, prior_status: str, notice: str) -> None:
+    """Project a non-terminal row whose executor positively ended as an infra failure, in place."""
+    merged.update(status=STATUS_FAILED, reason_code=reason, outcome_axes=infra_failed_axes(reason),
+                  status_reconciled_from=prior_status)
+    merged["result"] = (str(merged.get("result") or "Task was interrupted before a terminal result was recorded.")
+                        + "\n\n⚠️ " + notice)
+    if str(merged.get("artifact_status") or "").strip().lower() in ARTIFACT_NONTERMINAL_STATUSES:
+        merged["artifact_status"] = ARTIFACT_STATUS_FAILED
+        bundle = dict(merged["artifact_bundle"]) if isinstance(merged.get("artifact_bundle"), dict) else {}
+        merged["artifact_bundle"] = _fail_nonterminal_artifact_bundle(bundle, "task interrupted before artifact finalization")
+
+
+def _presence_attempt_lost(drive_root: pathlib.Path, result: Dict[str, Any],
+                           queue_snapshot: Optional[Dict[str, Any]] = None) -> bool:
+    """A non-terminal row of a Presence turn whose attempt can no longer change.
+
+    The positive end facts are one rule shared with the Host work view
+    (``presence_recovery.attempt_ended``); age, absence and worker boots prove nothing.
+    """
     metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
-    if not (str(result.get("workspace_root") or "").strip() or str(metadata.get("workspace_root") or "").strip()):
-        return result
-    task_constraint = result.get("task_constraint") if isinstance(result.get("task_constraint"), dict) else {}
-    if not task_constraint and isinstance(metadata.get("task_constraint"), dict):
-        task_constraint = metadata.get("task_constraint") or {}
-    if (
-        str(result.get("delegation_role") or metadata.get("delegation_role") or "").strip() == "subagent"
-        and str(task_constraint.get("mode") or "").strip() == "local_readonly_subagent"
-    ):
+    if (str(result.get("status") or "").lower() not in {STATUS_RUNNING, STATUS_INTERRUPTED}
+            or not isinstance(metadata.get("presence"), dict)):
+        return False
+    observation = task_execution_observation(drive_root, result, queue_snapshot=queue_snapshot)
+    if observation["kind"] != "presence" or observation["state"] == "active":
+        return False
+    from ouroboros.presence_recovery import attempt_ended
+
+    return attempt_ended(result, drive_root)
+
+
+def _normalize_workspace_artifact_status(result: Dict[str, Any]) -> Dict[str, Any]:
+    if not task_requires_workspace_capture(result):
         return result
     status = str(result.get("status") or "").lower()
     if status not in FINAL_STATUSES:
         return result
-    artifact_status = str(result.get("artifact_status") or "").lower()
+    artifact_status = str(result.get("artifact_status") or "").strip().lower()
     if artifact_status in ARTIFACT_TERMINAL_STATUSES:
         return result
     if status == STATUS_CANCELLED:
@@ -513,17 +686,27 @@ def _normalize_workspace_artifact_status(result: Dict[str, Any]) -> Dict[str, An
     return normalized
 
 
+def stored_list_order_is_final(result: Dict[str, Any]) -> bool:
+    """Whether this body's status and ts suffice for filtered-list membership.
+
+    Derived by the store writer, never a declaration that the task cannot change.
+    Retry and replica reads, workspace finalization and every nonterminal/unknown
+    status still need the ordinary effective reader. A later body write rederives
+    the fact; a pre-projection writer leaves NULL. No external state is consulted.
+    """
+    status = result.get("status")
+    ts = result.get("ts")
+    if status not in FINAL_STATUSES or (ts is not None and (not isinstance(ts, str) or ts != ts.strip())):
+        return False
+    if result.get("superseded_by") or result.get("retry_task_id"):
+        return False
+    if not cancellation_blocks_child_result(result) and _child_drive_candidates(result):
+        return False
+    return _normalize_workspace_artifact_status(result).get("status") == status
+
+
 def _parent_workspace_artifact_lifecycle_fields(result: Dict[str, Any]) -> frozenset[str]:
-    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
-    if not (str(result.get("workspace_root") or "").strip() or str(metadata.get("workspace_root") or "").strip()):
-        return frozenset()
-    task_constraint = result.get("task_constraint") if isinstance(result.get("task_constraint"), dict) else {}
-    if not task_constraint and isinstance(metadata.get("task_constraint"), dict):
-        task_constraint = metadata.get("task_constraint") or {}
-    if (
-        str(result.get("delegation_role") or metadata.get("delegation_role") or "").strip() == "subagent"
-        and str(task_constraint.get("mode") or "").strip() == "local_readonly_subagent"
-    ):
+    if not task_requires_workspace_capture(result):
         return frozenset()
     artifact_status = str(result.get("artifact_status") or "").strip().lower()
     if artifact_status in ARTIFACT_TERMINAL_STATUSES or artifact_status in ARTIFACT_NONTERMINAL_STATUSES:
@@ -531,12 +714,36 @@ def _parent_workspace_artifact_lifecycle_fields(result: Dict[str, Any]) -> froze
     return frozenset()
 
 
-def _merge_queue_status(current_status: str, queue_status: str) -> str:
+# A canonical row carrying a LIVE exact budget pause (#1196) owns its lifecycle
+# and accounting planes: the forked child-drive replica is the worker's
+# pre-pause ``running`` row, so it must neither resurrect ``running`` nor blank
+# the ledger-derived cost fields the park wrote onto the canonical row.
+_LIVE_PAUSE_CANONICAL_FIELDS = frozenset({
+    "status", "reason_code", "resource_limit", "result", "error", "ts", "outcome_axes",
+    "budget_pause", *_TERMINAL_ACCOUNTING_SCRUB_FIELDS,
+})
+
+
+def _budget_pause_marker(queue_task: Any) -> bool:
+    """A TYPED budget-pause marker on a PENDING row: exact (``exact_continuation``
+    is a bool, True for an exact mid-run pause, False for a pre-dispatch hold).
+    ``{}`` or a malformed dict is no marker, so it cannot defeat the ordinary
+    requeue race where the running mirror wins."""
+    pause = queue_task.get("_budget_pause") if isinstance(queue_task, dict) else None
+    return isinstance(pause, dict) and isinstance(pause.get("exact_continuation"), bool)
+
+
+def _merge_queue_status(
+    current_status: str, queue_status: str, queue_task: Optional[Dict[str, Any]] = None,
+) -> str:
     current = str(current_status or "").lower()
     queued = str(queue_status or "").lower()
     if not queued or current in FINAL_STATUSES:
         return current
-    if current == STATUS_RUNNING and queued == STATUS_SCHEDULED:
+    if current == STATUS_RUNNING and queued == STATUS_SCHEDULED and not _budget_pause_marker(queue_task):
+        # A PENDING row parked under a budget-pause marker is not running,
+        # whatever a stale mirror says (#1196); an ordinary PENDING row beside a
+        # ``running`` mirror is the requeue race the running mirror wins.
         return current
     return queued
 
@@ -546,6 +753,7 @@ def load_effective_task_result(
     task_id: str,
     *,
     materialize_artifacts: bool = True,
+    reads: Any = None,
 ) -> Dict[str, Any]:
     try:
         tid = validate_task_id(task_id)
@@ -553,48 +761,72 @@ def load_effective_task_result(
         return {}
     return effective_task_result(
         drive_root,
-        load_task_result(drive_root, tid) or {},
+        (reads.load(drive_root, tid) if reads is not None else load_task_result(drive_root, tid)) or {},
         materialize_artifacts=materialize_artifacts,
+        **({"reads": reads} if reads is not None else {}),
     )
+
+
+class _SweepReads(TaskReads):
+    """One sweep's queue document, intents and events tail, read once; WHOLE documents (a heal persists them)."""
+
+    def load(self, root: Any, task_id: str) -> Optional[Dict[str, Any]]:
+        return load_task_result(root, task_id)
 
 
 def reconcile_orphaned_running_tasks(
     drive_root: Any, *, exclude_task_ids: frozenset[str] = frozenset(),
     expired_quizzes: Optional[List[Any]] = None,
+    write_guard: Optional[Callable[[str], Any]] = None, boot: bool = True,
 ) -> int:
-    """Durably finalize on-disk RUNNING task results the effective-status
+    """Durably finalize stored RUNNING task results the effective-status
     projection already considers terminal.
 
     A task whose worker crashed / was SIGKILLed / manually stopped can leave
-    ``task_results/<id>.json`` at ``running`` forever (a misleading zombie). The
+    a task-store record at ``running`` forever (a misleading zombie). The
     read-time ``effective_task_result`` already projects such an orphan to a
     terminal status, but never persists it, so a headless/no-UI run that never
     re-reads the result keeps the stale ``running`` on disk.
 
-    This sweep reuses ``load_effective_task_result`` so the persisted file matches
-    the read projection exactly and inherits ALL of its liveness gates: the grace
-    window, the worker-boot-after-task evidence, and the refusal to reconcile when
-    the queue snapshot is missing. A task that is still pending/running in the
-    queue, or whose worker has not booted after the task's last event, is never
-    reconciled. The monotonic guard in ``write_task_result`` additionally protects
-    a genuinely newer terminal/cancel write. Idempotent; safe at boot and on a
-    periodic supervisor tick.
+    Boot accepts legacy snapshot timestamps; periodic callers pass ``boot=False``.
+    Grace, worker-boot-after-task and readable/fresh snapshot gates still apply.
+    The status-only (``materialize_artifacts=False``) projection means no child file is
+    listed or copied here: the child store stays served read-only from its drive
+    and reaches the canonical store through ``task_custody.settle_child_drive``
+    before that drive can go. The write is fenced by the row's attempt basis and
+    ``updated_at`` at decision time, and, given ``write_guard`` (the supervisor's
+    queue-ownership fence, queue -> row lock order), by live queue ownership; the
+    monotonic guard in ``write_task_result`` protects a newer terminal/cancel write.
+    Idempotent; safe at boot and on a periodic tick. Candidates are read in one batch, the sweep's other
+    facts once (``_SweepReads``); rows a caller's guard refuses anyway (``queue_owned_task_ids``) are excluded unread.
 
     ``expired_quizzes`` collects ``(task_id, quiz_id)`` for every question this
     sweep expired, so the supervisor-side caller can send the same live frame the
     task-done seam sends. This module stays free of a supervisor import.
     """
-    from ouroboros.task_results import list_task_results, write_task_result
+    from ouroboros.cancel_intents import has_active_intent
+    from ouroboros.task_custody import attempt_basis
+    from ouroboros.task_results import write_task_result
+    from ouroboros.obligations import result_rows
 
     root = pathlib.Path(drive_root)
     healed = 0
     try:
-        running = list_task_results(root, statuses=[STATUS_RUNNING, STATUS_INTERRUPTED])
+        running = [row for row in result_rows(root, "nonterminal", exclude=exclude_task_ids)
+                   if row.get("status") in {STATUS_RUNNING, STATUS_INTERRUPTED}]
     except Exception:
         return 0
+    reads = _SweepReads(root)
     for row in running:
         task_id = str(row.get("task_id") or row.get("id") or "")
         if not task_id or task_id in exclude_task_ids:
+            continue
+        try:
+            effective = effective_task_result(root, row, materialize_artifacts=False, _boot=boot, reads=reads)
+        except Exception:
+            continue
+        eff_status = str(effective.get("status") or "").strip().lower()
+        if eff_status not in SETTLED_STATUSES:
             continue
         # An ACTIVE cancel intent means cancellation custody already owns this
         # row and will settle it with its own outcome and text; at boot that
@@ -602,20 +834,12 @@ def reconcile_orphaned_running_tasks(
         # would win the race and publish infra_failed for a task the owner was
         # told is being cancelled. An UNREADABLE intent store is the same
         # refusal: this sweep never settles over an unknown cancel authority.
+        # Asked of the rows this sweep would settle, right before the write.
         try:
-            from ouroboros.cancel_intents import has_active_intent
-
             if has_active_intent(root, task_id, strict=True):
                 continue
         except Exception:
             log.debug("Orphan reconcile skipped %s: cancel authority unreadable", task_id, exc_info=True)
-            continue
-        try:
-            effective = load_effective_task_result(root, task_id)
-        except Exception:
-            continue
-        eff_status = str(effective.get("status") or "").strip().lower()
-        if eff_status not in SETTLED_STATUSES:
             continue
         persist_fields = {
             key: effective[key]
@@ -630,29 +854,44 @@ def reconcile_orphaned_running_tasks(
             if effective.get(key) is not None
         }
         try:
-            write_task_result(root, task_id, status=eff_status, **persist_fields)
-            healed += 1
+            applied: List[bool] = []
+            observed = (attempt_basis(row), row.get("updated_at"))
+            with (write_guard(task_id) if write_guard else nullcontext(True)) as allowed:
+                if not allowed:
+                    continue
+                # The projection is this write's replica: a child terminal lends the occurrence
+                # its canonical attempt matches, as copyback would; a recovery projection has none.
+                write_task_result(root, task_id, status=eff_status,
+                                  _field_projector=partial(_still_orphan_at_write, root, task_id, observed, applied),
+                                  _terminal_time_source=effective, **persist_fields)
+                if not applied:
+                    continue  # the row moved on between the effective read and this write: nothing was settled here
+                healed += 1
+                # This sweep is a terminal writer that never passes the task-done seam, so it closes the
+                # same per-task owner-control projections that seam closes (otherwise the record says
+                # "ended" while the card keeps an open question), before any next attempt can open new
+                # ones. Both legs are idempotent and fail-soft, as in the seam's own coordinator.
+                try:
+                    from ouroboros.owner_hurry import reconcile_terminal as reconcile_hurry
+
+                    reconcile_hurry(root, task_id)
+                except Exception:
+                    log.debug("owner_hurry reconcile failed for healed %s", task_id, exc_info=True)
+                try:
+                    from ouroboros.owner_quiz import reconcile_terminal as reconcile_quiz
+
+                    expired = reconcile_quiz(root, task_id)
+                    if expired_quizzes is not None:
+                        expired_quizzes.extend((task_id, quiz_id) for quiz_id in expired)
+                except Exception:
+                    log.debug("owner_quiz reconcile failed for healed %s", task_id, exc_info=True)
+            if persist_fields.get("reason_code") == PRESENCE_ATTEMPT_LOST:
+                # Outside the write guard: the room learns once that this turn ended unanswered.
+                from ouroboros.presence_runner import _notify_unresolved_turn
+
+                _notify_unresolved_turn(root, task_id)
         except Exception:
             continue
-        # This sweep is a terminal writer that never passes the task-done seam, so
-        # it closes the same per-task owner-control projections that seam closes:
-        # otherwise the record says "ended" while the card still shows an open
-        # question and the paired wait never releases. Both legs are idempotent
-        # and fail-soft, exactly as in the seam's own coordinator.
-        try:
-            from ouroboros.owner_hurry import reconcile_terminal as reconcile_hurry
-
-            reconcile_hurry(root, task_id)
-        except Exception:
-            log.debug("owner_hurry reconcile failed for healed %s", task_id, exc_info=True)
-        try:
-            from ouroboros.owner_quiz import reconcile_terminal as reconcile_quiz
-
-            expired = reconcile_quiz(root, task_id)
-            if expired_quizzes is not None:
-                expired_quizzes.extend((task_id, quiz_id) for quiz_id in expired)
-        except Exception:
-            log.debug("owner_quiz reconcile failed for healed %s", task_id, exc_info=True)
     return healed
 
 
@@ -660,6 +899,7 @@ def _apply_cancel_state_projection(
     drive_root: pathlib.Path,
     requested_task_id: str,
     merged: Dict[str, Any],
+    reads: Any = None,
 ) -> None:
     """Overlay durable cancel intent on one effective, non-authoritative view.
 
@@ -677,14 +917,15 @@ def _apply_cancel_state_projection(
             return
         from ouroboros.cancel_intents import cancel_state_fields
 
+        intents = reads.cancel_intents(drive_root) if reads is not None else None
         cancel_fields = cancel_state_fields(
-            pathlib.Path(drive_root), requested_task_id,
+            pathlib.Path(drive_root), requested_task_id, intents=intents,
         )
         if not cancel_fields:
             physical_task_id = str(merged.get("task_id") or "").strip()
             if physical_task_id and physical_task_id != requested_task_id:
                 cancel_fields = cancel_state_fields(
-                    pathlib.Path(drive_root), physical_task_id,
+                    pathlib.Path(drive_root), physical_task_id, intents=intents,
                 )
         merged.update(cancel_fields)
     except Exception:
@@ -698,25 +939,33 @@ def effective_task_result(
     materialize_artifacts: bool = True,
     _seen: frozenset[str] = frozenset(),
     _events_index: Optional[_EventsTailIndex] = None,
+    _boot: bool = False,
+    reads: Any = None,
 ) -> Dict[str, Any]:
     """Merge parent result, child-drive result, and active queue state.
 
-    ``materialize_artifacts=False`` yields a "status/cost projection only" read
-    (v6.90.x P2): the entire artifact block — including the mutating child-artifact
-    rebase (``copy_file_to_task_artifacts``), ``collect_task_artifact_records``
-    scans, and the task-tree ``_project_child_result_disposition`` hash lookup — is
-    skipped, and the projection never carries sha-bearing/disposition claims.
-    ``artifacts`` on a False row are the raw admission-time recorded entries,
-    not the merged/rebased set a materializing read would produce.
-    Read-only display surfaces (chat history annotation, ``api_tasks_list``, the
-    SSE follow loop, ``api_logs_tail`` discovery) pass ``False``; every consumer
-    that participates in the child-result sha economy or artifact durability
-    (join_ledger, wait_*/get_task_result, api_task_get/artifact, reconcile, prune)
-    keeps the ``True`` default.
+    Every read is pure (TZ-1 A): no file copy, hash, registration or manifest
+    write. Child files reach the canonical store only through copy-back and
+    ``task_custody.settle_child_drive``. The default read adds the artifact VIEW
+    (``task_custody.store_artifact_view``: recorded canonical rows, the task's
+    OWN child stores' recorded rows and stat-only ``measured: False`` listings)
+    plus the task-tree disposition lookup. ``materialize_artifacts=False`` (the
+    historical name) is the "status/cost projection only" read: no view, no
+    disposition lookup and no sha-bearing/disposition claims; its ``artifacts``
+    are the raw recorded rows. Read-only display surfaces (chat history
+    annotation, ``api_tasks_list``, the SSE follow loop, ``api_logs_tail``
+    discovery) pass ``False``; child-result consumers (join_ledger,
+    wait_*/get_task_result, api_task_get/artifact, prune) keep the ``True``
+    default. The orphan reconciler decides and persists on a ``False`` read.
     ``_events_index`` optionally shares ONE parsed events-tail across a batch of
     rows (the task-list request), so N stale-running rows cost one tail read
     instead of N; ``None`` keeps the per-call read for single-row callers.
+    ``reads`` (``task_reads.TaskReads``) serves every document, the queue snapshot, the cancel
+    intents and the events tail of a read of many tasks from its batches.
     """
+    load = reads.load if reads is not None else load_task_result
+    if reads is not None and _events_index is None:
+        _events_index = reads.events_index
 
     if not result:
         return {}
@@ -725,28 +974,46 @@ def effective_task_result(
         return dict(result)
     retry_id = str(result.get("superseded_by") or result.get("retry_task_id") or "").strip()
     if retry_id and retry_id != task_id and retry_id not in _seen:
-        retry_result = load_task_result(drive_root, retry_id) or {}
+        retry_result = load(drive_root, retry_id) or {}
         if retry_result:
             effective_retry = effective_task_result(
                 pathlib.Path(drive_root),
                 retry_result,
                 materialize_artifacts=materialize_artifacts,
                 _seen=frozenset(set(_seen) | {task_id}),
-                _events_index=_events_index,
+                _events_index=_events_index, _boot=_boot, **({"reads": reads} if reads is not None else {}),
             )
             if effective_retry:
                 merged_retry = dict(effective_retry)
                 lineage = list(merged_retry.get("retry_lineage") or [])
+                # #1573: the successor's answer must not hide retained outputs THIS
+                # physical row published; each receipt keeps its own physical read call.
+                audit = result.get("delegate_terminal_reconciliation")
+                published = [dict(row) for row in ((audit.get("terminal_runs") if isinstance(audit, dict)
+                                                    else None) or [])
+                             if isinstance(row, dict) and any(
+                                 row.get(k) for k in ("staged_output", "other_staged_outputs",
+                                                      "terminal_observation", "other_terminal_observations"))]
                 lineage.insert(0, {
                     "task_id": task_id,
                     "status": result.get("status"),
                     "outcome_axes": normalize_outcome_axes(result),
                     "reason_code": result.get("reason_code"),
                     "retry_task_id": retry_id,
+                    **({"terminal_runs": published} if published else {}),
                 })
                 merged_retry["retry_lineage"] = lineage
                 merged_retry.setdefault("original_task_id", task_id)
                 merged_retry.setdefault("supersedes_task_id", task_id)
+                if result.get("cancel_receipt") and "cancel_receipt" not in merged_retry:
+                    merged_retry["cancel_receipt"] = result["cancel_receipt"]
+                # The retry answer does not erase the original's unknown effects.
+                # Invocation IDs and their original task/attempt attribution stay
+                # factual disclosure only, never authority to repeat an operation.
+                retired = result.get("retired_tool_invocations") or {}
+                if retired:
+                    merged_retry["retired_tool_invocations"] = {
+                        **retired, **(merged_retry.get("retired_tool_invocations") or {})}
                 # GR6-5b: the interrupted original's unreconciled delegated
                 # runs are a fact about runs that may STILL be live — the
                 # retry projection must not drop the disclosure the raw row
@@ -765,7 +1032,7 @@ def effective_task_result(
                         rid for rid in inherited if rid not in own
                     ]
                 _apply_cancel_state_projection(
-                    pathlib.Path(drive_root), task_id, merged_retry,
+                    pathlib.Path(drive_root), task_id, merged_retry, reads,
                 )
                 return merged_retry
 
@@ -773,8 +1040,13 @@ def effective_task_result(
     child_result: Dict[str, Any] = {}
     child_text = ""
     if not cancellation_blocks_child_result(result):
+        from ouroboros.install_identity import StoreForeign
+
         for child_drive in _child_drive_candidates(result):
-            child_result = load_task_result(child_drive, task_id) or {}
+            try:
+                child_result = load(child_drive, task_id) or {}
+            except StoreForeign:  # another install's drive: this install keeps only its own row
+                child_result = {}
             if child_result:
                 child_text = str(child_drive)
                 break
@@ -804,6 +1076,17 @@ def effective_task_result(
             else set()
         )
         parent_authoritative_fields = parent_authoritative_fields | _parent_workspace_artifact_lifecycle_fields(result)
+        # Pool assignment can rebind a paused direct turn before its old child
+        # replica receives the new start. Owner and its attempt remain one fact.
+        if "execution_owner" in result:
+            parent_authoritative_fields = parent_authoritative_fields | {"execution_owner", "task_attempt", "_attempt"}
+        canonical_pause = result.get("budget_pause") if isinstance(result.get("budget_pause"), dict) else {}
+        # Only a STALE nonterminal replica (the worker's pre-pause ``running``
+        # row) yields to the live pause; a replica that already reached a
+        # terminal status is the child's real outcome and is never suppressed
+        # by a canonical pause the copyback has not yet cleared.
+        if str(canonical_pause.get("state") or "") in LIVE_PAUSE_STATES and child_status not in FINAL_STATUSES:
+            parent_authoritative_fields = parent_authoritative_fields | _LIVE_PAUSE_CANONICAL_FIELDS
         child_overlay = project_replica_task_result_fields(result, child_result)
         for key, value in child_overlay.items():
             if key in {"task_id", "parent_task_id", "root_task_id", "session_id", "actor_id", "delegation_role"}:
@@ -822,12 +1105,28 @@ def effective_task_result(
 
     merged = _normalize_workspace_artifact_status(merged)
 
+    queue_snapshot = None
+    terminal_projection = ""
     parent_status = str(merged.get("status") or "").lower()
     if parent_status not in FINAL_STATUSES:
-        queue_snapshot = _load_queue_snapshot(pathlib.Path(drive_root))
+        queue_snapshot = (reads.queue_snapshot(drive_root) if reads is not None
+                          else _load_queue_snapshot(pathlib.Path(drive_root)))
         queue_status, queue_task = _queue_task_status(queue_snapshot, task_id)
-        if queue_status and queue_status != "unknown":
-            merged["status"] = _merge_queue_status(parent_status, queue_status)
+        # The queue never owns a Presence turn (its body runs in a conversation-lane carrier or the
+        # disclosed degraded executor, admitted to a RUNNING snapshot row): a stale lane row a dead
+        # carrier left behind must not read as live ownership and mask the turn's own end fact. Its
+        # liveness is the carrier/controller's, decided below exactly as the Host work view decides it.
+        _meta = merged.get("metadata") if isinstance(merged.get("metadata"), dict) else {}
+        presence_turn = isinstance(_meta.get("presence"), dict) and queue_status == STATUS_RUNNING and (
+            queue_task.get("_execution_owner") or {}).get("lane") == "conversation"  # a moved turn's saved row reads the queue
+        if queue_status and queue_status != "unknown" and not presence_turn:
+            merged["status"] = _merge_queue_status(parent_status, queue_status, queue_task)
+            from ouroboros.project_admission import project_hold_fact
+            from ouroboros.work_stop import task_current_stop
+
+            merged["project_admission_hold"] = project_hold_fact(queue_task)
+            # The census's reading of the same row: a held row stays ``scheduled`` in its queue.
+            merged["current_stop"] = task_current_stop(drive_root, queue_snapshot, task_id)
             for key in (
                 "parent_task_id",
                 "root_task_id",
@@ -844,9 +1143,14 @@ def effective_task_result(
                 if not merged.get(key) and queue_task.get(key):
                     merged[key] = queue_task.get(key)
         else:
-            if queue_status == "unknown":
+            if _presence_attempt_lost(pathlib.Path(drive_root), merged, queue_snapshot):
+                # The queue never owns a Presence turn; its own end fact decides, as the work view does.
+                terminal_projection = "presence_attempt_lost"
+                _project_lost_attempt(merged, PRESENCE_ATTEMPT_LOST, parent_status, PRESENCE_ATTEMPT_LOST_NOTICE)
+            elif queue_status == "unknown":
                 merged["queue_reconciliation_warning"] = "queue snapshot missing or invalid"
             elif _terminal_failure_from_outcome(merged):
+                terminal_projection = "recorded_outcome"
                 merged["status"] = STATUS_CANCELLED if str(merged.get("status") or "").strip().lower() == STATUS_CANCELLED else STATUS_FAILED
                 merged["status_reconciled_from"] = parent_status
                 artifact_status = str(merged.get("artifact_status") or "").strip().lower()
@@ -859,42 +1163,38 @@ def effective_task_result(
                     )
             elif _is_stale_orphan_running_task(
                 pathlib.Path(drive_root), task_id, merged, _events_index,
-                queue_snapshot=queue_snapshot,
+                queue_snapshot=queue_snapshot, boot=_boot,
             ):
+                terminal_projection = "pooled_worker_restart"
                 orphan_reason = (
                     "interrupted_retry_lost"
                     if parent_status == STATUS_INTERRUPTED
                     else "orphaned_running_after_worker_restart"
                 )
-                merged["status"] = STATUS_FAILED
-                merged["reason_code"] = orphan_reason
-                merged["outcome_axes"] = infra_failed_axes(orphan_reason)
-                merged["status_reconciled_from"] = parent_status
-                merged["result"] = (
-                    str(merged.get("result") or "Task was interrupted before a terminal result was recorded.")
-                    + "\n\n⚠️ TASK_ORPHAN_RECONCILED: queue is empty and worker restarted after this task; "
-                    f"marking the stale {parent_status} task as infra_failed."
-                )
-                artifact_status = str(merged.get("artifact_status") or "").strip().lower()
-                if artifact_status in ARTIFACT_NONTERMINAL_STATUSES:
-                    merged["artifact_status"] = ARTIFACT_STATUS_FAILED
-                    bundle = dict(merged.get("artifact_bundle") or {}) if isinstance(merged.get("artifact_bundle"), dict) else {}
-                    merged["artifact_bundle"] = _fail_nonterminal_artifact_bundle(
-                        bundle,
-                        "task interrupted before artifact finalization",
-                    )
+                _project_lost_attempt(merged, orphan_reason, parent_status, (
+                    "TASK_ORPHAN_RECONCILED: queue is empty and worker restarted after this task; "
+                    f"marking the stale {parent_status} task as infra_failed."))
     # Typed public cancel projection (phase A): an ACTIVE durable cancel intent
     # rides every effective read as ``cancel_state: "pending"`` — status itself
     # stays honest (running/scheduled) until the supervisor settles the teardown.
     # A legacy ``cancel_requested`` status (old files awaiting boot migration)
     # projects the same pending state.
-    _apply_cancel_state_projection(pathlib.Path(drive_root), task_id, merged)
+    _apply_cancel_state_projection(pathlib.Path(drive_root), task_id, merged, reads)
+    merged["execution_observation"] = task_execution_observation(drive_root, merged, queue_snapshot=queue_snapshot)
+    observed = merged["execution_observation"]
+    if observed.get("reason") == "queue_ownership" and observed.get("status") == STATUS_SCHEDULED:
+        held = (merged.get("current_stop") or {}).get("state")
+        observed["dispatch"] = "unknown" if held == "unknown" else "held" if held else "queued"
+    if terminal_projection:
+        # This read inferred a terminal; a later persisted terminal is a recorded
+        # fact even when its historical status_reconciled_from marker survives.
+        merged["execution_observation"].update(
+            source="effective_task_result", reason="projected_terminal", basis=terminal_projection)
 
     if not materialize_artifacts:
-        # Status/cost projection only: skip the whole artifact block (incl. the
-        # mutating child-artifact rebase and collect_task_artifact_records file
-        # scans) AND the disposition hash lookup. Strip the legacy mirrored
-        # fields so a False row never carries sha-bearing/disposition claims.
+        # Status/cost projection only: no artifact view (no store listing) and no
+        # disposition lookup. Strip the legacy mirrored fields so a False row
+        # never carries sha-bearing/disposition claims.
         projected = dict(merged)
         for field in _CHILD_DISPOSITION_FIELDS:
             projected.pop(field, None)
@@ -902,84 +1202,24 @@ def effective_task_result(
             projected["artifact_status"] = normalize_outcome_axes(projected)["artifacts"]["status"]
         return projected
     try:
-        from ouroboros.artifacts import (
-            collect_task_artifact_records,
-            copy_file_to_task_artifacts,
-            merge_artifact_records,
-        )
         from ouroboros.outcomes import artifact_bundle_from_result
+        from ouroboros.task_custody import own_child_drives, store_artifact_view
 
-        if child_result:
-            parent_artifacts = [item for item in (result.get("artifacts") or []) if isinstance(item, dict)]
-            child_artifacts_for_merge = [item for item in (child_result.get("artifacts") or []) if isinstance(item, dict)]
-            if parent_artifacts or child_artifacts_for_merge:
-                merged["artifacts"] = merge_artifact_records(parent_artifacts, child_artifacts_for_merge)
-
-        rebased_child_artifacts: List[Dict[str, Any]] = []
-        if child_text:
-            parent_artifact_ctx = SimpleNamespace(drive_root=pathlib.Path(drive_root), task_id=task_id)
-            child_artifacts = merge_artifact_records(
-                [item for item in (child_result.get("artifacts") or []) if isinstance(item, dict)],
-                collect_task_artifact_records(pathlib.Path(child_text), task_id),
-            )
-            from ouroboros.outcome_receipt_store import (
-                is_verification_receipts_path,
-                publish_verification_receipt_union,
-            )
-
-            for child_artifact in child_artifacts:
-                source_text = str(child_artifact.get("path") or "").strip()
-                if not source_text:
-                    continue
-                source = pathlib.Path(source_text).expanduser().resolve(strict=False)
-                if is_verification_receipts_path(child_text, task_id, source):
-                    # Historical child results may already list the receipt
-                    # stream as a generic artifact.  Reconcile it through its
-                    # one locked owner and never feed it to shutil.copy2.
-                    publish_verification_receipt_union(
-                        pathlib.Path(drive_root), task_id, pathlib.Path(child_text),
-                    )
-                    continue
-                try:
-                    copied = copy_file_to_task_artifacts(
-                        parent_artifact_ctx, source,
-                        kind=str(child_artifact.get("kind") or "child_artifact"),
-                        **({"immutable": True, "expected": child_artifact} if child_artifact.get("immutable") else {}),
-                    )
-                    if copied is None:
-                        raise OSError("child artifact file is missing")
-                except (OSError, ValueError) as exc:
-                    copied = {**child_artifact, "status": ARTIFACT_STATUS_FAILED,
-                              "copy_status": "failed", "copy_error": f"{type(exc).__name__}: {exc}"}
-                    promotion = merged.get("child_ref_promotion")
-                    promotion = dict(promotion) if isinstance(promotion, dict) else {}
-                    merged["child_ref_promotion"] = {
-                        **promotion, "schema_version": 1, "status": "incomplete",
-                        "pending_refs": [*(promotion.get("pending_refs") or []),
-                                         {"path": str(source), "kind": "task_artifact", "reason": copied["copy_error"]}],
-                    }
-                rebased_child_artifacts.append(copied)
-
-        collected_artifacts = collect_task_artifact_records(drive_root, task_id)
-        if collected_artifacts or rebased_child_artifacts:
-            existing_artifacts = [item for item in (merged.get("artifacts") or []) if isinstance(item, dict)]
-            rebased_names = {
-                str(item.get("name") or pathlib.Path(str(item.get("path") or "")).name)
-                for item in rebased_child_artifacts
-                if isinstance(item, dict)
-            }
-            if rebased_names:
-                existing_artifacts = [
-                    item
-                    for item in existing_artifacts
-                    if str(item.get("name") or pathlib.Path(str(item.get("path") or "")).name) not in rebased_names
-                ]
-                collected_artifacts = collect_task_artifact_records(drive_root, task_id)
-            merged["artifacts"] = merge_artifact_records(existing_artifacts, rebased_child_artifacts, collected_artifacts)
+        # In this artifact view, canonical admission/copy-back facts authorize child store
+        # reads, never scratch existence. Keep child claims even after cancellation; the
+        # view copies, hashes and registers nothing.
+        child_rows = {}
+        for drive in own_child_drives(drive_root, task_id, store_row=result):
+            rows = (load_task_result(drive, task_id) or {}).get("artifacts")
+            child_rows[drive / "task_results" / "artifacts" / task_id] = rows if isinstance(rows, list) else []
+        recorded = [item for item in (merged.get("artifacts") or []) if isinstance(item, dict)]
+        listed = store_artifact_view(drive_root, task_id, recorded, child_rows)
+        if listed:
+            merged["artifacts"] = listed
             merged["artifact_bundle"] = artifact_bundle_from_result(merged)
             merged["artifact_status"] = merged["artifact_bundle"].get("status")
     except Exception:
-        pass
+        log.debug("Artifact view unavailable for %s", task_id, exc_info=True)
     return _project_child_result_disposition(pathlib.Path(drive_root), merged)
 
 
@@ -991,6 +1231,7 @@ def wait_for_effective_tasks(
     mode: str = "all_terminal",
     poll_interval_sec: float = 0.5,
     on_poll: Optional[Callable[[Dict[str, Any], Dict[str, bool]], Any]] = None,
+    terminal_probe: Optional[Callable[[Dict[str, Any]], Dict[str, bool]]] = None,
 ) -> Dict[str, Any]:
     """Poll effective task results until the wait ``mode`` is satisfied.
 
@@ -1001,7 +1242,7 @@ def wait_for_effective_tasks(
     intent to a real terminal shortly after. The wait stays bounded by
     ``timeout_sec`` either way, and ``live_child_status`` reports a pending
     cancellation honestly (``cancel_pending``) instead of collapsing it to
-    terminal/unknown."""
+    terminal/unknown, and a row its ``current_stop`` holds as ``held``."""
     ids = []
     for item in task_ids:
         try:
@@ -1016,19 +1257,18 @@ def wait_for_effective_tasks(
     timed_out = False
     early: Any = None
     while True:
-        # Poll reads are status/cancel_state projections only: the
-        # materializing default performed real cross-tree writes (artifact
-        # copy2 + manifest rewrites) every 2s tick — a 600s wait over 5
-        # children was ~1500 spurious materializations. The one materializing
-        # read happens after the loop, on every exit path, so wait/get
-        # consumers keep their place in the child-result sha economy.
+        # Poll reads are status/cancel_state projections only (no store listing
+        # or disposition lookup per 2s tick). The one full read happens after the
+        # loop, on every exit path, so wait/get consumers keep their place in the
+        # child-result sha economy.
         results = {
             tid: load_effective_task_result(
                 pathlib.Path(drive_root), tid, materialize_artifacts=False
             )
             for tid in ids
         }
-        terminal = {tid: str(data.get("status") or "").strip().lower() in SETTLED_STATUSES for tid, data in results.items()}
+        terminal = (terminal_probe(results) if terminal_probe is not None else
+                    {tid: str(data.get("status") or "").strip().lower() in SETTLED_STATUSES for tid, data in results.items()})
         # Sliced wait hook: a child->parent attention beacon (including review_requested)
         # gets one preflight even when the child already terminalized, so a beacon
         # written before this wait is not hidden by the terminal fast path.
@@ -1047,16 +1287,17 @@ def wait_for_effective_tasks(
         if time.monotonic() >= deadline:
             timed_out = True
             break
-        time.sleep(max(0.05, min(2.0, float(poll_interval_sec or 0.5))))
-    # The single materializing read, on EVERY exit path (terminal, timeout,
-    # early beacon): the returned rows re-enter the sha/artifact economy.
+        time.sleep(max(0.05, min(2.0, float(poll_interval_sec or 0.5), deadline - time.monotonic())))
+    # The single full read, on EVERY exit path (terminal, timeout, early
+    # beacon): the returned rows re-enter the sha/artifact economy.
     results = {tid: load_effective_task_result(pathlib.Path(drive_root), tid) for tid in ids}
     out: Dict[str, Any] = {
         "mode": mode,
         "timeout_sec": float(timeout_sec or 0),
         "elapsed_sec": max(0.0, time.monotonic() - start),
         "timed_out": timed_out,
-        "all_terminal": all(str(data.get("status") or "").strip().lower() in SETTLED_STATUSES for data in results.values()) if ids else True,
+        "all_terminal": (all(terminal_probe(results).values()) if terminal_probe is not None else
+                         all(str(data.get("status") or "").strip().lower() in SETTLED_STATUSES for data in results.values())) if ids else True,
         "tasks": results,
     }
     if early is not None:
@@ -1078,6 +1319,8 @@ def wait_for_effective_tasks(
                 # pending) or unknown. Covers the legacy latch too (the effective
                 # read projects it as cancel_state=pending).
                 _st = "cancel_pending"
+            elif (row.get("current_stop") or {}).get("state") == "held" and eff_status not in SETTLED_STATUSES:
+                _st = "held"  # in the queue, but a current stop keeps it from running
             live[tid] = _st or ("terminal" if eff_status in SETTLED_STATUSES else "unknown")
         out["live_child_status"] = live
     except Exception:
@@ -1085,6 +1328,8 @@ def wait_for_effective_tasks(
     return out
 
 
+@cached_finalization_children
+@timed_phase("child_lookup")
 def find_child_tasks(
     drive_root: pathlib.Path,
     *,
@@ -1094,44 +1339,29 @@ def find_child_tasks(
     scope: str = "subtree",
     materialize_artifacts: bool = True,
 ) -> List[Dict[str, Any]]:
-    """Collect a task's subagent children.
+    """Project matching subagents, including retry lineage and live queue rows.
 
-    ``scope`` selects the matching semantics (structural, never prose-parsed — P5):
-
-    - ``"subtree"`` (default): a row matches if it is a DIRECT child
-      (``parent_task_id == parent``) OR any subagent of the same tree
-      (``root_task_id == root``). This is the whole-subtree view UI/API surfaces
-      (`gateway/tasks.py`, `gateway/logs.py`) render as descendant cards.
-    - ``"direct"``: ONLY direct children (``parent_task_id == parent``); the
-      root-subtree fallback is skipped. This is what per-node absorption/handoff
-      wants — a LEAF task must see only its OWN children (none), not its parent
-      and siblings. The v6.56 root-fallback made a childless grandchild receive a
-      false ``children_unabsorbed`` reminder about its parent/sibling.
+    Subtree includes direct children OR members of the named root; direct scope
+    includes only children of parent_task_id. A leaf must not absorb siblings.
     """
     parent = str(parent_task_id or "").strip()
     root = str(root_task_id or "").strip()
     excluded = str(exclude_task_id or "").strip()
     direct_only = str(scope or "subtree").strip().lower() == "direct"
 
-    def _raw_row_may_match(item: Dict[str, Any]) -> bool:
-        # Prefilter on the RAW disk row before paying for the effective
-        # projection: with the materializing default that projection is not a
-        # read — it copies files, rewrites artifact manifests and re-hashes
-        # every artifact of UNRELATED tasks (one finalization ran it 4-5x over
-        # the whole store). The lineage fields the filter needs are already on
-        # the raw row. Two classes must still materialize despite not matching
-        # raw: a row with a retry pointer (the retry chain projects the
-        # RETRY's lineage, which may match where the raw row does not), and a
-        # lineage-less row is safe to skip — a LIVE one is re-discovered by
-        # the queue overlay below with the snapshot's lineage.
-        if str(item.get("superseded_by") or item.get("retry_task_id") or "").strip():
-            return True
-        if str(item.get("delegation_role") or "") != "subagent":
-            return False
-        if parent and str(item.get("parent_task_id") or "") == parent:
-            return True
-        return bool(not direct_only and root and str(item.get("root_task_id") or "") == root)
-
+    # One queue read serves the overlay below and seeds the store's lineage closure: a queued item
+    # naming the parent or root may carry its parent/role only in the queue. The store returns this
+    # lineage alone (``select_lineage``) in ``task_id`` order, so the retry projection and the
+    # last-row-wins fold below are deterministic. Lineage-less live rows reappear in the overlay.
+    snapshot = _load_queue_snapshot(pathlib.Path(drive_root))
+    queued = [(status, item, item["task"] if isinstance(item.get("task"), dict) else {})
+              for group, status in (("pending", STATUS_SCHEDULED), ("running", STATUS_RUNNING))
+              for item in snapshot.get(group) or [] if isinstance(item, dict)]
+    members = {identity for _status, item, task in queued
+               if (parent and str(task.get("parent_task_id") or "").strip() == parent)
+               or (not direct_only and root and str(task.get("root_task_id") or "").strip() == root)
+               for identity in (item.get("id") or item.get("task_id"), item.get("id") or task.get("id"))}
+    selected = select_lineage(pathlib.Path(drive_root), parent, root, direct_only=direct_only, queue_members=members)
     events_index = _EventsTailIndex(pathlib.Path(drive_root))
     rows: Dict[str, Dict[str, Any]] = {}
     for row in (
@@ -1140,8 +1370,7 @@ def find_child_tasks(
             materialize_artifacts=materialize_artifacts,
             _events_index=events_index,
         )
-        for item in list_task_results(pathlib.Path(drive_root))
-        if _raw_row_may_match(item)
+        for item in selected
     ):
         tid = str(row.get("task_id") or "")
         if not tid or tid == excluded:
@@ -1153,56 +1382,37 @@ def find_child_tasks(
         elif not direct_only and root and str(row.get("root_task_id") or "") == root:
             rows[tid] = row
 
-    snapshot = _load_queue_snapshot(pathlib.Path(drive_root))
-    for group, status in (("pending", STATUS_SCHEDULED), ("running", STATUS_RUNNING)):
-        for item in snapshot.get(group) or []:
-            if not isinstance(item, dict):
-                continue
-            task = item.get("task") if isinstance(item.get("task"), dict) else {}
-            tid = str(item.get("id") or task.get("id") or "")
-            if not tid or tid == excluded:
-                continue
-            if str(task.get("delegation_role") or "") != "subagent":
-                continue
-            if parent and str(task.get("parent_task_id") or "") == parent:
-                row = dict(task)
-            elif not direct_only and root and str(task.get("root_task_id") or "") == root:
-                row = dict(task)
-            else:
-                continue
-            row.setdefault("task_id", tid)
-            row["status"] = status
-            existing = rows.get(tid, {})
-            if not existing:
-                # The raw prefilter skips a disk row with no lineage of its own;
-                # the queue snapshot re-identifies it as a child here, but its
-                # thin queue row lacks the disk row's cost, result, artifacts and
-                # ts. Materialize the disk row now (bounded — this runs only for
-                # the handful of actual queue children) so a live lineage-less
-                # child keeps its content, not just its id.
-                disk = load_effective_task_result(
-                    pathlib.Path(drive_root), tid, materialize_artifacts=materialize_artifacts
-                )
-                if disk:
-                    combined = dict(disk)
-                    for key, value in row.items():
-                        if key == "status":
-                            combined["status"] = _merge_queue_status(
-                                str(disk.get("status") or ""), str(value or "")
-                            )
-                        elif not combined.get(key) and value:
-                            combined[key] = value
-                    rows[tid] = combined
-                else:
-                    rows[tid] = row
-                continue
-            combined = dict(existing)
-            for key, value in row.items():
-                if key == "status":
-                    combined["status"] = _merge_queue_status(str(existing.get("status") or ""), str(value or ""))
-                elif not combined.get(key) and value:
-                    combined[key] = value
-            rows[tid] = combined
+    for status, item, task in queued:
+        tid = str(item.get("id") or task.get("id") or "")
+        if not tid or tid == excluded:
+            continue
+        if str(task.get("delegation_role") or "") != "subagent":
+            continue
+        if parent and str(task.get("parent_task_id") or "") == parent:
+            row = dict(task)
+        elif not direct_only and root and str(task.get("root_task_id") or "") == root:
+            row = dict(task)
+        else:
+            continue
+        row.setdefault("task_id", tid)
+        row["status"] = status
+        existing = rows.get(tid, {})
+        if not existing:
+            # Queue lineage can recover a row skipped by the prefilter;
+            # retain its disk cost, result and artifacts as well.
+            existing = load_effective_task_result(
+                pathlib.Path(drive_root), tid, materialize_artifacts=materialize_artifacts
+            )
+        if not existing:
+            rows[tid] = row
+            continue
+        combined = dict(existing)
+        for key, value in row.items():
+            if key == "status":
+                combined["status"] = _merge_queue_status(str(existing.get("status") or ""), str(value or ""), row)
+            elif not combined.get(key) and value:
+                combined[key] = value
+        rows[tid] = combined
     return sorted(rows.values(), key=lambda item: (str(item.get("ts") or ""), str(item.get("task_id") or "")))
 
 
@@ -1331,9 +1541,20 @@ def format_subagent_absorption_message(
             f"\n[NOTE] {omitted} child result(s) omitted for the context budget — "
             "pull them explicitly with get_task_result if you need them."
         )
-    if pending:
-        lines.append("\n[STILL RUNNING — not yet absorbable]")
-        for child in pending:
+    import json
+
+    from ouroboros.work_stop import stop_for_reader
+
+    # A queued status is no permission to run: a child its current stop holds is listed apart, beside that stop
+    # as this parent may act on it (``stop_for_reader``: the request door when it is this parent's to ask for).
+    stops = [stop_for_reader(child.get("current_stop") or {}, child, parent) for child in pending]
+    for held, header in ((False, "[STILL RUNNING — not yet absorbable]"),
+                         (True, "[HELD BY A CURRENT STOP — not yet absorbable: each reaches no terminal state until "
+                                "its stop is released; a door named here is a request the supervisor still checks]")):
+        group = [(child, stop) for child, stop in zip(pending, stops) if (stop.get("state") == "held") is held]
+        if group:
+            lines.append("\n" + header)
+        for child, stop in group:
             cancel_note = (
                 " (cancel pending — supervisor teardown in progress)"
                 if str(child.get("cancel_state") or "") == "pending"
@@ -1341,7 +1562,8 @@ def format_subagent_absorption_message(
             )
             lines.append(
                 f"- {child.get('task_id') or child.get('id')}: {child.get('status')}{cancel_note}, "
-                f"child_result_sha256={_child_result_sha256(child)}"
+                + (f"current_stop={json.dumps(stop, ensure_ascii=False, sort_keys=True)}, " if stop else "")
+                + f"child_result_sha256={_child_result_sha256(child)}"
             )
     if descendants:
         lines.append(

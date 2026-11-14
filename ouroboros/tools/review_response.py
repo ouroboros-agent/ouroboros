@@ -12,13 +12,33 @@ from ouroboros.utils import truncate_review_artifact
 def review_operation_fields(actor: dict) -> dict:
     usage = actor.get("usage") if isinstance(actor.get("usage"), dict) else {}
     return {
+        "outcome": dict(actor.get("outcome") or {}),
         "operation_id": actor.get("operation_id") or "",
         "operation_state": actor.get("operation_state") or "settled",
         "late_result_pending": bool(actor.get("late_result_pending")),
         "recovery_binding": dict(actor.get("recovery_binding") or {}),
+        "error_event_logged": actor.get("error_event_logged") is True,  # #1578 append receipt
+        "review_wave_id": str(actor.get("review_wave_id") or ""),
         "pending_invocation_id": str(usage.get("pending_invocation_id") or ""),
         "delegated_run_id": str(usage.get("delegated_run_id") or ""),
     }
+
+
+def _reported_cost(usage: dict, headers: Any) -> float | None:
+    """Preserve reported money independently of whether an answer arrived."""
+    if usage.get("cost_estimated") is True:
+        return None
+    try:
+        if "cost" in usage:
+            return float(usage["cost"]) if usage["cost"] is not None else None
+        if "total_cost" in usage:
+            return float(usage["total_cost"]) if usage["total_cost"] is not None else None
+        for key, value in (headers or {}).items():
+            if key.lower() == "x-openrouter-cost":
+                return float(value)
+    except (ValueError, TypeError, KeyError):
+        pass
+    return None
 
 
 def parse_model_response(model: str, result: Any, headers_dict: Any) -> dict:
@@ -27,12 +47,14 @@ def parse_model_response(model: str, result: Any, headers_dict: Any) -> dict:
     provider = str(usage.get("provider") or "openrouter")
     slot_id = str(result.get("slot_id") or "") if isinstance(result, dict) else ""
     operation_fields = review_operation_fields(result if isinstance(result, dict) else {})
+    cost = _reported_cost(usage, headers_dict)
     if isinstance(result, str) or (isinstance(result, dict) and result.get("error")):
         return {
             "model": resolved_model, "request_model": model,
-            "provider": provider, "verdict": "ERROR",
+            "provider": provider, "verdict": "PENDING" if operation_fields["late_result_pending"]
+            and operation_fields["operation_state"] != "custody_lost" else "ERROR",
             "text": result if isinstance(result, str) else str(result.get("error") or ""),
-            "tokens_in": 0, "tokens_out": 0, "cost_estimate": None,
+            "tokens_in": 0, "tokens_out": 0, "cost_estimate": cost,
             "slot_id": slot_id,
             **operation_fields,
             "prompt_ref": result.get("prompt_ref", {}) if isinstance(result, dict) else {},
@@ -54,7 +76,7 @@ def parse_model_response(model: str, result: Any, headers_dict: Any) -> dict:
         else:
             text = choices[0]["message"]["content"]
             verdict = "UNKNOWN"
-            for line in text.split("\n")[:3]:
+            for line in (() if operation_fields["outcome"] else text.split("\n")[:3]):
                 line_upper = line.upper()
                 if "PASS" in line_upper:
                     verdict = "PASS"
@@ -72,25 +94,15 @@ def parse_model_response(model: str, result: Any, headers_dict: Any) -> dict:
         )
         verdict = "ERROR"
 
+    if isinstance(result.get("outcome"), dict) and result["outcome"]:
+        outcome = result["outcome"]
+        verdict = "PENDING" if outcome.get("status") == "pending" else outcome.get("verdict") or "UNKNOWN"
+
     prompt_tokens = usage.get("prompt_tokens", 0)
     completion_tokens = usage.get("completion_tokens", 0)
     cached_tokens = usage.get("cached_tokens", 0)
     cache_write_tokens = usage.get("cache_write_tokens", 0)
     prompt_cache_ttl = str(usage.get("prompt_cache_ttl") or "")
-
-    cost = None
-    try:
-        if "cost" in usage:
-            cost = float(usage["cost"])
-        elif "total_cost" in usage:
-            cost = float(usage["total_cost"])
-        elif headers_dict:
-            for key, value in headers_dict.items():
-                if key.lower() == "x-openrouter-cost":
-                    cost = float(value)
-                    break
-    except (ValueError, TypeError, KeyError):
-        pass
 
     return {
         "model": resolved_model, "request_model": model,
@@ -103,4 +115,9 @@ def parse_model_response(model: str, result: Any, headers_dict: Any) -> dict:
         **operation_fields,
         "prompt_ref": result.get("prompt_ref", {}) if isinstance(result, dict) else {},
         "response_ref": result.get("response_ref", {}) if isinstance(result, dict) else {},
+        # A retrieving seat's observed read coverage of its required-source
+        # manifest rides with the answer (the coupling part's diagnostic).
+        **({"native_read_coverage": usage["native_read_coverage"],
+            "read_provenance": str(usage.get("read_provenance") or usage.get("host_file_read_attestation") or "")}
+           if isinstance(usage.get("native_read_coverage"), dict) else {}),
     }

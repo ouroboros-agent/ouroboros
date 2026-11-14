@@ -91,6 +91,24 @@ def test_legacy_response_rechecks_exact_dispatch_before_release(tmp_path):
     assert gateway.reads == ["op-one"] and not gateway.results
 
 
+@pytest.mark.parametrize(("ready", "proven"), [(False, False), (True, True)])
+def test_late_upload_proof_keeps_attempt_but_releases_only_definite_non_delivery(tmp_path, proven, ready):
+    request(tmp_path, operation_id="op-one")
+    gateway = Gateway(state="failed", dispatch="not_started" if proven else "unknown", ready=ready)
+    gateway.detail["dispatch"].update(startedAt="2026-09-30T00:00:00Z", route={"source": "codex"})
+    problem = {"code": "transport_not_delivered" if proven else "transport_unknown",
+               "message": "Upload ended", "context": {"bodyBytes": 3_000_000,
+               "handedToSocketBytes": 65_536 if proven else 3_000_000}}
+    gateway.detail["problem"] = problem
+    gateway.raw = json.dumps({"outcome": "failed" if proven else "unknown", "message": None,
+                              "problem": problem, "usage": {}, "cost": {"knowledge": "unknown"}}).encode()
+    got = transport.recover_model_attempt(tmp_path, ROW, gateway_factory=lambda: gateway)
+    assert got == ("released" if proven else "abandoned", {}, None, False)
+    assert gateway.reads == ["op-one"] and len(gateway.acks) == int(ready)
+    # Once retained, reconciliation uses the same receipt without another engine read.
+    assert transport.recover_model_attempt(tmp_path, ROW, gateway_factory=lambda: pytest.fail("new lookup")) == got
+
+
 @pytest.mark.parametrize("dispatch", ["started", "unknown", "response_received"])
 def test_terminal_operation_without_response_keeps_price_unknown(tmp_path, dispatch):
     request(tmp_path, operation_id="op-one")
@@ -103,3 +121,30 @@ def test_conflicting_operation_binding_is_not_recovered(tmp_path):
     request(tmp_path, operation_id="op-different")
     response(tmp_path, operation_state="succeeded", dispatch_state="response_received")
     assert transport.recover_model_attempt(tmp_path, ROW) is None
+
+
+@pytest.mark.parametrize("retained", [True, False])
+@pytest.mark.parametrize("dispatch,disposition", [
+    ("response_received", "settled"), ("not_started", "released"), ("unknown", "abandoned")])
+def test_interrupted_operation_is_terminal_offline_and_live(tmp_path, retained, dispatch, disposition):
+    """The engine's ``interrupted`` is terminal (custody's TERMINAL_STATES): a received
+    response settles, a proven non-start releases, an unknown dispatch is abandoned at an
+    unknown price; none of them defers into the next pass's engine read."""
+    gateway = Gateway(state="interrupted", dispatch=dispatch, ready=dispatch == "response_received")
+    if retained:
+        response(tmp_path, operation_state="interrupted", dispatch_state=dispatch)
+    else:
+        request(tmp_path, operation_id="op-one")
+    got = transport.recover_model_attempt(
+        tmp_path, ROW, gateway_factory=(lambda: pytest.fail("a retained terminal receipt needs no read"))
+        if retained else (lambda: gateway))
+    assert got is not None and got[0] == disposition
+    if disposition == "settled":
+        assert got[2:] == (.2, True) and got[1]["prompt_tokens"] == 20
+    else:
+        assert got == (disposition, {}, None, False)
+    assert len(gateway.acks) == int(not retained and dispatch == "response_received")
+    manifest, _payload, _ = read_call_payload(tmp_path, task_id=ROW["task_id"], call_id="attempt-one_model_response")
+    assert (manifest["operation_state"], manifest["dispatch_state"]) == ("interrupted", dispatch)
+    # The receipt now decides alone: the next maintenance pass makes no engine request.
+    assert transport.recover_model_attempt(tmp_path, ROW, gateway_factory=lambda: pytest.fail("new lookup")) == got

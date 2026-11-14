@@ -91,7 +91,7 @@ def test_wall_exhausted_body_429_empty_is_infra_not_a_model_failure(tmp_path, mo
 
 
 def test_scheduled_presence_handoff_survives_the_no_call_rail(tmp_path):
-    """Presence keeps the admitted child and discloses the current provider outage."""
+    """Presence keeps the admitted child without sending host-salvaged text."""
     from ouroboros.presence_runner import build_presence_result_event
     tools_ctx = SimpleNamespace(
         task_metadata={"presence": {"binding_id": "presence-binding"}},
@@ -113,10 +113,10 @@ def test_scheduled_presence_handoff_survives_the_no_call_rail(tmp_path):
     assert usage["reason_code"] == "provider_unavailable"
     terminal = build_presence_result_event(
         {"id": "presence-turn"}, text, tools_ctx,
-        provider_notice=usage["terminal_provider_notice"],
+        terminal_origin=usage["terminal_origin"],
         retain_scheduled_handoff=True,
     )
     assert terminal["work_ref"] == "t-child-1"
     assert terminal["outcome"] == "deferred"  # admitted work retains its polling custody after the parent failure
-    assert terminal["text"].startswith("PARTIAL RESULT.")
-    assert terminal["text"].count(usage["terminal_provider_notice"]) == 1
+    assert usage["terminal_origin"] == "host_salvage"
+    assert terminal["text"] == ""

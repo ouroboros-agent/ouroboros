@@ -47,7 +47,7 @@ smoke_package() {
             test -f /usr/share/applications/ouroboros.desktop
             test -f /usr/share/pixmaps/ouroboros.png
             test -s /usr/lib/systemd/user/ouroboros.service
-            grep -Fqx 'ExecStart=/opt/ouroboros/Ouroboros' \
+            grep -Fqx 'ExecStart=/opt/ouroboros/Ouroboros --launch-intent automatic' \
               /usr/lib/systemd/user/ouroboros.service
             grep -Fqx 'KillMode=control-group' \
               /usr/lib/systemd/user/ouroboros.service

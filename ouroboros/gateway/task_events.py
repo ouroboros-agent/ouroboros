@@ -3,6 +3,30 @@
 The existing ``gateway.tasks`` exports remain the route and injection surface.
 Both transports share current result/lineage projections and all five sources;
 v2 owns only read positions, never event persistence or task state.
+
+``progress`` and ``chat`` are the dialogue store's streams (``state/dialog.sqlite``):
+a task tree's rows are indexed probes over its identifiers (``dialogue_store.task_rows``),
+never a scan of other rooms' history; the v1 ``line`` is the row's durable position
+among every stored object of its stream (``dialogue_positions``). ``events``, ``tools``
+and ``supervisor`` stay rotated files read by byte offset.
+
+v2 cursor: one coordinate per root and source -- a dialogue stream's chain coordinate
+(the byte offset the row has in the frozen archive plus the rows appended since) or a
+file chain's byte offset over archive plus live -- valid while archives stay immutable
+and retained. Only an explicit ``created_at`` on the task result bounds a file scan and
+lets the cursor step over a not-yet-imported archive segment that predates the task
+(API admission stamps it for generated ids). A pending segment the task may have rows
+in is disclosed once (``history_gap`` ``still_importing``) and never crossed, so no row
+is skipped; skipped archive bytes still count in the offset.
+
+A budgeted v2 pass checks its clock at fully processed row boundaries. After
+``_PASS_SLICE_SEC`` without a frame, a ``cursor_checkpoint`` carries its progress;
+a blocked read can delay that boundary. The pass reads until the later of the
+request deadline and one slice after it began. Spending that budget ends the
+request with a checkpoint and no ``task_result``; a result follows only a pass
+that reached every source's pinned end. The client resumes with that cursor.
+Legacy replay filters each file as it parses it, holding matches rather than the
+whole chain's records.
 """
 
 from __future__ import annotations
@@ -14,17 +38,22 @@ import json
 import os
 import pathlib
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 
+from ouroboros import dialogue_store as ds
+from ouroboros.dialogue_import import coverage as dialogue_coverage, pending_segments
+from ouroboros.dialogue_positions import ordinals_of, skipped_between
 from ouroboros.gateway._helpers import coerce_int, request_drive_root, run_sync_to_completion
+from ouroboros.gateway.logs import replica_key
 from ouroboros.headless import ARTIFACT_STATUS_FINALIZING, ARTIFACT_STATUS_PENDING
 from ouroboros.outcomes import public_task_result
-from ouroboros.task_results import load_task_result, task_results_dir, validate_task_id
+from ouroboros.task_results import load_task_result, validate_task_id
 from ouroboros.task_status import FINAL_STATUSES
-from ouroboros.gateway.task_list_scan import raw_result_facts
+from ouroboros.store import StoreError
+from ouroboros.task_store import task_facts
 from ouroboros.gateway.contracts import TaskEventsRequest
 from ouroboros.gateway.schema import validate_ingress
 from ouroboros.utils import jsonl_archive_segments, jsonl_chain_handles
@@ -55,6 +84,12 @@ _LOG_SOURCES = (
     ("tools", ("logs", "tools.jsonl")),
     ("supervisor", ("logs", "supervisor.jsonl")),
 )
+_DIALOGUE_SOURCES = frozenset(ds.STREAMS)  # read from the store; the other sources are rotated files
+_DIALOGUE_BATCH = 200  # rows per probe page: one short read transaction, never the whole stream
+_TASK_COLUMNS = ("task_id", "parent_task_id", "root_task_id", "subagent_task_id")
+# The longest a v2 pass reads without a frame, and the least read budget of one request: well
+# inside the CLI's 40 s socket timeout, so a scan of unrelated rows never reads as a dead server.
+_PASS_SLICE_SEC = 10.0
 
 
 async def api_task_events(request: Request) -> StreamingResponse:
@@ -121,8 +156,7 @@ async def api_task_events(request: Request) -> StreamingResponse:
                         pending.append(row)
                     if pending:
                         tail_key = _event_sort_key(pending[-1])
-            if follower._lineage_notice is not None:
-                notice, follower._lineage_notice = follower._lineage_notice, None
+            for notice in follower.take_notices():
                 # A read diagnostic is not a legacy history row/rank.
                 yield _sse({**notice, "seq": cursor}, event_id=cursor)
             for event in pending:
@@ -183,7 +217,7 @@ async def api_task_events(request: Request) -> StreamingResponse:
         try:
             async for frame in _legacy_events():
                 yield frame
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, StoreError) as exc:
             yield _sse({"type": "error", "task_id": task_id, "seq": cursor + 1,
                         "error": str(exc), "reason": "history_unavailable"}, event_id=cursor + 1)
 
@@ -270,13 +304,18 @@ class _TaskEventFollower:
         self.result: Dict[str, Any] = {}
         self.suppress_task_done = False
         self.filter_grew = False
+        self.replicas: set = set()  # REPLICA_RULE rows already emitted on this connection, by natural key
         self._queue_snapshot_mtime: Any = None
-        self._results_dir = task_results_dir(self.drive_root, create=False)
-        # Per-file proof belongs to this live follower, never a client cursor
-        # or the shared current-facts memo. Failed reads may retain this proof.
-        self._seen_result_names: Dict[str, tuple[str, str]] = {}
-        self._lineage_failed_names: set[str] = set()
+        # A lineage notice is raised when the store cannot answer the lineage query (a
+        # migration window); it clears once the query answers again. The last answered
+        # lineage survives a replay rebuild so an outage never narrows a live stream.
+        self._lineage_unavailable = False
         self._lineage_notice: Optional[dict] = None
+        self._lineage_proof: Optional[tuple] = None
+        # A dialogue stream whose archive import has not covered this root yet: its rows below the
+        # frontier are unknown, which the stream says once per (root, source), never "no rows".
+        self._import_notices: Dict[tuple, dict] = {}
+        self._import_noted: set = set()
         # Only an explicit creation fact may bound the scan. Legacy ``ts`` can
         # describe finalization and must never hide earlier task history.
         raw = load_task_result(self.drive_root, task_id) or {}
@@ -295,7 +334,7 @@ class _TaskEventFollower:
 
     def queue_snapshot_changed(self) -> bool:
         try:
-            mtime = (self.drive_root / "state" / "queue_snapshot.json").stat().st_mtime_ns
+            mtime = (self.drive_root / "state" / "queue.alive").stat().st_mtime_ns
         except OSError:
             mtime = None
         changed = mtime != self._queue_snapshot_mtime
@@ -303,43 +342,40 @@ class _TaskEventFollower:
         return changed
 
     def _discover_roots(self) -> bool:
-        """Rebuild the filter from current compact facts, reusing unchanged rows.
+        """Rebuild the filter from the store's current lineage facts (one query).
 
-        Results are written with lineage before enqueue. Stat invalidation also
-        sees later changes to an existing row; reconnects share that same memo.
-        Discovery is a read-only projection, never result/schema authority.
+        Results are written with lineage before enqueue. Discovery is a read-only
+        projection, never result/schema authority. The last answered lineage is the
+        follower's proof: while the store cannot answer, that proof stands (through a
+        replay rebuild too) and the gap is disclosed once; a follower without proof
+        reads the roots its own result names.
         """
         candidates = [self.drive_root]
         child = str(self.result.get("child_drive_root") or self.result.get("headless_child_drive_root") or "").strip()
         if child:
             candidates.append(pathlib.Path(child))
-        facts, malformed = raw_result_facts(
-            self._results_dir, reader=_tasks_namespace().read_json_dict,
-        )
-        failed = set(malformed)
-        bindings = {name: binding for name, binding in self._seen_result_names.items() if name in failed}
-        retained_count = len(bindings)
-        for name, row in facts.items():
-            if row["schema_refusal"] or row["delegation_role"] != "subagent":
-                continue
-            child_id = row["task_id"] or row["id"]
-            if not child_id or not (row["parent_task_id"] == self.task_id or row["root_task_id"] == self.task_id):
-                continue
-            child_root = row["child_drive_root"] or row["headless_child_drive_root"]
-            bindings[name] = (child_id, child_root)
-        ids = {self.task_id, *(child_id for child_id, _root in bindings.values())}
-        for _child_id, child_root in bindings.values():
-            if child_root:
-                candidates.append(pathlib.Path(child_root))
-        self._seen_result_names = bindings
-        if failed != self._lineage_failed_names:
-            self._lineage_notice = ({"type": "history_gap", "source": "task_result",
-                "task_id": self.task_id, "reason": "lineage_incomplete",
-                "data": {"failed_result_reads": len(failed), "retained_result_bindings": retained_count,
-                         "unknown_result_membership": len(failed) - retained_count}}
-                if failed else None)
-        self._lineage_failed_names = failed
-        roots = sorted(set(candidates), key=str)
+        try:
+            facts = task_facts(self.drive_root, where="delegation_role='subagent' AND (parent_task_id=? OR root_task_id=?)",
+                               params=(self.task_id, self.task_id))
+        except StoreError:
+            if not self._lineage_unavailable:
+                self._lineage_notice = {"type": "history_gap", "source": "task_result",
+                    "task_id": self.task_id, "reason": "lineage_incomplete",
+                    "data": {"store_unavailable": True}}
+            self._lineage_unavailable = True
+            if self._lineage_proof is not None:
+                ids, roots = set(self._lineage_proof[0]), list(self._lineage_proof[1])
+            else:
+                ids, roots = {self.task_id}, sorted(set(candidates), key=str)
+        else:
+            if self._lineage_unavailable:
+                self._lineage_notice = None
+            self._lineage_unavailable = False
+            bindings = {child_id: row["child_drive_root"] or row["headless_child_drive_root"] for child_id, row in facts.items()}
+            ids = {self.task_id, *bindings}
+            candidates.extend(pathlib.Path(child_root) for child_root in bindings.values() if child_root)
+            roots = sorted(set(candidates), key=str)
+            self._lineage_proof = (frozenset(ids), tuple(roots))
         changed = ids != self.task_filter_ids or roots != self.roots
         self.filter_grew = self.filter_grew or changed
         self.task_filter_ids, self.roots = ids, roots
@@ -349,19 +385,73 @@ class _TaskEventFollower:
         key = (str(root), source)
         state = self.logs.get(key)
         if state is None:
-            state = {"archives": [], "offset": 0, "ino": None, "lines": 0}
+            state = {"archives": [], "offset": 0, "ino": None, "lines": 0, "after": -1}
             self.logs[key] = state
         return state
 
-    def _read_chain_delta(self, root: pathlib.Path, source: str, parts: tuple) -> List[Dict[str, Any]]:
-        """Entries appended to one (root, source) chain since the recorded state.
+    def take_notices(self) -> List[dict]:
+        """The read diagnostics raised since the last take: the lineage gap, then each dialogue
+        stream whose archive import is incomplete for a root (once per root and source)."""
+        notices = [self._lineage_notice] if self._lineage_notice is not None else []
+        self._lineage_notice = None
+        notices.extend(self._import_notices.values())
+        self._import_notices = {}
+        return notices
+
+    def _note_import(self, root: pathlib.Path, source: str) -> None:
+        """Disclose once that ``source`` of ``root`` is still importing (or holds a segment that
+        never will be): the merge below the frontier is incomplete, not empty."""
+        key = (str(root), source)
+        facts = dialogue_coverage(root, source)
+        if facts["imported"]:
+            self._import_noted.discard(key)
+            return
+        if key not in self._import_noted:
+            self._import_noted.add(key)
+            self._import_notices[key] = {
+                "type": "history_gap", "source": source, "root": str(root), "task_id": self.task_id,
+                "reason": "segment_unimportable" if facts["mismatch"] and not facts["pending"] else "still_importing",
+                "data": {"pending": facts["pending"], "mismatch": facts["mismatch"]}}
+
+    def _read_dialogue_delta(self, root: pathlib.Path, source: str) -> List[Tuple[Dict[str, Any], Optional[int]]]:
+        """The task tree's rows stored in one dialogue stream after the recorded coordinate, with
+        each row's ``line`` (its durable ordinal + 1; None while the archive import has not settled
+        the counts, which ``_note_import`` discloses). Indexed probes, one statement per column, paged."""
+        state = self._log_state(root, source)
+        rows: List[ds.Row] = []
+        after = int(state["after"])
+        while True:
+            page = ds.task_rows(root, self.task_filter_ids, stream=source, after=after, limit=_DIALOGUE_BATCH)
+            rows.extend(page)
+            if len(page) < _DIALOGUE_BATCH:
+                break
+            after = page[-1].seq
+        if rows:
+            state["after"] = rows[-1].seq
+        self._note_import(root, source)
+        try:
+            ordinals = ordinals_of(root, source, [row.seq for row in rows]) if rows else {}
+        except StoreError:  # the counts below the cutover are not settled: no number is better than a guess
+            ordinals = {}
+        return [(row.row, ordinals[row.seq].ordinal + 1 if row.seq in ordinals else None)
+                for row in ds.whole_rows(root, rows)]
+
+    def _read_chain_rows(self, root: pathlib.Path, source: str, parts: tuple) -> Tuple[List[Dict[str, Any]], bool]:
+        """The lineage's rows appended to one (root, source) chain since the recorded state, and
+        whether anything was consumed: a dialogue stream's rows after the recorded coordinate (with
+        their lines), or a file chain's bytes, filtered file by file as each is parsed so a replay
+        holds matching rows, never every record of the chain; the line count still counts them all.
 
         Fresh state (a late-discovered log) naturally degenerates to reading the
         whole chain: every archive is "new" and the live offset is 0."""
+        if source in _DIALOGUE_SOURCES:
+            entries = self._read_dialogue_delta(root, source)
+            return self._entries_to_rows(root, source, entries), bool(entries)
         state = self._log_state(root, source)
         live = root.joinpath(*parts)
         prefix = _ROTATED_LOG_PREFIXES.get(source)
-        entries: List[Dict[str, Any]] = []
+        rows: List[Dict[str, Any]] = []
+        consumed = False
         if prefix:
             try:
                 archive_paths = sorted(
@@ -391,7 +481,8 @@ class _TaskEventFollower:
                 start = state.pop("rotated_offset", state["offset"])
                 for index, path in enumerate(new_archives):
                     got, _, _ = _tasks_namespace()._read_live_jsonl_entries(path, start if index == 0 else 0)
-                    entries.extend(got)
+                    rows.extend(self._entries_to_rows(root, source, got))
+                    consumed = consumed or bool(got)
                     state["archives"].append(path.name)
                 if not (had_stash and len(new_archives) == 1):
                     # No stash: offset/ino still describe the OLD live file (now
@@ -405,7 +496,7 @@ class _TaskEventFollower:
         try:
             live_stat = live.stat()
         except OSError:
-            return entries
+            return rows, consumed
         if (state["ino"] is not None and live_stat.st_ino != state["ino"]) or (
             live_stat.st_size < state["offset"]
         ):
@@ -418,16 +509,20 @@ class _TaskEventFollower:
             state["offset"] = 0
         got, new_offset, ino = _tasks_namespace()._read_live_jsonl_entries(live, state["offset"])
         state["offset"], state["ino"] = new_offset, ino
-        entries.extend(got)
-        return entries
+        rows.extend(self._entries_to_rows(root, source, got))
+        return rows, consumed or bool(got)
 
-    def _entries_to_rows(
-        self, root: pathlib.Path, source: str, entries: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
+    def _entries_to_rows(self, root: pathlib.Path, source: str, entries: List[Any]) -> List[Dict[str, Any]]:
+        """Events for the entries that match the lineage filter: a file chain's entries are
+        numbered as they are consumed; a dialogue row carries its own ``line`` (or none)."""
         state = self._log_state(root, source)
         rows: List[Dict[str, Any]] = []
-        for entry in entries:
-            state["lines"] += 1
+        for item in entries:
+            if source in _DIALOGUE_SOURCES:
+                entry, line = item
+            else:
+                state["lines"] += 1
+                entry, line = item, state["lines"]
             entry_task = str(entry.get("task_id") or "")
             entry_subagent = str(entry.get("subagent_task_id") or "")
             entry_parent = str(entry.get("parent_task_id") or "")
@@ -439,9 +534,15 @@ class _TaskEventFollower:
                 and entry_root != self.task_id
             ):
                 continue
-            event = _event_from_log_entry(source, state["lines"], entry, root)
+            event = _event_from_log_entry(source, line or 0, entry, root)
+            if line is None:
+                event.pop("line")  # unknown while the archive import settles the counts (disclosed once)
             if self.suppress_task_done and event.get("type") == "task_done":
                 continue
+            if (key := replica_key(entry)) is not None:
+                if key in self.replicas:
+                    continue
+                self.replicas.add(key)
             rows.append(event)
         return rows
 
@@ -449,6 +550,7 @@ class _TaskEventFollower:
         """Full archive-aware merge; rebuilds ALL follow state from scratch."""
         self.logs = {}
         self.roots = []
+        self.replicas = set()
         self.task_filter_ids = {self.task_id}
         # The process-local stat memo survives a connection/replay rebuild.
         # A replay rebuilds log positions, not the live follower's prior proof.
@@ -458,8 +560,7 @@ class _TaskEventFollower:
         rows: List[Dict[str, Any]] = []
         for root in self.roots:
             for source, parts in _LOG_SOURCES:
-                entries = self._read_chain_delta(root, source, parts)
-                rows.extend(self._entries_to_rows(root, source, entries))
+                rows.extend(self._read_chain_rows(root, source, parts)[0])
         if self.result:
             rows.append({
                 "source": "task_result",
@@ -481,10 +582,9 @@ class _TaskEventFollower:
         rows: List[Dict[str, Any]] = []
         for root in list(self.roots):
             for source, parts in _LOG_SOURCES:
-                entries = self._read_chain_delta(root, source, parts)
-                if entries:
-                    advanced = True
-                    rows.extend(self._entries_to_rows(root, source, entries))
+                got, consumed = self._read_chain_rows(root, source, parts)
+                advanced = advanced or consumed
+                rows.extend(got)
         rows.sort(key=_event_sort_key)
         return rows, advanced
 
@@ -521,6 +621,12 @@ class _TaskEventCursorFollower(_TaskEventFollower):
         self.seq = cursor["seq"]
         self.view = cursor["view"]
         self.positions = {root: dict(sources) for root, sources in cursor["positions"].items()}
+        # The current pass's read budget (a ``time.monotonic`` instant; None reads each pass whole,
+        # without slice checkpoints), whether the last pass reached every source's pinned end before
+        # that budget ran out, and when this request last sent a frame.
+        self.pass_deadline: Optional[float] = None
+        self.pass_complete = True
+        self._last_frame = time.monotonic()
 
     def checkpoint(self) -> dict:
         return {"v": 2, "seq": self.seq, "view": self.view,
@@ -529,7 +635,21 @@ class _TaskEventCursorFollower(_TaskEventFollower):
     def envelope(self, event: dict, *, identity: str = "", delivery: bool = True) -> dict:
         if delivery:
             self.seq += 1
+        self._last_frame = time.monotonic()  # every envelope becomes one frame of the stream
         return {**event, "seq": self.seq, "event_id": identity, "cursor": self.checkpoint()}
+
+    def _slice_frame(self) -> Optional[dict]:
+        """At a fully processed row boundary of a budgeted pass: the checkpoint owed after a slice
+        without a frame, or the one that ends the pass because its budget is spent, which turns
+        ``pass_complete`` False; None when the pass reads on silently."""
+        if self.pass_deadline is None:
+            return None
+        now = time.monotonic()
+        if now >= self.pass_deadline:
+            self.pass_complete = False
+        elif now - self._last_frame < _PASS_SLICE_SEC:
+            return None
+        return self.envelope({"type": "cursor_checkpoint", "task_id": self.task_id}, delivery=False)
 
     def refresh_view(self) -> Optional[dict]:
         self.refresh_result()
@@ -558,12 +678,20 @@ class _TaskEventCursorFollower(_TaskEventFollower):
         JSONL record keeps its existing support; history is never one batch.
         Each source's logical EOF is pinned for this pass; later appends wait
         for the next pass so a busy source cannot starve the rest of the view.
+        A budgeted pass checks its clock after each bounded read (``_slice_frame``),
+        so it can stop there, but only after it has made that read's progress.
         """
-        if self._lineage_notice is not None:
-            notice, self._lineage_notice = self._lineage_notice, None
+        self.pass_complete = True
+        for notice in self.take_notices():
             yield self.envelope(notice, delivery=False)
+        skipped = False  # a skipped replica's position, which only a frame carries to the client
         for root in self.roots:
             for source, parts in _LOG_SOURCES:
+                if source in _DIALOGUE_SOURCES:
+                    yield from self._read_dialogue_events(root, source)
+                    if not self.pass_complete:
+                        return
+                    continue
                 live = root.joinpath(*parts)
                 position = self.positions[str(root)][source]
                 if position == 0 and self._created_floor:
@@ -626,9 +754,88 @@ class _TaskEventCursorFollower(_TaskEventFollower):
                         event.pop("line")
                         if self.suppress_task_done and event["type"] == "task_done":
                             continue
+                        if (key := replica_key(entry)) is not None:  # one per connection; a cursor resumed between
+                            if key in self.replicas:                   # the two copies' frames shows both (disclosed)
+                                skipped = True
+                                continue
+                            self.replicas.add(key)
+                        skipped = False
                         yield self.envelope(event, identity=identity)
                     if position == before:
                         break
+                    if (frame := self._slice_frame()) is not None:
+                        yield frame
+                        if not self.pass_complete:
+                            return
+        if skipped:  # a cut in the idle window after the pass would otherwise re-read the copy it skipped
+            yield self.envelope({"type": "cursor_checkpoint", "task_id": self.task_id}, delivery=False)
+
+    def _read_dialogue_events(self, root: pathlib.Path, source: str):
+        """One pass over a dialogue stream from the cursor's coordinate: the task tree's rows and
+        the lines the import skipped, in coordinate order, each moving the position to its exact
+        end. The pass ends at the stream's end pinned when it began, so later appends wait for
+        the next pass, or at the archive import's frontier: a pending segment that may hold the
+        task's rows is disclosed once and never crossed (a segment proven to predate the task's
+        creation holds none and is stepped over), so no row is ever skipped."""
+        key = str(root)
+        position = self.positions[key][source]
+        end = ds.stream_end(root, source)
+        if position > end:
+            raise ValueError("cursor position is beyond the dialogue stream")
+        bound, waiting = end, False
+        for segment in pending_segments(root):
+            if segment["stream"] != source or int(segment["base"]) + int(segment["size"]) <= position:
+                continue
+            if self._created_floor and _archive_stamp_predates(segment["name"], source, self._created_floor):
+                continue  # rotated before the task existed: none of its rows; the probes find nothing there
+            bound, waiting = min(bound, max(position, int(segment["base"]))), True
+            break
+        if waiting and (key, source) not in self._import_noted:
+            self._import_noted.add((key, source))
+            yield self.envelope({"type": "history_gap", "source": source, "root": key, "task_id": self.task_id,
+                                 "reason": "still_importing"}, delivery=False)
+        elif not waiting:
+            self._import_noted.discard((key, source))
+        if bound > position and ds.range_coverage(root, source, lower=position, upper=bound)["mismatch"]:
+            yield self.envelope({"type": "history_gap", "source": source, "root": key, "task_id": self.task_id,
+                                 "reason": "segment_unimportable"}, delivery=False)
+        keys = [(column, task) for task in sorted(self.task_filter_ids) for column in _TASK_COLUMNS]
+        skipped = list(skipped_between(root, source, position, bound)) if bound > position else []
+        lower = position
+        while lower < bound:
+            rows = ds.probe_rows(root, source, keys, lower=lower, before=bound, limit=_DIALOGUE_BATCH, newest_first=False)
+            for row in ds.whole_rows(root, rows):
+                while skipped and skipped[0].seq < row.seq:
+                    gap = skipped.pop(0)
+                    self.positions[key][source] = gap.end
+                    yield self.envelope({"type": "history_gap", "source": source, "root": key, "task_id": self.task_id,
+                                         "reason": "invalid_archive_line"},
+                                        identity=json.dumps([key, source, gap.seq], separators=(",", ":")), delivery=False)
+                self.positions[key][source] = row.end
+                entry = row.row
+                if (str(entry.get("task_id") or "") not in self.task_filter_ids
+                        and str(entry.get("subagent_task_id") or "") not in self.task_filter_ids
+                        and str(entry.get("parent_task_id") or "") != self.task_id
+                        and str(entry.get("root_task_id") or "") != self.task_id):
+                    continue
+                event = _event_from_log_entry(source, 0, entry, root)
+                event.pop("line")  # v2 rows carry a coordinate identity, never a count
+                if self.suppress_task_done and event["type"] == "task_done":
+                    continue
+                yield self.envelope(event, identity=json.dumps([key, source, row.seq], separators=(",", ":")))
+            if len(rows) < _DIALOGUE_BATCH:
+                break
+            lower = rows[-1].seq + 1
+            if (frame := self._slice_frame()) is not None:  # positions sit at the page's last row
+                yield frame
+                if not self.pass_complete:
+                    return
+        for gap in skipped:
+            self.positions[key][source] = gap.end
+            yield self.envelope({"type": "history_gap", "source": source, "root": key, "task_id": self.task_id,
+                                 "reason": "invalid_archive_line"},
+                                identity=json.dumps([key, source, gap.seq], separators=(",", ":")), delivery=False)
+        self.positions[key][source] = bound
 
 
 async def _api_task_events_v2(request: Request, task_id: str):
@@ -656,6 +863,7 @@ async def _api_task_events_v2(request: Request, task_id: str):
                 replay = await asyncio.to_thread(follower.refresh_view)
                 if replay:
                     yield _sse(replay, event_id=follower.seq)
+                follower.pass_deadline = max(deadline, time.monotonic() + _PASS_SLICE_SEC)
                 rows = follower.read_events()
                 try:
                     while True:
@@ -665,6 +873,8 @@ async def _api_task_events_v2(request: Request, task_id: str):
                         yield _sse(event, event_id=event["seq"])
                 finally:
                     rows.close()
+                if not follower.pass_complete:
+                    break  # its checkpoint ended the request: a result waits for a whole pass
                 terminal = follower.result_is_final()
                 if first or terminal:
                     result = follower.result
@@ -685,7 +895,7 @@ async def _api_task_events_v2(request: Request, task_id: str):
                     yield _sse(event, event_id=follower.seq)
                     break
                 await asyncio.sleep(0.5)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, StoreError) as exc:
             event = follower.envelope({"type": "error", "task_id": task_id,
                 "error": str(exc), "reason": "cursor_unavailable"}, delivery=False)
             yield _sse(event, event_id=follower.seq)
@@ -694,11 +904,11 @@ async def _api_task_events_v2(request: Request, task_id: str):
 
 
 def iter_task_events(drive_root: pathlib.Path, task_id: str) -> List[Dict[str, Any]]:
-    """Return synthesized replayable events for a task from existing logs.
+    """Return synthesized replayable events for a task from the dialogue store and the file logs.
 
-    Archive-aware (v6.90.x P2): each rotated log's ``archive/<prefix>_*.jsonl``
-    chain is read oldest-first before the live file, so a rotation never erases
-    replay history. Also the SSE initial-replay/re-merge path."""
+    The dialogue streams answer the task tree's rows by indexed probe; each rotated file log's
+    ``archive/<prefix>_*.jsonl`` chain is read oldest-first before the live file, so a rotation
+    never erases replay history. Also the SSE initial-replay/re-merge path."""
     return _TaskEventFollower(drive_root, task_id).full_merge()
 
 
@@ -709,7 +919,9 @@ def _event_from_log_entry(source: str, line_no: int, entry: Dict[str, Any], root
     elif source == "chat":
         event_type = "message"
     elif source == "tools":
-        event_type = "tool_call"
+        # A call's start and wait-ended rows keep their own type (#1316): only the
+        # settlement is a "tool_call" event, so a replay counts each call once.
+        event_type = event_type if event_type in {"tool_call_started", "tool_call_timeout"} else "tool_call"
     data = dict(entry)
     data = public_task_result(
         data,

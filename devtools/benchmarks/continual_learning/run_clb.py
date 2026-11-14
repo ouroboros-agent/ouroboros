@@ -129,6 +129,7 @@ def render_run_settings(base_path: pathlib.Path, run_dir: pathlib.Path, *, solve
         # A benchmark template mode is an explicit operator declaration.
         settings["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "false"
     settings = normalize_context_mode_compat(settings)
+    settings["OUROBOROS_TASK_REVIEW_MODE"] = "required"
     settings.pop("OUROBOROS_MODEL_HEAVY", None)
     settings.pop("USE_LOCAL_HEAVY", None)
     bare = _bare_model(solve_model)
@@ -290,8 +291,8 @@ def _fidelity_report(settings: dict, args: argparse.Namespace,
     disabled = list(settings.get("CLBENCH_SOLVE_DISABLED_TOOLS") or [])
     applied = dict((patch_probe or {}).get("patches") or {})
     # ONE marker for the env knobs is CORRECT, not a shortcut: the campaign-override
-    # patch adds OUROBOROS_RUNTIME_MODE, OUROBOROS_REVIEW_ENFORCEMENT,
-    # OUROBOROS_SAFETY_MODE and OUROBOROS_SUBAGENTS in one loop/hunk, so they arrive
+    # patch adds OUROBOROS_RUNTIME_MODE, OUROBOROS_SAFETY_MODE and OUROBOROS_SUBAGENTS
+    # (and the retired review-enforcement key) in one loop/hunk, so they arrive
     # together or not at all. The patch probe includes the new key itself as a marker;
     # an older applied copy is conservatively reported as not enforcing actor purity.
     # The host engine boots a real `IsolatedServer`, so the ordinary scalar env knobs remain
@@ -328,9 +329,9 @@ def _fidelity_report(settings: dict, args: argparse.Namespace,
         "declared": settings.get("OUROBOROS_SAFETY_MODE"),
         "status": _env_status,
     }
-    (enforced if env_knobs_forwarded else gap)["OUROBOROS_REVIEW_ENFORCEMENT"] = {
-        "declared": settings.get("OUROBOROS_REVIEW_ENFORCEMENT"),
-        "status": _env_status,
+    gap["OUROBOROS_TASK_REVIEW_MODE"] = {
+        "declared": "required",
+        "status": "requested in rendered settings and child environment; executing external adapter settings and pre-review output producer are not attested by this launcher",
     }
     _subagents_status = (
         "exported in env and materialized in isolated settings by the host adapter"
@@ -417,11 +418,10 @@ def _sanitized_child_env(run_dir: pathlib.Path, settings: dict, args: argparse.N
         # Declared-only knobs (see _fidelity_report): effective on the host engine path,
         # forward-channel for a patched adapter on the docker path.
         "OUROBOROS_SAFETY_MODE": str(settings.get("OUROBOROS_SAFETY_MODE") or "light"),
-        "OUROBOROS_REVIEW_ENFORCEMENT": str(settings.get("OUROBOROS_REVIEW_ENFORCEMENT") or "blocking"),
         # Operator patch 2026-07-23: forward review MODE (not just enforcement) and
         # subagent depth so a submittable "review required" / no-swarm run is achievable
         # from the launcher instead of silently living on defaults (auto / depth 2).
-        "OUROBOROS_TASK_REVIEW_MODE": str(settings.get("OUROBOROS_TASK_REVIEW_MODE") or "auto"),
+        "OUROBOROS_TASK_REVIEW_MODE": "required",
         "OUROBOROS_MAX_SUBAGENT_DEPTH": str(settings.get("OUROBOROS_MAX_SUBAGENT_DEPTH") or 2),
         "CLBENCH_SOLVE_DISABLED_TOOLS": (
             _dt if isinstance((_dt := settings.get("CLBENCH_SOLVE_DISABLED_TOOLS") or []), str)

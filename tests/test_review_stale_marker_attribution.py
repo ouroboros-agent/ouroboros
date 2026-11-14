@@ -1,0 +1,634 @@
+"""Stale-marker ATTRIBUTION (community #783, owner decision 6A).
+
+The advisory stale marker is a fact about a checkout: one task's edit on a
+shared tree really does invalidate every task's preflight look there. The
+community donor (``ac2b0025``) filtered the marker out of other tasks' evidence
+by task id, which hid a genuinely stale tree — the panel said ``stale`` with no
+reason while ``review_status`` and the commit gate still reported the edit. The
+marker is ATTRIBUTED instead: every reader on the checkout keeps seeing it, and
+the task whose mutation or review wrote it is named relative to the reader.
+An unrecorded writer or reader stays ``unknown``; freshness, obligations and
+commit-readiness debt never read the attribution.
+"""
+
+from __future__ import annotations
+
+import json
+import types
+
+import pytest
+
+from ouroboros import review_ledger
+from ouroboros.review_evidence import collect_review_evidence
+from ouroboros.review_state import (
+    CommitAttemptRecord,
+    invalidate_advisory_after_mutation,
+    load_state,
+    make_repo_key,
+    save_state,
+    update_state,
+)
+
+_ATTRIBUTION_KEYS = ("stale_task_id", "stale_attribution", "stale_repo_key")
+
+
+def _checkout(tmp_path, name):
+    repo = tmp_path / name
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "tracked.py").write_text("x = 1\n", encoding="utf-8")
+    return repo
+
+
+def _drive(tmp_path):
+    drive = tmp_path / "drive"
+    (drive / "state").mkdir(parents=True)
+    (drive / "logs").mkdir()
+    return drive
+
+
+def _fresh(drive, *repos, owner="task-a"):
+    """Each checkout's preflight look (a ``surface=preflight`` ledger record): what an edit makes stale."""
+    for repo in repos:
+        review_ledger.write_record(drive, {
+            "record_id": review_ledger.new_record_id(), "state": "settled", "surface": "preflight",
+            "ts": "2026-09-28T00:00:00+00:00", "task_id": owner, "verdict": {"aggregate": "PASS"},
+            "subject": {"root": str(repo)}, "rows": []})
+
+
+def _reviewed(drive, repo, *, attempt=1):
+    """A reviewed attempt on the checkout, so its review history (and the marker in it) renders."""
+    update_state(drive, lambda state: state.record_attempt(CommitAttemptRecord(
+        ts=f"2026-09-28T00:0{attempt}:00+00:00", commit_message="reviewed", status="reviewed",
+        repo_key=make_repo_key(repo), tool_name="commit_reviewed", task_id="task-history", attempt=attempt)))
+
+
+def _ctx(drive, repo, task_id):
+    return types.SimpleNamespace(drive_root=str(drive), repo_dir=str(repo), task_id=task_id,
+                                 drive_logs=lambda: drive / "logs")
+
+
+def _edit(drive, repo, task_id):
+    """The ordinary tool path: ``commit_gate._invalidate_advisory`` with the task's ctx."""
+    from ouroboros.tools.commit_gate import _invalidate_advisory
+
+    (repo / "tracked.py").write_text("x = 2\n", encoding="utf-8")
+    _invalidate_advisory(_ctx(drive, repo, task_id), changed_paths=["tracked.py"], source_tool="edit_text")
+
+
+def _panel(drive, repo, reader):
+    return collect_review_evidence(drive, task_id=reader, repo_dir=repo)["current_repo"]
+
+
+def test_another_tasks_edit_keeps_the_shared_checkout_stale_and_names_the_writer(tmp_path):
+    drive, shared = _drive(tmp_path), _checkout(tmp_path, "shared")
+    _fresh(drive, shared)
+    _edit(drive, shared, "task-a")
+
+    other, own = _panel(drive, shared, "task-b"), _panel(drive, shared, "task-a")
+
+    # Not hidden: the task that did not edit still sees the stale checkout and why.
+    assert "edit_text mutated the worktree" in other["stale_reason"] and other["stale_ts"]
+    assert (other["stale_task_id"], other["stale_attribution"]) == ("task-a", "other_task")
+    assert (own["stale_task_id"], own["stale_attribution"]) == ("task-a", "this_task")
+    assert other["stale_repo_key"] == own["stale_repo_key"] == make_repo_key(shared)
+    # The relation is the ONLY difference between the two readers' readiness panels.
+    assert {k: v for k, v in other.items() if k != "stale_attribution"} == {
+        k: v for k, v in own.items() if k != "stale_attribution"}
+
+
+def test_a_marker_scoped_to_another_checkout_is_neither_shown_nor_attributed(tmp_path):
+    drive = _drive(tmp_path)
+    shared, other = _checkout(tmp_path, "shared"), _checkout(tmp_path, "other")
+    _fresh(drive, shared, other)
+    _edit(drive, shared, "task-a")
+
+    panel = _panel(drive, other, "task-b")
+
+    assert panel["stale_reason"] == panel["stale_ts"] == ""
+    assert all(panel[key] == "" for key in _ATTRIBUTION_KEYS)
+    from ouroboros.review_status_projection import build_review_projection
+
+    look = build_review_projection(drive, repo_dir=other, reader_task_id="task-b")["preflight"]
+    assert (look["marked"], look["stale_from_edit"]) == (False, False)
+
+
+def test_an_ambiguous_scope_mutation_stales_every_checkout_and_says_so(tmp_path):
+    drive = _drive(tmp_path)
+    shared, other = _checkout(tmp_path, "shared"), _checkout(tmp_path, "other")
+    _fresh(drive, shared, other)
+    _reviewed(drive, other)
+    invalidate_advisory_after_mutation(drive, mutation_root=None, changed_paths=[],
+                                       source_tool="run_shell", mutating_task_id="task-a")
+
+    panel = _panel(drive, other, "task-b")
+
+    # The unscoped marker genuinely applies here: the other checkout's look IS stale.
+    assert panel["stale_reason"]
+    assert (panel["stale_task_id"], panel["stale_attribution"], panel["stale_repo_key"]) == (
+        "task-a", "other_task", "")
+    from ouroboros.agent_task_pipeline import build_review_context
+
+    assert "applies to every checkout" in build_review_context(types.SimpleNamespace(drive_root=drive, repo_dir=other))
+
+
+def test_a_legacy_marker_without_a_writer_stays_unknown_for_every_reader(tmp_path):
+    drive, shared = _drive(tmp_path), _checkout(tmp_path, "shared")
+    _fresh(drive, shared)
+    _reviewed(drive, shared)
+    _edit(drive, shared, "task-a")
+    path = drive / "state" / "advisory_review.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw.pop("last_stale_task_id")  # a state file written before the field existed
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    for reader in ("task-a", "task-b", ""):
+        panel = _panel(drive, shared, reader)
+        assert "edit_text mutated the worktree" in panel["stale_reason"], reader
+        assert (panel["stale_task_id"], panel["stale_attribution"]) == ("", "unknown"), reader
+    from ouroboros.agent_task_pipeline import build_review_context
+
+    assert "invalidated_by=an unrecorded writer" in build_review_context(
+        types.SimpleNamespace(drive_root=drive, repo_dir=shared))
+
+
+def test_a_marker_no_preflight_look_precedes_is_history_never_current(tmp_path):
+    """The retired advisory lane wrote markers with no look behind them (owner decision:
+    archive only). Such a marker stays in the file; no reader treats it as current
+    freshness or copies it into debt, and a look written after it does not revive it.
+    Only an edit after a look stales that look."""
+    from ouroboros.agent_task_pipeline import build_review_context
+    from ouroboros.review_status_projection import build_review_projection
+
+    drive, shared = _drive(tmp_path), _checkout(tmp_path, "shared")
+    _reviewed(drive, shared)
+    state = load_state(drive)
+    state.last_stale_from_edit_ts = "2026-09-20T00:00:00+00:00"
+    state.last_stale_reason = "run_command mutated the worktree; advisory freshness invalidated."
+    save_state(drive, state)
+    _reviewed(drive, shared, attempt=2)  # a reviewed attempt syncs the debts
+
+    def surfaces():
+        projection = build_review_projection(drive, repo_dir=shared, reader_task_id="task-b")
+        context = build_review_context(types.SimpleNamespace(drive_root=drive, repo_dir=shared))
+        return _panel(drive, shared, "task-b"), projection, context
+
+    for _situation in ("no look", "a look written after the marker"):
+        panel, projection, context = surfaces()
+        assert panel["stale_reason"] == panel["stale_ts"] == "" and all(panel[k] == "" for k in _ATTRIBUTION_KEYS)
+        assert (projection["stale_from_edit"], projection["stale_from_edit_ts"], projection["stale_reason"]) == (
+            False, None, None)
+        assert "stale_marker=" not in context and "advisory freshness" not in context
+        assert load_state(drive).get_open_commit_readiness_debts(repo_key=make_repo_key(shared)) == []
+        assert load_state(drive).last_stale_from_edit_ts == "2026-09-20T00:00:00+00:00", "history stays in the file"
+        _fresh(drive, shared)  # the second pass reads a look newer than the marker
+
+    _edit(drive, shared, "task-a")  # an edit after the look is the current stale fact
+    panel, projection, context = surfaces()
+    assert "edit_text mutated the worktree" in panel["stale_reason"] and projection["stale_from_edit"] is True
+    assert "stale_marker=" in context
+
+
+def test_missing_identity_on_either_side_is_unknown_never_a_guess(tmp_path):
+    drive, shared = _drive(tmp_path), _checkout(tmp_path, "shared")
+    _fresh(drive, shared)
+    # A writer without task identity records unknown rather than inventing one.
+    invalidate_advisory_after_mutation(drive, mutation_root=shared, source_tool="run_shell")
+    panel = _panel(drive, shared, "task-b")
+    assert panel["stale_reason"] and (panel["stale_task_id"], panel["stale_attribution"]) == ("", "unknown")
+
+    drive_two = _drive(tmp_path / "second")
+    _fresh(drive_two, shared)
+    _edit(drive_two, shared, "task-a")
+    # A reader without identity sees the recorded writer but is told no relation.
+    panel = _panel(drive_two, shared, "")
+    assert (panel["stale_task_id"], panel["stale_attribution"]) == ("task-a", "unknown")
+
+
+def test_review_status_attributes_relative_to_the_caller_not_the_task_filter(tmp_path):
+    from ouroboros.tools.preflight_review import _handle_review_status
+
+    drive, shared = _drive(tmp_path), _checkout(tmp_path, "shared")
+    _fresh(drive, shared)
+    _edit(drive, shared, "task-a")
+
+    caller_b = json.loads(_handle_review_status(_ctx(drive, shared, "task-b"), task_id="task-a"))
+    caller_a = json.loads(_handle_review_status(_ctx(drive, shared, "task-a")))
+
+    assert (caller_b["stale_task_id"], caller_b["stale_attribution"]) == ("task-a", "other_task")
+    assert caller_a["stale_attribution"] == "this_task"
+    assert caller_b["stale_from_edit"] is True and caller_a["stale_from_edit"] is True
+    assert caller_b["stale_reason"] == caller_a["stale_reason"]
+    assert caller_b["latest_advisory_status"] == caller_a["latest_advisory_status"]
+
+
+def test_text_surfaces_without_a_reader_identity_state_only_the_recorded_writer(tmp_path):
+    from ouroboros.agent_task_pipeline import build_review_context
+
+    drive, shared = _drive(tmp_path), _checkout(tmp_path, "shared")
+    _fresh(drive, shared)
+    _reviewed(drive, shared)
+    _edit(drive, shared, "task-a")
+
+    context = build_review_context(types.SimpleNamespace(drive_root=drive, repo_dir=shared))
+
+    assert "invalidated_by=task task-a" in context
+    assert "this task" not in context and "another task" not in context
+
+
+def test_the_writer_round_trips_names_the_invalidation_and_clears_with_a_commit(tmp_path):
+    drive, shared = _drive(tmp_path), _checkout(tmp_path, "shared")
+    repo_key = make_repo_key(shared)
+    _fresh(drive, shared)
+    _edit(drive, shared, "task-a")
+    # A later edit finds nothing fresh left to invalidate: the marker keeps naming
+    # the mutation that DID invalidate the coverage, never the latest editor.
+    _edit(drive, shared, "task-b")
+    state = load_state(drive)
+    assert state.last_stale_task_id == "task-a"
+
+    for commit_scope in (repo_key, None):
+        # A look's marker is written once, by the first mutation after it.
+        state.mark_look_stale("2026-09-28T01:00:00+00:00", reason_ts="2026-09-28T02:00:00+00:00", reason="r",
+                              stale_repo_key=repo_key, stale_task_id="task-a")
+        assert state.last_stale_task_id == "task-a"
+        state.on_successful_commit(repo_key=commit_scope)
+        assert (state.last_stale_from_edit_ts, state.last_stale_task_id) == ("", "")
+
+
+def test_attribution_never_changes_freshness_obligations_or_debt(tmp_path):
+    """Same staleness written by three different writers reads identically everywhere
+    except the attribution itself."""
+    from ouroboros.review_status_projection import build_review_projection
+
+    shared = _checkout(tmp_path, "shared")
+    repo_key = make_repo_key(shared)
+    observed = {}
+    for writer in ("task-a", "task-b", ""):
+        drive = _drive(tmp_path / (writer or "unattributed"))
+        _fresh(drive, shared)
+        state = load_state(drive)
+        state.record_attempt(CommitAttemptRecord(  # an open obligation the edit must not touch
+            ts="2026-09-28T00:30:00+00:00", commit_message="blocked", status="blocked", repo_key=repo_key,
+            tool_name="commit_reviewed", task_id="task-a", attempt=1, block_reason="critical_findings",
+            critical_findings=[{"item": "tests_affected", "reason": "add a test", "severity": "critical",
+                                "verdict": "FAIL"}],
+        ))
+        save_state(drive, state)
+        invalidate_advisory_after_mutation(drive, mutation_root=shared, changed_paths=["tracked.py"],
+                                           source_tool="edit_text", mutating_task_id=writer)
+        _reviewed(drive, shared, attempt=2)  # a later reviewed attempt syncs the debts
+        state = load_state(drive)
+        projection = build_review_projection(drive, repo_dir=shared, reader_task_id="task-a")
+        observed[writer] = (
+            [(d.category, d.title, d.summary, list(d.evidence), d.fingerprint, d.status)
+             for d in state.get_open_commit_readiness_debts(repo_key=repo_key)],
+            [(o.item, o.status) for o in state.get_open_obligations(repo_key=repo_key)],
+            {key: projection[key] for key in ("stale_from_edit", "effective_status")},
+        )
+    assert observed["task-a"] == observed["task-b"] == observed[""]
+    assert observed[""][0] == [], "the marker is the one freshness fact: no debt copies it"
+    assert observed[""][1] == [("tests_affected", "still_open")], "the obligation is still owed"
+    assert observed[""][2] == {"stale_from_edit": True, "effective_status": "stale"}
+
+
+@pytest.mark.parametrize("writer", ["builtin", "generic", "generic_error"])
+def test_registered_writer_persists_identity_without_changing_shared_freshness(tmp_path, monkeypatch, writer):
+    """Real Git, registry dispatch and durable readers; only the generic handler is a fake."""
+    import subprocess
+
+    import ouroboros.safety as safety
+    from ouroboros.tools.registry import ToolRegistry
+
+    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    monkeypatch.setattr(safety, "check_safety", lambda *args, **kwargs: (True, ""))
+    drive, shared = _drive(tmp_path), tmp_path / "shared"
+    shared.mkdir()
+    subprocess.run(["git", "init", "-q", str(shared)], check=True)
+    target = shared / "tracked.py"
+    target.write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.py"], cwd=shared, check=True)
+    subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+                    "commit", "-qm", "baseline"], cwd=shared, check=True)
+    separate = tmp_path / "separate"
+    subprocess.run(["git", "clone", "-q", str(shared), str(separate)], check=True)
+    _fresh(drive, shared, separate)
+    tools = ToolRegistry(repo_dir=shared, drive_root=drive)
+    tools._ctx.task_id = "task-a"
+    # Exercise intentional shared-body edits via the supported Cyber override;
+    # ordinary self-authoring now isolates them in a task-owned candidate.
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "cyber_pro")
+    assert "writes the serving checkout directly" in tools.execute(
+        "prepare_self_change", {"in_place": True})
+    if writer != "builtin":
+        # run_command is a registered mutates_worktree producer. write_file
+        # owns its invalidation inside its handler, so replacing that handler
+        # would remove the very path this generic-dispatch control must test.
+        assert tools._entries["run_command"].mutates_worktree
+        def generic_handler(ctx, *, cmd, _resolved_binding=None, **kwargs):
+            assert ctx.repo_dir == shared
+            target.write_text(cmd[1], encoding="utf-8")
+            if writer == "generic_error" and cmd[1] != "x = 1\n":
+                raise RuntimeError("failure after writing")
+            return "OK"
+        tools.override_handler("run_command", generic_handler)
+        result = tools.execute_result("run_command", {
+            "cwd": "system_repo", "cmd": ["/usr/bin/printf", "x = 1\n"]})
+        assert result.status == "ok", result.text
+        assert not load_state(drive).last_stale_from_edit_ts
+
+    result = (tools.execute_result("write_file", {
+        "root": "system_repo", "path": "tracked.py", "content": "x = 2\n"})
+        if writer == "builtin" else tools.execute_result("run_command", {
+            "cwd": "system_repo", "cmd": ["/usr/bin/printf", "x = 2\n"]}))
+    assert (result.status == "ok") is (writer != "generic_error"), result.text
+    assert target.read_text(encoding="utf-8") == "x = 2\n"
+    # Read the shared freshness evidence under ordinary blocking enforcement;
+    # the Cyber writer's exception does not erase that evidence.
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    state = load_state(drive)
+    assert state.last_stale_task_id == "task-a"
+    assert state.last_stale_repo_key == make_repo_key(shared)
+    panel = _panel(drive, shared, "task-b")
+    assert panel["stale_attribution"] == "other_task" and panel["stale_reason"]
+    assert panel["stale_task_id"] == "task-a"
+    # The marker is disclosed, never a hold: no advisory freshness gates a commit (3A),
+    # and no readiness verdict is projected next to the marker.
+    assert "repo_commit_ready" not in panel
+    other_checkout = _panel(drive, separate, "task-b")
+    assert not other_checkout["stale_reason"]
+    assert all(other_checkout[key] == "" for key in _ATTRIBUTION_KEYS)
+
+    # A successful commit of the checkout clears the marker for either task.
+    update_state(drive, lambda current: current.on_successful_commit(repo_key=make_repo_key(shared)))
+    for task_id in ("task-a", "task-b"):
+        panel = _panel(drive, shared, task_id)
+        assert not panel["stale_reason"]
+        assert all(panel[key] == "" for key in _ATTRIBUTION_KEYS)
+
+
+# --- the author's preflight look (decision 3A, D5-002) ----------------------------------
+#
+# The look is a ``surface=preflight`` review-ledger record, not a legacy advisory run;
+# CHECKLISTS "Finish all edits first" promises that a worktree mutation after it marks
+# the recorded preflight stale and ``review_status`` reports ``stale_from_edit`` and
+# its editor. Real repository, real ``review_change``; only the paid seats are golden.
+
+
+def _installed_body(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from tests import _contributor_packet_shared as shared
+    from tests.review_pool_rosters import set_review_pool
+
+    repo = Path(shared.init_installed_body(tmp_path)["repo"])
+    set_review_pool(monkeypatch, shared.golden_pool())
+    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "pro")
+    return repo
+
+
+def _look(ctx, monkeypatch) -> str:
+    """The author's early look at the live worktree: ``review_change(subject=worktree,
+    surface=preflight, reviewers=[one row])``, the record's id."""
+    import ouroboros.review_substrate as substrate
+    from ouroboros.tools.review_change import run_review_change
+    from tests import _contributor_packet_shared as shared
+
+    monkeypatch.setattr(substrate, "run_review_request", shared.golden_substrate([]))
+    result = run_review_change(ctx, root="system_repo", subject="worktree", surface="preflight",
+                               reviewers=["s1"], goal="An early look before the commit")
+    assert result["state"] == "settled", result
+    assert review_ledger.load_record(ctx.drive_root, result["record_id"])["surface"] == "preflight"
+    return result["record_id"]
+
+
+def _status(drive, repo, reader):
+    from ouroboros.tools.preflight_review import _handle_review_status
+
+    return json.loads(_handle_review_status(_ctx(drive, repo, reader)))
+
+
+def test_an_edit_after_the_preflight_look_marks_it_stale_and_names_the_editor(tmp_path, monkeypatch):
+    from ouroboros.tools.registry import ToolContext
+
+    repo, drive = _installed_body(tmp_path, monkeypatch), _drive(tmp_path)
+    (repo / "README.md").write_text("# Fixture project\n\nEdited before the look.\n", encoding="utf-8")
+    record_id = _look(ToolContext(repo_dir=repo, drive_root=drive, task_id="task-a"), monkeypatch)
+
+    before = _status(drive, repo, "task-b")
+    assert (before["stale_from_edit"], before["latest_advisory_status"]) == (False, "fresh")
+    assert before["preflight"]["record_id"] == record_id and before["preflight"]["reviewer"] == "s1"
+    assert before["stale_reason"] is None and all(before[key] == "" for key in _ATTRIBUTION_KEYS)
+
+    (repo / "README.md").write_text("# Fixture project\n\nEdited AFTER the look.\n", encoding="utf-8")
+    _edit_through_the_tool_path(drive, repo, "task-a", changed=["README.md"])
+
+    after = _status(drive, repo, "task-b")
+    assert (after["stale_from_edit"], after["latest_advisory_status"]) == (True, "stale")
+    assert "edit_text mutated the worktree" in after["stale_reason"] and after["stale_from_edit_ts"]
+    assert (after["stale_task_id"], after["stale_attribution"]) == ("task-a", "other_task")
+    assert after["preflight"]["record_id"] == record_id and after["preflight"]["marked"] is True
+    assert _status(drive, repo, "task-a")["stale_attribution"] == "this_task"
+    # As for runs: the marker names the mutation that invalidated the look, not the latest editor.
+    _edit_through_the_tool_path(drive, repo, "task-b", changed=["README.md"])
+    assert _status(drive, repo, "task-b")["stale_task_id"] == "task-a"
+
+
+def test_a_marker_older_than_the_look_does_not_stale_it_and_an_unrecorded_move_still_shows(tmp_path, monkeypatch):
+    from ouroboros.tools.registry import ToolContext
+
+    repo, drive = _installed_body(tmp_path, monkeypatch), _drive(tmp_path)
+    (repo / "README.md").write_text("# Fixture project\n\nEdited before the look.\n", encoding="utf-8")
+    # A legacy marker from before the look (a state file with history) is not about it.
+    update_state(drive, lambda state: state.mark_look_stale(
+        "2026-01-01T00:00:00+00:00", reason_ts="2026-01-01T00:00:01+00:00", reason="an old edit",
+        stale_repo_key=make_repo_key(repo), stale_task_id="task-z"))
+    record_id = _look(ToolContext(repo_dir=repo, drive_root=drive, task_id="task-a"), monkeypatch)
+
+    fresh = _status(drive, repo, "task-a")
+    assert (fresh["stale_from_edit"], fresh["latest_advisory_status"]) == (False, "fresh")
+    assert fresh["preflight"]["record_id"] == record_id and fresh["stale_task_id"] == ""
+
+    # A move no tool recorded (an editor outside Ouroboros): the tree speaks, the editor is unknown.
+    (repo / "README.md").write_text("# Fixture project\n\nMoved by hand.\n", encoding="utf-8")
+    moved = _status(drive, repo, "task-a")
+    assert (moved["stale_from_edit"], moved["latest_advisory_status"]) == (True, "stale")
+    assert moved["stale_from_edit_ts"] == "now (worktree moved)"
+    assert moved["stale_reason"] == "The worktree no longer matches the tree the preflight read."
+    assert moved["preflight"] == {**fresh["preflight"], "tree_moved": True, "stale_from_edit": True}
+    assert all(moved[key] == "" for key in _ATTRIBUTION_KEYS)
+
+
+def _edit_through_the_tool_path(drive, repo, task_id, *, changed):
+    from ouroboros.tools.commit_gate import _invalidate_advisory
+
+    _invalidate_advisory(_ctx(drive, repo, task_id), changed_paths=changed, source_tool="edit_text")
+
+
+# --- separate checkouts on one review-state root (#2573) ---------------------------------
+#
+# Each checkout's look is its own preflight record bound to its live tree, but the newest
+# marker lives in one slot. The next checkout's mutation used to overwrite it: the first
+# checkout lost the editor of its invalidation, and its bytes returned to the reviewed tree
+# then read fresh although a recorded mutation followed its look. Real Git trees, the
+# ordinary tool path and every durable reader.
+
+
+def _git_checkout(tmp_path, name):
+    import subprocess
+
+    repo = tmp_path / name
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "tracked.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.py"], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+                    "commit", "-qm", "baseline"], cwd=repo, check=True)
+    return repo
+
+
+def _tree_look(drive, repo):
+    """The checkout's preflight look bound to its live tree, stamped when written."""
+    from supervisor.update_candidate import worktree_snapshot_tree
+
+    tree, error = worktree_snapshot_tree("HEAD", cwd=str(repo))
+    assert tree and not error, error
+    review_ledger.write_record(drive, {
+        "record_id": review_ledger.new_record_id(), "state": "settled", "surface": "preflight",
+        "task_id": "task-look", "verdict": {"aggregate": "PASS"},
+        "subject": {"root": str(repo), "tree_sha": tree}, "rows": []})
+
+
+def _mutate(drive, repo, task_id, text):
+    (repo / "tracked.py").write_text(text, encoding="utf-8")
+    _edit_through_the_tool_path(drive, repo, task_id, changed=["tracked.py"])
+
+
+def _looked_at(tmp_path, *names):
+    drive, repos = _drive(tmp_path), [_git_checkout(tmp_path, name) for name in names]
+    for repo in repos:
+        _tree_look(drive, repo)
+    return drive, *repos
+
+
+def _b_then_a(tmp_path):
+    drive, a, b = _looked_at(tmp_path, "a", "b")
+    _mutate(drive, b, "task-b", "x = 2\n")
+    _mutate(drive, a, "task-a", "x = 3\n")
+    return drive, a, b
+
+
+def test_each_checkout_keeps_the_editor_that_invalidated_its_own_look(tmp_path):
+    from ouroboros.agent_task_pipeline import build_review_context
+
+    drive, a, b = _b_then_a(tmp_path)
+    for repo, editor in ((b, "task-b"), (a, "task-a")):
+        _reviewed(drive, repo)
+        status, panel = _status(drive, repo, "task-reader"), _panel(drive, repo, "task-reader")
+        assert (status["latest_advisory_status"], status["preflight"]["marked"]) == ("stale", True), repo.name
+        assert "edit_text mutated the worktree" in status["stale_reason"] and status["stale_from_edit_ts"]
+        for surface in (status, panel):
+            assert (surface["stale_task_id"], surface["stale_attribution"], surface["stale_repo_key"]) == (
+                editor, "other_task", make_repo_key(repo)), repo.name
+        assert (panel["stale_reason"], panel["stale_ts"]) == (status["stale_reason"], status["stale_from_edit_ts"])
+        context = build_review_context(types.SimpleNamespace(drive_root=drive, repo_dir=repo))
+        for text in (context, context.operative_view):
+            assert "stale_marker=" in text and f"invalidated_by=task {editor}" in text, repo.name
+
+
+def test_restored_bytes_stay_marked_while_an_unrecorded_round_trip_reads_fresh(tmp_path):
+    """Byte freshness answers for a look no recorded mutation followed; a recorded mutation
+    after the look still speaks once the bytes return. Only a new look settles it."""
+    drive, a, b = _b_then_a(tmp_path)
+    c = _git_checkout(tmp_path, "c")
+    _tree_look(drive, c)
+    (c / "tracked.py").write_text("x = 9\n", encoding="utf-8")  # moved by hand, no tool records it
+    assert _status(drive, c, "task-reader")["preflight"]["tree_moved"] is True
+    for repo in (b, c):  # both back to the reviewed bytes outside any tool
+        (repo / "tracked.py").write_text("x = 1\n", encoding="utf-8")
+
+    restored, round_trip = _status(drive, b, "task-reader"), _status(drive, c, "task-reader")
+    assert restored["preflight"]["tree_moved"] is round_trip["preflight"]["tree_moved"] is False
+    assert (round_trip["latest_advisory_status"], round_trip["stale_task_id"]) == ("fresh", "")
+    assert (restored["latest_advisory_status"], restored["stale_task_id"]) == ("stale", "task-b")
+    _tree_look(drive, b)
+    assert _status(drive, b, "task-reader")["latest_advisory_status"] == "fresh"
+    assert _status(drive, a, "task-reader")["stale_task_id"] == "task-a"
+
+
+@pytest.mark.parametrize("settle", ["commit", "new_look"])
+def test_settling_one_checkout_leaves_the_other_checkouts_marker(tmp_path, settle):
+    drive, a, b = _b_then_a(tmp_path)
+    if settle == "commit":
+        update_state(drive, lambda state: state.on_successful_commit(repo_key=make_repo_key(a)))
+    else:
+        _tree_look(drive, a)  # a new look at A's edited tree
+
+    settled, other = _status(drive, a, "task-reader"), _status(drive, b, "task-reader")
+    assert (settled["preflight"]["marked"], settled["stale_task_id"]) == (False, "")
+    assert settled["latest_advisory_status"] == ("fresh" if settle == "new_look" else "stale")
+    assert (other["latest_advisory_status"], other["stale_task_id"]) == ("stale", "task-b")
+
+
+def test_an_ambiguous_scope_marker_neither_replaces_nor_is_erased_by_a_checkouts_own(tmp_path):
+    drive, a, b = _looked_at(tmp_path, "a", "b")
+    _mutate(drive, b, "task-b", "x = 2\n")
+    invalidate_advisory_after_mutation(drive, mutation_root=None, changed_paths=[],
+                                       source_tool="run_shell", mutating_task_id="task-shell")
+    own, unscoped = _status(drive, b, "task-reader"), _status(drive, a, "task-reader")
+    assert (own["stale_task_id"], own["stale_repo_key"]) == ("task-b", make_repo_key(b))
+    assert (unscoped["preflight"]["marked"], unscoped["stale_task_id"], unscoped["stale_repo_key"]) == (
+        True, "task-shell", "")
+    # The ambiguous mutation stays what invalidated A's look: A's own later edit is not the first.
+    _mutate(drive, a, "task-a", "x = 3\n")
+    assert _status(drive, a, "task-reader")["stale_task_id"] == "task-shell"
+    # A commit of A settles A and the unscoped marker, as it always did, never B's own marker.
+    update_state(drive, lambda state: state.on_successful_commit(repo_key=make_repo_key(a)))
+    assert _status(drive, a, "task-reader")["preflight"]["marked"] is False
+    assert _status(drive, b, "task-reader")["stale_task_id"] == "task-b"
+
+
+def test_a_checkouts_own_marker_does_not_erase_an_ambiguous_one_still_owed_elsewhere(tmp_path):
+    """A checkout looked at again after an ambiguous mutation writes its own marker; the
+    ambiguous one still stales the look it followed elsewhere, although no bytes moved there."""
+    drive, a, b = _looked_at(tmp_path, "a", "b")
+    invalidate_advisory_after_mutation(drive, mutation_root=None, changed_paths=[],
+                                       source_tool="run_shell", mutating_task_id="task-shell")
+    _tree_look(drive, a)
+    _mutate(drive, a, "task-a", "x = 3\n")
+    assert _status(drive, a, "task-reader")["stale_task_id"] == "task-a"
+    owed = _status(drive, b, "task-reader")
+    assert owed["preflight"]["tree_moved"] is False
+    assert (owed["latest_advisory_status"], owed["stale_task_id"], owed["stale_repo_key"]) == (
+        "stale", "task-shell", "")
+
+
+def test_a_single_checkout_keeps_the_legacy_file_and_a_legacy_marker_is_displaced(tmp_path):
+    drive, a, b, c = _looked_at(tmp_path, "a", "b", "c")
+    path = drive / "state" / "advisory_review.json"
+    _mutate(drive, b, "task-b", "x = 2\n")
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert (raw["last_stale_repo_key"], raw["last_stale_task_id"]) == (make_repo_key(b), "task-b")
+    assert "earlier_stale_markers" not in raw, "one marker keeps the legacy file shape"
+    raw.pop("last_stale_task_id")  # as written before the writer was recorded
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    _mutate(drive, a, "task-a", "x = 3\n")
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    # The newest write keeps the legacy slot; B's legacy marker is displaced, never erased.
+    assert (raw["last_stale_repo_key"], raw["last_stale_task_id"]) == (make_repo_key(a), "task-a")
+    assert list(raw["earlier_stale_markers"]) == [make_repo_key(b)]
+    legacy = _status(drive, b, "task-b")
+    assert (legacy["preflight"]["marked"], legacy["stale_task_id"], legacy["stale_attribution"]) == (
+        True, "", "unknown")
+    assert "edit_text mutated the worktree" in legacy["stale_reason"]
+
+    # A displaced marker leaves only as the slot always did: by its own checkout's commit.
+    _mutate(drive, c, "task-c", "x = 4\n")
+    assert sorted(json.loads(path.read_text(encoding="utf-8"))["earlier_stale_markers"]) == sorted(
+        [make_repo_key(a), make_repo_key(b)])
+    for repo in (b, a):
+        update_state(drive, lambda state, key=make_repo_key(repo): state.on_successful_commit(repo_key=key))
+    assert "earlier_stale_markers" not in json.loads(path.read_text(encoding="utf-8"))
+    assert _status(drive, c, "task-reader")["stale_task_id"] == "task-c"

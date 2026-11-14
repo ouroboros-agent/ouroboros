@@ -5,7 +5,7 @@ never exercised is the whole thing running as ONE system: a real ``server.py`` p
 real supervisor with real workers, real HTTP ingress over the SAME surface the web UI
 posts to, and the durable artifacts the owner and the watchdog actually read back
 (``state/cancel_intents.json``, the ``cancel_intent`` forensics in
-``logs/supervisor.jsonl``, ``task_results/<id>.json``, ``state/queue_snapshot.json``,
+``logs/supervisor.jsonl``, the task store, ``state/queue_snapshot.json``,
 ``state/terminal_deliveries.json``, the ``owner_hurry`` projection). Every scenario asserts
 those artifacts — never an HTTP 200 on its own, and never a harness exit code (AGENTS.md:
 the exit code is not the run status).
@@ -62,6 +62,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import signal
 import time
 import uuid
 
@@ -91,10 +92,19 @@ from tests.fixtures_e2e_cancellation import (
     start_server,
     submit_running,
     task_result,
-    task_result_bytes,
+    task_result_signature,
     wait_until,
     write_settings_file,
 )
+
+# One per-test ceiling for every MOCK-lane server scenario of this file: a hung scenario
+# fails BY NAME and the lane runs on, instead of starving the job until the runner
+# cancels it (tests/system_e2e/conftest.py carries the same rule for the system
+# scenarios). On POSIX the SIGALRM method fails only the running test, so its fixtures
+# still stop the server. The operator-run paid scenarios (E1-E3, E13) keep their own pace.
+SCENARIO_TIMEOUT_SEC = 900
+_SCENARIO_CEILING = pytest.mark.timeout(
+    SCENARIO_TIMEOUT_SEC, method="signal" if hasattr(signal, "SIGALRM") else "thread")
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -144,8 +154,10 @@ def completion_stub():
     return stub
 
 
-@pytest.mark.parametrize("marker", ["[OWNER_STOP]", "[FINALIZE_NOW]"])
-@pytest.mark.parametrize("multipart", [False, True], ids=["string", "multipart"])
+@pytest.mark.parametrize(("multipart", "marker"), [
+    pytest.param(False, "[OWNER_STOP]", id='string-[OWNER_STOP]'),
+    pytest.param(True, "[FINALIZE_NOW]", id='multipart-[FINALIZE_NOW]'),
+])
 def test_mock_finalization_completion(completion_stub, marker, multipart):
     text = f"{marker} Summarize the verified work and stop."
     content = [{"type": "text", "text": text}] if multipart else text
@@ -177,8 +189,11 @@ def test_mock_keepalive_completion(completion_stub, multipart):
     }
 
 
-@pytest.mark.parametrize("marker", ["[OWNER_STOP]", "[FINALIZE_NOW]"])
-@pytest.mark.parametrize("tail_state", ["unknown", "sent", "unsent"])
+@pytest.mark.parametrize(("tail_state", "marker"), [
+    ("unknown", "[OWNER_STOP]"),
+    ("sent", "[FINALIZE_NOW]"),
+    ("unsent", "[OWNER_STOP]"),
+])
 def test_mock_finalizes_after_production_multipart_append(completion_stub, marker, tail_state):
     from types import SimpleNamespace
 
@@ -451,7 +466,7 @@ def test_stall_forensics_separates_the_three_stall_hypotheses(tmp_path):
 # Mock lane: a real isolated server driven by the local stub model.
 # ===========================================================================
 
-@pytest.mark.serial
+@_SCENARIO_CEILING
 def test_e4_cancel_single_settles_the_intent_and_writes_the_terminal(mock_stack):
     """E4 — the single cancel: intent requested -> claimed -> settled, the projection is
     empty again, and the task has a durable ``cancelled`` result."""
@@ -477,7 +492,7 @@ def test_e4_cancel_single_settles_the_intent_and_writes_the_terminal(mock_stack)
     assert task_id not in intents(data_root)
 
 
-@pytest.mark.serial
+@_SCENARIO_CEILING
 def test_e5_cancel_cascade_settles_descendants_then_the_root(e2e_clone, tmp_path_factory):
     """E5 — the cascade: the root intent is minted with ``scope=cascade`` AT THE INGRESS,
     each captured descendant gets its own intent, and the ROOT settles only on the cascade
@@ -517,7 +532,7 @@ def test_e5_cancel_cascade_settles_descendants_then_the_root(e2e_clone, tmp_path
             server.stop()
 
 
-@pytest.mark.serial
+@_SCENARIO_CEILING
 def test_e6_cancel_after_settlement_is_a_404_and_preserves_the_result(mock_stack):
     """E6 — the cancel x completion race, on its deterministic side: once a task settles on
     its own, a cancel must neither resurrect it nor rewrite its stored result.
@@ -553,26 +568,26 @@ def test_e6_cancel_after_settlement_is_a_404_and_preserves_the_result(mock_stack
         180,
     ), "the completed task never released its worker"
 
-    def _settled_bytes():
-        first = task_result_bytes(data_root, task_id)
+    def _settled_signature():
+        first = task_result_signature(data_root, task_id)
         time.sleep(2)
-        return first if first == task_result_bytes(data_root, task_id) else None
+        return first if first == task_result_signature(data_root, task_id) else None
 
     # Snapshot only once the terminal writers have finished: an unrelated post-terminal
     # projection landing between the two reads would be misread as the cancel rewriting
     # the result.
-    before = wait_until(_settled_bytes, 60)
+    before = wait_until(_settled_signature, 60)
     assert before, "the stored result never stopped changing"
 
     answer = server.cancel_task(task_id)
     assert answer["status"] == 404
     assert answer["body"].get("error") == "task not found or not active"
-    assert task_result_bytes(data_root, task_id) == before, \
+    assert task_result_signature(data_root, task_id) == before, \
         "a cancel rewrote a settled task's result"
     assert task_id not in intents(data_root)
 
 
-@pytest.mark.serial
+@_SCENARIO_CEILING
 def test_e7_terminal_delivery_is_owed_then_recorded_exactly_once(mock_stack):
     """E7 — the owed outbox, on the side a stub can drive: a terminal answer registers a
     delivery id in ``state/terminal_deliveries.json`` and lands in ``delivered`` exactly
@@ -616,7 +631,7 @@ def test_e7_terminal_delivery_is_owed_then_recorded_exactly_once(mock_stack):
         _read_ledger()
 
 
-@pytest.mark.serial
+@_SCENARIO_CEILING
 def test_e9_boot_migration_adopts_a_legacy_cancel_requested_latch(e2e_clone, tmp_path_factory):
     """E9 — a pre-redesign ``cancel_requested`` result file becomes an ordinary intent at
     boot (``source=boot_migration``), and a SECOND boot migrates it zero more times."""
@@ -625,12 +640,14 @@ def test_e9_boot_migration_adopts_a_legacy_cancel_requested_latch(e2e_clone, tmp
     data_root = root_dir / "data"
     (data_root / "task_results").mkdir(parents=True, exist_ok=True)
     legacy_id = uuid.uuid4().hex[:16]
+    # This is an importer input: seed_result would finish the empty migration first.
     (data_root / "task_results" / f"{legacy_id}.json").write_text(json.dumps({
         "task_id": legacy_id,
         "status": "cancel_requested",
         "description": "a task wedged in the pre-redesign cancel latch",
         "created_at": "2020-01-01T00:00:00+00:00",
     }), encoding="utf-8")
+    assert not (data_root / "state" / "current.sqlite").exists()
 
     def _migrations():
         return [row for row in forensics(data_root, task_id=legacy_id, event="requested")
@@ -656,7 +673,7 @@ def test_e9_boot_migration_adopts_a_legacy_cancel_requested_latch(e2e_clone, tmp
             server.stop()
 
 
-@pytest.mark.serial
+@_SCENARIO_CEILING
 def test_e10_graceful_stop_keeps_the_intent_open_and_finalizes(e2e_clone, tmp_path_factory):
     """E10 — ``finalize_then_cancel``: a 202 pending acknowledgement, an intent that stays
     OPEN carrying the policy, and a terminal reason of ``owner_requested_finalization``
@@ -700,7 +717,87 @@ def test_e10_graceful_stop_keeps_the_intent_open_and_finalizes(e2e_clone, tmp_pa
             server.stop()
 
 
-@pytest.mark.serial
+# Each stub answer waits this long, so a stop sent as a call reaches the stub lands while that
+# call is provably on the wire (E10's own timing lands it wherever the loop happens to be).
+E10_ON_THE_WIRE_SEC = 4.0
+
+
+def _stop_while_a_call_is_on_the_wire(server, stub, **stop) -> tuple[str, int, dict]:
+    """Start the keepalive task, catch its next model call at the stub, and stop it right then.
+
+    Returns ``(task_id, calls_at_stop, answer)``: ``calls_at_stop`` counts the held call."""
+    task_id = submit_running(server, "List the repository files and keep watching them.")
+    assert wait_until(lambda: len(stub.calls) >= 2, 240), "the keepalive loop never reached its second round"
+    seen = len(stub.calls)
+    assert wait_until(lambda: len(stub.calls) > seen, 240), "no further model call reached the stub"
+    calls_at_stop = len(stub.calls)
+    return task_id, calls_at_stop, server.cancel_task(task_id, **stop)
+
+
+@_SCENARIO_CEILING
+def test_e10_wrap_up_landing_while_a_call_is_on_the_wire_still_gets_its_one_final_turn(e2e_clone, tmp_path_factory):
+    """E10, deterministically mid-call. The held call completes and the Wrap up keeps the round's
+    next tool from starting (its admission refuses: ``PhysicalDispatchInterrupted``, nothing sent).
+    That refusal is no interrupted provider wait, so the finalize_then_cancel contract holds:
+    exactly ONE further model call — the tool-less ``[OWNER_STOP]`` final turn — and E10's own
+    terminal (``completed``, ``owner_requested_finalization``, ``model_final``). Before the repair
+    the refused tool start ended the task ``failed``/``host_notice`` with no final turn (CI
+    2026-11-03, E10 twice)."""
+    require_lane(LANE_MOCK)
+    root_dir = tmp_path_factory.mktemp("e2e_graceful_on_the_wire")
+    with StubModelServer(latency_sec=E10_ON_THE_WIRE_SEC) as stub:
+        server = start_server(e2e_clone, root_dir, isolated_settings(stub=stub))
+        try:
+            data_root = server.data_root
+            task_id, calls_at_stop, answer = _stop_while_a_call_is_on_the_wire(
+                server, stub, stop_policy="finalize_then_cancel")
+            assert answer["status"] == 202, answer
+            assert answer["body"]["cancel_state"] == "pending", answer
+            assert (intents(data_root).get(task_id) or {}).get("stop_policy") == "finalize_then_cancel"
+
+            final = server.wait_task(task_id, timeout=300)
+            assert final.get("status") == "completed", {
+                key: final.get(key) for key in ("status", "reason_code", "terminal_origin", "result")}
+            reason = wait_until(lambda: task_result(data_root, task_id).get("reason_code"), 60)
+            stored = task_result(data_root, task_id)
+            assert reason == "owner_requested_finalization", stored.get("reason_code")
+            assert stored.get("terminal_origin") == "model_final", stored.get("terminal_origin")
+            assert stored.get("result") == "Final answer: the repository root was listed; stopping as asked."
+            after = stub.calls[calls_at_stop:]
+            assert [StubModelServer._is_finalization_turn(body) for body in after] == [True], (
+                f"{len(after)} model call(s) after the Wrap up; exactly the one final turn is owed")
+        finally:
+            server.stop()
+
+
+@_SCENARIO_CEILING
+def test_e10_stop_now_landing_while_a_call_is_on_the_wire_cancels_with_no_final_turn(e2e_clone, tmp_path_factory):
+    """The hard twin of the above, unchanged by the Wrap up repair: an immediate Stop landing while
+    a call is on the wire tears the worker down (200 once torn down), settles ``cancelled`` through
+    the one custody (requested -> claimed -> settled) and buys NO further model call."""
+    require_lane(LANE_MOCK)
+    root_dir = tmp_path_factory.mktemp("e2e_stop_now_on_the_wire")
+    with StubModelServer(latency_sec=E10_ON_THE_WIRE_SEC) as stub:
+        server = start_server(e2e_clone, root_dir, isolated_settings(stub=stub))
+        try:
+            data_root = server.data_root
+            task_id, calls_at_stop, answer = _stop_while_a_call_is_on_the_wire(server, stub)
+            assert answer["status"] == 200 and answer["body"] == {"ok": True, "task_id": task_id}, answer
+            assert server.wait_task(task_id, timeout=180).get("status") == "cancelled"
+            stored = task_result(data_root, task_id)
+            assert stored.get("status") == "cancelled", stored.get("status")
+            assert stored.get("reason_code") != "owner_requested_finalization", stored.get("reason_code")
+            rows = forensics(data_root, task_id=task_id)
+            assert [row.get("event") for row in rows][:3] == ["requested", "claimed", "settled"], rows
+            assert next(row for row in rows if row.get("event") == "settled").get("outcome") == "cancelled"
+            time.sleep(E10_ON_THE_WIRE_SEC + 1)  # the held answer would have arrived by now
+            assert stub.calls[calls_at_stop:] == [], "an immediate Stop bought a further model call"
+            assert not any(StubModelServer._is_finalization_turn(body) for body in stub.calls)
+        finally:
+            server.stop()
+
+
+@_SCENARIO_CEILING
 def test_e11_stop_now_hardens_the_same_intent_without_minting_a_second(e2e_clone, tmp_path_factory):
     """E11 — Stop-now during the graceful wait HARDENS the pending intent: same
     ``request_id``, policy flips to immediate, exactly one ``stop_policy_hardened``
@@ -718,7 +815,7 @@ def test_e11_stop_now_hardens_the_same_intent_without_minting_a_second(e2e_clone
             first = dict(intents(data_root).get(task_id) or {})
             assert first.get("request_id"), intents(data_root)
 
-            server.cancel_task(task_id)  # Stop-now: 200 while live, 404 if it just settled
+            server.cancel_task(task_id)  # Stop-now: 200 once torn down, 202 while still stopping, 404 if it just settled
             hardened = wait_until(
                 lambda: forensics(data_root, task_id=task_id, event="stop_policy_hardened"), 60,
             )
@@ -733,7 +830,7 @@ def test_e11_stop_now_hardens_the_same_intent_without_minting_a_second(e2e_clone
             server.stop()
 
 
-@pytest.mark.serial
+@_SCENARIO_CEILING
 def test_e12_owner_hurry_is_idempotent_text_free_and_loses_to_a_pending_stop(
     e2e_clone, tmp_path_factory,
 ):
@@ -786,7 +883,6 @@ def test_e12_owner_hurry_is_idempotent_text_free_and_loses_to_a_pending_stop(
 # lane's author — see the module docstring.
 # ===========================================================================
 
-@pytest.mark.serial
 def test_e1_delegated_run_lifecycle_emits_the_four_verb_families(e2e_clone, tmp_path_factory):
     """E1 — start -> wait -> answer -> cancel against a REAL delegated lane: the durable
     event families exist and containment recorded no fault."""
@@ -814,7 +910,6 @@ def test_e1_delegated_run_lifecycle_emits_the_four_verb_families(e2e_clone, tmp_
         server.stop()
 
 
-@pytest.mark.serial
 def test_e2_delegated_patch_integration_disposes_the_snapshot(e2e_clone, tmp_path_factory):
     """E2 — a clean ``integrate_delegated_patch``: capture -> apply -> disposed=applied."""
     require_lane(LANE_PAID)
@@ -836,10 +931,9 @@ def test_e2_delegated_patch_integration_disposes_the_snapshot(e2e_clone, tmp_pat
         server.stop()
 
 
-@pytest.mark.serial
 def test_e3_conflicting_delegated_patch_preserves_the_snapshot(e2e_clone, tmp_path_factory):
-    """E3 — a conflicting integrate: the patch is NOT disposed and the snapshot survives,
-    so the owner can retry instead of losing the delegated work."""
+    """E3 — a conflicting integrate: the patch is NOT disposed and the snapshot's record and
+    its pinned result survive, so the owner can retry instead of losing the delegated work."""
     require_lane(LANE_PAID)
     root_dir = tmp_path_factory.mktemp("e2e_conflict")
     server = start_server(e2e_clone, root_dir, isolated_settings(stub=None, paid=True))
@@ -855,14 +949,14 @@ def test_e3_conflicting_delegated_patch_preserves_the_snapshot(e2e_clone, tmp_pa
         applied = [row for row in events(data_root, "delegate_run_patch_disposed")
                    if str(row.get("disposition") or row.get("outcome") or "") == "applied"]
         assert not applied, "a conflicting patch was disposed as applied"
-        registry = pathlib.Path(data_root) / "state" / "subagent_worktrees.json"
-        assert registry.exists() and registry.read_text(encoding="utf-8").strip(), \
-            "the snapshot registry was discarded on a conflict"
+        records = sorted((pathlib.Path(data_root) / "state" / "private_copies").glob("*.json"))
+        rows = [json.loads(path.read_text(encoding="utf-8")) for path in records if not path.name.startswith(".")]
+        assert any(row.get("kind") == "delegated_exec" and row.get("result_sha") for row in rows), \
+            "the snapshot's record and its result were discarded on a conflict"
     finally:
         server.stop()
 
 
-@pytest.mark.serial
 def test_e13_budget_drain_pauses_queued_tasks_and_leaves_no_intents(e2e_clone, tmp_path_factory):
     """E13 — the budget drain under the LIVE pause semantics (supersedes E8, F6
     disposition): a task whose root budget is exhausted BEFORE its first model

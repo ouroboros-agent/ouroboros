@@ -270,8 +270,9 @@ def test_zero_readable_manifests_is_a_read_failure_not_an_empty_filter():
 
 
 def test_status_payload_filters_api_key_only_adapters(monkeypatch, tmp_path):
-    """The catalog projection AND the daemon's native pseudo-rows are filtered
-    to login-capable harnesses; a transient manifest-read failure fails OPEN."""
+    """The catalog projection AND named profile wrappers are filtered to
+    login-capable harnesses; a transient manifest-read failure fails OPEN. An
+    old client's `harnessAccounts` carrier is neither filtered nor read."""
     from ouroboros.gateway.claudexor_accounts import _status_payload
     from ouroboros.gateways import claudexor as gw
 
@@ -319,9 +320,8 @@ def test_status_payload_filters_api_key_only_adapters(monkeypatch, tmp_path):
                 {"profile": {"harness_id": "codex", "profile_id": "koshak",
                              "kind": "native_session"}, "status": {}, "identity": {}},
             ], "harnessAccounts": [
-                {"harness_id": "codex", "native_login_detected": True},
-                {"harness_id": "openrouter", "native_login_detected": False},
-            ]}
+                {"harness_id": "openrouter", "native_login_detected": True},
+            ], "accountPools": []}
 
         def quota_snapshots(self):
             return []
@@ -333,8 +333,8 @@ def test_status_payload_filters_api_key_only_adapters(monkeypatch, tmp_path):
 
     payload = _status_payload(include_models=False)
     assert [h["id"] for h in payload["harnesses"]] == ["codex"]
-    assert [r["harness_id"] for r in payload["profiles"]["harnessAccounts"]] == ["codex"]
     assert [w["profile"]["profile_id"] for w in payload["profiles"]["profiles"]] == ["koshak"]
+    assert payload["profiles"]["harnessAccounts"] == [{"harness_id": "openrouter", "native_login_detected": True}]
 
     class FlakyGateway(FakeGateway):
         def harnesses(self):
@@ -344,15 +344,14 @@ def test_status_payload_filters_api_key_only_adapters(monkeypatch, tmp_path):
     payload = _status_payload(include_models=False)
     # Fail-open: a blip in the manifest read must not blank the panel.
     assert [h["id"] for h in payload["harnesses"]] == ["codex", "openrouter"]
-    assert len(payload["profiles"]["harnessAccounts"]) == 2
     assert len(payload["profiles"]["profiles"]) == 2
 
 
-def test_a_vouched_login_survives_an_unreadable_manifest(monkeypatch, tmp_path):
-    """Review delta 1: a harness whose manifest is null/unreadable must not
-    lose the account the owner is really logged into — the daemon's own
-    ``native_login_detected`` vouches the row. The un-vouched, non-capable
-    adapter stays filtered (raw-api must NOT come back)."""
+def test_a_legacy_native_login_vouches_no_harness_past_a_readable_manifest(monkeypatch, tmp_path):
+    """#244: the native-login vouch went with the pre-unified model. With any
+    manifest readable, a manifest-less harness keeps neither its catalog row nor
+    its named wrapper, whatever an old client's carrier or a catalog row claims;
+    raw-api stays out (the exact leak this filter closes)."""
     from ouroboros.gateway.claudexor_accounts import _status_payload
     from ouroboros.gateways import claudexor as gw
 
@@ -377,7 +376,6 @@ def test_a_vouched_login_survives_an_unreadable_manifest(monkeypatch, tmp_path):
 
         def agent_capabilities(self):
             return {"harnesses": [
-                # Manifest-less codex: the daemon vouches the login on the row.
                 {"id": "codex", "displayName": "Codex CLI", "enabled": True,
                  "native_login_detected": True},
                 {"id": "cursor", "displayName": "Cursor", "enabled": True},
@@ -386,7 +384,7 @@ def test_a_vouched_login_survives_an_unreadable_manifest(monkeypatch, tmp_path):
 
         def harnesses(self):
             return [
-                {"id": "codex", "manifest": None},  # unreadable, NOT un-capable
+                {"id": "codex", "manifest": None},
                 {"id": "cursor", "manifest": {"capability_profile": {"auth": {
                     "supported_sources": ["native_session"]}}}},
                 {"id": "raw-api", "manifest": None},
@@ -394,15 +392,14 @@ def test_a_vouched_login_survives_an_unreadable_manifest(monkeypatch, tmp_path):
 
         def credential_profiles(self):
             return {"profiles": [
-                # A wrapper for the vouched-but-unreadable harness survives too.
                 {"profile": {"harness_id": "codex", "profile_id": "backup",
+                             "kind": "native_session"}, "status": {}, "identity": {}},
+                {"profile": {"harness_id": "cursor", "profile_id": "cursor-default",
                              "kind": "native_session"}, "status": {}, "identity": {}},
             ], "harnessAccounts": [
                 {"harness_id": "codex", "native_login_detected": True,
                  "identity": {"email": "owner@example.com"}},
-                {"harness_id": "cursor", "native_login_detected": False},
-                {"harness_id": "raw-api", "native_login_detected": False},
-            ]}
+            ], "accountPools": []}
 
         def quota_snapshots(self):
             return []
@@ -413,12 +410,8 @@ def test_a_vouched_login_survives_an_unreadable_manifest(monkeypatch, tmp_path):
     monkeypatch.setattr(gw, "ClaudexorGateway", FakeGateway)
 
     payload = _status_payload(include_models=False)
-    assert [h["id"] for h in payload["harnesses"]] == ["codex", "cursor"]
-    accounts = payload["profiles"]["harnessAccounts"]
-    # The logged-into row keeps its identity; raw-api stays out.
-    assert [r["harness_id"] for r in accounts] == ["codex", "cursor"]
-    assert accounts[0]["identity"] == {"email": "owner@example.com"}
-    assert [w["profile"]["profile_id"] for w in payload["profiles"]["profiles"]] == ["backup"]
+    assert [h["id"] for h in payload["harnesses"]] == ["cursor"]
+    assert [w["profile"]["profile_id"] for w in payload["profiles"]["profiles"]] == ["cursor-default"]
 
 
 def test_account_removal_is_the_engine_contract_and_refuses_out_loud(monkeypatch, tmp_path):
@@ -593,75 +586,38 @@ def test_account_enabled_toggle_is_the_engine_contract(monkeypatch, tmp_path):
     assert b"profile_id" in bare.body
 
 
-def test_unified_accounts_capability_reads_the_operations_catalog():
-    """The unified-account-model marker is the EXACT catalog id of the engine's
-    new `GET /v2/account-pools` operation (frozen contract §L.2) — never the
-    path spelling, and an unreadable catalog (spelled `[]` by the caller) is
-    the old model. Same discipline as `_login_disclosure_native`."""
-    from ouroboros.gateway.claudexor_accounts import _unified_accounts_native
-
-    by_id = [{"id": "get:quota"}, {"id": "get:account-pools", "path": "/v2/account-pools"}]
-    assert _unified_accounts_native(by_id) is True
-    # The id alone is sufficient; the path alone is NOT the marker.
-    assert _unified_accounts_native([{"id": "get:account-pools"}]) is True
-    assert _unified_accounts_native(
-        [{"id": "get:something-else", "path": "/v2/account-pools"}]) is False
-    assert _unified_accounts_native([{"id": "get:quota"}]) is False
-    assert _unified_accounts_native([]) is False
-    assert _unified_accounts_native([None, "get:account-pools"]) is False
-
-
-def test_pinned_engine_serves_the_account_pools_marker_id():
-    """Cross-repo byte-assertion (unified-accounts sprint obligation): from
-    Claudexor 3.6.0 the engine's /v2/operations catalog serves the pool-
-    authority read under the EXACT id `get:account-pools`. The engine derives
-    ids from routes (`method.toLowerCase() + ':' + path minus its '/v2/'
-    prefix, [:/<>]+ folded to '.'), and claudexor pins the same literal from
-    its side (control-api.test.ts asserts the catalog row for
-    /v2/account-pools carries this id verbatim). If either repo respells it,
-    the feature detect quietly answers False and every install degrades to
-    the legacy accounts rendering — the deliberate cheap direction of
-    `_unified_accounts_native`, which is exactly why no behavioral test would
-    notice. The assertion is gated on the tracked runtime pin so a deliberate
-    pre-3.6 pin rollback leaves it dormant instead of red."""
+def test_recorded_engine_rosters_decide_the_account_model():
+    """#244: the roster itself carries the account model. The unified producer
+    (Claudexor 3.6.0+) keeps `accountPools` present (`.default([])` in its strict
+    `ControlCredentialProfilesResponse`), so the recorded schema-parsed bodies
+    decide it with no operations catalog: the current body is answered, a
+    pre-unified body (native rows, no pools) is the typed retired model, never a
+    malformed or empty roster. Gated on the tracked pin so a deliberate pre-3.6
+    rollback leaves it dormant instead of red."""
     from ouroboros.claudexor_runtime import load_runtime_pin
-    from ouroboros.gateway.claudexor_accounts import (
-        _ACCOUNT_POOLS_OPERATION_ID,
-        _unified_accounts_native,
-    )
+    from ouroboros.gateway.claudexor_passive import ACCOUNT_MODEL_UNSUPPORTED, roster_error
 
     pin = load_runtime_pin()
     assert pin is not None, "the tracked runtime pin must select a release"
     major, minor, _patch = (int(part) for part in pin.version.split("."))
     if (major, minor) < (3, 6):
-        pytest.skip(
-            f"pinned engine {pin.version} predates the unified account model"
-        )
-    assert _ACCOUNT_POOLS_OPERATION_ID == "get:account-pools"
-    # A 3.6-shaped catalog slice — the accounts-surface rows exactly as the
-    # pinned engine generates them — satisfies the feature detect...
-    catalog_3_6 = [
-        {"id": "get:quota", "method": "GET", "path": "/v2/quota"},
-        {"id": "get:account-pools", "method": "GET", "path": "/v2/account-pools"},
-        {"id": "get:credential-profiles", "method": "GET",
-         "path": "/v2/credential-profiles"},
-        {"id": "post:accounts-migration.rollback", "method": "POST",
-         "path": "/v2/accounts-migration/rollback"},
-    ]
-    assert _unified_accounts_native(catalog_3_6) is True
-    # ...and the same catalog without the one marker row is the legacy model:
-    # no neighbouring accounts route may stand in for the marker.
-    without_marker = [
-        op for op in catalog_3_6 if op["id"] != _ACCOUNT_POOLS_OPERATION_ID
-    ]
-    assert _unified_accounts_native(without_marker) is False
+        pytest.skip(f"pinned engine {pin.version} predates the unified account model")
+    fixtures = pathlib.Path(__file__).resolve().parent.parent / "web/tests/fixtures"
+    current = json.loads((fixtures / "credential_profiles_response_unified.json").read_text(encoding="utf-8"))
+    pre_unified = json.loads((fixtures / "credential_profiles_response.json").read_text(encoding="utf-8"))
+    assert roster_error(current) == ""
+    assert roster_error(pre_unified) == ACCOUNT_MODEL_UNSUPPORTED == "account_model_unsupported"
+    # Neither carrier alone: a body with no model to read is malformed, never the old model.
+    assert roster_error({"profiles": current["profiles"]}) == "malformed_response"
 
 
 def test_status_payload_stamps_the_unified_accounts_fact(monkeypatch, tmp_path):
-    """`unified_accounts` rides every status answer: True only when the
-    operations catalog was READ and carries the account-pools marker; an old
-    engine reads False, and a catalog read failure fails CLOSED to False (the
-    legacy rendering is correct on every engine; a guessed True is not)."""
+    """`unified_accounts` rides every status answer: True exactly when THIS
+    read's roster was answered as the unified model. The operations catalog no
+    longer decides it: a catalog without the pool route, an unreadable one or a
+    gateway without the method leaves a unified roster unified and the facets
+    as read. A pre-unified roster fails the accounts facet with its own typed
+    reason; a stopped daemon reads nothing."""
     from ouroboros.gateway.claudexor_accounts import _status_payload
     from ouroboros.gateways import claudexor as gw
     import ouroboros.claudexor_daemon as owned
@@ -673,6 +629,7 @@ def test_status_payload_stamps_the_unified_accounts_fact(monkeypatch, tmp_path):
     class FakeGateway:
         engine_version = "9.9.9"
         operations_answer: list = [{"id": "get:account-pools"}]
+        roster: dict = {"profiles": [], "harnessAccounts": [], "accountPools": []}
 
         def __init__(self, endpoint):
             pass
@@ -693,7 +650,7 @@ def test_status_payload_stamps_the_unified_accounts_fact(monkeypatch, tmp_path):
             return []
 
         def credential_profiles(self):
-            return {"profiles": [], "harnessAccounts": [], "accountPools": []}
+            return type(self).roster
 
         def quota_snapshots(self):
             return []
@@ -709,7 +666,7 @@ def test_status_payload_stamps_the_unified_accounts_fact(monkeypatch, tmp_path):
     assert _status_payload(include_models=False)["unified_accounts"] is True
 
     FakeGateway.operations_answer = [{"id": "get:quota"}]
-    assert _status_payload(include_models=False)["unified_accounts"] is False
+    assert _status_payload(include_models=False)["unified_accounts"] is True
 
     class BrokenCatalog(FakeGateway):
         def operations(self):
@@ -717,49 +674,53 @@ def test_status_payload_stamps_the_unified_accounts_fact(monkeypatch, tmp_path):
 
     monkeypatch.setattr(gw, "ClaudexorGateway", BrokenCatalog)
     payload = _status_payload(include_models=False)
-    assert payload["unified_accounts"] is False, "an unreadable catalog fails closed to the old model"
-    # …and the absorbed catalog read never downgrades the real facets.
+    assert payload["unified_accounts"] is True, "an unrelated catalog failure never flips the model"
     assert payload["reads"] == {"catalog": "ok", "accounts": "ok", "quota": "ok"}
 
     class NoCatalogMethod(FakeGateway):
         operations = None
 
     monkeypatch.setattr(gw, "ClaudexorGateway", NoCatalogMethod)
-    assert _status_payload(include_models=False)["unified_accounts"] is False
+    assert _status_payload(include_models=False)["unified_accounts"] is True
 
     class UnifiedWire(FakeGateway):
         # The unified engine's full accounts body (frozen contract §L.1):
         # every account a named registry row, the legacy key an empty
         # compatibility list, the routing verdict in the ADDITIVE pool key.
-        operations_answer = [{"id": "get:account-pools"}]
-
         def harnesses(self):
-            # A populated manifest read turns the visibility filters ON —
-            # exactly the path that rewrites the profiles body's other keys.
+            # A populated manifest read turns the visibility filter ON.
             return [{"id": "codex", "manifest": {"capability_profile": {
                 "auth": {"supported_sources": ["native_session"]}}}}]
 
-        def credential_profiles(self):
-            return {
-                "profiles": [{"profile": {"harness_id": "codex",
-                                          "profile_id": "codex-default"}}],
-                "harnessAccounts": [],
-                "accountPools": [{"harness_id": "codex",
-                                  "next_up": {"kind": "profile",
-                                              "profileId": "codex-default"}}],
-            }
+        roster = {
+            "profiles": [{"profile": {"harness_id": "codex", "profile_id": "codex-default"}}],
+            "harnessAccounts": [],
+            "accountPools": [{"harness_id": "codex",
+                              "next_up": {"kind": "profile", "profileId": "codex-default"}}],
+        }
 
     monkeypatch.setattr(gw, "ClaudexorGateway", UnifiedWire)
     served = _status_payload(include_models=False)
     # The ADDITIVE pool key rides the accounts facet through the visibility
-    # filters untouched: the store's dual-wire nextUpAccount reader and the
-    # onboarding dual-read both consume it from this one served payload.
+    # filter untouched: the store's nextUpAccount reader and the onboarding
+    # preset both consume it from this one served payload.
     assert served["unified_accounts"] is True
-    assert served["profiles"]["accountPools"] == [
-        {"harness_id": "codex",
-         "next_up": {"kind": "profile", "profileId": "codex-default"}}]
+    assert served["profiles"]["accountPools"] == UnifiedWire.roster["accountPools"]
     assert served["profiles"]["harnessAccounts"] == []
     assert [w["profile"]["profile_id"] for w in served["profiles"]["profiles"]] == ["codex-default"]
+
+    class PreUnified(FakeGateway):
+        roster = {"profiles": [], "harnessAccounts": [
+            {"harness_id": "codex", "native_login_detected": True,
+             "next_up": {"kind": "native", "route": "local_session"}}]}
+
+    monkeypatch.setattr(gw, "ClaudexorGateway", PreUnified)
+    monkeypatch.setattr(owned, "owned_config_dir", lambda: tmp_path / "pre-unified")
+    retired = _status_payload(include_models=False)
+    assert retired["unified_accounts"] is False
+    assert retired["reads"] == {"catalog": "ok", "accounts": "failed", "quota": "ok"}
+    assert retired["facets"]["accounts"]["error"] == "account_model_unsupported"
+    assert retired["profiles"] == {}
 
     class StoppedDaemon:
         def status_dict(self):
@@ -1684,276 +1645,85 @@ def _missing_cli_job(harness="cursor", job_id="setup-1"):
     }
 
 
-def _install_receipt(**updates):
-    receipt = {
-        "ok": True,
-        "dryRun": False,
-        "exitCode": 0,
-        "target": "local",
-        "harness": "cursor",
-        "command": "vendor install command",
-        "installLocation": "~/.local/bin",
-        "installedBinary": "/managed/claudexor/bin/cursor-agent",
-        "installedVersion": "1.2.3",
-        "pinnedVersion": None,
-        "verification": "unattended_unpinned",
-    }
-    receipt.update(updates)
-    return receipt
+def test_immediate_missing_cli_trigger_is_structural_and_pre_command():
+    from ouroboros.gateway.claudexor_accounts import _is_immediate_missing_cli_job
+
+    job = _missing_cli_job(harness="future-program")
+    assert _is_immediate_missing_cli_job(job, "future-program")
+    for mutation in ({"state": "failed"}, {"phase": "verifying"}, {"outcome": {"reason": "timed_out"}},
+                     {"command": "setup attach"}, {"authorization": {}}, {"nativeCommand": {}},
+                     {"harness": "another-program"}, {"action": "logout"}, {"jobId": ""}):
+        assert not _is_immediate_missing_cli_job({**job, **mutation}, "future-program")
+    job.pop("command")
+    assert not _is_immediate_missing_cli_job(job, "future-program")
+    assert not _is_immediate_missing_cli_job(None, "future-program")
 
 
-def test_immediate_missing_cli_trigger_requires_exact_job_and_engine(monkeypatch):
-    from types import SimpleNamespace
-
-    from ouroboros import claudexor_runtime as runtime
-    from ouroboros.claudexor_daemon import is_immediate_missing_cli_job as _is_immediate_missing_cli_job
-
-    pin = SimpleNamespace(
-        version="3.4.0", build_sha="1" * 40, cli_entrypoint="claudexor.bundle.cjs")
-    monkeypatch.setattr(runtime, "get_runtime_manager", lambda: SimpleNamespace(pin=pin))
-    gateway = SimpleNamespace(engine_version=pin.version, engine_build_sha=pin.build_sha)
-    job = _missing_cli_job()
-    assert _is_immediate_missing_cli_job(job, "cursor", gateway) is True
-
-    mutations = (
-        {"state": "failed"},
-        {"phase": "verifying"},
-        {"outcome": {"reason": "timed_out"}},
-        {"command": "claudexor setup attach setup-1"},
-        {"authorization": {}},
-        {"nativeCommand": {}},
-        {"harness": "codex"},
-        {"action": "logout"},
-        {"jobId": ""},
-    )
-    for mutation in mutations:
-        assert _is_immediate_missing_cli_job({**job, **mutation}, "cursor", gateway) is False
-    without_command = dict(job)
-    without_command.pop("command")
-    assert _is_immediate_missing_cli_job(without_command, "cursor", gateway) is False
-    gateway.engine_build_sha = "2" * 40
-    assert _is_immediate_missing_cli_job(job, "cursor", gateway) is False
-    pin.cli_entrypoint = None
-    gateway.engine_build_sha = pin.build_sha
-    assert _is_immediate_missing_cli_job(job, "cursor", gateway) is False
-
-
-@pytest.mark.parametrize("retry_job", [
-    {"jobId": "setup-2", "state": "queued"},
-    _missing_cli_job(job_id="setup-2"),
+@pytest.mark.parametrize("first_job", [
+    _missing_cli_job(), {**_missing_cli_job(), "state": "failed"},
+    {**_missing_cli_job(), "command": "already launched"},
 ])
-def test_login_installs_and_retries_exactly_once(monkeypatch, retry_job):
-    from types import SimpleNamespace
-
-    from ouroboros import claudexor_runtime as runtime
+@pytest.mark.parametrize("retry_job", [
+    {"jobId": "setup-2", "state": "queued"}, _missing_cli_job(job_id="setup-2"),
+])
+def test_login_uses_shared_install_only_for_first_missing_result(monkeypatch, first_job, retry_job):
+    from ouroboros import harness_maintenance as maintenance
     from ouroboros.gateway import claudexor_accounts as accounts
 
-    pin = SimpleNamespace(
-        version="3.4.0", build_sha="1" * 40, cli_entrypoint="claudexor.bundle.cjs")
-    monkeypatch.setattr(runtime, "get_runtime_manager", lambda: SimpleNamespace(pin=pin))
     requests, installs = [], []
 
     class Gateway:
-        engine_version = pin.version
-        engine_build_sha = pin.build_sha
-
         def __enter__(self): return self
         def __exit__(self, *_args): return False
         def agent_capabilities(self):
             return {"harnesses": [{"id": "cursor", "setupLogin": None}]}
         def operations(self):
             pytest.fail("current null must not consult the legacy operations catalog")
-
         def setup_job_create(self, request):
             requests.append(dict(request))
-            return _missing_cli_job() if len(requests) == 1 else retry_job
+            return first_job if len(requests) == 1 else retry_job
 
     monkeypatch.setattr(owned, "ensure_owned_gateway", lambda: Gateway())
-    monkeypatch.setattr(owned, "install_missing_harness_cli", installs.append)
+    monkeypatch.setattr(maintenance, "install_for_connect", installs.append)
     answer = accounts._login_create({"harness": "cursor"})
-
-    assert installs == ["cursor"]
-    assert len(requests) == 2 and requests[0] == requests[1]
+    if first_job == _missing_cli_job():
+        assert installs == ["cursor"]
+        assert len(requests) == 2 and requests[0] == requests[1]
+        assert answer["job"] == retry_job
+    else:
+        assert not installs and len(requests) == 1
+        assert answer["job"] == first_job
     assert "transport" not in requests[0]
-    assert answer["job"] == retry_job
     assert answer["setup_login_source"] == "setup_job_admission"
 
 
-def test_install_success_receipt_is_strict_and_provenance_is_a_pair():
-    from ouroboros.claudexor_daemon import _valid_install_success
-
-    assert _valid_install_success(_install_receipt(), "cursor") is True
-    assert _valid_install_success(_install_receipt(
-        installerSha256="a" * 64, installerByteLength=123), "cursor") is True
-    assert _valid_install_success(_install_receipt(
-        harness="codex", verification="release_verified", pinnedVersion="1.2.3",
-        installLocation="~/.claudexor/node/bin"), "codex") is True
-    assert _valid_install_success(_install_receipt(
-        harness="opencode", verification="deterministic_only", pinnedVersion="1.2.3",
-        installLocation="~/.claudexor/node/bin"), "opencode") is True
-
-    missing_binary = _install_receipt()
-    missing_binary.pop("installedBinary")
-    missing_version = _install_receipt()
-    missing_version.pop("installedVersion")
-    invalid = (
-        missing_binary,
-        missing_version,
-        _install_receipt(pinnedVersion="latest"),
-        _install_receipt(verification="release_verified"),
-        _install_receipt(installerSha256="a" * 64),
-        _install_receipt(installerSha256="A" * 64, installerByteLength=123),
-        _install_receipt(installerSha256="a" * 64, installerByteLength=0),
-        _install_receipt(installerSha256="a" * 64, installerByteLength=True),
-        _install_receipt(
-            verification="release_verified", pinnedVersion="1.2.3",
-            installerSha256="a" * 64, installerByteLength=123),
-        _install_receipt(code="unexpected"),
-        _install_receipt(refusal="unexpected"),
-        _install_receipt(message="unexpected"),
-        _install_receipt(verification="human_observed"),
-        _install_receipt(verification={}),
-        _install_receipt(exitCode=True),
-        _install_receipt(installedBinary="cursor-agent"),
-        _install_receipt(installedBinary=""),
-        _install_receipt(installedVersion=""),
-        _install_receipt(installedVersion="   "),
-        _install_receipt(installedVersion="v" * 257),
-    )
-    assert all(not _valid_install_success(receipt, "cursor") for receipt in invalid)
-
-
-def test_installer_invocation_is_exact_grouped_and_stdout_bounded(monkeypatch):
-    import io
-    import subprocess
-    from types import SimpleNamespace
-
-    from ouroboros import claudexor_runtime as runtime
-    from ouroboros import platform_layer
-
-    command = ["/exact/node", "/exact/closure/claudexor.bundle.cjs"]
-    monkeypatch.setattr(runtime, "get_runtime_manager", lambda: SimpleNamespace(
-        ensure_cli_command=lambda: command))
-    monkeypatch.setattr(platform_layer, "subprocess_new_group_kwargs", lambda: {
-        "start_new_session": True})
-    monkeypatch.setattr(platform_layer, "merge_hidden_kwargs", dict)
-    seen = {}
-
-    class Process:
-        stdout = io.BytesIO(json.dumps(_install_receipt()).encode())
-
-        def wait(self, timeout):
-            seen.setdefault("timeouts", []).append(timeout)
-            return 0
-
-    import ouroboros.tools.shell as shell
-    from ouroboros.claudexor_daemon import owned_config_dir
-
-    def popen(argv, **kwargs):
-        seen["argv"], seen["kwargs"] = argv, kwargs
-        # /panic snapshots the tracked set under this lock: the spawn must be
-        # atomic with registration, so the lock is held HERE (round-2 finding).
-        seen["lock_held_during_spawn"] = shell._subprocess_lock.locked()
-        return Process()
-
-    monkeypatch.setattr(owned.subprocess, "Popen", popen)
-    owned.install_missing_harness_cli("cursor")
-    assert seen["argv"] == [
-        *command, "harness", "install", "cursor",
-        "--target", "local", "--yes", "--json",
-    ]
-    env = seen["kwargs"].pop("env")
-    assert seen["kwargs"] == {
-        "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.DEVNULL,
-        "start_new_session": True,
-    }
-    # The installer acts on the OWNED data plane, exactly like the daemon it
-    # repairs — never the operator's personal Claudexor home.
-    assert env["CLAUDEXOR_CONFIG_DIR"] == str(owned_config_dir())
-    assert "CLAUDEXOR_DAEMON_SOCK" not in env
-    assert "CLAUDEXOR_CONTROL_PORT" not in env
-    assert seen["lock_held_during_spawn"] is True
-    output, state = bytearray(), {}
-    owned._drain_installer_stdout(
-        io.BytesIO(b"x" * (owned._HARNESS_INSTALL_STDOUT_LIMIT + 1)), output, state)
-    assert len(output) == owned._HARNESS_INSTALL_STDOUT_LIMIT
-    assert state == {"overflow": True}
-
-
-def test_installer_timeout_kills_the_process_tree(monkeypatch):
-    import io
-    import subprocess
-    from types import SimpleNamespace
-
-    from ouroboros import claudexor_runtime as runtime
+@pytest.mark.parametrize("code", ["harness_install_unverified", "harness_install_timeout", "daemon_unreachable"])
+def test_connect_never_retries_login_after_an_unproved_install(monkeypatch, code):
+    from ouroboros import harness_maintenance as maintenance
+    from ouroboros.gateway import claudexor_accounts as accounts
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
-    from ouroboros import platform_layer
 
-    monkeypatch.setattr(runtime, "get_runtime_manager", lambda: SimpleNamespace(
-        ensure_cli_command=lambda: ["/exact/node", "/exact/cli.cjs"]))
-    monkeypatch.setattr(platform_layer, "subprocess_new_group_kwargs", lambda: {})
-    monkeypatch.setattr(platform_layer, "merge_hidden_kwargs", dict)
-    waits = []
+    calls = []
 
-    class Process:
-        pid = 42
-        stdout = io.BytesIO()
+    class Gateway:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def agent_capabilities(self):
+            return {"harnesses": [{"id": "cursor", "setupLogin": None}]}
+        def setup_job_create(self, request):
+            calls.append("login")
+            return _missing_cli_job()
 
-        def wait(self, timeout):
-            waits.append(timeout)
-            if len(waits) == 1:
-                raise subprocess.TimeoutExpired("installer", timeout)
-            return -9
+    def refuse(harness):
+        calls.append(("install", harness))
+        raise ClaudexorUnavailable(code, "unproved install")
 
-    proc = Process()
-    monkeypatch.setattr(owned.subprocess, "Popen", lambda *_a, **_kw: proc)
-    killed = []
-    import ouroboros.tools.shell as shell
-
-    monkeypatch.setattr(shell, "_kill_process_group", killed.append)
-    with pytest.raises(ClaudexorUnavailable) as excinfo:
-        owned.install_missing_harness_cli("cursor")
-    assert excinfo.value.code == "harness_install_timeout"
-    assert killed == [proc]
-    from ouroboros.config import get_claudexor_harness_install_timeout_sec
-
-    assert waits == [get_claudexor_harness_install_timeout_sec(), 10]
-    assert proc not in shell._active_subprocesses, "a timed-out installer must not stay tracked"
-
-
-def test_installer_child_is_panic_tracked_for_its_whole_run(monkeypatch):
-    """/panic kills only tools.shell-tracked subprocess trees before os._exit
-    (BIBLE: every subprocess tree stops immediately). The vendor installer must
-    therefore sit in that set exactly while it runs — the allowlisted raw Popen
-    is legitimate ONLY because of this registration."""
-    import io
-    from types import SimpleNamespace
-
-    from ouroboros import claudexor_runtime as runtime
-    from ouroboros import platform_layer
-    import ouroboros.tools.shell as shell
-
-    monkeypatch.setattr(runtime, "get_runtime_manager", lambda: SimpleNamespace(
-        ensure_cli_command=lambda: ["/exact/node", "/exact/cli.cjs"]))
-    monkeypatch.setattr(platform_layer, "subprocess_new_group_kwargs", lambda: {})
-    monkeypatch.setattr(platform_layer, "merge_hidden_kwargs", dict)
-    observed = {}
-
-    class Process:
-        pid = 43
-        stdout = io.BytesIO(json.dumps(_install_receipt()).encode())
-
-        def wait(self, timeout):
-            observed["tracked_during_wait"] = self in shell._active_subprocesses
-            return 0
-
-    proc = Process()
-    monkeypatch.setattr(owned.subprocess, "Popen", lambda *_a, **_kw: proc)
-    owned.install_missing_harness_cli("cursor")
-    assert observed["tracked_during_wait"] is True, "panic sweep must see the live installer"
-    assert proc not in shell._active_subprocesses, "custody ends with the request"
+    monkeypatch.setattr(owned, "ensure_owned_gateway", lambda: Gateway())
+    monkeypatch.setattr(maintenance, "install_for_connect", refuse)
+    with pytest.raises(ClaudexorUnavailable) as failure:
+        accounts._login_create({"harness": "cursor"})
+    assert failure.value.code == code
+    assert calls == ["login", ("install", "cursor")]
 
 
 def _input_request(job_id: str, body: dict):
@@ -2103,8 +1873,7 @@ def test_gateway_setup_job_operations_use_the_exact_daemon_routes():
     ]
 
 
-@pytest.mark.parametrize("op", ["snapshot", "cancel", "reconcile"])
-@pytest.mark.parametrize("status", [404, 410])
+@pytest.mark.parametrize(("status", "op"), [(404, "snapshot"), (404, "reconcile"), (410, "cancel")])
 def test_login_job_absence_statuses_pass_through(monkeypatch, tmp_path, op, status):
     """Job absence is a client-custody verdict for exactly these operations."""
     from ouroboros import claudexor_daemon as owned
@@ -3204,7 +2973,7 @@ def test_status_payload_fans_out_the_independent_daemon_reads(monkeypatch, tmp_p
 
         def credential_profiles(self):
             rendezvous.wait()
-            return {"profiles": [], "harnessAccounts": []}
+            return {"profiles": [], "harnessAccounts": [], "accountPools": []}
 
         def quota_snapshots(self):
             rendezvous.wait()
@@ -3220,13 +2989,13 @@ def test_status_payload_fans_out_the_independent_daemon_reads(monkeypatch, tmp_p
     payload = _status_payload(include_models=False)
 
     assert [h["id"] for h in payload["harnesses"]] == ["codex"]
-    assert payload["quota"] and payload["profiles"] == {"profiles": [], "harnessAccounts": []}
+    assert payload["quota"] and payload["profiles"] == {"profiles": [], "harnessAccounts": [], "accountPools": []}
 
 
-def test_status_payload_keeps_typed_unreachable_when_a_fanned_out_read_refuses(monkeypatch, tmp_path):
+def test_status_payload_keeps_a_typed_facet_failure_when_a_fanned_out_read_refuses(monkeypatch, tmp_path):
     """Concurrency must not change WHAT a refusal means: a catalog read that
-    raises still lands as the typed unreachable daemon state, not a half-filled
-    panel that looks healthy."""
+    raises lands as that facet's typed failure, not a half-filled panel that
+    looks healthy; the daemon that answered the handshake stays running."""
     from ouroboros.gateway.claudexor_accounts import _status_payload
     from ouroboros.gateways import claudexor as gw
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
@@ -3268,8 +3037,8 @@ def test_status_payload_keeps_typed_unreachable_when_a_fanned_out_read_refuses(m
     monkeypatch.setattr(gw, "ClaudexorGateway", FakeGateway)
 
     payload = _status_payload(include_models=False)
-    assert payload["daemon"]["state"] == "unreachable"
-    assert "daemon_unreachable" in payload["daemon"]["last_error"]
+    assert (payload["daemon"]["state"], payload["reads"]["catalog"]) == ("running", "failed")
+    assert payload["facets"]["catalog"] == {"observed_at": None, "stale": False, "error": "daemon_unreachable"}
     assert payload["harnesses"] == []
 
 
@@ -3324,7 +3093,7 @@ def _reads_probe(monkeypatch, tmp_path, daemon_state, failing_facet="", malforme
                 return {"profiles": []}          # native rows key missing
             if malformed == "accounts_half_native":
                 return {"harnessAccounts": []}   # named profiles key missing
-            return {"profiles": [], "harnessAccounts": []}
+            return {"profiles": [], "harnessAccounts": [], "accountPools": []}
 
         def quota_snapshots(self):
             refuse_if("quota")
@@ -3428,7 +3197,7 @@ def test_status_payload_discloses_a_refused_per_harness_model_read(monkeypatch, 
             raise ClaudexorUnavailable("daemon_unreachable", "model read refused")
 
         def credential_profiles(self):
-            return {"profiles": [], "harnessAccounts": []}
+            return {"profiles": [], "harnessAccounts": [], "accountPools": []}
 
         def quota_snapshots(self):
             return []
@@ -3451,16 +3220,12 @@ def test_status_payload_discloses_a_refused_per_harness_model_read(monkeypatch, 
 
 @pytest.mark.parametrize("half", ["accounts_half_named", "accounts_half_native"])
 def test_status_payload_calls_half_an_account_envelope_a_failed_read(monkeypatch, tmp_path, half):
-    """The accounts envelope carries TWO collections — named credential profiles
-    and the daemon's native per-harness rows — and the owner's machine has both
-    kinds. Accepting an envelope that brought only one made the missing half an
-    authoritative empty: exactly the reported bug ("no account connected" beside
-    accounts that exist), reached through a half-answer instead of a lazy daemon.
-    The engine schema declares both inside a strict object
-    (`ControlCredentialProfilesResponse`): `profiles` is REQUIRED outright and
-    `harnessAccounts` carries `.default([])`, so a validating daemon always
-    materializes the pair and a body missing either one is a read that did not
-    answer."""
+    """The roster must carry its named `profiles` AND the carrier that says
+    which account model it is (`accountPools` on the unified model; native
+    `harnessAccounts` rows name the retired one). A body with only one half is
+    a read that did not answer, never an authoritative empty — exactly the
+    reported bug ("no account connected" beside accounts that exist), reached
+    through a half-answer instead of a lazy daemon."""
     payload = _reads_probe(monkeypatch, tmp_path, "running", malformed=half)
 
     assert payload["reads"]["accounts"] == "failed", (
@@ -3482,10 +3247,10 @@ def test_status_payload_classifies_each_fanned_out_facet_independently(
     expected = {"catalog": "ok", "accounts": "ok", "quota": "ok"}
     expected[failing] = "failed"
     assert payload["reads"] == expected
-    # The refusal is still disclosed on the daemon, and the surviving facets keep
-    # their payload instead of blanking the whole panel.
-    assert payload["daemon"]["state"] == "unreachable"
-    assert "daemon_unreachable" in payload["daemon"]["last_error"]
+    # The refusal is disclosed on its own facet; the daemon that answered stays
+    # running, and the surviving facets keep their payload instead of blanking.
+    assert payload["daemon"]["state"] == "running" and payload["facets"][failing]["error"] == "daemon_unreachable"
+    assert all(payload["facets"][facet]["error"] is None for facet in expected if facet != failing)
     if failing != "catalog":
         assert [h["id"] for h in payload["harnesses"]] == ["codex"]
 
@@ -3533,7 +3298,7 @@ def test_wake_endpoint_starts_the_daemon_and_returns_the_fresh_reading(monkeypat
         order.append("ensure")
         return fake_ensure()
 
-    def fake_status(include_models):
+    def fake_status(include_models, **_kwargs):
         order.append("read")
         return {"daemon": {"state": "running"},
                 "reads": {"catalog": "ok", "accounts": "ok", "quota": "ok"}}
@@ -3589,17 +3354,15 @@ def test_the_proxy_count_in_the_docs_matches_the_handlers_that_exist(tmp_path):
     places a reader looks first. A hand-counted number in prose cannot be trusted
     to be re-counted when the fifth one lands, so it is asserted instead.
 
-    ``docs/ARCHITECTURE.md`` carries the same module-local count in its gateway
-    map. Every Claudexor route must also be named by one of the dedicated gateway
-    module entries: a proxy the map never names is a proxy nobody discovers from
-    the architecture doc.
+    The module map names the gateway owners; the endpoint registry names every
+    registered route. Short module-purpose rows need not duplicate that registry.
     """
     import inspect
     import re
 
     from ouroboros.gateway import claudexor_accounts as accounts
 
-    words = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six"}
+    words = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six", 7: "seven"}
     handlers = sorted(
         name for name, obj in vars(accounts).items()
         if name.startswith("api_claudexor_") and inspect.iscoroutinefunction(obj)
@@ -3612,18 +3375,14 @@ def test_the_proxy_count_in_the_docs_matches_the_handlers_that_exist(tmp_path):
     )
 
     arch = architecture_text()
-    account_line = next(ln for ln in arch.splitlines() if "claudexor_accounts.py" in ln)
-    assert f"{expected} thin proxies" in account_line.lower(), (
-        "the gateway map still counts a different number of account proxies: "
-        f"{account_line.strip()[:160]}"
-    )
-    gateway_lines = [
-        ln for ln in arch.splitlines()
-        if "claudexor_accounts.py" in ln or "claudexor_quota.py" in ln
-    ]
+    assert "claudexor_accounts.py" in arch and "claudexor_quota.py" in arch
+    from ouroboros.reference_books import load_reference_book, read_book_section
 
-    # Every REGISTERED path is named in that map entry, so a new proxy cannot
-    # land undocumented behind an updated count.
+    book = load_reference_book(pathlib.Path(__file__).resolve().parents[1], "architecture")
+    endpoints = read_book_section(book, "4. Server API Endpoints").text
+    documented = set(re.findall(r"^\|\s*(?:GET|POST|PUT|PATCH|DELETE|ANY)\s*\|\s*`([^`]+)`", endpoints, re.M))
+
+    # Every registered full path belongs in its canonical endpoint registry.
     from ouroboros.gateway.router import collect_routes
 
     paths = {
@@ -3632,12 +3391,7 @@ def test_the_proxy_count_in_the_docs_matches_the_handlers_that_exist(tmp_path):
     }
     assert paths, "no /api/claudexor/ routes are registered"
     for path in sorted(paths):
-        # The map spells path params by name, not by their brace form for the
-        # two-segment removal route; compare on the stable prefix.
-        prefix = re.split(r"\{", path)[0].rstrip("/")
-        assert any(prefix in line for line in gateway_lines), (
-            f"{path} is registered but the gateway map never names it"
-        )
+        assert path in documented, f"{path} is registered but the endpoint registry never names it"
 
 
 # ---------------------------------------------------------------------------
@@ -3873,6 +3627,8 @@ def test_ensure_owned_gateway_reconciles_rotation_on_every_ensure(monkeypatch):
     ensure_owned_gateway, so the reconcile riding it covers both — including
     the attach paths the old spawn-only patch never reached."""
     from ouroboros.gateways import claudexor as gateway_mod
+    observed_ready = []
+    monkeypatch.setattr("ouroboros.harness_program_facts.engine_ready", lambda gateway: observed_ready.append(gateway.handshakes))
 
     endpoint = gateway_mod.DaemonEndpoint(host="127.0.0.1", port=45699, token="tok")
 
@@ -3908,6 +3664,7 @@ def test_ensure_owned_gateway_reconciles_rotation_on_every_ensure(monkeypatch):
     # Reconcile ran, ONCE, against the very gateway the caller receives —
     # and only AFTER the authenticated handshake (identity before writes).
     assert manager.reconciled == [gateway]
+    assert observed_ready == [1], "a successful ready event follows the authenticated handshake"
 
 
 def test_reconcile_is_best_effort_and_never_breaks_the_ensure(monkeypatch, tmp_path):

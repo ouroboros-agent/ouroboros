@@ -17,10 +17,10 @@ nonterminal ``task_done`` wedged the parent. This module separates the two:
 
 Ownership: every cancel ingress (agent ``cancel_task`` tool, HTTP single, HTTP
 cascade, boot migration of legacy latch files) writes an intent through
-``request_cancel``. The supervisor's ``cancel_task_custody`` is the ONE settle
-owner: it CLAIMS the intent before teardown and SETTLES it with the terminal
-outcome; the supervisor-tick watchdog only re-feeds unclaimed/stale intents back
-into custody. The canonical ``status`` never carries intent again.
+``request_cancel``. ``cancel_task_custody`` claims before teardown and settles
+cancellations with their terminal outcome. Custody and boot restore may instead
+withdraw an obsolete helper-closure intent without cancelling. The tick watchdog
+re-feeds unclaimed/stale intents; canonical ``status`` never carries intent.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ import pathlib
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from ouroboros.utils import append_jsonl, update_json_locked, utc_now_iso
 
@@ -102,12 +102,14 @@ def _intents_path(drive_root: Any) -> pathlib.Path:
 
 
 @contextmanager
-def cancellation_projection_lock(drive_root: Any) -> Iterator[None]:
+def cancellation_projection_lock(drive_root: Any, *, wait: bool = True) -> Iterator[None]:
     """Hold the same short lock used by cancel-intent mutators.
 
     Cross-store decisions such as a paid acceptance claim use this only while
     committing their own atomic row.  If cancellation linearizes first they see
     it; if this lock wins first, the claim linearizes before cancellation.
+    ``wait=False`` tries once (an automatic caller under Q); the refusal's
+    ``reason`` keeps the acquisition outcome, so contention stays distinct.
     """
     from ouroboros.platform_layer import (
         acquire_exclusive_file_lock,
@@ -116,9 +118,13 @@ def cancellation_projection_lock(drive_root: Any) -> Iterator[None]:
 
     path = _intents_path(drive_root)
     lock_path = path.with_name(path.name + ".lock")
-    lock_fd = acquire_exclusive_file_lock(lock_path, owner_aware_stale=True)
+    outcome: Dict[str, Any] = {}
+    lock_fd = acquire_exclusive_file_lock(lock_path, owner_aware_stale=True, outcome=outcome,
+                                          **({} if wait else {"timeout_sec": 0.0}))
     if lock_fd is None:
-        raise TimeoutError("cancel-intent projection lock unavailable")
+        error = TimeoutError("cancel-intent projection lock unavailable")
+        error.reason = outcome.get("reason", "unknown")
+        raise error
     try:
         yield
     finally:
@@ -351,41 +357,27 @@ def request_cancel(
     allow_settled_target: bool = False,
     requested_stop_policy: str = "",
     observation: Optional[Dict[str, Any]] = None,
+    stop_action_id: str = "",
 ) -> Dict[str, Any]:
-    """Record durable cancel intent for ``task_id`` — idempotent per task.
+    """Record cancel custody, keeping action identity separate from request_id.
 
-    Returns the ACTIVE intent row (existing or newly minted) plus
-    ``already_requested``. Never touches the canonical task status: teardown and
-    the terminal write belong to the supervisor's cancellation custody.
-
-    An ALREADY-SETTLED task with NO live ownership mints nothing: an intent for
-    a task that finished on its own would show a false "Cancelling…" badge on a
-    settled card until the watchdog cleaned it up, and nothing is left to tear
-    down. The caller gets ``already_settled`` plus the real ``status`` instead
-    (completion wins).
-
-    ``allow_settled_target`` is the LIVE-OWNERSHIP exception (GR6-1, widening
-    the GR2-1b cascade case): the pipeline persists the durable terminal result
-    BEFORE post-task cognition ends, so a settled STATUS alone does not prove a
-    dead WORKER — ``already_settled`` is a terminal answer only when no live
-    physical ownership remains (no RUNNING row / busy worker). This module
-    stays pure (it never reads the queue): each INGRESS checks its own live
-    ownership fact (`supervisor.queue.task_has_live_ownership` in-process, the
-    queue-snapshot read worker-side) and passes ``allow_settled_target=True``
-    when ownership is live, so custody can kill the still-spending worker while
-    completion-wins preserves the stored result. The cascade-coordination
-    ingress (GR2-1b) passes it for a settled root with live descendants — the
-    intent is the watchdog's replay trigger and settles only at the cascade
-    postcondition. The settled-card badge hazard does not apply: the
-    effective-status read only projects ``cancel_state`` onto NON-settled
-    results.
-
-    ``scope`` is stored on the row so a watchdog replay re-runs the SAME shape:
-    a ``cascade`` intent re-fed as a single cancel would settle the root while
-    its descendants kept running.
+    Return the active intent plus already_requested. Exact stop_action_id retries
+    preserve the current future-control identity. Custody alone writes terminal
+    status. Settled targets without live ownership mint nothing (completion wins),
+    avoiding a false Cancelling badge. allow_settled_target is the ingress's live
+    ownership proof: a saved terminal result may precede post-task cognition, or a
+    settled root may still coordinate live descendants. In-process ingress checks
+    task_has_live_ownership; workers read the snapshot. This owner reads no queue.
+    Custody can stop that spending without replacing the stored completion; only
+    non-settled results project cancel_state. Cascade scope persists so watchdog
+    replay cannot settle a root while leaving its descendants running.
     """
     tid = _valid_task_id(task_id)
-    reason_text = " ".join(str(reason or "").split())[:500]
+    if not isinstance(stop_action_id, str) or len(stop_action_id) > 200:
+        raise ValueError("stop_action_id must be a string of at most 200 characters")
+    # The whole stated cause is the durable record (``cancel_origin.reason``
+    # carries it on); a surface that shows less labels its preview as one.
+    reason_text = " ".join(str(reason or "").split())
     policy_text = str(requested_stop_policy or "").strip()
     minted: Dict[str, Any] = {}
     scope_text = str(scope or "").strip()
@@ -394,6 +386,7 @@ def request_cancel(
     # request over an already-hardened intent must not re-emit the forensic row.
     newly_hardened = {"value": False}
     observed = copy.deepcopy(observation) if isinstance(observation, dict) else None
+    from supervisor.followup_policy import new_stop_fields
 
     def _mutate(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         newly_hardened["value"] = False
@@ -494,6 +487,15 @@ def request_cancel(
             ) from exc
         target_status = str(target_result.get("status") or "")
         resolved["status"] = target_status if target_status in SETTLED_STATUSES else ""
+        stop_fields, replayed = new_stop_fields(source,
+            previous=(existing or {}).get("followup_stop") or target_result.get("followup_stop"),
+            action_id=stop_action_id,
+            action_binding=(str(source), str(requested_by), scope_text, policy_text))
+        if replayed:
+            minted.update(existing or {"task_id": target_id, "status": target_status,
+                                       "already_settled": bool(resolved["status"]), **stop_fields})
+            minted.update(already_requested=True, stop_action_replayed=True)
+            return None
         if (
             resolved["status"]
             and not allow_settled_target
@@ -518,7 +520,8 @@ def request_cancel(
             minted.update(existing)
             minted["already_requested"] = True
             updated_row = dict(existing)
-            changed = rekeyed
+            changed = rekeyed or bool(stop_fields)
+            updated_row.update(stop_fields)
             if rekeyed and isinstance(updated_row.get("observation"), dict):
                 updated_row["observation"] = {**updated_row["observation"],
                     "matches_cancel_target": updated_row["observation"].get("observed_task_id") == target_id}
@@ -557,6 +560,7 @@ def request_cancel(
             "requested_at": utc_now_iso(),
             "generation": 0,
             "scope": scope_text or SCOPE_SINGLE,
+            **stop_fields,
             **({"observation": observed} if observed is not None else {}),
         }
         if policy_text == STOP_POLICY_FINALIZE:
@@ -767,9 +771,17 @@ def active_intents(
     enforcement is degraded) before the read still returns ``{}`` — fail-soft
     read, fail-closed write.
     """
+    return read_active_intents(drive_root, disclose_corruption=disclose_corruption, strict=strict)[0]
+
+
+def read_active_intents(
+    drive_root: Any, *, disclose_corruption: bool = False, strict: bool = False,
+) -> Tuple[Dict[str, Dict[str, Any]], Optional[List[str]]]:
+    """``active_intents`` and, from the same one read, the task ids it could not see: the quarantined
+    malformed rows, or ``None`` when the projection itself is unreadable (every row unseen)."""
     path = _intents_path_read(drive_root)
     if not path.is_file():
-        return {}
+        return {}, []
     try:
         from ouroboros.utils import read_json_dict
 
@@ -789,7 +801,7 @@ def active_intents(
             })
         if strict:
             raise CancelIntentProjectionCorrupt(str(exc)) from exc
-        return {}
+        return {}, None
     malformed = [str(tid) for tid, row in intents.items() if not isinstance(row, dict)]
     if malformed:
         # GR6-3 row strictness on the enforcement read: a malformed per-task
@@ -831,7 +843,7 @@ def active_intents(
         str(tid): dict(row)
         for tid, row in intents.items()
         if isinstance(row, dict)
-    }
+    }, malformed
 
 
 def _intents_path_read(drive_root: Any) -> pathlib.Path:
@@ -869,7 +881,7 @@ def active_intent(
 
 
 def resolve_owner_stop_intent(
-    drive_root: Any, task_id: str,
+    drive_root: Any, task_id: str, *, propagate_busy: bool = False,
 ) -> Tuple[str, Dict[str, Any]]:
     """Return the durable owner-stop key/row for a physical retry task.
 
@@ -886,6 +898,9 @@ def resolve_owner_stop_intent(
     exact = active_intent(drive_root, tid)
     if isinstance(exact, dict) and stop_policy(exact) == STOP_POLICY_FINALIZE:
         return tid, exact
+    if exact is not None:
+        return tid, {}  # A known immediate intent needs no lineage read.
+    from ouroboros.store import StoreBusy
     try:
         from ouroboros.task_results import load_task_result
 
@@ -902,6 +917,10 @@ def resolve_owner_stop_intent(
         ):
             return tid, {}
         return logical_root, logical
+    except StoreBusy:
+        if propagate_busy:
+            raise
+        return tid, {}
     except Exception:
         log.debug(
             "owner-stop intent resolution failed for physical task %s",
@@ -1153,6 +1172,20 @@ def settle_intent(
         if reason:
             mismatch.update({**row, "_reason": reason})
             return None
+        if row.get("followup_stop"):
+            # Transfer before retiring the active intent, under this same cancel
+            # lock. Natural completion keeps its status, answer, cost and custody.
+            # A failed transfer leaves the intent active for watchdog recovery.
+            from ouroboros.task_results import require_writable_task_result_schema
+            from ouroboros.task_store import patch_document
+            def retain_stop(result):
+                if not result:
+                    if outcome == SETTLED_NOT_FOUND:
+                        return None
+                    raise ValueError("followup_stop_result_missing")
+                require_writable_task_result_schema(result)
+                return {**result, "followup_stop": copy.deepcopy(row["followup_stop"])}
+            patch_document(pathlib.Path(drive_root), tid, retain_stop)
         intents.pop(tid, None)
         settled.update(row)
         return {"schema_version": _SCHEMA_VERSION, "intents": intents}
@@ -1185,6 +1218,44 @@ def settle_intent(
             "expected_generation": expected_generation,
         })
     return None
+
+
+def withdraw_intent(
+    drive_root: Any, task_id: str, *, withdrawable: Callable[[Dict[str, Any]], bool], detail: str = "",
+    expected_generation: Optional[int] = None, request_id: str = "",
+) -> Optional[Dict[str, Any]]:
+    """Retire the caller's own intent WITHOUT a cancellation while its CURRENT row, read under the intent lock, is still
+    ``withdrawable``: ``None`` once withdrawn or already gone; else that row, unchanged and still owed (a Stop or
+    cascade joined it). Unlike ``settle_intent`` nothing is transferred, deferred or released. A row that is no longer
+    the caller's claim (the generation/request fence) raises, so the caller gives its custody back."""
+    tid = _valid_task_id(task_id)
+    seen: Dict[str, Any] = {}
+
+    def _mutate(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        seen.clear()
+        intents = _load_intents(current, strict=True)
+        row = intents.get(tid)
+        if not isinstance(row, dict):
+            return None
+        seen.update(row, _reason=_generation_mismatch(row, expected_generation, request_id))
+        if seen["_reason"] or not withdrawable(row):
+            return None
+        intents.pop(tid)
+        seen["_withdrawn"] = True
+        return {"schema_version": _SCHEMA_VERSION, "intents": intents}
+
+    try:
+        update_json_locked(_intents_path(drive_root), _mutate, strict_existing_dict=True)
+    except ValueError as exc:
+        raise _refuse_corrupt(drive_root, tid, "withdraw_intent", exc) from exc
+    reason, withdrawn = seen.pop("_reason", ""), seen.pop("_withdrawn", False)
+    if reason:
+        raise RuntimeError(f"the intent of {tid} is no longer this claim's ({reason})")
+    if withdrawn:
+        _forensic(drive_root, {"event": "settled", "task_id": tid, "request_id": seen.get("request_id"),
+                               "outcome": "withdrawn", "detail": str(detail or "")[:500],
+                               "generation": seen.get("generation")})
+    return dict(seen) if seen and not withdrawn else None
 
 
 def claim_is_stale(intent: Dict[str, Any], *, now: Optional[float] = None) -> bool:
@@ -1262,7 +1333,7 @@ def claim_still_owned(drive_root: Any, task_id: str, claim: Dict[str, Any]) -> b
         return False
 
 
-def migrate_legacy_cancel_latches(drive_root: Any) -> List[str]:
+def migrate_legacy_cancel_latches(drive_root: Any, *, records=None) -> List[str]:
     """Boot migration: legacy ``cancel_requested`` status files → synthetic intents.
 
     Pre-redesign task results may still sit in the ``cancel_requested`` latch (the
@@ -1289,70 +1360,53 @@ def migrate_legacy_cancel_latches(drive_root: Any) -> List[str]:
     visibility owner decision 6.3=B gives the quarantine itself.
     """
     from ouroboros.task_result_schema import task_result_schema_refusal
-    from ouroboros.task_results import (
-        STATUS_CANCEL_REQUESTED, list_task_results, task_results_dir,
-        write_task_result,
-    )
-    from ouroboros.utils import read_json_dict
-
-    admitted: List[str] = []
-    for path in sorted(task_results_dir(drive_root, create=False).glob("*.json")):
-        raw = read_json_dict(path)
-        if task_result_schema_refusal(raw) != "unstamped_pre_7_0":
+    from ouroboros.task_results import STATUS_CANCEL_REQUESTED, write_task_result
+    if records is None:
+        from ouroboros.task_store import list_documents
+        records = [(str(row.get("task_id") or ""), row, "") for row in list_documents(drive_root)]
+    admitted, migrated, failed = [], [], []
+    for tid, row, error in records:
+        if error or not isinstance(row, dict) or row.get("status") != STATUS_CANCEL_REQUESTED:
             continue
-        if (
-            str(raw.get("status") or "") != STATUS_CANCEL_REQUESTED
-            or str(raw.get("task_id") or "") != path.stem
-        ):
-            continue  # not a latch, or an identity this write would rewrite
+        refusal = task_result_schema_refusal(row)
+        if str(row.get("task_id") or "") != tid or refusal not in {"", "unstamped_pre_7_0"}:
+            failed.append(tid)
+            continue
         try:
-            write_task_result(drive_root, path.stem, STATUS_CANCEL_REQUESTED)
+            if refusal:
+                write_task_result(drive_root, tid, STATUS_CANCEL_REQUESTED)
+                admitted.append(tid)
+            intent = request_cancel(pathlib.Path(drive_root), tid,
+                reason="legacy cancel_requested latch migrated at boot", source="boot_migration")
+            if not intent.get("already_requested") and not intent.get("already_settled"):
+                migrated.append(tid)
         except Exception:
-            log.warning("cancel-latch schema admission failed for %s", path.name,
-                        exc_info=True)
-            continue
-        admitted.append(path.stem)
+            failed.append(tid)
+            log.warning("legacy cancel-latch migration failed for %s", tid, exc_info=True)
     if admitted:
-        try:
-            append_jsonl(pathlib.Path(drive_root) / "logs" / "events.jsonl", {
-                "ts": utc_now_iso(),
-                "type": "task_result_cancel_latch_admitted",
-                "count": len(admitted),
-                "task_ids": admitted,
-                "reason": "unstamped_pre_7_0",
-            })
-        except Exception:
-            log.warning("failed to record the cancel-latch admission", exc_info=True)
-
-    migrated: List[str] = []
-    try:
-        latched = list_task_results(
-            pathlib.Path(drive_root), statuses=[STATUS_CANCEL_REQUESTED],
-        )
-    except Exception:
-        log.debug("legacy cancel-latch scan failed", exc_info=True)
-        return migrated
-    for row in latched:
-        tid = str(row.get("task_id") or row.get("id") or "")
-        if not tid:
-            continue
-        try:
-            intent = request_cancel(
-                pathlib.Path(drive_root), tid,
-                reason="legacy cancel_requested latch migrated at boot",
-                source="boot_migration",
-            )
-        except Exception:
-            log.debug("legacy cancel-latch migration failed for %s", tid, exc_info=True)
-            continue
-        if not intent.get("already_requested") and not intent.get("already_settled"):
-            migrated.append(tid)
+        append_jsonl(pathlib.Path(drive_root) / "logs/events.jsonl", {
+            "ts": utc_now_iso(), "type": "task_result_cancel_latch_admitted",
+            "count": len(admitted), "task_ids": admitted, "reason": "unstamped_pre_7_0"})
+    from ouroboros.obligations import add, members, remove
+    for tid in failed:
+        add(drive_root, "unknowns", f"task:{tid}",
+            {"task_id": tid, "reason": "cancel_latch_migration_failed"})
+    if migrated:  # a rerun (the explicit rebuild) that succeeds retires the gap it recorded
+        gaps = members(drive_root, "unknowns")
+        for tid in migrated:
+            if gaps.get(f"task:{tid}", {}).get("reason") == "cancel_latch_migration_failed":
+                remove(drive_root, "unknowns", f"task:{tid}")
     return migrated
 
 
-def cancel_state_fields(drive_root: Any, task_id: str) -> Dict[str, Any]:
-    """Typed public projection: ``{"cancel_state": "pending", ...}`` or ``{}``."""
-    intent = active_intent(drive_root, task_id)
+def cancel_state_fields(drive_root: Any, task_id: str, *, intents: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Typed public projection: ``{"cancel_state": "pending", ...}`` or ``{}``; ``intents`` is a
+    batch reader's one ``active_intents`` read (``task_reads``) instead of a read per task."""
+    if intents is None:
+        intent = active_intent(drive_root, task_id)
+    else:
+        row = intents.get(str(task_id))
+        intent = dict(row) if isinstance(row, dict) else None
     if intent is None:
         return {}
     fields: Dict[str, Any] = {"cancel_state": "pending"}
@@ -1366,7 +1420,7 @@ def cancel_state_fields(drive_root: Any, task_id: str) -> Dict[str, Any]:
     return fields
 
 
-def cancel_pending(drive_root: Any, task_id: str, *, strict: bool = False) -> bool:
+def cancel_pending(drive_root: Any, task_id: str, *, strict: bool = False, propagate_busy: bool = False) -> bool:
     """Both cancel-pending carriers in ONE predicate — fail-soft.
 
     The durable intent projection is the live authority; the legacy
@@ -1375,6 +1429,8 @@ def cancel_pending(drive_root: Any, task_id: str, *, strict: bool = False) -> bo
     both, or a task wedged in the old shape still accepts new owner messages
     while the supervisor is tearing it down.
     """
+    from ouroboros.store import StoreBusy
+
     try:
         if has_active_intent(drive_root, task_id, strict=strict):
             return True
@@ -1383,12 +1439,20 @@ def cancel_pending(drive_root: Any, task_id: str, *, strict: bool = False) -> bo
             raise
         log.debug("cancel-pending intent read failed for %s", task_id, exc_info=True)
     try:
-        from ouroboros.task_results import STATUS_CANCEL_REQUESTED, load_task_result
+        from ouroboros.task_results import STATUS_CANCEL_REQUESTED, load_task_result, validate_task_id
 
-        status = str(
-            (load_task_result(drive_root, task_id, strict=strict) or {}).get("status") or ""
-        )
+        if strict:
+            result = load_task_result(drive_root, task_id, strict=True) or {}
+        else:
+            from ouroboros.task_store import task_facts
+            tid = validate_task_id(task_id)
+            result = task_facts(drive_root, where="task_id=?", params=(tid,)).get(tid, {})
+        status = str(result.get("status") or "")
         return status == STATUS_CANCEL_REQUESTED
+    except StoreBusy:
+        if strict or propagate_busy:
+            raise
+        return False
     except Exception:
         if strict:
             raise

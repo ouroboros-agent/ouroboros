@@ -138,15 +138,17 @@ def _subagent_and_update_guard_result(
     repo_mutation: bool,
 ) -> ToolResult | None:
     """Early dispatch gates (native denial, or ``None`` to allow): the read-only and
-    acting subagent tool-name allowlists, and the managed-update merge write-exclusivity
-    (P2/SC2 — only the authorized resolution task may run code tools while a merge is staged)."""
+    acting subagent tool-name allowlists, and the managed-update merge
+    write-exclusivity (P2/SC2 — only the authorized resolution task may run code tools
+    while a merge is staged)."""
     if local_readonly_subagent and entry is not None and not registry._readonly_tool_allowed(name):
         return ToolResult(status="blocked", code="ACCESS_BLOCKED", text=(
             "⚠️ LOCAL_READONLY_SUBAGENT_BLOCKED: this subagent may inspect "
             "local repo/data/history plus web/browser surfaces and enabled "
-            "external tools, but may not call first-party local tool "
-            f"{name!r}. Parent tasks must perform writes, commits, review "
-            "gates, tool expansion, runtime control, shell, and skills. "
+            "external tools and may write knowledge notes, memory marks and "
+            "chronicle page drafts in its own name, but may not call first-party "
+            f"local tool {name!r}. Parent tasks must perform other writes, commits, "
+            "review gates, tool grants, runtime control, shell, and skills. "
             "Nested readonly delegation is allowed only through schedule_subagent "
             "within configured depth/cap limits."
         ))
@@ -158,8 +160,9 @@ def _subagent_and_update_guard_result(
             "⚠️ ACTING_SUBAGENT_BLOCKED: this mutative subagent may read and "
             "write inside its assigned write root and run shell/services "
             f"there, but may not call first-party tool {name!r}. It cannot "
-            "commit the live body, run review/runtime/skills lifecycle, enable "
-            "tools, or write cognitive memory; the parent applies isolated patches "
+            "commit the live body, run review gates/runtime/skills lifecycle, grant "
+            "itself tools, or write identity or scratchpad (chronicle pages and parts only "
+            "as its own drafts); the parent applies isolated patches "
             "or verifies shared external files and is the sole live-body committer."
         ))
     if acting_subagent and entry is None and (ext_tool or is_mcp) and acting_tool_grants is not None and name not in acting_tool_grants:
@@ -231,10 +234,7 @@ def _light_mode_payload_mutation_allowed(
 ) -> bool:
     """Return True for light-mode data skill payload edits that do not touch repo files."""
 
-    # apply_patch/edit_batch are DELIBERATELY absent: they refuse data-plane roots
-    # entirely (repo lanes only), so they can never be a payload edit — in light
-    # mode they stay under the generic repo-mutation block like any repo write.
-    if runtime_mode != "light" or tool_name not in {"edit_text", "write_file"}:
+    if runtime_mode != "light" or tool_name not in {"edit_text", "write_file", "edit_batch", "apply_patch"}:
         return False
     requested_root = str(args.get("root", "") or "active_workspace")
     try:
@@ -279,15 +279,15 @@ def _resource_allowed(ctx: Any, key: str) -> bool:
             resources.update(raw)
     if not resources:
         return True
-    for name in (key, f"allow_{key}"):
-        value = resources.get(name)
-        if isinstance(value, bool):
-            return value
     if key == "web":
         for name in ("network", "allow_network", "internet", "external_network"):
             value = resources.get(name)
             if isinstance(value, bool) and not value:
                 return False
+    for name in (key, f"allow_{key}"):
+        value = resources.get(name)
+        if isinstance(value, bool):
+            return value
     if key == "network":
         for name in ("internet", "external_network"):
             value = resources.get(name)
@@ -327,6 +327,9 @@ def _disabled_tools(ctx: Any) -> frozenset:
     # too (harmless: nothing registers it), so old contracts round-trip as-is.
     if "claude_code_edit" in names:
         names.add("delegate_start")
+    from ouroboros.contracts.task_contract import expand_disabled_tool_names
+
+    names.update(expand_disabled_tool_names(names))
     # Rename compatibility: contracts that withheld `advisory_review` keep
     # withholding the SAME organ under its new name, and vice versa (a new
     # contract naming only the new spelling must also silence the alias).
@@ -334,6 +337,10 @@ def _disabled_tools(ctx: Any) -> frozenset:
         names.add("preflight_review")
     if "preflight_review" in names:
         names.add("advisory_review")
+    # Exact aliases keep saved restrictions in both directions.
+    for spellings in ({"commit_reviewed", "vcs_commit_reviewed"}, {"ocr_pdf", "extract_pdf_text"}):
+        if names & spellings:
+            names.update(spellings)
     return frozenset(names)
 
 
@@ -344,19 +351,82 @@ def disabled_tools_dispatch_only(ctx: Any) -> bool:
     return is_consciousness_origin(getattr(ctx, "task_metadata", None))
 
 
-_GITHUB_TOKEN_TOOLS = frozenset({
-    "list_github_prs",
-    "get_github_pr",
-    "comment_on_pr",
-    "list_github_issues",
-    "get_github_issue",
-    "comment_on_issue",
-    "close_github_issue",
-    "create_github_issue",
-    "run_ci_tests",
-    "submit_skill_to_hub",
-    "generate_evolution_stats",
-})
+_GITHUB_TOKEN_TOOLS = frozenset({"github_read", "github_write", "pr_merge", "submit_skill_to_hub"})
+_NETWORK_BUILTIN_TOOLS = _WEB_TOOLS | _GITHUB_TOKEN_TOOLS | {
+    "vcs_pull_ff", "generate_image", "list_image_models", "recover_image", "remote_mcp_sign_in",
+}
+
+
+def _builtin_network_allowed(ctx: Any, name: str) -> bool:
+    """Whether a built-in's network resource gate permits this task's call."""
+    return name not in _NETWORK_BUILTIN_TOOLS or _resource_allowed(ctx, "network")
+
+# Retired names withhold covered methods and api; list disables also cover search.
+# Issue/PR numbers share routes, so comment/title/body restrictions cannot split without a read.
+# Rows: successor, ((method, constraints), ...); empty constraints match the whole method.
+# '*' target is positive; other fields are non-null (including ""/False). include matches a facet.
+_RETIRED_GITHUB_TOOLS: dict[str, tuple[str, tuple[tuple[str, dict[str, str]], ...]]] = {
+    "list_github_issues": ("github_read", (("list", {"kind": "issue"}), ("search", {}), ("api", {}))),
+    "get_github_issue": ("github_read", (("get", {"kind": "issue"}), ("list", {"kind": "comment", "target": "*"}), ("api", {}))),
+    "list_github_prs": ("github_read", (("list", {"kind": "pr"}), ("search", {}), ("api", {}))),
+    "get_github_pr": ("github_read", (("get", {"kind": "pr"}), ("list", {"kind": "review", "target": "*"}),
+                                    ("list", {"kind": "review_comment", "target": "*"}), ("list", {"kind": "comment", "target": "*"}), ("api", {}))),
+    "get_github_checks": ("github_read", (("checks", {}), ("api", {}))),
+    "comment_on_issue": ("github_write", (("comment", {}), ("api", {}))),
+    "comment_on_pr": ("github_write", (("comment", {}), ("review", {}), ("api", {}))),
+    "close_github_issue": ("github_write", (("update", {"state": "closed"}), ("api", {}))),
+    "create_github_issue": ("github_write", (("create_issue", {}), ("api", {}))),
+    "create_github_pr": ("github_write", (("create_pr", {}), ("api", {}))),
+    "update_github_pr": ("github_write", (("update", {"title": "*"}), ("update", {"body": "*"}),
+                                       ("update", {"base": "*"}), ("api", {}))),
+    "set_github_pr_ready": ("github_write", (("update", {"draft": "*"}), ("api", {}))),
+    "get_github_run_log": ("github_read", (("get", {"kind": "run", "include": "log"}), ("api", {}))),
+    "list_github_run_artifacts": ("github_read", (("list", {"kind": "artifact"}), ("api", {}))),
+    "download_github_artifact": ("github_read", (("download", {"kind": "artifact"}), ("api", {}))),
+}
+
+
+_RETIRED_VCS_TOOLS = {"vcs_status": "status", "vcs_diff": "diff"}
+
+
+def _retired_vcs_action_refusal(ctx: Any, name: str, args: Any) -> str:
+    if name == "vcs_read":
+        for retired, action in _RETIRED_VCS_TOOLS.items():
+            if retired in _disabled_tools(ctx) and args.get("action") == action:
+                return (f"⚠️ RESOURCE_CONSTRAINT_BLOCKED: task_contract.disabled_tools withholds {retired!r}, "
+                        f"which vcs_read(action={action!r}) would carry out for this task.")
+    return ""
+
+
+def _retired_github_method_refusal(ctx: Any, name: str, args: Any) -> str:
+    """The refusal for a successor method a retired, disabled GitHub tool name covered; '' to allow."""
+    if name not in ("github_read", "github_write"):
+        return ""
+    from ouroboros.tools.github import _canonical_github_args
+
+    # Mutate the invocation's arguments so dispatch consumes exactly the values admitted here.
+    args = _canonical_github_args(args if isinstance(args, dict) else {})
+    disabled = _disabled_tools(ctx)
+    method = str(args.get("method") or "")
+    target = str(args.get("target") or "").strip()
+    has_target = not isinstance(args.get("target"), bool) and target.isdigit() and int(target) > 0
+
+    def matches(key: str, value: str) -> bool:
+        if value == "*":
+            return has_target if key == "target" else args.get(key) is not None
+        if key == "include":
+            return isinstance(args.get(key), list) and value in args[key]
+        return str(args.get(key) or "") == value
+
+    for retired, (successor, rows) in _RETIRED_GITHUB_TOOLS.items():
+        if retired not in disabled or successor != name:
+            continue
+        for withheld, constraint in rows:
+            if withheld == method and all(matches(key, value) for key, value in constraint.items()):
+                call = ", ".join([f"method={method!r}"] + [f"{key}={value!r}" for key, value in constraint.items()])
+                return (f"⚠️ RESOURCE_CONSTRAINT_BLOCKED: task_contract.disabled_tools withholds {retired!r}, "
+                        f"which {name}({call}) would carry out for this task.")
+    return ""
 
 
 def _builtin_tool_availability(name: str, ctx: Any = None) -> tuple[bool, str, str]:
@@ -374,17 +444,17 @@ def _builtin_tool_availability(name: str, ctx: Any = None) -> tuple[bool, str, s
     tool = str(name or "").strip()
     if tool == "web_search":
         try:
-            from ouroboros.tools.search import _available_web_search_backends
+            from ouroboros.tools.search import _available_web_search_backends, _web_search_unavailability
 
             if not _available_web_search_backends():
-                return False, "missing_credential", "web_search_backend"
+                return (False, *_web_search_unavailability())
         except ImportError:
             return True, "", ""
         except Exception:
             return True, "", ""
     if tool in _GITHUB_TOKEN_TOOLS:
         detail = "GITHUB_TOKEN"
-        if tool in {"run_ci_tests", "submit_skill_to_hub", "generate_evolution_stats"}:
+        if tool == "submit_skill_to_hub":
             configured = bool(os.environ.get("GITHUB_TOKEN", "").strip())
         else:
             from ouroboros.tools.github import github_cli_configured
@@ -404,7 +474,21 @@ def _capability_resource_guard_result(
     is_mcp: bool = False,
 ) -> ToolResult | None:
     """Apply direct task capability and resource admission in legacy order."""
-    if name in _disabled_tools(ctx):
+    # Consciousness Observe keeps the names it needs for useful read-only research
+    # visible, but their ARGUMENTS cannot carry back the mutating authority the
+    # level removed. The policy lives with the level that owns it (a call-time
+    # import, like every other D04->D15 edge); a failure to consult it raises
+    # here rather than reading as permission.
+    from ouroboros.consciousness_authority import observe_argument_refusal
+
+    metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
+    if refusal := observe_argument_refusal(metadata, name, args):
+        return ToolResult(status="blocked", code="RESOURCE_CONSTRAINT_BLOCKED", text=refusal)
+    from ouroboros.place_guard import dispatch_refusal
+    if refusal := dispatch_refusal(ctx, name, args, ext_tool=ext_tool, is_mcp=is_mcp):
+        return ToolResult(status="blocked", code="RESOURCE_CONSTRAINT_BLOCKED", text=refusal)
+    disabled = _disabled_tools(ctx)
+    if name in disabled:
         return ToolResult(
             status="blocked",
             code="RESOURCE_CONSTRAINT_BLOCKED",
@@ -413,6 +497,8 @@ def _capability_resource_guard_result(
                 f"withholds {name!r} for this task."
             ),
         )
+    if refusal := (_retired_github_method_refusal(ctx, name, args) or _retired_vcs_action_refusal(ctx, name, args)):
+        return ToolResult(status="blocked", code="RESOURCE_CONSTRAINT_BLOCKED", text=refusal)
     available, unavailable_reason, unavailable_detail = _builtin_tool_availability(name, ctx)
     if not available:
         suffix = f" ({unavailable_detail})" if unavailable_detail else ""
@@ -432,6 +518,15 @@ def _capability_resource_guard_result(
                 "requires allowed_resources.web/network."
             ),
         )
+    if not _builtin_network_allowed(ctx, name):
+        return ToolResult(
+            status="blocked",
+            code="RESOURCE_CONSTRAINT_BLOCKED",
+            text=(
+                "⚠️ RESOURCE_CONSTRAINT_BLOCKED: task_contract.allowed_resources.network=false "
+                f"blocks {name!r}."
+            ),
+        )
     if name in _WEB_TOOLS and not _resource_allowed(ctx, "web"):
         return ToolResult(
             status="blocked",
@@ -439,15 +534,6 @@ def _capability_resource_guard_result(
             text=(
                 "⚠️ RESOURCE_CONSTRAINT_BLOCKED: task_contract.allowed_resources.web=false "
                 f"blocks {name!r}."
-            ),
-        )
-    if name == "vcs_pull_ff" and not _resource_allowed(ctx, "network"):
-        return ToolResult(
-            status="blocked",
-            code="RESOURCE_CONSTRAINT_BLOCKED",
-            text=(
-                "⚠️ RESOURCE_CONSTRAINT_BLOCKED: task_contract.allowed_resources.network=false "
-                "blocks 'vcs_pull_ff'."
             ),
         )
     if (is_mcp or ext_tool) and not _resource_allowed(ctx, "network"):
@@ -499,7 +585,7 @@ def _payload_dispatch_constraint(
         (raw_bucket or raw_skill_name)
         and short_form_decision is not None
         and short_form_decision.error
-        and name in {"write_file", "edit_text"}
+        and name in {"write_file", "edit_text", "edit_batch", "apply_patch"}
     ):
         root_arg = str(args.get("root", "") or "").strip().lower()
         if _stray_skill_payload_failsoft(root_arg, workspace_mode, task_constraint):
@@ -524,7 +610,7 @@ def _payload_dispatch_constraint(
             )
 
     redirect_err = _registry().cross_skill_redirect_error(task_constraint, synthesized)
-    if redirect_err and name in {"write_file", "edit_text"}:
+    if redirect_err and name in {"write_file", "edit_text", "edit_batch", "apply_patch"}:
         return None, ToolResult(
             status="blocked",
             code="SKILL_PAYLOAD_BLOCKED",
@@ -595,17 +681,6 @@ def _executor_backend_candidate_path(ctx: Any, candidate: str) -> pathlib.Path |
         return None
 
 
-def _workspace_write_block_outside_root_result(
-    path_text: Any = "", work_dir: Any = "", spelled: Any = "",
-) -> ToolResult:
-    """Typed carrier of the Guard-B outside-root denial (same bytes in text)."""
-    return ToolResult(
-        status="blocked",
-        code="WORKSPACE_BLOCKED",
-        text=_workspace_write_block_outside_root_message(path_text, work_dir, spelled),
-    )
-
-
 def _git_protected_roots(self) -> list:
     """Ouroboros runtime roots the target-aware git resolver protects, by
     enumeration: the system repo + EVERY data drive the task touches (parent
@@ -615,6 +690,7 @@ def _git_protected_roots(self) -> list:
     git_protected_roots = [
         pathlib.Path(getattr(self._ctx, "system_repo_dir", None) or self._ctx.repo_dir),
         pathlib.Path(self._ctx.repo_dir),
+        pathlib.Path(getattr(self._ctx, "serving_repo_dir", None) or self._ctx.repo_dir),
         pathlib.Path(self._ctx.drive_root),
     ]
     _meta = getattr(self._ctx, "task_metadata", {})
@@ -656,6 +732,7 @@ def _direct_shell_write_block(self, raw_cmd: Any, work_dir: pathlib.Path, runtim
     """Apply existing resource authority to certain direct writes, never mentions."""
     from dataclasses import replace
     from ouroboros.tool_access import _process_root_candidates, _resolve_target_in_selected_base, decide_tool_access, path_is_relative_to
+    from ouroboros.tool_access_user_files import UserFilesPathBlockedError
     from ouroboros.tools.deliverables_shell import _command_path
     from ouroboros.tools.shell_guards import direct_utility_target_rows, directory_destination_pairs
     from ouroboros.tools.core import _binding_skill_control_plane_path, is_skill_control_plane_path
@@ -666,25 +743,38 @@ def _direct_shell_write_block(self, raw_cmd: Any, work_dir: pathlib.Path, runtim
     rows = direct_utility_target_rows(raw_cmd)
     if not any(row[1] for row in rows):
         return None
+    # A command word alone (touch, rm, mkdir, ...) is a guess, not evidence of a
+    # write (DEVELOPMENT §2: permission is never reconstructed from command
+    # words). For a top-level principal the guess still meets light mode,
+    # protected paths and skill trust state below, never the outside-every-root
+    # fence (owner decision 5A); a subordinate child keeps its write confinement,
+    # so the guess still fences it.
+    guess_fences = self._is_acting_subagent() or self._is_local_readonly_subagent()
+    certain_rows = direct_utility_target_rows(raw_cmd, certain_only=True)
     items = _registry()._binding_items(binding)
     selected = items[0] if items else _registry().build_resolved_resource_binding(
         self._ctx, operation="shell", process_cwd=str(work_dir))
-    roots = list(dict.fromkeys([(selected.root, selected.base_path, selected.source, selected.skill_name),
-                               *_process_root_candidates(self._ctx, "shell")]))
-    system_repo = pathlib.Path(getattr(self._ctx, "system_repo_dir", None) or self._ctx.repo_dir)
+    roots = [row for row in dict.fromkeys([(selected.root, selected.base_path, selected.source, selected.skill_name),
+                                          *_process_root_candidates(self._ctx, "shell")])
+             if decide_tool_access(profile=selected.profile, root=row[0], operation="write").allow]
+    system_repo = pathlib.Path(getattr(self._ctx, "system_repo_dir", None) or self._ctx.repo_dir).resolve(strict=False)
 
-    def _refuse_write(target: pathlib.Path, token: str) -> ToolResult:
-        if self._is_acting_subagent():
-            return _workspace_write_block_outside_root_result(target.resolve(strict=False), work_dir, token)
-        light_internal = runtime_mode == "light" and any(
-            path_is_relative_to(target, root) for root in _git_protected_roots(self))
-        code = "LIGHT_MODE_BLOCKED" if light_internal else "WORKSPACE_BLOCKED"
-        prefix = "LIGHT_MODE_BLOCKED" if light_internal else "WORKSPACE_SHELL_BLOCKED"
-        return ToolResult(status="blocked", code=code, text=(
-            f"⚠️ {prefix}: explicit write target {target} is outside the resources this task may write. "
-            f"Selected process root: {work_dir}. The process was not started."))
+    def _refuse_write(target: pathlib.Path, token: str, declined: list, light_internal: bool) -> ToolResult:
+        # The refusal names the real reason and every root this task may write.
+        writable = ", ".join(dict.fromkeys(
+            f"{root}={pathlib.Path(base).resolve(strict=False)}" for root, base, _source, _skill in roots
+            if not (light_internal and pathlib.Path(base).resolve(strict=False) == system_repo))) or "(none)"
+        reason = ("runtime_mode=light keeps the Ouroboros repository and runtime control data read-only"
+                  if light_internal else "explicit write target is outside every root this task may write")
+        return ToolResult(
+            status="blocked", code="LIGHT_MODE_BLOCKED" if light_internal else "WORKSPACE_BLOCKED",
+            text=(f"⚠️ {'LIGHT_MODE_BLOCKED' if light_internal else 'WORKSPACE_SHELL_BLOCKED'}: {reason}."
+                  + _blocked_path_note(target, token) + f" Writable roots: {writable}."
+                  + "".join(f" {why}" for why in declined) + " The process was not started."))
 
-    for (argv, targets, _inline, _unknown), cwd in zip(rows, _registry().sequential_effective_cwds(rows, work_dir)):
+    for (argv, targets, _inline, _unknown), (_argv, certain, _i, _u), cwd in zip(
+            rows, certain_rows, _registry().sequential_effective_cwds(rows, work_dir)):
+        guessed = set(targets) - set(certain)
         for command, destination, source in directory_destination_pairs(argv):
             directory = _command_path(self._ctx, cwd, destination)
             child = directory_destination_child_name(command, argv, source)
@@ -701,10 +791,9 @@ def _direct_shell_write_block(self, raw_cmd: Any, work_dir: pathlib.Path, runtim
             # install resolves user_files to the whole host, which would admit a
             # repository target under that name for a light-capped task.
             if runtime_mode == "light" and path_is_relative_to(target, system_repo):
-                return _refuse_write(target, token)
+                return _refuse_write(target, token, [], True)
+            declined: list[str] = []
             for root, base, source, skill in roots:
-                if not decide_tool_access(profile=selected.profile, root=root, operation="write").allow:
-                    continue
                 try:
                     resolved = _resolve_target_in_selected_base(
                         self._ctx, root=root, base_path=base, path=str(target), operation="write")
@@ -716,21 +805,28 @@ def _direct_shell_write_block(self, raw_cmd: Any, work_dir: pathlib.Path, runtim
                             f"⚠️ SKILL_PAYLOAD_BLOCKED: explicit write target {resolved} is skill control-plane state. "
                             "Edit user-authored payload files instead. The process was not started."))
                     if _registry().binding_targets_system_repo(self._ctx, target_binding):
-                        if runtime_mode == "light" or (protected_paths_in([resolved.relative_to(base).as_posix()])
-                                                       and not mode_allows_protected_write(runtime_mode)):
+                        if runtime_mode == "light":
                             continue
+                        protected = protected_paths_in([resolved.relative_to(base).as_posix()])
+                        if protected and not mode_allows_protected_write(runtime_mode):
+                            return _registry()._protected_write_block_result(
+                                path=protected[0].path, runtime_mode=runtime_mode, action="let run_command write")
                     # Process output uses the existing shell/write grant owner,
                     # including a remapped Deliverables logical path prefix.
-                    if root == "user_files":
-                        if not _presence_allows_user_output(self._ctx, resolved):
-                            continue
-                    elif not _registry()._presence_binding_allowed(self._ctx, target_binding):
+                    if (not _presence_allows_user_output(self._ctx, resolved) if root == "user_files"
+                            else not _registry()._presence_binding_allowed(self._ctx, target_binding)):
+                        declined.append(f"{root} declines it under the Presence output policy.")
                         continue
                     break
+                except UserFilesPathBlockedError as exc:
+                    declined.append(f"user_files declines it: {str(exc).removeprefix('user_files path blocked: ')}")
                 except (OSError, ValueError, RuntimeError):
                     continue
             else:
-                return _refuse_write(target, token)
+                light_internal = runtime_mode == "light" and any(
+                    path_is_relative_to(target, root) for root in _git_protected_roots(self))
+                if guess_fences or light_internal or token not in guessed:
+                    return _refuse_write(target, token, declined, light_internal)
     return None
 
 
@@ -850,7 +946,7 @@ def _shell_git_and_runtime_block(
                     f"⚠️ GIT_VIA_SHELL_BLOCKED: `git {subcmd}` is blocked for acting "
                     "self_worktree children (no commits; the parent integrates the "
                     "returned patch and is the sole committer). For read-only git: "
-                    "vcs_status, vcs_diff tools, or run_command with git "
+                    "vcs_read tool, or run_command with git "
                     "log/show/diff/status/rev-list/show-ref/for-each-ref/listing branch-tag forms."
                 ),
             )
@@ -895,7 +991,7 @@ def _shell_git_and_runtime_block(
             "the Ouroboros runtime (system repo / data drives): self-repo changes go "
             "through commit_reviewed, which enforces pre-commit checks and review. "
             "Read-only git (status/log/diff/show/rev-parse/branch- and tag-listing, "
-            "or the vcs_status/vcs_diff tools) works everywhere, and mutating git is "
+            "or the vcs_read tool) works everywhere, and mutating git is "
             "free in any tree OUTSIDE the runtime (e.g. ~/projects, /tmp, an attached "
             "project folder)."
         ),

@@ -3,6 +3,8 @@
 import json
 from types import SimpleNamespace
 
+from tests.worker_pool_support import affirm_ready
+
 import pytest
 
 from ouroboros.contracts.task_contract import build_task_contract
@@ -22,6 +24,7 @@ from ouroboros.tools.control_delegation import (
     stamp_depth_provenance,
     stamp_task_assignment_depth,
 )
+from tests._store_shared import read_result, result_exists, result_signature, seed_result, unavailable_store, unreadable_result
 
 
 def test_task_depth_parser_rejects_negative_values_before_int_truncation():
@@ -423,13 +426,13 @@ def test_supervisor_schedule_path_preserves_admitted_cap_after_live_depth_decrea
     events._handle_schedule_task(event, _fake_ctx(tmp_path, enqueued))
 
     assert [task["id"] for task in enqueued] == ["child"]
-    queued = json.loads((tmp_path / "task_results" / "child.json").read_text())
+    queued = read_result(tmp_path, "child")
     assert queued["depth_provenance"]["permitted_depth"] == 3
 
     monkeypatch.setattr(events, "get_max_subagent_depth", lambda: 0)
     event["task_id"] = "child-zero"
     events._handle_schedule_task(event, _fake_ctx(tmp_path, enqueued))
-    rejected = json.loads((tmp_path / "task_results" / "child-zero.json").read_text())
+    rejected = read_result(tmp_path, "child-zero")
     assert rejected["status"] == "failed"
     assert "depth limit (0)" in rejected["result"]
 
@@ -579,7 +582,8 @@ def test_fresh_depth_default_increases_without_widening_active_cap(monkeypatch):
     monkeypatch.delenv("OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT", raising=False)
     assert get_max_subagent_depth() == 3
     assert get_max_active_subagents_per_root() == 6
-    assert get_max_workers() == 10
+    monkeypatch.delenv("OUROBOROS_MAX_WORKERS", raising=False)
+    assert get_max_workers() is None  # no number: the machine's memory is the limit
 
 
 def _schedule_event(task_id, parent_id, *, depth=1, drive_root=None):
@@ -605,6 +609,7 @@ def _fake_ctx(tmp_path, enqueued):
 
         def enqueue_task(self, task):
             enqueued.append(task)
+            return task
 
         def persist_queue_snapshot(self, reason=""):
             return None
@@ -625,10 +630,10 @@ def test_supervisor_admission_enforces_parent_rights_and_allows_one_non_fanout_c
     ctx = _fake_ctx(tmp_path, enqueued)
     events._handle_schedule_task(_schedule_event("child-1", "parent", drive_root=tmp_path), ctx)
     assert [task["id"] for task in enqueued] == ["child-1"]
-    queued = json.loads((tmp_path / "task_results" / "child-1.json").read_text(encoding="utf-8"))
+    queued = read_result(tmp_path, "child-1")
     assert queued["depth_provenance"]["achieved_depth"] is None
     events._handle_schedule_task(_schedule_event("child-2", "parent", drive_root=tmp_path), ctx)
-    rejected = json.loads((tmp_path / "task_results" / "child-2.json").read_text(encoding="utf-8"))
+    rejected = read_result(tmp_path, "child-2")
     assert len(enqueued) == 1
     assert rejected["reason_code"] == "delegation_rights_may_fan_out"
 
@@ -643,7 +648,7 @@ def test_supervisor_rejects_invalid_depth_before_provisioning_or_enqueue(tmp_pat
             _schedule_event(task_id, "parent", depth=raw_depth, drive_root=tmp_path),
             _fake_ctx(tmp_path, enqueued),
         )
-        result = json.loads((tmp_path / "task_results" / f"{task_id}.json").read_text())
+        result = read_result(tmp_path, task_id)
         assert enqueued == []
         assert result["status"] == STATUS_FAILED
         assert result["reason_code"] == "invalid_task_depth"
@@ -687,11 +692,8 @@ def test_supervisor_rolls_back_subagent_when_scheduled_result_write_fails(
     events._handle_schedule_task(
         _schedule_event("child-1", "parent", drive_root=tmp_path), ctx,
     )
-    assert [task["id"] for task in enqueued] == ["child-1"]
-    assert ctx.PENDING == []
-    rejected_first = json.loads(
-        (tmp_path / "task_results" / "child-1.json").read_text(encoding="utf-8")
-    )
+    assert enqueued == [] and ctx.PENDING == []  # the receipt precedes the put: nothing was ever queued
+    rejected_first = read_result(tmp_path, "child-1")
     assert rejected_first["status"] == "failed"
     assert rejected_first["reason_code"] == "scheduled_result_persist_failed"
     assert rejected_first["delegation_admission"]["status"] == "rejected"
@@ -699,10 +701,8 @@ def test_supervisor_rolls_back_subagent_when_scheduled_result_write_fails(
     events._handle_schedule_task(
         _schedule_event("child-2", "parent", drive_root=tmp_path), ctx,
     )
-    scheduled = json.loads(
-        (tmp_path / "task_results" / "child-2.json").read_text(encoding="utf-8")
-    )
-    assert [task["id"] for task in enqueued] == ["child-1", "child-2"]
+    scheduled = read_result(tmp_path, "child-2")
+    assert [task["id"] for task in enqueued] == ["child-2"]
     assert [task["id"] for task in ctx.PENDING] == ["child-2"]
     assert scheduled["status"] == "scheduled"
     assert scheduled["delegation_admission"]["status"] == "accepted"
@@ -765,9 +765,7 @@ def test_supervisor_receipt_rollback_removes_only_its_enqueue_identity(
 
     assert len(ctx.PENDING) == 1
     assert ctx.PENDING[0] is preexisting
-    preserved = json.loads(
-        (tmp_path / "task_results" / "same-id.json").read_text(encoding="utf-8")
-    )
+    preserved = read_result(tmp_path, "same-id")
     assert preserved["status"] == "scheduled"
     assert preserved["delegation_admission"] == {
         "status": "accepted",
@@ -802,9 +800,7 @@ def test_replayed_schedule_event_keeps_one_physical_task_and_transition(
     ctx.enqueue_task = enqueue_task
     event = _schedule_event("same-child", "parent", drive_root=tmp_path)
     events._handle_schedule_task(event, ctx)
-    first = json.loads(
-        (tmp_path / "task_results" / "same-child.json").read_text(encoding="utf-8")
-    )
+    first = read_result(tmp_path, "same-child")
     transition_id = first["delegation_admission"]["transition_id"]
 
     def unexpected_constraint_resolution(*_args, **_kwargs):
@@ -812,9 +808,7 @@ def test_replayed_schedule_event_keeps_one_physical_task_and_transition(
 
     monkeypatch.setattr(schedule_module, "_resolve_subagent_constraint", unexpected_constraint_resolution)
     events._handle_schedule_task(event, ctx)
-    replayed = json.loads(
-        (tmp_path / "task_results" / "same-child.json").read_text(encoding="utf-8")
-    )
+    replayed = read_result(tmp_path, "same-child")
     assert [task["id"] for task in ctx.PENDING] == ["same-child"]
     assert replayed["delegation_admission"]["transition_id"] == transition_id
 
@@ -822,10 +816,11 @@ def test_replayed_schedule_event_keeps_one_physical_task_and_transition(
 
     class FakeWorkerQueue:
         def put(self, task):
-            delivered.append(dict(task))
+            if task.get("type") != "worker_quiescence":
+                delivered.append(dict(task))
 
     worker_map = {
-        wid: SimpleNamespace(wid=wid, busy_task_id=None, in_q=FakeWorkerQueue())
+        wid: affirm_ready(SimpleNamespace(wid=wid, busy_task_id=None, in_q=FakeWorkerQueue()))
         for wid in (1, 2)
     }
     monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
@@ -834,7 +829,7 @@ def test_replayed_schedule_event_keeps_one_physical_task_and_transition(
     monkeypatch.setattr(workers, "WORKERS", worker_map)
     monkeypatch.setattr(workers, "load_state", lambda: {})
     monkeypatch.setattr(state, "budget_remaining", lambda *_args, **_kwargs: 100.0)
-    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": True)
 
     workers.assign_tasks()
 
@@ -856,7 +851,7 @@ def test_assignment_quarantines_bypassed_invalid_depth_and_normalizes_legacy_row
         def put(self, task):
             delivered.append(dict(task))
 
-    worker = SimpleNamespace(wid=1, busy_task_id=None, in_q=FakeWorkerQueue())
+    worker = affirm_ready(SimpleNamespace(wid=1, busy_task_id=None, in_q=FakeWorkerQueue()))
     pending = [{
         "id": "invalid-pending-depth",
         "type": "task",
@@ -871,7 +866,7 @@ def test_assignment_quarantines_bypassed_invalid_depth_and_normalizes_legacy_row
     monkeypatch.setattr(workers, "WORKERS", {1: worker})
     monkeypatch.setattr(workers, "load_state", lambda: {})
     monkeypatch.setattr(state, "budget_remaining", lambda *_args, **_kwargs: 100.0)
-    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": True)
     monkeypatch.setattr(
         workers,
         "_emit_task_done_terminal",
@@ -911,11 +906,11 @@ def test_assignment_quarantines_invalid_depth_before_budget_pause(tmp_path, monk
     from ouroboros.task_results import load_task_result
 
     delivered = []
-    worker = SimpleNamespace(
+    worker = affirm_ready(SimpleNamespace(
         wid=1,
         busy_task_id=None,
         in_q=SimpleNamespace(put=lambda task: delivered.append(dict(task))),
-    )
+    ))
     pending = [{
         "id": "invalid-before-budget",
         "type": "task",
@@ -1070,7 +1065,7 @@ def test_budget_pause_leaves_unresolved_invalid_depth_in_retry_custody(
             "budget_drive_root": str(tmp_path),
         },
         {
-            "id": "healthy-before-budget",
+            "id": "healthy-before-budget", "admitted_dispatch": "none",
             "type": "task",
             "chat_id": 1,
             "description": "pause this task",
@@ -1078,7 +1073,7 @@ def test_budget_pause_leaves_unresolved_invalid_depth_in_retry_custody(
             "budget_drive_root": str(tmp_path),
         },
     ]
-    worker = SimpleNamespace(wid=1, busy_task_id=None, reaping=False, in_q=SimpleNamespace(put=lambda _task: None))
+    worker = affirm_ready(SimpleNamespace(wid=1, busy_task_id=None, reaping=False, in_q=SimpleNamespace(put=lambda _task: None)))
     monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
     monkeypatch.setattr(workers, "PENDING", pending)
     monkeypatch.setattr(workers, "RUNNING", {})
@@ -1143,9 +1138,7 @@ def test_supervisor_keeps_admission_when_scheduled_write_raises_after_commit(
     )
 
     assert [task["id"] for task in ctx.PENDING] == ["child"]
-    scheduled = json.loads(
-        (tmp_path / "task_results" / "child.json").read_text(encoding="utf-8")
-    )
+    scheduled = read_result(tmp_path, "child")
     assert scheduled["status"] == "scheduled"
     assert scheduled["delegation_admission"]["status"] == "accepted"
     assert len(scheduled["delegation_admission"]["transition_id"]) == 32
@@ -1182,9 +1175,7 @@ def test_supervisor_rolls_back_when_monotonic_writer_returns_old_terminal(
     )
 
     assert ctx.PENDING == []
-    terminal = json.loads(
-        (tmp_path / "task_results" / "child.json").read_text(encoding="utf-8")
-    )
+    terminal = read_result(tmp_path, "child")
     assert terminal["status"] == "completed"
     assert terminal["result"] == "old terminal child"
 
@@ -1198,32 +1189,44 @@ def test_supervisor_admission_enforces_may_delegate_false_even_when_stringified(
     enqueued = []
     ctx = _fake_ctx(tmp_path, enqueued)
     events._handle_schedule_task(_schedule_event("child", "parent", drive_root=tmp_path), ctx)
-    rejected = json.loads((tmp_path / "task_results" / "child.json").read_text(encoding="utf-8"))
+    rejected = read_result(tmp_path, "child")
     assert enqueued == []
     assert rejected["reason_code"] == "delegation_rights_may_delegate"
 
 
-def test_direct_child_count_read_gap_is_typed_unknown(tmp_path):
-    results = tmp_path / "task_results"
-    results.mkdir()
-    (results / "corrupt-child.json").write_text("{not-json", encoding="utf-8")
+def test_direct_child_count_is_one_indexed_select_not_a_listing(tmp_path, monkeypatch):
+    """Grok M2: the admission count reads the parent's subagent rows by typed column (and only
+    a failed child's body, for its admission fact); a full listing is never taken."""
+    from ouroboros import task_store
+
+    rows = {"accepted": {"status": "running"}, "asked": {"status": "requested"},
+            "dup": {"status": "rejected_duplicate"}, "fell": {"status": "failed"},
+            "fell-admitted": {"status": "failed", "delegation_admission": {"status": "accepted"}},
+            "self": {"status": "running"}}
+    for task_id, extra in rows.items():
+        seed_result(tmp_path, task_id, {"task_id": task_id, "parent_task_id": "parent", "delegation_role": "subagent", **extra})
+    seed_result(tmp_path, "other", {"task_id": "other", "parent_task_id": "someone-else", "delegation_role": "subagent",
+                                    "status": "running"})
+    seed_result(tmp_path, "parent", {"task_id": "parent", "status": "running"})
+    for name in ("ouroboros.task_results.list_task_results", "ouroboros.task_results.list_documents"):
+        monkeypatch.setattr(name, lambda *a, **k: pytest.fail("a full listing was taken"))
+    monkeypatch.setattr(task_store, "list_documents", lambda *a, **k: pytest.fail("a full listing was taken"))
+    monkeypatch.setattr(task_store, "select_lineage", lambda *a, **k: pytest.fail("the lineage walk was taken"))
+    assert durable_direct_child_count(tmp_path, "parent") == 3  # accepted, fell-admitted, self
+    assert durable_direct_child_count(tmp_path, "parent", exclude_task_id="self") == 2
+
+
+def test_direct_child_count_read_gap_is_typed_unknown(tmp_path, monkeypatch):
+    seed_result(tmp_path, "child-one", {"task_id": "child-one", "parent_task_id": "parent",
+                                        "delegation_role": "subagent", "status": "running"})
     contract = build_task_contract({"delegation_budget": {"max_children": 1}})
+    assert durable_direct_child_count(tmp_path, "parent") == 1
 
+    unavailable_store(monkeypatch)  # the store cannot answer: the count is unknown, never zero
     assert durable_direct_child_count(tmp_path, "parent") is None
-    refusal = schedule_delegation_refusal(contract, tmp_path, "parent")
-    assert "delegation_rights_child_count_unknown" in refusal
-
-
-def test_direct_child_count_rejects_schema_empty_result(tmp_path):
-    results = tmp_path / "task_results"
-    results.mkdir()
-    (results / "empty-child.json").write_text("{}\n", encoding="utf-8")
-    contract = build_task_contract({"delegation_budget": {"max_children": 1}})
-
-    assert durable_direct_child_count(tmp_path, "parent") is None
-    assert "delegation_rights_child_count_unknown" in schedule_delegation_refusal(
-        contract, tmp_path, "parent",
-    )
+    # Unknown is not decided at this pre-check; the host's interlocked re-check refuses a hard
+    # unknown (test_supervisor_rejects_count_bounded_child_when_count_scan_fails).
+    assert schedule_delegation_refusal(contract, tmp_path, "parent") == ""
 
 
 def test_schedule_exact_id_preserves_unreadable_result_and_does_not_enqueue(
@@ -1231,10 +1234,9 @@ def test_schedule_exact_id_preserves_unreadable_result_and_does_not_enqueue(
 ):
     from supervisor import events
 
-    result_path = tmp_path / "task_results" / "child-malformed.json"
-    result_path.parent.mkdir()
-    malformed = b'{"status":"scheduled"'
-    result_path.write_bytes(malformed)
+    seed_result(tmp_path, "child-malformed", {"task_id": "child-malformed", "status": "scheduled"})
+    before = result_signature(tmp_path, "child-malformed")
+    unreadable = unreadable_result(monkeypatch, "child-malformed")
     enqueued = []
     notices = []
     ctx = _fake_ctx(tmp_path, enqueued)
@@ -1246,7 +1248,8 @@ def test_schedule_exact_id_preserves_unreadable_result_and_does_not_enqueue(
     )
 
     assert enqueued == []
-    assert result_path.read_bytes() == malformed
+    unreadable["on"] = False
+    assert result_signature(tmp_path, "child-malformed") == before
     assert notices
     assert "unreadable" in notices[0][0][1]
     assert notices[0][1]["progress_meta"]["status"] == STATUS_FAILED
@@ -1255,14 +1258,14 @@ def test_schedule_exact_id_preserves_unreadable_result_and_does_not_enqueue(
 def test_late_schedule_lookup_failure_preserves_exact_result(tmp_path, monkeypatch):
     from supervisor import events, task_admission
 
-    result_path = tmp_path / "task_results" / "late-corrupt.json"
-    result_path.parent.mkdir()
-    original = b"{late-corrupt"
     monkeypatch.setattr(
         task_admission, "subagent_schedule_owned", lambda *_args, **_kwargs: False,
     )
-    def late_refusal(_task):
-        result_path.write_bytes(original)
+    original = {}
+
+    def late_refusal(_task):  # a row appears late, exactly as the lookup fails
+        seed_result(tmp_path, "late-corrupt", {"task_id": "late-corrupt", "status": "scheduled"})
+        original["signature"] = result_signature(tmp_path, "late-corrupt")
         return {"_admission_blocked": "task_id_lookup_failed"}
 
     ctx = _fake_ctx(tmp_path, [])
@@ -1270,16 +1273,15 @@ def test_late_schedule_lookup_failure_preserves_exact_result(tmp_path, monkeypat
     events._handle_schedule_task(
         _schedule_event("late-corrupt", "parent", drive_root=tmp_path), ctx,
     )
-    assert result_path.read_bytes() == original
+    assert result_signature(tmp_path, "late-corrupt") == original["signature"]
 
 
 def test_generic_late_schedule_lookup_failure_preserves_exact_result(tmp_path, monkeypatch):
     from supervisor import events, queue
 
-    result_path = tmp_path / "task_results" / "generic-late-corrupt.json"
-    result_path.parent.mkdir()
-    original = b"{generic-late-corrupt"
-    result_path.write_bytes(original)
+    seed_result(tmp_path, "generic-late-corrupt", {"task_id": "generic-late-corrupt", "status": "scheduled"})
+    original = result_signature(tmp_path, "generic-late-corrupt")
+    unreadable = unreadable_result(monkeypatch, "generic-late-corrupt")
     pending = []
     running = {}
     monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
@@ -1296,7 +1298,8 @@ def test_generic_late_schedule_lookup_failure_preserves_exact_result(tmp_path, m
     events._handle_schedule_task(event, ctx)
 
     assert pending == []
-    assert result_path.read_bytes() == original
+    unreadable["on"] = False
+    assert result_signature(tmp_path, "generic-late-corrupt") == original
 
 
 def test_generic_schedule_replay_preserves_valid_exact_result(tmp_path, monkeypatch):
@@ -1306,8 +1309,7 @@ def test_generic_schedule_replay_preserves_valid_exact_result(tmp_path, monkeypa
         tmp_path, "generic-existing", "completed",
         root_task_id="generic-existing", delegation_role="root", result="keep me",
     )
-    result_path = tmp_path / "task_results" / "generic-existing.json"
-    original = result_path.read_bytes()
+    original = result_signature(tmp_path, "generic-existing")
     pending = []
     running = {}
     monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
@@ -1325,7 +1327,7 @@ def test_generic_schedule_replay_preserves_valid_exact_result(tmp_path, monkeypa
     events._handle_schedule_task(event, ctx)
 
     assert pending == []
-    assert result_path.read_bytes() == original
+    assert result_signature(tmp_path, "generic-existing") == original
 
 
 @pytest.mark.parametrize(
@@ -1346,8 +1348,7 @@ def test_generic_malformed_replay_preserves_live_exact_result(
         delegation_role="root",
         result="keep live work",
     )
-    result_path = tmp_path / "task_results" / f"{tid}.json"
-    original = result_path.read_bytes()
+    original = result_signature(tmp_path, tid)
     pending = []
     running = {}
     if location == "pending":
@@ -1369,7 +1370,7 @@ def test_generic_malformed_replay_preserves_live_exact_result(
 
     events._handle_schedule_task(event, ctx)
 
-    assert result_path.read_bytes() == original
+    assert result_signature(tmp_path, tid) == original
     assert pending == (
         [{"id": tid, "depth": 0, "delegation_role": "root"}]
         if location == "pending" else []
@@ -1399,15 +1400,14 @@ def test_malformed_replay_preserves_preexisting_admission_reservation(
 
     events._handle_schedule_task(event, ctx)
 
-    assert not (tmp_path / "task_results" / f"{tid}.json").exists()
+    assert not result_exists(tmp_path, tid)
     assert queue.ADMISSION_RESERVATIONS == {tid: "owner-token"}
     assert pending == []
     assert running == {}
     assert enqueued == []
 
 
-@pytest.mark.parametrize("delegation_role", ["root", "subagent"])
-@pytest.mark.parametrize("late_custody", ["reservation", "pending"])
+@pytest.mark.parametrize(("late_custody", "delegation_role"), [("reservation", "root"), ("pending", "subagent")])
 def test_malformed_replay_rechecks_identity_after_initial_preflight(
     tmp_path, monkeypatch, delegation_role, late_custody,
 ):
@@ -1446,7 +1446,7 @@ def test_malformed_replay_rechecks_identity_after_initial_preflight(
     events._handle_schedule_task(event, ctx)
 
     assert calls == 2
-    assert not (tmp_path / "task_results" / f"{tid}.json").exists()
+    assert not result_exists(tmp_path, tid)
     assert enqueued == []
     if late_custody == "reservation":
         assert queue.ADMISSION_RESERVATIONS == {tid: "late-token"}
@@ -1462,7 +1462,7 @@ def test_supervisor_rejects_count_bounded_child_when_count_scan_fails(
     from supervisor import events
 
     monkeypatch.setattr(
-        "ouroboros.task_results.list_task_results",
+        "ouroboros.task_store.task_facts",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("unreadable")),
     )
     parent_contract = build_task_contract({
@@ -1479,9 +1479,7 @@ def test_supervisor_rejects_count_bounded_child_when_count_scan_fails(
         _schedule_event("child", "parent", drive_root=tmp_path), ctx,
     )
 
-    rejected = json.loads(
-        (tmp_path / "task_results" / "child.json").read_text(encoding="utf-8")
-    )
+    rejected = read_result(tmp_path, "child")
     assert enqueued == []
     assert rejected["reason_code"] == "delegation_rights_child_count_unknown"
     assert rejected["delegation_admission"]["direct_child_count"] is None

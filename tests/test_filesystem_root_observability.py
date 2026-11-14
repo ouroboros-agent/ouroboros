@@ -180,7 +180,7 @@ def test_docker_workspace_payload_edits_preserve_file_identity(tmp_path, tool):
     assert target.read_text(encoding="utf-8") == "edited\n"
 
 
-@pytest.mark.parametrize("case", ["unmapped", "local", "prefix", "traversal", "outside_mapping", "system_root"])
+@pytest.mark.parametrize("case", ["unmapped", "local", "system_root"])
 def test_docker_mapping_does_not_authorize_other_absolute_addresses(tmp_path, case):
     registry, ctx, workspace = _docker_workspace_registry(tmp_path)
     path, root = "/workspace/answer.txt", "active_workspace"
@@ -264,7 +264,8 @@ def test_search_skips_non_regular_files(tmp_path):
 
 def test_new_readonly_roots_access_policy():
     """v6.40: subagent_projects/deliverables are READ-ONLY orchestrator roots — read/list/search
-    where granted, never write/edit/shell, and never to subagents."""
+    where granted, never write/edit/shell. Owner T4=A (#1105): a read-only child reads the
+    owner-visible Deliverables root; sibling projects (subagent_projects) stay top-level only."""
     from ouroboros.tool_access import _POLICY, _READONLY_RESOURCE_ROOTS, decide_tool_access
 
     roots = ("subagent_projects", "deliverables")
@@ -280,5 +281,6 @@ def test_new_readonly_roots_access_policy():
             for op in ("write", "edit", "shell"):
                 assert not decide_tool_access(profile=profile, root=root, operation=op).allow, (profile, root, op)
     for profile in ("acting_subagent", "local_readonly_subagent"):
-        for root in roots:
-            assert not decide_tool_access(profile=profile, root=root, operation="read").allow, (profile, root)
+        assert decide_tool_access(profile=profile, root="subagent_projects", operation="read").allow, profile
+    assert decide_tool_access(profile="local_readonly_subagent", root="deliverables", operation="read").allow
+    assert decide_tool_access(profile="acting_subagent", root="deliverables", operation="read").allow

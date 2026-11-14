@@ -87,6 +87,8 @@ def test_pending_outbox_gives_up_loudly_instead_of_retrying_forever(tmp_path, mo
         assert td.replay_pending_deliveries(tmp_path, event_queue=queue) == [
             event["delivery_id"],
         ]
+        assert td.record_replay_dispatch(tmp_path, event["delivery_id"])
+        queue.release_all()  # the handler returned without a receipt: the copy is no longer outstanding
     assert notices == [], "no give-up notice while attempts remain"
     _age_pending_rows(tmp_path)
     assert td.replay_pending_deliveries(tmp_path, event_queue=queue) == []
@@ -106,14 +108,14 @@ def test_pending_outbox_gives_up_loudly_instead_of_retrying_forever(tmp_path, mo
     assert preserved.is_file() and preserved.read_text(encoding="utf-8") == "never lands"
     (notice,) = notices
     assert notice[0] == 9
-    assert "could not be delivered" in notice[1]
-    assert str(preserved) in notice[1]
+    # A missing ACK is not non-delivery, and the copy is of THIS message.
+    assert "Sending a message for task outbox2 was not confirmed" in notice[1]
+    assert "could not be delivered" not in notice[1] and "full text" not in notice[1]
+    assert f"A copy of this message is saved at {preserved}." in notice[1]
     assert notice[2] == {"role": "system", "system_type": "terminal_incident"}
 
 def test_pending_outbox_spaces_replays_with_backoff(tmp_path):
-    """AR2-7: ``registered_at`` alone let all five attempts burn on consecutive
-    ticks. Each bump stamps ``last_replay_at`` and the next attempt waits an
-    exponentially longer min-age, so the cap covers a realistic outage window."""
+    """Queue admission dates backoff; dispatch entries increase its interval."""
     from supervisor import terminal_delivery as td
 
     event = {
@@ -126,12 +128,13 @@ def test_pending_outbox_spaces_replays_with_backoff(tmp_path):
     assert td.replay_pending_deliveries(tmp_path, event_queue=queue) == [
         event["delivery_id"],
     ]
-    # Immediately after a replay the row is NOT due again (fresh last_replay_at,
-    # and the min-age has doubled) — the next tick must not burn attempt 2.
+    # Queue admission only dates the base interval. Dispatch doubles it.
     assert td.replay_pending_deliveries(tmp_path, event_queue=queue) == []
+    assert td.pending_deliveries(tmp_path)[0]["dispatch_attempts"] == 0
+    assert td.record_replay_dispatch(tmp_path, event["delivery_id"])
     (row,) = td.pending_deliveries(tmp_path)
-    assert row["replay_attempts"] == 1
-    assert row.get("last_replay_at"), "each bump stamps the replay time"
+    assert row["dispatch_attempts"] == 1
+    assert row.get("last_replay_at"), "dispatch also stamps the replay time"
     assert td._replay_due(row) is False
     # The doubled min-age: attempt 2 is due only after 2 * base seconds.
     from datetime import datetime, timezone
@@ -258,3 +261,65 @@ def test_outbox_capacity_eviction_is_disclosed(tmp_path, monkeypatch):
     preserved = pathlib.Path(str(evicted["preserved_path"]))
     assert preserved.is_file() and "answer 0" in preserved.read_text(encoding="utf-8")
     assert notices and "cap0" in notices[0][1], "owner-visible notice"
+
+
+def _exhaust(td, drive, task_id, chat_id, text="copy me"):
+    row = {"task_id": task_id, "chat_id": chat_id, "text": text,
+           "delivery_id": td.delivery_id_for(task_id, text)}
+    td._disclose_exhausted_delivery(drive, row)
+    rows = [json.loads(line) for line in (pathlib.Path(drive) / "logs" / "events.jsonl").read_text(
+        encoding="utf-8").splitlines() if line.strip()]
+    return row, [r for r in rows if r.get("type") == "terminal_delivery_exhausted"][-1]
+
+
+def test_only_the_same_delivery_recorded_at_the_same_chat_retires_the_notice(tmp_path, monkeypatch):
+    """#1317: the send succeeded but the outbox row was never cleared. The cancel
+    receipt's ``delivered_chat_id`` for THIS delivery id is positive evidence and
+    retires the owner notice; the typed event stays. Another chat, another
+    delivery, or an id merely present in the delivered registry is not proof."""
+    from ouroboros.task_results import write_task_result
+    from supervisor import terminal_delivery as td
+
+    notices: list = []
+    monkeypatch.setattr("supervisor.message_bus.send_with_budget",
+                        lambda chat_id, text, **kw: notices.append((chat_id, text)))
+    did = td.delivery_id_for("t-same", "copy me")
+    write_task_result(tmp_path, "t-same", "cancelled", result="stopped",
+                      cancel_receipt={"delivery_id": did, "delivered_chat_id": 9})
+    _row, event = _exhaust(td, tmp_path, "t-same", 9)
+    assert notices == [] and event["owner_notice"] == "not_sent_same_delivery_recorded_at_this_chat"
+
+    write_task_result(tmp_path, "t-other-chat", "cancelled", result="stopped",
+                      cancel_receipt={"delivery_id": td.delivery_id_for("t-other-chat", "copy me"),
+                                      "delivered_chat_id": 4})
+    _row, event = _exhaust(td, tmp_path, "t-other-chat", 9)
+    assert "owner_notice" not in event and notices[-1][0] == 9
+
+    write_task_result(tmp_path, "t-other-id", "cancelled", result="stopped",
+                      cancel_receipt={"delivery_id": "cancel:t-other-id:ci_1", "delivered_chat_id": 9})
+    _row, event = _exhaust(td, tmp_path, "t-other-id", 9)
+    assert "owner_notice" not in event and len(notices) == 2
+
+    # A bare id in the delivered registry says nothing about the destination.
+    td.register_delivery(tmp_path, td.delivery_id_for("t-registry", "copy me"))
+    _row, event = _exhaust(td, tmp_path, "t-registry", 9)
+    assert "owner_notice" not in event and len(notices) == 3
+    assert all("was not confirmed" in text for _chat, text in notices)
+
+
+def test_capacity_eviction_and_a_failed_copy_are_worded_as_unconfirmed(tmp_path, monkeypatch):
+    from supervisor import terminal_delivery as td
+
+    notices: list = []
+    monkeypatch.setattr("supervisor.message_bus.send_with_budget",
+                        lambda chat_id, text, **kw: notices.append(text))
+
+    def refuse(*_args, **_kwargs):
+        raise OSError("Too many open files")
+
+    monkeypatch.setattr("ouroboros.observability.preserve_salvaged_output", refuse)
+    row = {"task_id": "t-evicted", "chat_id": 9, "text": "owed", "delivery_id": "d-evicted"}
+    td._disclose_exhausted_delivery(tmp_path, row, reason="outbox_capacity")
+    (text,) = notices
+    assert text.startswith("⚠️ Sending a message for task t-evicted was not confirmed: its pending-outbox slot")
+    assert text.endswith("No copy of this message could be saved.")

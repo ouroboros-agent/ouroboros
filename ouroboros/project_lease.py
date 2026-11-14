@@ -9,12 +9,17 @@ BETWEEN projects and via subagent swarms WITHIN a task).
 against each other. Subagents carry their parent's stored ``project_id`` but
 hold no lease of their own — the parent task IS the project's writer and its
 swarm must not deadlock against itself, so only top-level (non-subagent)
-tasks count as lane occupants.
+tasks count as lane occupants; the lane is their tree's (``lane_holders``). A
+conversation-lane turn (an owner's room turn, a wake, a Presence body) holds no
+lease either: it answers beside the room's work, so a Resume or Continue it
+grants starts at once.
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, Set
+
+from ouroboros.task_carrier import LANE_CONVERSATION
 
 
 def _as_task(item: Any) -> Any:
@@ -46,101 +51,134 @@ def running_project_ids(running: Iterable[Any]) -> Set[str]:
     """Project ids currently holding a writer lease.
 
     ``running`` is the supervisor's RUNNING mapping values (or any iterable of
-    task dicts); read under the queue lock by the caller.
+    task dicts); read under the queue lock by the caller. A conversation-lane
+    turn is known by its RUNNING row's ``lane``: a bare task dict always counts.
     """
     out: Set[str] = set()
     for task in running or ():
-        if _is_lane_occupant(task):
+        conversation = isinstance(task, dict) and task.get("lane") == LANE_CONVERSATION  # its RUNNING row's carrier
+        if _is_lane_occupant(task) and not conversation:
             out.add(_task_project_id(task))
     return out
 
 
-def candidate_is_leasable(candidate: Dict[str, Any], running_ids: Set[str]) -> bool:
-    """True when ``candidate`` may be assigned now under the one-writer rule."""
-    if not _is_lane_occupant(candidate):
-        return True
-    return _task_project_id(candidate) not in running_ids
+def _tree(task: Any) -> str:
+    """The tree a row belongs to: its logical root (a root's retry keeps the original id)."""
+    task = _as_task(task)
+    return str(task.get("root_task_id") or task.get("id") or "") if isinstance(task, dict) else ""
 
 
-def task_lane_project_id(running: Any, pending: Any, tid: Any) -> str:
-    """The project id the live queue copy of ``tid`` carries right now, "" when the
-    task holds no lane or is neither running nor pending.
+def _asleep(task: Dict[str, Any]) -> bool:
+    """Parked in its own model sleep, or granted back from it and not started yet."""
+    marker = task.get("_budget_pause") or (task.get("_budget_pause_resume") or {}).get("pause")
+    return isinstance(marker, dict) and marker.get("reason") == "sleep"
+
+
+def lane_holders(running: Iterable[Any], pending: Iterable[Any]) -> Dict[str, Set[str]]:
+    """The trees (root ids) holding each project lane; the caller holds the queue lock. A running
+    top-level writer holds its lane. A queued one keeps it while its tree lives: its accepted cold
+    custody, or, asleep (a sleep is its wait), a running or claimed member; with members only queued,
+    a lane no other tree holds, the first queued such tree keeping it, so a tree that released its
+    lane takes it back only once it is free and no two trees wait on each other."""
+    from ouroboros.sleep_custody import carrier_receipt
+
+    running, pending = list(running or ()), [task for task in pending or () if isinstance(task, dict)]
+    holders: Dict[str, Set[str]] = {}
+    for item in running:
+        if _is_lane_occupant(item) and not (isinstance(item, dict) and item.get("lane") == LANE_CONVERSATION):
+            holders.setdefault(_task_project_id(item), set()).add(_tree(item))
+    sleepers = [task for task in pending if _is_lane_occupant(task)
+                and (_asleep(task) or carrier_receipt(task).get("retains_project_lane"))]
+    acting, queued, waiting = {_tree(item) for item in running}, {}, {}  # waiting: project -> first queued-only tree
+    for task in pending if sleepers else ():
+        queued.setdefault(_tree(task), set()).add(str(task.get("id") or ""))
+    for task in sleepers:
+        tree, project = _tree(task), _task_project_id(task)
+        if carrier_receipt(task).get("retains_project_lane") or tree in acting:
+            holders.setdefault(project, set()).add(tree)
+        elif queued.get(tree, set()) - {str(task.get("id") or "")}:
+            waiting.setdefault(project, tree)
+    for project, tree in waiting.items():
+        holders.setdefault(project, {tree})
+    return holders
+
+
+def candidate_is_leasable(candidate: Dict[str, Any], running_ids: Set[str], *,
+                         holders: Dict[str, Set[str]] | None = None) -> bool:
+    """True when ``candidate`` may be assigned now under the one-writer rule: never beside a lane
+    another tree holds (``lane_holders``), and a top-level task never beside a running writer."""
+    project = _task_project_id(candidate)
+    if project and (holders or {}).get(project, set()) - {_tree(candidate)}:
+        return False
+    return not _is_lane_occupant(candidate) or project not in running_ids
+
+
+def task_lane_project_state(running: Any, pending: Any, tid: Any) -> dict:
+    """Scope and exact carrier (including absence) for a conversion rollback.
 
     Walks the same RUNNING map and PENDING list as ``mark_task_project``, so the two
-    can never disagree about where a task's in-memory project id lives. The UI
-    conversion reads it under the queue lock right before it marks, so a durable bind
-    that is then refused can put the lane back instead of leaving it on a project the
-    binding does not name. The caller MUST hold the queue lock."""
+    can never disagree about where a task's in-memory scope lives. The caller MUST
+    hold the queue lock from this read through the mark. Carrier values are replaced,
+    never mutated, so the saved evidence remains the original preparation's."""
     key = str(tid or "")
     if not key:
-        return ""
+        return {}
     meta = running.get(key) if hasattr(running, "get") else None
     rtask = _as_task(meta) if isinstance(meta, dict) else None
     if isinstance(rtask, dict):
-        return _task_project_id(rtask)
+        return {k: rtask[k] for k in ("project_id", "_project_admission") if k in rtask}
     for item in (pending or ()):
         ptask = _as_task(item)
         if isinstance(ptask, dict) and str(ptask.get("id") or "") == key:
-            return _task_project_id(ptask)
-    return ""
+            return {k: ptask[k] for k in ("project_id", "_project_admission") if k in ptask}
+    return {}
 
 
-def mark_task_project(running: Any, pending: Any, tid: Any, pid: Any, *, authority: str = "") -> bool:
-    """Set a task's ``project_id`` wherever it currently lives in the supervisor queue
-    state — the live RUNNING map (``{tid: {"task": {...}}}``) AND the PENDING list (bare
-    task dicts) — so a POST-HOC project conversion/scope makes it a one-writer lane
-    occupant whether it has started yet or not. The lease + assignment read
-    ``task['project_id']`` from these IN-MEMORY structures (assign_tasks checks the
-    pending candidate's own dict, then copies it into RUNNING), NOT the durable bindings —
-    so a converted PENDING task that is only bound durably would still start unscoped and
-    miss its lane. This is the SSOT for both post-hoc convert paths — the supervisor
-    in-task ``ensure_project_scope`` and the UI ``api_project_from_task`` — so they cannot
-    drift apart again. The caller MUST hold the queue lock. Returns True if any in-memory
-    task dict was updated; a no-op (False) when the task is neither running nor pending
-    (then the durable bind alone is correct — there is no live lane to occupy).
+def mark_task_project(running: Any, pending: Any, tid: Any, pid: Any, *, authority: str = "",
+                      project: dict | None = None, restore: dict | None = None) -> bool:
+    """Mark PENDING work only, under Q, after its durable binding commits.
 
-    FILL-ONLY by default: a task already carrying a DIFFERENT project keeps it and
-    False comes back. The durable binding is the one truth about a task's project
-    (owner decision B4=A); this in-memory copy must never be what moves a task
-    between projects, which is how a second, empty project acquired a live lane.
-
-    ``authority="binding"`` is the ONE exception, for a conversion that owns the
-    durable binding for ``pid`` itself: there the in-memory copy FOLLOWS the truth
-    instead of contradicting it. Without it a project-SCOPED but unbound task (a
-    bare-workspace promote carries a derived ``proj_<hash>``) converted durably
-    while its lane stayed on the old id, so the new project's one-writer lane was
-    left free and a concurrent task in it became assignable. That authority also
-    carries the rollback: an EMPTY ``pid`` clears the lane, so a conversion whose
-    durable bind was refused after the mark can restore the value the lane held
-    (including none) instead of leaving it on a project no binding names. Without
-    the authority an empty ``pid`` stays the no-op it has always been."""
+    RUNNING owns its old execution lease until it leaves that execution. Folder
+    and admission evidence are refreshed together at its next assignment.
+    """
     key = str(tid or "")
-    project = str(pid or "").strip()
-    if not key or (not project and authority != "binding"):
+    scope = str(pid or "").strip()
+    if not key or (not scope and authority != "binding"):
         return False
     rows = []
-    meta = running.get(key) if hasattr(running, "get") else None
-    rtask = _as_task(meta) if isinstance(meta, dict) else None
-    if isinstance(rtask, dict):
-        rows.append(rtask)
+    if hasattr(running, "get") and running.get(key) is not None:
+        return False
     for item in (pending or ()):
         ptask = _as_task(item)
         if isinstance(ptask, dict) and str(ptask.get("id") or "") == key:
             rows.append(ptask)
     if authority != "binding" and any(
-        str(row.get("project_id") or "").strip() not in ("", project) for row in rows
+        str(row.get("project_id") or "").strip() not in ("", scope) for row in rows
     ):
         return False
     updated = False
+    if project is not None:
+        from ouroboros.project_admission import project_admission_basis, validate_project_admission
+
+        basis = validate_project_admission(project_admission_basis(scope, project, frozen=True))
     for row in rows:
-        row["project_id"] = project
+        row["project_id"] = scope
+        if restore is not None:
+            for field in ("project_id", "_project_admission"):
+                row.pop(field, None)
+                if field in restore:
+                    row[field] = restore[field]
+        elif project is not None:
+            row["_project_admission"] = basis
+            row.pop("_project_scope_none", None)
         updated = True
     return updated
 
 
 __all__ = [
     "candidate_is_leasable",
+    "lane_holders",
     "mark_task_project",
     "running_project_ids",
-    "task_lane_project_id",
+    "task_lane_project_state",
 ]

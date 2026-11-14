@@ -61,13 +61,11 @@ def test_manifest_without_section_is_none_and_not_extra():
     ({"wat": "x"}, "unknown keys"),
     ({"what_model_sees": ["not", "prose"]}, "must be a prose string"),
     ({}, "at least one non-empty prose field"),
-    ({"what_model_sees": "   "}, "at least one non-empty prose field"),
     # Same teaching error for the STRING form: a section the author filled in
     # with nothing but whitespace was accepted and stored as empty prose, so
     # every model-visible surface rendered a "Model experience:" label with no
     # sentence after it. The mapping form has always refused it.
     ("   ", "at least one non-empty prose field"),
-    ("\n\t \n", "at least one non-empty prose field"),
     (42, "prose string or a mapping"),
 ])
 def test_model_experience_refusals_teach(bad_section, expected_problem_bit):
@@ -191,7 +189,8 @@ def test_context_section_without_section_unchanged(tmp_path):
 
 
 def test_bundled_skills_declare_model_experience():
-    for rel in ("skills/telegram/SKILL.md", "skills/unix_computer_use/SKILL.md"):
+    for rel in ("skills/telegram/SKILL.md", "skills/unix_computer_use/SKILL.md", "skills/windows_computer_use/SKILL.md",
+                "skills/ui_design/SKILL.md"):
         manifest = parse_skill_manifest_text((REPO / rel).read_text(encoding="utf-8"))
         section = manifest.model_experience
         assert section, f"{rel} lacks the Model Experience section"

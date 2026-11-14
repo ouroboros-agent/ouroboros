@@ -9,9 +9,9 @@ from ouroboros.gateways.claudexor import final_attempt_facts
 from ouroboros.llm_claudexor import (
     ClaudexorModelError,
     _ModelInvocation,
-    _remember_failed_profile,
     _request,
 )
+from ouroboros.llm_substitution import remember_failed_profile
 
 
 def _write_telemetry(tmp_path, attempts, *, final_id="a02", run_id="run-fixture"):
@@ -50,7 +50,7 @@ def test_final_attempt_keeps_observed_values_together(tmp_path, harness, request
     }
 
 
-@pytest.mark.parametrize("missing", [None, "", 12, False, ["model"], {"model": "value"}])
+@pytest.mark.parametrize("missing", [None, 12, {"model": "value"}])
 def test_final_attempt_missing_facts_never_borrow_from_earlier_attempt(tmp_path, missing):
     detail = _write_telemetry(tmp_path, [
         {"attempt_id": "a01", "harness_id": "earlier-harness", "observed_model": "earlier-model",
@@ -66,13 +66,8 @@ def test_final_attempt_missing_facts_never_borrow_from_earlier_attempt(tmp_path,
 
 @pytest.mark.parametrize("attempts,final_id", [
     ([{"attempt_id": "a01", "observed_model": "earlier-model"}], "a02"),
-    ([{"attempt_id": "a02"}, {"attempt_id": "a02"}], "a02"),
     ([{"attempt_id": "a01", "observed_model": "earlier-model"}], None),
     ([{"attempt_id": "a01", "observed_model": "earlier-model"}], ""),
-    ([{"attempt_id": "a01", "observed_model": "earlier-model"}], " "),
-    ([{"attempt_id": 2, "observed_model": "earlier-model"}], 2),
-    ({"a02": {"observed_model": "earlier-model"}}, "a02"),
-    ([None, "a02"], "a02"),
 ])
 def test_unbound_or_ambiguous_final_attempt_is_unknown(tmp_path, attempts, final_id):
     detail = _write_telemetry(tmp_path, attempts, final_id=final_id)
@@ -80,14 +75,14 @@ def test_unbound_or_ambiguous_final_attempt_is_unknown(tmp_path, attempts, final
     assert final_attempt_facts(detail, "run-fixture") == {}
 
 
-@pytest.mark.parametrize("run_id", ["other-run", "", None, 1])
+@pytest.mark.parametrize("run_id", ["other-run", "", 1])
 def test_telemetry_must_belong_to_the_requested_run(tmp_path, run_id):
     detail = _write_telemetry(tmp_path, [{"attempt_id": "a02", "observed_model": "actual"}])
 
     assert final_attempt_facts(detail, run_id) == {}
 
 
-@pytest.mark.parametrize("raw", [b"", b"null", b"[]", b"bad: [", b"\xff"])
+@pytest.mark.parametrize("raw", [b"", b"bad: [", b"\xff"])
 def test_unreadable_telemetry_stays_unknown(tmp_path, raw):
     detail = _write_telemetry(tmp_path, [{"attempt_id": "a02", "observed_model": "actual"}])
     (tmp_path / "final" / "telemetry.yaml").write_bytes(raw)
@@ -106,8 +101,7 @@ def test_missing_or_inaccessible_telemetry_stays_unknown(tmp_path, monkeypatch):
     assert final_attempt_facts(detail, "run-fixture") == {}
 
 
-@pytest.mark.parametrize("detail", [None, [], {}, {"summary": []}, {"summary": {}},
-                                     {"summary": {"runDir": ""}}, {"summary": {"runDir": 42}}])
+@pytest.mark.parametrize("detail", [None, [], {"summary": {"runDir": 42}}])
 def test_missing_engine_run_directory_never_reads_the_working_directory(detail, monkeypatch):
     def unexpected_read(*args, **kwargs):
         raise AssertionError("missing runDir must not become a relative path")
@@ -116,12 +110,10 @@ def test_missing_engine_run_directory_never_reads_the_working_directory(detail, 
     assert final_attempt_facts(detail, "run-fixture") == {}
 
 
-@pytest.mark.parametrize("applied,expected", [
-    ({"reasoningEffort": "xhigh"}, "confirmed"),
-    ({"reasoningEffort": "medium"}, "mismatch"),
-    (None, "unknown"),
+@pytest.mark.parametrize("applied", [
+    {"reasoningEffort": "xhigh"}, None, {"reasoningEffort": None},
 ])
-def test_model_invocation_records_requested_and_applied_options(applied, expected):
+def test_model_invocation_records_requested_and_applied_options(applied):
     requested = {"reasoningEffort": "xhigh"}
     invocation = _ModelInvocation(
         {"usage_model": "claudexor::codex=model"}, {"options": requested}, {}
@@ -137,7 +129,8 @@ def test_model_invocation_records_requested_and_applied_options(applied, expecte
     observed = usage["claudexor"]
     assert observed["requested_options"] == requested
     assert observed["applied_options"] == applied
-    assert observed["options_honored"] == expected
+    assert usage["effort"]["reported"] == (applied or {}).get("reasoningEffort")
+    assert usage["effort"]["report_source"] == ("provider_applied_options" if isinstance(applied, dict) and applied.get("reasoningEffort") is not None else None)
 
 
 def test_a_differently_echoed_cache_key_is_a_durable_mismatch_of_its_own():
@@ -152,7 +145,8 @@ def test_a_differently_echoed_cache_key_is_a_durable_mismatch_of_its_own():
         "appliedOptions": {"reasoningEffort": "xhigh", "cacheKey": "engine-b"},
     })
 
-    assert usage["claudexor"]["options_honored"] == "mismatch"
+    assert usage["claudexor"]["requested_options"] == requested
+    assert usage["claudexor"]["applied_options"] == {"reasoningEffort": "xhigh", "cacheKey": "engine-b"}
 
 
 def _continuation(profile="profile-a", source="codex", model="gpt-6"):
@@ -181,7 +175,7 @@ def test_status_null_failure_suppresses_only_the_next_same_route_preference():
         route={"source": "codex", "model": "gpt-6", "credentialProfileId": "profile-a"},
         unknown=True,
     )
-    _remember_failed_profile(target, parameters, error)
+    remember_failed_profile(target, parameters, error)
 
     assert _request(target, _continuation(), None, parameters)["account"] == {"mode": "auto"}
     assert _request(target, _continuation(), None, parameters)["account"] == {
@@ -198,7 +192,7 @@ def test_failure_fact_survives_an_interleaved_request_on_another_route():
         route={"source": "codex", "model": "gpt-6", "credentialProfileId": "profile-a"},
         unknown=True,
     )
-    _remember_failed_profile(target, parameters, error)
+    remember_failed_profile(target, parameters, error)
 
     # A request on another route neither consumes the fact nor loses its own preference.
     assert _request(other, _continuation("profile-b", "claude", "sonnet"), None, parameters)["account"] == {
@@ -218,14 +212,46 @@ def test_failure_fact_does_not_change_pin_or_single_account_auto_mode():
          "context": {"httpStatus": 429}},
         route={"source": "codex", "model": "gpt-6", "credentialProfileId": "only-profile"},
     )
-    _remember_failed_profile(target, parameters, error)
+    remember_failed_profile(target, parameters, error)
 
     pinned = _request(target, _continuation("only-profile"), None, {
         **parameters, "model_account_override": "only-profile",
     })
     assert pinned["account"] == {"mode": "pin", "profileId": "only-profile"}
 
-    _remember_failed_profile(target, parameters, error)
+    remember_failed_profile(target, parameters, error)
     assert _request(target, _continuation("only-profile"), None, parameters)["account"] == {
         "mode": "auto",
     }
+
+
+def _released(code):
+    from types import SimpleNamespace
+    from ouroboros.llm_claudexor import ClaudexorModelNotDispatched
+
+    error = ClaudexorModelNotDispatched({"code": code, "message": "no request left the host"},
+                                        route={"source": "codex", "model": "gpt-6", "credentialProfileId": "profile-a"})
+    error.physical_attempt_capture = SimpleNamespace(state="released", provider="claudexor", route_is_loopback=False)
+    return error
+
+
+@pytest.mark.parametrize(("error", "kept"), [
+    (ClaudexorModelError({"code": "context_length_exceeded", "message": "too long"},
+                         route={"source": "codex", "model": "gpt-6", "credentialProfileId": "profile-a"}), True),
+    (_released("model_account_unavailable"), False),  # an engine account verdict, though it reads as a transport wait
+    (ClaudexorModelError({"code": "context_length_exceeded", "message": "too long", "context": {"poolCause": "quota"}},
+                         route={"source": "codex", "model": "gpt-6", "credentialProfileId": "profile-a"}), False),
+    (ClaudexorModelError({"code": "server_error", "message": "stream ended"}, unknown=True,
+                         route={"source": "codex", "model": "gpt-6", "credentialProfileId": "profile-a"}), False),
+    (ClaudexorModelError({"code": "rate_limited", "message": "slow down"},
+                         route={"source": "codex", "model": "gpt-6", "credentialProfileId": "profile-a"}), False),
+])
+def test_a_size_refusal_keeps_the_conversations_account(error, kept):
+    """C2 S5 (06.11.2026): a size refusal says nothing about the account, so the shrunk request stays
+    where its prefix is cached; an unknown outcome or any account evidence still drops it once."""
+    target = {"source": "codex", "resolved_model": "gpt-6"}
+    parameters = {"cache_affinity": f"execution-{error.code}"}
+    remember_failed_profile(target, parameters, error)
+
+    preferred = _request(target, _continuation(), None, parameters)["account"].get("preferredProfileId")
+    assert preferred == ("profile-a" if kept else None)

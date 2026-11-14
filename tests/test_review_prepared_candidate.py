@@ -7,7 +7,7 @@ import pytest
 
 from ouroboros.review_state import CommitAttemptRecord, load_state, make_repo_key, update_state
 from ouroboros.tools import git
-from tests.test_advisory_inline_freshness import candidate  # noqa: F401
+from tests.test_git_review_preflight_gate import candidate  # noqa: F401
 
 
 def _git(ctx, *args):
@@ -24,7 +24,7 @@ def stage_context(candidate, monkeypatch):  # noqa: F811 - imported pytest fixtu
     candidate._last_scope_raw_result = {}
     candidate._review_degraded_reasons = []
     monkeypatch.setattr(git, "commit_review_contract_fingerprint", lambda: "contract")
-    monkeypatch.setattr(git, "_advisory_and_tests_gate", lambda *a, **kw: None)
+    monkeypatch.setattr(git, "_preflight_and_tests_gate", lambda *a, **kw: None)
     monkeypatch.setattr(git, "_run_parallel_review", lambda *a, **kw: (None, None, "", []))
     return candidate
 
@@ -41,7 +41,7 @@ def test_mechanical_files_are_staged_before_fingerprint_and_preflight(stage_cont
     def preflight(_ctx, message, started, **kwargs):
         calls.append("preflight")
         assert _git(ctx, "show", ":generated.txt") == "prepared carrier"
-        assert set(kwargs["advisory_paths"]) == {"change.py", "generated.txt"}
+        assert set(kwargs["classification_paths"]) == {"change.py", "generated.txt"}
         assert git._fingerprint_staged_diff(ctx.repo_dir)["fingerprint"] == ctx._current_review_binding_test
 
     def free_gate(_ctx, message, started, **kwargs):
@@ -51,9 +51,9 @@ def test_mechanical_files_are_staged_before_fingerprint_and_preflight(stage_cont
 
     monkeypatch.setattr("ouroboros.commit_admission.auto_sync_release_metadata_if_needed", prepare)
     monkeypatch.setattr(git, "_free_cycle_gate", free_gate)
-    monkeypatch.setattr(git, "_advisory_and_tests_gate", preflight)
+    monkeypatch.setattr(git, "_preflight_and_tests_gate", preflight)
     result = _stage(ctx)
-    assert result["status"] == "passed"
+    assert result["status"] == "reviewed"  # its PASS returns before Git
     assert calls == ["prepare", "admission", "preflight"]
     assert result["pre_fingerprint"]["fingerprint"] == result["post_fingerprint"]["fingerprint"]
 
@@ -67,12 +67,12 @@ def test_preflight_mutation_cannot_reach_triad(stage_context, monkeypatch, stage
         if stage_new_bytes:
             _git(ctx, "add", "change.py")
 
-    monkeypatch.setattr(git, "_advisory_and_tests_gate", preflight)
+    monkeypatch.setattr(git, "_preflight_and_tests_gate", preflight)
     monkeypatch.setattr(git, "_run_parallel_review", lambda *a, **kw: pytest.fail("changed material must not dispatch"))
     assert _stage(ctx)["block_reason"] == "revalidation_failed"
 
 
-def test_budget_ceiling_refuses_before_preflight(stage_context, monkeypatch):
+def test_a_spent_ceiling_buys_no_wave_and_returns_its_replay_before_git(stage_context, monkeypatch):
     ctx = stage_context
     monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "1")
     update_state(ctx.drive_root, lambda state: state.record_attempt(CommitAttemptRecord(
@@ -80,8 +80,9 @@ def test_budget_ceiling_refuses_before_preflight(stage_context, monkeypatch):
         repo_key=make_repo_key(ctx.repo_dir), task_id=ctx.task_id,
         root_task_id=ctx.task_id, paid=True, attempt=1,
     )))
-    monkeypatch.setattr(git, "_advisory_and_tests_gate", lambda *a, **kw: pytest.fail("no paid preflight before admission"))
-    assert _stage(ctx)["block_reason"] == "review_cycles_exhausted"
+    monkeypatch.setattr(git, "_run_parallel_review", lambda *a, **kw: pytest.fail("a spent ceiling buys no wave"))
+    result = _stage(ctx)
+    assert result["status"] == "reviewed" and "No new review wave was bought" in result["message"], result
 
 
 @pytest.mark.parametrize("change_index", [False, True])
@@ -106,8 +107,9 @@ def test_pending_retry_never_prepares_or_restages(stage_context, monkeypatch, ch
         return "review pending", None, "review_late_result_pending", []
 
     monkeypatch.setattr(git, "_run_parallel_review", wave)
+    pending = "Review outcome returned before commit: reviewers are still running."
     first = _stage(ctx)
-    assert first["block_reason"] == "review_late_result_pending"
+    assert first["status"] == "reviewed" and first["message"].startswith(pending), first
     original_index = _git(ctx, "write-tree")
     assert _git(ctx, "diff", "--cached", "--name-only") == "change.py"
     assert load_state(ctx.drive_root).attempts[-1].late_result_pending
@@ -121,7 +123,7 @@ def test_pending_retry_never_prepares_or_restages(stage_context, monkeypatch, ch
     assert git._check_overlapping_review_attempt(ctx) is None
     assert ctx._review_resume_pending
     monkeypatch.setattr("ouroboros.commit_admission.auto_sync_release_metadata_if_needed", lambda *a: pytest.fail("pending must not prepare"))
-    monkeypatch.setattr(git, "_advisory_and_tests_gate", lambda *a, **kw: pytest.fail("pending must not rerun preflight"))
+    monkeypatch.setattr(git, "_preflight_and_tests_gate", lambda *a, **kw: pytest.fail("pending must not rerun preflight"))
     second = _stage(ctx)
     assert _git(ctx, "write-tree") == before_retry
     assert (ctx.repo_dir / "change.py").read_text() == "value = 99\n"
@@ -131,6 +133,6 @@ def test_pending_retry_never_prepares_or_restages(stage_context, monkeypatch, ch
         assert calls == [False]
     else:
         assert before_retry == original_index
-        assert second["block_reason"] == "review_late_result_pending"
+        assert second["status"] == "reviewed" and second["message"].startswith(pending), second
         assert calls == [False, True]
     assert sum(row.paid for row in load_state(ctx.drive_root).attempts) == 1

@@ -18,15 +18,21 @@ from tests import test_update_merge_assisted as tua
 
 
 def _stub_resolver_queue(monkeypatch):
-    """Capture enqueue_task calls with an empty live queue (no pool spawn)."""
+    """Capture enqueue_task calls with an empty live queue (no pool spawn).
+
+    Like the real queue, the stub returns the admitted row; a first admission's
+    receipt lands under the test's own drive root."""
+    import supervisor.git_ops as git_ops
     import supervisor.queue as queue
     import supervisor.workers as workers
 
     monkeypatch.setattr(workers, "ensure_worker_pool_started", lambda **_kwargs: True)
     monkeypatch.setattr(workers, "PENDING", [])
     monkeypatch.setattr(workers, "RUNNING", {})
+    monkeypatch.setattr(queue, "DRIVE_ROOT", git_ops.DRIVE_ROOT)
     enqueued = []
-    monkeypatch.setattr(queue, "enqueue_task", lambda task, front=False: enqueued.append(task))
+    monkeypatch.setattr(queue, "enqueue_task",
+                        lambda task, front=False, **_kwargs: enqueued.append(task) or task)
     return enqueued
 
 

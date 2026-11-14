@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createChatInstance } from '../modules/chat.js';
+import { fetchTaskDetailStrict } from '../modules/api_client.js';
+import { createReviewHydrator } from '../modules/review_presentation.js';
+import { clock } from '../modules/work_status.js';
 import { installDom, restoreDom, walkCard } from './chat_dom_fixture.js';
+import { projection, room, work } from './work_fixture.js';
 
 const chatId = 77;
 const taskId = 'context-analysis';
@@ -19,6 +23,42 @@ const reference = (amount, final = false) => ({
     role: 'system', is_progress: true, system_type: 'review_reference',
     surface: 'task_acceptance', state_revision: 'a'.repeat(64),
     ts: '2026-09-15T10:00:01Z', history_id: 'progress:2', ...cost(amount, final),
+});
+
+test('task detail hydration retries migration quietly and cancels on disposal', async t => {
+    const previous = globalThis.fetch;
+    let migrating = true, reads = 0;
+    const statuses = [], applied = [];
+    globalThis.fetch = async () => {
+        reads += 1;
+        return { ok: !migrating, status: migrating ? 503 : 200,
+            json: async () => migrating ? { reason_code: 'migrating' } : { status: 'completed' } };
+    };
+    const hydrator = createReviewHydrator({ fetchDetail: fetchTaskDetailStrict,
+        applyDetail: (_id, row) => applied.push(row), onState: (_id, state) => statuses.push(state) });
+    t.after(() => { hydrator.clear(); globalThis.fetch = previous; });
+    await hydrator.hydrate('task1');
+    assert.equal(statuses.at(-1), 'loading');
+    assert.equal(hydrator.ready('task1'), false);
+    migrating = false;
+    await new Promise(resolve => setTimeout(resolve, 750));
+    assert.deepEqual(applied, [{ status: 'completed' }]);
+    assert.equal(hydrator.ready('task1'), true);
+    assert.equal(statuses.includes('error'), false);
+    assert.equal(reads, 2);
+    migrating = true;
+    await hydrator.hydrate('task2');
+    hydrator.clear();
+    await new Promise(resolve => setTimeout(resolve, 750));
+    assert.equal(reads, 3, 'closing the consumer cancels the pending migration retry');
+    globalThis.fetch = async () => {
+        reads += 1;
+        return { ok: false, status: 503, json: async () => ({ reason_code: 'unavailable' }) };
+    };
+    await hydrator.hydrate('task3');
+    assert.equal(statuses.at(-1), 'error');
+    await new Promise(resolve => setTimeout(resolve, 750));
+    assert.equal(reads, 4, 'ordinary failures keep their existing Retry contract');
 });
 
 function fixture(rows = [progress]) {
@@ -39,6 +79,7 @@ function fixture(rows = [progress]) {
         }
         if (String(url).startsWith('/api/tasks/')) {
             if (data.detailError) throw new Error('task detail unavailable');
+            if (data.detailMigrating) return { ok: false, status: 503, json: async () => ({ reason_code: 'migrating' }) };
             return { ok: true, json: async () => data.detail };
         }
         return { ok: true, json: async () => snapshot };
@@ -49,7 +90,7 @@ function fixture(rows = [progress]) {
             isConnected: () => true, send() {} },
         state: { activePage: 'chat', projectChatIds: new Set([chatId]), unreadCount: 0 },
         updateUnreadBadge() {},
-        stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }),
+        stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
             isCurrent: () => true, apply() {} },
         chatId, idPrefix: 'chat', mountEl: env.mount, asPanel: true,
     });
@@ -71,13 +112,72 @@ function fixture(rows = [progress]) {
     };
 }
 
+// A chip's status mark (docs/DESIGN.md "Status marks"): its shape and hue, or `none` while it is hidden.
+const markOf = (chip) => {
+    const mark = chip.firstElementChild;
+    return mark && !mark.hidden ? `${mark.dataset.shape}/${mark.dataset.hue}` : 'none';
+};
 const anatomy = (card) => ({
     phase: card.querySelector('[data-live-phase]').textContent,
     hidden: card.querySelector('[data-live-phase]').hidden,
-    typing: card.querySelector('[data-live-typing]').style.display,
+    mark: markOf(card.querySelector('[data-live-phase]')),
     notes: card.querySelector('[data-live-count]').textContent,
     activity: card.querySelector('[data-live-activity]').textContent,
 });
+
+const findDescendant = (node, selector) => node.querySelector(selector)
+    || node.children.map(child => findDescendant(child, selector)).find(Boolean) || null;
+
+for (const kind of ['direct_chat', 'managed_task']) {
+    for (const censusFirst of [false, true]) {
+        test(`${kind} paused review work reaches the real card from census hydration (census first=${censusFirst})`, async () => {
+            const fx = fixture();
+            try {
+                const activity = fx.snapshot.active_chat_activities[0];
+                Object.assign(activity, { kind, phase: 'budget_paused', pause_cause: 'owner', finishing_reviews: true });
+                // The server's work for that row: paused by the owner's press, its launched reviews finishing beside
+                // the Pause as its tail, and the Resume its door accepts (gateway/work_status.roll_up_work, controls_for).
+                const pressed = '2026-09-15T10:00:00Z';
+                const review = { kind: 'review', state: 'live', code: 'review_work_finishing', text: 'Review work finishing' };
+                const project = () => Object.assign(fx.snapshot, projection(activity.chat_id ?? 1, [work(activity,
+                    activity.phase === 'budget_paused' ? { activity: 'paused', mark: 'pause',
+                        because: [{ code: 'paused_by_owner', text: 'You paused it', since: pressed,
+                            by: { actor: 'owner', text: '', at: pressed } }],
+                        tails: activity.finishing_reviews ? [review] : [], live: Boolean(activity.finishing_reviews),
+                        controls: [{ action: 'resume', target: taskId }, { action: 'stop', target: taskId }] }
+                        : { mark: 'moving', controls: [{ action: 'stop', target: taskId }] })],
+                    room(activity.phase === 'budget_paused' ? 'paused' : 'working')));
+                project();
+                if (censusFirst) fx.hydrate();
+                await fx.replay();
+                if (!censusFirst) fx.hydrate();
+                // The chip says the work's word alone; who paused it and what still finishes are its line.
+                const phase = () => [fx.card().querySelector('[data-live-phase]').textContent,
+                    fx.card().querySelector('[data-live-phase-secondary]').textContent];
+                const paused = `You paused it · ${clock(pressed)}`;
+                assert.deepEqual(phase(), ['Paused', `${paused} · Review work finishing`]);
+                assert.ok(findDescendant(fx.card(), '[data-resume-run]'), 'Resume is available while reviews finish');
+                // The owner's own Pause is their decision, not a move waiting for them: its bars in neutral ink.
+                assert.deepEqual([markOf(fx.card().querySelector('[data-live-phase]')),
+                    fx.card().querySelector('[data-live-phase]').dataset.chipTone], ['pause/ink', 'neutral']);
+                for (const finishing of [true, false, true, undefined]) {
+                    if (finishing === undefined) delete activity.finishing_reviews;
+                    else activity.finishing_reviews = finishing;
+                    project();
+                    fx.hydrate();
+                    assert.deepEqual(phase(), ['Paused', finishing ? `${paused} · Review work finishing` : paused],
+                        'each body replaces the fact, including false or absence');
+                    assert.ok(findDescendant(fx.card(), '[data-resume-run]'));
+                }
+                Object.assign(activity, { phase: 'working', finishing_reviews: true });
+                project();
+                fx.hydrate();
+                assert.deepEqual(phase(), ['Working', ''], 'a stale fact cannot keep the resumed task paused');
+                assert.equal(findDescendant(fx.card(), '[data-resume-run]'), null);
+            } finally { fx.destroy(); }
+        });
+    }
+}
 
 test('a bound direct activity restores its Project card and survives progress/history replay', async () => {
     const fx = fixture();
@@ -90,7 +190,7 @@ test('a bound direct activity restores its Project card and survives progress/hi
         fx.send(progress);
         await fx.replay();
         assert.equal(fx.card().querySelector('[data-live-phase]').hidden, false);
-        assert.equal(fx.card().querySelector('[data-live-typing]').style.display, '');
+        assert.equal(markOf(fx.card().querySelector('[data-live-phase]')), 'moving/ink');
         assert.doesNotMatch(fx.card().querySelector('[data-live-meta]').innerHTML, /unconfirmed/);
         fx.send({ task_id: taskId, chat_id: chatId, role: 'system', system_type: 'task_summary',
             task_terminal_status: 'completed', ts: '2026-09-15T10:00:03Z', content: 'Done' });
@@ -99,7 +199,7 @@ test('a bound direct activity restores its Project card and survives progress/hi
     } finally { fx.destroy(); }
 });
 
-for (const firstDetail of ['completed', 'running', 'unavailable']) {
+for (const firstDetail of ['completed', 'running', 'unavailable', 'migrating']) {
     test(`a vanished direct activity reconciles its visible card from durable detail: ${firstDetail}`, async () => {
         const fx = fixture();
         try {
@@ -109,6 +209,7 @@ for (const firstDetail of ['completed', 'running', 'unavailable']) {
             fx.snapshot.active_chat_activities = [];
             fx.data.detail.status = firstDetail === 'completed' ? 'completed' : 'running';
             fx.data.detailError = firstDetail === 'unavailable';
+            fx.data.detailMigrating = firstDetail === 'migrating';
             fx.hydrate();
             await new Promise((resolve) => setImmediate(resolve));
             assert.ok(fx.calls.some((url) => url.startsWith('/api/tasks/')),
@@ -117,12 +218,13 @@ for (const firstDetail of ['completed', 'running', 'unavailable']) {
                 assert.equal(fx.card().dataset.finished, '0', 'absence/failure is not a terminal fact');
                 fx.data.detail.status = 'completed';
                 fx.data.detailError = false;
+                fx.data.detailMigrating = false;
                 fx.hydrate();
                 await new Promise((resolve) => setImmediate(resolve));
             }
             assert.equal(fx.card().dataset.finished, '1');
             assert.equal(fx.card().querySelector('[data-live-phase]').textContent, 'Done');
-            assert.equal(fx.card().querySelector('[data-live-typing]').style.display, 'none');
+            assert.equal(markOf(fx.card().querySelector('[data-live-phase]')), 'dot/ok');
         } finally { fx.destroy(); }
     });
 }

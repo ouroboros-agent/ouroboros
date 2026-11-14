@@ -2,9 +2,12 @@
 
 Lifecycle, execution health, artifacts, review, and objective evaluation are
 separate axes. Tool errors remain evidence without degrading a delivered answer.
-Task acceptance or qualified Advisory author completion establishes objective
+A settled result review of the delivered answer (a recorded task acceptance on
+older records) or a qualified Advisory author completion establishes objective
 success; neither final text nor absent tool errors can. Typed runtime evidence may conservatively
-degrade an otherwise ``not_evaluated`` objective.
+degrade an otherwise ``not_evaluated`` objective. An oversized ledger rides as
+a stub whose ``summary`` is re-projected from the artifact file; the stub is
+never a source for entries or axes.
 """
 
 from __future__ import annotations
@@ -17,6 +20,13 @@ from hashlib import sha256
 from typing import Any, Dict, List, Optional
 
 from ouroboros import _outcome_receipts
+# The receipt projections below parameterize the reconciliation core and live
+# with it; these historical names stay resolvable through this module.
+from ouroboros._outcome_receipts import (  # explicit re-exports, one statement
+    latest_unreconciled_failed_receipt as latest_unreconciled_failed_receipt,
+    latest_unreconciled_failed_verification as latest_unreconciled_failed_verification,
+    latest_unreconciled_masked_pass as latest_unreconciled_masked_pass,
+)
 # Tool-call trace vocabulary + execution-axis classifier (leaf module). Re-exported
 # here so `from ouroboros.outcomes import _classify_tool_errors/_POLICY_DENIAL_STATUSES/...`
 # keeps resolving for every historical import site.
@@ -27,11 +37,14 @@ from ouroboros._outcome_tool_errors import (  # explicit re-exports, one stateme
     _is_ignored_readonly_block as _is_ignored_readonly_block,
     _NON_BLOCKING_READONLY_BLOCK_STATUSES as _NON_BLOCKING_READONLY_BLOCK_STATUSES,
     _NON_BLOCKING_RECOVERABLE_STATUSES as _NON_BLOCKING_RECOVERABLE_STATUSES,
+    _NON_EFFECT_OBSERVATION_STATUSES as _NON_EFFECT_OBSERVATION_STATUSES,
     _OK_TOOL_STATUSES as _OK_TOOL_STATUSES,
     _POLICY_DENIAL_STATUSES as _POLICY_DENIAL_STATUSES,
     _RECOVERY_TOOL_NAMES as _RECOVERY_TOOL_NAMES,
     _ROOT_WRITE_TOOLS as _ROOT_WRITE_TOOLS,
+    SAFETY_HELD_STATUSES as SAFETY_HELD_STATUSES,
     _unresolved_tool_errors as _unresolved_tool_errors,
+    warns_without_review as warns_without_review,
     _user_file_basenames as _user_file_basenames,
 )
 from ouroboros.headless import (
@@ -102,7 +115,7 @@ BEST_EFFORT_REASON_CODES = frozenset({
     "round_limit",
     "finalization_grace",
     "deadline_local",
-    "children_unabsorbed",
+    "children_unabsorbed",  # Historical records only; reminders no longer force a terminal.
     # S3 (Q1/Q3=A, 2026-08-15): the owner asked the task to summarize and stop.
     # A successful owner-requested finalization is an honest best-effort
     # completion — NEVER recorded as the false ``acceptance_bypassed_deadline``
@@ -128,21 +141,24 @@ REASON_TASK_EXCEPTION = "task_exception"
 REASON_DEEP_SELF_REVIEW_UNAVAILABLE = "deep_self_review_unavailable"
 REASON_DEEP_SELF_REVIEW_ERROR = "deep_self_review_error"
 REASON_TOOL_FAILURE = "tool_failure"
+REASON_AUTHORING_HANDOVER_INCOMPLETE = "authoring_handover_incomplete"
 REASON_DELIVERY_CONTROL_DEGRADED = "delivery_control_degraded"
 REASON_CHILD_RESULTS_DEFERRED = "child_results_deferred"
-REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE = "review_skipped_deadline_reserve"
+# The reasons and statuses named "acceptance" below are the vocabulary of task-acceptance
+# decisions stored before the result review replaced that machine. Nothing writes them
+# now; old task cards (the cause sentences) and the objective reader still read them.
 # HQ1 (2026-08-15): the owner-hurry acceptance-skip reason. A finite typed
 # acceptance-decision reason ONLY — deliberately NOT a member of
 # ACCEPTANCE_BYPASS_REASON_BY_RAIL (it is an owner-approved skip, not a forced
 # rail), never a lifecycle status, commit-review reason, truncation reason, or
-# BEST_EFFORT reason. ``ouroboros/owner_hurry.py`` is the consumer.
+# BEST_EFFORT reason.
 REASON_ACCEPTANCE_SKIPPED_OWNER_HURRY = "owner_hurry"
 # Owner D10/D27 (2026-08-15): the shared review-cycle cap (``review_cycles.py``)
-# spent under BLOCKING enforcement. One typed reason AND event name for both
-# gates: task acceptance (Required+Blocking passes exhausted) stamps it as the
-# acceptance-decision reason; plan review stamps it on the held wave/event. The
-# host objective then terminalizes as BLOCKED (``blocked_with_evidence``) — never
-# ``best_effort`` — with the reviewer findings preserved in the review axis.
+# spent under BLOCKING enforcement. One typed reason AND event name: a blocking
+# result review that could buy no review of its result reads as it (an old
+# acceptance decision carried it as its reason); plan review stamps it on the held
+# wave/event. The host objective then terminalizes as BLOCKED
+# (``blocked_with_evidence``) — never ``best_effort``.
 REASON_REVIEW_CYCLES_EXHAUSTED = "review_cycles_exhausted"
 
 # B2b: a BLOCKING plan review whose recorded wave proves its reviewer quorum is
@@ -153,30 +169,27 @@ REASON_REVIEW_CYCLES_EXHAUSTED = "review_cycles_exhausted"
 REASON_REVIEW_QUORUM_UNREACHABLE = "plan_review_quorum_unreachable"
 
 # A-material (owner ratification 2026-08-30): the agent resubmitted the SAME paid
-# acceptance identity — unchanged candidate answer AND no new obligation
-# disposition — so the recorded verdict was replayed for free instead of buying
-# another panel. The branch only fires when that recorded verdict was NOT a clean
-# PASS (a clean PASS replays as `accepted` on its own branch), so the objective
-# terminalizes BLOCKED exactly like the spent-cap case above: the deliverable was
-# never accepted and no further reviewer round will happen.
+# acceptance identity, so a recorded verdict that was NOT a clean PASS was replayed
+# for free; the objective terminalized BLOCKED like the spent-cap case above.
 REASON_IDENTICAL_ACCEPTANCE_REFUSED = "identical_acceptance_refused"
 
-# The acceptance-decision reasons whose (finalized_unaccepted, reason) PAIR
-# terminalizes the objective axis BLOCKED. Value-keyed readers of the acceptance
-# decision live here: adding a terminal reason without adding it to the right key
-# is the silent false green DEVELOPMENT.md warns about.
+# #1223: the host could not assemble the acceptance evidence LOCALLY, before any
+# reviewer existed: the host's own failure, not a reviewer verdict. The decision's
+# `acceptance_incident` carries the incident identity and the real host attempt count.
+REASON_ACCEPTANCE_PREPARATION_FAILED = "acceptance_preparation_failed"
+
+# The old decision reasons whose (finalized_unaccepted, reason) PAIR terminalizes the
+# objective axis BLOCKED; ``_objective_axis`` reads them on stored review axes.
 _ACCEPTANCE_BLOCKED_TERMINAL_REASONS = frozenset({
     REASON_REVIEW_CYCLES_EXHAUSTED,
     REASON_IDENTICAL_ACCEPTANCE_REFUSED,
     "author_stop",
 })
 
-# CLOSED mapping: forced-finalization rail (the loop's typed reason_code) -> typed
-# acceptance-bypass reason, stamped by the loop's common forced-finalization recorder
-# when the panel was OWED (eligible) but a rail ended the task first. Both deadline
-# rails collapse to ONE reason; an unmapped rail stamps nothing — the enum stays finite
-# and no call site may mint a reason by concatenation (ledger vocabulary only, never
-# agent-visible text — the v6.61.4 token-parroting class).
+# CLOSED mapping: forced-finalization rail (the loop's typed reason_code) -> the typed
+# acceptance-bypass reason an old decision carries when a rail ended the task before an
+# OWED panel ran (both deadline rails collapse to ONE reason). The cause sentences read
+# it so a bypass and its rail are not said twice.
 ACCEPTANCE_BYPASS_REASON_BY_RAIL = {
     "budget_exhausted": "acceptance_bypassed_budget_exhausted",
     "round_limit": "acceptance_bypassed_round_limit",
@@ -189,55 +202,34 @@ ACCEPTANCE_BYPASS_REASON_BY_RAIL = {
     # task to wrap up now — its own typed reason, never the deadline's (CF-02).
     REASON_OWNER_REQUESTED_FINALIZATION: "acceptance_bypassed_owner_requested_finalization",
 }
-ACCEPTANCE_BYPASS_REASONS = frozenset(ACCEPTANCE_BYPASS_REASON_BY_RAIL.values())
 
-# v6.78.0 (owner Q23=B): the HOST acceptance decision has exactly three owner-facing
-# states, each carrying a typed `reason` drawn from facts the host already computed
-# (dialogue_status, pass_reason, panel/degraded reasons, the pacing launch reason).
-# This is the HOST decision vocabulary only — the reviewer's own PASS|FAIL|DEGRADED
-# verdict vocabulary is a different layer and is deliberately unchanged.
+# v6.78.0 (owner Q23=B): an old HOST acceptance decision carried one of three owner-facing
+# states, each with a typed `reason` (`revision_requested` was the third). This is the HOST decision vocabulary only —
+# the reviewer's own PASS|FAIL|DEGRADED verdict vocabulary is a different layer.
 ACCEPTANCE_ACCEPTED = "accepted"
-ACCEPTANCE_REVISION_REQUESTED = "revision_requested"
 ACCEPTANCE_FINALIZED_UNACCEPTED = "finalized_unaccepted"
-ACCEPTANCE_DECISION_STATUSES = (
-    ACCEPTANCE_ACCEPTED, ACCEPTANCE_REVISION_REQUESTED, ACCEPTANCE_FINALIZED_UNACCEPTED,
-)
 
-# When unresolved or cosmetic errors exist but no acceptance review ran, the
+# When unresolved or cosmetic errors other than failed reads exist but no review of the result ran, the
 # execution axis is OK yet "did it actually work?" was never judged: surface a
 # structural warning so a default-`auto` overclaim isn't displayed as clean.
 WARN_RESIDUAL_TOOL_ERRORS_WITHOUT_REVIEW = "residual_tool_errors_without_review"
-# FR3: a turn produced real effects and finished cleanly, but the agent recorded
-# NO host-attested verification (no verify_and_record receipt and no trivial
-# write/edit deliverable). A BINARY transparency flag that keeps the result solved
-# (never a downgrade — anti-oscillation), surfaced loudly on the objective axis.
+# A turn produced reviewable effects and nothing examined the result after its last effect
+# (``result_unexamined``): no executed check and no result review. A declaration that nothing
+# is machine-checkable, a confirmed path and the write itself are statements, not an
+# examination. A BINARY transparency flag that keeps the result solved (never a downgrade —
+# anti-oscillation), shown in the details, never on the headline (owner, 9 Nov 2026).
 WARN_RECEIPT_ABSENT = "receipt_absent"
-# M2 zero-grounding: the task declared a TYPED expected_output, finished cleanly,
-# but the agent did literally no tool work and produced no structured FINAL ANSWER —
-# a structural overclaim. Advisory flag (keeps solved); conservative so a normal
-# text-answer or tool-using task is never false-flagged.
-WARN_EXPECTED_OUTPUT_UNGROUNDED = "expected_output_ungrounded"
-# Receipt statuses that count as host-attested grounding (suppress receipt_absent):
-# a verify_and_record pass, an observed artifact, or an honest no_visible_machine_contract
-# declaration. NOT a fail (that is an overclaim signal, not grounding). A trivial write/
-# edit deliverable is its OWN grounding via _trace_has_write_edit_grounding (derived from
-# the trace, not a receipt), so it needs no receipt status here.
+# A check of this task failed and no later check of the same verification passed
+# (``_outcome_receipts.unreconciled_failed``): its own word, never "no receipt" (audit 11.11).
+WARN_VERIFICATION_RED = "verification_red_unreconciled"
+# Finished direct children whose results carry no recorded decision (``child_result_dispositions.undecided``).
+WARN_CHILDREN_UNDECIDED = "children_undecided"
+# Facts for the owner's details that ask nothing of the owner: the headline stays Done (9 Nov 2026).
+DETAIL_ONLY_WARNINGS = frozenset({WARN_RECEIPT_ABSENT, WARN_VERIFICATION_RED, WARN_CHILDREN_UNDECIDED})
+# The verify_and_record kinds that RUN a check whose outcome the author then sees.
+_EXAMINING_VERIFY_KINDS = frozenset({"explicit_command", "explicit_metric", "visible_verifier"})
+# Receipt statuses that are not ledger failures: a pass, an observed artifact, an honest declaration.
 _RECEIPT_GROUNDING_STATUSES = frozenset({"pass", "observed", "declared"})
-
-
-def _verification_receipt_is_grounding(receipt: Dict[str, Any]) -> bool:
-    """Whether one receipt grounds the task's declared deliverable.
-
-    ``delegation_zero_run`` is a typed lifecycle decision: it proves that the
-    configured actor deliberately closed the no-leaf branch, not that the
-    requested artifact or answer is correct.  It stays visible in the normal
-    receipt/acceptance packet, but must not suppress ``receipt_absent`` or turn a
-    lifecycle declaration into host-attested deliverable evidence.
-    """
-    return (
-        str(receipt.get("status") or "") in _RECEIPT_GROUNDING_STATUSES
-        and str(receipt.get("contract_kind") or "") != "delegation_zero_run"
-    )
 
 
 def _terminal_zero_run_receipt_present(receipts: List[Dict[str, Any]]) -> bool:
@@ -246,7 +238,7 @@ def _terminal_zero_run_receipt_present(receipts: List[Dict[str, Any]]) -> bool:
     Such a receipt is intentionally not grounding, but the local-readonly actor
     also no longer exposes the general verification tool after this terminal
     choice.  Do not inject an impossible ``call verify_and_record`` reminder;
-    the final outcome/acceptance projection still discloses missing deliverable
+    the final outcome projection still discloses missing deliverable
     grounding independently.
     """
     from ouroboros.outcome_receipt_store import terminal_zero_run_receipt
@@ -256,6 +248,7 @@ def _terminal_zero_run_receipt_present(receipts: List[Dict[str, Any]]) -> bool:
 # Historical name of the RED-reconciling statuses; the SSOT now lives next to the
 # reconciliation core it parameterizes (see `_outcome_receipts.RED_RECONCILING_STATUSES`).
 _RECEIPT_RED_RECONCILING_STATUSES = _outcome_receipts.RED_RECONCILING_STATUSES
+plan_review_awaiting = _outcome_receipts.plan_review_awaiting  # the task-row reader of `execution.plan_review`
 
 # Ledger entry statuses that do NOT count as a failure for ``summary.has_failures``.
 # SSOT: the receipt grounding statuses (pass/observed/declared) are folded in so a turn
@@ -270,7 +263,8 @@ _LEDGER_NON_FAILURE_STATUSES = (
     | frozenset({"refused_out_of_scope"})
     # tool_reported_failure: the tool RAN and answered honestly ({"ok": false} — a
     # diagnostic reporting what it was called to find). A finding, not a failure.
-    | frozenset({"tool_reported_failure"})
+    | frozenset({"tool_reported_failure"}) | _NON_EFFECT_OBSERVATION_STATUSES
+    | SAFETY_HELD_STATUSES  # a call Safety held is no failure; its execution-axis record keeps it visible
 )
 
 
@@ -293,135 +287,50 @@ def _merge_objective_warning(objective: Dict[str, Any], code: str) -> None:
         objective["warning"] = code
 
 
-def _trace_has_write_edit_grounding(llm_trace: Dict[str, Any]) -> bool:
-    """Host-derived trivial grounding (FR3): a successful non-scratch write_file/
-    edit_text IS its own file-exists receipt (the deliverable provably exists), so it
-    suppresses receipt_absent without forcing the agent to call verify_and_record for
-    a plain write. Derived from the durable trace at finalization, so no per-write
-    handler hook is needed."""
-    for call in llm_trace.get("tool_calls") or []:
+def result_unexamined(llm_trace: Dict[str, Any]) -> bool:
+    """Whether nothing examined this result since it last changed: the turn has reviewable effects
+    and, after the last of them, no executed check ran (``verify_and_record`` of a run kind, any
+    verdict: its author saw the outcome) and no result review was asked for or bound. A reviewed
+    commit as the last effect passed its change review. The finish-door notice and the
+    ``receipt_absent`` record read this one fact (P7; audit 11.11, item 18). Typed calls only,
+    never message content (P5)."""
+    effects = reviewable_effect_projection(llm_trace)
+    if not effects:
+        return False
+    last = effects[-1]
+    if last["tool"] in _EFFECT_COMMIT_TOOLS:
+        return False
+    for call in (llm_trace.get("tool_calls") or [])[last["index"] + 1:]:
         if not isinstance(call, dict) or call.get("is_error"):
             continue
-        if str(call.get("status") or "ok") not in _OK_TOOL_STATUSES:
-            continue
-        if str(call.get("tool") or "") in _ROOT_WRITE_TOOLS:
-            args = call.get("args") if isinstance(call.get("args"), dict) else {}
-            if str(args.get("root") or "active_workspace") not in _SCRATCH_ROOTS:
-                return True
-    return False
-
-
-def verification_grounding_present(
-    llm_trace: Dict[str, Any], drive_root: Any, task_id: str,
-    *, receipts: Optional[List[Dict[str, Any]]] = None,
-) -> bool:
-    """True when the turn already carries host-attested grounding — a verify_and_record
-    receipt with a grounding status, or a trivial write/edit deliverable. Read-only
-    (shared by the one-shot nudge gate and the receipt_absent flag)."""
-    receipt_rows = (
-        receipts if isinstance(receipts, list)
-        else read_verification_receipts(drive_root, task_id)
-    )
-    if any(_verification_receipt_is_grounding(receipt) for receipt in receipt_rows):
-        return True
-    return _trace_has_write_edit_grounding(llm_trace)
-
-
-def should_nudge_verification(
-    llm_trace: Dict[str, Any], drive_root: Any, task_id: str,
-    *, receipts: Optional[List[Dict[str, Any]]] = None,
-) -> bool:
-    """FR3 one-shot nudge gate: the turn produced real reviewable effects but recorded
-    NO host-attested grounding yet — ping the agent ONCE to verify_and_record before it
-    finalizes. Binary; the caller latches it so it fires at most once per task."""
-    if not turn_has_reviewable_effects(llm_trace):
-        return False
-    return not verification_grounding_present(
-        llm_trace, drive_root, task_id, receipts=receipts,
-    )
-
-
-def latest_unreconciled_failed_receipt(receipts: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Pure core: the most recent RED receipt (``status=="fail"``) with NO later genuine
-    grounding receipt for the SAME verification (a passing run-kind check or an observed
-    artifact — see ``_RECEIPT_RED_RECONCILING_STATUSES``; a later ``declared`` does NOT
-    reconcile). Returns the failing receipt, or ``None``. Structural: the typed receipt
-    status decides pass/fail, and identity is ONE typed key: the ``criterion_id`` when
-    present, else the canonical ``check`` text, else the observed ``paths`` set (owner
-    Q28=B, content-ADDRESSING — never a semantic keyword gate). Kind AND value must match,
-    so a green of another check — or one that omits the id — no longer clears a red; a red
-    with NO key at all keeps the older any-later-green rule. Advisory, never a gate.
-    The NEWEST element of the OUTSTANDING SET (``_outcome_receipts.unreconciled_failed``)
-    — never a single latest-pointer, which a newer red would let erase an older still-red
-    one. Shared SSOT by the finalize nudge and the acceptance verification_summary so the
-    reconciliation rule lives in one place."""
-    return _outcome_receipts.latest_unreconciled_failed(receipts, _RECEIPT_RED_RECONCILING_STATUSES)
-
-
-def latest_unreconciled_failed_verification(
-    drive_root: Any, task_id: str,
-    *, receipts: Optional[List[Dict[str, Any]]] = None,
-) -> Optional[Dict[str, Any]]:
-    """Disk-backed wrapper of ``latest_unreconciled_failed_receipt`` — reads the task's
-    durable receipts. Feeds the one-shot red-verification finalization nudge: finalizing over
-    your own host-attested red is a self-contradiction (Bible P3/P12), distinct from the
-    receipt_absent case."""
-    rows = receipts if isinstance(receipts, list) else read_verification_receipts(drive_root, task_id)
-    return latest_unreconciled_failed_receipt(rows)
-
-
-def latest_unreconciled_masked_pass(receipts: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Pure core (v6.52.2): the most recent PASS receipt whose check can MASK the real exit code
-    (``check_exit_masking`` flag from the verify sensor — e.g. ``... | tail``, ``|| true``), with
-    NO later CLEAN (non-masked) grounding receipt (a pass/observed whose check is not masked).
-    Returns the masked passing receipt, or ``None``. Identity is the ``criterion_id`` key when
-    the masked receipt carries one, else ANY clean grounding reconciles: its own text
-    identity is the MASKED command, which the remediation necessarily changes, so the red
-    path's check-text rule would be unclearable (``_outcome_receipts._reconciles_masked``).
-    The NEWEST element of the OUTSTANDING SET (``_outcome_receipts.unreconciled_masked``),
-    so a cleanly reconciled newer masked check no longer takes an older one with it.
-    FLAG-driven (typed receipt field); advisory only. Shared SSOT by the finalize nudge and
-    the acceptance verification_summary."""
-    return _outcome_receipts.latest_unreconciled_masked(receipts, _RECEIPT_RED_RECONCILING_STATUSES)
-
-
-def latest_unreconciled_masked_verification(
-    drive_root: Any, task_id: str,
-    *, receipts: Optional[List[Dict[str, Any]]] = None,
-) -> Optional[Dict[str, Any]]:
-    """Disk-backed wrapper of ``latest_unreconciled_masked_pass`` — feeds the one-shot ADVISORY
-    masked-check finalization nudge (the agent may still finalize). Distinct from the red nudge:
-    that fires on a RED check; this fires on a green check whose exit code may be laundered."""
-    rows = receipts if isinstance(receipts, list) else read_verification_receipts(drive_root, task_id)
-    return latest_unreconciled_masked_pass(rows)
-
-
-def latest_agent_defined_verification(
-    drive_root: Any, task_id: str,
-    *, receipts: Optional[List[Dict[str, Any]]] = None,
-) -> Optional[Dict[str, Any]]:
-    """Newest verify receipt whose criterion was AGENT-DEFINED without a stated basis
-    (v6.54.4) — feeds the one-shot advisory criterion-provenance nudge: the check
-    passed, but the success criterion was synthesized by the agent, so the agent is
-    asked once to confirm it is equivalent to what the task actually requires."""
-    rows = receipts if isinstance(receipts, list) else read_verification_receipts(drive_root, task_id)
-    return _outcome_receipts.latest_agent_defined(rows)
+        args = call.get("args") if isinstance(call.get("args"), dict) else {}
+        tool = str(call.get("tool") or "")
+        if tool == "verify_and_record" and str(args.get("contract_kind") or "") in _EXAMINING_VERIFY_KINDS:
+            return False
+        if tool == "review_change" and str(args.get("subject") or "") == "result":
+            return False
+    # Only a current bound review speaks for this result: every new delivery candidate supersedes the runs bound
+    # so far (``review_result.supersede_result_runs``), a run of an earlier version stands beside the delivered
+    # bytes as that version's, and a $0 refusal examined nothing.
+    return not any(isinstance(run, dict) and run.get("surface") == "result" and not run.get("superseded_by_revision")
+                   and not run.get("earlier_revision") and run.get("aggregate") != "NOT_DISPATCHED"
+                   for run in llm_trace.get("review_runs") or [])
 
 
 def apply_receipt_absent_flag(
     loop_outcome: Dict[str, Any], llm_trace: Dict[str, Any], drive_root: Any, task_id: str,
-    *, expected_output: str = "", receipts: Optional[List[Dict[str, Any]]] = None,
+    *, receipts: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
-    """FR3 flag (+ M2) — run by the host AFTER ``derive_loop_outcome`` and BEFORE the
-    verification ledger. Inject durable verify_and_record receipts into the trace so
-    the ledger records them, then on a clean turn (execution ok — NOT best_effort/
-    degraded/failed) flag one of two structural transparency signals on the objective
-    axis: ``receipt_absent`` (real reviewable effects but no host-attested grounding)
-    or, when there were no effects at all, the M2 ``expected_output_ungrounded`` zero-
-    grounding signal (a TYPED expected_output was declared yet the agent did no tool
-    work and produced no structured FINAL ANSWER). Both are BINARY warnings that keep
-    the result solved (never a downgrade — anti-oscillation). Applied before
-    ``outcome_axes`` is normalized so the persisted axes and the ledger agree."""
+    """Run by the host AFTER ``derive_loop_outcome`` and BEFORE the verification ledger. Inject
+    durable verify_and_record receipts into the trace so the ledger records them; then, on a clean
+    turn (execution ok — NOT best_effort/degraded/failed), flag ``receipt_absent`` when nothing
+    examined the result after it last changed (``result_unexamined``) and
+    ``verification_red_unreconciled`` when a check failed and no later check of it passed, and
+    ``children_undecided`` for finished direct children without a recorded decision. All are
+    BINARY details that keep the result solved (never a downgrade — anti-oscillation) and never
+    raise the headline (``DETAIL_ONLY_WARNINGS``). A turn without effects is never flagged: plain
+    prose can itself be the deliverable. Applied before ``outcome_axes`` is normalized so the
+    persisted axes and the ledger agree."""
     receipt_rows = (
         receipts if isinstance(receipts, list)
         else read_verification_receipts(drive_root, task_id)
@@ -431,24 +340,14 @@ def apply_receipt_absent_flag(
     axes = loop_outcome.get("outcome_axes") if isinstance(loop_outcome.get("outcome_axes"), dict) else {}
     objective = axes.get("objective") if isinstance(axes.get("objective"), dict) else None
     execution = axes.get("execution") if isinstance(axes.get("execution"), dict) else {}
-    if not isinstance(objective, dict):
+    if not isinstance(objective, dict) or str(execution.get("status") or "") != EXECUTION_OK:
         return
-    if str(execution.get("status") or "") != EXECUTION_OK:
-        return
-    if not turn_has_reviewable_effects(llm_trace):
-        # M2 zero-grounding: a declared deliverable, no tool work, no structured answer.
-        if (
-            str(expected_output or "").strip()
-            and not (llm_trace.get("tool_calls") or [])
-            and not str(loop_outcome.get("final_answer") or "").strip()
-        ):
-            _merge_objective_warning(objective, WARN_EXPECTED_OUTPUT_UNGROUNDED)
-        return
-    if verification_grounding_present(
-        llm_trace, drive_root, task_id, receipts=receipt_rows,
-    ):
-        return
-    _merge_objective_warning(objective, WARN_RECEIPT_ABSENT)
+    if result_unexamined(llm_trace):
+        _merge_objective_warning(objective, WARN_RECEIPT_ABSENT)
+    if _outcome_receipts.unreconciled_failed(receipt_rows):
+        _merge_objective_warning(objective, WARN_VERIFICATION_RED)
+    if (llm_trace.get("child_result_dispositions") or {}).get("undecided"):
+        _merge_objective_warning(objective, WARN_CHILDREN_UNDECIDED)
 
 
 def terminal_outcome_axes(
@@ -477,25 +376,47 @@ def infra_failed_axes(reason_code: str, *, lifecycle: str = "failed", review_tri
     )
 
 
-# An undisposed own delegated patch is a DEBT, not a failure: the task's own
-# derived verdicts (execution, review, objective, artifacts) are what it earned
-# and must survive, so the custody fact is ADDED as an objective warning rather
-# than replacing the axes with an infrastructure terminal.
+# An undisposed own delegated run is a DEBT beside the cause, never the cause (#1583):
+# the row keeps the reason and axes it earned, and the debt is its current
+# ``delegated_runs_unreconciled`` list plus the reconciliation envelope, healed from the
+# write side. Rows written earlier carry this code as their ``reason_code`` and objective
+# warning; readers keep those bytes and look beneath them (``recorded_cause``).
 WARN_DELEGATED_CUSTODY_UNRECONCILED = "delegated_custody_unreconciled"
 
 
-def custody_debt_axes(axes: Any) -> Dict[str, Any]:
-    """Add the custody-debt warning to derived axes without rewriting them.
+def recorded_cause(result: Any) -> str:
+    """A terminal row's own cause: its ``reason_code``, or beneath an older custody
+    stamp the typed ``outcome_axes.execution.reason_code`` (``""`` when that is missing
+    too: the cause is unrecorded, never guessed from prose)."""
+    record = result if isinstance(result, dict) else {}
+    reason = str(record.get("reason_code") or "")
+    if reason != WARN_DELEGATED_CUSTODY_UNRECONCILED:
+        return reason
+    axes = record.get("outcome_axes") if isinstance(record.get("outcome_axes"), dict) else {}
+    execution = axes.get("execution") if isinstance(axes.get("execution"), dict) else {}
+    cause = str(execution.get("reason_code") or "")
+    return "" if cause == WARN_DELEGATED_CUSTODY_UNRECONCILED else cause  # a read-back stamp is no cause
 
-    Idempotent: the overlay is applied again when the result row is stored, and
-    ``_merge_objective_warning`` already dedups. Nothing is copied onto the
-    execution axis — the debt list itself lives on the row as
-    ``delegated_runs_unreconciled`` plus the reconciliation envelope."""
-    out = copy.deepcopy(axes) if isinstance(axes, dict) and axes else {}
-    objective = out.setdefault(
-        "objective", {"status": OBJECTIVE_NOT_EVALUATED, "source": "none"})
-    _merge_objective_warning(objective, WARN_DELEGATED_CUSTODY_UNRECONCILED)
-    return out
+
+def current_custody_debt(*records: Any) -> Optional[list]:
+    """The first ``delegated_runs_unreconciled`` list a record carries (a row before its
+    event); ``None`` when none does: absence is not proof of reconciliation."""
+    return next((record["delegated_runs_unreconciled"] for record in records if isinstance(record, dict)
+                 and isinstance(record.get("delegated_runs_unreconciled"), list)), None)
+
+
+def objective_warned(objective: Any, debt: Optional[list]) -> bool:
+    """The headline's objective warning: a nonempty current debt list warns, and an older row's custody warning
+    stops counting once that list is known empty; every other warning, and one beside an absent list, keep the stored
+    word; a detail-only fact (``DETAIL_ONLY_WARNINGS``) asks nothing of the owner (9 Nov 2026). Twin:
+    log_events.js ``objectiveWarned``."""
+    objective = objective if isinstance(objective, dict) else {}
+    if debt:
+        return True
+    warnings = objective.get("warnings") if isinstance(objective.get("warnings"), list) else []
+    return any(code and code not in DETAIL_ONLY_WARNINGS
+               and not (debt is not None and code == WARN_DELEGATED_CUSTODY_UNRECONCILED)
+               for code in [objective.get("warning"), *warnings])
 
 # Tools/roots whose successful use means the turn produced reviewable work.
 # Root-aware write tools: these take a `root` arg, so the scratch-exclusion rule
@@ -508,8 +429,6 @@ _EFFECT_COMMIT_TOOLS = frozenset({"commit_reviewed", "vcs_commit_reviewed"})
 # runtime_data). Excluding by scratch — not enumerating "deliverable" roots —
 # keeps the immune gate complete as roots evolve and errs toward reviewing work.
 _SCRATCH_ROOTS = frozenset({"task_drive"})
-# Process/service tools that produce a registered deliverable when given outputs=[...].
-_EFFECT_PROCESS_TOOLS = frozenset({"run_command", "run_script", "start_service"})
 # Substantial cwd-based coding tools: none since D10 retired the SDK edit
 # gateway; the set stays so the projection shape (and its consumers) hold.
 _EFFECT_CODING_TOOLS = frozenset()
@@ -519,35 +438,40 @@ _EFFECT_CODING_TOOLS = frozenset()
 _EFFECT_INTEGRATION_TOOLS = frozenset({"integrate_subagent_patch", "integrate_delegated_patch"})
 
 
-def reviewable_effect_projection(llm_trace: Dict[str, Any]) -> List[Dict[str, Any]]:
+def reviewable_effect_projection(llm_trace: Dict[str, Any], *, observed_only: bool = False) -> List[Dict[str, Any]]:
     """Return the structured tool effects shared by review and delivery binding.
 
     Reviewable effects are a successful repo commit; a successful write_file/
     edit_text/apply_patch/edit_batch to any non-scratch root; a successful
-    run_command/run_script/start_service that declared deliverable outputs; or any
-    successful tool that registered a canonical artifact (artifact_registered — a
-    stopped service's outputs or a user_files write). Pure scratch (root=task_drive)
-    write_file/edit_text does NOT count. Cognitive-memory updates go through
+    tool that registered a canonical artifact; or a native editor's typed changed-path receipt even on error.
+    Failed capture does not erase the write, nor does that write make the call successful. Pure scratch (root=task_drive)
+    writes and a call its producer typed ``completed_no_effect`` (a write of the bytes a
+    file already held) do NOT count. Cognitive-memory updates go through
     update_identity/update_scratchpad/knowledge_write (not write tools) and are
     intentionally not effects; a light-mode generic cognitive write is
     advisory-redirected and never succeeds here. This is a P3 deterministic immune
     signal over observable runtime facts, never message-content inspection.
+    ``observed_only`` keeps calls whose outcome the host recorded (the loop always
+    stores a boolean ``is_error``; ``artifact_registered`` comes from the full
+    result): arguments without a recorded result are an intention, not production.
     """
     effects: List[Dict[str, Any]] = []
     for index, call in enumerate(llm_trace.get("tool_calls") or []):
-        if not isinstance(call, dict) or call.get("is_error"):
+        if not isinstance(call, dict):
             continue
-        if str(call.get("status") or "ok") not in _OK_TOOL_STATUSES:
+        artifact = call.get("artifact_registered") is True
+        if observed_only and not (artifact or isinstance(call.get("is_error"), bool)):
             continue
+        succeeded = not call.get("is_error") and str(call.get("status") or "ok") in _OK_TOOL_STATUSES
+        meta = call.get("tool_result_meta") if isinstance(call.get("tool_result_meta"), dict) else {}
         tool = str(call.get("tool") or "")
+        partial = tool in _ROOT_WRITE_TOOLS and bool(meta.get("changed_paths") or meta.get("changed_paths_omitted"))
+        if not (succeeded or artifact or partial) or (meta.get("operation_outcome") == "completed_no_effect" and not artifact):
+            continue  # the producer proved this call changed nothing (a same-byte write): an outcome, no effect
         args = call.get("args") if isinstance(call.get("args"), dict) else {}
-        is_effect = tool in _EFFECT_COMMIT_TOOLS or tool in _EFFECT_CODING_TOOLS or tool in _EFFECT_INTEGRATION_TOOLS
-        if tool in _ROOT_WRITE_TOOLS and str(args.get("root") or "active_workspace") not in _SCRATCH_ROOTS:
+        is_effect = succeeded and (tool in _EFFECT_COMMIT_TOOLS or tool in _EFFECT_CODING_TOOLS or tool in _EFFECT_INTEGRATION_TOOLS)
+        if (succeeded or partial) and tool in _ROOT_WRITE_TOOLS and str(args.get("root") or "active_workspace") not in _SCRATCH_ROOTS:
             is_effect = True
-        if tool in _EFFECT_PROCESS_TOOLS:
-            outputs = args.get("outputs")
-            if isinstance(outputs, list) and any(str(item or "").strip() for item in outputs):
-                is_effect = True
         # Structured flag set from the full (untruncated) tool result at capture time;
         # covers stopped-service outputs and user_files writes regardless of preview length.
         if call.get("artifact_registered"):
@@ -564,9 +488,9 @@ def reviewable_effect_projection(llm_trace: Dict[str, Any]) -> List[Dict[str, An
     return effects
 
 
-def turn_has_reviewable_effects(llm_trace: Dict[str, Any]) -> bool:
+def turn_has_reviewable_effects(llm_trace: Dict[str, Any], *, observed_only: bool = False) -> bool:
     """True when the shared structured projection contains a real effect."""
-    return bool(reviewable_effect_projection(llm_trace))
+    return bool(reviewable_effect_projection(llm_trace, observed_only=observed_only))
 
 
 def _extract_outcome_tiers(runs: List[Dict[str, Any]]) -> List[str]:
@@ -608,6 +532,7 @@ def _aggregate_outcome_tier(tiers: List[str]) -> str:
     return OUTCOME_TIER_SOLVED if tiers else ""
 
 
+from ouroboros.review_projection import AWAITING_PROJECTION  # noqa: E402 - the one word for an answer that has not arrived
 from ouroboros.review_projection import acceptance_decision_projection as _acceptance_decision_projection  # noqa: E402,F401
 
 
@@ -624,13 +549,13 @@ def _review_axis(llm_trace: Dict[str, Any]) -> Dict[str, Any]:
     selection = _outcome_receipts.select_current_review_runs(
         llm_trace.get("review_runs"),
         delivery_candidate=_trace_mapping(llm_trace, "delivery_candidate"),
-        review_decision=review_decision,
     )
     runs = selection.current_runs
     if not runs:
         axis = {
             "status": "degraded" if selection.superseded_only_acceptance_gap else "skipped",
             "eligibility": str(review_decision.get("eligibility") or "not_eligible"),
+            **({"mode": review_decision["mode"]} if review_decision.get("mode") else {}),
             "trigger": str(review_decision.get("trigger") or "not_evaluated"),
             "run_count": 0,
         }
@@ -646,8 +571,11 @@ def _review_axis(llm_trace: Dict[str, Any]) -> Dict[str, Any]:
     signals = [str(run.get("aggregate_signal") or "").upper() for run in runs]
     if "FAIL" in signals:
         status = "fail"
+    elif all(run.get("pending_finish") for run in runs):  # the author finished while its review still ran
+        status = AWAITING_PROJECTION
     elif "DEGRADED" in signals or any(bool(run.get("degraded")) for run in runs):
-        status = "degraded"
+        # A panel that was only awaited holds no verdict yet: a gap, not a degraded review.
+        status = AWAITING_PROJECTION if _outcome_receipts.review_runs_only_awaited(runs) else "degraded"
     elif "PASS" in signals:
         status = "pass"
     else:
@@ -655,12 +583,38 @@ def _review_axis(llm_trace: Dict[str, Any]) -> Dict[str, Any]:
     axis = {
         "status": status,
         "eligibility": str(review_decision.get("eligibility") or "eligible"),
+        **({"mode": review_decision["mode"]} if review_decision.get("mode") else {}),
         "trigger": str(review_decision.get("trigger") or "review_run"),
         "run_count": len(runs),
         "aggregate_signals": signals,
     }
+    if all(run.get("surface") == "result" for run in runs):
+        axis["source"] = "result_review"  # review_change(subject="result") bound to the delivered answer
+        # The author's own acceptance counts only on a current run and for the exact subject it accepted: a
+        # superseded run kept for its critique never carries its acceptance to another answer (owner, 8 Nov 2026).
+        accepted = [run for run in runs if run.get("informed_finish") and not run.get("superseded_by_revision") and (
+            not isinstance(run["informed_finish"], dict) or run["informed_finish"].get("subject_sha") == run.get("binding_hash"))]
+        if accepted and (status != "pass" or any(run.get("earlier_revision") for run in accepted)):
+            axis["author_finish"] = ("author_finish_pending" if status == AWAITING_PROJECTION else
+                                     "previous_revision_accepted" if status == "pass" else "author_finish")
+            if status == AWAITING_PROJECTION:  # the review its late verdict will be read from (``late_review_marks``)
+                axis["pending_review"] = {"record_id": str(accepted[0].get("record_id") or ""),
+                                          "subject_sha": str(accepted[0].get("binding_hash") or "")}
+        if any(run.get("enforcement") == "blocking" and run.get("dispatch_refusal") == REASON_REVIEW_CYCLES_EXHAUSTED
+               for run in runs):
+            axis["blocked_reason"] = REASON_REVIEW_CYCLES_EXHAUSTED  # no review of this result could be bought
+        if axis.get("author_finish") or axis.get("blocked_reason"):
+            # The task card's cause sentence reads the decision shape (project_dialogue / log_events twins).
+            finish = (accepted[0]["informed_finish"] if accepted else None) if axis.get("author_finish") else None
+            axis["acceptance_decision"] = {
+                "status": ACCEPTANCE_ACCEPTED if axis.get("author_finish") == "previous_revision_accepted"
+                else ACCEPTANCE_FINALIZED_UNACCEPTED, "source": "result_review",
+                "reason": axis.get("author_finish") or REASON_REVIEW_CYCLES_EXHAUSTED,
+                "enforcement": "advisory" if axis.get("author_finish") else "blocking",
+                **({"author_disposition": {"action": "finish", "rationale": finish["rationale"]}}
+                   if isinstance(finish, dict) and finish.get("rationale") else {})}
     tier = _aggregate_outcome_tier(_extract_outcome_tiers(runs))
-    if tier:
+    if tier and status != AWAITING_PROJECTION:  # a minority answer is not the panel's tier
         axis["outcome_tier"] = tier
     # Only applied host facts demote a valid non-clean PASS; legacy rows retain their projection.
     impacts = {str(run.get("enforcement_impact") or "") for run in runs
@@ -678,19 +632,29 @@ def _review_axis(llm_trace: Dict[str, Any]) -> Dict[str, Any]:
 def _objective_axis(review: Dict[str, Any]) -> Dict[str, Any]:
     status = str(review.get("status") or "skipped")
     tier = str(review.get("outcome_tier") or "")
+    if review.get("source") == "result_review" and review.get("author_finish"):
+        # The author's own informed finish, not a grade: the host derives no tier from it.
+        reason = review["author_finish"] if isinstance(review["author_finish"], str) else "author_finish"
+        return {"status": OBJECTIVE_PASS, "source": "author_acceptance", "review_status": status, "reason": reason}
+    if review.get("source") == "result_review" and review.get("blocked_reason"):
+        # Blocking enforcement with no review of this result left to buy: never approved, never green.
+        return {"status": OBJECTIVE_FAIL, "source": "result_review", "review_status": status,
+                "outcome_tier": OUTCOME_TIER_BLOCKED, "reason": str(review["blocked_reason"])}
     decision = review.get("acceptance_decision") if isinstance(review.get("acceptance_decision"), dict) else {}
     _decision_reason = str(decision.get("reason") or "")
     from ouroboros.review_records import validate_author_disposition
 
     author = validate_author_disposition(decision.get("author_disposition"))
-    if (_decision_reason == "author_finish" and author and author.get("enforcement") == "advisory"
+    local_failure = (decision.get("acceptance_incident") or {}).get("status") == "failed"
+    if (not local_failure and _decision_reason == "author_finish" and author and author.get("enforcement") == "advisory"
             and author.get("action", "finish") == "finish"):
-        return {"status": OBJECTIVE_PASS, "source": "author_acceptance", "review_status": status,
-                "outcome_tier": OUTCOME_TIER_SOLVED, "reason": "author_finish"}
+        # The author's own finish, not a grade: the host derives no tier from it.
+        return {"status": OBJECTIVE_PASS, "source": "author_acceptance", "review_status": status, "reason": "author_finish"}
     if (
         str(decision.get("status") or "") == ACCEPTANCE_FINALIZED_UNACCEPTED
         and (_decision_reason in _ACCEPTANCE_BLOCKED_TERMINAL_REASONS
-             or (decision.get("enforcement") == "blocking" and _decision_reason in {"review_degraded", "infra_failure"}))
+             or (decision.get("enforcement") == "blocking" and _decision_reason in {
+                 "review_degraded", "infra_failure", REASON_ACCEPTANCE_PREPARATION_FAILED}))
     ):
         # D27: Required+Blocking acceptance whose shared cap is spent terminalizes
         # BLOCKED, whatever tier the last (failed) review proposed. A-material
@@ -722,7 +686,7 @@ def _objective_axis(review: Dict[str, Any]) -> Dict[str, Any]:
             objective = OBJECTIVE_FAIL
         return {
             "status": objective,
-            "source": "task_acceptance_review",
+            "source": str(review.get("source") or "task_acceptance_review"),
             "review_status": status,
             "outcome_tier": tier,
         }
@@ -736,9 +700,20 @@ def _objective_axis(review: Dict[str, Any]) -> Dict[str, Any]:
         objective = OBJECTIVE_NOT_EVALUATED
     return {
         "status": objective,
-        "source": "task_acceptance_review" if objective != OBJECTIVE_NOT_EVALUATED else "none",
+        "source": str(review.get("source") or "task_acceptance_review") if objective != OBJECTIVE_NOT_EVALUATED else "none",
         "review_status": status,
     }
+
+
+def selected_final_answer(text: str, trace: Dict[str, Any]) -> str:
+    """The exact answer protocol selection shared by retention and final consumers."""
+    if any(line.strip().startswith(FINAL_ANSWER_MARKER) for line in str(text or "").splitlines()):
+        return extract_final_answer(text)  # an explicit empty selection withdraws the old answer
+    return (
+        str(trace.get("best_valid_final_answer") or "")
+        if len(trace.get("tool_calls") or []) <= int(trace.get("best_valid_final_answer_tools") or 0)
+        else ""
+    )
 
 
 def extract_final_answer(text: str) -> str:
@@ -750,9 +725,9 @@ def extract_final_answer(text: str) -> str:
 
     Structural invariant: the snake_case outcome-tier identifiers
     (``best_effort``/``blocked_with_evidence``) are internal ledger vocabulary
-    from the acceptance-review contract, never a legitimate deliverable — a
+    from the reviewers' outcome-tier contract, never a legitimate deliverable — a
     reviewed GAIA run shipped ``FINAL ANSWER: blocked_with_evidence`` verbatim
-    after an acceptance downgrade. Such an answer counts as missing so the
+    after a review downgrade. Such an answer counts as missing so the
     marker nudge / salvage path can recover a real one. ``solved`` is NOT
     rejected: it is an ordinary English word that can be a real answer.
     """
@@ -771,6 +746,34 @@ def _merge_axis(default: Dict[str, Any], value: Any) -> Dict[str, Any]:
     if isinstance(value, dict):
         merged.update(value)
     return merged
+
+
+def _advisory_procedural_refusal(axes: Dict[str, Any], result: Dict[str, Any]) -> bool:
+    """A stored task-acceptance FAIL that was only the Advisory host declining a second panel.
+
+    The record's own decision is ``identical_acceptance_refused`` under explicit
+    ``advisory`` enforcement over a verdict that was not FAIL (``degraded``), and
+    execution is ``ok`` with a nonempty retained answer, not a typed host notice.
+    Execution alone proves no answer. Under Advisory that refusal is a
+    warning, so ``normalize_outcome_axes`` reads the objective as ``best_effort``
+    with the stored status beside it; the review, its verdict and the decision
+    stay as recorded. Any other enforcement (missing included), reason, verdict
+    or execution keeps the stored fail. Twin: ``log_events.advisoryProceduralRefusal``.
+    """
+    objective, review, execution = (axes.get(key) if isinstance(axes.get(key), dict) else {}
+                                    for key in ("objective", "review", "execution"))
+    decision = review.get("acceptance_decision") if isinstance(review.get("acceptance_decision"), dict) else {}
+    signals = review.get("aggregate_signals") if isinstance(review.get("aggregate_signals"), list) else []
+    answer = result.get("result")
+    # Display views omit the body but carry this same existence fact from that row.
+    ready = (isinstance(answer, str) and bool(answer)) if "result" in result else result.get("_result_text_present") is True
+    return (ready
+            and str(result.get("terminal_origin") or "") in {"", "model_final"}
+            and execution.get("status") == EXECUTION_OK and objective.get("status") == OBJECTIVE_FAIL
+            and objective.get("source") == "task_acceptance_review"
+            and objective.get("reason") == decision.get("reason") == REASON_IDENTICAL_ACCEPTANCE_REFUSED
+            and decision.get("status") == ACCEPTANCE_FINALIZED_UNACCEPTED and decision.get("enforcement") == "advisory"
+            and review.get("status") == OBJECTIVE_DEGRADED and "FAIL" not in {str(s).upper() for s in signals})
 
 
 def normalize_outcome_axes(result: Dict[str, Any]) -> Dict[str, Any]:
@@ -812,6 +815,8 @@ def normalize_outcome_axes(result: Dict[str, Any]) -> Dict[str, Any]:
     elif not legacy and status == "failed":
         execution = EXECUTION_FAILED
         reason = reason or status
+    if str(result.get("reason_code") or "").strip() == WARN_DELEGATED_CUSTODY_UNRECONCILED:
+        reason = ""  # an older custody stamp names no execution cause (#1583): only a typed one stands
     artifact_bundle = result.get("artifact_bundle") if isinstance(result.get("artifact_bundle"), dict) else {}
     explicit_artifact_status = str(artifact_bundle.get("status") or result.get("artifact_status") or "").strip()
     artifact_status = explicit_artifact_status or "not_applicable"
@@ -840,6 +845,9 @@ def normalize_outcome_axes(result: Dict[str, Any]) -> Dict[str, Any]:
         normalized["lifecycle"]["status"] = str(result.get("status") or "")
     if explicit_artifact_status:
         normalized["artifacts"]["status"] = explicit_artifact_status
+    if _advisory_procedural_refusal(axes, result):
+        normalized["objective"] = {**normalized["objective"], "status": OBJECTIVE_BEST_EFFORT,
+                                   "ignored_status": OBJECTIVE_FAIL}
     objective = normalized.get("objective") if isinstance(normalized.get("objective"), dict) else {}
     objective_status = str(objective.get("status") or OBJECTIVE_NOT_EVALUATED)
     objective_source = str(objective.get("source") or "none")
@@ -848,7 +856,11 @@ def normalize_outcome_axes(result: Dict[str, Any]) -> Dict[str, Any]:
     plan_blocked = (objective_status == OBJECTIVE_FAIL and objective_source in {
         "plan_review_cycles_exhausted", "plan_review_quorum_unreachable", "plan_review_author_stop"}
         and objective.get("reason") in {REASON_REVIEW_CYCLES_EXHAUSTED, REASON_REVIEW_QUORUM_UNREACHABLE, "author_stop"})
-    if objective_status != OBJECTIVE_NOT_EVALUATED and objective_source != "task_acceptance_review" and not (author_current or plan_blocked):
+    stopped = objective_source == "task_completion" and (normalized["execution"].get("task_completion") or {}).get("action") == "stop"
+    # ``task_acceptance_review`` names an objective a recorded task acceptance decided (older records);
+    # ``result_review`` one a settled result review of the delivered answer decided.
+    reviewed = objective_source in {"task_acceptance_review", "result_review"}
+    if objective_status != OBJECTIVE_NOT_EVALUATED and not reviewed and not (author_current or plan_blocked or stopped):
         normalized["objective"] = {
             **objective,
             "status": OBJECTIVE_NOT_EVALUATED,
@@ -859,10 +871,10 @@ def normalize_outcome_axes(result: Dict[str, Any]) -> Dict[str, Any]:
     for key, value in axes.items():
         if key not in normalized:
             normalized[key] = value
-    # Delivery/deferred-work states are not acceptance. Keep the warning when
+    # Delivery/deferred-work states are no review verdict. Keep the warning when
     # normalization restores their objective to not_evaluated.
-    if normalized["objective"].get("status") == OBJECTIVE_NOT_EVALUATED and (
-        normalized["execution"].get("unresolved_tool_errors") or normalized["execution"].get("cosmetic_tool_errors")
+    if normalized["objective"].get("status") == OBJECTIVE_NOT_EVALUATED and warns_without_review(
+        normalized["execution"].get("unresolved_tool_errors"), normalized["execution"].get("cosmetic_tool_errors"),
     ):
         _merge_objective_warning(normalized["objective"], WARN_RESIDUAL_TOOL_ERRORS_WITHOUT_REVIEW)
     return normalized
@@ -882,6 +894,7 @@ def public_task_result(result: Dict[str, Any], *, include_outcome_axes: bool = T
                 item_key: item_value
                 for item_key, item_value in value.items()
                 if item_key not in {"result_status", "compat_result_status"}
+                and (parent is not None or item_key not in {"swarm_fanouts", "swarm_fanout_basis", "swarm_fanout_rollup"})
             }
             if parent is None:
                 public = clone
@@ -912,6 +925,11 @@ def public_task_result(result: Dict[str, Any], *, include_outcome_axes: bool = T
     from ouroboros.cost_projection import normalize_task_result_cost_planes
 
     public = normalize_task_result_cost_planes(public)
+    from ouroboros.history_retention import retention_summary
+
+    retention = retention_summary(result)
+    if retention:
+        public["history_retention"] = retention
     from ouroboros.task_finalization import terminal_host_notice_text
 
     notice = terminal_host_notice_text(public)
@@ -1012,23 +1030,7 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
     # telemetry only, never degrading and never a `tool_failure` headline.
     policy_denials = tool_error_state.get("policy_denials") or []
     delivery_candidate = _trace_mapping(llm_trace, "delivery_candidate")
-    acceptance_decision = _trace_mapping(llm_trace, "acceptance_decision")
-    review_decision = _trace_mapping(llm_trace, "review_decision")
     mutation_attribution = _trace_mapping(llm_trace, "mutation_attribution")
-    # v6.78.0: keyed on the CANONICAL status plus the typed reason (before the
-    # three-state collapse the reason literal WAS the status). Missing this pairing
-    # would silently stop degrading an eligible-but-skipped panel — a false green;
-    # keying on the status alone would degrade honest capsule_spent finalizations.
-    # The forced-rail bypass reasons (ACCEPTANCE_BYPASS_REASONS) ride the same key.
-    _acceptance_reason = str(acceptance_decision.get("reason") or "")
-    acceptance_review_skipped_eligible = (
-        str(acceptance_decision.get("status") or "") == ACCEPTANCE_FINALIZED_UNACCEPTED
-        and (
-            _acceptance_reason == REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE
-            or _acceptance_reason in ACCEPTANCE_BYPASS_REASONS
-        )
-        and str(review_decision.get("eligibility") or "") == "eligible"
-    )
     disposition_projection = _trace_mapping(llm_trace, "child_result_dispositions")
     deferred_child_count = int(disposition_projection.get("deferred_count") or 0)
     degraded_reason = str(delivery_candidate.get("degraded_reason") or "")
@@ -1063,23 +1065,25 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
         # host-fallback prefix table below already assigns to this exact
         # terminal text; calling it a provider failure made the two paths of
         # this one function contradict each other.
-        failure = {"kind": "runtime" if reason_code == REASON_TASK_EXCEPTION else "provider", "reason_code": reason_code}
-        # The overflow salvage keeps `llm_api_error`; a waited-out outage or the unknown
-        # no-resend fence may leave the same sticky kind behind under its own reason code,
-        # and the published projection must not contradict the terminal that chose it.
-        if reason_code == "llm_api_error" and str(usage.get("_last_llm_error_kind") or "") == "context_overflow":
+        failure = {"kind": "runtime" if reason_code in {
+            REASON_TASK_EXCEPTION, "context_overflow", "context_capacity", "required_reference_unavailable",
+        } else "provider", "reason_code": reason_code}
+        # Forecasts use context_overflow; actual/legacy provider failures keep llm_api_error.
+        # A waited-out outage or unknown outcome keeps its own terminal cause.
+        if reason_code in {"llm_api_error", "context_overflow"} and str(usage.get("_last_llm_error_kind") or "") == "context_overflow":
             failure["error_kind"] = "context_overflow"
     elif (
         usage_status == RESULT_FAILED
         and usage_reason in BEST_EFFORT_REASON_CODES
         and bool(usage.get("_best_effort_extracted"))
-        and text.strip()
-        and not text.lstrip().startswith(("⚠️", "❌"))
+        and (text.strip() or usage.get("wake_silent") is True)
     ):
         # Forced finalization (deadline grace / budget / round limit) that
         # actually EXTRACTED a model answer: honest best-effort, not failure.
         # Deterministic structural gate: forced reason code + the loop's typed
-        # "model answer extracted" fact + non-empty non-error text. Host
+        # "model answer extracted" fact + non-empty text or the author's typed
+        # silent selection (its words may be none). A model may begin
+        # its answer with a warning or cross; typography is not provenance. Host
         # fallback strings (e.g. budget rejection notices) never set the
         # extraction fact and stay failed — no text-shape whitewashing.
         execution_status = EXECUTION_BEST_EFFORT
@@ -1089,7 +1093,16 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
         execution_status = EXECUTION_FAILED
         reason_code = usage_reason or REASON_EMPTY_FINAL_TEXT
         failure = {"kind": "agent", "reason_code": reason_code}
-    elif not text.strip() and usage.get("presence_completion_outcome") not in {"silent", "tool_delivered"}:
+    elif (
+        (usage_status == EXECUTION_DEGRADED and usage_reason == REASON_AUTHORING_HANDOVER_INCOMPLETE)
+        or bool(llm_trace.get("authoring_handover_incomplete"))
+    ):
+        execution_status = EXECUTION_DEGRADED
+        reason_code = usage_reason or REASON_AUTHORING_HANDOVER_INCOMPLETE
+        failure = {"kind": "authoring_handover", "reason_code": reason_code}
+    elif not text.strip() and usage.get("presence_completion_outcome") not in {"silent", "tool_delivered"} \
+            and not usage.get("wake_silent"):
+        # A typed wake-silent finish is intentional, unlike an ordinary empty final.
         execution_status = EXECUTION_FAILED
         reason_code = REASON_EMPTY_FINAL_TEXT
         failure = {"kind": "agent", "reason_code": reason_code}
@@ -1119,47 +1132,14 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
             "reason_code": reason_code,
             "verification_failures": verification_failures[:20],
         }
-    # A skipped-or-bypassed eligible panel is not a verdict, but cannot remain clean;
-    # preserve stronger classifications and degrade only the false-green remainder.
-    # Honest reachability (measured, not asserted): the FORCED-rail bypass reasons
-    # cannot arrive here on an OK execution — a bypass is stamped only when the rail
-    # already wrote `usage.reason_code`, and every writer of that key also writes
-    # `execution_status='failed'` (the provider rail upgrades it to 'infra_failed'),
-    # so those runs land on the STRONGER failed/infra_failed /
-    # best_effort branches above and the owner-visible bypass rides the review axis
-    # (see test_forced_rail_axes_are_the_production_shape). What this branch actually
-    # decides is the pacing skip (REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE).
-    # The bypass keys stay in the condition as a BACKSTOP, not as a live behaviour
-    # claim: a future rail that bypasses an owed panel without failing the usage must
-    # not be able to come back as a clean green.
-    if acceptance_review_skipped_eligible and execution_status == EXECUTION_OK:
-        execution_status = EXECUTION_DEGRADED
-        reason_code = _acceptance_reason
-        failure = {
-            "kind": "task_acceptance",
-            "reason_code": reason_code,
-        }
     review = _review_axis(llm_trace)
+    if usage_reason in ACCEPTANCE_BYPASS_REASON_BY_RAIL:  # a rail ended the task before its delivery's review step
+        review.update(trigger="forced_rail", rail=usage_reason)
     objective = _objective_axis(review)
-    plan_gate = _trace_mapping(llm_trace, "force_plan_decision")
-    _plan_gate_status = str(plan_gate.get("status") or "")
-    if _plan_gate_status == "author_stopped" or (str(plan_gate.get("enforcement") or "") == "blocking" and (
-        _plan_gate_status == "cycles_exhausted"
-        or (_plan_gate_status == "open" and plan_gate.get("quorum_unreachable"))
-    )):
-        # D27: a blocking plan review whose cycle cap is spent never closed — the
-        # task terminalizes BLOCKED, never best_effort. B2b extends the same honest
-        # terminal to a structurally unreachable reviewer quorum (the agent CHOSE to
-        # finalize; the review itself stays open and implementation stayed held).
-        _quorum_case = _plan_gate_status != "cycles_exhausted"
-        objective.update({
-            "status": OBJECTIVE_FAIL,
-            "source": ("plan_review_author_stop" if _plan_gate_status == "author_stopped" else "plan_review_quorum_unreachable" if _quorum_case
-                       else "plan_review_cycles_exhausted"),
-            "outcome_tier": OUTCOME_TIER_BLOCKED,
-            "reason": (str(plan_gate.get("review_capacity_reason") or "author_stop") if _plan_gate_status == "author_stopped" else REASON_REVIEW_QUORUM_UNREACHABLE if _quorum_case
-                       else REASON_REVIEW_CYCLES_EXHAUSTED),
-        })
+    # The planning gate holds or releases the final answer; it names no objective of its
+    # own (plans have no cycle cap, no quorum and no author stop: the stop path is the
+    # task's). Its open objections and pending asks ride ``execution.plan_review`` below.
+    plan_gate = _trace_mapping(llm_trace, "plan_gate") or _trace_mapping(llm_trace, "force_plan_decision")
     if deferred_child_count and objective.get("status") != OBJECTIVE_FAIL:
         objective.update({
             "status": OBJECTIVE_BEST_EFFORT,
@@ -1174,46 +1154,22 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
         and not deferred_child_suffix
         and not forced_best_effort_with_deferred_child
         and objective.get("status") != OBJECTIVE_FAIL
-        # Delivery warning and the current acceptance verdict are independent
-        # facts. _objective_axis already selected the bound, non-superseded
-        # review; preserve that assessment without clearing delivery degradation.
-        and objective.get("source") != "task_acceptance_review"
+        # Delivery warning and a verdict under _objective_axis's default reviewed
+        # source are independent facts. _objective_axis already selected the bound,
+        # non-superseded review; preserve that assessment without clearing delivery degradation.
+        and objective.get("source") not in {"task_acceptance_review", "result_review"}
     ):
         objective.update({
             "status": OBJECTIVE_DEGRADED,
             "source": "delivery_finalization_control",
         })
-    if (
-        acceptance_review_skipped_eligible
-        and objective.get("status") == OBJECTIVE_NOT_EVALUATED
-    ):
-        objective.update({
-            "status": OBJECTIVE_DEGRADED,
-            "source": (
-                "task_acceptance_deadline_reserve"
-                if _acceptance_reason == REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE
-                else "task_acceptance_forced_bypass"
-            ),
-        })
     # Mutation attribution is evidence for the reviewing panels (attached to the
     # failure-evidence projection below), deliberately never a structural veto.
-    # Tool-call errors alone do not degrade a delivered answer's execution, so
-    # when the objective was never judged (default "auto" with no self-call ->
-    # objective not_evaluated) a real overclaim could read as clean. Surface a
-    # structural warning (not a failure) so the UI escalates it. Gating on the
-    # objective being genuinely unjudged is the honest condition: a review that
-    # ran (any verdict) already judged it. No review is auto-run, no env knob, no
-    # content inference (Bible P5).
-    if (cosmetic_tool_errors or tool_errors) and objective.get("status") == OBJECTIVE_NOT_EVALUATED:
+    # Unjudged objectives retain a structural tool-error warning, never an inferred
+    # failure or an automatic review. Any recorded critic already judged its subject.
+    if warns_without_review(cosmetic_tool_errors, tool_errors) and objective.get("status") == OBJECTIVE_NOT_EVALUATED:
         _merge_objective_warning(objective, WARN_RESIDUAL_TOOL_ERRORS_WITHOUT_REVIEW)
-    final_answer_payload = (
-        extract_final_answer(text)
-        or (
-            str(llm_trace.get("best_valid_final_answer") or "")
-            if len(llm_trace.get("tool_calls") or []) <= int(llm_trace.get("best_valid_final_answer_tools") or 0)
-            else ""
-        )
-    )
+    final_answer_payload = selected_final_answer(text, llm_trace)
     headline_reason = reason_code
     headline_failure = failure
     if (
@@ -1227,14 +1183,20 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
         # headline a completed answer-bearing task as a top-level tool failure.
         headline_reason = REASON_FINAL_MESSAGE
         headline_failure = None
+    completion = _trace_mapping(llm_trace, "task_completion")
+    if completion.get("action") == "stop" and objective.get("reason") not in {"author_stop", REASON_REVIEW_CYCLES_EXHAUSTED}:
+        objective.update(status=OBJECTIVE_FAIL, source="task_completion", reason="author_stop")
     outcome_axes = {
         "schema_version": 1,
         "lifecycle": {"status": "completed"},
         "execution": {
             "status": execution_status,
+            **({"task_completion": completion} if completion else {}),
             "reason_code": reason_code,
             "failure": failure,
             **({"resource_limit": resource_limit} if resource_limit else {}),
+            # The durable fact of a clean finish over a plan review only awaited (an unreadable record stays unknown).
+            **({"plan_review": AWAITING_PROJECTION} if execution_status == EXECUTION_OK and plan_gate.get("review_only_awaited") is True and not plan_gate.get("unreadable") else ({"plan_review": plan_gate["plan_review_class"]} if plan_gate.get("plan_review_class") else {})),
             "recoveries": recovered_tool_errors[:20],
             "cosmetic_tool_errors": cosmetic_tool_errors[:20],
             "ignored_tool_errors": ignored_tool_errors[:20],
@@ -1279,18 +1241,23 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
 def collect_trace_refs(usage: Dict[str, Any], llm_trace: Dict[str, Any]) -> Dict[str, Any]:
     # Keep received responses, including incomplete ones with unavailable capture.
     # Sparse pre-response failures stay in usage/history and raw error events.
+    # A forced rail's verdict and its reply's completion request are the trace's only record of why an answer
+    # was not adopted; the trace itself is not stored, so they ride here (``loop_forced_finalization``).
     refs: Dict[str, Any] = {}
     execution_id = str(usage.get("execution_id") or "").strip()
     if execution_id:
         refs["execution_id"] = execution_id
+    for key in ("timeout_repeat", "output_recovery", "forced_finalization", "forced_completion_request"):
+        if isinstance(llm_trace.get(key), dict):
+            refs[key] = copy.deepcopy(llm_trace[key])
     llm_refs = [
         {key: item.get(key) for key in (
             "llm_call_id", "execution_id", "round_id", "round", "request_ref",
             "response_ref", "model", "resolved_model", "provider",
-            "reported_model", "use_local", "usable_solve_response",
+            "reported_model", "use_local", "usable_solve_response", "manifest_ref",
         )}
         for item in usage.get("llm_call_refs") or []
-        if isinstance(item, dict) and (not item.get("failure_code") or "response_ref" in item)
+        if isinstance(item, dict) and (not item.get("failure_code") or "response_ref" in item or "manifest_ref" in item)
     ]
     if llm_refs:
         refs["llm_call_refs"] = llm_refs
@@ -1361,10 +1328,11 @@ def artifact_bundle_from_result(result: Dict[str, Any]) -> Dict[str, Any]:
             "errors": (list(item.get("errors") or []) if isinstance(item.get("errors"), list) else [])
                       + ([str(item["copy_error"])] if item.get("copy_error") else []),
         }
-        records.append(record)
-    if old_status == ARTIFACT_STATUS_FAILED or any(item["status"] == ARTIFACT_STATUS_FAILED for item in records):
+        records.append(record | ({"relpath": str(item["relpath"])} if item.get("relpath") else {}))
+    current_records = [item for item in records if item["kind"] != "workspace_capture_history"]
+    if old_status == ARTIFACT_STATUS_FAILED or any(item["status"] == ARTIFACT_STATUS_FAILED for item in current_records):
         status = ARTIFACT_STATUS_FAILED
-    elif status != ARTIFACT_STATUS_FAILED and any(item["status"] == "missing" for item in records):
+    elif status != ARTIFACT_STATUS_FAILED and any(item["status"] == "missing" for item in current_records):
         status = "missing"
     errors = []
     if result.get("artifact_error"):
@@ -1384,9 +1352,7 @@ def refresh_verification_ledger_artifacts(
     """Return ``ledger`` with artifact status synchronized after finalization."""
     if not isinstance(ledger, dict):
         return ledger
-    # An omitted-to-artifact stub is a PROJECTION of the artifact file, not a
-    # source: it carries no entries, so rebuilding from it would mint "0
-    # entries / no failures / execution ok" over the real ledger's summary.
+    # A stub has no entries: rebuilding from it would mint a clean "0 failures" summary.
     if ledger.get("omitted_to_artifact"):
         return ledger
     entries = [
@@ -1408,7 +1374,13 @@ def refresh_verification_ledger_artifacts(
         artifact_axis["status"] = artifact_status
         axes["artifacts"] = artifact_axis
     updated["outcome_axes"] = axes
-    updated["summary"] = {
+    updated["summary"] = _ledger_summary(entries)
+    return updated
+
+
+def _ledger_summary(entries: List[Any]) -> Dict[str, Any]:
+    """Entry count and failure flag; a recorded or draft task contract is no failure."""
+    return {
         "entry_count": len(entries),
         "has_failures": any(
             str(item.get("status") or "").lower() not in _LEDGER_NON_FAILURE_STATUSES
@@ -1417,7 +1389,6 @@ def refresh_verification_ledger_artifacts(
             if isinstance(item, dict)
         ),
     }
-    return updated
 
 
 def build_verification_ledger(
@@ -1498,7 +1469,6 @@ def build_verification_ledger(
     _review_selection = _outcome_receipts.select_current_review_runs(
         llm_trace.get("review_runs"),
         delivery_candidate=_trace_mapping(llm_trace, "delivery_candidate"),
-        review_decision=_trace_mapping(llm_trace, "review_decision"),
     )
     for run in _review_selection.all_runs:
         # Selection keeps sole stale failures fail-closed while old PASS is audit-only.
@@ -1538,15 +1508,7 @@ def build_verification_ledger(
         "task_contract": task.get("task_contract") if isinstance(task.get("task_contract"), dict) else {},
         "outcome_axes": axes,
         "entries": entries,
-        "summary": {
-            "entry_count": len(entries),
-            "has_failures": any(
-                str(item.get("status") or "").lower() not in _LEDGER_NON_FAILURE_STATUSES
-                and not (str(item.get("kind") or "") == "task_contract" and str(item.get("status") or "").lower() in {"draft", "recorded"})
-                for item in entries
-                if isinstance(item, dict)
-            ),
-        },
+        "summary": _ledger_summary(entries),
     }
 
 
@@ -1557,7 +1519,7 @@ def maybe_write_verification_artifact(
     *,
     threshold_chars: int = 12_000,
 ) -> Dict[str, Any]:
-    """Inline small ledgers; write large ledgers as task artifacts."""
+    """Inline small ledgers; write a large one as a task artifact: a dated capture finalization never rewrites."""
     raw = json.dumps(ledger, ensure_ascii=False, sort_keys=True, default=str)
     if len(raw) <= threshold_chars:
         return {"inline": ledger, "artifact": None}
@@ -1584,4 +1546,25 @@ def maybe_write_verification_artifact(
             "status": ARTIFACT_STATUS_READY,
             "errors": [],
         },
+    }
+
+
+# What a reader shows beside the summary: the capture date (a published ledger file keeps those
+# bytes) and, once the host recomputed the summary with current artifact status, when and from
+# which complete file.
+_LEDGER_VIEW_FACTS = ("created_at", "omitted_to_artifact", "summary_refreshed_at", "summary_source_sha256")
+
+
+def verification_ledger_view(ledger: Any) -> Dict[str, Any]:
+    """The bounded ledger projection of parent and list readers; {} without a ledger. A stub
+    has no entries, so its summary is the count authority; for a full ledger the two agree."""
+    if not isinstance(ledger, dict) or not ledger:
+        return {}
+    summary = ledger.get("summary") if isinstance(ledger.get("summary"), dict) else {}
+    entries = ledger.get("entries")
+    return {
+        "schema_version": ledger.get("schema_version"),
+        "summary": summary,
+        "entry_count": summary.get("entry_count", len(entries) if isinstance(entries, list) else 0),
+        **{key: ledger[key] for key in _LEDGER_VIEW_FACTS if ledger.get(key)},
     }

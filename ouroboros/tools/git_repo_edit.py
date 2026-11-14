@@ -7,12 +7,14 @@ stays the one tests monkeypatch.
 
 from __future__ import annotations
 
+import json
 import pathlib
-import subprocess
+import stat
 from typing import Dict, List, Optional
 
 from ouroboros.tools.registry import ToolContext
 from ouroboros.tool_access import ResolvedResourceBinding, canonical_data_root
+from ouroboros.tools.tool_result import publish_no_effect
 
 
 def _git():
@@ -31,28 +33,125 @@ def _git():
 _CONTENT_OMITTED_PREFIX = "<<CONTENT_OMITTED"
 
 
+def _holds_exactly(target: pathlib.Path, content: str) -> bool:
+    """The regular file already holds exactly the bytes ``write_text`` would leave (UTF-8, byte-exact). A symlink
+    (the atomic write would replace it), a link on a work path's way, or anything unreadable is not, so the ordinary
+    write decides. A work file is compared through the confined intake, never a service open of its pathname."""
+    from ouroboros import work_domain
+
+    data = content.encode("utf-8")
+    try:
+        if work_domain.is_work(target):
+            info = work_domain.lstat(target)
+            return (stat.S_ISREG(info.st_mode) and info.st_size == len(data)
+                    and work_domain.read_bytes(target, limit=len(data) + 1) == data)
+        return (not target.is_symlink() and target.is_file() and target.stat().st_size == len(data)
+                and target.read_bytes() == data)
+    except (OSError, ValueError):
+        return False
+
+
+def _unchanged_result(ctx: ToolContext, paths: List[str], base: pathlib.Path) -> str:
+    """A write whose every target already held its exact bytes changed nothing: the producer says so as the typed
+    ``completed_no_effect`` outcome, which no effect reader counts as production (owner, 8 Nov 2026)."""
+    from ouroboros.tools.tool_result import TOOL_CODE_SPECS, ToolResult, _publish_tool_result
+
+    return _publish_tool_result(ctx, ToolResult(
+        status=TOOL_CODE_SPECS["OK"].status, code="OK", meta={"operation_outcome": "completed_no_effect"},
+        text=f"✅ Unchanged: {', '.join(paths)} already held exactly this content; nothing was written.\n"
+             f"Resolved root: {base}"))
+
+
+_RECEIPT_BYTES = 7168  # the receipt's share of the 8192 encoded bytes a typed result's producer meta may hold
+_PATH_LIST_BYTES = 4096  # one path list's share of it
+
+
+def _bounded_paths(key: str, paths: List[str], budget: int) -> tuple:
+    """``({key: kept, key_omitted?: n}, bytes used)``: the paths that fit ``budget`` as the typed result encodes them."""
+    kept: List[str] = []
+    size = 2
+    for rel in paths:
+        encoded_size = len(json.dumps(rel, ensure_ascii=True)) + 1
+        if size + encoded_size > budget:
+            break
+        kept.append(rel)
+        size += encoded_size
+    return {key: kept, **({f"{key}_omitted": len(paths) - len(kept)} if len(kept) < len(paths) else {})}, size
+
+
+def _with_path_facts(ctx: ToolContext, tool_name: str, text: str, base: pathlib.Path,
+                     changed: List[str], unchanged: List[str] = ()) -> str:
+    """The editor's typed receipt of what its call did to its targets: ``changed_paths``, the files it wrote or deleted
+    exactly as its binding resolved them at write time, and ``unchanged_paths``, those it found already holding their
+    exact bytes, both relative to ``resolved_root`` (the binding's resolved base). A reader takes production from this
+    receipt, never from the call's arguments resolved again later: a link retargeted since the write would name a
+    file the call never touched (Astra, 10 Nov 2026). Beyond the typed-result byte budget a list says it is
+    incomplete; an omitted path is never inferred. The text keeps its own classification."""
+    if not changed and not unchanged:
+        return text
+    from ouroboros.tools.tool_result import LegacyTextResultAdapter, _publish_tool_result, _replace_tool_result
+
+    root = str(base)
+    budget = _RECEIPT_BYTES - len(json.dumps(root, ensure_ascii=True)) - 128  # keys and counts
+    if budget <= 0:  # no room even to name the base: no receipt, so its reader names the gap
+        return text
+    changed_meta, used = _bounded_paths("changed_paths", list(changed), min(_PATH_LIST_BYTES, budget))
+    unchanged_meta = _bounded_paths("unchanged_paths", list(unchanged), min(_PATH_LIST_BYTES, budget - used))[0] \
+        if unchanged else {}
+    return _publish_tool_result(ctx, _replace_tool_result(LegacyTextResultAdapter.from_text(tool_name, text),
+                                                          meta_updates={"resolved_root": root, **changed_meta,
+                                                                        **unchanged_meta}))
+
+
+def _land_repo_bytes(target: pathlib.Path, content: str, *, append: bool = False) -> None:
+    """Land repo file bytes at ``target``.
+
+    A work-domain path is written AS THE WORK DOMAIN (``work_domain.write_text``): the pinned container
+    resolves and opens it, so an employee's ancestor swap reaches only the work domain and never a service root
+    the mapping does not carry, and the parent folder is made there too. The service's own paths (its checkout,
+    its data) keep the exact atomic overwrite and non-atomic append they always had."""
+    from ouroboros import work_domain
+
+    if work_domain.is_work(target):
+        work_domain.write_text(target, content, append=append)
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if append:
+        with target.open("a", encoding="utf-8", newline="") as fh:
+            fh.write(content)  # append is intentionally NOT atomized
+    else:
+        _git().write_text(target, content)
+
+
 def _check_shrink_guard(
     binding: ResolvedResourceBinding,
     new_content: str,
     force: bool = False,
+    *,
+    recovery: str = "",
 ) -> Optional[str]:
-    """Block likely accidental tracked-file truncation unless force=True."""
+    """Block likely accidental tracked-file truncation unless force=True.
+
+    ``recovery`` replaces the full-write next step; exact editors pass
+    ``edit_ops.EXACT_EDIT_SHRINK_RECOVERY``."""
     from ouroboros.runtime_mode_policy import mode_has_unrestricted_agency
 
     if force or mode_has_unrestricted_agency(_git()._current_runtime_mode()):
         return None
+    from ouroboros import work_domain  # a work file is read, and its Git run, as the work domain
+
     try:
         target = binding.target_path
         file_path = _git()._binding_repo_rel(binding)
-        if not target.exists():
+        if not work_domain.exists(target):
             return None
-        result = subprocess.run(
+        result = work_domain.run(
             ["git", "ls-files", "--error-unmatch", _git().safe_relpath(file_path)],
             cwd=str(binding.base_path), capture_output=True, text=True,
         )
         if result.returncode != 0:
             return None
-        old_content = target.read_text(encoding="utf-8")
+        old_content = work_domain.read_text(target)
         old_len = len(old_content)
         new_len = len(new_content)
         if old_len > 0 and new_len < old_len * 0.7:
@@ -60,8 +159,8 @@ def _check_shrink_guard(
             return (
                 f"⚠️ WRITE_BLOCKED: new content for '{file_path}' is {pct}% of original "
                 f"({old_len} -> {new_len} chars). This looks like accidental truncation. "
-                f"Use edit_text for surgical edits, or pass force=true to confirm "
-                f"intentional rewrite."
+                + (recovery or "Use edit_text for surgical edits, or pass force=true to confirm "
+                   "intentional rewrite.")
             )
     except Exception:
         pass
@@ -87,19 +186,19 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
     if files:
         for entry in files:
             if not isinstance(entry, dict):
-                return "⚠️ WRITE_ERROR: each item in files must be {path, content}."
+                return publish_no_effect(ctx, "⚠️ WRITE_ERROR: each item in files must be {path, content}.", tool_name="write_file")
             p = entry.get("path", "").strip()
             c = entry.get("content", "")
             if not p:
-                return "⚠️ WRITE_ERROR: every file entry must have a non-empty 'path'."
+                return publish_no_effect(ctx, "⚠️ WRITE_ERROR: every file entry must have a non-empty 'path'.", tool_name="write_file")
             write_list.append({"path": p, "content": c})
     elif path and content is not None:
         write_list.append({"path": path.strip(), "content": content})
     else:
-        return "⚠️ WRITE_ERROR: provide either (path + content) or files array."
+        return publish_no_effect(ctx, "⚠️ WRITE_ERROR: provide either (path + content) or files array.", tool_name="write_file")
 
     if not write_list:
-        return "⚠️ WRITE_ERROR: nothing to write."
+        return publish_no_effect(ctx, "⚠️ WRITE_ERROR: nothing to write.", tool_name="write_file")
 
     try:
         if _resolved_binding is None:
@@ -155,14 +254,15 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
             if force:
                 syntax_bypass_notes.append(f"{rel_path}: {syntax_err}")
                 continue
-            return (
+            return publish_no_effect(ctx, (
                 f"⚠️ WRITE_BLOCKED_SYNTAX: {syntax_err} for '{e['path']}'. "
                 "Nothing was written. Fix the content, or pass force=true for an "
                 "intentionally invalid file."
-            )
+            ), tool_name="write_file")
 
     written = []
     written_paths: List[str] = []
+    unchanged: List[str] = []  # already held exactly this content: not rewritten, not captured as a new result
     overwrite_diffs: List[str] = []
     capture_notes: List[str] = []
     from ouroboros.workspace_file_outputs import capture_known_workspace_outputs
@@ -181,13 +281,13 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
                     mutation_root=binding_items[0].base_path,
                     source_tool="write_file",
                 )
-            return "\n".join([shrink_warning, *([f"Successfully written: {', '.join(written)}"] if written else []), *capture_notes])
+            return _with_path_facts(ctx, "write_file", "\n".join([
+                shrink_warning, *([f"Successfully written: {', '.join(written)}"] if written else []), *capture_notes]),
+                binding_items[0].base_path, written_paths, unchanged)
         try:
             target = binding.target_path
-            target.parent.mkdir(parents=True, exist_ok=True)
             if mode == "append":
-                with target.open("a", encoding="utf-8", newline="") as fh:
-                    fh.write(e["content"])  # append is intentionally NOT atomized
+                _land_repo_bytes(target, e["content"], append=True)
                 written.append(f"{display_root}:{rel_path} (+{len(e['content'])} chars appended)")
                 written_paths.append(rel_path)
                 note = capture_known_workspace_outputs(
@@ -196,13 +296,18 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
                 if note:
                     capture_notes.append(note)
                 continue
+            if _holds_exactly(target, e["content"]):
+                unchanged.append(rel_path)
+                continue
             old_content: Optional[str] = None
-            if target.exists():
+            from ouroboros import work_domain  # the previous bytes of a work file: confined intake
+
+            if work_domain.exists(target):
                 try:
-                    old_content = target.read_text(encoding="utf-8")
+                    old_content = work_domain.read_text(target)
                 except Exception:
                     old_content = None
-            _git().write_text(target, e["content"])
+            _land_repo_bytes(target, e["content"])
             written.append(f"{display_root}:{rel_path} ({len(e['content'])} chars)")
             written_paths.append(rel_path)
             note = capture_known_workspace_outputs(
@@ -223,12 +328,14 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
                     source_tool="write_file",
                 )
             already = ", ".join(written) if written else "(none)"
-            return (
+            return _with_path_facts(ctx, "write_file", (
                 f"⚠️ FILE_WRITE_ERROR on '{e['path']}': {exc}\n"
                 f"Successfully written before error: {already}"
                 + ("\n" + "\n".join(capture_notes) if capture_notes else "")
-            )
+            ), binding_items[0].base_path, written_paths, unchanged)
 
+    if unchanged and not written:
+        return _unchanged_result(ctx, [f"{display_root}:{rel}" for rel in unchanged], binding_items[0].base_path)
     _git()._invalidate_advisory(
         ctx,
         changed_paths=written_paths,
@@ -252,9 +359,11 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
     else:
         result = (
             f"✅ Written {len(written)} file(s): {summary}\n"
-            "Files are on disk but NOT committed. Run commit_reviewed when ready.\n"
-            "⚠️ Advisory pre-review is now stale — run preflight_review before commit_reviewed."
+            "Files are on disk but NOT committed. Run commit_reviewed when ready."
         )
+    if unchanged:
+        result += "\nUnchanged, not rewritten (already held exactly this content): " + ", ".join(
+            f"{display_root}:{rel}" for rel in unchanged)
     result += f"\nResolved root: {binding_items[0].base_path}"
     if syntax_bypass_notes:
         result += (
@@ -271,10 +380,15 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
             "\nℹ️ Native seed boundary: system_repo/skills changed; the installed "
             "data/skills/native copy remains unchanged until launcher reseed."
         )
+    from ouroboros.review import diff_pulse
+
+    pulse = diff_pulse(binding_items[0].base_path, written_paths) if system_target else ""
+    if pulse:
+        result += "\n" + pulse
     protected_written = _git().protected_paths_in(written_paths) if system_target else []
     if protected_written and _git().mode_allows_protected_write(_git()._current_runtime_mode()):
         result += "\n\n" + _git().core_patch_notice(protected_written)
-    return result
+    return _with_path_facts(ctx, "write_file", result, binding_items[0].base_path, written_paths, unchanged)
 
 
 def _str_replace_editor(
@@ -290,9 +404,9 @@ def _str_replace_editor(
 ) -> str:
     """Replace exactly one occurrence of old_str with new_str in a file."""
     if not path or not path.strip():
-        return "⚠️ STR_REPLACE_ERROR: path is required."
+        return publish_no_effect(ctx, "⚠️ EDIT_TEXT_ERROR: path is required.", tool_name="edit_text")
     if not old_str:
-        return "⚠️ STR_REPLACE_ERROR: old_str is required (cannot be empty)."
+        return publish_no_effect(ctx, "⚠️ EDIT_TEXT_ERROR: old_str is required (cannot be empty).", tool_name="edit_text")
 
     existing_tc = _git().normalize_task_constraint(getattr(ctx, "task_constraint", None))
     data_skill_target = None
@@ -311,7 +425,7 @@ def _str_replace_editor(
             drive_root=pathlib.Path(ctx.drive_root),
         )
         if short_form.error:
-            return f"⚠️ STR_REPLACE_ERROR: {short_form.error}"
+            return f"⚠️ EDIT_TEXT_ERROR: {short_form.error}"
         synth = short_form.constraint
         redirect_err = _git().cross_skill_redirect_error(existing_tc, synth)
         if redirect_err:
@@ -323,7 +437,7 @@ def _str_replace_editor(
             target = _git().resolve_payload_path(pathlib.Path(ctx.drive_root), task_constraint, path)
             data_skill_target = target
         except ValueError as e:
-            return f"⚠️ STR_REPLACE_ERROR: {e}"
+            return f"⚠️ EDIT_TEXT_ERROR: {e}"
         if _git().is_skill_control_plane_path(target, pathlib.Path(ctx.drive_root).resolve(strict=False)):
             return (
                 "⚠️ STR_REPLACE_BLOCKED: skill provenance, launcher seed, "
@@ -367,33 +481,43 @@ def _str_replace_editor(
             action="edit",
         )
 
-    if not target.exists():
-        return f"⚠️ STR_REPLACE_ERROR: file not found: {path}"
+    from ouroboros import work_domain  # a work file is read through the confined intake, never a service open
+
+    if not work_domain.exists(target):
+        return publish_no_effect(ctx, f"⚠️ EDIT_TEXT_ERROR: file not found: {path}", tool_name="edit_text")
 
     try:
-        content = target.read_text(encoding="utf-8")
+        content = work_domain.read_text(target)
     except Exception as e:
-        return f"⚠️ STR_REPLACE_ERROR: cannot read {path}: {e}"
+        return publish_no_effect(ctx, f"⚠️ EDIT_TEXT_ERROR: cannot read {path}: {e}", tool_name="edit_text")
 
     # Shared exact-match single-replacement (deferral 4): identical count==0/count>1
     # feedback for the repo and data-plane editors.
-    new_content, _match_err = _git()._str_match_replace(content, old_str, new_str, path, "STR_REPLACE_ERROR")
+    new_content, _match_err = _git()._str_match_replace(content, old_str, new_str, path, "EDIT_TEXT_ERROR")
     if _match_err:
-        return _match_err
-    if data_skill_target is not None:
+        return publish_no_effect(ctx, _match_err, tool_name="edit_text")
+    if new_content == content and _holds_exactly(target, new_content):
+        return _unchanged_result(ctx, [f"{display_root}:{rel_path}"], invalidation_root)
+    from ouroboros.tools.edit_ops import (
+        EXACT_EDIT_SHRINK_RECOVERY,
+        _edit_content_block,
+        edit_syntax_note,
+        newline_normalization_note,
+    )
+
+    newline_note = newline_normalization_note(target)
+    if binding is not None and (content_block := _edit_content_block(binding, new_content, force)):
+        return publish_no_effect(ctx, content_block, tool_name="edit_text")
+    syntax_note = edit_syntax_note(binding, new_content)
+    if binding is None and data_skill_target is not None:
         # Deferral 5: a data-plane skill payload edited via the active_workspace route gets
-        # the SAME shrink guard as the root=skill_payload editor — no silent >30% truncation
-        # of a payload file. (Intentional large rewrites go through root=skill_payload, which
-        # carries the force escape hatch.)
+        # the SAME shrink guard, force confirmation and exact-edit next step as the
+        # root=skill_payload editor — no silent >30% truncation of a payload file.
         from ouroboros.tools.core import _check_data_shrink_guard
 
-        _shrink_block = _check_data_shrink_guard(target, new_content, force)
+        _shrink_block = _check_data_shrink_guard(target, new_content, force, recovery=EXACT_EDIT_SHRINK_RECOVERY)
         if _shrink_block:
-            return _shrink_block
-    elif binding is not None:
-        _shrink_block = _git()._check_shrink_guard(binding, new_content, force)
-        if _shrink_block:
-            return _shrink_block
+            return publish_no_effect(ctx, _shrink_block, tool_name="edit_text")
     # X3 hash-bind: the ADMITTED repair task's payload edits CAS-check the
     # repair's own hash chain; drift outside the repair is a typed stale
     # terminalization, never a silent write over foreign changes.
@@ -416,9 +540,18 @@ def _str_replace_editor(
         if _cas:
             return _cas
     try:
-        _git().write_text(target, new_content)
+        _land_repo_bytes(target, new_content)
     except Exception as e:
-        return f"⚠️ STR_REPLACE_ERROR: write failed for {path}: {e}"
+        try:
+            changed_after_error = work_domain.read_text(target) != content
+        except OSError:
+            changed_after_error = True
+        if changed_after_error:
+            from ouroboros.tools.edit_ops import _partial_write_failure
+
+            return _partial_write_failure(ctx, [rel_path], "edit_text", "EDIT_TEXT_ERROR",
+                                          f"write failed for {path}: {e}", binding)
+        return f"⚠️ EDIT_TEXT_ERROR: write failed for {path}: {e}"
     from ouroboros.workspace_file_outputs import capture_known_workspace_outputs
 
     capture_note = capture_known_workspace_outputs(
@@ -431,12 +564,11 @@ def _str_replace_editor(
             canonical_data_root(ctx), _repair_cas_constraint,
             task_id=str(getattr(ctx, "task_id", "") or ""))
 
-    replacement_line = new_content[:new_content.index(new_str)].count('\n') + 1
-    context_start = max(0, replacement_line - 3)
-    context_lines = new_content.splitlines()[context_start:replacement_line + len(new_str.splitlines()) + 2]
-    context_preview = "\n".join(
-        f"{context_start + i + 1:>4}| {line}" for i, line in enumerate(context_lines)
-    )
+    from ouroboros.tools.edit_ops import edit_source_line, numbered_edit_preview
+
+    replacement_offset = content.index(old_str)
+    replacement_line = edit_source_line(content, replacement_offset)
+    context_preview = numbered_edit_preview(new_content, [replacement_offset])
 
     _git()._invalidate_advisory(
         ctx,
@@ -459,7 +591,7 @@ def _str_replace_editor(
         from ouroboros.tools.edit_ops import workspace_edit_note
         result += "\n" + workspace_edit_note(ctx)
     elif system_target:
-        result += "\nRun commit_reviewed when ready.\n⚠️ Advisory pre-review is now stale — run preflight_review before commit_reviewed."
+        result += "\nRun commit_reviewed when ready."
     elif data_skill_target is not None:
         result += "\nRun skill_review for this skill before enabling or declaring it ready."
     if system_target and pathlib.PurePosixPath(rel_path).parts[:1] == ("skills",):
@@ -467,6 +599,15 @@ def _str_replace_editor(
             "\nℹ️ Native seed boundary: system_repo/skills changed; the installed "
             "data/skills/native copy remains unchanged until launcher reseed."
         )
+    from ouroboros.review import diff_pulse
+
+    pulse = diff_pulse(binding.base_path, [rel_path]) if system_target and binding is not None else ""
+    if pulse:
+        result += "\n" + pulse
+    if newline_note:
+        result += f"\n{newline_note}"
+    if syntax_note:
+        result += f"\n{syntax_note}"
     if system_target and _git().is_protected_runtime_path(norm) and _git().mode_allows_protected_write(_git()._current_runtime_mode()):
         result += "\n\n" + _git().core_patch_notice([norm])
-    return result
+    return _with_path_facts(ctx, "edit_text", result, binding.base_path, [rel_path]) if binding is not None else result

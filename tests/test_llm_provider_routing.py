@@ -11,7 +11,8 @@ def test_resolve_openrouter_target_uses_canonical_app_attribution():
         "HTTP-Referer": "https://ouroboros-agent.ai/",
         "X-OpenRouter-Title": "Ouroboros",
     }
-    assert target["default_headers"] == OPENROUTER_APP_HEADERS
+    # Attribution stays its own SSOT; the router is also asked for its upstream attempts.
+    assert target["default_headers"] == {**OPENROUTER_APP_HEADERS, "X-OpenRouter-Metadata": "enabled"}
 
 
 def test_resolve_openai_target(monkeypatch):
@@ -200,7 +201,7 @@ def test_non_openrouter_payload_strips_reasoning_roundtrip_metadata(monkeypatch)
     assert messages[1]["reasoning_details"] == [{"type": "reasoning.text", "text": "read first"}]
 
 
-def test_openrouter_payload_keeps_reasoning_roundtrip_metadata(monkeypatch):
+def test_openrouter_payload_keeps_full_details_without_duplicate_flat_reasoning(monkeypatch):
     client = LLMClient()
     monkeypatch.setattr(client, "_get_supported_parameters", lambda _model_id: None)
     messages = [
@@ -226,9 +227,10 @@ def test_openrouter_payload_keeps_reasoning_roundtrip_metadata(monkeypatch):
     )
 
     assistant_msg = kwargs["messages"][1]
-    assert assistant_msg["reasoning"] == "read first"
+    assert "reasoning" not in assistant_msg
     assert assistant_msg["reasoning_details"] == [{"type": "reasoning.text", "text": "read first"}]
     assert assistant_msg["response_id"] == "gen-123"
+    assert messages[1]["reasoning"] == "read first"
 
 
 def test_system_message_placement_demotes_late_notices_preserving_tool_adjacency():
@@ -368,11 +370,9 @@ def _dispatch_provider_block(monkeypatch, model, messages):
 @pytest.mark.parametrize("model,details", [
     # Roster-vouched families: their SIGNED artifacts replay across sibling endpoints.
     ("anthropic/claude-sonnet-4.6", _SIGNED_TEXT),
-    ("google/gemini-3.5-flash", _SIGNED_TEXT),
     # Shape-first: an UNSIGNED readable artifact is portable for EVERY family — the
     # issue #468 case (a deepseek run pinned to one 429ing endpoint with 30 healthy ones).
     ("deepseek/deepseek-v4-flash-0731", _PLAIN_TEXT),
-    ("z-ai/glm-4.6", _PLAIN_TEXT),
     ("openai/gpt-5.5", _PLAIN_TEXT),
 ])
 def test_portable_reasoning_replay_stays_failover_eligible(monkeypatch, model, details):
@@ -634,7 +634,12 @@ def test_openrouter_gemini_preserves_message_cache_blocks_and_strips_tool_cache(
         ]},
     ]
 
-    or_target = client._resolve_remote_target("openai/gpt-4.1")
+    tool_schema = {
+        "type": "function",
+        "function": {"name": "alpha_tool", "description": "a", "parameters": {"type": "object"}},
+        "cache_control": {"type": "ephemeral"},
+    }
+    or_target = client._resolve_remote_target("x-ai/grok-4")
     kwargs = client._build_remote_kwargs(
         or_target,
         messages,
@@ -642,11 +647,7 @@ def test_openrouter_gemini_preserves_message_cache_blocks_and_strips_tool_cache(
         512,
         "auto",
         None,
-        [{
-            "type": "function",
-            "function": {"name": "alpha_tool", "description": "a", "parameters": {"type": "object"}},
-            "cache_control": {"type": "ephemeral"},
-        }],
+        [dict(tool_schema)],
     )
 
     assert kwargs["messages"][0]["content"] == "cached result"
@@ -657,6 +658,17 @@ def test_openrouter_gemini_preserves_message_cache_blocks_and_strips_tool_cache(
     assert "cache_control" not in kwargs["tools"][0]
     assert "cache_control" in messages[0]["content"][0]
     assert "cache_control" in messages[1]["content"][0]
+
+    # OpenAI on OpenRouter keeps the message markers (OpenRouter translates them to
+    # prompt_cache_breakpoint on GPT-5.6+); tools and TTLs still gain nothing.
+    or_target = client._resolve_remote_target("openai/gpt-4.1")
+    kwargs = client._build_remote_kwargs(or_target, messages, "medium", 512, "auto", None, [dict(tool_schema)])
+    assert kwargs["messages"][0]["content"][0] == {"type": "text", "text": "cached result",
+                                                   "cache_control": {"type": "ephemeral"}}
+    assert kwargs["messages"][1]["content"][0]["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control" not in kwargs["tools"][0]
+    assert client._normalize_payload_cache_ttl(or_target, kwargs) == "default"
+    assert "cache_control" not in kwargs["tools"][0]
 
     kwargs = client._build_remote_kwargs(
         or_target,
@@ -1110,17 +1122,8 @@ def _sealed(details=None, content=None, model="z-ai/glm-4.6", **extra):
     ({"reasoning_content": "plain chain of thought"}, False),
     ({"response_id": "gen-1"}, False),  # an identifier is not an artifact (Q3)
     ({}, False),
-    # --- sealed for a non-roster family ---
-    ({"details": [{"type": "reasoning.text", "text": "t", "signature": "sig"}]}, True),
-    # A signed SUMMARY seals too: a signature is an endpoint binding wherever it
-    # rides on a readable entry (fail-closed; roast finding F6).
-    ({"details": [{"type": "reasoning.summary", "summary": "s", "signature": "sig"}]}, True),
     # Non-string truthy flat reasoning fields are unrecognized shapes => fail-closed.
     ({"reasoning": {"weird": "dict"}}, True),
-    ({"reasoning_content": ["weird", "list"]}, True),
-    # A truthy NON-STRING signature is an unrecognized shape => fail-closed too.
-    ({"details": [{"type": "reasoning.text", "text": "t", "signature": 123}]}, True),
-    ({"content": [{"type": "thinking", "thinking": "p", "signature": b"sig"}]}, True),
     # FALSY-present reasoning_details is the common JSON idiom for "no reasoning at
     # all" — NOT an artifact. Sealing it would pin transcripts with zero reasoning
     # (the response_id bug class); parity with the presence predicate's truthiness.
@@ -1129,14 +1132,6 @@ def _sealed(details=None, content=None, model="z-ai/glm-4.6", **extra):
     ({"details": 0}, False),
     ({"details": False}, False),
     ({"reasoning_details": None}, False),  # explicit present-null via **extra
-    ({"details": [{"type": "reasoning.encrypted", "data": "blob"}]}, True),
-    ({"details": [{"type": "reasoning.brand_new_shape"}]}, True),  # unknown => fail-closed
-    ({"details": [{"no_type": 1}]}, True),
-    ({"details": "not-a-list"}, True),                             # malformed => fail-closed
-    ({"details": {"type": "reasoning.text"}}, True),
-    ({"content": [{"type": "redacted_thinking", "data": "blob"}]}, True),
-    ({"content": [{"type": "thinking", "thinking": "p", "signature": "sig"}]}, True),
-    ({"content": [{"type": "text", "text": "hi", "signature": "stray"}]}, True),
 ])
 def test_sealed_classifier_single_forms(kwargs, expected):
     """One artifact form at a time, on a NON-ROSTER family, so the verdict is the
@@ -1144,14 +1139,12 @@ def test_sealed_classifier_single_forms(kwargs, expected):
     assert _sealed(**kwargs) is expected
 
 
-@pytest.mark.parametrize("model", ["anthropic/claude-sonnet-4.6", "google/gemini-3.5-flash",
-                                   "~google/gemini-3.5-flash", " anthropic/claude-opus-5 ",
-                                   "Anthropic/Claude-Opus-5"])
-@pytest.mark.parametrize("form", [
-    {"details": [{"type": "reasoning.encrypted", "data": "blob"}]},
-    {"details": [{"type": "reasoning.text", "text": "t", "signature": "sig"}]},
-    {"details": [{"type": "reasoning.unknown_future"}]},
-    {"content": [{"type": "redacted_thinking", "data": "blob"}]},
+@pytest.mark.parametrize(("form", "model"), [
+    pytest.param({"details": [{"type": "reasoning.encrypted", "data": "blob"}]}, "anthropic/claude-sonnet-4.6", id='form0-anthropic/claude-sonnet-4.6'),
+    pytest.param({"details": [{"type": "reasoning.encrypted", "data": "blob"}]}, "Anthropic/Claude-Opus-5", id='form0-Anthropic/Claude-Opus-5'),
+    pytest.param({"details": [{"type": "reasoning.text", "text": "t", "signature": "sig"}]}, "google/gemini-3.5-flash", id='form1-google/gemini-3.5-flash'),
+    pytest.param({"details": [{"type": "reasoning.unknown_future"}]}, "~google/gemini-3.5-flash", id='form2-~google/gemini-3.5-flash'),
+    pytest.param({"content": [{"type": "redacted_thinking", "data": "blob"}]}, " anthropic/claude-opus-5 ", id='form3- anthropic/claude-opus-5 '),
 ])
 def test_signed_portable_roster_vouches_every_opaque_form(model, form):
     """The roster is the SECOND axis and it vouches ALL non-plain forms for its

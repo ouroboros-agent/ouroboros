@@ -90,6 +90,7 @@ class WireUsageDisclosure:
     ladder_ordinal: int
     applied_actions: Tuple[Mapping[str, Any], ...]
     task_local: bool = False
+    original_requested_effort: str | None = None
 
     @classmethod
     def from_candidate(
@@ -115,6 +116,7 @@ class WireUsageDisclosure:
             ladder_ordinal=candidate.ladder_ordinal,
             applied_actions=candidate.disclosed_actions(),
             task_local=candidate.task_local,
+            original_requested_effort=(physical_attempt.effort or {}).get("requested"),
         )
 
     def __post_init__(self) -> None:
@@ -156,6 +158,11 @@ class WireUsageDisclosure:
         return {
             "requested_effort": self.requested_effort,
             "applied_effort": self.applied_effort,
+            "original_requested_effort": self.original_requested_effort,
+            "requested_effort_source": "provider_projection",
+            "applied_effort_source": "sent_candidate",
+            "reported_effort": None,
+            "reported_effort_source": None,
             "requested_tool_dialect": self.requested_tool_dialect,
             "applied_tool_dialect": self.applied_tool_dialect,
             "reason_code": self.reason_code,

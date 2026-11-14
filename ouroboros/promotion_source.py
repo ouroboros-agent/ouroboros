@@ -15,7 +15,8 @@ def _source_project_id(source: str, is_git: bool) -> str:
 
 
 def resolve_promote_source(
-    ctx: Any, source: str, project_id: str,
+    ctx: Any, source: str, project_id: str, *, project_name: str = "",
+    admission_basis_out: dict | None = None,
 ) -> Tuple[str, str, str, str, bool]:
     """Attach/clone only after the supervisor has admitted an executor.
 
@@ -27,7 +28,10 @@ def resolve_promote_source(
     the project row — the promote continuation carries it so the one
     workers-side ``project_started`` announce still fires for a creation that
     happened in this off-loop half (owner 2=A: it is the same agent-initiated
-    promote flow).
+    promote flow). ``project_name`` is the display name the model gave: this
+    half registers the row FIRST, and a later named ``create_project`` returns
+    the existing row untouched, so a name withheld here is lost for good and
+    the Project shows its id (``proj_<digest>`` for a non-Latin name).
     """
     from ouroboros.config import DATA_DIR
     from ouroboros.project_sources import clone_project_repo, valid_git_url, validate_attach_path
@@ -40,9 +44,10 @@ def resolve_promote_source(
     is_git = valid_git_url(src)
     pid = pid or _source_project_id(src, is_git)
     try:
-        from ouroboros.projects_registry import get_reserved_project
+        from ouroboros.projects_registry import project_admission_view
 
-        existing = get_reserved_project(drive_root, pid)
+        basis = project_admission_view(drive_root, pid, allow_unregistered=True)
+        existing = basis["project"]
     except Exception as exc:
         return "", "", f"project_lookup_failed: {type(exc).__name__}: {exc}", pid, False
     lifecycle = str((existing or {}).get("lifecycle") or "active")
@@ -85,25 +90,30 @@ def resolve_promote_source(
             f"conflict: project {pid!r} already has folder {prior_wd}; use another project id "
             "or omit source"
         ), pid, False
-    if prior_wd == folder and str((existing or {}).get("provenance") or "").strip() not in ("", "none"):
-        return folder, note, "", pid, False
     try:
-        from ouroboros.projects_registry import create_project, update_project
+        from ouroboros.projects_registry import PROJECT_NAME_MAX, create_project, update_project, project_admission_basis
         from ouroboros.utils import utc_now_iso
 
-        created = bool(create_project(
-            drive_root, pid, origin="promote_chat_to_task",
-        ).get("created"))
-        update_project(
-            drive_root,
-            pid,
-            working_dir=folder,
-            provenance=provenance,
-            clone_url=clone_url,
-            trusted_at=utc_now_iso(),
-        )
+        name = str(project_name or "").strip()
+        if len(name) > PROJECT_NAME_MAX:
+            name = ""  # never refuse a finished clone over a long title; the row keeps its id
+        chosen = create_project(drive_root, pid, name=name, origin="promote_chat_to_task", admission_basis=basis)
+        created = bool(chosen.get("created"))
+        if existing is None:
+            if not created:
+                raise RuntimeError("Project appeared during source preparation")
+            basis = project_admission_basis(pid, chosen)
+        # The guarded create returns the full row: repeated attachment keeps its
+        # original provenance/trust fact, without rereading a different basis.
+        if chosen.get("working_dir") != folder or str(chosen.get("provenance") or "").strip() in ("", "none"):
+            chosen = update_project(
+                drive_root, pid, admission_basis=basis, working_dir=folder,
+                provenance=provenance, clone_url=clone_url, trusted_at=utc_now_iso(),
+            )
     except Exception as exc:
         return "", "", f"register: {type(exc).__name__}: {exc}", pid, False
+    if admission_basis_out is not None:
+        admission_basis_out.update(project_admission_basis(pid, chosen, frozen=True))
     return folder, note, "", pid, created
 
 

@@ -1,13 +1,23 @@
 // Pure chat-activity helpers shared by chat.js and dependency-free node tests:
 // live-card presentation projections (moved verbatim from chat.js) plus the
-// in-flight direct/ephemeral turn status reducer and snapshot hydration.
-import { executorIdentityMarkup } from './harness_presentation.js';
-import { compactModel, formatLogDuration, modelExecutionLabel } from './log_events.js';
-import { createSystemMessageAction, createSystemMessageActions } from './ui_helpers.js';
-import { joinMarkdownHeadings } from './utils.js';
+// census snapshot hydration. The room's status word is the server's (work_status.js).
+import { META_PART_SEPARATOR, executorIdentityMarkup, executorModelText, formatCoordinatorProvenance, harnessPresentation } from './harness_presentation.js';
+import { effortChipMarkup } from './effort_chip.js';
+import { resultFilesItemHtml } from './result_files.js';
+import { taskSourceDownloadUrl, taskReviewSourceUrl, readState } from './api_client.js';
+import { compactModel, formatLogDuration, modelExecutionView } from './log_events.js';
+import { connectionLabel, routeConnectionId } from './connection_labels.js';
+import { fitText, fullText } from './text_fit.js';
+import { delegatedActivityBodyHtml, delegatedHeadline, delegatedLineView } from './delegated_activity.js';
 import { REUSABLE_TASK_IDS } from './task_control_menu.js';
+import { ownLiveDetail, paintLiveDetail } from './task_phase_chip.js';
+import { fmt, tr } from './i18n.js';
+import { formatMsgTime, formatUsdKnown } from './utils.js';
+import { placeIngressNote } from './chat_attachments.js';
+import { hostRowDisplayText, hostSentenceText } from './host_notice_text.js';
+export { bootPhase, startingStatus, supervisorReady } from './host_starting_status.js';
 import {
-    accountedUpperBound,
+    projectMarkdownLines, MARKDOWN_FENCED_CODE, accountedUpperBound,
     accountedUpperBoundWithChildren,
     escapeHtmlAttr,
     escapeHtmlText as escapeHtml,
@@ -39,20 +49,18 @@ export function applyHistoricalModelExecution(record, historical) {
     return true;
 }
 
-export function senderLabel(role, isProgress = false, systemType = '', opts = {}, chatSessionId = '') {
+export function senderLabel(role, isProgress = false, systemType = '', opts = {}) {
     if (role === 'user') {
         if (opts.source === 'telegram') return opts.senderLabel || 'Telegram';
-        if (opts.senderSessionId && opts.senderSessionId !== chatSessionId) {
-            return `WebUI (${opts.senderSessionId.slice(0, 8)})`;
-        }
+        // The owner's words from another window or device are still the owner's: no session id.
         return opts.senderLabel || 'You';
     }
     if (role === 'system') {
-        if (systemType === 'task_summary') return '📋 Task Summary';
-        if (systemType === 'skill_review') return '📋 Skill Review';
-        return '📋 System';
+        if (systemType === 'task_summary') return 'Task Summary';
+        if (systemType === 'skill_review') return 'Skill Review';
+        return 'System';
     }
-    if (isProgress) return '💬 Thought';
+    if (isProgress) return 'Thought';
     // A self-initiated turn (a consciousness wake-up) signs its final bubble
     // through the same sender line the user bubble uses for its source.
     if (opts.initiator === 'consciousness') return 'Ouroboros · Consciousness';
@@ -69,20 +77,62 @@ export function isLiveLineExpandable(item) {
     );
 }
 
+// Exact record (#1369) or reviewer report: timeline and card-less System rows share readers; absent selectors offer no link.
+export function cardRowEvidenceRef(msg) {
+    const source = msg?.late_evidence?.kind === 'merge_review' && msg.late_evidence.review_source;
+    if (source?.task_id && source.record_id && source.seat_id && /^[0-9a-f]{64}$/.test(source.sha256 || ''))
+        return { href: taskReviewSourceUrl(source.task_id, source.record_id, source.seat_id, source), label: 'Download the reviewer’s report' };
+    const evidence = msg?.late_evidence && typeof msg.late_evidence === 'object'
+        ? taskSourceDownloadUrl(String(msg.task_id || '').trim(), msg.late_evidence.source_ref) : '';
+    return evidence ? { href: evidence, label: 'Download the review record' } : null;
+}
+
+// A restored snapshot keeps its task reader; the download wears chat link ink (md-link), like result-file downloads.
+export function evidenceLinkHtml(evidenceRef) {
+    const href = typeof evidenceRef?.href === 'string' && evidenceRef.href.startsWith('/api/tasks/') ? evidenceRef.href : '';
+    return href
+        ? `<p class="chat-live-line-evidence"><a class="md-link" href="${escapeHtmlAttr(href)}" download data-live-line-evidence>${escapeHtml(evidenceRef.label || 'Download the review record')}</a></p>`
+        : '';
+}
+
+// A placed row's first line heads; card_row_id keeps identity, and late reviews
+// retain their record link. Only typed host pause copy enters the translator.
+export function cardRowSummary(msg, phase, rawTs = '') {
+    const text = String(msg.text ?? msg.content ?? '');
+    const lines = hostRowDisplayText(msg, msg.role === 'system' && msg.system_type === 'task_pause_notice' ? hostSentenceText(text) : text).split('\n');
+    const rowId = String(msg.card_row_id || '').trim() || `${String(msg.system_type || '').trim()}|${rawTs}`;
+    return {
+        phase, headline: lines[0].trim(), body: lines.slice(1).join('\n').trim(), dedupeKey: `cardrow|${rowId}`,
+        cardRowRevision: msg.card_row_revision, evidenceRef: cardRowEvidenceRef(msg),
+        cardReview: msg?.late_evidence?.kind === 'merge_review' ? msg.late_evidence : null,
+    };
+}
+
 export function buildTimelineItemHtml(item, record) {
-    const expandable = isLiveLineExpandable(item);
+    if (item.resultArtifacts) return resultFilesItemHtml(item);
+    // A delegated observation renders its per-seq projection; one wholly shown by
+    // an earlier row, or folded into a silent stretch, keeps only its keyed slot.
+    const delegated = item.activity ? delegatedLineView(item) : null;
+    if (delegated?.hidden) return `<div class="chat-live-line" data-live-line-key="${escapeHtmlAttr(item.lineKey || '')}" data-delegated-folded hidden></div>`;
+    const expandable = Boolean(delegated) || isLiveLineExpandable(item);
     const expanded = expandable && record.expandedLineKeys.has(item.lineKey);
-    const displayHeadline = expanded && item.fullHeadline ? item.fullHeadline : item.headline;
+    const displayHeadline = delegated ? delegatedHeadline(delegated)
+        : expanded && item.fullHeadline ? item.fullHeadline : item.headline;
     // P3: when expanded, prefer the genuinely-full fetched output, then the capped
     // fullBody, then the preview body. A server-truncated line shows the fetched full
     // text in a bounded-scroll box so a huge research output never grows the chat.
-    const displayBody = expanded ? (item.fetchedFull || item.fullBody || item.body) : item.body;
+    const displayBody = expanded ? (item.fullReadError || item.fetchedFull || item.fullBody || item.body) : item.body;
     const showingFetched = expanded && Boolean(item.fetchedFull);
-    const loadingFull = expanded && Boolean(item.truncated && item.fullRef && !item.fetchedFull);
+    const loadingFull = expanded && Boolean(item.truncated && item.fullRef && !item.fetchedFull && !item.fullReadError);
+    // A late-review row offers its exact applied review record (`cardRowSummary`).
+    const evidenceHtml = evidenceLinkHtml(item.evidenceRef);
+    const plainBody = item.bodyFormat === 'text' || item.cardReview?.kind === 'merge_review';
+    const bodyHtml = !displayBody ? '' : plainBody
+        ? escapeHtml(displayBody) : renderMarkdown(displayBody, { inlineHeadingBreaks: true });
     const isProgressLine = item.phase === 'working' || item.phase === 'thinking';
     const bodyId = `chat-live-line-body-${String(record.groupId || 'task').replace(/[^A-Za-z0-9_-]/g, '-')}-${String(item.lineKey || '').replace(/[^A-Za-z0-9_-]/g, '-')}`;
     const headContent = `
-        <span class="chat-live-line-title"${isProgressLine ? ' data-chat-markdown-enhanced' : ''}>${isProgressLine ? renderMarkdown(displayHeadline, { inlineHeadingBreaks: true }) : escapeHtml(displayHeadline)}</span>
+        <span class="chat-live-line-title"${isProgressLine && !delegated ? ' data-chat-markdown-enhanced' : ''}>${isProgressLine && !delegated ? renderMarkdown(displayHeadline, { inlineHeadingBreaks: true }) : escapeHtml(displayHeadline)}</span>
         <span class="chat-live-line-repeat" ${item.count > 1 ? '' : 'hidden'}>${item.count > 1 ? `${item.count}x` : ''}</span>
         ${item.ts ? `<span class="chat-live-line-time">${escapeHtml(item.ts)}</span>` : ''}
     `;
@@ -104,11 +154,13 @@ export function buildTimelineItemHtml(item, record) {
         <div
             class="chat-live-line ${item.phase || 'working'}${expandable ? ' expandable' : ''}"
             data-live-line-key="${escapeHtmlAttr(item.lineKey || '')}"
-            ${item.historyId ? `data-history-id="${escapeHtmlAttr(item.historyId)}"` : ''}
+            ${item.historyId ? `data-history-id="${escapeHtmlAttr(item.historyId)}"`
+        : item.sourceHistoryId ? `data-source-history-id="${escapeHtmlAttr(item.sourceHistoryId)}"` : ''}
             data-expanded="${expanded ? '1' : '0'}"
         >
             ${headHtml}
-            ${displayBody ? `<div class="chat-live-line-body${showingFetched ? ' chat-live-line-body-full' : ''}" id="${escapeHtmlAttr(bodyId)}">${renderMarkdown(displayBody, { inlineHeadingBreaks: true })}${loadingFull ? '<div class="chat-live-line-loading">Loading full output…</div>' : ''}</div>` : ''}
+            ${delegated ? `<div class="chat-live-line-body chat-delegated-activity" id="${escapeHtmlAttr(bodyId)}">${delegatedActivityBodyHtml(delegated, { expanded })}</div>`
+        : displayBody || evidenceHtml ? `<div class="chat-live-line-body${showingFetched ? ' chat-live-line-body-full' : ''}"${plainBody ? ' data-body-format="text"' : ''} id="${escapeHtmlAttr(bodyId)}">${bodyHtml}${evidenceHtml}${loadingFull ? '<div class="chat-live-line-loading">Loading full output…</div>' : ''}</div>` : ''}
         </div>
     `;
 }
@@ -131,31 +183,36 @@ function ensureToolFold(record) {
 
 /**
  * One frame's fact about one invocation: {key, status, receipt, tool}. Status
- * never regresses — a start frame that arrives after the finish cannot reopen
- * the call, and an error stays an error however many frames report that key.
+ * preserves independent start/wait/settlement facts. Reordered starts never reopen
+ * a settled call; a true result replaces only a provisional host-error settlement.
  */
 export function noteToolCall(record, observation) {
     const key = observation?.key;
     if (!record || !key) return record;
     const { calls } = ensureToolFold(record);
     const prev = calls.get(key);
-    const status = observation.status === 'error' || prev?.status === 'error' ? 'error'
-        : ((observation.status === 'ok' || prev?.status === 'ok') ? 'ok' : 'calling');
-    calls.set(key, {
-        status,
-        // A call is an addressing receipt only while EVERY frame about it says so
-        // (the host stamps `routing_action`): the first frame without the stamp
-        // makes the call content, and content it stays.
-        receipt: Boolean(observation.receipt) && (prev ? prev.receipt : true),
+    const fact = observation.fact || (['ok', 'error'].includes(observation.status) ? 'settled' : 'started');
+    const next = { ...prev,
+        receipt: prev?.receipt ?? Boolean(observation.receipt),
         tool: observation.tool || prev?.tool || '',
-    });
+    };
+    if (fact === 'settled') {
+        if (!next.settlement || (next.settlement.hostError && !observation.hostError)) {
+            next.settlement = { status: observation.status, hostError: Boolean(observation.hostError) };
+            next.receipt = Boolean(observation.receipt);
+        }
+    } else if (fact === 'wait_ended') next.waitEnded = true;
+    else next.started = true;
+    next.live = !record.finished && (next.live || observation.live === true || (!observation.fact && observation.status === 'calling'));
+    next.status = next.settlement?.status || (next.waitEnded ? 'wait_ended' : next.live ? 'calling' : 'unknown');
+    calls.set(key, next);
     return record;
 }
 
 /**
  * The host's totals for the turn, merged FIELD-WISE onto what the host already
  * stated. An ABSENT field (null/undefined) stays absent and keeps the previous
- * known value: a partial snapshot that carries `tool_calls` alone must not read
+ * known value; invocation totals never decrease on replay. A partial snapshot carrying `tool_calls` must not read
  * as "no addressing calls" and turn a block that only addressed work into
  * content, and it must not erase an error or routing count a complete snapshot
  * already gave. `counts` is known only as a NON-EMPTY object, so an empty or
@@ -163,15 +220,22 @@ export function noteToolCall(record, observation) {
  * is never explicitly emptied while the turn counts calls.
  */
 export function noteToolHostMetrics(record, host) {
+    for (const observation of host?.evidence?.observations || []) applyToolObservation(record, observation);
     const fold = ensureToolFold(record);
+    if (host?.evidence?.coverage) { fold.coverage = host.evidence.coverage; fold.legacy = host.evidence.legacy; }
+    if (record.finished) for (const call of fold.calls.values()) {
+        call.live = false;
+        call.status = call.settlement?.status || (call.waitEnded ? 'wait_ended' : 'unknown');
+    }
     const known = fold.host || {};
     const carry = (next, before) => (next === null || next === undefined ? (before ?? null) : next);
     const counts = host?.counts && typeof host.counts === 'object' && Object.keys(host.counts).length > 0
         ? host.counts : (known.counts ?? null);
     fold.host = {
-        calls: carry(host?.calls, known.calls),
+        calls: host?.calls == null ? (known.calls ?? null) : Math.max(host.calls, known.calls ?? 0),
         errors: carry(host?.errors, known.errors),
-        routing: carry(host?.routing, known.routing),
+        routing: host?.routing == null ? (known.routing ?? null) : Math.max(host.routing, known.routing ?? 0),
+        completion: host?.completion == null ? (known.completion ?? null) : Math.max(host.completion, known.completion ?? 0),
         counts,
     };
     return toolEvidenceView(record.toolFold);
@@ -188,6 +252,13 @@ export function applyToolObservation(record, observation) {
     const view = toolEvidenceView(record.toolFold);
     record.toolCalls = view.calls;
     record.toolErrors = view.errors;
+    // Successful settlement retires an earlier provisional error/wait notice;
+    // the fold retains the independent wait fact, including after task terminal.
+    if (record.toolFold.calls.get(observation.key)?.settlement?.status === 'ok' && record.items) {
+        const count = record.items.length;
+        record.items = record.items.filter(item => item.dedupeKey !== observation.key);
+        view.clearedNotice = count !== record.items.length;
+    }
     return view;
 }
 
@@ -195,35 +266,56 @@ const perToolLine = (entries) => entries
     .filter(([name, n]) => name && n > 0)
     .map(([name, n]) => (n > 1 ? `${name} ×${n}` : name)).join(' · ');
 
-/**
- * The block's one tool row, built from the live map and the host's totals
- * together: the host answers what it stated, the live map answers the rest.
- * The closed row carries the counts only (summary outranks details); the
- * per-tool names live behind Expand, so the row stays one line either way.
- */
+// A read that failed (a recorded gap, an unreadable live file), not one that stopped at a bound.
+const toolReadFailed = coverage => Boolean(coverage && (coverage.gaps?.length
+    || coverage.source && !Number.isFinite(coverage.live_size)));
+
+export function toolEvidenceIncomplete(coverage) {
+    return Boolean(coverage && (toolReadFailed(coverage) || coverage.matched > coverage.shown));
+}
+
+// One tool row combines host counts with invocation facts; names and read scope
+// live behind Expand. A bounded read is not an unknown invocation outcome.
 export function toolEvidenceView(fold = null) {
     const live = fold?.calls instanceof Map ? [...fold.calls.values()] : [];
     const host = fold?.host || null;
-    const calls = Number.isInteger(host?.calls) ? host.calls : live.length;
-    const errors = Number.isInteger(host?.errors) ? host.errors
-        : live.filter((call) => call.status === 'error').length;
+    const observed = live.length + (fold?.legacy?.calls || 0);
+    const calls = Math.max(Number.isInteger(host?.calls) ? host.calls : 0, observed);
+    const coverage = fold?.coverage;
+    // Frozen totals count model wait errors. Canonical evidence reports operation outcomes; a read names
+    // its extent, never revives a wait: a counted call without a record is unread behind a bound, else missing.
+    const bounded = Boolean(coverage) && (coverage.archives_bounded || coverage.archives_available > coverage.archives
+        || coverage.live_size > coverage.live_window || coverage.matched > coverage.shown);
+    const partial = toolReadFailed(coverage) || Boolean(coverage) && observed < calls && !bounded;
+    // Only settled, individually identified calls can supersede an aggregate
+    // host error. Partial replay and legacy start-only rows have no such proof.
+    const outcomesKnown = calls > 0 && live.length === calls && !(fold?.legacy?.calls)
+        && live.every(call => call.settlement);
+    const observedErrors = live.filter(call => call.status === 'error').length + (fold?.legacy?.errors || 0);
+    const errors = outcomesKnown ? observedErrors
+        : Math.max(Number.isInteger(host?.errors) ? host.errors : 0, observedErrors);
     const liveCounts = new Map();
     for (const call of live) liveCounts.set(call.tool, (liveCounts.get(call.tool) || 0) + 1);
-    const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+    const headline = !calls && partial ? tr('task.tools.history_incomplete', 'Tool history incomplete')
+        : fmt(calls === 1 ? '{n} tool call' : '{n} tool calls', { n: calls });
     return {
         phase: errors > 0 ? 'warn'
             : ((!host && live.some((call) => call.status === 'calling')) ? 'calling' : 'result'),
-        headline: `${plural(calls, 'tool call')}${errors > 0 ? ` · ${plural(errors, 'error')}` : ''}`,
+        headline: headline + (errors > 0 ? ` · ${fmt(errors === 1 ? '{n} error' : '{n} errors', { n: errors })}` : '')
+            + (live.some(call => call.waitEnded) || fold?.legacy?.wait_ended ? ` · ${tr('task.tools.wait_ended', 'wait ended')}` : '')
+            + (calls && (live.some(call => ['unknown', 'wait_ended'].includes(call.status)) || fold?.legacy?.unknown)
+                ? ` · ${tr('task.tools.outcome_unknown', 'outcome unknown')}` : ''),
         body: '',
-        fullBody: perToolLine(host?.counts && typeof host.counts === 'object'
+        fullBody: (partial || bounded ? (partial ? tr('task.tools.incomplete', 'Invocation evidence is incomplete.')
+            : tr('task.tools.bounded_window', 'Only recent tool history was read.'))
+            + (coverage?.source ? ` ${fmt('Source: {source}.', { source: coverage.source })}` : '') + ' ' : '')
+            + perToolLine(host?.counts && typeof host.counts === 'object'
             ? Object.entries(host.counts) : [...liveCounts]),
         visible: true,
-        // Addressing calls report themselves on the owner's message, so a block
-        // that ran nothing else stands on nothing. The host's count decides when
-        // it stated one; otherwise the live map decides, but only while it
-        // accounts for every counted call. Knowing neither means content.
-        receipt: errors <= 0 && (Number.isInteger(host?.routing) ? host.routing >= calls
-            : live.length >= calls && live.length > 0 && live.every((call) => call.receipt)),
+        // Host-stamped routing/completion acts are receipts, never work. Missing
+        // aggregate fields do not erase complete per-invocation receipt evidence.
+        receipt: calls > 0 && errors <= 0 && (Number(host?.routing || 0) + Number(host?.completion || 0) >= calls
+            || !toolEvidenceIncomplete(coverage) && live.length >= calls && live.every((call) => call.receipt)),
         calls,
         errors,
     };
@@ -271,10 +363,6 @@ export function documentMessageKey(msg) {
     ].join('|');
 }
 
-export function pendingAttachmentBytes(items = []) {
-    return items.reduce((total, item) => total + Number(item.file?.size || 0), 0);
-}
-
 export function isFileDrag(event) {
     return Array.from(event.dataTransfer?.types || []).includes('Files');
 }
@@ -289,7 +377,7 @@ export function isNonTerminalMediaHistoryRow(msg) {
  * distinction for the replay passes and the pager's page-row count.
  */
 export function isReplayEvidenceRow(row) {
-    return row?.system_type === 'quiz_answer' || Boolean(row?.summary_kind && row?.historical_terminal);
+    return ['quiz_answer', 'quiz_closed', 'task_evidence'].includes(row?.system_type) || Boolean(row?.summary_kind && row?.historical_terminal);
 }
 
 export function isForegroundLiveCard(record) {
@@ -298,23 +386,95 @@ export function isForegroundLiveCard(record) {
     );
 }
 
-export function shouldFirePanic(dialogResult) {
-    return dialogResult === true;
+export function sendPanic({ ws, frame = { type: 'command', cmd: '/panic' }, onAccepted }) {
+    const result = ws.send(frame, { onPanicAccepted: onAccepted });
+    // Send first, then stop the page's own work (skills' page modules).
+    globalThis.dispatchEvent?.(new CustomEvent('ouro:panic'));
+    return result;
 }
 
-export async function confirmAndSendPanic(deps) {
-    const decision = await deps.openConfirmDialog({
-        title: 'Panic — stop all workers',
-        body: 'Kill all workers immediately?',
-        confirmLabel: 'Kill all workers',
-        cancelLabel: 'Keep running',
-        danger: true,
-    });
-    if (shouldFirePanic(decision)) {
-        deps.ws.send({ type: 'command', cmd: '/panic' });
-        return true;
+// A task still settling its pause (the durable row says ``pausing``): its
+// checkpoint may not be saved yet, so a Restart can interrupt it.
+const PAUSING_PHASES = new Set(['budget_pausing', 'pausing']);
+
+/**
+ * The truthful body of the ONE Restart confirmation (owner quiz 285597): what
+ * the server's owner Restart actually does to running, paused, queued and
+ * still-pausing work (supervisor/restart_retention.py). ``activities`` is the
+ * live census; ``null`` means it could not be read, and the body says so
+ * instead of promising there is nothing still pausing. A live inline Presence
+ * turn (`kind` presence) has no saved return: the restart ends its stack;
+ * a new event in its place can start another (architecture §12). One moved
+ * to a Project as text (`presence_pause`, never a live call) is the
+ * exception: the restart saves and returns it.
+ * @param {Array<{phase?: string, kind?: string, presence_pause?: boolean}>|null} activities
+ * @returns {string}
+ */
+export function restartConfirmBody(activities) {
+    // One line says what happens; the policy is the dialog's Details (RESTART_FACTS); a gap that changes the choice stays.
+    const lines = ['Running tasks stop and continue after the restart.'];
+    if (!Array.isArray(activities) || activities.some((row) => row?.phase === 'unknown')) {
+        lines.push('Pause status could not be read: a task that is still pausing would be interrupted instead of staying paused.');
+        if (!Array.isArray(activities)) return lines.join('\n');
     }
-    return false;
+    const pausing = activities.filter((row) => PAUSING_PHASES.has(String(row?.phase || ''))).length;
+    if (pausing) {
+        lines.push(`${pausing} task${pausing === 1 ? ' is' : 's are'} still pausing: a pause not saved when the restart `
+            + 'stops it is interrupted instead of staying paused.');
+    }
+    const inline = activities.filter((row) => row?.kind === 'presence' && row.presence_pause !== true).length;
+    if (inline) {
+        lines.push(`${inline === 1 ? '1 place conversation is' : `${inline} place conversations are`} mid-turn: the restart `
+            + `interrupts ${inline === 1 ? 'it and it does not resume by itself' : 'them and they do not resume by themselves'}; `
+            + 'a new message can start another turn.');
+    }
+    return lines.join('\n');
+}
+
+export const RESTART_FACTS = { summary: 'Details', rows: [
+    { label: 'Running tasks', value: 'They stop, then eligible saved work resumes after the restart. Sleeping tasks wait for Resume. Tasks already paused stay paused. Runs they started in Claudexor end.' },
+    { label: 'Queued tasks', value: 'Runnable ones return to the queue. Existing holds and limits still apply.' },
+    { label: 'Settings', value: 'Saved settings apply: work that follows a model setting resumes on the current setting; task-specific choices stay.' },
+] };
+
+async function readLiveActivities() {
+    const { state: data } = await readState();  // a refusal, an unparsable body or no answer is unknown, never "none"
+    if (!Array.isArray(data?.active_chat_activities)) throw new Error('census unavailable');
+    // The frozen census lists roots. A parked root can still have a child
+    // saving its Pause: Restart must warn about that member too, once per id.
+    const activities = new Map(data.active_chat_activities.map((row) => [row.activity_id, row]));
+    for (const work of data.works || []) {
+        for (const [id, state] of Object.entries(work.members?.states || {})) {
+            if (state.confirmed === false) activities.set(id, { ...activities.get(id), phase: 'unknown' });
+            else if (state.transition === 'pausing') activities.set(id, { ...activities.get(id), phase: 'pausing' });
+        }
+    }
+    // An incomplete body keeps what it did see, and says the rest is unread.
+    const whole = data.active_chat_activities_complete === true && data.works_complete !== false;
+    return whole ? [...activities.values()] : [...activities.values(), { phase: 'unknown' }];
+}
+
+/**
+ * The ONE Restart confirm-and-send both UI Restart buttons use (the chat
+ * header and Settings "Restart now"; owner quiz 285597: one shared
+ * confirmation, deliberately added to the formerly immediate header button,
+ * never two dialogs). Telegram `/restart` and Panic are separate commands and
+ * keep their own contracts. `queue:false`: a disconnected page never queues a
+ * destructive command for a later reconnect.
+ */
+export async function confirmAndSendRestart({ openConfirmDialog, ws, readActivities = readLiveActivities }) {
+    let activities = null;
+    try {
+        activities = await readActivities();
+    } catch {
+        activities = null;
+    }
+    const confirmed = await openConfirmDialog({
+        title: 'Restart agent', body: restartConfirmBody(activities), details: RESTART_FACTS, confirmLabel: 'Restart', danger: true,
+    });
+    if (!confirmed) return 'cancelled';
+    const result = ws?.send?.({ type: 'command', cmd: '/restart', ui_control: { name: 'restart' } }, { queue: false });
+    return result?.status === 'sent' ? 'sent' : 'not_connected';
 }
 
 export function getOrCreateChatSessionId(storage, cryptoImpl, now = Date.now, random = Math.random) {
@@ -470,20 +630,24 @@ function optionalFiniteNumber(value) {
     return Number.isFinite(number) ? number : null;
 }
 
-/** Pure presentation projection used by the header and dependency-free tests. */
+/** Pure presentation projection used by the header and dependency-free tests. `attention` is the owner's move: a
+ *  task the spending limit stopped waits for the owner (a Main attention row, main_decisions.py), else the pill is
+ *  a neutral fact. */
 export function headerBudgetPresentation(data) {
+    const attention = Array.isArray(data?.main_attention)
+        && data.main_attention.some((row) => row?.attention_reason === 'budget');
     if (!data || data.accounting_loading === true) {
-        return { state: 'loading', label: 'Loading…', fillPct: 0 };
+        return { state: 'loading', label: 'Loading…', fillPct: 0, attention };
     }
     if (data?.accounting?.available === false) {
-        return { state: 'unavailable', label: 'Unavailable', fillPct: 0 };
+        return { state: 'unavailable', label: 'Unavailable', fillPct: 0, attention };
     }
     // Older state shapes did not carry accounting.available.  Keep accepting
     // them when they contain a real numeric projection, but never coerce null
     // (ledger failure in the new shape) into a convincing $0.
     const spent = optionalFiniteNumber(data.spent_usd);
     if (spent === null) {
-        return { state: 'unavailable', label: 'Unavailable', fillPct: 0 };
+        return { state: 'unavailable', label: 'Unavailable', fillPct: 0, attention };
     }
     const rawLimit = optionalFiniteNumber(data.budget_limit);
     const limit = rawLimit !== null && rawLimit > 0 ? rawLimit : 0;
@@ -494,13 +658,59 @@ export function headerBudgetPresentation(data) {
         state: 'available',
         label,
         fillPct: limit > 0 ? Math.min(100, Math.max(0, (spent / limit) * 100)) : 0,
+        attention,
     };
 }
 
 /**
- * Render task money without conflating unknown/non-final values with a final
- * zero.  The returned strings are card metadata, not another cost authority.
+ * Project the producer's scoped carrier (#498) into card meta: strings, not another cost
+ * authority, never conflating unknown/non-final values with a final zero. The carrier
+ * answers the whole question in one fact — which scope the number describes,
+ * whether a zero is EVIDENCED, whether anything in that scope is unpriced — so
+ * a frame that has one never re-derives it from two half-matching fields.
+ *
+ * `null` means "no carrier here, use the legacy derivation below".
  */
+export function costPresentationMeta(presentation, context = null) {
+    if (!presentation || typeof presentation !== 'object') return null;
+    const amount = presentation.tracked_amount;
+    const known = presentation.has_rows === true && amount !== null && amount !== undefined
+        && Number.isFinite(Number(amount));
+    // An unreadable custody view or quarantined ledger is not an in-flight
+    // accounting state: without a known subtotal it reads unknown, never pending.
+    // A known subtotal keeps the qualification its producer gave it below.
+    if (!known && (context?.ledger_integrity_degraded === true
+        || context?.cost_custody?.status === 'unavailable')) return ['Cost unknown'];
+    if (!presentation.has_rows) {
+        // Closed: an intact empty ledger has no line; a run closed without a cost record is unknown, never pending.
+        if (!presentation.accounting_open) return presentation.has_unpriced ? ['Cost unknown'] : [];
+        // Pending delegated custody has an unpriced row even before a priced
+        // row arrives; an empty open carrier is instead an integrity gap.
+        return presentation.has_unpriced ? ['Cost pending'] : ['Cost unknown'];
+    }
+    if (!known) {
+        // No priced or bounded row evidenced anything: an empty ledger and a
+        // ledger of exclusively unpriced calls both sum to 0.0, and neither is a
+        // measured zero. The card says so instead of inventing a free result.
+        if (presentation.accounting_open === true) return ['Cost pending'];
+        if (presentation.has_unpriced) return ['Cost not priced'];
+        return ['Cost unknown'];
+    }
+    const money = formatUsdKnown(Number(amount));  // never $0.00 for a positive amount
+    if (presentation.has_unpriced) return [`Tracked: ${presentation.tracked_final ? money : `up to ${money}`}`];
+    return [presentation.tracked_final ? money : `up to ${money}`];
+}
+
+/** Why a mixed subtotal reads `Tracked:`: said in the card's details, never a hover-only title. */
+export const costPresentationDetail = (presentation, context = null) => {
+    const meta = costPresentationMeta(presentation, context);
+    const first = meta?.[0] || '';
+    if (first === 'Cost pending') return 'Cost: accounting is still open; no amount is counted as $0.';
+    if (first === 'Cost not priced') return 'Cost: settled usage has no price, so it is not counted as known spend or as $0.';
+    if (!first.startsWith('Tracked: ')) return '';
+    return 'Cost: some steps have no price, so Tracked counts only the priced steps.';
+};
+
 export function taskCostMeta(payload = {}) {
     // Presence means a VALUE, exactly as in `resolveCostPair`: a browser
     // producer literal (chat.js `costMetaKeys`) materializes every cost name it
@@ -516,13 +726,27 @@ export function taskCostMeta(payload = {}) {
     // task_done/task_cost_finalized frames carry cost_accounting_status /
     // cost_final alongside cost_usd, so honest task-scope frames still qualify.
     const hasAccountingEvidence = [
-        'cost_accounting_status', 'cost_final',
+        'cost_accounting_status', 'cost_final', 'cost_presentation',
         'cost_usd_with_children', 'cost_with_children_partial',
         'accounted_upper_bound_usd', 'accounted_upper_bound_usd_with_children',
         'reserved_usd', 'unresolved_upper_bound_usd', 'unknown_unmetered',
     ].some(has);
     if (!hasAccountingEvidence) return [];
     if (payload.cost_accounting_status === 'unavailable') return ['cost unavailable'];
+    // #498: a producer that had a readable ledger but NO same-scope facts for
+    // this frame (a nested child's foreign subtree rollup) sends an explicit
+    // null carrier. That amount is unknown to this card, not unreadable: the
+    // owner vocabulary for an unknown amount is "Cost unknown" (DESIGN), while
+    // "cost unavailable" stays reserved for a ledger that could not be read.
+    // The projection below still ranks it `unavailable` so a narrower own zero
+    // cannot outrank it (mergeStickyCostMeta).
+    if (has('cost_presentation') && payload.cost_presentation === null) return ['Cost unknown'];
+
+    // #498: the producer's own carrier wins, because it was built from the exact
+    // ledger bucket it describes. The derivation below stays for legacy frames
+    // and is deliberately conservative: it may not know a zero is unevidenced.
+    const presented = costPresentationMeta(payload.cost_presentation, payload);
+    if (presented) return presented;
 
     // C2/F12: ONE precedence resolver, shared with the Python seams and with
     // log_events — the deprecated alias wins a diverged pair, so the read side
@@ -530,7 +754,8 @@ export function taskCostMeta(payload = {}) {
     const own = accountedUpperBound(payload);
     // Compact cards show one complete amount. Prefer the subtree projection
     // when the producer has one; leaf/legacy frames still fall back to own.
-    const total = accountedUpperBoundWithChildren(payload) ?? own;
+    const hasSubtree = has('accounted_upper_bound_usd_with_children') || has('cost_usd_with_children');
+    const total = hasSubtree ? accountedUpperBoundWithChildren(payload) : own;
     const finalKnown = payload.cost_final === true
         && payload.cost_with_children_partial !== true;
     const pendingKnown = payload.cost_final === false
@@ -542,9 +767,9 @@ export function taskCostMeta(payload = {}) {
     // (`up to`) while the ledger is open, a plain amount once final. Calls with no
     // known price are not named here (owner: no separate counter); component
     // breakdowns and unmetered counts stay on Costs, Logs and task detail.
-    if (total === null) return ['cost pending'];
+    if (total === null) return ['Cost unknown'];
     if (!(finalKnown || pendingKnown || total !== 0)) return [];
-    const amount = `$${total.toFixed(2)}`;
+    const amount = formatUsdKnown(total);
     return [finalKnown ? amount : `up to ${amount}`];
 }
 
@@ -552,20 +777,37 @@ export function taskCostMeta(payload = {}) {
  * Project one frame's task-scope cost evidence into the sticky structured form
  * `{meta, ts, final}` (v6.82 P1). Returns null when the frame carries NO
  * task-scope accounting evidence (e.g. an llm_round_finished per-round delta)
- * — such frames must never touch a card's cost.
+ * — such frames must never touch a card's cost. A readable closed-empty carrier is evidence: the versioned clear
+ * `{meta: [], cleared, ts, scope}` draws no line yet settles an earlier pending; never final, so a retry still shows.
  */
 export function taskCostProjection(payload = {}, rawTs = '') {
     const meta = taskCostMeta(payload);
-    if (!meta.length) return null;
-    const unavailable = payload.cost_accounting_status === 'unavailable';
+    const presentation = payload?.cost_presentation;
+    if (!meta.length) {
+        return presentation?.has_rows === false && presentation.accounting_open === false && !presentation.has_unpriced
+            && payload.cost_accounting_status !== 'unavailable'
+            ? { meta: [], cleared: true, ts: rawTimestampEpoch(rawTs), scope: presentation.scope, final: false, unavailable: false } : null;
+    }
+    const detail = costPresentationDetail(payload.cost_presentation, payload);
+    const unavailable = payload.cost_accounting_status === 'unavailable' || payload.cost_presentation === null;
+    const legacyRollup = payload.cost_presentation === null && (
+        payload.accounted_upper_bound_usd_with_children !== undefined || payload.cost_usd_with_children !== undefined);
     return {
         meta,
+        ...(detail ? { detail } : {}),
         ts: rawTimestampEpoch(rawTs),
+        ...(presentation?.scope ? { scope: presentation.scope } : legacyRollup ? { scope: 'rollup' } : {}),
         // Only a SETTLED ledger value is final. "unavailable" is an honest
         // unknown, not a settled truth: marking it final let one transient
-        // ledger-read failure outrank every later real reading.
-        final: payload.cost_final === true
-            && payload.cost_with_children_partial !== true,
+        // ledger-read failure outrank every later real reading. The scoped
+        // carrier answers this for its own scope when the frame has one (#498).
+        final: presentation && typeof presentation === 'object'
+            ? !unavailable && presentation.tracked_final === true
+                && presentation.has_unpriced === false && presentation.accounting_open === false
+                && payload.cost_final !== false && payload.cost_with_children_partial !== true
+            : !unavailable && !meta.includes('Cost unknown') && payload.cost_final === true
+                && payload.cost_with_children_partial !== true && !(Number(payload.unknown_unmetered) > 0)
+                && !(Number(payload.non_final_rows) > 0) && !payload.ledger_integrity_degraded,
         unavailable,
     };
 }
@@ -576,21 +818,19 @@ export function taskCostProjection(payload = {}, rawTs = '') {
  * must not pin the card for the whole run) and a settled value outranks both.
  * Among equal rank the newer raw source timestamp wins, so an older history replay
  * can never overwrite newer evidence; frames without evidence (null `next`) keep
- * the previous projection, so an unavailable snapshot is still sticky.
+ * the previous projection, so an unavailable snapshot is still sticky (a `cleared` one is pending-rank evidence).
  */
 export function mergeStickyCostMeta(previous, next) {
-    if (!next || !Array.isArray(next.meta) || !next.meta.length) return previous || null;
-    if (!previous || !Array.isArray(previous.meta) || !previous.meta.length) return next;
-    // Rank: unavailable < pending < final. An `unavailable` snapshot is sticky (a
-    // costless frame must not erase it) but must NOT outrank a later HONEST reading:
-    // one transient ledger-read failure would otherwise pin the card to "cost
-    // unavailable" for the rest of the run.
+    const evidenced = (p) => Boolean(p && Array.isArray(p.meta) && (p.meta.length || p.cleared === true));
+    if (!evidenced(next)) return previous || null;
+    if (!evidenced(previous)) return next;
+    if (previous.scope === 'root_tree' && next.scope !== 'root_tree') return previous;
+    if (next.scope === 'root_tree' && previous.scope !== 'root_tree') return next;
+    if (previous.scope === 'rollup' && next.scope === 'own') return previous;
+    if (next.scope === 'rollup' && previous.scope === 'own') return next;
     const rank = (p) => (p.final ? 2 : (p.unavailable ? 0 : 1));
-    const prevRank = rank(previous);
-    const nextRank = rank(next);
-    if (prevRank !== nextRank) return nextRank > prevRank ? next : previous;
-    const prevTs = Number(previous.ts);
-    const nextTs = Number(next.ts);
+    if (rank(previous) !== rank(next)) return rank(next) > rank(previous) ? next : previous;
+    const [prevTs, nextTs] = [Number(previous.ts), Number(next.ts)];
     if (Number.isFinite(prevTs) && Number.isFinite(nextTs) && nextTs < prevTs) return previous;
     // A frame whose source timestamp is unreadable must not defeat a
     // timestamped previous value of equal finality.
@@ -606,25 +846,35 @@ export function mergeStickyCostMeta(previous, next) {
 export function clearStickyCardState(record) {
     if (!record) return record;
     record.collapsedActivity = '';
+    record.collapsedActivityLead = '';
+    record.causeHeld = false;  // an outcome's cause owns the line from then on; equal narration words never take it
     record.costMeta = null;
     // The executor chip is cycle state like the cost projection: a recycled
     // slot must not claim the previous cycle's delegated route as its own.
     record.executorChip = null;
-    // A recycled slot must not inherit the previous cycle's finalizing hold.
-    record.finalizingHold = false;
+    // A recycled slot must not inherit the previous cycle's finalizing hold —
+    // nor the outcome observed under it (#1110), which would otherwise paint the
+    // new cycle's chip with the old cycle's Failed.
+    Object.assign(record, { finalizingHold: false, censusPhase: '', observedOutcome: '', workView: null });
     // The activity clock is cycle state too: a recycled slot ('active') would
     // otherwise open showing the previous cycle's "updated" time.
     record.latestActivityTs = '';
+    record.latestActivityRaw = '';
+    record.startedAt = 0;
     if (record.activityEl) {
-        record.activityEl.textContent = '';
+        fitText(record.activityEl, '', 0);  // also drops a portal line's word-cut fit
         record.activityEl.removeAttribute('title');
+        if (record.activityEl.dataset) delete record.activityEl.dataset.lead;
     }
     record.modelExecution = null;
+    record.effort = null;
     record.toolCalls = null;
+    record.rounds = null;
     record.toolErrors = null;
     // The folded evidence is cycle state too: a recycled slot must not count
     // the previous cycle's invocations.
     record.toolFold = null;
+    record.waitFolds = null; if (record.waitFaceEl) record.waitFaceEl.hidden = true;  // and its face line (syncWaitFace)
     record.durationSec = null;
     record.historicalUnavailable = false;
     record.historicalUnconfirmed = false;
@@ -640,8 +890,9 @@ export function clearStickyCardState(record) {
  * activity, so the line is suppressed to avoid duplication. Subagent titles
  * keep the role · model identity (the id only for twins), so their routed progress body always feeds
  * the line. A frame without new activity keeps `previous`, so finishing a card
- * never blanks its last activity. Geometry is owned by the two-line CSS clamp;
- * this character ceiling is only a defensive DOM/accessibility bound.
+ * never blanks its last activity. This character ceiling bounds a child's and a
+ * portal's line (their geometry is the fitted one or two lines); an ordinary
+ * root's title and line are whole (owner 30.10, B).
  */
 export const COLLAPSED_ACTIVITY_MAX = 240;
 
@@ -652,40 +903,64 @@ export const COLLAPSED_ACTIVITY_MAX = 240;
  * strikethrough, headings, bullets, links, table pipes. It strips line by line
  * without the renderer's block context, so a stray pipe row or list marker the
  * timeline would show literally is dropped here too: over-stripping is the
- * accepted side of that trade, a leaked marker is not. Headings follow the
- * renderer's own rule (`joinMarkdownHeadings`: markers off, ` — ` before the
- * text under a real heading). A headline that is nothing but markers keeps its
- * source text: an empty projection would flip the reserved activity band's
+ * accepted side of that trade, a leaked marker is not. The line-anchored markers
+ * (headings with ` — ` before the text under a real heading, bullets, table rows)
+ * go through `projectMarkdownLines`, the one projection `describeText` also runs
+ * before a preview loses its newlines. A headline that is nothing but markers keeps
+ * its source text: an empty projection would flip the reserved activity band's
  * `:empty` rules.
  */
 export function plainActivityText(text = '') {
     const source = String(text || '');
-    const plain = joinMarkdownHeadings(source)
-        .replace(/```\w*\n([\s\S]*?)```/g, '$1')
+    const plain = projectMarkdownLines(source)
+        .replace(MARKDOWN_FENCED_CODE, '$1')
         .replace(/(``|`)(.+?)\1/g, '$2')
         .replace(/\*\*(.+?)\*\*/g, '$1')
         .replace(/\*(.+?)\*/g, '$1')
         .replace(/~~(.+?)~~/g, '$1')
-        .replace(/^- (.+)$/gm, '$1')
-        .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1')
-        .replace(/^\|(.+)\|$/gm, (_, row) => row.split('|').map((cell) => cell.trim()).join(' '))
-        .replace(/^[\s\-:|]+$/gm, '');
+        .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1');
     const trimmed = plain.trim();
     return trimmed || source;
 }
 
+/** An authored line's whole normalized text: the preview's own projection, never cut. */
+export function wholeActivityText(value = '') {
+    return plainActivityText(value).replace(/\s+/g, ' ').trim();
+}
+
 export function boundActivityPreview(value = '') {
-    const candidate = plainActivityText(value).replace(/\s+/g, ' ').trim();
+    const candidate = wholeActivityText(value);
     if (candidate.length <= COLLAPSED_ACTIVITY_MAX) return candidate;
     return candidate.slice(0, COLLAPSED_ACTIVITY_MAX - 1).trimEnd() + '…';
 }
 
+// An ordinary root card: neither a nested child nor a Main portal (both keep a bounded preview and a meta-line clock).
+const ordinaryRoot = (record) => Boolean(record) && !record.isSubagent && record.root?.dataset?.portal !== '1';
+
+/**
+ * The authored words a card keeps as its line (an unnamed root's title is the same words): an ordinary root's whole
+ * normalized text, from the frame's complete words (`fullHeadline`, which the host sends whole, live and on replay);
+ * a child's or a portal's bounded preview. A frame with no preview has no line.
+ */
+export function authoredLine(record, summary = {}) {
+    const preview = summary.activityPreview ?? summary.headline;
+    return ordinaryRoot(record) && preview ? wholeActivityText(summary.fullHeadline || preview) : boundActivityPreview(preview);
+}
+
+/** An unnamed card's title from its newest authored words: an ordinary root's whole line, else the bounded headline. */
+export function authoredTitle(record) {
+    return (ordinaryRoot(record) && record.lastHumanHeadlineSource?.preview) || record?.lastHumanHeadline || '';
+}
+
 export function projectCollapsedActivity({
-    isSubagent = false, suggestedName = '', headline = '', body = '', previous = '',
+    record = null, isSubagent = Boolean(record?.isSubagent), portal = record?.root?.dataset?.portal === '1',
+    suggestedName = '', headline = '', body = '', previous = '',
 } = {}) {
-    const current = boundActivityPreview(isSubagent ? body : headline);
-    const candidate = current || boundActivityPreview(previous);
-    if (!isSubagent && candidate === boundActivityPreview(suggestedName || headline)) return '';
+    // A child's and a portal's line is a bounded preview; an ordinary root's is its whole normalized text.
+    const shape = isSubagent || portal ? boundActivityPreview : wholeActivityText;
+    const current = shape(isSubagent ? body : headline);
+    const candidate = current || shape(previous);
+    if (!isSubagent && candidate === shape(suggestedName || headline)) return '';
     return candidate;
 }
 
@@ -695,36 +970,10 @@ export function isTerminalTaskPhase(phase = '', terminal = false) {
     return Boolean(terminal) || ['done', 'lifecycle_error', 'cancelled'].includes(phase);
 }
 
-// ---------------------------------------------------------------------------
 // In-flight chat activity status (owner decisions 1A-5A; managed continuity).
-// ---------------------------------------------------------------------------
 
-/**
- * One request/apply clock for every /api/state consumer on a page. Responses
- * may finish in either order; once generation N applies, an older generation
- * can no longer mutate any projection. requestedAt stays tied to request start
- * and is the barrier for the CARD scan (`lastLiveObservedAt`) only — activity
- * hydration is a plain projection of the census and has no barrier.
- */
-export function createStateSnapshotSequencer(onApply, now = () => Date.now()) {
-    let requestedGeneration = 0;
-    let appliedGeneration = 0;
-    return {
-        begin() {
-            return { generation: ++requestedGeneration, requestedAt: now() };
-        },
-        apply(request, data) {
-            const generation = Number(request?.generation) || 0;
-            if (!generation || generation <= appliedGeneration) return false;
-            appliedGeneration = generation;
-            onApply(data, request.requestedAt, generation);
-            return true;
-        },
-        isCurrent(request) {
-            return (Number(request?.generation) || 0) > appliedGeneration;
-        },
-    };
-}
+// The page's single-flight state read lives in state_snapshots.js; its sequencer keeps this public name.
+export { createStateSnapshotSequencer } from './state_snapshots.js';
 
 /**
  * Main-thread fan-out gate for a live WS frame.
@@ -766,7 +1015,8 @@ export function mainLogFrameAccepts(msg, projectChatIds) {
 /** Route one ordinary Chat frame to the current Main or Project instance. */
 export function chatThreadAccepts(msg, isMain, chatId, projectChatIds) {
     if (isMain) return mainThreadAccepts(msg, projectChatIds);
-    return Number(msg?.chat_id ?? 1) === chatId;
+    // One row a Project also shows (its work's notice to Main, the owner's Reply to it): `also_rooms`.
+    return Number(msg?.chat_id ?? 1) === chatId || (Array.isArray(msg?.also_rooms) && msg.also_rooms.map(Number).includes(chatId));
 }
 
 /**
@@ -806,51 +1056,12 @@ export function positiveTaskTerminalFact(row) {
 }
 
 /**
- * Single status reducer for the chat header (owner decisions 2A/5A; managed
- * activities added by the project-continuity contract). Priority: disconnected
- * > background live card (Working...) > admitted managed work (Working...) >
- * server-confirmed direct/ephemeral turns (Thinking...) > local pending
- * submissions (Sending...) > queue-admitted but unstarted managed work
- * (Queued...) > idle. A queued task ranks below
- * Sending... because an unacknowledged local submission is the more actionable
- * state. Pure over its inputs for dependency-free node tests.
+ * Whether an unkeyed live row ends the unscoped Main turn: only a legacy model final does.
+ * Voice confers no finality (DESIGN), so a System row concludes nothing; one answering a
+ * submission names its `client_message_id`, and only that `Sending` settles.
  */
-export function computeDerivedChatStatus({
-    isConnected = true,
-    hasActiveLiveCard = false,
-    activeDirectCount = 0,
-    activeManagedCount = 0,
-    queuedManagedCount = 0,
-    pausedManagedCount = 0,
-    waitingModelCount = 0,
-    pendingSubmissionsCount = 0,
-} = {}) {
-    if (!isConnected) {
-        return { kind: 'offline', text: 'Reconnecting...', showDots: false };
-    }
-    if (hasActiveLiveCard) {
-        return { kind: 'thinking', text: 'Working...', showDots: false };
-    }
-    if (activeManagedCount > 0) {
-        return { kind: 'thinking', text: 'Working...', showDots: true };
-    }
-    if (activeDirectCount > 0) {
-        return { kind: 'thinking', text: 'Thinking...', showDots: true };
-    }
-    if (pendingSubmissionsCount > 0) {
-        return { kind: 'thinking', text: 'Sending...', showDots: true };
-    }
-    if (queuedManagedCount > 0) {
-        if (waitingModelCount > 0) return { kind: 'online', text: 'Waiting for access', showDots: false };
-        return { kind: 'thinking', text: 'Queued...', showDots: true };
-    }
-    if (waitingModelCount > 0) return { kind: 'online', text: 'Waiting for access', showDots: false };
-    if (pausedManagedCount > 0) {
-        // Budget-paused work is NOT running and will not start by itself:
-        // never dress it up as Working or Queued.
-        return { kind: 'online', text: 'Paused (budget)', showDots: false };
-    }
-    return { kind: 'online', text: 'Online', showDots: false };
+export function unkeyedFrameEndsTurn(row) {
+    return String(row?.role || '') !== 'system';
 }
 
 /**
@@ -907,85 +1118,13 @@ export function buildMessageKey(role, text, timestamp, opts = {}) {
     ].join('|');
 }
 
-export function reconnectBannerText(reason = '') {
-    if (reason === 'sha-change') return '♻️ Restart complete';
-    if (reason) return '♻️ Reconnected';
-    return '';
+// Only a reload onto changed code earns a feed notice; any other reload reason or reconnect is silent.
+export function restartNoticeText(reason = '') {
+    return reason === 'sha-change' ? 'Restart complete' : '';
 }
 
-/** {short, full} presentation of a message timestamp, or null when unreadable. */
-export function formatMsgTime(isoStr) {
-    if (!isoStr) return null;
-    try {
-        const d = new Date(isoStr);
-        if (isNaN(d)) return null;
-        const now = new Date();
-        const pad = n => String(n).padStart(2, '0');
-        const hhmm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-        const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-        const todayStr = now.toDateString();
-        const yesterday = new Date(now);
-        yesterday.setDate(now.getDate() - 1);
-        let short;
-        if (d.toDateString() === todayStr) short = hhmm;
-        else if (d.toDateString() === yesterday.toDateString()) short = `Yesterday, ${hhmm}`;
-        else short = `${months[d.getMonth()]} ${d.getDate()}, ${hhmm}`;
-        const full = `${months[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()} at ${hhmm}`;
-        return { short, full };
-    } catch {
-        return null;
-    }
-}
-
-/** Human label for ONE manual-routing option row (shared with the picker card). */
-export function routingOptionLabel(option) {
-    if (!option || typeof option !== 'object') return '';
-    if (option.label) return String(option.label);
-    if (option.action === 'new_task_in_project') {
-        return `New task in ${String(option.project_name || 'Project')}`;
-    }
-    if (option.title || option.project_name) {
-        return String(option.title || option.project_name);
-    }
-    return option.project_id && !option.task_id ? 'Project' : 'Task';
-}
-
-/** Human text for a typed routing annotation ('' hides the line). */
-export function routingAnnotationText(annotation) {
-    if (!annotation || typeof annotation !== 'object') return '';
-    // A refused act carries the host's own owner-facing sentence (`cause`);
-    // it outranks the status matrix below. Absent on scheduled/delivered/
-    // pending rows and on the picker frame, so those labels are unchanged.
-    const cause = String(annotation.cause || '').trim();
-    if (cause) return cause;
-    const action = String(annotation.action || '');
-    const status = String(annotation.status || '');
-    const target = String(annotation.target || '');
-    const targetLabel = String(annotation.target_label || '')
-        || (target ? (action === 'project_route' ? 'Project' : 'Task') : '');
-    if (status === 'pending') return 'Choosing the right destination…';
-    if (status === 'needs_manual_target') {
-        const optionLabels = (Array.isArray(annotation.options) ? annotation.options : [])
-            .map(routingOptionLabel)
-            .filter(Boolean);
-        if (optionLabels.length) return `Choose a target · ${optionLabels.join(' / ')}`;
-        // No options and (by the guard above) no cause: a receipt written
-        // before the host sentence existed, or by a producer that bypasses
-        // `_emit_routing_receipt`. Nothing can be chosen on such a row, so it
-        // must not invite a choice.
-        return targetLabel ? `Not routed · ${targetLabel}` : 'Not routed';
-    }
-    if (status === 'project_unavailable') return 'Project is unavailable';
-    const labels = {
-        mailbox_delivery: 'Delivered to task',
-        steer_task: 'Steered task',
-        promote_chat_to_task: 'Started task',
-        route_to_project: 'Routed to project',
-        project_route: 'Project routing',
-    };
-    const label = labels[action] || status.replaceAll('_', ' ') || action.replaceAll('_', ' ');
-    return targetLabel && label ? `${label} · ${targetLabel}` : label;
-}
+// The message clock is the chat's one compact time format, shared with the terminal time line (utils.js).
+export { formatMsgTime };
 
 /**
  * Project one /api/state activity census onto the client's active-activity map.
@@ -996,8 +1135,8 @@ export function routingAnnotationText(annotation) {
  * authority follows from that — on a
  * `complete` snapshot every id the census does not list is gone, whatever its
  * kind, with no wall-clock barrier and no generation marker. An incomplete
- * snapshot (supervisor not ready, or a source failed) is a partial listing and
- * deletes nothing.
+ * snapshot retains omitted rows as unconfirmed; only its positive rows can
+ * affirm current activity.
  *
  * `concludedIds` (Set/Map with .has) is the client-side conclusion ledger: a
  * turn already concluded by its keyed final must never be re-inserted by a
@@ -1005,7 +1144,8 @@ export function routingAnnotationText(annotation) {
  * never restart, so conclusion is final).
  */
 export function computeHydratedDirectActivities(existingMap, turnsList, chatId, concludedIds = null, complete = true) {
-    const nextMap = new Map(existingMap || []);
+    const nextMap = new Map(Array.from(existingMap || [], ([id, row]) => [id,
+        complete ? row : { ...row, _activityUnconfirmed: true }]));
     if (!Array.isArray(turnsList)) return nextMap;
     const listed = new Set();
     for (const turn of turnsList) {
@@ -1014,6 +1154,7 @@ export function computeHydratedDirectActivities(existingMap, turnsList, chatId, 
         if (!aid || (concludedIds && concludedIds.has(aid))) continue;
         listed.add(aid);
         nextMap.set(aid, {
+            ...turn, _activityUnconfirmed: false,
             activityId: aid,
             kind: turn.kind || 'direct_chat',
             phase: turn.phase || 'thinking',
@@ -1085,13 +1226,13 @@ export function reconcileHydratedDirectActivities(
 }
 
 /**
- * Card-set durable-truth reconcile (stuck "Working..." pill class). The header
- * reducer reads hasActiveLiveCard — a pure DOM scan of mounted unfinished
- * foreground cards — so a card minted by a replayed frame whose own terminal
- * row never reached this client (lost task_done, lineage-only subagent final
- * re-minting a finished parent) kept the pill on "Working..." forever: every
- * existing terminal path keys on the card's OWN id reaching a snapshot or
- * frame first. This selector closes the gap from the card side: given the
+ * Card-set durable-truth reconcile (stuck "Working..." card class). A card
+ * minted by a replayed frame whose own terminal row never reached this client
+ * (lost task_done, lineage-only subagent final re-minting a finished parent)
+ * kept its chip on "Working..." forever: every existing terminal path keys on
+ * the card's OWN id reaching a snapshot or frame first, and such a card never
+ * sets the room's status (the server's work projection does). This selector
+ * closes the gap from the card side: given the
  * compact card projection `{id, finished, isSubagent, connected}` and the set
  * of ids the GLOBAL /api/state snapshot confirms live, it returns the mounted
  * unfinished foreground card ids the snapshot does NOT vouch for. Each one is
@@ -1117,91 +1258,125 @@ export function unconfirmedForegroundCardIds(cards, activeIds) {
     return out;
 }
 
-// Extracted from chat.js (byte-ratchet payment): the DOM half of the routing
-// acknowledgement, kept beside its text builder above.
-export function clearTransientRoutingAnnotations(messagesDiv = globalThis.document?.querySelector?.('#chat-messages')) {
-    if (!messagesDiv) return false;
-    let changed = false;
-    for (const note of messagesDiv.querySelectorAll(
-        '.msg-routing-annotation[data-annotation-status="pending"]',
-    )) {
-        const bubble = note.closest('.chat-bubble');
-        if (bubble) delete bubble.dataset.chatAnnotationStatus;
-        note.remove();
-        changed = true;
-    }
-    return changed;
-}
-
-export function renderRoutingAnnotation(bubble, annotation, chatId = 1) {
-    if (!bubble) return false;
-    const text = routingAnnotationText(annotation);
-    let note = bubble.querySelector('.msg-routing-annotation');
-    if (!text) {
-        const hasStatus = bubble.dataset.chatAnnotationStatus !== undefined;
-        if (!note && !hasStatus) return false;
-        note?.remove();
-        bubble.querySelector('.msg-routing-actions')?.remove();
-        if (hasStatus) delete bubble.dataset.chatAnnotationStatus;
-        return true;
-    }
-    const status = String(annotation.status || '');
-    const destinationKey = `${annotation.project_id || ''}|${annotation.project_chat_id || ''}|${annotation.target || ''}`;
-    const changed = !note || note.dataset.annotationText !== text
-        || note.dataset.destinationKey !== destinationKey
-        || note.dataset.annotationStatus !== status
-        || bubble.dataset.chatAnnotationStatus !== status;
-    if (!note) {
-        note = document.createElement('div');
-        note.className = 'msg-routing-annotation';
-        const time = bubble.querySelector('.msg-time');
-        if (time) time.before(note);
-        else bubble.append(note);
-    }
-    if (!changed) return false;
-    bubble.querySelector('.msg-routing-actions')?.remove();
-    note.textContent = text;
-    note.dataset.annotationText = text;
-    note.dataset.destinationKey = destinationKey;
-    if (note.dataset.annotationStatus !== status) note.dataset.annotationStatus = status;
-    if (bubble.dataset.chatAnnotationStatus !== status) bubble.dataset.chatAnnotationStatus = status;
-    const destination = annotation.project_id && Number(annotation.project_chat_id) > 0
-        && Number(annotation.project_chat_id) !== Number(chatId)
-        && ['scheduled', 'delivered'].includes(status);
-    if (destination) {
-        const button = createSystemMessageAction({
-            label: 'Open Project', title: 'Open Project',
-            onClick: () => window.dispatchEvent(new CustomEvent('ouro:open-project', { detail: {
-                project: { id: annotation.project_id, chat_id: Number(annotation.project_chat_id) },
-                task_id: annotation.target || '',
-            } })),
-        });
-        const actions = createSystemMessageActions(button);
-        actions.classList.add('msg-routing-actions');
-        const time = bubble.querySelector('.msg-time');
-        if (time) time.before(actions);
-        else bubble.append(actions);
-    }
-    return changed;
+// В9: the host stamps a typed `ingress_accepted: true` on an owner echo only after the durable chat write, so that
+// client_message_id's bubble carries `Input saved` (a tick by its time) — never read or begun. `ingress_pending` keeps that note
+// provisional until dispatch is confirmed or the ended host's delivery becomes unknown.
+export function markIngressSaved(root, row) {
+    const cmid = String(row?.client_message_id || ''), state = row?.ingress_pending === true ? 'pending' : '';
+    if (row?.role !== 'user' || row.ingress_accepted !== true || !cmid) return false;
+    const bubble = [...root.querySelectorAll('.chat-bubble.user[data-client-message-id]')]
+        .find((node) => node.dataset.clientMessageId === cmid), prior = bubble?.querySelector('[data-ingress-saved]');
+    if (!bubble || (prior && (prior.dataset.ingressSaved !== 'pending' || prior.dataset.ingressSaved === state))) return false;  // `Input saved` and a kept send's delivery doubt are final
+    const note = Object.assign(document.createElement('div'), { className: 'msg-pending', textContent: 'Input saved' });
+    note.dataset.ingressSaved = state;
+    for (const doubt of [prior, bubble.querySelector('[data-ingress-unconfirmed]')]) doubt?.remove();  // the saved row settles a "Send again" doubt
+    placeIngressNote(bubble, note);  // the plain saved fact: a quiet tick before the time
+    return true;
 }
 
 // Full narration stays in the timeline, not a mouse-only title.
-export function renderCollapsedActivity(record, text) {
-    if (!record?.activityEl) return false;
-    const changed = record.activityEl.textContent !== text
-        || Boolean(record.activityEl.hasAttribute?.('title'));
-    if (record.activityEl.textContent !== text) record.activityEl.textContent = text;
-    if (record.activityEl.hasAttribute?.('title')) record.activityEl.removeAttribute('title');
-    return Boolean(changed && record.activityEl.isConnected);
+// How many lines a COLLAPSED card's activity line shows (the CSS clamps say the same: a child 1, a Main portal
+// 2); a root card and an expanded card show the whole line (0).
+export function collapsedActivityLines(record) {
+    const root = record?.root;
+    if (!root || root.dataset?.expanded === '1') return 0;
+    if (record.isSubagent || root.dataset?.subagent === '1') return 1;
+    return root.dataset?.portal === '1' ? 2 : 0;
 }
 
-// The 12 cost-meta keys shared by both subagent whitelists (the delegation
+/** Re-fit the activity line after the card's form changed (expanded, collapsed, bound as a portal). */
+export function refitCollapsedActivity(record) {
+    const el = record?.activityEl;
+    if (!el) return false;
+    fitText(el, fullText(el), collapsedActivityLines(record));
+    return true;
+}
+
+export function renderCollapsedActivity(record, text) {
+    if (!record?.activityEl) return false;
+    const el = record.activityEl;
+    // A child's report names its reader before its words: the label is drawn by CSS from
+    // `data-lead`, so the fit below counts its room and a copy of the line keeps only the words.
+    const lead = text ? String(record.collapsedActivityLead || '') : '';
+    const leadChanged = (el.dataset?.lead || '') !== lead;
+    if (leadChanged && el.dataset) {
+        if (lead) el.dataset.lead = lead;
+        else delete el.dataset.lead;
+    }
+    // A collapsed card's line is cut on a word with a clean ending (never `.…`; text_fit.js).
+    const shown = fullText(el);
+    const changed = shown !== text || leadChanged || Boolean(el.hasAttribute?.('title'));
+    if (shown !== text || leadChanged) fitText(el, text, collapsedActivityLines(record));
+    if (el.hasAttribute?.('title')) el.removeAttribute('title');
+    return Boolean(changed && el.isConnected);
+}
+
+// The terminal observation names only this task's loose files. Keep paths and
+// HEAD in the existing Details timeline; the compact line lives in taskReasonDetail.
+export function readCandidateRemainder(item, detail, ok = true) {
+    const body = ok ? candidateRemainderBody(detail, item.remainderFact) : null;
+    item.fullReadError = body !== null ? '' : ok
+        ? 'The saved file list is unavailable for this observation. Close and reopen this detail to retry.'
+        : 'The saved file list could not be loaded. Close and reopen this detail to retry.';
+    return body;
+}
+
+export function candidateRemainderBody(detail, fact) {
+    const snapshot = detail?.mutation_evidence?.terminal_candidate_snapshot;
+    const exact = fact?.snapshot_at && snapshot?.captured_at === fact.snapshot_at
+        && snapshot?.baseline_hash === fact.baseline_hash && Array.isArray(snapshot.surfaces);
+    // Older terminal rows carried the exact list inline. A newer observation
+    // never substitutes a different saved snapshot for the one the summary names.
+    const paths = exact ? snapshot.surfaces.filter(row => Array.isArray(row.uncommitted_paths)).map(row => ({
+        root: row.canonical_root, commit: row.base_commit, paths: row.uncommitted_paths,
+    })) : Array.isArray(fact?.surfaces) ? fact.surfaces : null;
+    if (!paths) return null;
+    return [fact.state === 'unknown' ? 'The uncommitted remainder could not be checked.' : '',
+        ...paths.filter(row => Array.isArray(row.paths) && row.paths.length).map(row =>
+            `Candidate: ${row.root || 'Saved candidate'}\nHEAD: ${row.commit || 'unknown'}\n\nFiles:\n${row.paths.join('\n')}`)]
+        .filter(Boolean).join('\n\n');
+}
+
+export function syncCandidateRemainderItem(record, detail) {
+    const fact = detail?.outcome_axes?.execution?.mutation_attribution?.uncommitted_remainder;
+    if (!record || !fact) return false;
+    const key = `candidate-remainder|${record.groupId}`;
+    const index = record.items.findIndex(item => item.dedupeKey === key);
+    const previous = record.items[index];
+    const same = previous && JSON.stringify(previous.remainderFact) === JSON.stringify(fact);
+    const full = candidateRemainderBody(detail, fact);
+    const fullRef = fact.snapshot_at ? String(fact.task_id || detail.task_id || record.groupId) : '';
+    const body = fact.state === 'known' && fact.count === 0 ? '' : full
+        ?? (same && !previous.truncated ? previous.body : null)
+        ?? [fact.state === 'unknown' ? 'The uncommitted remainder could not be checked.' : '',
+        fact.paths_omitted > 0 ? `${fact.paths_omitted} recorded file path${fact.paths_omitted === 1 ? ' is' : 's are'} not loaded.` : '',
+        fullRef ? 'Expand to read the saved file list.' : 'The saved file list is unavailable.']
+        .filter(Boolean).join('\n\n');
+    if (!body) {
+        if (index < 0) return false;
+        record.items.splice(index, 1);
+        return true;
+    }
+    if (same && previous.body === body) return false;
+    const item = { phase: 'info', headline: 'Uncommitted files', fullHeadline: 'Uncommitted files',
+        body, fullBody: body, bodyFormat: 'text', receipt: true, count: 1, ts: '', sourceTs: String(detail.ts || ''),
+        dedupeKey: key, lineKey: `candidate-remainder-${String(record.groupId).replace(/[^A-Za-z0-9_-]/g, '-')}`,
+        remainderFact: fact, fullField: 'candidate_remainder', fullRef,
+        truncated: full === null && Boolean(fullRef) && !(same && !previous.truncated),
+        fetchedFull: same ? previous.fetchedFull : '', fullReadError: same ? previous.fullReadError : '' };
+    if (index < 0) record.items.push(item);
+    else Object.assign(record.items[index], item);
+    return true;
+}
+
+// The 15 cost-meta keys shared by both subagent whitelists (the delegation
 // trio stays inline in each literal — the wire test scans those literals).
 const COST_META_KEYS = [
     'cost_usd', 'accounted_upper_bound_usd', 'accounted_upper_bound_usd_with_children',
     'cost_accounting_status', 'cost_accounting_error', 'cost_final', 'cost_usd_with_children',
     'cost_with_children_partial', 'reserved_usd', 'unresolved_upper_bound_usd',
-    'unknown_unmetered', 'non_final_rows',
+    'unknown_unmetered', 'non_final_rows', 'cost_presentation', 'cost_custody',
+    'ledger_integrity_degraded',
 ];
 export function costMetaKeys(src) {
     return Object.fromEntries(COST_META_KEYS.map((key) => [key, src?.[key]]));
@@ -1209,7 +1384,8 @@ export function costMetaKeys(src) {
 
 const CARD_META_KEYS = [
     ...COST_META_KEYS, 'executor_route', 'execution_evidence', 'actual_substrate',
-    'executor_observation', 'model_execution', 'tool_calls', 'model', 'ts', 'initiator', 'cancel_origin',
+    'executor_observation', 'model_execution', 'tool_calls', 'model', 'ts', 'initiator', 'continue_requester', 'cancel_origin',
+    'delegated_activity', 'outcome_axes', 'task_completion', 'effort_level', 'effort_requested', 'effort_source', 'reasoning',
 ];
 export function cardMetaKeys(src) {
     return Object.fromEntries(CARD_META_KEYS.map((key) => [key, src?.[key]]));
@@ -1217,29 +1393,184 @@ export function cardMetaKeys(src) {
 
 // the ONE meta-line renderer, fed entirely from record state,
 // so a replay batch renders it exactly once per card.
+// "updated" names the turn's own last narration in the chat's one time format (formatMsgTime: the
+// same words as a bubble's clock), never the host locale's long date.
+function updatedTime(record) {
+    const time = record.latestActivityRaw ? formatMsgTime(record.latestActivityRaw) : null;
+    return time?.short || record.latestActivityTs || '';
+}
+
+function updatedLabel(record) {
+    const text = updatedTime(record);
+    return text ? `updated ${text}` : '';
+}
+
+// An unfinished card always carries a time: its last narration's, else when the work started (the census
+// start, else the card's first row). A root card says it in its head beside the chip; a child and a Main
+// portal end their meta line with it.
+function clockLabel(record) {
+    const updated = updatedLabel(record);
+    if (updated || record.finished) return updated;
+    const started = Number(record.startedAt) || Number(record.root?.dataset?.ts) || 0;
+    const time = started > 0 ? formatMsgTime(new Date(started).toISOString()) : null;
+    return time?.short ? `started ${time.short}` : '';
+}
+
+// The meta line keeps its real ` · ` text separators (a copied line reads as it looks), but each
+// separator rides inside the part before it and holds on to that part's last word (a no-break space
+// before the dot): a wrapped line may end with a dot, never start with one or keep a dot alone.
+const META_SEP_HTML = `<span class="chat-live-meta-sep">${META_PART_SEPARATOR.replace(/^ /, '&nbsp;')}</span>`;
+// The dot goes inside the part's last fact when that fact is a plain meta span, so the fact (kept
+// whole, as today) carries its dot with it; otherwise it follows the part.
+function withTrailingSeparator(part) {
+    const lastFact = part.lastIndexOf('<span class="chat-live-meta-text');
+    const tail = lastFact >= 0 ? part.slice(lastFact + 1) : '';
+    if (lastFact >= 0 && /<\/span>\s*$/.test(part) && !tail.includes('<span') && (tail.match(/<\/span>/g) || []).length === 1) {
+        return part.replace(/<\/span>\s*$/, `${META_SEP_HTML}</span>`);
+    }
+    return part + META_SEP_HTML;
+}
+
+function metaLineHtml(parts) {
+    const kept = parts.filter(Boolean);
+    return kept.map((part, index) => `<span class="chat-live-meta-part">${index < kept.length - 1
+        ? withTrailingSeparator(part) : part}</span>`).join('');
+}
+
+// The card's facts beyond its compact line: labelled rows of its own details block (a nested child
+// carries its own), opened by the card's one disclosure. A row exists only for a known fact; the
+// markup equals its serialization, so an unchanged list is never rebuilt under a reader's selection.
+function paintLiveFacts(record, rows) {
+    const el = ownLiveDetail(record, 'liveFacts');
+    if (!el) return false;
+    if (record.wakeSummary && (record.initiator === 'consciousness' || record.scheduleName || record.causeHeld)) rows.unshift([tr('task.fact.wake_summary', 'In its words'), `<span data-i18n-authored>${escapeHtml(record.wakeSummary)}</span>`]);
+    const html = rows.filter(([, value]) => value).map(([label, value]) =>
+        `<div class="chat-live-fact"><dt>${escapeHtml(label)}</dt><dd>${value}</dd></div>`).join('');
+    if (el.innerHTML === html && el.hidden === !html) return false;
+    if (el.innerHTML !== html) el.innerHTML = html;
+    el.hidden = !html;
+    return true;
+}
+
 export function renderLiveCardMeta(record, { agentModel = record?.agentModel || '' } = {}) {
     if (!record?.metaEl) return false;
-    const html = executorIdentityMarkup(record.executorChip, { agentModel: compactModel(agentModel) }) + [
-        record.initiator === 'consciousness' ? 'Consciousness' : '',
+    const toolCalls = Number.isInteger(record.toolCalls) ? `${record.toolCalls} tool ${record.toolCalls === 1 ? "call" : "calls"}` : '';
+    const rounds = Number.isInteger(record.rounds) && record.rounds >= 0 ? `${record.rounds} round${record.rounds === 1 ? '' : 's'}` : '';
+    const cost = (record.costMeta && Array.isArray(record.costMeta.meta)) ? record.costMeta.meta : [];
+    // A Main portal is the collapsed form of a work that lives in its Project room: tool calls ·
+    // cost · updated, plus the facts that change what the owner may trust. Executor, model and
+    // effort details stay on the room's card.
+    const portal = record.root?.dataset?.portal === '1';
+    const clock = record.finished ? '' : clockLabel(record);
+    // A root card's clock moves whole to its head; a portal and a child keep it last on this line.
+    const headClock = ordinaryRoot(record);
+    const text = (item) => `<span class="chat-live-meta-text">${escapeHtml(item)}</span>`;
+    // The compact line says who ran the work, on what, how long and for how much (DESIGN §5 "A task card's
+    // summary outranks its details"). A delegated child names its executor and only the executor's own model
+    // evidence; any other card the model a usable solve response observed, else its agent model, and an
+    // unobserved execution in its own words. Effort is the selected leaf's dispatch level, not the nanny's
+    // reasoning level or a provider echo (subagent_runtime.resolve_configured_actor_dispatch).
+    // Session counters belong to the supervising agent, never the foreign executor.
+    const chip = record.executorChip;
+    const supervision = chip && harnessPresentation(chip.harness).kind === 'harness';
+    const execution = modelExecutionView(record.modelExecution);
+    const coordinator = compactModel(agentModel);
+    const provenance = chip ? formatCoordinatorProvenance(
+        record?.coordinatorProvenance || chip?.coordinatorProvenance || chip?.snapshot || '',
+    ) : '';
+    const model = chip ? executorModelText(chip, compactModel)
+        : execution && !execution.observed ? execution.value : execution?.model || coordinator;
+    // The compact line names the model a Claudexor route ran on, not the route's spelling `codex=…` (Details keep it).
+    const lineModel = String(model || '').replace(/(^|\s)[a-z][\w.-]*=(?=\S)/i, '$1');
+    // A key added under Accounts follows its model ("claude-opus-5.5 · Claude credits"); the built-in key adds nothing.
+    const keyRoute = chip || (execution && !execution.observed) ? '' : execution ? record.modelExecution?.used_model : agentModel;
+    const key = connectionLabel(routeConnectionId(keyRoute));
+    const updated = record.finished ? updatedTime(record) : '';
+    // The executor block is ONE part of this line, joined by the same text
+    // separator as the rest: concatenating it left the chip and the first fact
+    // touching in a copied line and running together for a screen reader,
+    // because only the flex gap separated them.
+    const html = portal ? metaLineHtml([
         record.historicalUnavailable ? 'Outcome unavailable' : (record.historicalUnconfirmed ? 'Activity unconfirmed' : ''),
-        modelExecutionLabel(record.modelExecution),
-        Number.isInteger(record.toolCalls) ? `${record.toolCalls} tool ${record.toolCalls === 1 ? "call" : "calls"}` : '',
-        record.toolErrors > 0 ? `${record.toolErrors} error${record.toolErrors === 1 ? '' : 's'}` : '',
-        Number.isFinite(record.durationSec) ? formatLogDuration(record.durationSec) : '',
-        ...(Array.isArray(record._lastFrameMeta) ? record._lastFrameMeta : []),
-        ...((record.costMeta && Array.isArray(record.costMeta.meta)) ? record.costMeta.meta : []),
-        record.latestActivityTs ? `updated ${record.latestActivityTs}` : '',
-    ].filter(Boolean).map((item) => `<span class="chat-live-meta-text">${escapeHtml(item)}</span>`).join(' · ');
-    if (record.metaEl.innerHTML === html) return false;
+        !record.finished && record.projectHoldDetail || '',
+        record.reviewGateLine || '',  // review_gate_card.js: changes what the owner may trust, so the portal keeps it
+        // A settled portal needs no activity clock: its chip states how the work ended and the author's
+        // final (with its own end time) arrives as a message.
+        toolCalls, ...cost, clock,
+    ].filter(Boolean).map(text)) : metaLineHtml([
+        chip ? executorIdentityMarkup(chip, { model }) : (lineModel && !record.lead ? text(key ? `${lineModel} · ${key}` : lineModel) : ''),
+        effortChipMarkup(record.effort),
+        ...[
+            record.historicalUnavailable ? 'Outcome unavailable' : (record.historicalUnconfirmed ? 'Activity unconfirmed' : ''),
+            !record.finished && record.projectHoldDetail || '',
+            record.historyRetentionProblem || '',
+            record.reviewGateLine || '',
+            // Under a Done chip the block's own rows name the errors; this line does not repeat them (DESIGN principle 7).
+            record.toolErrors > 0 && !(record.finished && record.phaseEl?.dataset?.phase === 'done')
+                ? `${record.toolErrors} error${record.toolErrors === 1 ? '' : 's'}` : '',
+            Number.isFinite(record.durationSec) ? formatLogDuration(record.durationSec) : '',
+            !supervision && record.toolCalls > 0 ? toolCalls : '',
+            ...(Array.isArray(record._lastFrameMeta) ? record._lastFrameMeta : []),
+            ...cost,
+            headClock ? '' : clock,
+        ].filter(Boolean).map(text),
+    ]);
+    const clockChanged = paintHeadClock(record, headClock ? clock : '');
+    const factsChanged = paintLiveFacts(record, portal ? [] : [
+        ['Executor', chip?.title ? escapeHtml(chip.title) : ''],
+        // Provenance is a recorded fact of the schedule (chosen_by / coordinator_provenance), never inferred here.
+        [chip ? 'Coordinator' : 'Agent model', coordinator ? escapeHtml(provenance ? `${coordinator} (${provenance})` : coordinator) : ''],
+        // An unobserved execution of a card without an executor is its compact model fact already.
+        [execution?.label || 'Model execution', execution && (chip || execution.observed) ? escapeHtml(execution.value) : ''],
+        ['Started by', record.scheduleName ? `${tr('task.fact.started_by.schedule', 'Schedule')} · <span data-i18n-authored>${escapeHtml(record.scheduleName)}</span>` : record.initiator === 'consciousness' ? 'Consciousness' : ''],
+        ['Continued by', { owner: 'You', ouroboros: 'Ouroboros', unknown: 'Not recorded' }[record.continueRequester] || ''],
+        ['Tool calls', !supervision && record.toolCalls === 0 ? '0' : ''],
+        ['Rounds', !supervision && rounds ? `${record.rounds} · usable solve response${record.rounds === 1 ? '' : 's'}` : ''],
+        ['Supervision', supervision && (rounds || toolCalls)
+            ? `${[rounds, toolCalls].filter(Boolean).join(META_PART_SEPARATOR)} (supervising agent; executor session counts are not reported)` : ''],
+        ['Updated', escapeHtml(updated)],
+        ...(record.costBreakdownRows || []),  // a root's detail: where its money and work went
+    ]);
+    const detailChanged = paintLiveDetail(record, 'liveCostDetail', String(record.costMeta?.detail || ''));
+    if (record.metaEl.innerHTML === html) return (detailChanged || factsChanged || clockChanged) && Boolean(record.metaEl.isConnected);
     record.metaEl.innerHTML = html;
     return Boolean(record.metaEl.isConnected);
+}
+
+// The head's clock (`data-live-when`, beside the chip): written only on change, hidden while it says nothing.
+function paintHeadClock(record, text) {
+    const el = record.summaryButtonEl?.querySelector?.('[data-live-when]');
+    if (!el || (el.textContent === text && el.hidden === !text)) return false;
+    el.textContent = text;
+    el.hidden = !text;
+    return true;
+}
+
+// The Reviews door stands in a root card's head beside Details; a child docks it in its own foot, before its
+// controls, the action row under its metadata (DESIGN "Reviews inside task cards"). The same node moves, never a copy.
+export function dockChildReviewDoor(record) {
+    const door = record?.reviewSummaryEl;
+    const end = ownFootEnd(record);
+    if (!record?.isSubagent || !door || !end || door.parentElement === end) return false;
+    end.prepend(door);
+    return true;
 }
 
 // Only host-attested cancelable queue roots receive this control.
 // A card's OWN actions row: a nested child card carries a row of its own, and a
 // descendant lookup would hand a root without one its child's.
+// The row lives at the end of the card's own foot: a root's beside its meta line, right-docked, and under it
+// when the two do not fit; a child's and a portal's under the meta line, after the child's docked Reviews door
+// or the portal's Project reference. A nested child's foot is its own, so a descendant lookup is never used.
+function ownFootEnd(record) {
+    const foot = record?.footEl;
+    const end = record?.footEndEl;
+    return foot && end && foot.parentElement === record.root && end.parentElement === foot ? end : null;
+}
+
 export function ownLiveActionsEl(record) {
-    return [...(record?.root?.children || [])]
+    const holder = ownFootEnd(record) || record?.root;
+    return [...(holder?.children || [])]
         .find((node) => node.classList?.contains('chat-live-actions')) || null;
 }
 
@@ -1251,10 +1582,15 @@ export function ensureLiveActionsEl(record) {
     if (!actions) {
         actions = document.createElement('div');
         actions.className = 'chat-live-actions';
-        const timeline = record.timelineEl && record.timelineEl.parentElement === record.root
-            ? record.timelineEl
-            : null;
-        record.root.insertBefore(actions, timeline);
+        const end = ownFootEnd(record);
+        if (end) {
+            end.appendChild(actions);
+        } else {
+            const timeline = record.timelineEl && record.timelineEl.parentElement === record.root
+                ? record.timelineEl
+                : null;
+            record.root.insertBefore(actions, timeline);
+        }
     }
     return actions;
 }

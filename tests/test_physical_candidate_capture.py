@@ -12,6 +12,7 @@ import pytest
 
 from ouroboros import usage_accounting as ua
 from ouroboros.llm import LLMClient, _canonical_candidate_bytes
+from tests._usage_store_testing import ledger_rows
 
 
 @pytest.fixture
@@ -46,8 +47,7 @@ class _Response:
 
 
 def _rows(root: Path):
-    path = root / ua.LEDGER_REL
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    return ledger_rows(root)
 
 
 def _final_rows(root: Path):
@@ -149,7 +149,7 @@ def test_remote_candidate_manifest_matches_exact_post_transform_send(data_root):
     })
     rows = _rows(data_root)
     final = rows[-1]
-    assert [row["state"] for row in rows] == ["reserved", "dispatched", "settled"]
+    assert [row["state"] for row in rows] == ["settled"]
     assert all(row["candidate_raw_sha256"] == hashlib.sha256(raw).hexdigest() for row in rows)
     assert all(row["candidate_raw_size_bytes"] == len(raw) for row in rows)
     assert all(row["candidate_context_sha256"] == hashlib.sha256(context_bytes).hexdigest() for row in rows)
@@ -218,7 +218,7 @@ def test_marker_free_candidate_does_not_invent_applied_cache_ttl(data_root):
     assert final["prompt_cache_ttl"] == ""
 
 
-def test_local_candidate_is_measured_after_existing_local_transform(data_root, monkeypatch):
+def test_local_candidate_is_measured_as_prepared_without_a_compactor(data_root, monkeypatch):
     import ouroboros.local_model as local_model
 
     client = LLMClient(api_key="unused")
@@ -241,11 +241,6 @@ def test_local_candidate_is_measured_after_existing_local_transform(data_root, m
 
         lambda: SimpleNamespace(serving_context_evidence=lambda: {"context_window": 8192, "confirmed": True}, measure_prepared_input=lambda payload: {"supported": False}),
     )
-    monkeypatch.setattr(
-        client,
-        "_prepare_messages_for_local_context",
-        lambda messages, ctx_len, max_tokens: [{"role": "system", "content": "post-local-compactor"}],
-    )
     tools = [{
         "type": "function",
         "function": {"name": "local_tool", "parameters": {"type": "object"}},
@@ -261,7 +256,7 @@ def test_local_candidate_is_measured_after_existing_local_transform(data_root, m
             tool_choice="auto",
         )
     assert message["content"] == "local"
-    assert sent["messages"] == [{"role": "system", "content": "post-local-compactor"}]
+    assert sent["messages"] == [{"role": "user", "content": "pre-transform"}]  # whole, never cut to the window
     assert sent["tools"] == [{
         "type": "function",
         "function": {"name": "local_tool", "parameters": {"type": "object"}},
@@ -272,6 +267,74 @@ def test_local_candidate_is_measured_after_existing_local_transform(data_root, m
     raw = _canonical_candidate_bytes(sent)
     assert final["candidate_raw_sha256"] == hashlib.sha256(raw).hexdigest()
     assert final["candidate_raw_size_bytes"] == len(raw)
+
+
+@pytest.mark.parametrize(("measurement_supported", "timeout", "asynchronous"), [
+    pytest.param(False, 33.0, False, id='estimated-33.0-sync'),
+    pytest.param(False, 0.0, False, id='estimated-0.0-sync'),
+    pytest.param(True, None, True, id='measured-None-async'),
+    pytest.param(True, -1.0, True, id='measured--1.0-async'),
+])
+def test_local_transport_timeout_is_separate_from_physical_candidate(
+    data_root, monkeypatch, asynchronous, timeout, measurement_supported,
+):
+    from importlib import import_module
+
+    import httpx
+    from openai import OpenAI
+
+    from ouroboros.local_model_server import input_fingerprint
+    from ouroboros.observability import read_blob_ref
+
+    client = LLMClient(api_key="unused")
+    sent, transport_timeouts, measured = [], [], []
+
+    def handle(request):
+        sent.append(json.loads(request.content))
+        transport_timeouts.append(request.extensions["timeout"])
+        return httpx.Response(200, json=_Response(text="local").model_dump())
+
+    def measure(payload):
+        measured.append(copy.deepcopy(payload))
+        return {
+            "supported": measurement_supported, "input_is_exact": measurement_supported,
+            "input_tokens": 8, "context_window": 8192, "process_id": 123,
+            "native_input_sha256": input_fingerprint(payload),
+            "output_limit_enforced": True, "reasoning_included_in_limit": True,
+        }
+
+    monkeypatch.setattr(import_module("ouroboros.local_model"), "get_manager", lambda: SimpleNamespace(
+        serving_context_evidence=lambda: {"context_window": 8192, "confirmed": True, "process_id": 123},
+        measure_prepared_input=measure,
+    ))
+    messages = [{"role": "user", "content": "hello", "_context_capsule": {"generation": 2}}]
+    original = copy.deepcopy(messages)
+    kwargs = dict(messages=messages, model="local", use_local=True, max_tokens=512, timeout=timeout)
+    with OpenAI(
+        base_url="http://127.0.0.1:8799/v1", api_key="local", max_retries=0, timeout=91.0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handle)),
+    ) as transport, ua.usage_scope(_scope(data_root)), ua.physical_attempt_limit(1):
+        monkeypatch.setattr(client, "_get_local_client", lambda: transport)
+        message, usage = asyncio.run(client.chat_async(**kwargs)) if asynchronous else client.chat(**kwargs)
+
+    assert message["content"] == "local" and len(sent) == 1
+    # Assert the SDK's actual HTTP timeout, including its unchanged default
+    # when the caller supplies no positive override, independently of kwargs.
+    expected_timeout = timeout if timeout is not None and timeout > 0 else 91.0
+    assert transport_timeouts == [dict.fromkeys(("connect", "read", "write", "pool"), expected_timeout)]
+    physical = sent[0]
+    assert measured == [physical] and "timeout" not in measured[0]
+    assert not _has_capsule(physical) and messages == original
+    raw = _canonical_candidate_bytes(physical)
+    rows = _rows(data_root)
+    assert [row["state"] for row in rows] == ["settled"]
+    assert all(row["candidate_raw_sha256"] == hashlib.sha256(raw).hexdigest() for row in rows)
+    assert all(row["candidate_raw_size_bytes"] == len(raw) for row in rows)
+    assert rows[0]["reservation_upper_bound_usd"] == rows[-1]["cost_usd"] == 0.0
+    assert usage["cost"] == 0.0 and usage["cost_final"] is True
+    assert usage["ledger_attempt_ids"] == [rows[-1]["attempt_id"]]
+    manifest = _manifest(rows[-1]["candidate_manifest_ref"])
+    assert read_blob_ref(data_root, manifest["full_payload_ref"]) == physical
 
 
 def test_local_read_timeout_after_dispatch_is_not_retried(data_root, monkeypatch):
@@ -327,12 +390,6 @@ def test_internal_retry_gets_distinct_attempt_but_stable_context_identity(data_r
             raise _Rejected("temperature unsupported")
         return _Response()
 
-    def retry_without_temperature(candidate, model, exc):
-        retry = copy.deepcopy(candidate)
-        retry.pop("temperature", None)
-        return retry
-
-    monkeypatch.setattr(client, "_retry_without_optional_sampling", retry_without_temperature)
     monkeypatch.setattr(client, "_openrouter_signature_retry_kwargs", lambda *args: None)
     payload = {
         "model": "gpt-5.2",
@@ -492,7 +549,7 @@ def test_precondition_releases_before_dispatch_and_does_not_claim_send(data_root
             _target(),
         )
     assert provider_calls == 0
-    assert [row["state"] for row in _rows(data_root)] == ["reserved", "released"]
+    assert [row["state"] for row in _rows(data_root)] == ["released"]
     assert _rows(data_root)[-1]["candidate_manifest_ref"]
     capture = ua.physical_attempt_capture_from_exception(caught.value)
     assert capture is not None and capture.state == "released"
@@ -521,7 +578,7 @@ def test_attempt_limit_keeps_persisted_manifest_on_release_and_capture(data_root
         )
 
     assert provider_calls == 0
-    assert [row["state"] for row in _rows(data_root)] == ["reserved", "released"]
+    assert [row["state"] for row in _rows(data_root)] == ["released"]
     final = _rows(data_root)[-1]
     assert final["candidate_manifest_ref"]
     assert _manifest(final["candidate_manifest_ref"])["call_id"] == final["attempt_id"]
@@ -643,7 +700,7 @@ def test_candidate_persistence_failure_releases_without_send_or_limit_claim(
             _target(),
         )
     assert provider_calls == 0
-    assert [row["state"] for row in _rows(data_root)] == ["reserved", "released"]
+    assert [row["state"] for row in _rows(data_root)] == ["released"]
     assert "candidate_manifest_ref" not in _rows(data_root)[-1]
     capture = ua.physical_attempt_capture_from_exception(caught.value)
     assert capture is not None and capture.candidate_manifest_ref is None

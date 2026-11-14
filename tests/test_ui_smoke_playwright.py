@@ -1,4 +1,5 @@
 from __future__ import annotations
+from tests._dialogue import advance_room_revision
 
 import json
 import os
@@ -13,34 +14,70 @@ from collections import deque
 
 import pytest
 
+from tests.candidate_checkout import (
+    assert_served_candidate as _assert_served_candidate,
+    case_checkout, require_candidate_interpreter, verify_checkout,
+)
+from ouroboros.test_environment import isolated_environment, owned_process_temp
+from ouroboros.test_evidence import diagnostic_directory, keep_startup_log
 from tests.fixtures_mock_llm import MockLLMServer
-from tests.ui_chat_viewport_smoke import _CAPTURE_TEST_SOCKET, _emit_ws_frame
+from tests.ui_chat_viewport_smoke import (
+    _CAPTURE_TEST_SOCKET, _OBSERVE_STATE_READS, _emit_ws_frame, _wait_socket_open_quiescent,
+)
 
 REPO_ROOT = os.path.dirname(os.path.dirname(__file__))
 
 
-def _fixture_python() -> str:
+def _fixture_interpreter() -> str:
     """Use the real Windows interpreter, bypassing the venv PID redirector."""
     if os.name == "nt":
         return str(getattr(sys, "_base_executable", sys.executable))
     return sys.executable
 
 
+def _fixture_python() -> str:
+    """Launch target; Settings may wrap it."""
+    return _fixture_interpreter()
+
+
+def _browser_missing(exc) -> bool:
+    """Playwright's report of an engine that was never installed; each test decides skip or fail."""
+    return "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower()
+
+
+def _store_rows(data_dir, stream: str, rows) -> None:
+    """History for a running server: it reads its dialogue store (#1982), never a log file written after it started."""
+    from ouroboros import dialogue_store
+
+    for row in rows:
+        dialogue_store.append(pathlib.Path(data_dir), stream, row)
+
+
+# A box's place in its flex row is its margin box: the card's disclosure overhangs its row by the padding its
+# negative margin pays back, so its words stand where they stood (style.css .chat-live-summary-side, #1998).
+_ROW_SLOT = """(el) => { const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return {top: r.top - parseFloat(s.marginTop), bottom: r.bottom + parseFloat(s.marginBottom)}; }"""
+
+
 def _open_review_checkpoint(card, *, open_card=True):
     if open_card:
-        card.locator(":scope > [data-live-summary-button]").click()
+        card.locator(":scope > [data-live-summary-button] [data-live-disclosure]").click()
     assert card.is_visible()
+    door = card.locator(":scope > :is([data-live-summary-button], [data-live-foot]) [data-live-review-summary]")
+    door.wait_for(state="visible", timeout=5_000)
+    assert door.get_attribute("aria-expanded") == "false"
+    door.click()
+    assert door.get_attribute("aria-expanded") == "true"
     section = card.locator(":scope > [data-live-reviews-host] [data-review-section]")
     section.wait_for(state="visible", timeout=5_000)
-    assert section.get_attribute("data-expanded") == "0"
-    section.locator("[data-review-section-toggle]").click()
     assert section.get_attribute("data-expanded") == "1"
     group = section.locator("[data-review-group]").first
     assert group.locator("[data-review-group-toggle]").get_attribute("aria-expanded") == "false"
     group.locator("[data-review-group-toggle]").click()
-    attempt = group.locator("[data-review-attempt-toggle]").first
-    attempt.click()
-    assert attempt.get_attribute("aria-expanded") == "true"
+    facts = group.locator("[data-review-facts]")
+    assert facts.get_attribute("open") is None
+    facts.locator(":scope > summary").click()
+    assert facts.get_attribute("open") is not None
 
 
 def _free_port() -> int:
@@ -66,17 +103,18 @@ def _wait_health(url: str, timeout_sec: int = 30) -> None:
 def _wait_supervisor_ready(url: str, timeout_sec: int = 45) -> None:
     """Wait past port readiness until the direct test runtime can serve history."""
     deadline = time.time() + timeout_sec
-    last = ""
+    last = error = ""
     while time.time() < deadline:
         try:
             with urllib.request.urlopen(f"{url}/api/state", timeout=2) as resp:  # noqa: S310 - local test server
-                payload = json.loads(resp.read().decode("utf-8"))
+                payload = json.load(resp)
                 if payload.get("supervisor_ready") is True:
                     return
+                error = payload.get("supervisor_error") or error
         except Exception as exc:
             last = str(exc)
         time.sleep(0.25)
-    raise RuntimeError(f"server supervisor did not become ready: {last}")
+    raise RuntimeError(f"server supervisor did not become ready: {error or last}")
 
 
 def _run_core_ui_assertions(url: str) -> None:
@@ -118,7 +156,7 @@ def _run_core_ui_assertions(url: str) -> None:
             finally:
                 browser.close()
     except PlaywrightError as exc:
-        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+        if _browser_missing(exc):
             pytest.skip(str(exc))
         raise
 
@@ -130,12 +168,12 @@ def test_ui_projects_sidebar_unread_and_keyboard_menu(direct_server_with_data):
     from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import sync_playwright
 
-    from ouroboros.projects_registry import create_project, increment_project_visible_revision
+    from ouroboros.projects_registry import create_project
 
     url = direct_server_with_data["url"]
     data_dir = direct_server_with_data["data_dir"]
     create_project(data_dir, "alpha", name="Alpha project")
-    increment_project_visible_revision(data_dir, project_id="alpha")
+    advance_room_revision(data_dir, project_id="alpha")
 
     try:
         with sync_playwright() as pw:
@@ -149,7 +187,7 @@ def test_ui_projects_sidebar_unread_and_keyboard_menu(direct_server_with_data):
                 assert add.is_visible()
                 assert add.get_attribute("aria-label") == "New project"
                 assert page.locator("#nav-projects-count").inner_text() == "1"
-                assert row.locator(".nav-unread-dot").count() == 1
+                assert row.get_attribute("data-unread") == ""
 
                 row.click()
                 page.wait_for_selector('#project-panel:not([hidden])', timeout=30_000)
@@ -162,9 +200,9 @@ def test_ui_projects_sidebar_unread_and_keyboard_menu(direct_server_with_data):
                 kebab = page.locator('.nav-project-kebab[aria-label="Actions for Alpha project"]')
                 kebab.focus()
                 kebab.press("Enter")
-                menu = page.locator('.project-row-menu[role="menu"]')
+                menu = page.locator('.project-row-menu:not([data-leaving])[role="menu"]')
                 menu.wait_for(state="visible", timeout=5_000)
-                assert page.locator(':focus').get_attribute("data-prm") == "rename"
+                assert page.locator(':focus').get_attribute("data-prm") == "pin"  # the menu's first action
                 box = menu.bounding_box()
                 assert box is not None
                 assert box["x"] >= 0 and box["y"] >= 0
@@ -183,7 +221,7 @@ def test_ui_projects_sidebar_unread_and_keyboard_menu(direct_server_with_data):
             finally:
                 browser.close()
     except PlaywrightError as exc:
-        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+        if _browser_missing(exc):
             pytest.skip(str(exc))
         raise
 
@@ -230,53 +268,45 @@ def _run_docker_ui_assertions(url: str) -> None:
             finally:
                 browser.close()
     except PlaywrightError as exc:
-        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+        if _browser_missing(exc):
             pytest.skip(str(exc))
         raise
 
 
 @pytest.fixture()
-def direct_server_with_data(tmp_path):
-    if os.environ.get("OUROBOROS_RUN_UI_SMOKE") != "1":
-        pytest.skip("set OUROBOROS_RUN_UI_SMOKE=1 to run browser UI smoke")
-    with MockLLMServer() as llm:
+def direct_server_with_data(tmp_path, ui_candidate_checkout):
+    # The session's copy (tests/conftest.py) in this case's custody; its sentinels prove each boot's origin.
+    with case_checkout(pathlib.Path(REPO_ROOT), ui_candidate_checkout) as candidate, MockLLMServer() as llm:
+        checkout = candidate.path
         port = _free_port()
         data_dir = tmp_path / "data"
         data_dir.mkdir(parents=True)
-        model = "openai-compatible::mock-model"
-        (data_dir / "settings.json").write_text(
-            json.dumps(
-                {
-                    "OPENAI_COMPATIBLE_API_KEY": "ui-smoke-key",
-                    "OPENAI_COMPATIBLE_BASE_URL": llm.base_url,
-                    "OUROBOROS_MODEL": model,
-                    "OUROBOROS_MODEL_HEAVY": model,
-                    "OUROBOROS_MODEL_LIGHT": model,
-                    "OUROBOROS_MODEL_FALLBACKS": model,
-                    # Every smoke case is single-task or deterministic log replay;
-                    # a ten-process default pool adds only process churn and makes
-                    # sequential browser history fetches flaky on shared hosts.
-                    "OUROBOROS_MAX_WORKERS": 1,
-                    "OUROBOROS_RUNTIME_MODE": "light",
-                }
-            ),
-            encoding="utf-8",
+        settings = dict.fromkeys(
+            ("OUROBOROS_MODEL", "OUROBOROS_MODEL_LIGHT", "OUROBOROS_MODEL_FALLBACKS"),
+            "openai-compatible::mock-model",
         )
-        env = {
-            **os.environ,
-            "OUROBOROS_APP_ROOT": str(tmp_path),
-            "OUROBOROS_DATA_DIR": str(data_dir),
-            "OUROBOROS_SETTINGS_PATH": str(data_dir / "settings.json"),
-            "OUROBOROS_REPO_DIR": REPO_ROOT,
+        settings.update(
+            OPENAI_COMPATIBLE_API_KEY="ui-smoke-key", OPENAI_COMPATIBLE_BASE_URL=llm.base_url,
+            # Single-task cases and deterministic replay need only one worker;
+            # extra workers churn processes and make shared-host history flaky.
+            OUROBOROS_MAX_WORKERS=1, OUROBOROS_RUNTIME_MODE="light",
+            # The bundled telegram only, installed off: no hub clone at boot (#1995).
+            OUROBOROS_STARTER_SKILLS='["builtin/telegram"]', OUROBOROS_STARTER_SKILLS_TURN_ON=False,
+        )
+        (data_dir / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+        env = isolated_environment(tmp_path, checkout, process_temp=owned_process_temp())
+        env.update({
             "OUROBOROS_SERVER_HOST": "127.0.0.1",
             "OUROBOROS_SERVER_PORT": str(port),
-            "OUROBOROS_HOST_SERVICE_PORT": str(port + 1),
+            "OUROBOROS_HOST_SERVICE_PORT": str(_free_port()),
             "OUROBOROS_NETWORK_PASSWORD": "ui-smoke-password",
-        }
+        })
         if os.name == "nt":
             site = pathlib.Path(sys.executable).resolve().parent.parent / "Lib" / "site-packages"
             if site.is_dir():
                 env["PYTHONPATH"] = os.pathsep.join([str(site), env.get("PYTHONPATH", "")])
+        # Probe the actual child, not the parent venv.
+        require_candidate_interpreter(_fixture_interpreter(), env, checkout)
         url = f"http://127.0.0.1:{port}"
         active_proc = active_container = None
 
@@ -292,35 +322,38 @@ def direct_server_with_data(tmp_path):
                     try:
                         proc.wait(timeout=10)
                     except subprocess.TimeoutExpired:
-                        pass  # The container below also owns surviving descendants.
+                        pass  # Reap descendants below.
             finally:
                 try:
-                    # Parent exit never proves the entire incarnation is gone.
+                    # Parent exit alone is insufficient.
                     error = container.reap()
                 finally:
                     container.close()
                 if error:
                     if proc is not None:
-                        proc.poll()  # Collect an exited parent without masking the reap failure.
+                        proc.poll()  # Preserve the reap failure.
                     raise RuntimeError(f"UI fixture process cleanup failed: {error}")
                 if proc is not None:
                     proc.wait(timeout=5)
+            # Only proven teardown releases the copy.
+            candidate.release()
 
+        @keep_startup_log(tmp_path, "server-stdio.log")
         def start_server() -> None:
             nonlocal active_proc, active_container
             from ouroboros.process_containment import ProcessContainer
 
-            # Reap consumes the token/Job: every restart needs fresh containment.
+            # Reap consumes custody: restart needs a new container.
+            verify_checkout(checkout, candidate)
             active_container = ProcessContainer()
-            active_proc = active_container.spawn(
-                [_fixture_python(), "server.py"],
-                cwd=REPO_ROOT,
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            # Pin before spawn.
+            candidate.hold()
+            with (tmp_path / "server-stdio.log").open("ab") as log:
+                active_proc = active_container.spawn(
+                    [_fixture_python(), "server.py"], cwd=checkout, env=env, stdout=log, stderr=subprocess.STDOUT)
             _wait_health(url)
             _wait_supervisor_ready(url)
+            _assert_served_candidate(url, checkout, data_dir, active_proc.pid, candidate)
 
         def restart_server() -> None:
             stop_server()
@@ -329,10 +362,13 @@ def direct_server_with_data(tmp_path):
         try:
             start_server()
             yield {
-                "url": url, "data_dir": data_dir, "restart_server": restart_server,
-                # A seed that must survive into the next boot (queue snapshot, state files) has to
-                # land while no server runs: the main loop persists its own snapshot every tick.
-                "stop_server": stop_server, "start_server": start_server,
+                "url": url, "data_dir": data_dir, "restart_server": restart_server, "env": env,
+                "repo_dir": checkout, "candidate_identity": candidate.identity,
+                # Static and Python origin proof.
+                "candidate_sentinel": candidate.sentinel_bytes,
+                "candidate_version": candidate.version_text,
+                # Seed only while stopped: live ticks overwrite snapshots.
+                "stop_server": stop_server, "start_server": start_server, "candidate": candidate,
             }
         finally:
             stop_server()
@@ -683,8 +719,8 @@ def test_ui_smoke_phase3_declarative_widgets_and_settings(direct_server_with_dat
                 callout = card.locator('.widget-callout')
                 assert metric.get_attribute("data-tone") == "ok"
                 assert callout.get_attribute("data-tone") == "warn"
-                assert metric.evaluate("element => getComputedStyle(element).borderLeftColor") == "rgb(110, 231, 183)"
-                assert callout.evaluate("element => getComputedStyle(element).borderLeftColor") == "rgb(252, 211, 77)"
+                assert metric.evaluate("e => getComputedStyle(e).borderLeftColor") == "rgb(131, 228, 153)"
+                assert callout.evaluate("e => getComputedStyle(e).borderLeftColor") == "rgb(247, 203, 88)"
 
                 emitted = page.evaluate(
                     """async (skill) => {
@@ -793,6 +829,16 @@ def test_ui_smoke_phase3_declarative_widgets_and_settings(direct_server_with_dat
                     "element => getComputedStyle(element).maxHeight"
                 ) == "360px"
 
+                # The board's layout is planned for the cards it holds: this one alone, once a card whose frame is
+                # still stopping has left it (widgets.js retireCard) and the masonry frame after that has run.
+                board = """() => [...document.querySelectorAll('#widgets-list .widgets-card')].map((item) =>
+                    [item.dataset.widgetKey, item.hasAttribute('data-widget-removed')])"""
+                try:
+                    page.wait_for_function(f"() => {{ const cards = ({board})(); return cards.length === 1 && !cards[0][1]; }}",
+                                           timeout=15_000)
+                except PlaywrightError as exc:
+                    raise AssertionError(f"the board holds this card alone: {page.evaluate(board)}") from exc
+                page.evaluate("() => new Promise(done => requestAnimationFrame(() => requestAnimationFrame(done)))")
                 list_box = page.locator('#widgets-list').bounding_box()
                 card_box = card.bounding_box()
                 operations_group = card.locator('.widget-group').filter(has_text="Operations overview")
@@ -864,13 +910,15 @@ def test_ui_smoke_phase3_declarative_widgets_and_settings(direct_server_with_dat
                 page.set_viewport_size({"width": 1440, "height": 1000})
                 page.wait_for_timeout(100)
 
-                page.click('[data-nav-page="settings"]')
-                page.locator('[data-settings-tab="advanced"]').click()
-                section = page.locator('.settings-extension-section').filter(
-                    has_text="Phase 3 settings"
-                )
+                # The skill's form stands on its own Settings page, titled by its one section.
+                page.wait_for_function("() => Boolean(window.__ouroSettings)")
+                assert page.evaluate("() => window.__ouroSettings.open('skill/phase3_widget_smoke')") is not False
+                page.locator('#page-settings .settings-page-title').filter(has_text="Phase 3 settings").wait_for(
+                    state="visible", timeout=30_000)
+                section = page.locator('.settings-extension-section')
                 section.wait_for(state="visible", timeout=30_000)
                 settings_form = section.locator('[data-extension-settings-form]')
+                settings_form.locator('[data-extension-settings-edit-anyway]').click()  # POST-only: values unknown (#1552)
                 settings_form.locator('select[name="mode"]').select_option("fast")
                 settings_form.locator('input[name="token"]').fill("discard-me")
                 save = settings_form.locator('button[type="submit"]')
@@ -889,7 +937,7 @@ def test_ui_smoke_phase3_declarative_widgets_and_settings(direct_server_with_dat
             finally:
                 browser.close()
     except PlaywrightError as exc:
-        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+        if _browser_missing(exc):
             pytest.skip(str(exc))
         raise
 
@@ -905,38 +953,32 @@ def test_ui_smoke_collapsed_activity_line_named_vs_unnamed(
     direct_server_with_data,
     browser_engine,
 ):
-    """Collapsed root summaries stay compact without destroying full activity."""
+    """A collapsed root keeps its whole latest line; an empty one reserves no band."""
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import sync_playwright
 
     url = direct_server_with_data["url"]
     data_dir = direct_server_with_data["data_dir"]
-    logs_dir = data_dir / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    (logs_dir / "chat.jsonl").write_text("", encoding="utf-8")
     unique_tail = "UNIQUE_FULL_ACTIVITY_TAIL"
     long_activity = (
         "Analyzing the dataset and comparing every source. " * 18
         + "https://example.com/" + "unbroken-segment-" * 18 + unique_tail
     )
-    (logs_dir / "progress.jsonl").write_text(
-        json.dumps({
-            "ts": "2026-07-29T10:00:00+00:00",
-            "chat_id": 1,
-            "task_id": "named-act",
-            "content": long_activity,
-        }) + "\n" + json.dumps({
-            "ts": "2026-07-29T10:00:01+00:00",
-            "chat_id": 1,
-            "task_id": "unnamed-act",
-            "content": "Doing things without a name",
-        }) + "\n",
-        encoding="utf-8",
-    )
-    task_results = data_dir / "task_results"
-    task_results.mkdir(parents=True, exist_ok=True)
-    (task_results / "named-act.json").write_text(json.dumps({
+    _store_rows(data_dir, "progress", [{
+        "ts": "2026-07-29T10:00:00+00:00",
+        "chat_id": 1,
+        "task_id": "named-act",
+        "content": long_activity,
+    }, {
+        "ts": "2026-07-29T10:00:01+00:00",
+        "chat_id": 1,
+        "task_id": "unnamed-act",
+        "content": "Doing things without a name",
+    }])
+    from tests._store_shared import seed_result  # the server reads its store, not later files
+
+    seed_result(data_dir, "named-act", {
         "_schema_version": 1,
         "task_id": "named-act",
         "status": "completed",
@@ -944,16 +986,188 @@ def test_ui_smoke_collapsed_activity_line_named_vs_unnamed(
         "cost_usd": 0.42,
         "cost_accounting_status": "available",
         "cost_final": True,
-    }) + "\n", encoding="utf-8")
+    })
     try:
         with sync_playwright() as pw:
             browser_type = getattr(pw, browser_engine)
             try:
                 browser = browser_type.launch(headless=True)
             except PlaywrightError as exc:
-                if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+                if _browser_missing(exc):
                     pytest.fail(f"required Playwright {browser_engine} browser is not installed: {exc}")
                 raise
+            from tests._work_projection_shared import with_work_fields
+
+            def vouch_running(route):
+                # Census membership keeps Working stable between frames.
+                if draining:  # its width is closing (#2120): the read passes through
+                    route.fallback()
+                    return
+                in_flight.append(route)
+                try:
+                    body = route.fetch().json()
+                    body["active_chat_activities"] = [*body.get("active_chat_activities", []), {
+                        "activity_id": "running-act", "chat_id": 1, "project_id": "", "client_message_id": "",
+                        "kind": "managed_task", "phase": "working", "started_at": 1.0}]
+                    route.fulfill(content_type="application/json", body=json.dumps(with_work_fields(body)))
+                finally:
+                    in_flight.remove(route)
+
+            def check_width(page, width):
+                page.add_init_script(f"({_CAPTURE_TEST_SOCKET})();({_OBSERVE_STATE_READS})()")
+                page.route("**/api/state*", vouch_running)
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                _wait_socket_open_quiescent(page)  # the frames below live on the test socket only
+                named = page.locator('.chat-live-card[data-task-id="named-act"]')
+                named.wait_for(state="attached", timeout=30_000)
+                unnamed = page.locator('.chat-live-card[data-task-id="unnamed-act"]')
+                unnamed.wait_for(state="attached", timeout=30_000)
+                page.wait_for_function(
+                    "() => document.querySelector('.chat-live-card[data-task-id=\"named-act\"]"
+                    " [data-live-title]')?.textContent === 'Data Analysis'",
+                    timeout=30_000,
+                )
+                _emit_ws_frame(page, {
+                    "type": "chat", "role": "assistant", "is_progress": True,
+                    "chat_id": 1, "task_id": "running-act", "suggested_name": "Short task",
+                    "content": "Short update", "ts": "2026-07-29T10:00:02+00:00",
+                })
+                running = page.locator('.chat-live-card[data-task-id="running-act"]')
+                running.wait_for(state="attached", timeout=30_000)
+                assert running.locator('[data-live-title]').text_content().strip() == "Short task"
+                assert named.get_attribute("data-expanded") == "0"
+                named_activity = named.locator('[data-live-activity]')
+                # Whole (owner 30.10, B): past the preview, through the tail, no cut marker.
+                assert named_activity.text_content().strip() == long_activity
+                assert named_activity.get_attribute("title") is None
+                geometry = named.evaluate(
+                    """card => {
+                        const facts = selector => {
+                            const el = card.querySelector(selector);
+                            const style = getComputedStyle(el);
+                            const lineHeight = parseFloat(style.lineHeight);
+                            const rect = el.getBoundingClientRect();
+                            return { lines: rect.height / lineHeight, width: rect.width };
+                        };
+                        return {
+                            title: facts('[data-live-title]'),
+                            activity: facts('[data-live-activity]'),
+                            clientWidth: card.clientWidth,
+                            scrollWidth: card.scrollWidth,
+                        };
+                    }"""
+                )
+                assert geometry["title"]["lines"] <= 2.2, geometry
+                assert geometry["activity"]["lines"] >= 9, geometry  # whole, unclamped
+                assert geometry["scrollWidth"] <= geometry["clientWidth"] + 1, geometry
+                named_meta = named.locator('[data-live-meta]').inner_text().split()
+                # Final ledger: the plain amount, never the open-ledger ceiling.
+                assert "$0.42" in named_meta and "up" not in named_meta, named_meta
+
+                unnamed_activity = unnamed.locator('[data-live-activity]')
+                assert "Doing things without a name" in unnamed.locator('[data-live-title]').text_content()
+                assert unnamed_activity.text_content().strip() == ""
+                assert not unnamed_activity.is_visible()
+                bands = page.evaluate(
+                    """() => Object.fromEntries(['named-act', 'unnamed-act', 'running-act'].map(id => {
+                        const card = document.querySelector(`.chat-live-card[data-task-id="${id}"]`);
+                        const facts = selector => {
+                            const node = card.querySelector(selector);
+                            const style = getComputedStyle(node);
+                            const height = node.getBoundingClientRect().height;
+                            const lineHeight = parseFloat(style.lineHeight);
+                            return {height, lines: height / lineHeight,
+                                display: style.display, visibility: style.visibility};
+                        };
+                        return [id, {
+                            title: facts('[data-live-title]'),
+                            activity: facts('[data-live-activity]'),
+                            meta: facts('[data-live-meta]'),
+                            finished: card.dataset.finished === '1',
+                            clipped: card.scrollHeight > card.clientHeight + 1,
+                            reviews: card.querySelector('[data-live-review-summary]')?.textContent || '',
+                        }];
+                    }))"""
+                )
+                assert bands["named-act"]["finished"] is True, bands
+                assert bands["unnamed-act"]["finished"] is False, bands
+                assert bands["running-act"]["finished"] is False, bands
+                assert all(0.9 <= bands[task_id]["title"]["lines"] <= 1.2 for task_id in bands), bands
+                assert 2.9 <= bands["named-act"]["activity"]["lines"], bands  # whole, unclamped (B)
+                assert 0.9 <= bands["running-act"]["activity"]["lines"] <= 1.2, bands
+                assert bands["unnamed-act"]["activity"]["display"] == "none", bands
+                # Empty activity reserves no band, even after finish; an unnamed turn uses its note as title.
+                _emit_ws_frame(page, {
+                    "type": "chat", "role": "assistant", "is_progress": True,
+                    "chat_id": 1, "task_id": "done-empty",
+                    "content": "Quick task", "ts": "2026-07-29T10:00:03+00:00",
+                })
+                done_empty = page.locator('.chat-live-card[data-task-id="done-empty"]')
+                done_empty.wait_for(state="attached", timeout=30_000)
+                _emit_ws_frame(page, {
+                    "type": "chat", "role": "system", "system_type": "task_summary",
+                    "chat_id": 1, "task_id": "done-empty", "content": "Done",
+                    "ts": "2026-07-29T10:00:04+00:00",
+                })
+                page.wait_for_function(
+                    "() => document.querySelector('.chat-live-card[data-task-id=\"done-empty\"]')"
+                    "?.dataset.finished === '1'",
+                    timeout=30_000,
+                )
+                fold = done_empty.evaluate(
+                    """card => { const node = card.querySelector('[data-live-activity]');
+                        return {text: node.textContent, display: getComputedStyle(node).display,
+                            height: card.getBoundingClientRect().height}; }"""
+                )
+                assert fold["text"].strip() == "", fold
+                assert fold["display"] == "none", fold
+                running_height = running.evaluate("el => el.getBoundingClientRect().height")
+                assert fold["height"] <= running_height - 20, (fold, running_height)
+                assert all(bands[task_id]["meta"]["lines"] >= 0.9 for task_id in bands), bands
+                button_height = "el => el.getBoundingClientRect().height"
+                before_reviews = running.locator(":scope > [data-live-summary-button]").evaluate(button_height)
+                # Acceptance arrives through task-detail logs.
+                _emit_ws_frame(page, {"type": "log", "chat_id": 1, "data": {
+                    "type": "task_metrics_event", "task_id": "running-act",
+                    "ts": "2026-07-29T10:00:03+00:00",
+                    "review_projection": {"panels": [{
+                        "panel_id": "act-review", "surface": "task_acceptance",
+                        "aggregate_signal": "PASS", "reason": "smoke", "actors": [],
+                    }]},
+                }})
+                page.wait_for_function(
+                    "() => document.querySelector('.chat-live-card[data-task-id=\"running-act\"]"
+                    " [data-live-review-summary]')?.textContent === 'Reviews 1'",
+                    timeout=10_000,
+                )
+                row = running.evaluate(
+                    """card => {
+                        const btn = card.querySelector(':scope > [data-live-summary-button]');
+                        const r = (s) => btn.querySelector(s).getBoundingClientRect();
+                        return {height: btn.getBoundingClientRect().height, door: r('[data-live-disclosure]').top,
+                            reviewTop: r('[data-live-review-summary]').top};
+                    }"""
+                )
+                # The quiet count is Details' twin in the head (B); a wide summary keeps its height.
+                assert abs(row["reviewTop"] - row["door"]) <= 1, row
+                assert width < 600 or abs(row["height"] - before_reviews) <= 1, row
+                assert all(not bands[task_id]["clipped"] for task_id in bands), bands
+                assert all("Reviews" not in bands[task_id]["reviews"] for task_id in bands), bands
+
+                named.locator(':scope > [data-live-summary-button] [data-live-disclosure]').click()
+                line_toggle = named.locator(':scope > [data-live-timeline] .chat-live-line-toggle').first
+                line_toggle.wait_for(state="visible", timeout=5_000)
+                line_toggle.click()
+                page.wait_for_function(
+                    "tail => document.querySelector('.chat-live-card[data-task-id=\"named-act\"] > [data-live-timeline]')"
+                    ".innerText.includes(tail)",
+                    arg=unique_tail,
+                )
+                page.screenshot(
+                    path=str(diagnostic_directory(data_dir.parent, "ui-smoke", publish=True) / f"compact-activity-{browser_engine}-{width}.png"),
+                    full_page=True,
+                )
+
             try:
                 for width, height, mobile in [(1440, 1000, False), (390, 844, True)]:
                     context = browser.new_context(
@@ -962,175 +1176,22 @@ def test_ui_smoke_collapsed_activity_line_named_vs_unnamed(
                         has_touch=mobile,
                     )
                     page = context.new_page()
-                    page.add_init_script(f"({_CAPTURE_TEST_SOCKET})()")
-                    page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-                    page.wait_for_function(
-                        "() => window.__testSockets?.some(socket => socket.readyState === WebSocket.OPEN)",
-                        timeout=30_000,
-                    )
-                    named = page.locator('.chat-live-card[data-task-id="named-act"]')
-                    named.wait_for(state="attached", timeout=30_000)
-                    unnamed = page.locator('.chat-live-card[data-task-id="unnamed-act"]')
-                    unnamed.wait_for(state="attached", timeout=30_000)
-                    page.wait_for_function(
-                        "() => document.querySelector('.chat-live-card[data-task-id=\"named-act\"]"
-                        " [data-live-title]')?.textContent === 'Data Analysis'",
-                        timeout=30_000,
-                    )
-                    _emit_ws_frame(page, {
-                        "type": "chat", "role": "assistant", "is_progress": True,
-                        "chat_id": 1, "task_id": "running-act", "suggested_name": "Short task",
-                        "content": "Short update", "ts": "2026-07-29T10:00:02+00:00",
-                    })
-                    running = page.locator('.chat-live-card[data-task-id="running-act"]')
-                    running.wait_for(state="attached", timeout=30_000)
-                    assert running.locator('[data-live-title]').text_content().strip() == "Short task"
-                    assert named.get_attribute("data-expanded") == "0"
-                    named_activity = named.locator('[data-live-activity]')
-                    activity_text = named_activity.text_content().strip()
-                    assert activity_text
-                    assert len(activity_text) <= 240
-                    assert activity_text.endswith(("…", "..."))
-                    assert unique_tail not in activity_text
-                    assert named_activity.get_attribute("title") is None
-                    geometry = named.evaluate(
-                        """card => {
-                            const facts = selector => {
-                                const el = card.querySelector(selector);
-                                const style = getComputedStyle(el);
-                                const lineHeight = parseFloat(style.lineHeight);
-                                const rect = el.getBoundingClientRect();
-                                return { lines: rect.height / lineHeight, width: rect.width };
-                            };
-                            return {
-                                title: facts('[data-live-title]'),
-                                activity: facts('[data-live-activity]'),
-                                clientWidth: card.clientWidth,
-                                scrollWidth: card.scrollWidth,
-                            };
-                        }"""
-                    )
-                    assert geometry["title"]["lines"] <= 2.2, geometry
-                    assert geometry["activity"]["lines"] <= 3.2, geometry
-                    assert geometry["scrollWidth"] <= geometry["clientWidth"] + 1, geometry
-                    named_meta = named.locator('[data-live-meta]').inner_text().split()
-                    # Final ledger: the plain amount, never the open-ledger ceiling.
-                    assert "$0.42" in named_meta and "up" not in named_meta, named_meta
-
-                    unnamed_activity = unnamed.locator('[data-live-activity]')
-                    assert "Doing things without a name" in unnamed.locator('[data-live-title]').text_content()
-                    assert unnamed_activity.text_content().strip() == ""
-                    assert not unnamed_activity.is_visible()
-                    bands = page.evaluate(
-                        """() => Object.fromEntries(['named-act', 'unnamed-act', 'running-act'].map(id => {
-                            const card = document.querySelector(`.chat-live-card[data-task-id="${id}"]`);
-                            const facts = selector => {
-                                const node = card.querySelector(selector);
-                                const style = getComputedStyle(node);
-                                const height = node.getBoundingClientRect().height;
-                                const lineHeight = parseFloat(style.lineHeight);
-                                return {height, lines: height / lineHeight,
-                                    display: style.display, visibility: style.visibility};
-                            };
-                            return [id, {
-                                title: facts('[data-live-title]'),
-                                activity: facts('[data-live-activity]'),
-                                meta: facts('[data-live-meta]'),
-                                finished: card.dataset.finished === '1',
-                                clipped: card.scrollHeight > card.clientHeight + 1,
-                                reviews: card.querySelector('[data-live-review-summary]')?.textContent || '',
-                            }];
-                        }))"""
-                    )
-                    assert bands["named-act"]["finished"] is True, bands
-                    assert bands["unnamed-act"]["finished"] is False, bands
-                    assert bands["running-act"]["finished"] is False, bands
-                    assert all(0.9 <= bands[task_id]["title"]["lines"] <= 1.2 for task_id in bands), bands
-                    assert 2.9 <= bands["named-act"]["activity"]["lines"] <= 3.2, bands
-                    assert 0.9 <= bands["running-act"]["activity"]["lines"] <= 1.2, bands
-                    assert bands["unnamed-act"]["activity"]["display"] == "none", bands
-                    # Useful root activity sizes naturally up to three lines; empty activity
-                    # reserves no band on either running or finished cards. An uncoined turn
-                    # promotes its only note to the title, so the collapsed line stays empty
-                    # while the block still stands on that row of work.
-                    _emit_ws_frame(page, {
-                        "type": "chat", "role": "assistant", "is_progress": True,
-                        "chat_id": 1, "task_id": "done-empty",
-                        "content": "Quick task", "ts": "2026-07-29T10:00:03+00:00",
-                    })
-                    done_empty = page.locator('.chat-live-card[data-task-id="done-empty"]')
-                    done_empty.wait_for(state="attached", timeout=30_000)
-                    _emit_ws_frame(page, {
-                        "type": "chat", "role": "system", "system_type": "task_summary",
-                        "chat_id": 1, "task_id": "done-empty", "content": "Done",
-                        "ts": "2026-07-29T10:00:04+00:00",
-                    })
-                    page.wait_for_function(
-                        "() => document.querySelector('.chat-live-card[data-task-id=\"done-empty\"]')"
-                        "?.dataset.finished === '1'",
-                        timeout=30_000,
-                    )
-                    fold = done_empty.evaluate(
-                        """card => { const node = card.querySelector('[data-live-activity]');
-                            return {text: node.textContent, display: getComputedStyle(node).display,
-                                height: card.getBoundingClientRect().height}; }"""
-                    )
-                    assert fold["text"].strip() == "", fold
-                    assert fold["display"] == "none", fold
-                    running_height = running.evaluate("el => el.getBoundingClientRect().height")
-                    assert fold["height"] <= running_height - 20, (fold, running_height)
-                    assert all(bands[task_id]["meta"]["lines"] >= 0.9 for task_id in bands), bands
-                    button_height = "el => el.getBoundingClientRect().height"
-                    before_reviews = running.locator(":scope > [data-live-summary-button]").evaluate(button_height)
-                    # A root card's acceptance evidence rides the log channel (task detail seam).
-                    _emit_ws_frame(page, {"type": "log", "chat_id": 1, "data": {
-                        "type": "task_metrics_event", "task_id": "running-act",
-                        "ts": "2026-07-29T10:00:03+00:00",
-                        "review_projection": {"panels": [{
-                            "panel_id": "act-review", "surface": "task_acceptance",
-                            "aggregate_signal": "PASS", "reason": "smoke", "actors": [],
-                        }]},
-                    }})
-                    page.wait_for_function(
-                        "() => document.querySelector('.chat-live-card[data-task-id=\"running-act\"]"
-                        " [data-live-review-summary]')?.textContent === 'Reviews 1'",
-                        timeout=10_000,
-                    )
-                    row = running.evaluate(
-                        """card => {
-                            const btn = card.querySelector(':scope > [data-live-summary-button]');
-                            const meta = btn.querySelector('[data-live-meta]').getBoundingClientRect();
-                            const review = btn.querySelector('[data-live-review-summary]').getBoundingClientRect();
-                            return {height: btn.getBoundingClientRect().height, metaTop: meta.top,
-                                reviewTop: review.top, reviewRight: review.right,
-                                buttonRight: btn.getBoundingClientRect().right};
-                        }"""
-                    )
-                    # The quiet count shares the metadata row, docked right, without a new row.
-                    assert abs(row["reviewTop"] - row["metaTop"]) <= 2, row
-                    assert row["buttonRight"] - row["reviewRight"] <= 20, row
-                    assert abs(row["height"] - before_reviews) <= 1, row
-                    assert all(not bands[task_id]["clipped"] for task_id in bands), bands
-                    assert all("Reviews" not in bands[task_id]["reviews"] for task_id in bands), bands
-
-                    named.locator(':scope > [data-live-summary-button]').click()
-                    line_toggle = named.locator(':scope > [data-live-timeline] .chat-live-line-toggle').first
-                    line_toggle.wait_for(state="visible", timeout=5_000)
-                    line_toggle.click()
-                    page.wait_for_function(
-                        "tail => document.querySelector('.chat-live-card[data-task-id=\"named-act\"]')"
-                        ".innerText.includes(tail)",
-                        arg=unique_tail,
-                    )
-                    page.screenshot(
-                        path=str(data_dir.parent / f"compact-activity-{browser_engine}-{width}.png"),
-                        full_page=True,
-                    )
-                    context.close()
+                    in_flight, draining = [], []
+                    try:
+                        check_width(page, width)
+                    finally:
+                        try:  # its callbacks finish, none starting, with the routes still set (#2120)
+                            draining.append(time.monotonic() + 30)
+                            while in_flight and time.monotonic() < draining[0]:
+                                page.wait_for_timeout(20)
+                            assert not in_flight, in_flight
+                            page.unroute_all(behavior="wait")
+                        finally:
+                            context.close()
             finally:
                 browser.close()
     except PlaywrightError as exc:
-        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+        if _browser_missing(exc):
             pytest.fail(f"required Playwright {browser_engine} browser is not installed: {exc}")
         raise
 
@@ -1138,12 +1199,10 @@ def test_ui_smoke_collapsed_activity_line_named_vs_unnamed(
 @pytest.mark.ui_browser
 @pytest.mark.parametrize("browser_engine", ["chromium", "webkit"])
 def test_ui_smoke_live_card_mutations_preserve_viewport(
-    direct_server_with_data,
-    browser_engine,
+    direct_server_with_data, browser_engine, request,
 ):
-    from tests.ui_chat_viewport_smoke import run_chat_viewport_smoke
-
-    run_chat_viewport_smoke(direct_server_with_data, browser_engine)
+    from tests.ui_chat_viewport_smoke import run_chat_viewport_smoke as run
+    run(direct_server_with_data, browser_engine, request)
 
 @pytest.mark.ui_browser
 def test_ui_smoke_chat_chronology_reconnect_and_plain_answer_marker(direct_server_with_data):
@@ -1153,8 +1212,6 @@ def test_ui_smoke_chat_chronology_reconnect_and_plain_answer_marker(direct_serve
 
     url = direct_server_with_data["url"]
     data_dir = direct_server_with_data["data_dir"]
-    logs_dir = data_dir / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
     evidence_dir = pathlib.Path(
         os.environ.get("OUROBOROS_UI_EVIDENCE_DIR", str(data_dir.parent))
     )
@@ -1186,15 +1243,12 @@ def test_ui_smoke_chat_chronology_reconnect_and_plain_answer_marker(direct_serve
         ),
         "format": "markdown",
     }
-    (logs_dir / "chat.jsonl").write_text(
-        json.dumps(anchor_summary) + "\n" + json.dumps(t3) + "\n",
-        encoding="utf-8",
-    )
+    _store_rows(data_dir, "chat", [anchor_summary, t3])
 
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
-            context = browser.new_context(viewport={"width": 1280, "height": 800})
+            context = browser.new_context(viewport={"width": 1280, "height": 800}, timezone_id="UTC")
             page = context.new_page()
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=30_000)
@@ -1206,6 +1260,13 @@ def test_ui_smoke_chat_chronology_reconnect_and_plain_answer_marker(direct_serve
                 )
                 mounted_anchor.wait_for(state="attached", timeout=30_000)
                 assert mounted_anchor.is_visible()
+                # Establish build: unknown SHA deliberately reloads.
+                page.wait_for_function(
+                    "() => typeof window.__ouroWs?._lastSha === 'string'"
+                    " && window.__ouroWs._lastSha.length > 0",
+                    timeout=30_000,
+                )
+                page.evaluate("() => { window.__chronologyDocument = {socket: window.__ouroWs.ws}; }")
 
                 t1 = {
                     "ts": "2025-07-18T10:00:01+00:00",
@@ -1223,22 +1284,10 @@ def test_ui_smoke_chat_chronology_reconnect_and_plain_answer_marker(direct_serve
                     "format": "markdown",
                 }
                 disconnected_summary = {
+                    **anchor_summary,
                     "ts": "2025-07-18T10:00:02.500000+00:00",
-                    "direction": "system",
-                    "type": "task_summary",
-                    "system_type": "task_summary",
                     "task_id": "chronology-disconnected",
-                    "chat_id": 1,
                     "text": "Disconnected summary-only card.",
-                    "tool_calls": 1,
-                    "rounds": 2,
-                    "outcome_axes": {
-                        "lifecycle": {"status": "completed"},
-                        "execution": {"status": "ok"},
-                        "objective": {"status": "pass"},
-                        "review": {"status": "pass"},
-                        "artifacts": {"status": "ready"},
-                    },
                 }
                 t4 = {
                     "ts": "2025-07-18T10:00:04+00:00",
@@ -1247,30 +1296,22 @@ def test_ui_smoke_chat_chronology_reconnect_and_plain_answer_marker(direct_serve
                     "text": "Fourth new message below the reading anchor.",
                     "format": "markdown",
                 }
-                (logs_dir / "chat.jsonl").write_text(
-                    "".join(
-                        json.dumps(row) + "\n"
-                        for row in (anchor_summary, t3, t1, t2, disconnected_summary, t4)
-                    ),
-                    encoding="utf-8",
-                )
-                (logs_dir / "progress.jsonl").write_text(
-                    json.dumps({
-                        "ts": "2025-07-18T10:00:01.500000+00:00",
-                        "chat_id": 1,
-                        "task_id": "chronology-progress-only",
-                        "content": "Progress-only terminal card.",
-                    }) + "\n" + json.dumps({
-                        "ts": "2025-07-18T10:00:01.750000+00:00",
-                        "chat_id": 1,
-                        "task_id": "chronology-anchor",
-                        "content": "Earlier progress backfilled for the mounted anchor card.",
-                    }) + "\n",
-                    encoding="utf-8",
-                )
-                task_results = data_dir / "task_results"
-                task_results.mkdir(parents=True, exist_ok=True)
-                (task_results / "chronology-progress-only.json").write_text(json.dumps({
+                # Backfilled while the page reads the room: older rows land after the ones it shows.
+                _store_rows(data_dir, "chat", [t1, t2, disconnected_summary, t4])
+                _store_rows(data_dir, "progress", [{
+                    "ts": "2025-07-18T10:00:01.500000+00:00",
+                    "chat_id": 1,
+                    "task_id": "chronology-progress-only",
+                    "content": "Progress-only terminal card.",
+                }, {
+                    "ts": "2025-07-18T10:00:01.750000+00:00",
+                    "chat_id": 1,
+                    "task_id": "chronology-anchor",
+                    "content": "Earlier progress backfilled for the mounted anchor card.",
+                }])
+                from tests._store_shared import seed_result  # the server reads its store, not later files
+
+                seed_result(data_dir, "chronology-progress-only", {
                     "_schema_version": 1,
                     "task_id": "chronology-progress-only",
                     "status": "completed",
@@ -1281,7 +1322,7 @@ def test_ui_smoke_chat_chronology_reconnect_and_plain_answer_marker(direct_serve
                         "review": {"status": "degraded"},
                         "artifacts": {"status": "ready"},
                     },
-                }) + "\n", encoding="utf-8")
+                })
 
                 scroll_before = page.evaluate(
                     """() => {
@@ -1302,8 +1343,8 @@ def test_ui_smoke_chat_chronology_reconnect_and_plain_answer_marker(direct_serve
                 assert scroll_before["remaining"] > 160
                 direct_server_with_data["restart_server"]()
                 page.wait_for_function(
-                    "() => [...document.querySelectorAll('.chat-bubble.system')]"
-                    ".some((node) => node.textContent.includes('Reconnected'))",
+                    "() => window.__ouroWs.ws !== window.__chronologyDocument.socket"
+                    " && window.__ouroWs.ws?.readyState === WebSocket.OPEN",
                     timeout=20_000,
                 )
                 page.wait_for_selector(
@@ -1319,8 +1360,7 @@ def test_ui_smoke_chat_chronology_reconnect_and_plain_answer_marker(direct_serve
                     # timestamp of its own: it is chrome, not a transcript row.
                     """() => [...document.querySelector('#chat-messages').children]
                         .filter((node) => !node.classList.contains('typing-bubble')
-                            && !node.classList.contains('chat-load-older')
-                            && !node.textContent.includes('Reconnected'))
+                            && !node.classList.contains('chat-load-older'))
                         .map((node) => ({
                             text: node.textContent,
                             ts: node.dataset.ts || '',
@@ -1344,23 +1384,16 @@ def test_ui_smoke_chat_chronology_reconnect_and_plain_answer_marker(direct_serve
                 assert page.locator(".final-answer-chip").count() == 0
                 assert "FINAL ANSWER: 41" in page.locator("#chat-messages").inner_text()
                 assert "FINAL ANSWER: 42" in page.locator("#chat-messages").inner_text()
-                assert "2025" in page.locator(
-                    '.chat-live-card[data-task-id="chronology-progress-only"]'
-                ).inner_text()
-                scroll_after = page.evaluate(
-                    """() => {
-                        const messages = document.querySelector('#chat-messages');
-                        const anchor = messages.querySelector(
-                            '.chat-live-card[data-task-id="chronology-anchor"]'
-                        );
-                        return {
-                            top: messages.scrollTop,
-                            height: messages.scrollHeight,
-                            anchorTop: anchor?.getBoundingClientRect().top,
-                        };
-                    }"""
-                )
-                assert abs(scroll_after["anchorTop"] - scroll_before["anchorTop"]) <= 6
+                anchor_after = page.locator('.chat-live-card[data-task-id="chronology-anchor"]').evaluate(
+                    "el => el.getBoundingClientRect().top")
+                assert page.evaluate("() => Boolean(window.__chronologyDocument)")
+                assert abs(anchor_after - scroll_before["anchorTop"]) <= 6
+                # Settled clocks live in Details (#2188): the last note's day in this UTC chat, not the reload's.
+                settled = page.locator('.chat-live-card[data-task-id="chronology-progress-only"]')
+                settled.locator('[data-live-disclosure]').click()
+                updated = settled.locator('.chat-live-fact').filter(has=page.get_by_text("Updated", exact=True)).locator('dd')
+                assert updated.is_visible() and "Jul 18," in updated.inner_text()
+                settled.locator('[data-live-disclosure]').click()
                 page.locator("#chat-messages").evaluate("(messages) => { messages.scrollTop = 0; }")
                 page.screenshot(
                     path=str(evidence_dir / "phase3-chat-chronology-desktop.png"),
@@ -1392,6 +1425,7 @@ def test_ui_smoke_chat_chronology_reconnect_and_plain_answer_marker(direct_serve
                 )
 
                 page.goto(f"{url}/?_ouro_reason=sha-change", wait_until="domcontentloaded", timeout=30_000)
+                assert page.evaluate("() => typeof window.__chronologyDocument === 'undefined'")
                 page.get_by_text("Restart complete").wait_for(state="visible", timeout=30_000)
                 first = page.locator(".chat-bubble", has_text="First historical message.").first
                 first.wait_for(state="attached", timeout=30_000)
@@ -1405,7 +1439,7 @@ def test_ui_smoke_chat_chronology_reconnect_and_plain_answer_marker(direct_serve
                 context.close()
                 browser.close()
     except PlaywrightError as exc:
-        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+        if _browser_missing(exc):
             pytest.skip(str(exc))
         raise
 
@@ -1442,7 +1476,7 @@ def test_ui_smoke_direct_mode_creates_task_with_mock_provider(direct_server):
             finally:
                 browser.close()
     except PlaywrightError as exc:
-        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+        if _browser_missing(exc):
             pytest.skip(str(exc))
         raise
 
@@ -1455,8 +1489,6 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
 
     url = direct_server_with_data["url"]
     data_dir = direct_server_with_data["data_dir"]
-    logs_dir = data_dir / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
     child_review_projection = {
         "panels": [{
             "panel_id": "panel_child_review",
@@ -1611,27 +1643,21 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
             "result": "Nested evidence result",
         },
     ]
-    (logs_dir / "progress.jsonl").write_text(
-        "".join(json.dumps(row) + "\n" for row in rows),
-        encoding="utf-8",
-    )
-    (logs_dir / "chat.jsonl").write_text(
-        json.dumps({
-            "ts": "2026-05-25T10:00:03.500000+00:00",
-            "chat_id": 1,
-            "direction": "out",
-            "task_id": "child1",
-            "text": "Final child answer should stay inside the child card.",
-            "format": "markdown",
-            "delegation_role": "subagent",
-            "subagent_event": "completed",
-            "subagent_task_id": "child1",
-            "parent_task_id": "parent1",
-            "root_task_id": "parent1",
-            "subagent_role": "researcher",
-            }) + "\n",
-        encoding="utf-8",
-    )
+    _store_rows(data_dir, "progress", rows)
+    _store_rows(data_dir, "chat", [{
+        "ts": "2026-05-25T10:00:03.500000+00:00",
+        "chat_id": 1,
+        "direction": "out",
+        "task_id": "child1",
+        "text": "Final child answer should stay inside the child card.",
+        "format": "markdown",
+        "delegation_role": "subagent",
+        "subagent_event": "completed",
+        "subagent_task_id": "child1",
+        "parent_task_id": "parent1",
+        "root_task_id": "parent1",
+        "subagent_role": "researcher",
+    }])
 
     try:
         with sync_playwright() as pw:
@@ -1707,8 +1733,8 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
 
                 assert child.get_attribute("data-expanded") == "0"
                 assert grandchild.get_attribute("data-expanded") == "0"
-                child_summary = child.locator(":scope > [data-live-summary-button]").first
-                child_summary.click()
+                child_disclosure = child.locator(":scope > [data-live-summary-button] [data-live-disclosure]").first
+                child_disclosure.click()
                 _open_review_checkpoint(child, open_card=False)
                 assert "panel_child_review" in child.inner_text()
                 assert "claude-fable-5" in child.inner_text()
@@ -1733,7 +1759,7 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
                 assert "Scheduled subagent child1" not in expanded_text
                 assert "Subagent child1 running" not in expanded_text
                 assert child.locator('[data-live-line-key="terminal-subagent-lifecycle-child1"]').count() == 1
-                assert child_summary.get_attribute("aria-expanded") == "true"
+                assert child_disclosure.get_attribute("aria-expanded") == "true"
                 assert child.locator("[data-live-timeline]").first.get_attribute("id")
                 assert result_toggle.get_attribute("aria-controls")
 
@@ -1778,10 +1804,10 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
                 assert replay_child.locator('[data-live-line-key="terminal-subagent-lifecycle-child1"]').count() == 1
                 page.wait_for_timeout(900)  # cover the routine background history sync
                 assert replay_child.locator('.chat-live-line-repeat:not([hidden])').count() == 0
-                page.screenshot(path=str(data_dir.parent / "review-truth-child-reconnect.png"), full_page=True)
+                page.screenshot(path=str(diagnostic_directory(data_dir.parent, "ui-smoke", publish=True) / "review-truth-child-reconnect.png"), full_page=True)
                 replay_progress.locator(".chat-live-line-toggle").click()
                 replay_child.scroll_into_view_if_needed()
-                page.screenshot(path=str(data_dir.parent / "lifecycle-current-status.png"), full_page=True)
+                page.screenshot(path=str(diagnostic_directory(data_dir.parent, "ui-smoke", publish=True) / "lifecycle-current-status.png"), full_page=True)
                 assert page.locator(".chat-bubble.progress").count() == 0
                 assert page.locator(".chat-bubble", has_text="Final child answer should stay inside the child card.").count() == 0
 
@@ -1808,7 +1834,7 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
             finally:
                 browser.close()
     except PlaywrightError as exc:
-        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+        if _browser_missing(exc):
             pytest.skip(str(exc))
         raise
 
@@ -1838,25 +1864,25 @@ def test_ui_smoke_desktop_composer_chips_above_input_send_inside(direct_server):
                             toolbar: rect('.chat-toolbar-row'),
                             send: rect('.chat-send-group'),
                             sendButton: rect('.chat-send-inline'),
-                            swarm: rect('.chat-swarm'),
+                            subagents: rect('.chat-subagents-mode'),
                             contextMode: rect('.chat-context-mode'),
                         };
                     }"""
                 )
                 # v6.32.0 composer redesign (owner: "чипы правильнее НАД полем ввода"):
-                # the chips row (Swarm + Low/Max) sits ABOVE the text input...
+                # the capsules row (Subagents, Context, Effort) sits ABOVE the text input...
                 assert metrics["toolbar"]["bottom"] <= metrics["input"]["top"] + 4, metrics
-                assert metrics["swarm"]["bottom"] <= metrics["input"]["top"] + 4, metrics
+                assert metrics["subagents"]["bottom"] <= metrics["input"]["top"] + 4, metrics
                 assert metrics["contextMode"]["bottom"] <= metrics["input"]["top"] + 4, metrics
-                # ...the two chips share that row (aligned tops)...
-                assert abs(metrics["swarm"]["top"] - metrics["contextMode"]["top"]) <= 2, metrics
+                # ...the capsules share that row (aligned tops)...
+                assert abs(metrics["subagents"]["top"] - metrics["contextMode"]["top"]) <= 2, metrics
                 # ...and the Send button stays INSIDE the input's vertical band (same text row).
                 assert metrics["send"]["top"] >= metrics["input"]["top"] - 4, metrics
                 assert metrics["send"]["bottom"] <= metrics["input"]["bottom"] + 4, metrics
             finally:
                 browser.close()
     except PlaywrightError as exc:
-        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+        if _browser_missing(exc):
             pytest.skip(str(exc))
         raise
 
@@ -1885,10 +1911,9 @@ def test_ui_smoke_mobile_composer_toolbar_does_not_overlap_input(direct_server):
                         return {
                             input: rect('#chat-input'),
                             toolbar: rect('.chat-toolbar-row'),
-                            pills: rect('.chat-composer-pills'),
                             send: rect('.chat-send-group'),
                             sendButton: rect('.chat-send-inline'),
-                            swarm: rect('.chat-swarm'),
+                            subagents: rect('.chat-subagents-mode'),
                             contextMode: rect('.chat-context-mode'),
                             paddingRight: inputStyle.paddingRight,
                         };
@@ -1904,13 +1929,13 @@ def test_ui_smoke_mobile_composer_toolbar_does_not_overlap_input(direct_server):
                 assert metrics["toolbar"]["bottom"] <= metrics["input"]["top"] + 1, metrics
                 assert metrics["send"]["top"] >= metrics["input"]["top"] - 1, metrics
                 assert metrics["send"]["bottom"] <= metrics["input"]["bottom"] + 1, metrics
-                assert abs(metrics["swarm"]["height"] - metrics["sendButton"]["height"]) <= 1, metrics
+                assert abs(metrics["subagents"]["height"] - metrics["sendButton"]["height"]) <= 1, metrics
                 assert abs(metrics["contextMode"]["height"] - metrics["sendButton"]["height"]) <= 1, metrics
                 assert metrics["paddingRight"] != "256px", metrics
             finally:
                 browser.close()
     except PlaywrightError as exc:
-        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+        if _browser_missing(exc):
             pytest.skip(str(exc))
         raise
 
@@ -2012,10 +2037,10 @@ def _mobile_keyboard_drawer_assertions(page, url: str, screenshot_path: pathlib.
     # surface even though the keyboard touch lock was active one frame earlier.
     scroll = page.evaluate(
         """() => {
-            const scroller = document.querySelector('#primary-sidebar .sidebar-scroll');
+            const scroller = document.querySelector('#primary-sidebar #nav-projects-list');
             for (let i = 0; i < 60; i += 1) {
                 const row = document.createElement('button');
-                row.className = 'nav-row';
+                row.className = 'nav-row nav-project-row';
                 row.type = 'button';
                 row.textContent = `Drawer overflow probe ${i}`;
                 scroller.appendChild(row);
@@ -2032,11 +2057,12 @@ def _mobile_keyboard_drawer_assertions(page, url: str, screenshot_path: pathlib.
     assert scroll["scrollHeight"] > scroll["clientHeight"], scroll
     assert scroll["scrollTop"] > 0, scroll
     assert scroll["overflowY"] in {"auto", "scroll"}, scroll
-    page.screenshot(path=str(screenshot_path), full_page=True)
+    page.screenshot(path=str(diagnostic_directory(screenshot_path.parent, "ui-smoke", publish=True) / screenshot_path.name), full_page=True)
 
-    # Exercise the real backdrop click in the visible strip to the right of the
-    # 320px drawer, then require all state/ARIA projections to close together.
-    page.locator("#nav-drawer-backdrop").click(position={"x": 380, "y": 400})
+    # Exercise the real backdrop click on the room's quarter left showing beside
+    # the drawer (all the scrim covers), then require all state/ARIA projections
+    # to close together.
+    page.locator("#nav-drawer-backdrop").click()
     page.wait_for_function(
         "() => !document.body.classList.contains('nav-drawer-open')"
         " && !document.querySelector('#primary-sidebar').classList.contains('open')"
@@ -2067,7 +2093,7 @@ def test_ui_smoke_mobile_keyboard_state_cannot_hide_open_drawer_chromium(direct_
             finally:
                 browser.close()
     except PlaywrightError as exc:
-        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+        if _browser_missing(exc):
             pytest.skip(str(exc))
         raise
 
@@ -2087,7 +2113,7 @@ def test_ui_smoke_mobile_keyboard_state_cannot_hide_open_drawer_webkit(direct_se
             try:
                 browser = pw.webkit.launch(headless=True)
             except PlaywrightError as exc:
-                if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+                if _browser_missing(exc):
                     pytest.skip(f"Playwright WebKit browser is not installed: {exc}")
                 raise
             context = browser.new_context(**iphone)
@@ -2104,7 +2130,7 @@ def test_ui_smoke_mobile_keyboard_state_cannot_hide_open_drawer_webkit(direct_se
             finally:
                 browser.close()
     except PlaywrightError as exc:
-        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+        if _browser_missing(exc):
             pytest.skip(str(exc))
         raise
 
@@ -2145,10 +2171,10 @@ def test_ui_smoke_direct_mode_chat_scrolls_on_desktop(direct_server):
                 page.goto(direct_server, wait_until="domcontentloaded", timeout=30_000)
                 page.get_by_role("button", name="Chat").click()
                 page.wait_for_selector("#chat-messages", timeout=30_000)
-                # Wait for the initial history rebuild to finish before injecting
-                # synthetic rows; otherwise that authoritative rebuild may erase
-                # the probe immediately after insertion on slower startup paths.
-                page.wait_for_selector("#chat-messages .chat-bubble.assistant", timeout=30_000)
+                # Wait for the first history rebuild to land (the hydration stamp; empty
+                # Main has no bubble) before injecting synthetic rows, or that rebuild may
+                # erase the probe right after insertion on slower startups.
+                page.wait_for_selector('#chat-messages[data-history-hydrated="true"]', timeout=30_000)
                 # A viewport change can re-render the chat from the (empty) real
                 # history and drop injected probe nodes, so injection is a helper
                 # re-run before every measurement instead of a one-shot setup.
@@ -2188,7 +2214,7 @@ def test_ui_smoke_direct_mode_chat_scrolls_on_desktop(direct_server):
             finally:
                 browser.close()
     except PlaywrightError as exc:
-        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+        if _browser_missing(exc):
             pytest.skip(str(exc))
         raise
 
@@ -2244,7 +2270,7 @@ def test_ui_smoke_finished_cards_keep_height_when_transcript_overflows(direct_se
             finally:
                 browser.close()
     except PlaywrightError as exc:
-        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+        if _browser_missing(exc):
             pytest.skip(str(exc))
         raise
 
@@ -2307,8 +2333,6 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
     data_dir = direct_server_with_data["data_dir"]
     url = direct_server_with_data["url"]
     project = create_project(data_dir, "layout-project", name="Layout Project")
-    logs_dir = data_dir / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
     rows = [{
         "ts": "2026-05-25T10:00:00+00:00",
         "chat_id": 1,
@@ -2318,6 +2342,7 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
         "is_progress": True,
     }]
     long_url = "https://example.com/" + "nested-segment-without-breaks-" * 18 + "final"
+    long_role = "accessibility-and-localization-reviewer"
     parent_id = "layout-root"
     for depth in range(1, 11):
         child_id = f"layout-child-{depth:02d}"
@@ -2332,7 +2357,7 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
             "subagent_task_id": child_id,
             "parent_task_id": parent_id,
             "root_task_id": "layout-root",
-            "subagent_role": "pty-tests",
+            "subagent_role": long_role if depth == 1 else "pty-tests",
             "model": "google/gemini-3.6-flash",
             "status": "completed",
             "result": f"Depth {depth} complete. Full evidence: {long_url}",
@@ -2346,12 +2371,10 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
         "suggested_name": "Narrow Project panel keeps a usable title column",
         "is_progress": True,
     }
-    (logs_dir / "progress.jsonl").write_text(
-        "".join(json.dumps(row) + "\n" for row in rows),
-        encoding="utf-8",
-    )
+    _store_rows(data_dir, "progress", rows)
 
     mobile_geometry = """() => {
+        const slot = """ + _ROW_SLOT + """;
         const messages = document.querySelector('#page-chat #chat-messages');
         const messagesStyle = getComputedStyle(messages);
         const usableMessageWidth = messages.clientWidth
@@ -2370,13 +2393,15 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
             const activityLineHeight = parseFloat(activityStyle.lineHeight);
             const activityRect = activity.getBoundingClientRect();
             const cardMain = card.querySelector(':scope > .chat-live-summary-button .chat-live-summary-main').getBoundingClientRect();
-            const cardSide = card.querySelector(':scope > .chat-live-summary-button .chat-live-summary-side').getBoundingClientRect();
+            const cardSide = slot(card.querySelector(':scope > .chat-live-summary-button .chat-live-summary-side'));
             return {
                 id: card.dataset.taskId,
                 collapsedChild: card.classList.contains('subagent') && card.dataset.expanded !== '1',
                 clientWidth: card.clientWidth,
                 scrollWidth: card.scrollWidth,
                 titleWidth: titleRect.width,
+                titleClient: title.clientWidth,
+                titleScroll: title.scrollWidth,
                 titleHeight: titleRect.height,
                 titleLines: lineHeight > 0 ? titleRect.height / lineHeight : 99,
                 titleTop: titleRect.top,
@@ -2387,7 +2412,7 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
             };
         });
         const main = root.querySelector(':scope > .chat-live-summary-button .chat-live-summary-main').getBoundingClientRect();
-        const side = root.querySelector(':scope > .chat-live-summary-button .chat-live-summary-side').getBoundingClientRect();
+        const side = slot(root.querySelector(':scope > .chat-live-summary-button .chat-live-summary-side'));
         const title = root.querySelector(':scope > .chat-live-summary-button [data-live-title]').getBoundingClientRect();
         return {
             messageWidth: usableMessageWidth,
@@ -2419,31 +2444,34 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
         # Narrow regime: the side controls share the chip row, the title takes its own
         # full-width row below both.
         # Main and side controls start on one flex row. A terminal projection may
-        # make the main box zero-height; their shared top still distinguishes it
-        # from a real wrap, whose row gap would move the side down.
-        assert abs(facts["rootSideTop"] - facts["rootMainTop"]) <= 1, facts
+        # leave the main box empty; their shared top still distinguishes it
+        # from a real wrap, whose row gap would move the side down (a door centres in its 24px group).
+        assert abs(facts["rootSideTop"] - facts["rootMainTop"]) <= 2, facts
         assert facts["rootTitleTop"] >= max(facts["rootMainBottom"], facts["rootSideBottom"]) - 1, facts
         assert all(card["scrollWidth"] <= card["clientWidth"] + 1 for card in facts["cardFacts"]), facts
-        assert min(card["titleWidth"] for card in facts["cardFacts"]) >= 160, facts
+        assert min(card["titleWidth"] for card in facts["cardFacts"] if not card["collapsedChild"]) >= 160, facts
         assert 0.9 <= min(card["titleLines"] for card in facts["cardFacts"]), facts
         assert max(card["titleLines"] for card in facts["cardFacts"]) <= 2.2, facts
         assert max(card["activityLines"] for card in facts["cardFacts"]
                    if not card["collapsedChild"]) <= 3.2, facts
         assert max(card["activityLines"] for card in facts["cardFacts"]
                    if card["collapsedChild"]) <= 1.2, facts
-        # #623: a collapsed child keeps its identity row — the title beside the
-        # chip, the summary at most two bands (the side wraps under only when a
-        # 160px title cannot share the row), never a third band for the title.
+        # #623: a collapsed child keeps its identity row: title beside chip and controls, whole if short, wrapped
+        # if long (child-01). The summary is reading content, no button (#1998): the title holds the whole role
+        # as its text, however much shows.
+        assert page.get_by_text(long_role, exact=True).count() == 1
         for card in facts["cardFacts"]:
             if card["collapsedChild"]:
+                assert 0 < card["titleClient"] and card["titleScroll"] <= card["titleClient"] + 1 and (
+                    card["titleLines"] > 1.5) == (card["id"] == "layout-child-01"), card
                 assert abs(card["titleTop"] - card["mainTop"]) <= 4, card
                 assert card["summaryBottom"] - card["mainTop"] <= 2.2 * card["titleHeight"] + 8, card
         assert all(card["activityTitle"] is None for card in facts["cardFacts"]), facts
         deepest = page.locator('.chat-live-card[data-task-id="layout-child-10"]')
         assert deepest.locator(':scope > .chat-live-summary-button [data-live-title]').inner_text() == "pty-tests"
-        assert "Agent model: gemini-3.6-flash" in deepest.locator(
-            ':scope > .chat-live-summary-button [data-live-meta]').inner_text()
-        deepest.locator(":scope > [data-live-summary-button]").click()
+        assert "gemini-3.6-flash" in deepest.locator(
+            ':scope > .chat-live-foot [data-live-meta]').inner_text()
+        deepest.locator(":scope > [data-live-summary-button] [data-live-disclosure]").click()
         line_toggle = deepest.locator(":scope > [data-live-timeline] .chat-live-line-toggle").last
         line_toggle.wait_for(state="visible", timeout=5_000)
         line_toggle.click()
@@ -2470,11 +2498,9 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
     def assert_jump_geometry(page, scope_selector, *, require_overflow=True):
         page.evaluate(
             """({scopeSelector, requireOverflow}) => {
-                const scope = document.querySelector(scopeSelector);
-                const messages = scope
-                    .querySelector('.chat-messages, #chat-messages');
-                messages.scrollTop = 0;
-                messages.dispatchEvent(new Event('scroll'));
+                const messages = document.querySelector(scopeSelector).querySelector('.chat-messages, #chat-messages');
+                messages.dispatchEvent(new WheelEvent('wheel', {deltaY: -1}));
+                messages.scrollTop = 0; messages.dispatchEvent(new Event('scroll'));
             }""",
             {"scopeSelector": scope_selector, "requireOverflow": require_overflow},
         )
@@ -2499,7 +2525,7 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
                     remaining: messages.scrollHeight - messages.scrollTop - messages.clientHeight,
                     visible: button.classList.contains('visible'),
                     width: b.width, height: b.height,
-                    centerDelta: Math.abs((b.left + b.width / 2) - (w.left + w.width / 2)),
+                    endInset: w.right - b.right,
                     gap: w.top - b.bottom,
                     toolbarOverlap: overlap(b, t),
                     previewOverlap: preview ? overlap(b, preview.getBoundingClientRect()) : 0,
@@ -2515,9 +2541,10 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
         if require_overflow:
             assert facts["remaining"] > 48, facts
         assert abs(facts["width"] - 32) <= 1 and abs(facts["height"] - 32) <= 1, facts
-        assert facts["centerDelta"] <= 1 and abs(facts["gap"] - 8) <= 1, facts
+        # ↓ latest stands at the composer's end, never over the middle of the column.
+        assert abs(facts["endInset"] - 8) <= 1 and abs(facts["gap"] - 8) <= 1, facts
         assert facts["toolbarOverlap"] == 0 and facts["previewOverlap"] == 0, facts
-        assert facts["boxShadow"] == "none", facts
+        assert facts["boxShadow"] != "none", facts
         return facts
 
     try:
@@ -2526,7 +2553,7 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
             try:
                 browser = browser_type.launch(headless=True)
             except PlaywrightError as exc:
-                if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+                if _browser_missing(exc):
                     pytest.fail(f"required Playwright {browser_engine} browser is not installed: {exc}")
                 raise
             try:
@@ -2540,7 +2567,7 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
                 assert_mobile_geometry(mobile)
                 assert_jump_geometry(mobile, "#page-chat")
                 mobile.screenshot(
-                    path=str(data_dir.parent / f"live-card-depth-10-{browser_engine}.png"),
+                    path=str(diagnostic_directory(data_dir.parent, "ui-smoke", publish=True) / f"live-card-depth-10-{browser_engine}.png"),
                     full_page=True,
                 )
                 mobile.reload(wait_until="domcontentloaded", timeout=30_000)
@@ -2561,12 +2588,13 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
                 assert len(rendered_ids) == 11, rendered_ids
                 wide_facts = wide.evaluate(
                     """() => {
+                        const slot = """ + _ROW_SLOT + """;
                         const ids = ['layout-root', 'layout-child-01', 'layout-child-02'];
                         return ids.map((id) => {
                             const card = document.querySelector(`#page-chat .chat-live-card[data-task-id="${id}"]`);
                             const summary = card.querySelector(':scope > .chat-live-summary-button .chat-live-summary');
                             const main = summary.querySelector('.chat-live-summary-main').getBoundingClientRect();
-                            const side = summary.querySelector('.chat-live-summary-side').getBoundingClientRect();
+                            const side = slot(summary.querySelector('.chat-live-summary-side'));
                             const rect = card.getBoundingClientRect();
                             const title = summary.querySelector('.chat-live-title').getBoundingClientRect();
                             return {
@@ -2589,16 +2617,15 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
                 assert wide_facts[2]["left"] - wide_facts[1]["left"] >= 30, wide_facts
                 assert all(card["scroll"] <= card["client"] + 1 for card in wide_facts), wide_facts
                 for card in wide_facts[:2]:
-                    assert abs(card["mainTop"] - card["sideTop"]) <= 1, wide_facts
+                    assert abs(card["mainTop"] - card["sideTop"]) <= 2, wide_facts
                 # #623: the depth-2 collapsed child is in the 560px container regime
-                # (wrap allowed) yet keeps ONE identity row: chip, title, side controls.
+                # yet keeps ONE identity row: chip, title, side controls.
                 deep = wide_facts[2]
-                assert deep["wrap"] == "wrap", wide_facts
                 assert abs(deep["titleTop"] - deep["mainTop"]) <= 4, wide_facts
                 assert abs(deep["mainTop"] - deep["sideTop"]) <= 1, wide_facts
 
                 # The 620-700px column (laptop with the project panel open): the root
-                # card takes up to 620px there and keeps its single-row header.
+                # card takes up to 620px there.
                 wide.set_viewport_size({"width": 1004, "height": 750})
                 wide.wait_for_timeout(250)
                 owner_facts = wide.evaluate(
@@ -2612,7 +2639,7 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
                 )
                 assert 700 <= owner_facts["column"] <= 740, owner_facts
                 # 80% of a 700-740px column is below the 620px floor, so the floor wins.
-                assert abs(owner_facts["width"] - 620) <= 1 and owner_facts["wrap"] == "nowrap", owner_facts
+                assert abs(owner_facts["width"] - 620) <= 1, owner_facts
                 # The width is monotonic across the 620px chatcol breakpoint: against
                 # its containing block's content width the card is
                 # min(content, max(80% of content, 620px)) at every column width.
@@ -2672,8 +2699,7 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
                 )
                 assert_jump_geometry(wide, "#page-chat")
 
-                with (logs_dir / "progress.jsonl").open("a", encoding="utf-8") as handle:
-                    handle.write(json.dumps(panel_row) + "\n")
+                _store_rows(data_dir, "progress", [panel_row])
                 wide.evaluate(
                     "() => document.documentElement.style.setProperty('--project-panel-width', '440px')"
                 )
@@ -2686,10 +2712,11 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
                 panel_card.wait_for(state="visible", timeout=30_000)
                 panel_facts = panel_card.evaluate(
                     """card => {
+                        const slot = """ + _ROW_SLOT + """;
                         const panel = card.closest('.chat-instance-panel');
                         const summary = card.querySelector(':scope > .chat-live-summary-button .chat-live-summary');
                         const main = summary.querySelector('.chat-live-summary-main').getBoundingClientRect();
-                        const side = summary.querySelector('.chat-live-summary-side').getBoundingClientRect();
+                        const side = slot(summary.querySelector('.chat-live-summary-side'));
                         const title = summary.querySelector('[data-live-title]').getBoundingClientRect();
                         return {
                             panelWidth: panel.getBoundingClientRect().width,
@@ -2709,28 +2736,28 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
                 assert panel_facts["cardWidth"] >= panel_facts["panelWidth"] * 0.9, panel_facts
                 assert panel_facts["cardScroll"] <= panel_facts["cardClient"] + 1, panel_facts
                 assert panel_facts["titleWidth"] >= 180, panel_facts
-                assert abs(panel_facts["mainTop"] - panel_facts["sideTop"]) <= 1, panel_facts
+                assert abs(panel_facts["mainTop"] - panel_facts["sideTop"]) <= 2, panel_facts
                 assert panel_facts["titleTop"] >= max(panel_facts["mainBottom"], panel_facts["sideBottom"]) - 1, panel_facts
                 assert_jump_geometry(
                     wide, "#panel-pchat-layout-project", require_overflow=False
                 )
                 wide.screenshot(
-                    path=str(data_dir.parent / f"live-card-project-panel-{browser_engine}.png"),
+                    path=str(diagnostic_directory(data_dir.parent, "ui-smoke", publish=True) / f"live-card-project-panel-{browser_engine}.png"),
                     full_page=True,
                 )
             finally:
                 browser.close()
     except PlaywrightError as exc:
-        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+        if _browser_missing(exc):
             pytest.fail(f"required Playwright {browser_engine} browser is not installed: {exc}")
         raise
 
 
 @pytest.mark.ui_browser
 def test_ui_smoke_v639_skip_review_button(direct_server_with_data):
-    # C1: the owner-only "⚠️ Skip review" action is offered for the owner's OWN (external)
-    # skill and hash-verified official-hub payloads that still need review, and NEVER for
-    # native/ClawHub/unverified marketplace payloads.
+    # C1: the owner-only "Skip review" action follows the host's attestability fact for the exact
+    # bytes (any origin may be attested by its owner; the endpoint repeats every check), is never
+    # offered for bytes already attested, and an attested skill says so in words.
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import sync_playwright
@@ -2745,23 +2772,27 @@ def test_ui_smoke_v639_skip_review_button(direct_server_with_data):
     mk = data_dir / "skills" / "clawhub" / "markettool"
     mk.mkdir(parents=True, exist_ok=True)
     (mk / "SKILL.md").write_text(manifest.format(n="markettool"), encoding="utf-8")
-    # A real marketplace skill carries clawhub provenance -> resolves to source=clawhub
-    # (without it, an unprovenanced clawhub-bucket payload is treated as owner-own external).
+    # A real marketplace skill carries clawhub provenance -> resolves to source=clawhub.
     (mk / ".clawhub.json").write_text(
         json.dumps({"slug": "markettool", "version": "0.1.0"}), encoding="utf-8")
-    # An already owner-attested skill: must show the distinct 'owner-attested' badge.
+    # An owner-attested skill (the attestation bound to these exact bytes): says "You skipped the
+    # review" and offers no second Skip.
+    from ouroboros.skill_loader import compute_content_hash
+
     att = data_dir / "skills" / "external" / "attestedtool"
     att.mkdir(parents=True, exist_ok=True)
     (att / "SKILL.md").write_text(manifest.format(n="attestedtool"), encoding="utf-8")
+    attested_hash = compute_content_hash(att)
     att_state = data_dir / "state" / "skills" / "attestedtool"
     att_state.mkdir(parents=True, exist_ok=True)
     (att_state / "review.json").write_text(json.dumps({
-        "status": "clean", "content_hash": "seed", "review_profile": "owner_attested",
+        "status": "clean", "content_hash": attested_hash, "review_profile": "owner_attested",
         "reviewer_models": ["owner_attestation"],
         "findings": [{"item": "owner_attestation", "verdict": "PASS", "severity": "info", "reason": "owner attested"}],
     }), encoding="utf-8")
     (att_state / "owner_attestation.json").write_text(
-        json.dumps({"attested_at": "now", "content_hash": "seed"}), encoding="utf-8")
+        json.dumps({"attested_at": "now", "content_hash": attested_hash}), encoding="utf-8")
+    skip = '[data-skill-action="attest_review"]'
 
     try:
         with sync_playwright() as pw:
@@ -2772,18 +2803,22 @@ def test_ui_smoke_v639_skip_review_button(direct_server_with_data):
                 page.click('[data-nav-page="skills"]')
                 page.wait_for_selector("#page-skills", timeout=30_000)
                 page.wait_for_selector('.skills-card[data-skill="owntool"]', timeout=30_000)
+                listing = {row["name"]: row for row in page.request.get(f"{url}/api/extensions").json()["skills"]}
                 own = page.locator('.skills-card[data-skill="owntool"]').first
                 market = page.locator('.skills-card[data-skill="markettool"]').first
-                # owner-own external skill that still needs review -> Skip review offered.
-                assert own.locator(".skills-attest-review").count() == 1
-                assert "Skip review" in (
-                    own.locator(".skills-attest-review").first.text_content() or "")
-                # ClawHub marketplace skill -> never attestable, no Skip review action.
-                assert market.locator(".skills-attest-review").count() == 0
-                # owner-attested skill -> distinct 'owner-attested' badge (review_profile surfaced).
+                # The owner's own skill that still needs review -> Skip review offered, in words.
+                assert own.locator(skip).count() == 1
+                assert "Skip review" in (own.locator(skip).first.text_content() or "")
+                # Every origin follows the host's fact for its exact bytes, in both directions.
+                attestable = listing["markettool"].get("owner_attestable") is not False
+                assert market.locator(skip).count() == (1 if attestable else 0), listing["markettool"].get("owner_attestable")
+                # An attested skill: the review sentence and chip say so, and no second Skip.
                 page.wait_for_selector('.skills-card[data-skill="attestedtool"]', timeout=30_000)
                 att_card = page.locator('.skills-card[data-skill="attestedtool"]').first
-                assert att_card.locator(".skills-badge").filter(has_text="owner-attested").count() >= 1
+                att_card.locator(".skills-details > summary").click()
+                assert "You skipped the review; it runs unreviewed." in att_card.inner_text()
+                assert att_card.locator(".ui-chip").filter(has_text="review skipped by you").count() >= 1
+                assert att_card.locator(skip).count() == 0
                 # The backend is the sole publication classifier. Owner-attested review is
                 # not publication-ready, but the selected flow may start an ordinary task
                 # that repairs/reviews the bytes before opening a PR.
@@ -2805,197 +2840,131 @@ def test_ui_smoke_v639_skip_review_button(direct_server_with_data):
                 assert 'data-submit-disabled="false"' in submit_html
                 assert 'data-publication-ready="false"' in submit_html
                 assert 'data-submit-state="needs_attention"' in submit_html
-                assert "owner-attested" in submit_html.lower()
-                # Defense-in-depth (mirrors the backend source gate): a marketplace skill
-                # mislabeled self-authored must STILL NOT offer Skip review.
-                market_self_html = page.evaluate(
+                assert "review skipped by you" in submit_html
+                assert 'data-skill-action="attest_review"' not in submit_html
+                # The host's attestability fact decides; a fresh attestation is never offered again.
+                cards = page.evaluate(
                     """async () => {
                         const m = await import('/static/modules/skill_card_renderer.js');
-                        return m.renderInstalledSkillCard(
+                        const row = (extra) => m.renderInstalledSkillCard(
                             { name: 'mk2', type: 'instruction', version: '0.1.0', source: 'clawhub',
-                              is_self_authored: true, review_status: 'pending',
-                              review_gate: { executable_review: false }, review_stale: false,
-                              review_profile: '', grants: {}, permissions: [],
-                              payload_root: 'skills/clawhub/mk2', enabled: false },
+                              review_status: 'pending', review_gate: { executable_review: false },
+                              review_stale: false, review_profile: '', grants: {}, permissions: [],
+                              payload_root: 'skills/clawhub/mk2', enabled: false, ...extra },
                             new Set(), new Set(), {}, {});
-                    }"""
-                )
-                assert "skills-attest-review" not in market_self_html
-                # Unverified OuroborosHub payloads also stay blocked; only the official_hub
-                # profile is a cheap UI hint, and the backend still re-verifies.
-                hub_html = page.evaluate(
-                    """async () => {
-                        const m = await import('/static/modules/skill_card_renderer.js');
                         return {
-                          unverified: m.renderInstalledSkillCard(
-                            { name: 'hub1', type: 'instruction', version: '0.1.0', source: 'ouroboroshub',
-                              is_self_authored: false, review_status: 'pending',
-                              review_gate: { executable_review: false }, review_stale: false,
-                              review_profile: '', grants: {}, permissions: [],
-                              payload_root: 'skills/ouroboroshub/hub1', enabled: false },
-                            new Set(), new Set(), {}, {}),
-                          verified: m.renderInstalledSkillCard(
-                            { name: 'hub2', type: 'instruction', version: '0.1.0', source: 'ouroboroshub',
-                              is_self_authored: false, review_status: 'pending',
-                              review_gate: { executable_review: false }, review_stale: false,
-                              review_profile: '', owner_attestable: true, official_hub_verified: true,
-                              grants: {}, permissions: [],
-                              payload_root: 'skills/ouroboroshub/hub2', enabled: false },
-                            new Set(), new Set(), {}, {}),
-                          staleProfile: m.renderInstalledSkillCard(
-                            { name: 'hub3', type: 'instruction', version: '0.1.0', source: 'ouroboroshub',
-                              is_self_authored: false, review_status: 'pending',
-                              review_gate: { executable_review: false }, review_stale: true,
-                              review_profile: 'official_hub', owner_attestable: false,
-                              official_hub_verified: false, grants: {}, permissions: [],
-                              payload_root: 'skills/ouroboroshub/hub3', enabled: false },
-                            new Set(), new Set(), {}, {})
+                          refused: row({ owner_attestable: false }),
+                          allowed: row({ owner_attestable: true }),
+                          attested: row({ owner_attestable: true, review_profile: 'owner_attested',
+                                          review_gate: { executable_review: true } }),
+                          staleAttestation: row({ owner_attestable: true, review_profile: 'owner_attested',
+                                                  review_stale: true }),
                         };
                     }"""
                 )
-                assert "skills-attest-review" not in hub_html["unverified"]
-                assert "skills-attest-review" in hub_html["verified"]
-                assert "skills-attest-review" not in hub_html["staleProfile"]
+                assert 'data-skill-action="attest_review"' not in cards["refused"]
+                assert 'data-skill-action="attest_review"' in cards["allowed"]
+                assert 'data-skill-action="attest_review"' not in cards["attested"]
+                assert 'data-skill-action="attest_review"' in cards["staleAttestation"]
             finally:
                 browser.close()
     except PlaywrightError as exc:
-        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+        if _browser_missing(exc):
             pytest.skip(str(exc))
         raise
 
 
 @pytest.mark.ui_browser
 def test_ui_smoke_v679_subagent_depth_zero_round_trips_through_settings(direct_server_with_data):
-    """v6.79.0: the owner can actually reach, save, and re-read a Subagent Depth of 0.
+    """v6.79.0: the owner can actually reach, save, and re-read a helper depth of 0.
 
     The structural fix (``_bounded_positive_int_setting`` honouring a configured 0) is
     unreachable if the visible control refuses the value or the load path rewrites it back to
-    the fallback. This drives the real consumer flow — Settings -> Advanced -> type -> save ->
-    full page reload — and pins the three neighbouring states so the fix cannot silently break
-    them: 0 (no delegation), a normal positive value, and empty (falls back, does not persist
-    an invalid value). Screenshots are written for vision inspection; a saved screenshot is
-    not verification on its own (docs/DEVELOPMENT.md "Responsive and accessible
-    behavior").
+    the fallback. This drives the real consumer flow (Settings › Agents › the fold's "Helpers of
+    helpers" row: type, leave the field, full page reload) and pins the three neighbouring
+    states so the fix cannot silently break them: 0 (no delegation), a normal positive value,
+    and empty (refused in the row; nothing invalid is persisted). Screenshots are written for
+    vision inspection; a saved screenshot is not verification on its own (docs/DEVELOPMENT.md
+    "Responsive and accessible behavior").
     """
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import sync_playwright
+    from tests.settings_browser_helpers import commit_row, open_settings
 
     url = direct_server_with_data["url"]
     data_dir = direct_server_with_data["data_dir"]
     settings_path = data_dir / "settings.json"
-    evidence_dir = pathlib.Path(
-        os.environ.get("OUROBOROS_UI_EVIDENCE_DIR", str(data_dir.parent))
-    )
+    evidence_dir = pathlib.Path(os.environ.get("OUROBOROS_UI_EVIDENCE_DIR", str(data_dir.parent)))
     evidence_dir.mkdir(parents=True, exist_ok=True)
+    row = "OUROBOROS_MAX_SUBAGENT_DEPTH"
 
     def saved_depth():
-        return json.loads(settings_path.read_text(encoding="utf-8")).get(
-            "OUROBOROS_MAX_SUBAGENT_DEPTH", "<absent>"
-        )
+        return json.loads(settings_path.read_text(encoding="utf-8")).get(row, "<absent>")
 
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
             page = browser.new_page(viewport={"width": 1400, "height": 1000})
             try:
-                def open_settings_advanced():
-                    """Reload the whole app the way an owner would, then reopen the field."""
+                def open_depth(expected):
+                    """Reload the whole app the way an owner would, then land on the row: its fold opens."""
                     page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-                    page.wait_for_selector('[data-nav-page="settings"]', timeout=30_000)
                     page.click('[data-nav-page="settings"]')
-                    page.wait_for_selector("#s-subagent-depth", state="attached", timeout=30_000)
-                    # D-10: subagent depth bounds the AGENTS, so it moved out of
-                    # Advanced -> Runtime Limits into Agents -> Delegation.
-                    page.click('[data-settings-tab="agents"]')
-                    depth = page.locator("#s-subagent-depth")
+                    level = open_settings(page, "agents", row, timeout=30_000)
+                    depth = level.locator(f'[data-setting-row="{row}"] [data-setting-control]')
                     depth.wait_for(state="visible", timeout=30_000)
-                    # Saving is blocked until the settings load succeeds; waiting on the real
-                    # enablement avoids racing the first fetch.
-                    page.wait_for_function(
-                        "() => document.querySelector('#btn-save-settings')?.disabled === false",
-                        timeout=30_000,
-                    )
-                    depth.scroll_into_view_if_needed()
+                    page.wait_for_function("([row, v]) => document.querySelector(`[data-setting-row=\"${row}\"] "
+                                           "[data-setting-control]`)?.value === v", arg=[row, expected], timeout=30_000)
                     return depth
 
-                def type_depth(value):
-                    page.fill("#s-subagent-depth", value)
-                    page.dispatch_event("#s-subagent-depth", "input")
-                    page.dispatch_event("#s-subagent-depth", "change")
+                def shot(name):
+                    page.screenshot(path=str(evidence_dir / f"v679-depth-{name}.png"))
 
-                def save_and_wait():
-                    page.click("#btn-save-settings")
-                    page.wait_for_function(
-                        "() => (document.querySelector('#settings-status')?.textContent || '')"
-                        ".includes('Settings saved')",
-                        timeout=30_000,
-                    )
-
-                depth = open_settings_advanced()
-                # The control must admit 0 at all: a min of 1 would make it unreachable.
-                assert depth.get_attribute("min") == "0"
-                assert depth.get_attribute("max") == "10"
+                depth = open_depth("3")  # unset -> visible fallback
                 assert depth.is_enabled()
-                assert depth.input_value() == "3"  # unset -> visible fallback
-                page.screenshot(path=str(evidence_dir / "v679-depth-01-initial-unset.png"))
+                shot("01-initial-unset")
 
-                # 0 is a valid value for the control, not a validation error.
-                type_depth("0")
-                assert page.evaluate(
-                    "() => document.querySelector('#s-subagent-depth').validity.valid"
-                ) is True
-                assert page.evaluate(
-                    "() => document.querySelector('#s-subagent-depth').validationMessage"
-                ) == ""
-                page.screenshot(path=str(evidence_dir / "v679-depth-02-typed-zero.png"))
-
-                save_and_wait()
-                assert page.locator("#s-subagent-depth").input_value() == "0"
-                assert saved_depth() == 0
-                page.screenshot(path=str(evidence_dir / "v679-depth-03-saved-zero.png"))
+                # 0 is a valid value for the row, not a refusal: leaving the field saves it.
+                assert commit_row(page, row, "0", timeout=30_000).startswith("Saved")
+                assert depth.input_value() == "0" and saved_depth() == 0
+                shot("03-saved-zero")
 
                 # The round trip is the point: a reload must not rewrite 0 back to 3.
-                open_settings_advanced()
-                assert page.locator("#s-subagent-depth").input_value() == "0"
+                open_depth("0")
                 assert saved_depth() == 0
-                page.screenshot(path=str(evidence_dir / "v679-depth-04-reload-zero.png"))
+                shot("04-reload-zero")
 
                 # Neighbouring state: an ordinary positive value still round-trips.
-                type_depth("3")
-                save_and_wait()
+                assert commit_row(page, row, "3", timeout=30_000).startswith("Saved")
                 assert saved_depth() == 3
-                open_settings_advanced()
-                assert page.locator("#s-subagent-depth").input_value() == "3"
-                page.screenshot(path=str(evidence_dir / "v679-depth-05-reload-three.png"))
+                open_depth("3")
+                shot("05-reload-three")
 
-                # Neighbouring state: empty is not a value — it falls back to 3 rather than
-                # persisting an unparsable setting.
-                type_depth("")
-                page.screenshot(path=str(evidence_dir / "v679-depth-06-empty-typed.png"))
-                save_and_wait()
-                assert saved_depth() == 3
-                open_settings_advanced()
-                assert page.locator("#s-subagent-depth").input_value() == "3"
-                page.screenshot(path=str(evidence_dir / "v679-depth-07-reload-after-empty.png"))
+                # Neighbouring state: empty is not a value. The row refuses it and nothing is written.
+                before = settings_path.read_bytes()
+                assert commit_row(page, row, "", timeout=30_000) == "Not saved. Enter a number from 0 to 10."
+                shot("06-empty-typed")
+                assert settings_path.read_bytes() == before and saved_depth() == 3
+                open_depth("3")
+                shot("07-reload-after-empty")
             finally:
                 browser.close()
     except PlaywrightError as exc:
-        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+        if _browser_missing(exc):
             pytest.skip(str(exc))
         raise
 @pytest.mark.ui_browser
-def test_ui_owner_context_mode_and_scope_slot_save(direct_server_with_data):
-    """Owner context intent and a scope-slot save, driven in a real browser.
+def test_ui_owner_context_mode_and_reviewer_row_save(direct_server_with_data):
+    """Owner context intent and a reviewer-row save, driven in a real browser.
 
     Two owner flows that source-string tests cannot certify:
 
     1. OWNER MAX. Switching an explicit Low to Max succeeds without a Main-route
        context-window confirmation; the frozen compatibility field remains false.
-    2. SCOPE SLOT. Saving a scope row whose route has no window evidence at all
-       completes with no confirmation: window size is not a condition of scope
-       authority (owner decision 2026-09-17), so there is nothing to confirm and
-       no ack is written.
+    2. REVIEWER ROW. A Reviewer row whose route has no window evidence saves with
+       no confirmation: window size is not a condition of review authority (owner
+       decision 2026-09-17), so no ack is written.
     """
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
@@ -3011,7 +2980,6 @@ def test_ui_owner_context_mode_and_scope_slot_save(direct_server_with_data):
     seeded = json.loads(settings_path.read_text(encoding="utf-8"))
     seeded["OUROBOROS_CONTEXT_MODE"] = "low"
     seeded["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "false"
-    seeded["OUROBOROS_SCOPE_REVIEW_MODELS"] = seeded["OUROBOROS_MODEL"]
     settings_path.write_text(json.dumps(seeded), encoding="utf-8")
     direct_server_with_data["restart_server"]()
 
@@ -3034,11 +3002,9 @@ def test_ui_owner_context_mode_and_scope_slot_save(direct_server_with_data):
                 assert toggle.get_attribute("data-context-mode") == "low"
                 page.screenshot(path=str(evidence_dir / "context-mode-low-before.png"))
 
+                toggle.locator(".chat-capsule-head").click()  # the capsule opens into its modes
                 toggle.locator('.chat-seg[data-mode="max"]').click()
-                page.wait_for_function(
-                    "() => document.querySelector('#chat-context-mode')?.dataset.contextMode === 'max'",
-                    timeout=30_000,
-                )
+                page.wait_for_selector('#chat-context-mode[data-context-mode="max"]', timeout=30_000)
                 assert page.locator(".confirm-dialog:not([hidden])").count() == 0
                 page.screenshot(path=str(evidence_dir / "context-mode-max-after.png"))
                 persisted = json.loads(settings_path.read_text(encoding="utf-8"))
@@ -3049,47 +3015,42 @@ def test_ui_owner_context_mode_and_scope_slot_save(direct_server_with_data):
                 assert after["context_mode"] == "max"
                 assert after["context_mode_auto_low"] is False
 
-                # 2. A scope slot saves with no window question anywhere.
-                # Select the fixture's configured provider, then edit its model;
-                # the grouped combobox uses provider-specific API choices.
+                # 2. A reviewer saves with no window question anywhere: on its agent's page the mark
+                # writes at once, then the page's Save writes the provider and the model.
+                from tests.settings_browser_helpers import open_entry, open_settings, press_editor_save
                 page.click('[data-nav-page="settings"]')
-                page.wait_for_selector("#s-context-mode", state="attached", timeout=30_000)
-                page.locator('[data-settings-tab="agents"]').click()
-                page.wait_for_selector("#reviewer-slots-section", timeout=30_000)
-                scope_route = page.locator(
-                    '#reviewer-scope-rows .reviewer-slot-row [data-slot-route]'
-                ).first
-                scope_route.wait_for(state="visible", timeout=30_000)
-                scope_route.select_option("api:openai-compatible")
-                assert scope_route.input_value() == "api:openai-compatible"
-                custom_input = page.locator(
-                    '#reviewer-scope-rows .reviewer-slot-row [data-slot-custom-api]'
-                ).first
-                custom_input.wait_for(state="visible", timeout=30_000)
-                custom_input.fill("scope-reviewer-x")
-                page.locator("#btn-save-settings").click()
-                page.wait_for_function(
-                    "() => !document.querySelector('#btn-save-settings').disabled",
-                    timeout=60_000,
-                )
-                page.screenshot(path=str(evidence_dir / "scope-slot-save-no-window-question.png"),
+                level = open_settings(page, "agents", timeout=30_000)
+                level.locator("[data-entry-id]").first.wait_for(state="visible", timeout=30_000)
+                form = open_entry(page, level.locator("[data-entry-id]").first.get_attribute("data-entry-id"), timeout=30_000)
+                mark = form.locator('[data-subagent-field="review_eligible"]')
+                if not mark.is_checked():
+                    form.locator('.agent-use:has([data-subagent-field="review_eligible"]) .ui-switch').click()
+                page.wait_for_function("() => { const i = document.querySelector('#page-settings [data-subagent-field=\"review_eligible\"]');"
+                                       " return i && i.checked && i.getAttribute('aria-busy') !== 'true'; }", timeout=60_000)
+                row_route = form.locator('[data-subagent-field="route"]')
+                row_route.select_option("api:openai-compatible")
+                assert row_route.input_value() == "api:openai-compatible"
+                form.locator('[data-subagent-field="model"]').fill("scope-reviewer-x")
+                status_text = press_editor_save(page, timeout=60_000)
+                page.screenshot(path=str(evidence_dir / "reviewer-row-save-no-window-question.png"),
                                 full_page=True)
 
                 # No dialog of any kind: the owner is never asked to confirm a
                 # reviewer's window, so a route with no evidence saves silently.
                 assert page.locator(".confirm-dialog").count() == 0
-                status_text = page.locator("#settings-status").inner_text()
-                assert "context window" not in status_text, status_text
-                assert "Settings saved" in status_text or "No changes" in status_text, status_text
-                saved_slots = json.loads(settings_path.read_text(encoding="utf-8"))["OUROBOROS_REVIEWER_SLOTS"]
-                assert "scope-reviewer-x" in json.dumps(saved_slots)
+                assert "context window" not in status_text and status_text.startswith("Saved"), status_text
+                stored = json.loads(settings_path.read_text(encoding="utf-8"))
+                assert "OUROBOROS_REVIEWER_SLOTS" not in stored
+                rows = json.loads(stored["OUROBOROS_SUBAGENTS"])["items"]
+                assert any(row["route"]["target_id"] == "openai-compatible::scope-reviewer-x"
+                           and row.get("review_eligible") is True for row in rows), rows
                 evidence_path = data_dir / "state" / "capability_evidence.json"
                 evidence = json.loads(evidence_path.read_text(encoding="utf-8")) if evidence_path.exists() else {}
-                assert not (evidence.get("owner_acks") or {}), "a scope slot save wrote an owner window ack"
+                assert not (evidence.get("owner_acks") or {}), "a reviewer row save wrote an owner window ack"
             finally:
                 browser.close()
     except PlaywrightError as exc:
-        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+        if _browser_missing(exc):
             pytest.skip(str(exc))
         raise
 
@@ -3132,9 +3093,24 @@ def test_ui_smoke_superseded_input_dialog_resolves_object_result(direct_server_w
             finally:
                 browser.close()
     except PlaywrightError as exc:
-        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+        if _browser_missing(exc):
             pytest.skip(str(exc))
         raise
+
+
+def _open_login_provider(page, url):
+    """Mount the provider that owns login; keep unrelated discovery inside the test."""
+    from tests.settings_browser_helpers import open_settings
+
+    page.route("**/api/claudexor/status*", lambda route: route.fulfill(json={
+        "daemon": {"state": "running"}, "harnesses": [{"id": "codex", "display_name": "Codex"}],
+        "profiles": {"profiles": []}, "quota": [],
+        "reads": {"catalog": "ok", "accounts": "ok", "quota": "ok"},
+    }))
+    page.route("**/api/claudexor/maintenance/**", lambda route: route.fulfill(json={"harnesses": []}))
+    page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+    open_settings(page, "accounts/codex")
+    page.locator('[data-family-login="codex"]').wait_for(state="attached")
 
 
 @pytest.mark.ui_browser
@@ -3193,7 +3169,7 @@ def test_ui_smoke_login_recovery_reconcile_detach_and_retry_are_explicit(direct_
                 page.route("**/api/claudexor/login", handle_create)
                 page.route("**/api/claudexor/login/*", handle_job)
                 page.route("**/api/claudexor/login/*/reconcile", handle_job)
-                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                _open_login_provider(page, url)
 
                 setup_result = page.evaluate(
                     """
@@ -3279,7 +3255,7 @@ def test_ui_smoke_login_recovery_reconcile_detach_and_retry_are_explicit(direct_
             finally:
                 browser.close()
     except PlaywrightError as exc:
-        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+        if _browser_missing(exc):
             pytest.skip(str(exc))
         raise
 
@@ -3319,7 +3295,7 @@ def test_ui_smoke_dismiss_overlapping_start_cannot_drop_a_live_job(direct_server
 
                 page.route("**/api/claudexor/login", handle_create)
                 page.route("**/api/claudexor/login/*", handle_cancel)
-                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                _open_login_provider(page, url)
 
                 result = page.evaluate(
                     """
@@ -3355,7 +3331,7 @@ def test_ui_smoke_dismiss_overlapping_start_cannot_drop_a_live_job(direct_server
             finally:
                 browser.close()
     except PlaywrightError as exc:
-        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+        if _browser_missing(exc):
             pytest.skip(str(exc))
         raise
 
@@ -3414,7 +3390,7 @@ def test_ui_smoke_stale_get_cannot_overwrite_login_terminal_faces(
                 page.route("**/api/claudexor/login", handle_create)
                 page.route("**/api/claudexor/login/*", handle_job)
                 page.route("**/api/claudexor/login/*/reconcile", handle_reconcile)
-                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                _open_login_provider(page, url)
 
                 result = page.evaluate(
                     """
@@ -3466,7 +3442,7 @@ def test_ui_smoke_stale_get_cannot_overwrite_login_terminal_faces(
             finally:
                 browser.close()
     except PlaywrightError as exc:
-        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+        if _browser_missing(exc):
             pytest.skip(str(exc))
         raise
 
@@ -3534,7 +3510,7 @@ def test_ui_smoke_window_pagehide_detaches_login_without_lifecycle_http(direct_s
             finally:
                 browser.close()
     except PlaywrightError as exc:
-        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+        if _browser_missing(exc):
             pytest.skip(str(exc))
         raise
 
@@ -3574,7 +3550,7 @@ def test_ui_smoke_dismiss_overlapping_settle_never_freezes_the_card(direct_serve
                 page.route("**/api/claudexor/login", handle_create)
                 page.route("**/api/claudexor/login/*", handle_job)
                 page.route("**/api/claudexor/login/*/reconcile", handle_reconcile)
-                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                _open_login_provider(page, url)
 
                 result = page.evaluate(
                     """
@@ -3610,13 +3586,13 @@ def test_ui_smoke_dismiss_overlapping_settle_never_freezes_the_card(direct_serve
                     """
                 )
                 assert result["cardCount"] == 1
-                assert result["verdict"] == "Connected."
+                assert result["verdict"] == "Signed in."
                 assert "Could not cancel" not in result["html"]
                 assert (len(creates), result["deletes"], len(gets), len(reconciles)) == (1, 1, 1, 0)
             finally:
                 browser.close()
     except PlaywrightError as exc:
-        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+        if _browser_missing(exc):
             pytest.skip(str(exc))
         raise
 
@@ -3626,7 +3602,7 @@ def test_ui_smoke_cancel_run_button_eligibility_and_cancelled_state(direct_serve
     """v6.82 P5 / S3 Q2: the stop control renders ONLY on live marker-attested
     root cards (never marker-less direct-turn cards, subagent children, or the
     reusable background slot), opens the dropdown, and a cancelled root
-    replays as an honest warn-toned "Cancelled" — never a generic "Done"."""
+    replays as an honest neutral "Stopped" — never a generic "Done"."""
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import sync_playwright
@@ -3661,19 +3637,12 @@ def test_ui_smoke_cancel_run_button_eligibility_and_cancelled_state(direct_serve
     (logs_dir / "progress.jsonl").write_text(
         "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8",
     )
-    task_results = data_dir / "task_results"
-    task_results.mkdir(parents=True, exist_ok=True)
-    (task_results / "gone-root.json").write_text(json.dumps({
-        "_schema_version": 1,
-        "task_id": "gone-root",
-        "status": "cancelled",
-        "reason_code": "cancelled",
-        "outcome_axes": {
-            "lifecycle": {"status": "cancelled"},
-            "execution": {"status": "cancelled"},
-        },
-    }) + "\n", encoding="utf-8")
+    from tests._store_shared import seed_result
     from tests.test_s3_task_control_browser import _hold_live_root, _release_mock_model
+
+    # Through the store, as a writer leaves it: a raw file waits for the store's reconcile pass.
+    seed_result(data_dir, "gone-root", {"status": "cancelled", "reason_code": "cancelled", "outcome_axes": {
+        "lifecycle": {"status": "cancelled"}, "execution": {"status": "cancelled"}}})
 
     _hold_live_root(data_dir, "live-root")
     direct_server_with_data["start_server"]()
@@ -3695,15 +3664,22 @@ def test_ui_smoke_cancel_run_button_eligibility_and_cancelled_state(direct_serve
                     card = page.locator(f'.chat-live-card[data-task-id="{absent_id}"]')
                     card.wait_for(state="attached", timeout=30_000)
                     assert card.locator('[data-cancel-run]').count() == 0, absent_id
-                # The cancelled root replays as an honest Cancelled state.
+                # The cancelled root replays as an honest Stopped state.
                 gone_phase = page.locator('.chat-live-card[data-task-id="gone-root"] [data-live-phase]')
                 page.wait_for_function(
                     "() => document.querySelector('.chat-live-card[data-task-id=\"gone-root\"]"
-                    " [data-live-phase]')?.textContent === 'Cancelled'",
+                    " [data-live-phase]')?.textContent === 'Stopped'",
                     timeout=30_000,
                 )
                 assert "cancelled" in (gone_phase.get_attribute("class") or "")
-                # Dropdown wiring (S3 Q2): open, then dismiss = keep running.
+                # Dropdown wiring (S3 Q2): open, then dismiss = keep running. Wrap up is a running
+                # root's control: the server starts the root first, then the page reads that state.
+                deadline = time.monotonic() + 60
+                while time.monotonic() < deadline and not any(w.get("work_id") == "live-root" and w.get("activity") == "working"
+                                                              for w in json.load(urllib.request.urlopen(url + "/api/state", timeout=10))["works"]):
+                    time.sleep(0.25)
+                with page.expect_response("**/api/state*", timeout=15_000):
+                    pass
                 cancel_btn.click()
                 menu = page.locator('body > .task-control-menu')
                 menu.wait_for(state="visible", timeout=10_000)
@@ -3711,12 +3687,12 @@ def test_ui_smoke_cancel_run_button_eligibility_and_cancelled_state(direct_serve
                 page.keyboard.press("Escape")
                 menu.wait_for(state="detached", timeout=10_000)
                 assert cancel_btn.is_enabled()
-                page.screenshot(path=str(data_dir.parent / "cancel-run.png"), full_page=True)
+                page.screenshot(path=str(diagnostic_directory(data_dir.parent, "ui-smoke", publish=True) / "cancel-run.png"), full_page=True)
             finally:
                 browser.close()
                 _release_mock_model()
     except PlaywrightError as exc:
-        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+        if _browser_missing(exc):
             pytest.skip(str(exc))
         raise
 

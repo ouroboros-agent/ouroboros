@@ -28,7 +28,9 @@
       ],
       "reporting": {
         "self_reported": true,
-        "submission_status": "open",
+        "submission_status": "closed",
+        "submission_merged": false,
+        "submission_closed_at": "2026-09-19T20:48:57Z",
         "evidence_status": "public_run"
       },
       "evidence": [
@@ -105,7 +107,9 @@
       ],
       "reporting": {
         "self_reported": true,
-        "submission_status": "open",
+        "submission_status": "closed",
+        "submission_merged": false,
+        "submission_closed_at": "2026-09-19T20:49:39Z",
         "submission_validation": "failed_source_filter",
         "evidence_status": "public_run"
       },
@@ -143,7 +147,9 @@
       ],
       "reporting": {
         "self_reported": true,
-        "submission_status": "open",
+        "submission_status": "closed",
+        "submission_merged": false,
+        "submission_closed_at": "2026-09-19T20:49:21Z",
         "evidence_status": "upstream_submission"
       },
       "evidence": [

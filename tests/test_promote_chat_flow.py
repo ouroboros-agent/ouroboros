@@ -9,6 +9,8 @@ import types
 
 import pytest
 
+from ouroboros import dialogue_store
+from tests import _dialogue as dialogue_test
 from tests.test_swarm_host_admission import host as _swarm_host
 
 swarm_host = _swarm_host
@@ -34,7 +36,7 @@ def _confirm_promote(monkeypatch, effective_project_id: str = ""):
 def test_first_main_conversation_promotion_keeps_its_original_message_annotation(swarm_host):
     """No project/active-root facts are needed to transport the ingress id."""
     import server
-    from ouroboros.tools.control import _promote_chat_to_task
+    from ouroboros.tools.control import _start_task
     from supervisor.events import _handle_promote_chat_to_task
     from tests.test_swarm_host_admission import incoming_case, rows
 
@@ -50,7 +52,7 @@ def test_first_main_conversation_promotion_keeps_its_original_message_annotation
             pending_events=[], event_queue=types.SimpleNamespace(
                 put_nowait=lambda event: _handle_promote_chat_to_task(event, host.ctx)),
         )
-        result = _promote_chat_to_task(ctx, text, workspace="none", predecessor_task_id="")
+        result = _start_task(ctx, text, title="Owner request", workspace="none")
         assert result.startswith("OK: task"), result
 
     host.ctx.handle_chat_direct = direct
@@ -65,7 +67,7 @@ def test_first_main_conversation_promotion_keeps_its_original_message_annotation
 
 
 def test_promote_tool_emits_event_with_chat_and_project(tmp_path, monkeypatch):
-    from ouroboros.tools.control import _promote_chat_to_task
+    from ouroboros.tools.control import _start_task
 
     _confirm_promote(monkeypatch)
     events = []
@@ -75,7 +77,8 @@ def test_promote_tool_emits_event_with_chat_and_project(tmp_path, monkeypatch):
         current_chat_id=1,
         drive_root=tmp_path,
     )
-    out = _promote_chat_to_task(ctx, "Build the racer prototype", project_id="racer", predecessor_task_id="")
+    out = _start_task(ctx, "Build the racer prototype", title="Racer prototype",
+                                project_id="racer")
     assert out.startswith("OK: task")
     assert "accepted and durably scheduled" in out
     assert len(events) == 1
@@ -88,281 +91,9 @@ def test_promote_tool_emits_event_with_chat_and_project(tmp_path, monkeypatch):
     assert ctx._typed_routing_action_emitted == "promote_chat_to_task"
 
 
-def test_cat_router_preview_promote_first_request_and_direct_harness_keep_full_authority(
-    tmp_path, monkeypatch,
-):
-    import json
-
-    import server
-    import supervisor.workers as workers
-    from ouroboros.agent import Env
-    from ouroboros.agent_startup_checks import validate_task_authority_sources
-    from ouroboros.contracts.task_contract import attach_task_contract
-    from ouroboros.context import build_llm_messages
-    from ouroboros.memory import Memory
-    from ouroboros.outcomes import append_verification_receipt
-    from ouroboros.projects_registry import create_project
-    from ouroboros.subagent_work_order import assignment_instructions, compile_external_work_order
-    from ouroboros.tools.control import (
-        _build_child_subagent_contract,
-        _get_task_result,
-        _promote_chat_to_task,
-    )
-    from ouroboros.tools.registry import ToolContext
-
-    monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path)
-    _confirm_promote(monkeypatch)
-    project = create_project(tmp_path, "cat-tower", name="Cat Tower Builder")
-    predecessor_id = "cat-old-root"
-    tail = "CLAUDEXOR_ONLY; L1 MUST ASK L2 TO SPAWN L3"
-    result_tail = "KEEP_EXISTING_TOWER_ASSET; DO_NOT_REBUILD_FROM_SCRATCH"
-    artifact_error = "ARTIFACT_CAPTURE_FAILED_AFTER_PARTIAL_COPY"
-    artifact_finalized_at = "2026-08-21T00:00:00Z"
-    capability_delta = "HARNESS_ROUTE_REDUCED_TO_NATIVE_ONLY"
-    delegated_custody = "DELEGATED_RUN_STILL_OPEN"
-    verification_ledger = "VERIFICATION_LEDGER_BLOCKER"
-    verification_receipt = "CANONICAL_RECEIPT_FAILED"
-    future_terminal_fact = "FUTURE_TERMINAL_AUTHORITY_FIELD"
-    final_answer = "FINAL_ANSWER_TERMINAL_FACT"
-    non_final_rows = "NON_FINAL_ROWS_TERMINAL_FACT"
-    mutation_evidence = "MUTATION_EVIDENCE_TERMINAL_FACT"
-    plan_review_state = "PLAN_REVIEW_STATE_TERMINAL_FACT"
-    process_evidence = (
-        "RAW_LOOP_TRANSCRIPT_MUST_NOT_BE_INHERITED",
-        "UNRELATED_ROUTING_METADATA_MUST_NOT_BE_INHERITED",
-        "RAW_LLM_TRACE_MUST_NOT_BE_INHERITED",
-        "RAW_REVIEW_EVIDENCE_MUST_NOT_BE_INHERITED",
-        "RAW_REVIEW_PROJECTION_MUST_NOT_BE_INHERITED",
-        "RAW_TRACE_REFS_MUST_NOT_BE_INHERITED",
-        "RAW_ROOT_PHASE_CHECKPOINT_MUST_NOT_BE_INHERITED",
-    )
-    excluded_process_fields = (
-        "review_evidence", "review_projection", "trace_refs", "root_phase_checkpoint",
-    )
-    process_padding = "P" * 12_000
-    predecessor = {
-        "task_id": predecessor_id,
-        "status": "cancelled",
-        "title": "Cat Tower Builder",
-        "objective": "o" * 700 + tail,
-        "result": "completed implementation evidence\n" + "r" * 700 + result_tail,
-        "artifact_status": "failed",
-        "artifact_error": artifact_error,
-        "artifact_finalized_at": artifact_finalized_at,
-        "capability_delta": {"reduced": True, "detail": capability_delta},
-        "delegated_runs_unreconciled": [delegated_custody],
-        "verification_ledger": {"entries": [{"evidence": verification_ledger}]},
-        "future_terminal_fact": {"detail": future_terminal_fact},
-        "final_answer": final_answer,
-        "non_final_rows": [{"reason": non_final_rows}],
-        "mutation_evidence": {"summary": mutation_evidence},
-        "plan_review_state": {
-            "schema_version": 2,
-            "current_attempt": {"status": "closed", "decision": plan_review_state},
-            "waves": [],
-        },
-        "loop_outcome": {"final_text": process_evidence[0] * 500},
-        "metadata": {"main_routing_manifest": {"raw": process_evidence[1]}},
-        "llm_trace": {"reasoning_notes": [process_evidence[2]]},
-        "review_evidence": {"reasoning_notes": [process_evidence[3] + process_padding]},
-        "review_projection": {
-            "panels": [{"raw_response": process_evidence[4] + process_padding}],
-        },
-        "trace_refs": {"tool_log": process_evidence[5] + process_padding},
-        "root_phase_checkpoint": {
-            "post_task_synthesis": {"raw_output": process_evidence[6] + process_padding},
-        },
-        "project_id": "cat-tower",
-        "task_contract": {
-            "objective": "o" * 700 + tail,
-            "context": "never use native/API fallback",
-            "constraints": "Claudexor harness only",
-            "delegation_budget": {"intent_note": "L1 asks L2 to spawn L3"},
-        },
-    }
-    result_dir = tmp_path / "task_results"
-    result_dir.mkdir()
-    (result_dir / f"{predecessor_id}.json").write_text(
-        json.dumps({"_schema_version": 1, **predecessor}), encoding="utf-8",
-    )
-    assert len(json.dumps(predecessor["plan_review_state"])) < 1_000
-    assert len(json.dumps({
-        key: predecessor[key]
-        for key in (
-            "loop_outcome", "metadata", "llm_trace", *excluded_process_fields,
-        )
-    })) > 40_000
-    append_verification_receipt(tmp_path, predecessor_id, {
-        "criterion_id": "canonical-receipt", "status": "fail",
-        "evidence": verification_receipt,
-    })
-    preview = server._task_result_ground_truth(predecessor)
-    assert preview["objective"].endswith("chars omitted]")
-    assert preview["authority_source"]["arguments"] == {
-        "task_id": predecessor_id, "include_authority": True,
-    }
-    router_ctx = _managed_swarm_ctx(
-        tmp_path,
-        project_id="cat-tower",
-        current_chat_id=int(project["chat_id"]),
-        task_metadata={
-            "force_plan": True,
-            "force_plan_source": "swarm",
-            "project_last_task_result": preview,
-        },
-    )
-
-    assert _promote_chat_to_task(
-        router_ctx, "Continue the Cat build", predecessor_task_id=predecessor_id,
-    ).startswith("OK: task")
-    event = router_ctx.pending_events[0]
-    assert event["predecessor_authority_source"] == preview["authority_source"]
-    fresh_router = _managed_swarm_ctx(
-        tmp_path, project_id="cat-tower", current_chat_id=int(project["chat_id"]),
-        task_metadata={
-            "force_plan": True, "force_plan_source": "swarm",
-            "project_last_task_result": preview,
-        },
-    )
-    assert _promote_chat_to_task(fresh_router, "Build a fresh Cat demo", predecessor_task_id="").startswith("OK: task")
-    assert "predecessor_authority_source" not in fresh_router.pending_events[0]
-    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
-    admitted = []
-    outcome = workers.promote_chat_to_task(event, types.SimpleNamespace(
-        enqueue_task=lambda task: admitted.append(task),
-        persist_queue_snapshot=lambda **_kwargs: True,
-        load_state=lambda: {"owner_chat_id": 1},
-    ))
-    assert outcome["status"] == "scheduled"
-    task = admitted[0]
-    task["budget_drive_root"] = str(tmp_path)
-    repo = tmp_path / "repo"
-    (repo / "prompts").mkdir(parents=True)
-    (repo / "docs").mkdir()
-    (repo / "prompts" / "SYSTEM.md").write_text("You are Ouroboros.", encoding="utf-8")
-    (repo / "BIBLE.md").write_text("# BIBLE", encoding="utf-8")
-    (repo / "docs" / "ARCHITECTURE.md").write_text("# Architecture", encoding="utf-8")
-    (repo / "docs" / "DEVELOPMENT.md").write_text("# Development", encoding="utf-8")
-    env = Env(repo_dir=repo, drive_root=tmp_path, budget_drive_root=tmp_path)
-
-    assert validate_task_authority_sources(env, task) == {}
-    attach_task_contract(task)
-    assert task["task_contract"]["predecessor_authority"] == task["predecessor_authority"]
-    messages, _ = build_llm_messages(env=env, memory=Memory(tmp_path, repo_dir=repo), task=task)
-    rendered = json.dumps(messages, ensure_ascii=False)
-    tool_ctx = ToolContext(
-        repo_dir=repo, drive_root=tmp_path, budget_drive_root=str(tmp_path),
-        task_contract=task["task_contract"], task_metadata=task["metadata"],
-    )
-    direct_harness = assignment_instructions(tool_ctx)
-    retrieved = _get_task_result(tool_ctx, predecessor_id, include_authority=True)
-    child_contract = _build_child_subagent_contract({
-        "tid": "cat-nested", "objective": "Inspect the Cat implementation",
-        "expected_output": "Report", "constraints": "Use the inherited authority",
-        "parent_contract": task["task_contract"], "child_delegation_budget": {
-            **task["task_contract"]["delegation_budget"], "depth_remaining": 1,
-        },
-    })
-    nested_work_order = compile_external_work_order({
-        "id": "cat-nested", "objective": "Inspect the Cat implementation",
-        "task_contract": child_contract,
-    })
-    assert len(nested_work_order) < 250_000
-    assert child_contract["predecessor_authority"] == task["predecessor_authority"]
-
-    surfaces = (rendered, retrieved, direct_harness, nested_work_order)
-    for surface in surfaces:
-        for marker in (
-            tail, result_tail, artifact_error, artifact_finalized_at, capability_delta,
-            delegated_custody, verification_ledger, verification_receipt,
-            future_terminal_fact, final_answer, non_final_rows,
-            mutation_evidence, plan_review_state,
-        ):
-            assert marker in surface
-        for marker in process_evidence:
-            assert marker not in surface
-        for field in excluded_process_fields:
-            assert field not in surface
-    assert "never use native/API fallback" in rendered
-    assert "L1 asks L2 to spawn L3" in direct_harness
-    assert "never use native/API fallback" in nested_work_order
-
-
-def test_main_promotion_selects_only_manifested_canonical_predecessor(tmp_path, monkeypatch):
-    import json
-
-    import server
-    from ouroboros.tools.control import _promote_chat_to_task
-
-    _confirm_promote(monkeypatch)
-    result_dir = tmp_path / "task_results"
-    result_dir.mkdir()
-    rows = [
-        {"_schema_version": 1, "task_id": "old-a", "status": "completed", "title": "First project"},
-        {"_schema_version": 1, "task_id": "old-b", "status": "completed", "title": "Chosen project"},
-    ]
-    for row in rows:
-        (result_dir / f"{row['task_id']}.json").write_text(
-            json.dumps(row), encoding="utf-8",
-        )
-    manifest = {"final_results": [server._task_result_ground_truth(row) for row in rows]}
-    selected = _managed_swarm_ctx(tmp_path, task_metadata={
-        "force_plan": True, "force_plan_source": "swarm",
-        "main_routing_manifest": manifest,
-    })
-
-    out = _promote_chat_to_task(
-        selected, "Continue the chosen work", predecessor_task_id="old-b",
-    )
-
-    assert out.startswith("OK: task")
-    assert selected.pending_events[0]["predecessor_authority_source"] == (
-        manifest["final_results"][1]["authority_source"]
-    )
-
-    fresh = _managed_swarm_ctx(tmp_path, task_metadata={
-        "force_plan": True, "force_plan_source": "swarm",
-        "main_routing_manifest": manifest,
-    })
-    assert _promote_chat_to_task(fresh, "Start unrelated work", predecessor_task_id="").startswith("OK: task")
-    assert "predecessor_authority_source" not in fresh.pending_events[0]
-
-    selected_source = manifest["final_results"][1]["authority_source"]
-    forged_sources = [
-        manifest["final_results"][0]["authority_source"],
-        {**selected_source, "kind": "other"},
-        {**selected_source, "tool": "other"},
-        {**selected_source, "arguments": {"task_id": "other", "include_authority": True}},
-        {**selected_source, "arguments": {"task_id": "old-b", "include_authority": False}},
-    ]
-    for forged_source in forged_sources:
-        forged_manifest = json.loads(json.dumps(manifest))
-        forged_manifest["final_results"][1]["authority_source"] = forged_source
-        forged = _managed_swarm_ctx(tmp_path, task_metadata={
-            "force_plan": True, "force_plan_source": "swarm",
-            "main_routing_manifest": forged_manifest,
-        })
-        refused_forgery = _promote_chat_to_task(
-            forged, "Continue mismatched work", predecessor_task_id="old-b",
-        )
-        assert refused_forgery.startswith("⚠️ AUTHORITY_SOURCE_UNAVAILABLE")
-        assert forged.pending_events == []
-
-    missing = _managed_swarm_ctx(tmp_path, task_metadata={
-        "force_plan": True, "force_plan_source": "swarm",
-        "main_routing_manifest": manifest,
-    })
-    (result_dir / "old-b.json").unlink()
-    refused = _promote_chat_to_task(
-        missing, "Continue missing work", predecessor_task_id="old-b",
-    )
-    assert refused.startswith("⚠️ AUTHORITY_SOURCE_UNAVAILABLE")
-    assert missing.pending_events == []
-
-
 def test_presence_promotion_preserves_ceiling_and_cannot_choose_new_scope(tmp_path, monkeypatch):
     from ouroboros.presence_authority import PresenceCapabilityCeiling, presence_ceiling_payload
-    from ouroboros.tools.control import _build_child_subagent_contract, _promote_chat_to_task
+    from ouroboros.tools.control import _build_child_subagent_contract, _start_task
 
     _confirm_promote(monkeypatch)
     capability_ceiling = presence_ceiling_payload(PresenceCapabilityCeiling(
@@ -374,7 +105,8 @@ def test_presence_promotion_preserves_ceiling_and_cannot_choose_new_scope(tmp_pa
     contract = {
         "capability_ceiling": capability_ceiling,
         "context": "preserve exact owner context",
-        "predecessor_authority": {"result": "preserve completed predecessor"},
+        "predecessor_authority": {"result": "preserve completed predecessor",
+                                  "source": {"task_id": "previous", "tool": "get_task_result"}},
         "attachment_manifest": [{
             "ordinal": 0, "status": "staged", "reason": "", "label": "authority",
             "root": "artifact_store", "relpath": "attachments/authority.txt",
@@ -389,13 +121,15 @@ def test_presence_promotion_preserves_ceiling_and_cannot_choose_new_scope(tmp_pa
         task_metadata={"presence": {"binding_id": "b" * 32}},
         task_contract=contract,
     )
-    out = _promote_chat_to_task(
+    out = _start_task(
         ctx,
         "Research the question",
+        title="Question research",
         project_name="Injected",
         workspace_root="/tmp/foreign",
         source="https://example.invalid/repo.git",
-        predecessor_task_id="",
+        destination="place",
+
     )
     assert out.startswith("OK: task")
     event = ctx.pending_events[0]
@@ -410,10 +144,9 @@ def test_presence_promotion_preserves_ceiling_and_cannot_choose_new_scope(tmp_pa
     })
     for key in ("capability_ceiling", "context", "attachment_manifest"):
         assert child[key] == contract[key]
-    # Envelope contract (2026-08-30): a bounded legacy body - no nested
-    # recursion carrier, no oversized string - passes through byte-identical
-    # (exact strings are authority); only the growth carriers get collapsed.
-    assert child["predecessor_authority"] == contract["predecessor_authority"]
+    assert child["predecessor_authority"]["source"] == contract["predecessor_authority"]["source"]
+    assert "result" not in child["predecessor_authority"]
+    assert child["predecessor_authority"]["omitted_fields"]["result"] == len("preserve completed predecessor")
 
 
 def test_real_presence_promotion_rebases_root_and_materializes_all_attachments(
@@ -425,7 +158,7 @@ def test_real_presence_promotion_rebases_root_and_materializes_all_attachments(
     from ouroboros.tools.control import (
         _build_child_subagent_contract,
         _materialize_child_attachment_manifest,
-        _promote_chat_to_task,
+        _start_task,
     )
     from tests.test_presence_runner import _admission, _event
 
@@ -452,13 +185,15 @@ def test_real_presence_promotion_rebases_root_and_materializes_all_attachments(
         },
         task_contract=presence_task["task_contract"],
     )
-    result = _promote_chat_to_task(
+    result = _start_task(
         tool_ctx,
         "Research the new question deeply",
+        title="Deep question research",
         expected_output="A grounded report",
         project_name="forbidden scope",
         workspace_root="/tmp/forbidden",
-        predecessor_task_id="",
+        destination="place",
+
     )
     assert result.startswith("OK: task")
     event = tool_ctx.pending_events[0]
@@ -519,7 +254,7 @@ def test_real_presence_promotion_rejection_cleans_promoted_attachment_copy(
 ):
     import supervisor.workers as workers
     from ouroboros.presence_runner import _build_task
-    from ouroboros.tools.control import _promote_chat_to_task
+    from ouroboros.tools.control import _start_task
     from tests.test_presence_runner import _admission, _event
 
     inherited_source = tmp_path / "presence-input.txt"
@@ -542,7 +277,7 @@ def test_real_presence_promotion_rejection_cleans_promoted_attachment_copy(
         },
         task_contract=presence_task["task_contract"],
     )
-    assert _promote_chat_to_task(tool_ctx, "Long work", predecessor_task_id="").startswith("OK: task")
+    assert _start_task(tool_ctx, "Long work", title="Long work", destination="place").startswith("OK: task")
     event = tool_ctx.pending_events[0]
 
     monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
@@ -577,41 +312,22 @@ def _managed_swarm_ctx(tmp_path, **overrides):
     return types.SimpleNamespace(**values)
 
 
-def test_presence_promotion_keeps_its_host_scope_and_records_handoff(tmp_path, monkeypatch):
-    from ouroboros.tools.control import _promote_chat_to_task
-
-    _confirm_promote(monkeypatch)
-    presence = {"binding_id": "presence-binding"}
-    ctx = _managed_swarm_ctx(tmp_path, project_id="alpha", task_metadata={"presence": presence})
-    out = _promote_chat_to_task(
-        ctx, "Audit and fix the issue", project_id="beta", project_name="Injected Project",
-        workspace_root="/tmp/foreign", workspace="none",
-        source="https://example.invalid/repo.git", predecessor_task_id="",
-    )
-    assert out.startswith("OK: task")
-    evt = ctx.pending_events[0]
-    assert evt["presence"] == presence
-    assert evt["project_id"] == evt["project_name"] == evt["workspace_root"] == evt["workspace"] == evt["source"] == ""
-    assert "force_plan" not in evt
-    assert ctx._swarm_handoff_attempt["status"] == "scheduled"
-    assert ctx._swarm_handoff_attempt["task_id"] == evt["task_id"]
-
-
 def test_managed_swarm_can_choose_a_named_project_for_later_work(tmp_path, monkeypatch):
     """The admitted root chooses the ordinary project and source selectors."""
     from ouroboros.project_facts import project_id_from_display_name
-    from ouroboros.tools.control import _promote_chat_to_task
+    from ouroboros.tools.control import _start_task
 
     _confirm_promote(monkeypatch, project_id_from_display_name("Slime Lab Escape"))
     ctx = _managed_swarm_ctx(tmp_path, task_id="swarm-root")  # project_id="" — projectless main chat
 
-    out = _promote_chat_to_task(
+    out = _start_task(
         ctx,
         "Build the slime lab escape game",
+        title="Slime lab escape game",
         project_name="Slime Lab Escape",
         workspace_root="/tmp/foreign",
         source="https://example.invalid/repo.git",
-        predecessor_task_id="",
+
     )
 
     assert out.startswith("OK: task")
@@ -621,22 +337,21 @@ def test_managed_swarm_can_choose_a_named_project_for_later_work(tmp_path, monke
     assert evt["project_id"] == project_id_from_display_name("Slime Lab Escape")
     assert evt["workspace_root"] == "/tmp/foreign"
     assert evt["source"] == "https://example.invalid/repo.git"
-    # Owner 3=A: the root's still-unmet Swarm obligation follows the promoted work.
-    assert (evt["force_plan"], evt["force_plan_source"], evt["force_plan_transferred_from"]) == (
-        True, "swarm", "swarm-root",
-    )
+    assert "force_plan_transferred_from" not in evt and "force_plan" not in evt
+    assert ctx.task_metadata["force_plan"] is True
 
 
 def test_managed_swarm_can_choose_an_existing_project_for_later_work(tmp_path, monkeypatch):
     """Q9-A sibling parameter: in a PROJECTLESS room an explicitly passed
     project_id is honored, not silently dropped (the same saga failure shape as
     the project_name drop)."""
-    from ouroboros.tools.control import _promote_chat_to_task
+    from ouroboros.tools.control import _start_task
 
     _confirm_promote(monkeypatch, "racer")
     ctx = _managed_swarm_ctx(tmp_path)  # project_id="" — projectless main chat
 
-    out = _promote_chat_to_task(ctx, "Continue the racer build", project_id="racer", predecessor_task_id="")
+    out = _start_task(ctx, "Continue the racer build", title="Racer build continuation",
+                                project_id="racer")
 
     assert out.startswith("OK: task")
     assert "in project 'racer'" in out
@@ -646,14 +361,14 @@ def test_managed_swarm_can_choose_an_existing_project_for_later_work(tmp_path, m
 
 
 def test_managed_swarm_promotes_in_current_project_without_explicit_target(tmp_path, monkeypatch):
-    from ouroboros.tools.control import _promote_chat_to_task
+    from ouroboros.tools.control import _start_task
 
     _confirm_promote(monkeypatch)
     ctx = _managed_swarm_ctx(tmp_path, project_id="alpha", task_id="swarm-root")
-    out = _promote_chat_to_task(ctx, "Audit the issue", predecessor_task_id="")
+    out = _start_task(ctx, "Audit the issue", title="Issue audit")
     assert out.startswith("OK: task")
     assert ctx.pending_events[0]["project_id"] == "alpha"
-    assert ctx.pending_events[0]["force_plan_transferred_from"] == "swarm-root"
+    assert "force_plan_transferred_from" not in ctx.pending_events[0]
     assert not hasattr(ctx, "_swarm_handoff_attempt")
 
 
@@ -737,37 +452,6 @@ def test_promote_announces_project_started_only_on_real_creation(tmp_path, monke
     assert queued == []  # idempotent re-create (created=False) announces nothing
 
 
-def test_ensure_project_scope_announces_started_only_on_real_create(tmp_path, monkeypatch):
-    """B1 seam 2 (owner 2=A): a mid-task ensure_project_scope announces the
-    `project_started` row only when it REALLY created the project; scoping a
-    later task to the existing project stays silent."""
-    import supervisor.workers as workers
-
-    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
-    queued = []
-    monkeypatch.setattr(
-        "supervisor.terminal_delivery.enqueue_terminal_delivery",
-        lambda _root, event, **_k: queued.append(dict(event)) or True,
-    )
-    ctx = types.SimpleNamespace(RUNNING={})
-
-    workers.ensure_project_scope({
-        "type": "ensure_project_scope", "task_id": "midtask01",
-        "project_id": "research-hub", "project_name": "Research Hub",
-    }, ctx)
-    assert [row["system_type"] for row in queued] == ["project_started"]
-    assert queued[0]["chat_id"] == 1
-    assert queued[0]["delivery_id"] == "project-start:research-hub"
-    assert queued[0]["progress_meta"]["project_name"] == "Research Hub"
-
-    queued.clear()
-    workers.ensure_project_scope({
-        "type": "ensure_project_scope", "task_id": "midtask02",
-        "project_id": "research-hub",
-    }, ctx)
-    assert queued == []  # attach to the existing project announces nothing
-
-
 def test_source_prepared_promote_announces_started_for_flow_created_project(
     tmp_path, monkeypatch,
 ):
@@ -811,16 +495,14 @@ def test_source_prepared_promote_announces_started_for_flow_created_project(
 
 def test_worker_admits_promoted_presence_with_same_verified_ceiling(tmp_path, monkeypatch):
     import supervisor.workers as workers
-    from ouroboros.presence_authority import (
-        build_presence_capability_ceiling,
-        presence_ceiling_payload,
-    )
-    from ouroboros.presence_capabilities import (
+    from ouroboros.presence_authority import presence_ceiling_payload
+    from tests.frozen_presence_authority import build_presence_capability_ceiling
+    from tests.frozen_presence_capabilities import (
         PresenceProfileResolution,
         PresenceSelection,
         PresenceToolTarget,
     )
-    from ouroboros.presence_runtime import ResolvedPresenceRuntime
+    from tests.frozen_presence_runtime import ResolvedPresenceRuntime
 
     resolution = PresenceProfileResolution(
         active=(PresenceSelection("1" * 64, PresenceToolTarget("builtin", "chat_history")),),
@@ -864,22 +546,22 @@ def test_worker_admits_promoted_presence_with_same_verified_ceiling(tmp_path, mo
 
 
 def test_presence_unconfirmed_promotion_records_handoff_for_reconciliation(tmp_path, monkeypatch):
-    from ouroboros.tools.control import _promote_chat_to_task
+    from ouroboros.tools.control import _start_task
 
     monkeypatch.setattr(
         "ouroboros.tools.control_events._wait_for_promotion_admission",
         lambda *_args, **_kwargs: {"status": "unconfirmed", "reason": "confirmation_timeout"},
     )
     ctx = _managed_swarm_ctx(tmp_path, task_metadata={"presence": {"binding_id": "presence-binding"}})
-    out = _promote_chat_to_task(ctx, "Audit and fix the issue", predecessor_task_id="")
-    assert out.startswith("⚠️ PROMOTE_UNCONFIRMED")
+    out = _start_task(ctx, "Audit and fix the issue", title="Issue audit and fix", destination="place")
+    assert out.startswith("Not confirmed yet:")
     assert len(ctx.pending_events) == 1
     assert ctx._swarm_handoff_attempt["task_id"] == ctx.pending_events[0]["task_id"]
     assert ctx._swarm_handoff_attempt["status"] == "unconfirmed"
 
 
 def test_promotion_receipt_error_after_emit_propagates(tmp_path, monkeypatch):
-    from ouroboros.tools.control import _promote_chat_to_task
+    from ouroboros.tools.control import _start_task
 
     monkeypatch.setattr(
         "ouroboros.tools.control_events._wait_for_promotion_admission",
@@ -888,62 +570,38 @@ def test_promotion_receipt_error_after_emit_propagates(tmp_path, monkeypatch):
     event_queue = queue.Queue()
     ctx = _managed_swarm_ctx(tmp_path, event_queue=event_queue)
     with pytest.raises(OSError, match="receipt unavailable"):
-        _promote_chat_to_task(ctx, "Audit and fix the issue", predecessor_task_id="")
+        _start_task(ctx, "Audit and fix the issue", title="Issue audit and fix")
     assert event_queue.qsize() == 1
     assert event_queue.get_nowait()["type"] == "promote_chat_to_task"
     assert not hasattr(ctx, "_swarm_handoff_attempt")
 
 
 def test_presence_rejected_promotion_records_handoff_without_event(tmp_path, monkeypatch):
-    from ouroboros.tools.control import _promote_chat_to_task
+    from ouroboros.tools.control import _start_task
 
     monkeypatch.setattr(
         "ouroboros.tools.control_routing._promotion_pool_disabled_from_snapshot",
         lambda _ctx: "crash_storm",
     )
     ctx = _managed_swarm_ctx(tmp_path, task_metadata={"presence": {"binding_id": "presence-binding"}})
-    out = _promote_chat_to_task(ctx, "Audit and fix the issue", predecessor_task_id="")
+    out = _start_task(ctx, "Audit and fix the issue", title="Issue audit and fix", destination="place")
     assert out.startswith("⚠️ PROMOTE_REJECTED")
     assert ctx.pending_events == []
     assert ctx._swarm_handoff_attempt["status"] == "rejected"
 
 
-def test_an_unmet_swarm_obligation_follows_the_promoted_work(tmp_path, monkeypatch):
-    """Owner 3=A supersedes the old "no recursive propagation" rule: a Swarm root
-    that never entered plan review and promotes its work hands the obligation to
-    the new root (the admission seam stamps it and releases the promoter). A root
-    whose obligation is already met -- a plan wave recorded -- transfers nothing."""
-    import ouroboros.task_results as task_results
-    from ouroboros.tools.control import _promote_chat_to_task
-
-    _confirm_promote(monkeypatch)
-    ctx = _managed_swarm_ctx(tmp_path, task_id="swarm-root")
-
-    _promote_chat_to_task(ctx, "A later task chosen during execution", predecessor_task_id="")
-
-    evt = ctx.pending_events[0]
-    assert evt["force_plan"] is True and evt["force_plan_transferred_from"] == "swarm-root"
-    assert not hasattr(ctx, "_swarm_handoff_attempt")
-
-    monkeypatch.setattr(task_results, "load_plan_review_state",
-                        lambda _root, _tid: {"schema_version": 2, "waves": [{"request_fingerprint": "f1"}]})
-    engaged = _managed_swarm_ctx(tmp_path, task_id="swarm-root")
-    _promote_chat_to_task(engaged, "Another later task", predecessor_task_id="")
-    assert "force_plan" not in engaged.pending_events[0]
-
-
 def test_managed_swarm_can_steer_through_the_ordinary_receipt_path(tmp_path, monkeypatch):
-    from ouroboros.tools.control import _steer_task
+    from ouroboros.tools.control import _tell_task
 
     monkeypatch.setattr(
         "ouroboros.tools.control_events._wait_for_routing_annotation",
         lambda *_args, **_kwargs: {"status": "delivered"},
     )
     ctx = _managed_swarm_ctx(tmp_path, task_id="swarm-root")
-    out = _steer_task(ctx, "existing-root", "do this there")
+    out = _tell_task(ctx, "existing-root", "do this there")
     # A Swarm root speaks for itself: its words are WRITTEN as a task message
     # (never the owner's), on the same receipt rail (wave 2 issuer fact).
-    assert out.startswith("✉️ Message to task existing-root written to its mailbox (durably confirmed")
+    assert out.startswith("Message written to existing-root")
     assert ctx.pending_events[0]["type"] == "steer_task"
     assert ctx.pending_events[0]["target_task_id"] == "existing-root"
     assert ctx.pending_events[0]["issuer"] == {
@@ -953,12 +611,12 @@ def test_managed_swarm_can_steer_through_the_ordinary_receipt_path(tmp_path, mon
 
 
 def test_promote_tool_rejects_dirty_project_id(tmp_path):
-    from ouroboros.tools.control import _promote_chat_to_task
+    from ouroboros.tools.control import _start_task
 
     ctx = types.SimpleNamespace(
         pending_events=[], event_queue=None, current_chat_id=1, drive_root=tmp_path,
     )
-    out = _promote_chat_to_task(ctx, "x", project_id="Bad Name!", predecessor_task_id="")
+    out = _start_task(ctx, "x", title="Scoped work", project_id="Bad Name!")
     assert "TOOL_ARG_ERROR" in out
     assert not ctx.pending_events
 
@@ -966,17 +624,17 @@ def test_promote_tool_rejects_dirty_project_id(tmp_path):
 def test_promote_tool_project_name_creates_named_project_event(tmp_path, monkeypatch):
     """LLM-first 'create a named project and work there' (v6.33.0): project_name
     derives a clean id, carries the human display name, and rides title."""
-    from ouroboros.tools.control import _promote_chat_to_task
+    from ouroboros.tools.control import _start_task
 
     _confirm_promote(monkeypatch, "airi-research")
     events = []
     ctx = types.SimpleNamespace(
         pending_events=events, event_queue=None, current_chat_id=1, drive_root=tmp_path,
     )
-    out = _promote_chat_to_task(
+    out = _start_task(
         ctx, "research everything about the airi institute",
         project_name="Airi Research", title="Airi Research",
-        predecessor_task_id="",
+
     )
     assert out.startswith("OK: task")
     assert "in project 'airi-research'" in out   # the receipt's destination, not the ask
@@ -1002,14 +660,14 @@ def test_promote_tool_cyrillic_project_name_still_creates(tmp_path, monkeypatch)
     """promote_chat_to_task(project_name=<cyrillic>) must NOT fail — it derives a
     hash id while keeping the Cyrillic display name (Workflow-caught regression)."""
     from ouroboros.project_facts import project_id_from_display_name
-    from ouroboros.tools.control import _promote_chat_to_task
+    from ouroboros.tools.control import _start_task
 
     _confirm_promote(monkeypatch)
     events = []
     ctx = types.SimpleNamespace(
         pending_events=events, event_queue=None, current_chat_id=1, drive_root=tmp_path,
     )
-    out = _promote_chat_to_task(ctx, "исследуй динозавров", project_name="динозавры", title="динозавры", predecessor_task_id="")
+    out = _start_task(ctx, "исследуй динозавров", project_name="динозавры", title="динозавры")
     assert "TOOL_ARG_ERROR" not in out
     assert out.startswith("OK: task")
     evt = events[0]
@@ -1185,77 +843,7 @@ def test_promote_success_relocates_pre_admitted_attachment_to_child_drive(
     ).exists()
 
 
-def test_promote_post_stage_lookup_failure_cleans_attachment(tmp_path, monkeypatch):
-    import ouroboros.projects_registry as projects_registry
-    import supervisor.workers as workers
-
-    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
-    source = tmp_path / "input.txt"
-    source.write_text("input", encoding="utf-8")
-    monkeypatch.setattr(
-        projects_registry,
-        "get_reserved_project",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("registry unavailable")),
-    )
-    ctx = types.SimpleNamespace(
-        enqueue_task=lambda task: task,
-        persist_queue_snapshot=lambda **_kwargs: True,
-        load_state=lambda: {"owner_chat_id": 1},
-    )
-
-    outcome = workers.promote_chat_to_task({
-        "task_id": "attach-lookup-fail",
-        "objective": "use input",
-        "project_id": "lookup-project",
-        "attachment_uploads": [{"path": str(source), "label": "input"}],
-    }, ctx)
-
-    assert outcome["reason"] == "project_routing_fence_lookup_failed"
-    assert not (
-        tmp_path / "task_results" / "artifacts" / "attach-lookup-fail"
-    ).exists()
-
-
-@pytest.mark.parametrize("failure", ["enqueue", "snapshot"])
-def test_promote_queue_failure_cleans_pre_staged_attachment(
-    tmp_path, monkeypatch, failure,
-):
-    import supervisor.workers as workers
-
-    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
-    source = tmp_path / f"{failure}.txt"
-    source.write_text("input", encoding="utf-8")
-    captured = []
-
-    def enqueue(task):
-        captured.append(task)
-        if failure == "enqueue":
-            return {"_admission_blocked": "project_routing_fence"}
-        return task
-
-    ctx = types.SimpleNamespace(
-        enqueue_task=enqueue,
-        persist_queue_snapshot=lambda **_kwargs: failure != "snapshot",
-        load_state=lambda: {"owner_chat_id": 1},
-    )
-    tid = f"attach-{failure}-fail"
-
-    outcome = workers.promote_chat_to_task({
-        "task_id": tid,
-        "objective": "use input",
-        "workspace": "none",
-        "attachment_uploads": [{"path": str(source), "label": "input"}],
-    }, ctx)
-
-    expected = "project_routing_fence" if failure == "enqueue" else "queue_snapshot_persist_failed"
-    assert outcome["reason"] == expected
-    assert captured
-    staged_path = pathlib.Path(captured[0]["attachments"][0]["abs_path"])
-    assert not staged_path.exists()
-    assert not (tmp_path / "task_results" / "artifacts" / tid).exists()
-
-
-def test_promote_worker_persists_swarm_intent_on_managed_root(tmp_path, monkeypatch):
+def test_promote_worker_ignores_legacy_swarm_flags(tmp_path, monkeypatch):
     import supervisor.workers as workers
 
     monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
@@ -1276,8 +864,7 @@ def test_promote_worker_persists_swarm_intent_on_managed_root(tmp_path, monkeypa
     }, ctx)
 
     assert outcome["status"] == "scheduled"
-    assert enqueued[0]["metadata"]["force_plan"] is True
-    assert enqueued[0]["metadata"]["force_plan_source"] == "swarm"
+    assert "force_plan" not in enqueued[0].get("metadata", {})
 
 
 def test_route_to_project_event_emits_route_receipt_action(tmp_path, monkeypatch):
@@ -1474,6 +1061,8 @@ def test_promote_route_persists_source_ref_and_fails_closed_on_binding_error(tmp
         "status": "needs_manual_target",
         "reason": "project_binding_failed",
         "task_id": "route-fail",
+        "never_admitted": True,
+        "_admission_cleanup_manifest": [],
     }
     assert len(enqueued) == 1
 
@@ -1510,38 +1099,34 @@ def test_promote_chat_to_task_broadcasts_projects_changed(tmp_path, monkeypatch)
     assert changed[0]["chat_id"] == project_chat_id("proj-x")
 
 
-def test_registered_project_chat_ids_recognizes_every_project(tmp_path):
+def test_reserved_project_chat_ids_recognizes_every_project(tmp_path):
     """The isolation SSOT recognizes EVERY registered project's chat_id (regardless
     of sidebar visibility) so its raw chat never re-leaks into the штаб's main
     context / dialogue consolidation / background consciousness (BIBLE P1). Sidebar
     visibility is a separate presentation concern (no project statuses, v6.33.0)."""
     from ouroboros.projects_registry import (
         create_project,
-        registered_project_chat_ids,
+        reserved_project_chat_ids,
         update_project,
     )
 
     proj = create_project(tmp_path, "old-racer")
     chat_id = int(proj["chat_id"])
-    assert chat_id in registered_project_chat_ids(tmp_path)
+    assert chat_id in reserved_project_chat_ids(tmp_path)
     # A rename (or any mutable-field update) never drops it from the isolation set.
     update_project(tmp_path, "old-racer", name="Old Racer (renamed)")
-    assert chat_id in registered_project_chat_ids(tmp_path)
+    assert chat_id in reserved_project_chat_ids(tmp_path)
 
 
 def test_chat_history_tool_spans_all_threads_full_awareness(tmp_path):
     """Full project awareness (v6.32.0): the chat_history TOOL is the one mind's
     DELIBERATE recall — it spans the WHOLE conversation (main + ALL project
     threads), only A2A virtual transport excluded. Project-task FOCUS lives in the
-    passive default context (build_recent_sections), NOT in this recall tool, so
+    passive default context (the memory view's room), NOT in this recall tool, so
     the one identity can recall anything it chooses (BIBLE P1)."""
-    import json
-
     from ouroboros.memory import Memory
     from ouroboros.projects_registry import create_project
 
-    logs = tmp_path / "logs"
-    logs.mkdir(parents=True)
     a = create_project(tmp_path, "alpha")
     b = create_project(tmp_path, "beta")
     ca, cb = int(a["chat_id"]), int(b["chat_id"])
@@ -1551,8 +1136,8 @@ def test_chat_history_tool_spans_all_threads_full_awareness(tmp_path):
         {"direction": "in", "text": "beta-msg", "chat_id": cb},
         {"direction": "in", "text": "a2a-noise", "chat_id": -1001},
     ]
-    (logs / "chat.jsonl").write_text(
-        "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    for row in rows:
+        dialogue_store.append(tmp_path, "chat", row)
     mem = Memory(drive_root=tmp_path)
 
     view = mem.chat_history(count=50)
@@ -1561,24 +1146,21 @@ def test_chat_history_tool_spans_all_threads_full_awareness(tmp_path):
 
 
 def test_chat_history_tool_uses_canonical_budget_root_and_archive_pagination(tmp_path):
-    import json
     from types import SimpleNamespace
 
     from ouroboros.tools.control import _chat_history
 
     canonical = tmp_path / "canonical"
     child = tmp_path / "child"
-    (canonical / "logs").mkdir(parents=True)
-    (canonical / "archive").mkdir()
     child.mkdir()
-    (canonical / "archive" / "chat_20260820T010000.jsonl").write_text(
-        "\n".join(json.dumps({"direction": "in", "text": f"old-{i}"}) for i in range(3)) + "\n",
-        encoding="utf-8",
+    dialogue_test.seed(
+        canonical,
+        archives={"chat_20260820T010000.jsonl": [
+            {"direction": "in", "text": f"old-{i}"} for i in range(3)
+        ]},
+        live={"chat": [{"direction": "in", "text": "new-live"}]},
     )
-    (canonical / "logs" / "chat.jsonl").write_text(
-        json.dumps({"direction": "in", "text": "new-live"}) + "\n",
-        encoding="utf-8",
-    )
+    dialogue_test.import_all(canonical)
     ctx = SimpleNamespace(
         drive_root=child,
         budget_drive_root=str(canonical),
@@ -1593,39 +1175,38 @@ def test_chat_history_tool_uses_canonical_budget_root_and_archive_pagination(tmp
     assert "old-0" in second and "old-1" in second
 
 
-def test_recent_context_full_awareness_and_project_focus_with_bindings(tmp_path):
-    """Passive context (v6.32.0): the one identity's MAIN recent context sees
-    EVERYTHING, including a post-hoc bound task's rows (one mind, BIBLE P1). A
-    PROJECT task's recent context is FOCUSED on its own thread + rows of tasks
-    bound to it; unrelated main chat is left out of the focused working view
-    (focus in the passive default, not isolation)."""
-    import json
-
-    from ouroboros.context import build_recent_sections
-    from ouroboros.memory import Memory
+def test_memory_view_main_names_the_bound_room_and_the_project_task_sees_its_rows(tmp_path):
+    """Main keeps its words and aggregates the quiet Project with an exact room directory;
+    the bound task reads its own room, with original rows available through memory_read."""
     from ouroboros.projects_registry import bind_task_to_project, create_project
+    from ouroboros.tools.chronicle import _memory_read
+    from tests._memory_view_context import blocks, section
+    from tests.test_cache_optimization import _make_env_and_memory
 
-    logs = tmp_path / "logs"
-    logs.mkdir(parents=True)
-    proj = create_project(tmp_path, "promoted")
+    env, mem = _make_env_and_memory(tmp_path)
+    root = mem.drive_root
+    proj = create_project(root, "promoted", name="Promoted")
     pchat = int(proj["chat_id"])
-    bind_task_to_project(tmp_path, "task-7", "promoted", pchat, origin={"absent": "system"})
-    rows = [
-        {"direction": "in", "text": "plain-main", "chat_id": 1},
-        {"direction": "out", "text": "bound-task-row", "chat_id": 1, "task_id": "task-7"},
-    ]
-    (logs / "chat.jsonl").write_text(
-        "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
-    mem = Memory(drive_root=tmp_path)
+    bind_task_to_project(root, "task-7", "promoted", pchat, origin={"absent": "system"})
+    dialogue_store.append(root, "chat", {"direction": "in", "text": "plain-main", "chat_id": 1, "ts": "2026-09-01T00:00:00+00:00"})
+    dialogue_store.append(root, "chat", {"direction": "out", "text": "bound-task-row", "chat_id": 1,
+                                        "task_id": "task-7", "ts": "2026-09-01T00:01:00+00:00"})
 
-    # Main passive context: full awareness sees everything.
-    main_ctx = "\n".join(build_recent_sections(mem, env=None))
-    assert "plain-main" in main_ctx and "bound-task-row" in main_ctx
+    _a, _b, main_ctx, _cap = blocks(env, mem, {"id": "main-turn", "chat_id": 1})
+    assert "] plain-main" in section(main_ctx, "## This room (Main)")
+    assert "bound-task-row" not in main_ctx
+    others = section(main_ctx, "## Other conversations")
+    assert f"### Project Promoted [chat_id={pchat}]" in others and "; host; task task-7] " in others  # a task line
+    reader = types.SimpleNamespace(drive_root=root)
+    assert f"- Project Promoted [chat_id={pchat}];" in _memory_read(reader, room_id="*", start=0)
 
-    # Project task passive context: focused on its own thread + bound-task rows.
-    proj_ctx = "\n".join(build_recent_sections(mem, env=None, thread_chat_id=pchat))
-    assert "bound-task-row" in proj_ctx
-    assert "plain-main" not in proj_ctx
+    _a, _b, proj_ctx, _cap = blocks(env, mem, {"id": "task-7", "chat_id": 1})  # bound: its room is the Project
+    room = section(proj_ctx, f"## This room (Project Promoted [chat_id={pchat}])")
+    # A pre-lineage outgoing row is a host fact of its task, with its address one read away.
+    assert "; host; task task-7] " in room and "get_task_result(task_id='task-7')" in room
+    assert "plain-main" not in room and "] plain-main" in section(proj_ctx, "## Other conversations")  # Main's, there
+    history = _memory_read(reader, room_id=str(pchat), rows=True)
+    assert "bound-task-row" in history and "plain-main" not in history
 
 
 def test_restart_drain_defers_then_completes_without_sleeping(tmp_path, monkeypatch):
@@ -1640,6 +1221,12 @@ def test_restart_drain_defers_then_completes_without_sleeping(tmp_path, monkeypa
     performed = []
     monkeypatch.setattr(server, "_perform_supervisor_restart", lambda ctx, **kw: performed.append(True))
     server._pending_restart.clear()
+    # The drain path records its admission intent in the module-global
+    # _AGENT_RESTART; a leftover "ready" record from a sibling test makes
+    # agent_restart_pending() True and short-circuits the drain before it
+    # reaches the live-task check. Reset it so each drain test is isolated.
+    from ouroboros import server_restart
+    monkeypatch.setattr(server_restart, "_AGENT_RESTART", {})
 
     now = __import__("time").time()
     ctx = types.SimpleNamespace(
@@ -1674,6 +1261,8 @@ def test_restart_drain_no_live_tasks_restarts_immediately(tmp_path, monkeypatch)
     performed = []
     monkeypatch.setattr(server, "_perform_supervisor_restart", lambda ctx, **kw: performed.append(True))
     server._pending_restart.clear()
+    from ouroboros import server_restart
+    monkeypatch.setattr(server_restart, "_AGENT_RESTART", {})
 
     ctx = types.SimpleNamespace(
         RUNNING={},
@@ -1702,6 +1291,8 @@ def test_restart_drain_uses_generic_queue_heartbeat_not_retired_planning_knob(
     performed = []
     monkeypatch.setattr(server, "_perform_supervisor_restart", lambda ctx, **kw: performed.append(True))
     server._pending_restart.clear()
+    from ouroboros import server_restart
+    monkeypatch.setattr(server_restart, "_AGENT_RESTART", {})
 
     ctx = types.SimpleNamespace(
         RUNNING={
@@ -2135,13 +1726,19 @@ def test_bound_project_history_backfills_task_progress(tmp_path):
     project = create_project(tmp_path, "bound-progress", name="Bound progress")
     project_chat = int(project["chat_id"])
     bind_task_to_project(tmp_path, "task-1", "bound-progress", project_chat, origin={"absent": "system"})
-    logs = tmp_path / "logs"
-    logs.mkdir(parents=True)
-    with open(logs / "chat.jsonl", "w", encoding="utf-8") as fh:
-        fh.write(json.dumps({"ts": "2026-01-01T00:00:00Z", "direction": "out", "text": "final answer", "chat_id": 1, "task_id": "task-1"}) + "\n")
-        fh.write(json.dumps({"ts": "2026-01-01T00:00:01Z", "direction": "in", "text": "raw project chat", "chat_id": project_chat}) + "\n")
-    with open(logs / "progress.jsonl", "w", encoding="utf-8") as fh:
-        fh.write(json.dumps({"ts": "2026-01-01T00:00:02Z", "type": "send_message", "content": "working", "text": "working", "is_progress": True, "chat_id": 1, "task_id": "task-1", "format": "markdown", "cancelable": True}) + "\n")
+    dialogue_store.append(tmp_path, "chat", {
+        "ts": "2026-01-01T00:00:00Z", "direction": "out", "text": "final answer",
+        "chat_id": 1, "task_id": "task-1",
+    })
+    dialogue_store.append(tmp_path, "chat", {
+        "ts": "2026-01-01T00:00:01Z", "direction": "in", "text": "raw project chat",
+        "chat_id": project_chat,
+    })
+    dialogue_store.append(tmp_path, "progress", {
+        "ts": "2026-01-01T00:00:02Z", "type": "send_message", "content": "working",
+        "text": "working", "is_progress": True, "chat_id": 1, "task_id": "task-1",
+        "format": "markdown", "cancelable": True,
+    })
 
     api = make_chat_history_endpoint(tmp_path)
 
@@ -2258,8 +1855,6 @@ def test_chat_history_filters_by_thread(tmp_path):
     project_chat = int(proj["chat_id"])
     transport_chat = 555000111
 
-    logs = tmp_path / "logs"
-    logs.mkdir(parents=True)
     rows = [
         {"ts": "2026-06-13T00:00:01Z", "direction": "in", "text": "main hello", "chat_id": 1},
         {"ts": "2026-06-13T00:00:02Z", "direction": "out", "text": "main reply", "chat_id": 1},
@@ -2269,9 +1864,8 @@ def test_chat_history_filters_by_thread(tmp_path):
         {"ts": "2026-06-13T00:00:04Z", "direction": "out", "text": "a2a noise", "chat_id": -1001},
         {"ts": "2026-06-13T00:00:05Z", "direction": "out", "text": "legacy row (no chat_id)"},
     ]
-    with open(logs / "chat.jsonl", "w", encoding="utf-8") as fh:
-        for row in rows:
-            fh.write(json.dumps(row) + "\n")
+    for row in rows:
+        dialogue_store.append(tmp_path, "chat", row)
 
     api = make_chat_history_endpoint(tmp_path)
 
@@ -2341,32 +1935,34 @@ def test_journal_write_rejects_over_limit_instead_of_truncating(tmp_path, monkey
 def test_steer_task_tool_emits_event_with_target_and_client_id(tmp_path):
     """The agent's steer_task choice emits a transport event (target + message +
     chat + originating message id); the supervisor performs the actual delivery."""
-    from ouroboros.tools.control import _steer_task
+    from ouroboros.tools.control import _tell_task
 
     events = []
     ctx = types.SimpleNamespace(
         pending_events=events, event_queue=None, current_chat_id=1,
-        drive_root=tmp_path,
-        task_metadata={"client_message_id": "cm-42"},
+        drive_root=tmp_path, is_direct_chat=True,
+        task_metadata={"client_message_id": "cm-42",
+                       "origin_message_ref": {"chat_id": 1, "client_message_id": "cm-42"}},
     )
-    out = _steer_task(ctx, "abc12345", "also add the benchmarks slide")
-    assert out.startswith("⚠️ STEER_UNCONFIRMED")
+    out = _tell_task(ctx, "abc12345", "also add the benchmarks slide")
+    assert out.startswith("TELL_UNCONFIRMED")
     assert len(events) == 1
     evt = events[0]
     assert evt["type"] == "steer_task"
     assert evt["target_task_id"] == "abc12345"
     assert evt["message"] == "also add the benchmarks slide"
     assert evt["chat_id"] == 1
-    assert evt["client_message_id"] == "cm-42"
+    assert evt["client_message_id"].startswith("agent-steer:")
+    assert evt["quotes"] == []
     # The host-minted issuer fact replaces the routing-contract lane flag: a
     # chat turn is an owner turn, and the lane is the supervisor's registry answer.
-    assert evt["issuer"] == {"kind": "owner_turn"}
+    assert evt["issuer"] == {"kind": "owner_turn", "task_id": ""}
     assert "allow_global_root" not in evt
     assert ctx._typed_routing_action_emitted == "steer_task"
 
 
-def test_steer_task_uses_exact_ingress_owner_text(tmp_path):
-    from ouroboros.tools.control import _steer_task
+def test_tell_keeps_note_without_implicit_origin_substitution(tmp_path):
+    from ouroboros.tools.control import _tell_task
 
     events = []
     exact = "  exact owner text\nwith trailing space  "
@@ -2375,21 +1971,24 @@ def test_steer_task_uses_exact_ingress_owner_text(tmp_path):
         event_queue=None,
         current_chat_id=1,
         drive_root=tmp_path,
+        is_direct_chat=True,
         task_metadata={
             "client_message_id": "cm-exact",
             "origin_message_text": exact,
+            "origin_message_ref": {"chat_id": 1, "client_message_id": "cm-exact"},
         },
     )
 
-    _steer_task(ctx, "target-task", "model paraphrase")
+    _tell_task(ctx, "target-task", "model paraphrase")
 
-    assert events[0]["message"] == exact
+    assert events[0]["message"] == "model paraphrase"
+    assert events[0]["quotes"] == []
 
 
 def test_main_steer_can_address_project_bound_root_from_host_manifest(tmp_path, monkeypatch):
     import supervisor.queue as queue
-    from ouroboros.owner_mailbox import drain_owner_messages
-    from ouroboros.tools.control import _steer_task
+    from ouroboros.owner_mailbox import drain_owner_entries
+    from ouroboros.tools.control import _tell_task
     from supervisor.events import _handle_steer_task
 
     monkeypatch.setattr(queue, "DRIVE_ROOT", str(tmp_path))
@@ -2399,13 +1998,15 @@ def test_main_steer_can_address_project_bound_root_from_host_manifest(tmp_path, 
         event_queue=None,
         current_chat_id=1,
         drive_root=tmp_path,
+        is_direct_chat=True,
         task_metadata={
             "client_message_id": "main-42",
+            "origin_message_ref": {"chat_id": 1, "client_message_id": "main-42"},
             "routing_contract": {"source_lane": "main"},
         },
     )
-    _steer_task(tool_ctx, "project-root", "continue from Main")
-    assert emitted[0]["issuer"] == {"kind": "owner_turn"}
+    _tell_task(tool_ctx, "project-root", "continue from Main")
+    assert emitted[0]["issuer"] == {"kind": "owner_turn", "task_id": ""}
 
     supervisor_ctx = types.SimpleNamespace(
         DRIVE_ROOT=tmp_path,
@@ -2417,15 +2018,15 @@ def test_main_steer_can_address_project_bound_root_from_host_manifest(tmp_path, 
         },
     )
     _handle_steer_task(emitted[0], supervisor_ctx)
-    assert drain_owner_messages(tmp_path, "project-root") == ["continue from Main"]
+    assert [e["text"] for e in drain_owner_entries(tmp_path, "project-root")] == ["continue from Main"]
 
 
 def test_busy_direct_main_root_is_manifested_and_steerable_without_promotion(tmp_path):
     import threading
 
     import server
-    from ouroboros.owner_mailbox import drain_owner_messages
-    from ouroboros.tools.control import _steer_task
+    from ouroboros.owner_mailbox import drain_owner_entries
+    from ouroboros.tools.control import _tell_task
     from supervisor.events import _handle_steer_task
 
     direct_agent = types.SimpleNamespace(
@@ -2461,12 +2062,14 @@ def test_busy_direct_main_root_is_manifested_and_steerable_without_promotion(tmp
         event_queue=None,
         current_chat_id=1,
         drive_root=tmp_path,
+        is_direct_chat=True,
         task_metadata={
             "client_message_id": "followup-1",
+            "origin_message_ref": {"chat_id": 1, "client_message_id": "followup-1"},
             "routing_contract": metadata["routing_contract"],
         },
     )
-    _steer_task(tool_ctx, "direct-root", "Use FusionBrain images too")
+    _tell_task(tool_ctx, "direct-root", "Use FusionBrain images too")
     assert [event["type"] for event in emitted] == ["steer_task"]
 
     event_ctx = types.SimpleNamespace(
@@ -2476,7 +2079,7 @@ def test_busy_direct_main_root_is_manifested_and_steerable_without_promotion(tmp
         get_chat_agent=lambda: direct_agent,
     )
     _handle_steer_task(emitted[0], event_ctx)
-    assert drain_owner_messages(tmp_path, "direct-root") == ["Use FusionBrain images too"]
+    assert [e["text"] for e in drain_owner_entries(tmp_path, "direct-root")] == ["Use FusionBrain images too"]
 
 
 def test_direct_turn_closed_admission_returns_manual_target(tmp_path):
@@ -2521,11 +2124,11 @@ def test_direct_turn_closed_admission_returns_manual_target(tmp_path):
 
 
 def test_steer_task_tool_requires_args(tmp_path):
-    from ouroboros.tools.control import _steer_task
+    from ouroboros.tools.control import _tell_task
 
     ctx = types.SimpleNamespace(pending_events=[], event_queue=None, current_chat_id=1, task_metadata={})
-    assert "TOOL_ARG_ERROR" in _steer_task(ctx, "", "msg")
-    assert "TOOL_ARG_ERROR" in _steer_task(ctx, "t1", "")
+    assert "TOOL_ARG_ERROR" in _tell_task(ctx, "", "msg")
+    assert "TOOL_ARG_ERROR" in _tell_task(ctx, "t1", "")
     assert not ctx.pending_events
 
 
@@ -2550,58 +2153,6 @@ def test_handle_steer_task_delivers_once_to_running_task(tmp_path, monkeypatch):
     assert [e["text"] for e in entries] == ["steer me"]  # delivered exactly once
 
 
-@pytest.mark.parametrize("chat_id", [1, 0, None])
-def test_steering_delivers_text_and_identical_typed_attachment_report(
-    tmp_path, monkeypatch, chat_id,
-):
-    import supervisor.queue as queue
-    from ouroboros.owner_mailbox import drain_owner_entries
-    from ouroboros.project_dialogue import latest_chat_annotations
-    from supervisor.events import _handle_steer_task
-
-    monkeypatch.setattr(queue, "DRIVE_ROOT", str(tmp_path))
-    good = tmp_path / "good.txt"
-    good.write_text("ok", encoding="utf-8")
-    notices = []
-    acks = []
-    bridge = types.SimpleNamespace(
-        send_routing_ack=lambda _chat_id, **payload: acks.append(payload),
-    )
-    ctx = types.SimpleNamespace(
-        DRIVE_ROOT=tmp_path,
-        RUNNING={"t-report": {"task": {"id": "t-report", "chat_id": chat_id or 0}}},
-        send_with_budget=lambda _cid, text, *a, **k: notices.append(text),
-        bridge=bridge,
-    )
-    exact = "urgent owner text  \n"
-    evt = {
-        "type": "steer_task",
-        "target_task_id": "t-report",
-        "message": exact,
-        "chat_id": chat_id,
-        "client_message_id": "cm-report",
-        "routing_token": "route-report",
-        "attachment_uploads": [
-            {"path": str(good), "label": "good"},
-            {"path": str(tmp_path / "missing.txt"), "label": "missing"},
-        ],
-    }
-
-    _handle_steer_task(evt, ctx)
-
-    delivered = drain_owner_entries(tmp_path, "t-report")[0]["text"]
-    assert delivered.startswith(exact)
-    report = delivered.split("[ATTACHMENTS]\n", 1)[1].split("\n[END_ATTACHMENTS]", 1)[0]
-    if chat_id is None:
-        assert notices == []
-    else:
-        assert report in notices[-1]
-    annotation = latest_chat_annotations(tmp_path)["cm-report"]
-    assert annotation["attachment_manifest"] == acks[-1]["attachment_manifest"]
-    assert [row["status"] for row in annotation["attachment_manifest"]] == [
-        "staged", "rejected",
-    ]
-    assert annotation["detail"] == report
 
 
 def test_direct_root_steering_uses_live_human_identity_for_receipt_and_notice(
@@ -2642,6 +2193,7 @@ def test_direct_root_steering_uses_live_human_identity_for_receipt_and_notice(
         get_chat_agent=lambda: direct_agent,
         bridge=types.SimpleNamespace(
             send_routing_ack=lambda _chat_id, **payload: acks.append(payload),
+            send_message=lambda *a, **k: None,
         ),
         send_with_budget=lambda _chat_id, text, *args, **kwargs: notices.append(text),
         persist_queue_snapshot=lambda **_kwargs: None,
@@ -2663,9 +2215,8 @@ def test_direct_root_steering_uses_live_human_identity_for_receipt_and_notice(
 
     assert acks[-1]["target"] == "direct-live-opaque-id"
     assert acks[-1]["target_label"] == "Tower Defence › Fix nested delegation"
-    assert notices[-1].splitlines()[0] == (
-        "📎 Attachment staging report for Tower Defence › Fix nested delegation:"
-    )
+    assert acks[-1]["status"] == "delivered"
+    assert notices == []  # the receipt carries the identity; no staging row in the chat
 
 
 def test_direct_project_followup_carries_same_live_human_identity(tmp_path):
@@ -2716,9 +2267,8 @@ def test_direct_project_followup_carries_same_live_human_identity(tmp_path):
 
     assert routed == "direct-live-opaque-id"
     assert metadata["_routing_target_label"] == "Tower Defence › Fix nested delegation"
-    assert notices[-1].splitlines()[0] == (
-        "📎 Attachment staging report for Tower Defence › Fix nested delegation:"
-    )
+    assert [row["status"] for row in metadata["_attachment_manifest"]] == ["staged"]
+    assert notices == []  # the receipt recorded from this stash is the whole record
 
 
 def test_handle_steer_task_stale_target_notifies_visibly(tmp_path, monkeypatch):
@@ -2746,20 +2296,22 @@ def test_handle_steer_task_stale_target_notifies_visibly(tmp_path, monkeypatch):
     _handle_steer_task({"target_task_id": "gone", "message": "a", "chat_id": room}, ctx)   # not running
     _handle_steer_task({"target_task_id": "other", "message": "b", "chat_id": room}, ctx)  # wrong chat
     _handle_steer_task({"target_task_id": "sub", "message": "c", "chat_id": room}, ctx)    # subagent
-    assert len(notices) == 3
+    assert len(notices) == 2
     for (cid, text, kwargs), target, reason in zip(
-        notices, ("gone", "other", "sub"), ("target_unknown", "chat_mismatch", "subagent_target"),
+        notices, ("gone", "sub"), ("target_unknown", "subagent_target"),
     ):
         assert cid == room
-        assert kwargs == {"role": "system", "system_type": "steer_not_delivered", "task_id": target}
+        # No bridge handed an ACK over, so this row carries the notice and replies to no owner row.
+        assert kwargs == {"role": "system", "system_type": "steer_not_delivered", "task_id": target,
+                          "progress_meta": {"routing_notice_carrier": "system", "reply_to": {}}}
         assert routing_refusal_cause("steer_task", "needs_manual_target", reason) in text
         assert "I'll" not in text and "Couldn't steer task" not in text
     assert drain_owner_entries(tmp_path, "gone") == []
-    assert drain_owner_entries(tmp_path, "other") == []
+    assert [e["text"] for e in drain_owner_entries(tmp_path, "other")] == ["b"]
     assert drain_owner_entries(tmp_path, "sub") == []
 
 
-def test_chat_running_tasks_lists_same_chat_pooled_only(tmp_path):
+def test_chat_running_tasks_lists_pooled_and_restored_direct_roots(tmp_path):
     """The structural snapshot lists the chat's pooled RUNNING root tasks (so the
     decision turn can pick a steer target) and excludes direct/subagent/other-chat."""
     import server
@@ -2775,7 +2327,7 @@ def test_chat_running_tasks_lists_same_chat_pooled_only(tmp_path):
         },
     )
     rows = server._chat_running_tasks(ctx, 1)
-    assert {r["task_id"] for r in rows} == {"a", "b"}
+    assert {r["task_id"] for r in rows} == {"a", "b", "direct"}
     assert all(r["steerable"] for r in rows)
     by_id = {r["task_id"]: r for r in rows}
     assert by_id["a"]["objective"] == "build racer"
@@ -2797,9 +2349,11 @@ def test_decision_turn_metadata_injects_running_tasks_and_client_id(tmp_path):
     assert md["client_message_id"] == "cm-9"
     assert md["current_chat"]["chat_id"] == 1
     assert [t["task_id"] for t in md["current_chat"]["running_tasks"]] == ["a"]
-    # No running tasks + no client id -> metadata returned unchanged.
+    # No running tasks + no client id -> no routing facts at all (the head's
+    # context capture builds its own live-works present).
     empty_ctx = types.SimpleNamespace(DRIVE_ROOT=tmp_path, RUNNING={})
-    assert server._decision_turn_metadata(empty_ctx, 1, "", {"k": "v"}) == {"k": "v"}
+    md = server._decision_turn_metadata(empty_ctx, 1, "", {"k": "v"})
+    assert md == {"k": "v"}
 
 
 # --- Q10=A (owner, 2026-08-08): file-less project promotes auto-provision -----
@@ -2946,16 +2500,19 @@ def test_promote_provisioning_failure_loud_fails_not_silent_fileless(tmp_path, m
 
 def test_swarm_intent_survives_admission_to_the_finalization_read(swarm_host):  # noqa: F811 -- imported fixture
     """Host-admitted Swarm intent survives through the actual efficiency reader."""
-    import server
+    from supervisor.events import _handle_promote_chat_to_task
     from ouroboros.agent_task_pipeline import _build_swarm_efficiency
-    from tests.test_swarm_host_admission import incoming_case
+    from tests.test_swarm_host_admission import incoming_case, promotion_event
 
+    swarm_host.monkeypatch.setenv("OUROBOROS_SUBAGENTS_MODE", "swarm")
     case = incoming_case(swarm_host, "main")
-    server._route_owner_message(swarm_host.bridge, swarm_host.ctx, case.incoming)
+    _handle_promote_chat_to_task(promotion_event(case), swarm_host.ctx)
     assert swarm_host.attempts == []
     assert len(swarm_host.pending) == 1
     task = swarm_host.pending[0]
-    assert task["metadata"]["force_plan_source"] == "swarm"
+    assert "force_plan_source" not in task.get("metadata", {})
+    assert task["metadata"]["subagents_mode"] == "swarm"
+    swarm_host.monkeypatch.setenv("OUROBOROS_SUBAGENTS_MODE", "off")  # telemetry keeps admission, runtime reads live
     block = _build_swarm_efficiency(types.SimpleNamespace(drive_root=str(swarm_host.root)), task)
     assert block == {
         "intent_source": "swarm",
@@ -2971,7 +2528,7 @@ def test_promote_emission_row_carries_the_owner_message_id(tmp_path, monkeypatch
     the record at all."""
     import json
 
-    from ouroboros.tools.control import _promote_chat_to_task
+    from ouroboros.tools.control import _start_task
 
     _confirm_promote(monkeypatch)
     ctx = types.SimpleNamespace(
@@ -2979,8 +2536,8 @@ def test_promote_emission_row_carries_the_owner_message_id(tmp_path, monkeypatch
         task_metadata={"client_message_id": "cm-ingress"},
     )
 
-    assert _promote_chat_to_task(
-        ctx, "Build the racer prototype", project_id="racer", predecessor_task_id="",
+    assert _start_task(
+        ctx, "Build the racer prototype", title="Racer prototype", project_id="racer",
     ).startswith("OK: task")
 
     rows = [
@@ -2994,14 +2551,14 @@ def test_promote_emission_row_carries_the_owner_message_id(tmp_path, monkeypatch
 
 
 def _steer_refusal(tmp_path, monkeypatch, *, running: dict, chat_id: int = 1):
-    """Drive one refused steer and return (receipt kwargs, owner messages)."""
+    """Drive one refused steer and return (receipt kwargs, owner messages); no bridge: the row is the carrier."""
     import supervisor.events as events_mod
     from supervisor.steering import _handle_steer_task
 
     receipts: list = []
     sent: list = []
     monkeypatch.setattr(events_mod, "_emit_routing_receipt",
-                        lambda ctx, evt, **kwargs: receipts.append(kwargs) or {})
+                        lambda ctx, evt, **kwargs: receipts.append(kwargs) or {"routing_notice_carrier": "system"})
     ctx = types.SimpleNamespace(
         DRIVE_ROOT=tmp_path, RUNNING=running, PENDING=[],
         get_chat_agent=lambda: None,
@@ -3013,34 +2570,12 @@ def _steer_refusal(tmp_path, monkeypatch, *, running: dict, chat_id: int = 1):
     return receipts[-1], sent
 
 
-def test_steer_refusal_names_the_room_when_the_task_belongs_to_another_chat(tmp_path, monkeypatch):
-    """Four refusals folded into one boolean told the owner the task "may have
-    finished" while it ran in its own project room for another half hour, and the
-    receipt said only `target_not_steerable`. The room is what the owner needs.
-    The refusing turn is itself a Project room (Main may address any root)."""
-    from ouroboros.projects_registry import create_project
-    from ouroboros.project_dialogue import routing_refusal_cause
-
-    create_project(tmp_path, "roomp", name="RoomP")
-    issuing_room = int(create_project(tmp_path, "rooma", name="RoomA")["chat_id"])
-    receipt, sent = _steer_refusal(tmp_path, monkeypatch, chat_id=issuing_room, running={
-        "target-1": {"task": {"id": "target-1", "chat_id": 777, "project_id": "roomp",
-                              "title": "Deploy the docs"}},
-    })
-
-    assert receipt["status"] == "needs_manual_target" and receipt["reason"] == "chat_mismatch"
-    assert len(sent) == 1
-    text, kwargs = sent[0]
-    assert text == "RoomP › Deploy the docs · " + routing_refusal_cause("steer_task", "needs_manual_target", "chat_mismatch")
-    assert kwargs == {"role": "system", "system_type": "steer_not_delivered", "task_id": "target-1"}
 
 
 @pytest.mark.parametrize("running, reason", [
     ({}, "target_unknown"),
     ({"target-1": {"task": {"id": "target-1", "chat_id": 1, "delegation_role": "subagent",
                             "title": "Review"}}}, "subagent_target"),
-    ({"target-1": {"task": {"id": "target-1", "chat_id": 1, "_is_direct_chat": True,
-                            "title": "Chat"}}}, "direct_chat_turn"),
 ])
 def test_steer_refusal_keeps_a_distinct_reason_for_every_other_cause(
         tmp_path, monkeypatch, running, reason):
@@ -3053,26 +2588,50 @@ def test_steer_refusal_keeps_a_distinct_reason_for_every_other_cause(
     text, kwargs = sent[0]
     assert routing_refusal_cause("steer_task", "needs_manual_target", reason) in text
     assert "I'll" not in text and "Couldn't steer task" not in text
-    assert kwargs == {"role": "system", "system_type": "steer_not_delivered", "task_id": "target-1"}
+    assert kwargs == {"role": "system", "system_type": "steer_not_delivered", "task_id": "target-1",
+                      "progress_meta": {"routing_notice_carrier": "system", "reply_to": {}}}
 
 
-def test_the_steer_tool_renders_the_typed_reason_and_still_defaults_without_one(monkeypatch):
+def test_steer_reaches_a_queue_resident_direct_turn(tmp_path, monkeypatch):
+    """A direct turn resumed on a pooled worker under the SAME id after its exact
+    budget pause (#1196) is a RUNNING row: the owner's follow-up is delivered to
+    that actor's mailbox and is never refused as a finished direct reply."""
+    import supervisor.events as events_mod
+    from supervisor.steering import _handle_steer_task
+
+    receipts: list = []
+    monkeypatch.setattr(events_mod, "_emit_routing_receipt",
+                        lambda ctx, evt, **kwargs: receipts.append(kwargs) or {})
+    ctx = types.SimpleNamespace(
+        DRIVE_ROOT=tmp_path, PENDING=[], get_chat_agent=lambda: None,
+        RUNNING={"target-1": {"task": {"id": "target-1", "chat_id": 1, "_is_direct_chat": True,
+                                       "title": "Chat"}}},
+        send_with_budget=lambda _chat_id, text, **kwargs: None,
+    )
+    _handle_steer_task({"target_task_id": "target-1", "message": "hurry up", "chat_id": 1}, ctx)
+
+    assert receipts, "a steer must leave a receipt"
+    assert receipts[-1].get("reason") != "direct_chat_turn"
+    assert receipts[-1].get("status") == "delivered"
+
+
+def test_the_steer_tool_renders_the_typed_reason_and_still_defaults_without_one(tmp_path, monkeypatch):
     """The fallback belongs to the RENDERER, not to the emitter: every refusal the
     handler emits now carries its own typed reason, and a receipt that carries
     none (another producer, an older row) still renders the documented default."""
-    from ouroboros.tools import control_routing
+    from ouroboros.tools import control_routing, control_relay
 
     answers = iter([
-        ("live", {"status": "needs_manual_target", "reason": "chat_mismatch"}),
+        ("live", {"status": "needs_manual_target", "reason": "target_finished"}),
         ("live", {"status": "needs_manual_target"}),
     ])
     monkeypatch.setattr(control_routing, "_emit_and_wait_for_routing",
                         lambda _ctx, _evt: next(answers))
     ctx = types.SimpleNamespace(pending_events=[], event_queue=None, current_chat_id=1,
-                                task_metadata={})
+                                task_metadata={}, drive_root=tmp_path)
 
-    assert "(chat_mismatch)" in control_routing._steer_task(ctx, "t1", "go")
-    assert "(target_not_steerable)" in control_routing._steer_task(ctx, "t1", "go")
+    assert "target_finished" in control_relay._tell_task(ctx, "t1", "go")
+    assert "target_not_steerable" in control_relay._tell_task(ctx, "t1", "go")
 
 
 def _repair_hint(**kwargs):
@@ -3165,192 +2724,6 @@ def test_workspace_repair_hint_names_the_presence_profile():
     assert hint.startswith("The folder configured in the Presence profile is unusable: ")
     assert "workspace_root is not a directory: /gone" in hint
     assert hint.endswith("Fix the Presence profile's workspace_root or clear it.")
-
-
-def test_promote_without_an_explicit_target_inherits_the_binding_then_the_origin(
-    tmp_path, monkeypatch,
-):
-    """The other half of "one owner message, one Project": a turn that was already
-    turned into a Project promotes its work INTO that Project, instead of minting a
-    root in Main that carries its own convert button (the second unit the owner
-    clicked). Order: this task's durable binding (a conversion never reaches the
-    running worker's ctx.project_id), then the Project the owner MESSAGE already has,
-    then the in-memory scope copy."""
-    from ouroboros.project_dialogue import build_owner_message_ref
-    from ouroboros.projects_registry import bind_task_to_project, create_project
-    from ouroboros.tools.control import _promote_chat_to_task
-
-    monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path)
-    _confirm_promote(monkeypatch)
-    ref = build_owner_message_ref(
-        chat_id=1, client_message_id="msg-owner", ts="2026-09-14T12:15:20+00:00",
-        text="Publish and merge the seven pull requests",
-    )
-    room = create_project(tmp_path, "the-work", name="The Work")
-    bind_task_to_project(tmp_path, "t-turn", "the-work", room["chat_id"],
-                         origin={"ref": ref, "text": "Publish and merge the seven pull requests"})
-
-    def _ctx(task_id):
-        return types.SimpleNamespace(
-            pending_events=[], event_queue=None, current_chat_id=1, drive_root=tmp_path,
-            project_id="", task_id=task_id,
-            task_metadata={"origin_message_ref": dict(ref)},
-        )
-
-    # (1) the promoter's own binding
-    bound_ctx = _ctx("t-turn")
-    assert _promote_chat_to_task(bound_ctx, "Merge them", predecessor_task_id="").startswith("OK")
-    assert bound_ctx.pending_events[0]["project_id"] == "the-work"
-
-    # (2) a SIBLING task id of the same owner message, itself unbound
-    sibling_ctx = _ctx("t-sibling")
-    assert _promote_chat_to_task(sibling_ctx, "Merge them", predecessor_task_id="").startswith("OK")
-    assert sibling_ctx.pending_events[0]["project_id"] == "the-work"
-
-    # (3) neither: the in-memory scope copy still answers, unchanged
-    free_ctx = _ctx("t-free")
-    free_ctx.task_metadata = {}
-    free_ctx.project_id = "alpha"
-    assert _promote_chat_to_task(free_ctx, "Merge them", predecessor_task_id="").startswith("OK")
-    assert free_ctx.pending_events[0]["project_id"] == "alpha"
-
-    # Explicit intent stays the model's ceiling, and Presence still cannot choose one.
-    explicit_ctx = _ctx("t-turn")
-    _promote_chat_to_task(explicit_ctx, "Merge them", project_id="racer", predecessor_task_id="")
-    assert explicit_ctx.pending_events[0]["project_id"] == "racer"
-    presence_ctx = _ctx("t-turn")
-    presence_ctx.task_metadata["presence"] = {"binding_id": "presence-binding"}
-    presence_ctx.task_contract = {}
-    _promote_chat_to_task(presence_ctx, "Merge them", predecessor_task_id="")
-    assert presence_ctx.pending_events[0]["project_id"] == ""
-
-
-def test_promote_scope_lookup_fails_open_on_an_unreadable_bindings_store(tmp_path, monkeypatch):
-    """The owner is waiting on this routing decision: an unreadable store reads as
-    "no binding" and the in-memory scope copy answers, exactly as before the seam."""
-    from ouroboros.tools.control import _promote_chat_to_task
-
-    monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path)
-    _confirm_promote(monkeypatch)
-    (tmp_path / "state").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "state" / "project_task_bindings.json").write_text("{ not json", encoding="utf-8")
-
-    ctx = types.SimpleNamespace(
-        pending_events=[], event_queue=None, current_chat_id=1, drive_root=tmp_path,
-        project_id="alpha", task_id="t-turn", task_metadata={},
-    )
-    assert _promote_chat_to_task(ctx, "Merge them", predecessor_task_id="").startswith("OK")
-    assert ctx.pending_events[0]["project_id"] == "alpha"
-
-
-def test_promote_admission_lands_in_the_project_the_owner_message_already_has(
-    tmp_path, monkeypatch,
-):
-    """The emit -> admission window is real: the tool inherits the scope when it emits
-    the event, but a sibling card of the same message can be turned into a Project in
-    between. The supervisor resolves the origin again under the claim lock, so the
-    promoted root joins that room instead of arriving in Main as a second convertible
-    unit. A Presence promote keeps its empty scope - a public conversation cannot
-    choose a Project."""
-    import supervisor.workers as workers
-    from ouroboros.project_dialogue import build_owner_message_ref
-    from ouroboros.projects_registry import (
-        bind_task_to_project,
-        create_project,
-        list_projects,
-        project_binding_for_task,
-    )
-
-    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
-    text = "Publish and merge the seven pull requests"
-    ref = build_owner_message_ref(
-        chat_id=1, client_message_id="msg-owner", ts="2026-09-14T12:15:20+00:00", text=text,
-    )
-    room = create_project(tmp_path, "the-work", name="The Work")
-    bind_task_to_project(tmp_path, "t-turn", "the-work", room["chat_id"],
-                         origin={"ref": ref, "text": text})
-    enqueued: list = []
-    ctx = types.SimpleNamespace(
-        enqueue_task=lambda task: enqueued.append(task) or task,
-        persist_queue_snapshot=lambda **_kwargs: True,
-        load_state=lambda: {"owner_chat_id": 1},
-    )
-
-    outcome = workers.promote_chat_to_task({
-        "type": "promote_chat_to_task", "task_id": "root01", "objective": "Merge them",
-        "project_id": "", "chat_id": 1, "client_message_id": "msg-owner",
-        "source_ref": dict(ref), "source_text": text,
-    }, ctx)
-
-    assert outcome["status"] == "scheduled"
-    assert enqueued[0]["project_id"] == "the-work"
-    assert (project_binding_for_task(tmp_path, "root01") or {}).get("project_id") == "the-work"
-    assert [p["id"] for p in list_projects(tmp_path)] == ["the-work"]
-
-    presence_outcome = workers.promote_chat_to_task({
-        "type": "promote_chat_to_task", "task_id": "root02", "objective": "Merge them",
-        "project_id": "", "chat_id": 1, "client_message_id": "msg-owner",
-        "source_ref": dict(ref), "source_text": text,
-        "presence": {"binding_id": "presence-binding"},
-    }, ctx)
-
-    assert presence_outcome["status"] == "scheduled"
-    assert enqueued[1].get("project_id", "") == ""
-    assert project_binding_for_task(tmp_path, "root02") is None
-
-
-def test_the_implicit_promote_claim_creates_and_binds_under_the_claim_lock(
-    tmp_path, monkeypatch,
-):
-    """Resolving the origin under the lock and RELEASING it, then creating and
-    binding a hundred lines later, left the whole window open: a sibling card of the
-    same message converts in between, and the promoted root arrives in Main unscoped
-    - a second convertible card for one piece of work (#895). The origin re-read and
-    the durable bind are ONE transaction against that conversion's claim now."""
-    import ouroboros.projects_registry as registry
-    import supervisor.workers as workers
-    from ouroboros.project_dialogue import build_owner_message_ref
-
-    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
-    text = "Publish and merge the seven pull requests"
-    ref = build_owner_message_ref(
-        chat_id=1, client_message_id="msg-owner", ts="2026-09-14T12:15:20+00:00", text=text,
-    )
-    room = registry.create_project(tmp_path, "the-work", name="The Work")
-    registry.bind_task_to_project(tmp_path, "t-turn", "the-work", room["chat_id"],
-                                  origin={"ref": ref, "text": text})
-    real_create, real_bind = registry.create_project, registry.bind_task_to_project
-    held: list = []
-
-    def _create(*args, **kwargs):
-        held.append(("create_project", registry._ORIGIN_CLAIM_LOCK._is_owned()))
-        return real_create(*args, **kwargs)
-
-    def _bind(*args, **kwargs):
-        held.append(("bind_task_to_project", registry._ORIGIN_CLAIM_LOCK._is_owned()))
-        return real_bind(*args, **kwargs)
-
-    monkeypatch.setattr(registry, "create_project", _create)
-    monkeypatch.setattr(registry, "bind_task_to_project", _bind)
-    enqueued: list = []
-    ctx = types.SimpleNamespace(
-        enqueue_task=lambda task: enqueued.append(task) or task,
-        persist_queue_snapshot=lambda **_kwargs: True,
-        load_state=lambda: {"owner_chat_id": 1},
-    )
-
-    outcome = workers.promote_chat_to_task({
-        "type": "promote_chat_to_task", "task_id": "root01", "objective": "Merge them",
-        "project_id": "", "chat_id": 1, "client_message_id": "msg-owner",
-        "source_ref": dict(ref), "source_text": text,
-    }, ctx)
-
-    # The CPython RLock answers "is this thread inside the claim?" directly.
-    assert held == [("create_project", True), ("bind_task_to_project", True)]
-    assert outcome["status"] == "scheduled" and outcome["project_id"] == "the-work"
-    assert enqueued[0]["project_id"] == "the-work"
-    assert (registry.project_binding_for_task(tmp_path, "root01") or {}).get(
-        "project_id") == "the-work"
 
 
 # --- promote refusals: placement (Q1/Q2=A), the host cause (Q3=A), the repo root (Q4=A) ---
@@ -3465,7 +2838,7 @@ def test_promote_maps_the_exact_repo_root_onto_no_workspace(tmp_path, monkeypatc
     """Q4=A: naming the Ouroboros repository ITSELF names the documented default
     (the ordinary self-modification task): the event carries the existing
     "none" sentinel — in a project room too — and the tool result discloses it."""
-    from ouroboros.tools.control import _promote_chat_to_task
+    from ouroboros.tools.control import _start_task
 
     _confirm_promote(monkeypatch)
     repo = tmp_path / "Ouroboros" / "repo"
@@ -3475,9 +2848,9 @@ def test_promote_maps_the_exact_repo_root_onto_no_workspace(tmp_path, monkeypatc
         pending_events=events, event_queue=None, current_chat_id=1, drive_root=tmp_path / "data",
         repo_dir=repo, system_repo_dir=repo,
     )
-    out = _promote_chat_to_task(
-        ctx, "Audit the GitHub tool", project_id="racer", workspace_root=f"{repo}/",
-        predecessor_task_id="",
+    out = _start_task(
+        ctx, "Audit the GitHub tool", title="GitHub tool audit", project_id="racer", workspace_root=f"{repo}/",
+
     )
 
     assert out.startswith("OK: task")
@@ -3493,7 +2866,7 @@ def test_promote_maps_the_exact_repo_root_onto_no_workspace(tmp_path, monkeypatc
 def test_promote_passes_a_repo_subfolder_through_to_admission_unchanged(tmp_path, monkeypatch):
     """A SUBFOLDER is a different ask the shape cannot serve: it reaches admission
     unchanged and is refused there with the repair hint."""
-    from ouroboros.tools.control import _promote_chat_to_task
+    from ouroboros.tools.control import _start_task
 
     _confirm_promote(monkeypatch)
     repo = tmp_path / "Ouroboros" / "repo"
@@ -3504,7 +2877,8 @@ def test_promote_passes_a_repo_subfolder_through_to_admission_unchanged(tmp_path
         pending_events=events, event_queue=None, current_chat_id=1, drive_root=tmp_path / "data",
         repo_dir=repo, system_repo_dir=repo,
     )
-    out = _promote_chat_to_task(ctx, "Audit the GitHub tool", workspace_root=str(sub), predecessor_task_id="")
+    out = _start_task(ctx, "Audit the GitHub tool", title="GitHub tool audit",
+                                workspace_root=str(sub))
 
     assert out.startswith("OK: task") and "named the Ouroboros repository itself" not in out
     [evt] = events

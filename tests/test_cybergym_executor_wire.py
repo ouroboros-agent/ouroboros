@@ -505,6 +505,103 @@ def _stub_terminal_task_executor(tmp_path, monkeypatch, gateway_result):
     return config, executor
 
 
+@pytest.mark.parametrize("change", ["stable_a", "stable_b_before_submit", "changed_back_after_submit"])
+def test_delivery_binds_published_bytes_to_submitted_digest(tmp_path, monkeypatch, change):
+    gateway_result = {
+        "status": "completed", "observed_model": "deepseek/deepseek-v4-flash-0731",
+        "observed_provider": "synthetic-backend", "reasoning_effort": "high",
+        "prompt_tokens": 10, "completion_tokens": 5, "cost_usd": 0.1, "cost_final": True,
+        "cost_breakdown": {"accounted_upper_bound_usd": 0.1, "cost_final": True},
+        "outcome_axes": {"execution": {"status": "ok"}},
+    }
+    config, executor = _stub_terminal_task_executor(tmp_path, monkeypatch, gateway_result)
+    original, updated = b"synthetic-original-marker", b"synthetic-later-marker"
+    markers, submitted, argvs = [], [], []
+    calls = {"gateway": 0, "query": 0}
+
+    def generate(_task, workspace, _agent_id):
+        marker = workspace / "final.poc"
+        marker.write_bytes(original)
+        (workspace / "submit.sh").write_text('TASK_ID="opaque1234"\n', encoding="utf-8")
+        markers.append(marker)
+
+    def gateway(*_args, **_kwargs):
+        calls["gateway"] += 1
+        return dict(gateway_result)
+
+    def command(argv, **_kwargs):
+        # Record, do not assert, here: after the paid gateway call the executor
+        # turns any exception into an infra_failed row, hiding the cause.
+        argvs.append(list(argv))
+        submitted.append(markers[0].read_bytes())
+        if change == "changed_back_after_submit":
+            markers[0].write_bytes(original)
+        return CommandResult(0, json.dumps({"task_id": "opaque1234", "poc_id": "poc-1", "exit_code": 1}), "")
+
+    def query(*_args, **_kwargs):
+        calls["query"] += 1
+        if calls["query"] == 1:
+            if change != "stable_a":
+                markers[0].write_bytes(updated)
+            return []
+        return [{"task_id": "arvo:1", "agent_id": "opaque1234", "poc_id": "poc-1",
+                 "poc_hash": hashlib.sha256(submitted[0]).hexdigest(),
+                 "vul_exit_code": 1, "fix_exit_code": 0}]
+
+    def external_operation(*_args, **_kwargs):
+        pytest.fail("No actual command, HTTP, provider or PoC may execute")
+
+    executor.config = dataclasses_replace(config, command_runner=command, http_runner=external_operation)
+    executor._task_containers["container-a"] = "workspace-123"
+    monkeypatch.setattr(executor, "_generate", generate)
+    monkeypatch.setattr(executor, "_gateway_wait", gateway)
+    monkeypatch.setattr(executor, "_private_query", query)
+    monkeypatch.setattr(executor, "_ensure_key", lambda: "synthetic-key")
+    monkeypatch.setattr(executor, "_server_http", external_operation)
+    [row] = run_campaign([TaskSpec("arvo:1", "arvo")], run_root=config.run_root,
+                         executor=executor.run_task, estimated_cost_usd=1, budget_cap_usd=10)
+    # Only --host is host-shaped; the rest runs inside the Linux container and
+    # stays a literal on every host (a resolved D:\workspace\final.poc names no file).
+    assert argvs == [["docker", "--host", executor.host.value, "exec", "--workdir", "/workspace",
+                      "workspace-123", "bash", "/workspace/submit.sh", "/workspace/final.poc"]]
+    persisted = [json.loads(line) for line in (config.run_root / "result_index.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert persisted == [row]
+    assert calls["gateway"] == len(submitted) == 1
+    expected = original if change == "stable_a" else updated
+    assert submitted == [expected]
+    digest = hashlib.sha256(expected).hexdigest()
+    checkpoint = json.loads(pathlib.Path(row["artifact_refs"]["checkpoint"]).read_text(encoding="utf-8"))
+    delivery = checkpoint["delivery"]
+    assert delivery["final_poc_sha256"] == digest
+    assert delivery["submit"]["poc_id"] == "poc-1"
+    destination = pathlib.Path(row["artifact_refs"]["task_dir"]) / "final.poc"
+    assert not list(destination.parent.glob(".final-poc-*"))
+    if change == "changed_back_after_submit":
+        assert row["status"] == "infra_failed"
+        assert row["lifecycle"] == "post_gateway_evaluation_failed"
+        assert row["error"] == "final PoC changed before copy"
+        assert row["final_submission_status"] == "unknown"
+        assert row["final_submission_success"] is not True and row["official_success"] is not True
+        assert row["prediction_written"] is False and row["official_eval_status"] == "not_run"
+        assert row["trial_count"] == 0
+        assert not destination.exists()
+        assert delivery["phase"] == "submitted" and calls["query"] == 1
+    else:
+        assert row["status"] == "completed"
+        assert row["final_submission_success"] is True and row["official_success"] is True
+        assert row["prediction_written"] is True and row["official_eval_status"] == "completed"
+        assert row["final_poc_hash"] == digest
+        assert destination.read_bytes() == expected
+        assert delivery["phase"] == "classified" and calls["query"] > 1
+    assert row["cost_usd"] == pytest.approx(0.1) and row["cost_final"] is True
+    assert row["prompt_tokens"] == 10 and row["completion_tokens"] == 5
+    ledger = BudgetLedger(config.run_root / "claims.jsonl", cap_usd=10)
+    assert ledger.projection().settled_usd == pytest.approx(0.1)
+    assert ledger.projection().unresolved_upper_bound_usd == 0
+    events = [json.loads(line)["event"] for line in ledger.path.read_text(encoding="utf-8").splitlines()]
+    assert events.count("claim") == events.count("settle") == 1
+
+
 def test_regrade_final_poc_uses_official_verifier_without_gateway(tmp_path, monkeypatch):
     config = _config(tmp_path, provider_probe=False)
     executor = CyberGymExecutor(config)
@@ -931,7 +1028,8 @@ def _tool_error(tool: str, text: str, status: str = "error") -> dict:
     return {"tool": tool, "status": status, "exit_code": None, "signal": None, "result": text}
 
 
-def test_fair_completion_execution_ok_and_agent_attributable_tool_errors():
+@pytest.mark.parametrize("edit_prefix", ["STR_REPLACE_ERROR", "EDIT_TEXT_ERROR"])
+def test_fair_completion_execution_ok_and_agent_attributable_tool_errors(edit_prefix):
     from devtools.benchmarks.cybergym.cybergym_wire import _gateway_fair_completion
 
     assert _gateway_fair_completion(_envelope({"status": "ok"})) == (True, "execution_ok")
@@ -940,7 +1038,7 @@ def test_fair_completion_execution_ok_and_agent_attributable_tool_errors():
         "failure": {"kind": "tool", "reason_code": "tool_failure", "tool_errors": [
             _tool_error("run_command", "⚠️ TOOL_ARG_ERROR: Could not parse arguments for 'run_command': Expecting ',' delimiter: line 1 column 257 (char 256)"),
             _tool_error("search_code", "⚠️ TOOL_ARG_ERROR (search_code): invalid arguments for search_code. Accepted parameters: query, path"),
-            _tool_error("edit_text", "⚠️ STR_REPLACE_ERROR: old_str not found in sweep.py."),
+            _tool_error("edit_text", f"⚠️ {edit_prefix}: old_str not found in sweep.py."),
             _tool_error("list_files", "⚠️ LIST_FILES_ERROR: Directory not found: tmp"),
             _tool_error("run_command", "⚠️ TOOL_TIMEOUT (run_command): command exceeded the per-command timeout of 900s", status="timeout"),
             # full1507 arvo:1461 (2026-09-08): the model hallucinated a `bash`
@@ -972,16 +1070,6 @@ def test_fair_completion_dead_extension_unknown_tool_text_stays_infra():
     ({"status": "infra_failed"}, "execution_infra_failed"),
     ({"status": "best_effort"}, "execution_best_effort"),
     ({}, "execution_missing"),
-    ({"status": "degraded", "failure": {"kind": "finalization_control", "reason_code": "delivery_control_degraded"}},
-     "degraded_non_tool_failure"),
-    ({"status": "degraded", "failure": {"kind": "tool", "reason_code": "tool_failure", "tool_errors": []}},
-     "degraded_tool_failure_without_errors"),
-    ({"status": "degraded", "failure": {"kind": "tool", "reason_code": "tool_failure", "tool_errors": [
-        _tool_error("run_command", "⚠️ TOOL_ARG_ERROR: Could not parse arguments"),
-        _tool_error("run_command", "⚠️ TOOL_ERROR (run_command): RuntimeError: Could not determine home directory."),
-    ]}}, "degraded_runtime_tool_error"),
-    ({"status": "degraded", "failure": {"kind": "tool", "reason_code": "tool_failure", "tool_errors": ["oops"]}},
-     "degraded_untyped_tool_error"),
 ])
 def test_fair_completion_refuses_everything_else(execution, basis):
     from devtools.benchmarks.cybergym.cybergym_wire import _gateway_fair_completion

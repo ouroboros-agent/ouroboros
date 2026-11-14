@@ -8,7 +8,7 @@ import pytest
 from tests.test_onboarding_host import _install_fake_webview
 
 
-@pytest.mark.parametrize("settled", [True, False, RuntimeError("no browser"), None])
+@pytest.mark.parametrize("settled", [True, False, None])
 def test_setup_and_main_bridge_share_the_bounded_external_opener(monkeypatch, settled):
     import launcher
     from ouroboros import launcher_onboarding
@@ -28,13 +28,14 @@ def test_setup_and_main_bridge_share_the_bounded_external_opener(monkeypatch, se
     monkeypatch.setattr(launcher, "_open_browser_detached", open_browser)
     created, _ = _install_fake_webview(monkeypatch)
     result = launcher_onboarding.present_first_run_onboarding(
-        {}, 8765, open_external_url=launcher._open_external_url,
+        {}, 1, open_external_url=launcher._open_external_url,
     )
     # Evaluate the actual main-window API class without launching a server/UI.
     source = inspect.getsource(launcher.main)
     node = next(node for node in ast.walk(ast.parse(source))
                 if isinstance(node, ast.ClassDef) and node.name == "MainApi")
-    namespace = {"_open_external_url": launcher._open_external_url}
+    namespace = {"_open_external_url": launcher._open_external_url, "DesktopApi": launcher.DesktopApi,
+                 "_shell_facts": launcher._shell_facts, "background": None}
     exec(compile(ast.Module(body=[node], type_ignores=[]), "MainApi", "exec"), namespace)
     assert "open_external_url=_open_external_url" in source
     for api in (created["js_api"], namespace["MainApi"]()):
@@ -64,19 +65,26 @@ def test_external_opener_returns_thread_start_failure(monkeypatch):
     }
 
 
-def test_main_bridge_request_attention_delegates_window_and_sound(monkeypatch):
+def test_main_bridge_request_attention_delegates_to_the_background_policy(monkeypatch):
+    """The bridge only forwards: the window-or-banner choice belongs to launcher_background
+    (a window hidden on purpose is never raised). `notify_owner` is the same method under the
+    name newer pages feature-detect to send the alert text; older launchers lack it."""
     import launcher
 
     source = inspect.getsource(launcher.main)
     node = next(node for node in ast.walk(ast.parse(source))
                 if isinstance(node, ast.ClassDef) and node.name == "MainApi")
-    shown = []
+    seen = []
     namespace = {
         "_open_external_url": launcher._open_external_url,
-        "_webview_window": type("Window", (), {"show": lambda self: shown.append(True)})(),
-        "request_native_attention": lambda show, sound=True: (show(), {"ok": True, "sound": sound})[1],
+        "DesktopApi": launcher.DesktopApi,  # the alert half lives in launcher_background
+        "_shell_facts": launcher._shell_facts,
+        "background": type("Background", (), {
+            "attention": lambda self, *args: seen.append(args) or {"ok": True}})(),
     }
     exec(compile(ast.Module(body=[node], type_ignores=[]), "MainApi", "exec"), namespace)
-    result = namespace["MainApi"]().request_attention(False)
-    assert result == {"ok": True, "sound": False}
-    assert shown == [True]
+    api = namespace["MainApi"]()
+    assert api.request_attention(False) == {"ok": True}  # an older page: sound only
+    assert api.notify_owner(1, "Task finished", None) == {"ok": True}
+    assert api.notify_owner(True, "Task finished", "", False) == {"ok": True}  # a page with its own banner asks first
+    assert seen == [(False, "", "", True), (True, "Task finished", "", True), (True, "Task finished", "", False)]

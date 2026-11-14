@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pathlib
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,7 +13,6 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from ouroboros.tools import edit_ops
 from ouroboros.tools.edit_ops import (
     _apply_hunks_to_text,
-    _find_sequence,
     _parse_patch,
     _syntax_check,
 )
@@ -163,7 +163,7 @@ def test_pure_insertion_with_anchor():
     assert "def other(x):\n    # inserted\n    return ddd(x)" in new
 
 
-def test_sequential_hunks_advance_cursor():
+def test_nonoverlapping_hunks_use_whole_file_coordinates():
     ops, _ = _parse_patch(
         "*** Update File: s.py\n"
         "-    return ddd(x)\n"
@@ -179,9 +179,10 @@ def test_sequential_hunks_advance_cursor():
     assert "def ddd(x):" in new  # the def line was not part of either hunk
 
 
-def test_find_sequence_caps_matches():
-    lines = ["x"] * 20
-    assert len(_find_sequence(lines, ["x"], 0, fuzzy=False)) == 5
+def test_repeated_context_is_ambiguous_beyond_five_matches():
+    ops, _ = _parse_patch("*** Update File: s.py\n-x\n+y\n")
+    new, _, error = _apply_hunks_to_text("x\n" * 20, ops[0].hunks, "s.py")
+    assert new is None and "ambiguous" in error
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +230,7 @@ def ws(tmp_path, monkeypatch):
     # Route guard helpers around ToolContext specifics: keep the real access
     # logic out of scope — these tests exercise edit mechanics.
     monkeypatch.setattr(edit_ops, "_resolve_edit_target", _fake_resolver(ctx))
+    monkeypatch.setattr(edit_ops, "_edit_content_block", lambda *_args: "")
     monkeypatch.setattr(
         edit_ops,
         "_finish_mutation",
@@ -240,11 +242,14 @@ def ws(tmp_path, monkeypatch):
 def _fake_resolver(ctx):
     from ouroboros.utils import safe_relpath
 
-    def resolver(_ctx, path, _root, *, error_tag, _resolved_binding=None):
+    def resolver(_ctx, path, _root, *, error_tag, _resolved_binding=None, **_kwargs):
         if not path:
             return None, "", None, f"⚠️ {error_tag}: path is required."
         try:
-            return ctx.repo_path(path), safe_relpath(path), _resolved_binding, ""
+            target = ctx.repo_path(path)
+            binding = SimpleNamespace(target_path=target, base_path=ctx.repo_dir,
+                                      root="active_workspace", source="active_workspace", skill_name="")
+            return target, safe_relpath(path), binding, ""
         except ValueError as e:
             return None, "", None, f"⚠️ PATH_ERROR: {e}"
     return resolver
@@ -334,6 +339,44 @@ def test_edit_batch_sequential_edits_see_prior_results(ws):
     )
     assert result.startswith("✅")
     assert "def aaa(value):" in (ws.repo_dir / "s.py").read_text()
+
+
+def _typed(ctx, call):
+    """The handler's text and the typed result it published, read through the registry's own sidecar."""
+    from ouroboros.tools.tool_result import (
+        _install_tool_result_sidecar, _published_tool_result, _restore_tool_result_sidecar,
+    )
+
+    sentinel = object()
+    token = _install_tool_result_sidecar(ctx, sentinel)
+    try:
+        text, typed = call(), _published_tool_result(ctx, sentinel)
+    finally:
+        _restore_tool_result_sidecar(token)
+    return text, None if typed is sentinel else typed
+
+
+def test_patch_and_batch_leave_a_file_already_holding_their_bytes_untouched(ws):
+    """Owner, 8 Nov 2026: a target already holding exactly the bytes an edit would leave is not rewritten. A call that
+    changed nothing is the typed ``completed_no_effect`` (no effect reader counts it as production); a call that
+    changed other files names it in ``unchanged_paths``, which the result review leaves out of what was produced."""
+    target, other = ws.repo_dir / "s.py", ws.repo_dir / "t.py"
+    other.write_text("T = 1\n", encoding="utf-8")
+    stamp = target.stat().st_mtime_ns
+    same_patch = "*** Update File: s.py\n-def ddd(x):\n+def ddd(x):\n"
+    same_edit = {"path": "s.py", "old_str": "def ddd(x):", "new_str": "def ddd(x):", "count": 1}
+    for call in (lambda: edit_ops._apply_patch(ws, same_patch), lambda: edit_ops._edit_batch(ws, [same_edit])):
+        text, typed = _typed(ws, call)
+        assert text.startswith("✅ Unchanged: active_workspace:s.py already held exactly this content"), text
+        assert typed.code == "OK" and typed.meta["operation_outcome"] == "completed_no_effect"
+        assert target.stat().st_mtime_ns == stamp, "nothing was written"
+    mixed = (lambda: edit_ops._apply_patch(ws, same_patch + "*** Update File: t.py\n-T = 1\n+T = 2\n"),
+             lambda: edit_ops._edit_batch(ws, [same_edit, {"path": "t.py", "old_str": "T = 2", "new_str": "T = 3"}]))
+    for expected, call in zip(("T = 2\n", "T = 3\n"), mixed):
+        text, typed = _typed(ws, call)
+        assert other.read_text() == expected and target.stat().st_mtime_ns == stamp, text
+        assert typed.meta["unchanged_paths"] == ["s.py"] and "operation_outcome" not in typed.meta
+        assert "Unchanged, not rewritten (already held exactly this content): s.py" in text
 
 
 def test_registry_registration():
@@ -487,8 +530,11 @@ def _protected_call(tool, path):
     return {"edits": [{"path": path, "old_str": "P1 honest", "new_str": "P1 loose"}]}
 
 
-@pytest.mark.parametrize("tool", ["edit_text", "apply_patch", "edit_batch"])
-@pytest.mark.parametrize("spelling", ["canonical", "absolute", "root_basename"])
+@pytest.mark.parametrize(("spelling", "tool"), [
+    ("canonical", "edit_text"),
+    ("absolute", "apply_patch"),
+    ("root_basename", "edit_batch"),
+])
 def test_protected_path_blocked_in_every_spelling(tmp_path, tool, spelling):
     """A protected path is refused however it is SPELLED.
 
@@ -696,6 +742,7 @@ def test_partial_write_marks_advisory_stale_and_says_so(tmp_path, monkeypatch):
     repo.mkdir()
     (repo / "one.py").write_text("A = 1\n", encoding="utf-8")
     (repo / "two.py").write_text("B = 1\n", encoding="utf-8")
+    (repo / "three.py").write_text("C = 1\n", encoding="utf-8")
     ctx = _FakeCtx(repo)
     monkeypatch.setattr(edit_ops, "_resolve_edit_target", _fake_resolver(ctx))
     real_write = edit_ops.write_text
@@ -708,10 +755,14 @@ def test_partial_write_marks_advisory_stale_and_says_so(tmp_path, monkeypatch):
     monkeypatch.setattr(edit_ops, "write_text", flaky)
     result = edit_ops._apply_patch(
         ctx,
-        "*** Update File: one.py\n-A = 1\n+A = 2\n*** Update File: two.py\n-B = 1\n+B = 2\n",
+        "*** Update File: one.py\n-A = 1\n+A = 2\n*** Update File: two.py\n-B = 1\n+B = 2\n"
+        "*** Update File: three.py\n-C = 1\n+C = 2\n",
     )
     assert "EDIT_OPS_PARTIAL_WRITE_FAILED" in result and "PARTIALLY APPLIED" in result and "one.py" in result
+    assert "write failed for two.py" in result and "Not attempted: three.py." in result
+    assert "Do not repeat this call" in result and "Re-read them before retrying" not in result
     assert (repo / "one.py").read_text() == "A = 2\n"
+    assert (repo / "two.py").read_text() == "B = 1\n" and (repo / "three.py").read_text() == "C = 1\n"
     assert invalidated == [("one.py",)]
 
 

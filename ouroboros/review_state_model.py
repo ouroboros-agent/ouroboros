@@ -1,10 +1,11 @@
 """The in-memory review ledger and every transition it permits.
 
 ``AdvisoryReviewState`` is the whole mutable state of one drive's review history:
-advisory runs, commit attempts, open obligations and commit-readiness debts,
-their lifecycle transitions, freshness and expiry rules, and the projections the
-review surfaces read. It owns no persistence — loading, saving, locking and
-repo identity stay with ``review_state``. Extracted from
+commit attempts, open obligations and commit-readiness debts, their lifecycle
+transitions, freshness and expiry rules, and the projections the review surfaces read;
+the retired advisory lane's rows and the debts it minted ride along only as a verbatim
+archive, never read as freshness, guidance or debt. It owns no persistence — loading,
+saving, locking and repo identity stay with ``review_state``. Extracted from
 ouroboros/review_state.py (v7 D06 split, re-cut on the v7next tip);
 review_state.py re-exports the class at its historical binding. The class-level
 defaults and the f-string reads the call-time handle cannot carry stay
@@ -17,7 +18,6 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from ouroboros.review_state_records import (
-    _DEFAULT_ADVISORY_TOOL_NAME,
     _REVIEW_ATTEMPT_GRACE_SEC,
     _REVIEW_ATTEMPT_TTL_SEC,
     _STATE_SCHEMA_VERSION,
@@ -26,7 +26,6 @@ from ouroboros.review_state_records import (
 
 if TYPE_CHECKING:  # annotation-only names; lazy under future annotations, never imported at runtime
     from ouroboros.review_state_records import (
-        AdvisoryRunRecord,
         CommitAttemptRecord,
         CommitReadinessDebtItem,
         ObligationItem,
@@ -51,7 +50,9 @@ class AdvisoryReviewState:
     """Top-level durable review state."""
 
     state_version: int = _STATE_SCHEMA_VERSION
-    advisory_runs: List[AdvisoryRunRecord] = field(default_factory=list)
+    # The retired advisory lane's rows exactly as stored (owner decision: archive only).
+    # Nothing writes, normalizes or interprets them; saving writes them back unchanged.
+    advisory_runs: List[Any] = field(default_factory=list)
     attempts: List[CommitAttemptRecord] = field(default_factory=list)
     open_obligations: List[ObligationItem] = field(default_factory=list)
     next_obligation_seq: int = 1
@@ -60,9 +61,14 @@ class AdvisoryReviewState:
     last_stale_from_edit_ts: str = ""
     last_stale_reason: str = ""
     last_stale_repo_key: str = ""
-
-    def latest(self) -> Optional[AdvisoryRunRecord]:
-        return self.advisory_runs[-1] if self.advisory_runs else None
+    # The task whose mutation or review wrote the marker; "" = not recorded.
+    last_stale_task_id: str = ""
+    # last_stale_* is the newest marker; the markers of other scopes it displaced stay
+    # here, by checkout key ("" = unscoped): {"ts", "reason", "task_id"} (#2573).
+    earlier_stale_markers: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    # The debts the retired lane minted (``_is_archived_advisory_debt``), exactly as stored:
+    # never current debt, verified or pruned, ids never reused; saved after the live debts.
+    archived_advisory_debts: List[Dict[str, Any]] = field(default_factory=list)
 
     def latest_attempt(self) -> Optional[CommitAttemptRecord]:
         return self.attempts[-1] if self.attempts else None
@@ -90,22 +96,6 @@ class AdvisoryReviewState:
         ]
         return _rs()._filter_repo_scope(active, repo_key)
 
-    def filter_advisory_runs(
-        self,
-        *,
-        repo_key: str | None = None,
-        tool_name: str | None = None,
-        task_id: str | None = None,
-        attempt: int | None = None,
-    ) -> List[AdvisoryRunRecord]:
-        return _rs()._filter_lifecycle_records(
-            self.advisory_runs,
-            repo_key=repo_key,
-            tool_name=tool_name,
-            task_id=task_id,
-            attempt=attempt,
-        )
-
     def filter_attempts(
         self,
         *,
@@ -122,133 +112,88 @@ class AdvisoryReviewState:
             attempt=attempt,
         )
 
-    def next_attempt_number(self, repo_key: str, tool_name: str, task_id: str = "") -> int:
+    def next_attempt_number(self, repo_key: str, tool_name: str, task_id: str = "", *, above: int = 0) -> int:
+        """The next number of this task's attempts, never one at or below ``above`` (a number the caller still holds)."""
         candidates = self.filter_attempts(repo_key=repo_key, tool_name=tool_name, task_id=task_id)
         latest = max((int(item.attempt or 0) for item in candidates), default=0)
-        return latest + 1
+        return max(latest, int(above or 0)) + 1
 
-    def next_advisory_attempt_number(
-        self,
-        repo_key: str,
-        task_id: str = "",
-        tool_name: str = _DEFAULT_ADVISORY_TOOL_NAME,
-    ) -> int:
-        candidates = self.filter_advisory_runs(
-            repo_key=repo_key,
-            tool_name=tool_name,
-            task_id=task_id,
-        )
-        latest = max((int(run.attempt or 0) for run in candidates), default=0)
-        return latest + 1
+    def _newest_stale_marker(self) -> Dict[str, str]:
+        return {"ts": self.last_stale_from_edit_ts, "reason": self.last_stale_reason,
+                "task_id": self.last_stale_task_id, "repo_key": self.last_stale_repo_key}
 
-    def find_by_hash(
-        self,
-        snapshot_hash: str,
-        repo_key: str | None = None,
-    ) -> Optional[AdvisoryRunRecord]:
-        for run in reversed(_rs()._filter_repo_scope(self.advisory_runs, repo_key)):
-            if run.snapshot_hash != snapshot_hash:
-                continue
-            return run
-        return None
+    def _stale_markers(self) -> List[Dict[str, str]]:
+        """Every marker held, with its checkout key: the newest, then those it displaced
+        (a ``__new__``-built state has no factory default)."""
+        earlier = getattr(self, "earlier_stale_markers", None) or {}
+        rows = (self._newest_stale_marker(), *({**row, "repo_key": key} for key, row in earlier.items()))
+        return [row for row in rows if row.get("ts")]
 
-    def is_fresh(self, snapshot_hash: str, repo_key: str | None = None) -> bool:
-        run = self.find_by_hash(snapshot_hash, repo_key=repo_key)
-        return run is not None and run.status in ("fresh", "bypassed", "skipped")
+    def stale_marker(self, repo_key: str = "", look_ts: str = "") -> Dict[str, str]:
+        """The marker that invalidated ``repo_key``'s look recorded at ``look_ts`` (any
+        look when empty): the first written at or after it, scoped to that checkout or
+        unscoped (an unscoped marker applies to every checkout); ``{}`` when none was."""
+        rows = [row for row in self._stale_markers() if row["repo_key"] in ("", repo_key) and row["ts"] >= look_ts]
+        return min(rows, key=lambda row: row["ts"], default={})
 
-    def add_run(self, run: AdvisoryRunRecord) -> None:
-        invocation = str(run.execution.get("invocation_id") or run.execution.get("operation_id") or "")
-        for index, existing in enumerate(self.advisory_runs):
-            if (run.status == "bypassed" and run.bypass_reason
-                    and existing.blocks_preflight and existing.repo_key == run.repo_key):
-                # Both existing bypass writers converge here under the state lock.
-                # Preserve the old task, exact request token, result and custody.
-                existing.bypass_reason = run.bypass_reason
-                existing.bypassed_by_task = run.bypassed_by_task
-                existing.updated_ts = _rs()._utc_now()
-            if (existing.blocks_preflight and existing.repo_key == run.repo_key
-                    and (not invocation or invocation != (existing.execution.get("invocation_id") or existing.execution.get("operation_id")))):
-                raise ValueError("an unresolved preflight already owns this repository")
-            if (invocation and (existing.execution.get("invocation_id") or existing.execution.get("operation_id")) == invocation
-                    and (existing.repo_key, existing.task_id) == (run.repo_key, run.task_id)):
-                run.attempt, run.created_ts = existing.attempt, existing.created_ts
-                if existing.bypass_reason:
-                    # A late result updates its own historical row in place; it
-                    # cannot revoke the newer bypass or reclaim its admission.
-                    run.bypass_reason, run.bypassed_by_task = existing.bypass_reason, existing.bypassed_by_task
-                    self.advisory_runs[index] = run
-                    return
-                self.advisory_runs.pop(index)
-                break
-        if not run.attempt:
-            run.attempt = self.next_advisory_attempt_number(
-                str(run.repo_key or _rs()._LEGACY_CURRENT_REPO_KEY),
-                str(run.task_id or ""),
-                str(run.tool_name or _DEFAULT_ADVISORY_TOOL_NAME),
-            )
-        if not run.created_ts:
-            run.created_ts = run.ts or _rs()._utc_now()
-        if not run.updated_ts:
-            run.updated_ts = run.created_ts
-        self.mark_all_stale_except(run.snapshot_hash, repo_key=run.repo_key)
-        self.advisory_runs.append(run)
-        if len(self.advisory_runs) > _rs()._MAX_RUN_HISTORY:
-            cutoff = len(self.advisory_runs) - _rs()._MAX_RUN_HISTORY
-            self.advisory_runs = [
-                row for index, row in enumerate(self.advisory_runs)
-                if index >= cutoff or row.execution_pending
-            ]
-        if run.status in ("fresh", "bypassed", "skipped", "parse_failure"):
-            self.last_stale_from_edit_ts = ""
-            self.last_stale_reason = ""
-            self.last_stale_repo_key = ""
-        self._sync_commit_readiness_debts(repo_key=run.repo_key or None)
+    def marker_postdates(self, look_ts: str, repo_key: str = "") -> bool:
+        """Whether a stale marker already covers a look recorded at ``look_ts`` on ``repo_key``."""
+        return bool(look_ts and self.stale_marker(repo_key, look_ts))
 
-    def mark_stale(self, snapshot_hash: str) -> None:
-        for run in self.advisory_runs:
-            if run.snapshot_hash == snapshot_hash:
-                run.status = "stale"
-                run.updated_ts = _rs()._utc_now()
+    def mark_look_stale(
+        self, look_ts: str, *, reason_ts: str = "", reason: str = "", stale_repo_key: str = "", stale_task_id: str = "",
+    ) -> bool:
+        """Write the stale marker for a preflight look — a ``surface=preflight``
+        review-ledger record (D5-002). The FIRST mutation after the look writes the
+        marker and later ones keep it, so the marker names the mutation that
+        invalidated the look, never the latest editor. The newest marker of another
+        scope is displaced, not erased. Returns whether this call wrote it."""
+        if not look_ts or self.marker_postdates(look_ts, stale_repo_key):
+            return False
+        earlier = dict(getattr(self, "earlier_stale_markers", None) or {})
+        if self.last_stale_from_edit_ts and self.last_stale_repo_key != stale_repo_key:
+            earlier[self.last_stale_repo_key] = {"ts": self.last_stale_from_edit_ts, "reason": self.last_stale_reason,
+                                                 "task_id": self.last_stale_task_id}
+        earlier.pop(stale_repo_key, None)  # superseded: it does not cover this look
+        self.earlier_stale_markers = earlier
+        self.last_stale_from_edit_ts = reason_ts or _rs()._utc_now()
+        self.last_stale_reason = reason
+        self.last_stale_repo_key = stale_repo_key
+        self.last_stale_task_id = stale_task_id
+        return True
 
-    def mark_all_stale_except(self, snapshot_hash: str, repo_key: str = "") -> None:
-        for run in self.advisory_runs:
-            same_repo = not repo_key or run.repo_key == repo_key
-            if same_repo and run.snapshot_hash != snapshot_hash and run.status in ("fresh", "bypassed", "skipped"):
-                run.status = "stale"
-                run.updated_ts = _rs()._utc_now()
+    def stale_marker_provenance(self, task_id: str = "", *, marker: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+        """Whose mutation or review wrote ``marker`` (a ``stale_marker`` row; by default the
+        newest marker), and for which checkout.
 
-    def mark_repo_stale(
-        self,
-        *,
-        repo_key: str = "",
-        reason_ts: str = "",
-        reason: str = "",
-        stale_repo_key: str = "",
-    ) -> int:
-        """Invalidate advisory runs for a repo, falling back conservatively."""
-        invalidatable = [
-            run for run in self.advisory_runs
-            if run.status in ("fresh", "bypassed", "skipped")
-        ]
-        if not invalidatable:
-            return 0
+        Attribution, never scoping (#783, owner 6A): staleness is a fact about
+        the checkout, so every task on it keeps seeing the marker; this only
+        names the writer relative to the reading ``task_id``. An unrecorded
+        writer (legacy marker, or a writer without task identity) or a reader
+        without identity stays ``unknown`` — never re-attributed to either side.
+        An empty ``stale_repo_key`` is an ambiguous or unrecorded checkout scope,
+        which is why that marker applies to every checkout.
+        """
+        marker = self._newest_stale_marker() if marker is None else marker
+        if not marker.get("ts"):
+            return {"stale_task_id": "", "stale_attribution": "", "stale_repo_key": ""}
+        writer, reader = str(marker.get("task_id") or ""), str(task_id or "")
+        relation = ("this_task" if writer == reader else "other_task") if writer and reader else "unknown"
+        return {"stale_task_id": writer, "stale_attribution": relation,
+                "stale_repo_key": str(marker.get("repo_key") or "")}
 
-        if not repo_key:
-            target_runs = invalidatable
-        else:
-            exact_matches = [run for run in invalidatable if run.repo_key == repo_key]
-            legacy_present = any(run.repo_key in ("", _rs()._LEGACY_CURRENT_REPO_KEY) for run in invalidatable)
-            target_runs = invalidatable if legacy_present and not exact_matches else (exact_matches or invalidatable)
-
-        for run in target_runs:
-            run.status = "stale"
-            run.updated_ts = reason_ts or _rs()._utc_now()
-        if target_runs:
-            self.last_stale_from_edit_ts = reason_ts or _rs()._utc_now()
-            self.last_stale_reason = reason
-            self.last_stale_repo_key = stale_repo_key or repo_key
-            self._sync_commit_readiness_debts(repo_key=stale_repo_key or repo_key or None)
-        return len(target_runs)
+    def stale_marker_attribution_note(self, task_id: str = "", *, marker: Optional[Dict[str, str]] = None) -> str:
+        """Prose form of ``stale_marker_provenance`` for text surfaces ("invalidated by …")."""
+        provenance = self.stale_marker_provenance(task_id, marker=marker)
+        writer = provenance["stale_task_id"]
+        note = {
+            "this_task": f"this task ({writer})",
+            "other_task": f"another task ({writer}); the shared checkout stays stale for every task on it",
+        }.get(provenance["stale_attribution"]) or (
+            f"task {writer}" if writer else "an unrecorded writer (legacy or unattributed marker)")
+        if not provenance["stale_repo_key"]:
+            note += "; checkout scope ambiguous or unrecorded, so it applies to every checkout"
+        return note
 
     def add_blocking_attempt(self, attempt: CommitAttemptRecord) -> None:
         """Compatibility alias for existing callers/tests."""
@@ -304,10 +249,9 @@ class AdvisoryReviewState:
         """Authority-preserving eviction (Q16 fix round, F1): trimming to the
         historical cap may only evict NON-authoritative rows, oldest first.
         Paid rows are the money ledger ``count_paid_review_cycles`` derives the
-        per-root-task ceiling from, and verdict-block rows anchor the
-        identical-diff refusal streak (the quoted verdict) — evicting either
-        would let a capped root task loop free refusals until the ceiling and
-        the refusal both forget themselves. Both preserved classes are bounded
+        per-root-task ceiling from — evicting them would let a capped root task
+        loop until the ceiling forgets itself — and verdict-block rows are kept
+        with them. Both preserved classes are bounded
         by the money ceiling itself, so only the noise portion (free refusals,
         preflight facts, unpaid infra rows) is capped at
         ``_MAX_ATTEMPT_HISTORY``; the list may exceed the cap only by the
@@ -420,7 +364,7 @@ class AdvisoryReviewState:
 
     def _allocate_commit_readiness_debt_id(self) -> str:
         candidate, next_seq = _rs()._allocate_prefixed_id(
-            _rs()._commit_readiness_debts_view(self),
+            [*_rs()._commit_readiness_debts_view(self), *getattr(self, "archived_advisory_debts", ())],
             "debt_id",
             self.next_commit_readiness_debt_seq,
             "crd-",
@@ -504,29 +448,8 @@ class AdvisoryReviewState:
                 "evidence": evidence,
             })
 
-        stale_matches_repo = repo_key is None or self.last_stale_repo_key in ("", repo_key)
-        if self.last_stale_from_edit_ts and stale_matches_repo:
-            _remember({
-                "category": "advisory_stale",
-                "title": "Advisory freshness debt",
-                "summary": "Fresh advisory coverage was invalidated by a worktree mutation before the next reviewed attempt.",
-                "severity": "warning",
-                "repo_key": str(self.last_stale_repo_key or repo_key or ""),
-                "fingerprint": "advisory_stale",
-                "source": "review_state",
-                "source_obligation_ids": [],
-                "evidence": [str(self.last_stale_reason or "worktree mutation invalidated advisory freshness")],
-            })
-
         scoped_attempts = self.filter_attempts(repo_key=repo_key) if repo_key is not None else list(self.attempts)
         latest_attempt = scoped_attempts[-1] if scoped_attempts else None
-        latest_success_ts = ""
-        for attempt in reversed(scoped_attempts):
-            if str(getattr(attempt, "status", "") or "") != "succeeded":
-                continue
-            latest_success_ts = str(getattr(attempt, "finished_ts", "") or getattr(attempt, "updated_ts", "") or getattr(attempt, "ts", "") or "")
-            break
-
         if (
             latest_attempt
             and latest_attempt.readiness_warnings
@@ -545,27 +468,6 @@ class AdvisoryReviewState:
                     "fingerprint": f"readiness_warning:attempt:{_stable_digest(warning_text)}",
                     "source": "review_state",
                     "source_obligation_ids": list(getattr(latest_attempt, "obligation_ids", []) or []),
-                    "evidence": [warning_text],
-                })
-
-        advisory_runs = self.filter_advisory_runs(repo_key=repo_key) if repo_key is not None else list(self.advisory_runs)
-        latest_run = advisory_runs[-1] if advisory_runs else None
-        latest_run_ts = str(getattr(latest_run, "updated_ts", "") or getattr(latest_run, "ts", "") or "") if latest_run else ""
-        advisory_warnings_resolved = bool(latest_success_ts and latest_run_ts and _rs()._max_iso_ts(latest_run_ts, latest_success_ts) == latest_success_ts)
-        if latest_run and latest_run.readiness_warnings and not advisory_warnings_resolved:
-            for warning in latest_run.readiness_warnings:
-                warning_text = str(warning or "").strip()
-                if not warning_text:
-                    continue
-                _remember({
-                    "category": "readiness_warning",
-                    "title": "Readiness warning debt",
-                    "summary": warning_text,
-                    "severity": "warning",
-                    "repo_key": str(getattr(latest_run, "repo_key", "") or repo_key or ""),
-                    "fingerprint": f"readiness_warning:advisory:{_stable_digest(warning_text)}",
-                    "source": "advisory_review",
-                    "source_obligation_ids": [],
                     "evidence": [warning_text],
                 })
 
@@ -698,21 +600,14 @@ class AdvisoryReviewState:
             reason = str(f.get("reason", ""))
             severity = str(f.get("severity", "critical"))
             raw_explicit_id = str(f.get("obligation_id", "") or "").strip()
-            # Reviewer-supplied ids must match an open compatible obligation;
-            # otherwise a bogus id could corrupt durable debt links.
-            explicit_id = ""
-            if raw_explicit_id and _rs()._looks_like_public_obligation_id(raw_explicit_id):
-                candidate = existing.get(raw_explicit_id)
-                if candidate is not None:
-                    canon_new = _rs()._normalize_obligation_item_key(item)
-                    canon_old = _rs()._normalize_obligation_item_key(candidate.item)
-                    items_compatible = (
-                        (canon_new and canon_old and canon_new == canon_old)
-                        or not canon_new
-                        or not canon_old
-                    )
-                    if items_compatible:
-                        explicit_id = raw_explicit_id
+            # A reviewer-supplied id folds into the OPEN obligation of this repo it names,
+            # under any item: one root defect is one obligation across both parts of the
+            # brief. A malformed or unknown id names nothing, so it cannot corrupt debt
+            # links; a mis-cited open id folds a distinct defect into it, which then
+            # re-surfaces under its own fingerprint while still broken (as below).
+            explicit = None
+            if _rs()._looks_like_public_obligation_id(raw_explicit_id):
+                explicit = existing.get(raw_explicit_id)
             fingerprint = _rs()._make_obligation_fingerprint(item, reason)
 
             # A reworded restatement that misses the exact fingerprint folds into the
@@ -730,8 +625,8 @@ class AdvisoryReviewState:
             # false-MERGE here is the costly direction; it never blocks review.
             redirected = existing.get(redirects.get(fingerprint, "")) if redirects else None
             obligation = None
-            if explicit_id and explicit_id in existing:
-                obligation = existing[explicit_id]
+            if explicit is not None:
+                obligation = explicit
             elif fingerprint in by_fingerprint:
                 obligation = by_fingerprint[fingerprint]
             elif redirected is not None:
@@ -764,21 +659,6 @@ class AdvisoryReviewState:
         self._coalesce_open_obligations()
         return _rs()._dedupe_strings(touched_ids)
 
-    def resolve_obligations(
-        self,
-        resolved_ids: List[str],
-        resolved_by: str = "",
-        repo_key: str | None = None,
-    ) -> int:
-        count = 0
-        for ob in _rs()._filter_repo_scope(self.open_obligations, repo_key):
-            if ob.obligation_id not in resolved_ids or ob.status != "still_open":
-                continue
-            ob.status = "resolved"
-            ob.resolved_by = resolved_by
-            count += 1
-        return count
-
     def get_open_obligations(self, repo_key: str | None = None) -> List[ObligationItem]:
         return [
             ob for ob in _rs()._filter_repo_scope(self.open_obligations, repo_key)
@@ -792,6 +672,8 @@ class AdvisoryReviewState:
             self.last_stale_from_edit_ts = ""
             self.last_stale_reason = ""
             self.last_stale_repo_key = ""
+            self.last_stale_task_id = ""
+            self.earlier_stale_markers = {}
             for debt in _rs()._commit_readiness_debts_view(self):
                 self._hydrate_commit_readiness_debt(debt)
                 if debt.status in _rs()._OPEN_COMMIT_READINESS_DEBT_STATUSES:
@@ -809,6 +691,9 @@ class AdvisoryReviewState:
             self.last_stale_from_edit_ts = ""
             self.last_stale_reason = ""
             self.last_stale_repo_key = ""
+            self.last_stale_task_id = ""
+        earlier = getattr(self, "earlier_stale_markers", None) or {}
+        self.earlier_stale_markers = {key: row for key, row in earlier.items() if key not in ("", repo_key)}
         self._sync_commit_readiness_debts(repo_key=repo_key)
 
     def expire_stale_attempts(

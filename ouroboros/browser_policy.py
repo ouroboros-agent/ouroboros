@@ -2,11 +2,15 @@
 
 Playwright lifecycle and operations remain in tools.browser. This owner composes
 existing resource authority, concrete origins and live service identity.
+
+Owner control is admitted from the actual HTTP requests a page makes and three-valued
+service identity, not from JavaScript text, per-request LLMs or a second policy engine.
+Every browser surface (the Playwright tools, an MCP server through ``mcp_browser_guard``)
+asks these same predicates instead of carrying a script-text rule of its own.
 """
 from __future__ import annotations
 
 import ipaddress
-import pathlib
 import re
 import socket
 from typing import Any
@@ -58,7 +62,7 @@ def runtime_service_kind(url: str, ctx: Any = None) -> str:
     Identity is read from the actual binding and live process, never inferred
     from a port number or an ``/api/owner/...`` pathname alone.
     """
-    from ouroboros.tools.core_secret_paths import restricted_data_roots
+    from ouroboros.tools.core_secret_paths import runtime_data_roots
 
     origin = normalize_browser_origin(url)
     if not origin:
@@ -78,13 +82,42 @@ def runtime_service_kind(url: str, ctx: Any = None) -> str:
                    for address in resolved["addresses"])
 
     try:
-        for root in restricted_data_roots(ctx):
+        for root in runtime_data_roots(ctx):
             if identity := runtime_service_identity(root, parsed.port, host_matches):
                 return identity
         return ""
     except OSError:
         # A recorded endpoint's port matched and the target could not be resolved.
         return SERVICE_IDENTITY_UNKNOWN
+
+
+def browser_runtime_mode(ctx: Any) -> str:
+    """The effective mode for owner-control browser operations: the boot mode, narrowed by the task's cap."""
+    try:
+        from ouroboros.config import get_runtime_mode
+        from ouroboros.consciousness_authority import effective_runtime_mode
+
+        return effective_runtime_mode(get_runtime_mode(), getattr(ctx, "task_metadata", None))
+    except Exception:
+        return "advanced"
+
+
+def browser_script_block_reason(ctx: Any) -> str:
+    """Whether this actor may run arbitrary page JavaScript (every browser surface asks here).
+
+    The broad restricted-subagent predicate stays the URL/install and secret/control
+    protection, not a JavaScript capability: acting children already have an isolated
+    write surface and may inspect the pages of their own work. Invalid or missing
+    delegated constraints resolve to local-readonly through ``active_tool_profile`` and
+    stay blocked; keeping the restricted predicate in the condition also fails closed
+    for a future restricted profile added without an explicit acting contract.
+    """
+    from ouroboros.tool_access import active_tool_profile
+    from ouroboros.tools.core import is_restricted_subagent_profile
+
+    if is_restricted_subagent_profile(ctx) and active_tool_profile(ctx) != "acting_subagent":
+        return "BROWSER_LOCAL_READONLY_BLOCKED: local-readonly subagents cannot run arbitrary browser JavaScript."
+    return ""
 
 
 def _task_allowed_origins(ctx: Any) -> list[str]:
@@ -106,7 +139,7 @@ def browser_url_block_reason(
     if not restricted:
         return "BROWSER_METADATA_BLOCKED: link-local/cloud metadata target" if _is_metadata_blocked_browser_url(url) else ""
     if parsed.scheme == "file":
-        return "" if _file_url_under_workspace(parsed, ctx) else "BROWSER_LOCAL_READONLY_BLOCKED: file URL is outside the task workspace"
+        return ""  # Same local-file reach as the parent; network/action policy stays separate.
     origin = normalize_browser_origin(url)
     if not origin:
         return "BROWSER_LOCAL_READONLY_BLOCKED: expected a concrete HTTP(S) target"
@@ -149,7 +182,10 @@ def browser_request_block_reason(
 
     The owner POST shapes apply at a proven Ouroboros endpoint and at an expected
     one whose identity is unknown; an unrelated application reusing the pathname
-    on any other port keeps working."""
+    on any other port keeps working. A body-dependent shape whose body existed
+    but is unavailable (``_readable_body``) is not proof of an ordinary request:
+    it matches, so the owner's endpoint refuses what could not be read; a
+    genuinely absent or empty body stays ordinary."""
     reason = browser_url_block_reason(
         request.url, ctx, restricted=restricted, runtime_mode=runtime_mode)
     if reason or restricted:
@@ -157,31 +193,12 @@ def browser_request_block_reason(
     if mode_has_unrestricted_agency(runtime_mode):
         return ""
     if any(predicate(request) for predicate in (
-        _is_context_mode_owner_post, _is_review_enforcement_post, _is_safety_mode_owner_post,
-        _is_owner_skill_attest_post, _is_owner_settings_self_elevation_post,
+        _is_context_mode_owner_post, _is_effort_range_owner_post,
+        _is_safety_mode_owner_post, _is_owner_skill_attest_post, _is_owner_settings_self_elevation_post,
+        _is_model_wait_owner_post, _is_model_owner_post,
     )) and runtime_service_kind(request.url, ctx):
         return "BROWSER_OWNER_CONTROL_BLOCKED: this operation belongs to the owner"
     return ""
-
-
-def _file_url_under_workspace(parsed: Any, ctx: Any) -> bool:
-    """True only when a file:// path resolves under the task's EXPLICIT workspace
-    root, so a subagent can view its own built app but not the data root/secrets."""
-    if ctx is None:
-        return False
-    ws = str(getattr(ctx, "workspace_root", "") or "").strip()
-    if not ws:
-        return False
-    try:
-        from urllib.request import url2pathname
-
-        path = pathlib.Path(url2pathname(parsed.path)).resolve(strict=False)
-        base = pathlib.Path(ws).resolve(strict=False)
-        path.relative_to(base)
-        return True
-    except (ValueError, OSError):
-        return False
-
 
 
 def _is_blocked_subagent_ip(ip: ipaddress._BaseAddress) -> bool:
@@ -239,6 +256,37 @@ def _is_metadata_blocked_browser_url(url: str) -> bool:
 
 
 
+def _readable_body(request: Any) -> Any:
+    """The request's body text (``""`` when it has none), or None when a body exists but is unavailable.
+
+    A genuinely absent or empty body stays an ordinary empty body. A body the transport saw but
+    could not hand over as text is not: ``body_present`` true (the MCP guard's fact), bytes in
+    ``post_data_buffer``, or a raise on reading (Playwright decodes strictly, so a binary body
+    raises). An owner shape judged on such a request would read missing data as ordinary."""
+    try:
+        text = request.post_data
+    except Exception:
+        return None
+    if isinstance(text, str):
+        return text
+    try:
+        buffered = getattr(request, "post_data_buffer", None)
+    except Exception:
+        return None
+    present = getattr(request, "body_present", None) is True or bool(buffered)
+    return "" if text is None and not present else None
+
+
+
+def _is_model_owner_post(request: Any) -> bool:
+    import urllib.parse
+
+    path = urllib.parse.unquote(urllib.parse.unquote(urlparse(str(request.url or "")).path)).rstrip("/")
+    parts = path.split("/")
+    return str(request.method or "").upper() == "POST" and (path == "/api/owner/chat-model" or (
+        len(parts) == 5 and parts[1:3] == ["api", "tasks"] and bool(parts[3]) and parts[4] == "model"))
+
+
 def _is_context_mode_owner_post(request: Any) -> bool:
     try:
         parsed = urlparse(str(request.url or ""))
@@ -247,6 +295,19 @@ def _is_context_mode_owner_post(request: Any) -> bool:
         return False
     return method == "POST" and parsed.path.rstrip("/") == "/api/owner/context-mode"
 
+
+
+def _is_effort_range_owner_post(request: Any) -> bool:
+    """POST to the owner effort-range endpoint (the chat composer's control), decoded like safety-mode."""
+    import urllib.parse
+
+    try:
+        parsed = urlparse(str(request.url or ""))
+        method = str(request.method or "").upper()
+    except Exception:
+        return False
+    path = urllib.parse.unquote(urllib.parse.unquote(parsed.path)).rstrip("/")
+    return method == "POST" and path == "/api/owner/effort-range"
 
 
 def _is_safety_mode_owner_post(request: Any) -> bool:
@@ -261,16 +322,23 @@ def _is_safety_mode_owner_post(request: Any) -> bool:
     except Exception:
         return False
     path = urllib.parse.unquote(urllib.parse.unquote(parsed.path)).rstrip("/")
-    return method == "POST" and path == "/api/owner/safety-mode"
+    return method == "POST" and path in {"/api/owner/safety-mode", "/api/owner/safety-model", "/api/owner/safety-rules"}
 
 
-def _is_review_enforcement_post(request: Any) -> bool:
-    """The actual Settings field changes enforcement, independently of Access."""
+def _is_model_wait_owner_post(request: Any) -> bool:
+    """Keeping a waiting role's model is an owner settings write, not a one-off switch."""
     import json
+    import urllib.parse
+
     try:
-        return (str(request.method).upper() == "POST"
-                and urlparse(str(request.url)).path.rstrip("/") == "/api/settings"
-                and "OUROBOROS_REVIEW_ENFORCEMENT" in json.loads(request.post_data or "{}"))
+        path = urllib.parse.unquote(urllib.parse.unquote(urlparse(str(request.url)).path)).rstrip("/")
+        if str(request.method).upper() != "POST" or path != "/api/decisions":
+            return False
+        if (text := _readable_body(request)) is None:
+            return True
+        body = json.loads(text or "{}")
+        return (isinstance(body, dict) and str(body.get("decision_id", "")).startswith("model_wait:")
+                and body.get("persist_role") is True)
     except (AttributeError, TypeError, ValueError):
         return False
 
@@ -299,9 +367,24 @@ def _is_owner_settings_self_elevation_post(request: Any) -> bool:
         parsed = urlparse(str(request.url or ""))
         if parsed.path.rstrip("/") != "/api/settings":
             return False
-        body = str(request.post_data or "").lower()
     except Exception:
         return False
+    if (text := _readable_body(request)) is None:
+        return True
+    body = text.lower()
+    from ouroboros import config
+    from ouroboros.server_runtime import repropose_unedited_slots
+    import json
+    try:
+        proposed = json.loads(text or "{}")
+        current = config.load_settings()
+        candidate = {**current, **proposed}
+        document = config._settings_integrity.read_settings_json_verified(config.SETTINGS_PATH) or {}
+        repropose_unedited_slots(candidate, document, proposed, current)
+        if config.safety_configuration(current) != config.safety_configuration(candidate):
+            return True
+    except (TypeError, ValueError):
+        return True
     return (
         "ouroboros_post_task_evolution" in body
         or "ouroboros_allow_mutative_subagents" in body

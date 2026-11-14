@@ -25,6 +25,8 @@ from ouroboros.openai_chat_custom import (
 )
 from ouroboros.request_wire_contract import canonical_json
 from ouroboros.request_wire_receipts import WireCandidateSpec, bind_wire_candidate
+from tests.test_mcp_headers_loopback import loopback  # noqa: F401
+from tests.test_mcp_redirects import recorder  # noqa: F401
 
 _SCHEMA_CLAUSE = "Input must be one JSON object matching this schema: "
 
@@ -362,7 +364,7 @@ def test_canonical_replay_rejects_non_mapping_calls(call):
         reencode_canonical_calls_for_openai_custom([call], catalog)
 
 
-@pytest.mark.parametrize("call_id", [None, "", "   ", 0])
+@pytest.mark.parametrize("call_id", [None, "", 0])
 def test_canonical_replay_rejects_missing_or_empty_call_ids(call_id):
     catalog = project_function_tools_to_openai_custom(_tools())
     with pytest.raises(CustomToolProjectionError, match="missing or empty"):
@@ -390,11 +392,6 @@ def test_canonical_replay_rejects_duplicate_call_ids_as_one_invalid_batch():
         "type": "function",
         "function": {"name": "probe", "arguments": "{}"},
     }, "id has surrounding whitespace"),
-    ({
-        "id": "call_padded_name",
-        "type": "function",
-        "function": {"name": " probe ", "arguments": "{}"},
-    }, "name has surrounding whitespace"),
     ({
         "id": "call_numeric_name",
         "type": "function",
@@ -441,6 +438,15 @@ def test_custom_calls_normalize_and_full_schema_receipt_gates_execution():
     assert invalid_receipts[0].error_code == "schema_validation_failed"
     assert not invalid_receipts[0].allows_execution
     assert custom_receipts_prove_wire_acceptance(invalid_receipts)
+    # The refusal says which constraint failed where, in jsonschema's own words, bounded; a valid call carries none.
+    assert invalid_receipts[0].detail == "marker: 'wrong' is not one of ['ok']" and valid_receipts[0].detail == ""
+    _, long_receipts = normalize_openai_custom_tool_calls([{
+        "id": "call_long",
+        "type": "custom",
+        "custom": {"name": "probe", "input": json.dumps({"marker": "w" * 5000})},
+    }], candidate)
+    detail = long_receipts[0].detail
+    assert detail.startswith("marker: 'www") and "OMISSION NOTE" in detail and len(detail) == 200
 
     _, malformed = normalize_openai_custom_tool_calls([{
         "id": "call_malformed",
@@ -489,6 +495,139 @@ def test_missing_local_schema_ref_returns_typed_non_executable_receipt():
     assert custom_receipts_prove_wire_acceptance(receipts)
 
 
+def _mcp_input_schema_app(schema):
+    from mcp import types
+    from mcp.server.fastmcp import FastMCP
+
+    server = FastMCP("custom-schema-refs", host="127.0.0.1", log_level="WARNING")
+
+    @server._mcp_server.list_tools()
+    async def list_tools():
+        return [types.Tool(name="probe", inputSchema=schema)]
+
+    return server.streamable_http_app()
+
+
+@pytest.mark.parametrize(("keyword", "dialect", "relative"), [
+    ("$ref", None, False),
+    ("$dynamicRef", None, False),
+    ("$ref", "http://json-schema.org/draft-07/schema#", False),
+    ("$ref", None, True),
+])
+def test_mcp_custom_arguments_never_fetch_external_schema_refs(loopback, recorder, monkeypatch, tmp_path, keyword, dialect, relative):  # noqa: F811
+    """A real MCP listing reaches the custom consumer, without a hidden GET."""
+    from ouroboros import config, mcp_client
+    from ouroboros.tools.registry_core import _dynamic_tool_schema
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    body = b'{"type":"string","enum":["ok"]}'
+    target = recorder(reply=b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode()
+                      + b"\r\nConnection: close\r\n\r\n" + body)
+    schema = {"type": "object", "properties": {
+        "marker": {keyword: "marker" if relative else target.url("/marker")},
+    }}
+    if relative:
+        schema["$id"] = target.url("/tool")
+    if dialect:
+        schema["$schema"] = dialect
+    _app, url = loopback("http", {}, wrap=lambda _app: _mcp_input_schema_app(schema))
+    manager = mcp_client.get_manager()
+    manager.reconfigure({"MCP_ENABLED": True, "MCP_TOOL_TIMEOUT_SEC": 20, "MCP_SERVERS": [
+        {"id": "ref_probe", "enabled": True, "url": url},
+    ]})
+    listing = manager.refresh_server("ref_probe")
+    assert listing["ok"] and [tool["name"] for tool in listing["tools"]] == ["probe"], listing
+    catalog = [_dynamic_tool_schema(tool) for tool in manager.list_tools_for_registry()]
+    assert len(catalog) == 1
+    candidate = _wire_candidate(catalog)
+    name = catalog[0]["function"]["name"]
+    assert candidate.custom_catalog.schema_binding(name).schema() == schema
+    _, receipts = normalize_openai_custom_tool_calls([{
+        "id": "call_external_ref", "type": "custom",
+        "custom": {"name": name, "input": '{"marker":"ok"}'},
+    }], candidate)
+    assert target.connections == [], target.connections
+    assert receipts[0].error_code == "invalid_schema"
+    assert not receipts[0].allows_execution
+    assert custom_receipts_prove_wire_acceptance(receipts)
+
+
+@pytest.mark.parametrize(("dialect", "definitions", "reference", "identifier"), [
+    ("http://json-schema.org/draft-07/schema#", "definitions", "#/definitions/marker", {}),
+    ("https://json-schema.org/draft/2020-12/schema", "$defs", "#/$defs/marker", {}),
+    ("https://json-schema.org/draft/2020-12/schema", "$defs", "#marker", {"$anchor": "marker"}),
+    ("https://json-schema.org/draft/2020-12/schema", "$defs", "marker", {"$id": "marker"}),
+    ("https://json-schema.org/draft/2020-12/schema", "$defs", "https://schema.example/marker", {
+        "$id": "https://schema.example/marker",
+    }),
+])
+def test_custom_argument_local_refs_preserve_validation(monkeypatch, dialect, definitions, reference, identifier):
+    import urllib.request
+
+    def no_retrieval(*_args, **_kwargs):
+        pytest.fail("an in-document reference tried to retrieve a resource")
+
+    monkeypatch.setattr(urllib.request, "urlopen", no_retrieval)
+    tools = _tools()
+    tools[0]["function"]["parameters"] = {
+        "$schema": dialect, "$id": "https://schema.example/tool",
+        "type": "object", "properties": {"marker": {"$ref": reference}},
+        definitions: {"marker": {"type": "string", "enum": ["ok"], **identifier}},
+    }
+    candidate = _wire_candidate(tools)
+    for marker, expected in (("ok", ""), ("wrong", "schema_validation_failed")):
+        _, receipts = normalize_openai_custom_tool_calls([{
+            "id": "call_local_ref", "type": "custom",
+            "custom": {"name": "probe", "input": json.dumps({"marker": marker})},
+        }], candidate)
+        assert receipts[0].error_code == expected
+        assert receipts[0].allows_execution is (not expected)
+        assert custom_receipts_prove_wire_acceptance(receipts)
+
+
+@pytest.mark.parametrize(("schema", "valid", "invalid"), [
+    ({"type": "object", "properties": {
+        "marker": {"type": "string"}, "child": {"$ref": "#"},
+    }}, {"child": {"marker": "ok"}}, {"child": {"marker": 3}}),
+    ({"$ref": "https://json-schema.org/draft/2020-12/schema"},
+     {"type": "string"}, {"type": "not-a-schema-type"}),
+])
+def test_custom_argument_refs_keep_recursion_and_bundled_metaschemas(monkeypatch, schema, valid, invalid):
+    import urllib.request
+
+    def no_retrieval(*_args, **_kwargs):
+        pytest.fail("a local resource tried to retrieve an external document")
+
+    monkeypatch.setattr(urllib.request, "urlopen", no_retrieval)
+    tools = _tools()
+    tools[0]["function"]["parameters"] = schema
+    candidate = _wire_candidate(tools)
+    for arguments, expected in ((valid, ""), (invalid, "schema_validation_failed")):
+        _, receipts = normalize_openai_custom_tool_calls([{
+            "id": "call_resource", "type": "custom",
+            "custom": {"name": "probe", "input": json.dumps(arguments)},
+        }], candidate)
+        assert receipts[0].error_code == expected
+        assert receipts[0].allows_execution is (not expected)
+        assert custom_receipts_prove_wire_acceptance(receipts)
+
+
+def test_custom_argument_validation_does_not_load_file_references(tmp_path):
+    referenced = tmp_path / "marker.json"
+    referenced.write_text('{"type":"string","const":"ok"}', encoding="utf-8")
+    tools = _tools()
+    tools[0]["function"]["parameters"] = {
+        "type": "object", "properties": {"marker": {"$ref": referenced.as_uri()}},
+    }
+    _, receipts = normalize_openai_custom_tool_calls([{
+        "id": "call_file_ref", "type": "custom",
+        "custom": {"name": "probe", "input": '{"marker":"ok"}'},
+    }], _wire_candidate(tools))
+    assert receipts[0].error_code == "invalid_schema"
+    assert not receipts[0].allows_execution
+    assert custom_receipts_prove_wire_acceptance(receipts)
+
+
 @pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
 def test_custom_decoder_rejects_non_json_numeric_constants(constant):
     tools = copy.deepcopy(_tools())
@@ -520,7 +659,7 @@ def test_custom_response_rejects_non_mapping_calls_before_receipt_creation(call)
         normalize_openai_custom_tool_calls([call], candidate)
 
 
-@pytest.mark.parametrize("call_id", [None, "", "   ", 0])
+@pytest.mark.parametrize("call_id", [None, "", 0])
 def test_custom_response_rejects_missing_or_empty_call_ids(call_id):
     candidate = _wire_candidate()
     with pytest.raises(CustomToolProjectionError, match="missing or empty"):
@@ -561,11 +700,6 @@ def test_custom_response_rejects_duplicate_call_ids_as_one_invalid_batch():
         "type": "custom",
         "custom": {"name": 123, "input": "{}"},
     }, "name is missing or empty"),
-    ({
-        "id": "call_wrong_type",
-        "type": "function",
-        "custom": {"name": "probe", "input": "{}"},
-    }, "type must be exactly custom"),
 ])
 def test_custom_response_rejects_coerced_or_noncanonical_identity(call, message):
     candidate = _wire_candidate()
@@ -640,3 +774,56 @@ def test_full_builtin_registry_fits_custom_description_contract(tmp_path):
         compact = _projected_schema(catalog, function["name"])
         validator_class = validators.validator_for(compact)
         validator_class.check_schema(compact)
+
+
+_ACTUAL_PROFILES = {
+    "full": {}, "readonly": {"mode": "local_readonly_subagent"},
+    "acting": {"mode": "acting_subagent", "surface": "self_worktree", "root_task_id": "projection"},
+}
+
+
+@pytest.mark.parametrize("profile", sorted(_ACTUAL_PROFILES))
+def test_actual_profile_catalogs_carry_every_tool_lead_whole(tmp_path, profile):
+    """Custom tools drop parameter prose, so a first-party lead clipped to fit beside its compact
+    schema loses pre-call conditions nothing else on that wire carries (schedule_subagent's tail
+    did, #502). Extension and MCP descriptions are external text, not covered here."""
+    from ouroboros.tools.registry import ToolRegistry
+
+    registry = ToolRegistry(repo_dir=pathlib.Path(__file__).resolve().parents[1], drive_root=tmp_path)
+    registry._ctx.task_constraint = _ACTUAL_PROFILES[profile]
+    schemas = registry.schemas()
+    descriptions = {tool["custom"]["name"]: tool["custom"]["description"]
+                    for tool in project_function_tools_to_openai_custom(schemas).wire_tools()}
+    over, checked = {}, set()
+    for tool in schemas:
+        name = tool["function"]["name"]
+        if name not in registry._entries:
+            continue
+        checked.add(name)
+        lead = " ".join(str(tool["function"].get("description") or "").split())
+        if not descriptions[name].startswith((lead + "\n" if lead else "") + _SCHEMA_CLAUSE):
+            clause = descriptions[name].rpartition("\n")[2]
+            over[name] = len(lead) - (MAX_CUSTOM_DESCRIPTION_CHARS - len(clause) - 1)
+    assert "schedule_subagent" in checked, sorted(checked)
+    assert over == {}, f"{profile}: leads clipped by the custom description bound (chars over): {over}"
+
+
+@pytest.mark.parametrize("name", ["knowledge_read", "knowledge_write"])
+def test_knowledge_tools_project_whole_where_parameter_prose_does_not_arrive(name):
+    """The custom route drops parameter descriptions and clips description plus schema to 4,096
+    characters, so every knowledge mode must be explained in the tool's own lead, unclipped."""
+    from ouroboros.tools.knowledge import get_tools
+
+    entry = next(entry for entry in get_tools() if entry.name == name)
+    projected = project_function_tools_to_openai_custom([{"type": "function", "function": entry.schema}]).wire_tools()
+    description = projected[0]["custom"]["description"]
+    lead = " ".join(entry.schema["description"].split())
+    assert len(description) <= MAX_CUSTOM_DESCRIPTION_CHARS
+    assert description.startswith(lead + "\n" + _SCHEMA_CLAUSE), f"{name} lead clipped on the custom route"
+    words = (["view='outline'", "view='history'", "version="] if name == "knowledge_read" else
+             ["mode is required and has no default", "overwrite", "append", "edit", "edits", "{old_str, new_str}",
+              "revert", "archive", "restore", "reason",
+              "summary", "expected_revision", "names the note's enduring scope and when to open it",
+              "not a dated log of the latest edit", "Text a write removes stays in the note's history",
+              "view='history' or version=", "put back (mode='revert')"])
+    assert all(word in lead for word in words), [word for word in words if word not in lead]

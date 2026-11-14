@@ -9,7 +9,10 @@ digest → 409 ``idempotency_conflict``), run detail with the ``summary`` facts 
 custody settler consumes, the cancel control verb, and the interactive
 question surface — ``pendingInteractions`` on the detail plus the
 ``POST /v2/runs/:id/interactions/:iid/answer`` verb ``delegate_answer`` speaks,
-with its typed delivered/already_resolved/rejected statuses. Behavior is scripted
+with its typed delivered/already_resolved/rejected statuses — and the live-message
+surface ``delegate_message`` negotiates: the ``/v2/operations`` catalog row for
+``POST /v2/runs/:id/messages``, ``liveInput`` on the harness row, and the route
+itself (Idempotency-Key replay, typed outcomes at HTTP 200). Behavior is scripted
 PER RUN by markers in the POSTed prompt (success / hang / typed refusal / ask)
 plus the pinned-profile refusal, and the applied facts a
 WRITING run produces: the edits themselves, made inside the private execution
@@ -42,6 +45,19 @@ _NOT_LANDED = (
 FAKE_HANG_MARKER = "[FAKE:HANG]"       # the run never reaches a terminal state
 FAKE_REFUSE_MARKER = "[FAKE:REFUSE]"   # the start POST is refused 400, typed
 FAKE_ASK_MARKER = "[FAKE:ASK]"         # the run asks ONE question and waits for the answer
+# Serial addressed turns over ONE physical run: the run asks FAKE_TURN_QUESTIONS
+# sequential questions (each a NEW interactionId, each stating an INTERIM position
+# that is not its final), pauses on each until answered, and its terminal output
+# echoes every received ``freeText`` VERBATIM with its sha256 — the retained-bytes
+# proof that an addressed original relayed through delegate_answer reached the
+# same session unchanged. Other runs keep their text, so [FAKE:ASK] is unaffected.
+FAKE_TURN_MARKER = "[FAKE:TURN]"
+FAKE_TURN_QUESTIONS = 2
+# The codex-shaped twin: no mid-run channel, the run ENDS needing input
+# (``summary.outcomeFacts.reason == "input_required"``), so the next turn can only
+# be a NEW physical run — never a resumed session.
+FAKE_INPUT_REQUIRED_MARKER = "[FAKE:INPUT_REQUIRED]"
+FAKE_INPUT_REQUIRED_INPUTS = ["the other participants' originals"]
 # The mutating marker: the run EDITS the workspace its start body was given, exactly
 # as a real harness would, and records the applied containment facts of its attempt.
 # Nothing else in the fake changes for it — a mutating run is an ordinary run whose
@@ -85,6 +101,29 @@ def _fake_pending_interaction(run_id: str, harness_id: str) -> Dict[str, Any]:
     }
 
 
+def _fake_turn_interaction(run_id: str, harness_id: str, ordinal: int) -> Dict[str, Any]:
+    """Question ``ordinal`` of a [FAKE:TURN] run: a free-text question (no options)
+    whose text is an interim position, never a final."""
+    return {
+        "interactionId": f"turn-{run_id[:8]}-{ordinal}",
+        "runId": run_id,
+        "attemptId": "a01",
+        "harnessId": harness_id,
+        "sourceTool": "AskUserQuestion",
+        "questions": [{
+            "id": "q1",
+            "question": (f"INTERIM (not final) position {ordinal} of {FAKE_TURN_QUESTIONS}: "
+                         "I hold this until the next addressed original arrives. "
+                         "Relay it verbatim as free_text."),
+            "header": f"Turn {ordinal}",
+            "options": [],
+            "multi_select": False,
+        }],
+        "requestedAt": "2026-09-01T00:00:00Z",
+        "timeoutAt": None,
+    }
+
+
 def _tree_engine_identity() -> tuple:
     """(version, build_sha) the fake reports — the TREE'S OWN runtime pin.
 
@@ -122,8 +161,20 @@ class FakeClaudexorDaemon:
                  applied_profile: str = "fake-profile-1",
                  ghost_profile: str = "ghost-profile",
                  workspace_edits: Optional[Dict[str, str]] = None,
-                 runs_dir: Optional[pathlib.Path] = None) -> None:
+                 runs_dir: Optional[pathlib.Path] = None,
+                 live_input: str = "mid_turn",
+                 reports_created: bool = False,
+                 require_registration: bool = False) -> None:
         self.harness_id = str(harness_id)
+        # The harness row's declared live-input capability (``liveInput``); a
+        # scenario passes "none" to script a route with no mid-run channel.
+        self.live_input = str(live_input)
+        # Opt-in engine facts of the project registry: ``reports_created`` answers
+        # ``POST /v2/projects`` with the engine's ``created`` field, and
+        # ``require_registration`` refuses a run on an unregistered, non-ephemeral
+        # project root with the real 404 ``project_not_registered``.
+        self.reports_created = bool(reports_created)
+        self.require_registration = bool(require_registration)
         pin_version, pin_sha = _tree_engine_identity()
         self.engine_version = str(engine_version or pin_version)
         self.engine_build_sha = str(engine_build_sha or pin_sha)
@@ -259,6 +310,15 @@ class FakeClaudexorDaemon:
                                     "sha": self.engine_build_sha}}
         if method == "GET" and clean == "/v2/agent-capabilities":
             return 200, {"harnesses": [self._harness_row()]}
+        if method == "GET" and clean == "/v2/operations":
+            # The engine's own route catalog (Express-style templates, the shape
+            # ``run_message_supported`` negotiates against).
+            return 200, {"protocolMajor": 3, "operations": [
+                {"id": "run.message", "method": "POST", "path": "/v2/runs/:id/messages",
+                 "mutability": "mutating", "idempotency": "key_required"},
+                {"id": "run.control", "method": "POST", "path": "/v2/runs/:id/control",
+                 "mutability": "mutating", "idempotency": "natural"},
+            ]}
         if method == "GET" and clean == "/v2/harnesses":
             return 200, {"harnesses": [self._harness_row()]}
         if method == "GET" and clean == "/v2/quota":
@@ -278,9 +338,10 @@ class FakeClaudexorDaemon:
                 root = str(body.get("root") or "")
                 if not root:
                     return 400, {"code": "invalid_request", "message": "root is required"}
+                fresh = root not in self._projects
                 pid = self._projects.get(root) or ("proj" + uuid.uuid4().hex[:12])
                 self._projects[root] = pid
-                return 200, {"id": pid}
+                return 200, {"id": pid, **({"created": fresh} if self.reports_created else {})}
         if method == "DELETE" and len(parts) == 3 and parts[:2] == ["v2", "projects"]:
             for root, pid in list(self._projects.items()):
                 if pid == parts[2]:
@@ -312,7 +373,14 @@ class FakeClaudexorDaemon:
                 run["answers"].append({"interaction_id": iid, "answers": rows})
                 run["pending"] = [row for row in run["pending"]
                                   if str(row.get("interactionId")) != iid]
+                if run["turn"] and run["turn"] < FAKE_TURN_QUESTIONS:
+                    # The next addressed turn of the SAME run: a NEW interaction id,
+                    # state still running — the session was resumed, not restarted.
+                    run["turn"] += 1
+                    run["pending"] = [_fake_turn_interaction(run["id"], self.harness_id, run["turn"])]
                 return 200, {"accepted": True, "status": "delivered"}
+            if method == "POST" and len(parts) == 4 and parts[3] == "messages":
+                return self._run_message(run, record)
             if method == "POST" and len(parts) == 4 and parts[3] == "control":
                 control = body.get("control") if isinstance(body.get("control"), dict) else {}
                 if str(control.get("kind") or "") == "cancel":
@@ -326,7 +394,50 @@ class FakeClaudexorDaemon:
     def _harness_row(self) -> Dict[str, Any]:
         return {"id": self.harness_id, "enabled": True,
                 "accessProfilesSupported": ["readonly", "workspace_write",
-                                            "external_sandbox_full"]}
+                                            "external_sandbox_full"],
+                "liveInput": self.live_input}
+
+    def _run_message(self, run: Dict[str, Any], record: Dict[str, Any]) -> tuple:
+        """``POST /v2/runs/:id/messages``: the live-message route, every typed
+        outcome at HTTP 200 (the deliberate difference from the answer route),
+        served through the same Idempotency-Key replay as run creation — a
+        replayed key with the same digest returns the STORED receipt (never a
+        second delivery), a different digest is 409 ``idempotency_conflict``."""
+        body = record["body"]
+        key = record["idempotency_key"]
+        if not key:
+            return 400, {"code": "missing_idempotency_key",
+                         "message": "run message requires Idempotency-Key"}
+        digest = hashlib.sha256(json.dumps(body, sort_keys=True).encode("utf-8")).hexdigest()
+        replayed = self._replay.get(key)
+        if replayed is not None:
+            if replayed["digest"] != digest:
+                return 409, {"code": "idempotency_conflict",
+                             "message": "Idempotency-Key replayed with a different request digest"}
+            return replayed["status"], json.loads(json.dumps(replayed["payload"]))
+
+        def _remember(status: int, payload: Dict[str, Any]) -> tuple:
+            self._replay[key] = {"digest": digest, "status": status, "payload": payload}
+            return status, payload
+
+        text = body.get("text")
+        if not isinstance(text, str) or not text:
+            return _remember(400, {"code": "invalid_request", "message": "text is required"})
+        receipt: Dict[str, Any] = {"runId": run["id"], "messageId": key,
+                                   "harnessId": self.harness_id, "liveInput": self.live_input}
+        if run["state"] in ("succeeded", "cancelled", "failed"):
+            return _remember(200, {**receipt, "accepted": False, "outcome": "not_active",
+                                   "reason": "run_terminal"})
+        if run["pending"]:
+            # INV-048: a steer beside an open question is never written to the harness.
+            return _remember(200, {**receipt, "accepted": False, "outcome": "not_active",
+                                   "reason": "interaction_pending", "attemptId": "a01"})
+        if self.live_input == "none":
+            return _remember(200, {**receipt, "accepted": False, "outcome": "unsupported",
+                                   "reason": "no_live_session", "attemptId": "a01"})
+        run.setdefault("messages", []).append({"message_id": key, "text": text})
+        return _remember(200, {**receipt, "accepted": True, "outcome": "accepted",
+                               "attemptId": "a01"})
 
     def _start_run(self, record: Dict[str, Any]) -> tuple:
         body = record["body"]
@@ -347,6 +458,11 @@ class FakeClaudexorDaemon:
             self._replay[key] = {"digest": digest, "status": status, "payload": payload}
             return status, payload
 
+        scope = body.get("scope") if isinstance(body.get("scope"), dict) else {}
+        if (self.require_registration and scope.get("kind") == "project"
+                and scope.get("ephemeral") is not True and str(scope.get("root") or "") not in self._projects):
+            return _remember(404, {"code": "project_not_registered", "retryable": False,
+                                   "message": "register the root first, or declare scope.ephemeral"})
         harnesses = body.get("harnesses")
         if harnesses != [self.harness_id] or body.get("primaryHarness") != self.harness_id:
             return _remember(404, {"code": "route_not_found",
@@ -370,7 +486,11 @@ class FakeClaudexorDaemon:
             "access": str(body.get("access") or ""),
             "run_dir": run_dir, "body": body, "cancel_reason": "",
             "pending": ([_fake_pending_interaction(rid, self.harness_id)]
-                        if FAKE_ASK_MARKER in prompt else []),
+                        if FAKE_ASK_MARKER in prompt else
+                        [_fake_turn_interaction(rid, self.harness_id, 1)]
+                        if FAKE_TURN_MARKER in prompt else []),
+            "turn": 1 if FAKE_TURN_MARKER in prompt else 0,
+            "input_required": FAKE_INPUT_REQUIRED_MARKER in prompt,
             "answers": [], "workspace_written": [],
         }
         if FAKE_MUTATE_MARKER in prompt:
@@ -433,7 +553,7 @@ class FakeClaudexorDaemon:
         # A run with a pending interaction WAITS (state stays running) until
         # the answer verb clears it; the very next poll then flips terminal.
         if run["state"] == "running" and not run["hang"] and not run["pending"]:
-            run["state"] = "succeeded"
+            run["state"] = "failed" if run.get("input_required") else "succeeded"
         state = run["state"]
         terminal = state in ("succeeded", "cancelled", "failed")
         summary: Dict[str, Any] = {
@@ -445,10 +565,13 @@ class FakeClaudexorDaemon:
         }
         detail: Dict[str, Any] = {
             "id": run["id"],
-            "lastSeq": 3 if terminal else run["polls"],
+            "lastSeq": run.setdefault("terminal_seq", max(3, run["polls"])) if terminal else run["polls"],
             "summary": summary,
             "pendingInteractions": [json.loads(json.dumps(row)) for row in run["pending"]],
         }
+        if terminal and run.get("input_required"):
+            summary["outcomeFacts"] = {"reason": "input_required",
+                                       "work_state": {"required_inputs": list(FAKE_INPUT_REQUIRED_INPUTS)}}
         if terminal:
             if run["run_dir"]:
                 final = pathlib.Path(run["run_dir"]) / "final"
@@ -467,6 +590,16 @@ class FakeClaudexorDaemon:
                 "authRoute": {"profileId": self.applied_profile},
             })
             text = f"FAKE_RUN_RESULT {run['id']}: assignment complete."
+            if run.get("turn"):
+                text = f"FINAL: FAKE_RUN_RESULT {run['id']} after {len(run['answers'])} addressed turn(s).\n" + "".join(
+                    "RELAYED[%d] sha256=%s\n%s\n" % (
+                        index, hashlib.sha256(str(free or "").encode("utf-8")).hexdigest(), free or "")
+                    for index, free in enumerate(
+                        (str((row["answers"][0] or {}).get("freeText") or "") if row["answers"] else ""
+                         for row in run["answers"]), 1))
+            elif run.get("input_required"):
+                text = (f"INTERIM (not final): FAKE_RUN_RESULT {run['id']} ended needing input: "
+                        + "; ".join(FAKE_INPUT_REQUIRED_INPUTS))
             detail["outcomeBanner"] = state
             detail["finalSummary"] = "Fake delegated run finished."
             detail["primaryOutput"] = {

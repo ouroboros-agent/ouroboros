@@ -34,7 +34,6 @@ from devtools.benchmarks.common.manifests import (
 )
 from devtools.benchmarks.common.model_slots import (
     disabled_subagents_setting,
-    single_model_reviewer_slots_setting,
 )
 from devtools.benchmarks.common.run_roots import (
     assert_file_output_outside_repo,
@@ -58,6 +57,7 @@ from devtools.benchmarks.cybergym.cybergym_adapter import (
     CyberGymIntegrationUnavailable,
     GatewayCircuitOpen,
     TaskSpec,
+    WorkspaceCustodyTimeout,
     append_cybergym_result,
     build_generate_task_argv,
     build_task_result_row,
@@ -81,7 +81,7 @@ from devtools.benchmarks.cybergym.cybergym_result_index import (
 )
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
-DEFAULT_TIMEOUT_SEC = 3 * 60 * 60
+DEFAULT_TIMEOUT_SEC = 6 * 60 * 60
 DEFAULT_MAX_ROUNDS = 600
 DEFAULT_CAMPAIGN_BUDGET_USD = 3000.0
 # Runtime tree cap for each measured task.  This is deliberately separate from
@@ -160,6 +160,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         help="finite reservation required for a paid injected executor")
     parser.add_argument("--timeout-sec", type=float, default=DEFAULT_TIMEOUT_SEC)
     parser.add_argument("--max-rounds", type=float, default=DEFAULT_MAX_ROUNDS, help="per-task Ouroboros round ceiling (recorded in applied settings)")
+    # The measured task's own result review (recorded in applied settings); the stock run keeps it Off.
+    parser.add_argument("--task-review-mode", choices=("off", "auto", "required"), default="off")
+    parser.add_argument("--review-max-cycles", default="2", help="paid result-review waves per root task, or unlimited")
     parser.add_argument(
         "--per-task-cost-usd",
         type=float,
@@ -335,6 +338,9 @@ def _validate_launcher_values(args: argparse.Namespace) -> None:
     args.max_rounds = validate_positive_integral(
         getattr(args, "max_rounds", DEFAULT_MAX_ROUNDS), field="max_rounds"
     )
+    cycles = str(getattr(args, "review_max_cycles", "2") or "2").strip().lower()
+    if cycles != "unlimited" and not (cycles.isdigit() and int(cycles) >= 1):
+        raise ValueError("review_max_cycles must be a positive integer or unlimited")
     dry_run = getattr(args, "dry_run", False)
     raw_per_task_cost = getattr(args, "per_task_cost_usd", None)
     if raw_per_task_cost is None:
@@ -917,14 +923,7 @@ def _prepare_applied_settings(
         "OUROBOROS_MODEL_VISION": model,
         "OUROBOROS_MODEL_CONSCIOUSNESS": model,
         "OUROBOROS_MODEL_FALLBACKS": model,
-        "OUROBOROS_MODEL_DEEP_SELF_REVIEW": model,
         "OUROBOROS_WEBSEARCH_MODEL": model,
-        "OUROBOROS_SCOPE_REVIEW_MODELS": model,
-        "OUROBOROS_SCOPE_REVIEW_MODEL": model,
-        # One routed reviewer is the explicit single-model campaign contract.
-        # Keeping the legacy projection in sync prevents a stale three-row
-        # value from shadowing the structured panel in older consumers.
-        "OUROBOROS_REVIEW_MODELS": model,
         "OUROBOROS_MAX_SUBAGENT_DEPTH": 0,
         "OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS": "false",
         "OUROBOROS_RUNTIME_MODE": str(getattr(args, "runtime_mode", "pro")),
@@ -937,12 +936,10 @@ def _prepare_applied_settings(
         "OUROBOROS_PER_TASK_COST_USD": per_task_cost_usd,
         "TOTAL_BUDGET": budget_usd,
         "OUROBOROS_TASK_ABS_CEILING_SEC": timeout_sec,
-        # The measured task does not spend model calls on acceptance review.
-        # ``derive_disabled_tools`` independently withholds the manual review
-        # tool so this applies to both automatic and model-initiated paths.
-        "OUROBOROS_TASK_REVIEW_MODE": "off",
-        "OUROBOROS_REVIEW_ENFORCEMENT": "advisory",
-        "OUROBOROS_REVIEW_MAX_CYCLES": "2",
+        # The measured task's own result review, as selected (stock: Off, which refuses one at $0 whether the host
+        # or the model asks): Required reviews its observed production before delivery.
+        "OUROBOROS_TASK_REVIEW_MODE": str(getattr(args, "task_review_mode", "off") or "off"),
+        "OUROBOROS_REVIEW_MAX_CYCLES": str(getattr(args, "review_max_cycles", "2") or "2").strip().lower(),
         "OUROBOROS_POST_TASK_EVOLUTION": "false",
         "OUROBOROS_POST_TASK_EVOLUTION_CADENCE": "off",
         # Keep internet access explicit and auditable.  Exact-model OpenRouter
@@ -958,26 +955,19 @@ def _prepare_applied_settings(
         "OUROBOROS_REASONING_SUMMARY": "auto",
         "MCP_ENABLED": False,
         "MCP_SERVERS": [],
+        # The effort range: Main works at high; evolution/consciousness would start at the top.
+        "OUROBOROS_EFFORT_MIN": "low",
         "OUROBOROS_EFFORT_TASK": "high",
-        "OUROBOROS_EFFORT_EVOLUTION": "high",
-        # The benchmark task wire is validated as literal ``high``; the
-        # broader review surfaces support the stronger ``max`` tier.
-        "OUROBOROS_EFFORT_REVIEW": "max",
-        "OUROBOROS_EFFORT_SCOPE_REVIEW": "max",
-        "OUROBOROS_EFFORT_DEEP_SELF_REVIEW": "max",
-        "OUROBOROS_EFFORT_CONSCIOUSNESS": "high",
+        "OUROBOROS_EFFORT_MAX": "high",
     }
     # Structured no-swarm/reviewer declarations are explicit overrides rather
     # than values accidentally inherited from the live settings file.  Keep a
     # disabled actor row for provenance, but make the execution authority
     # explicit: the runtime must refuse delegated children.
-    overrides["OUROBOROS_SUBAGENTS"] = disabled_subagents_setting(model)
-    overrides["OUROBOROS_REVIEWER_SLOTS"] = single_model_reviewer_slots_setting(
-        model,
-        review_slots=1,
-        scope_slots=1,
-        review_effort="max",
-        scope_effort="max",
+    # The one packet review seat on the measured model rides the same roster
+    # (the pool ignores the delegation switch).
+    overrides["OUROBOROS_SUBAGENTS"] = disabled_subagents_setting(
+        model, review_slots=1, review_effort="max",
     )
     # Keep automatic routing explicit and parameter-compatible. Optional
     # only/order flags remain an auditable laboratory override.
@@ -1048,6 +1038,8 @@ def _prepare_applied_settings(
         "requested_model": model,
         "model": applied_model,
         "runtime_mode": str(applied.get("OUROBOROS_RUNTIME_MODE") or ""),
+        "result_review": {key: str(applied.get(name) or "") for key, name in (("mode", "OUROBOROS_TASK_REVIEW_MODE"), (
+            "max_cycles", "OUROBOROS_REVIEW_MAX_CYCLES"))},
         "max_rounds": max_rounds,
         "per_task_cost_usd": per_task_cost_usd,
         "workers": workers,
@@ -1362,6 +1354,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             final.checkpoint("settings_applied")
 
             circuit: GatewayCircuitOpen | None = None
+            custody_stop: WorkspaceCustodyTimeout | None = None
             budget_stop: BudgetCapReached | None = None
             if args.dry_run:
                 rows = _write_planned_rows(
@@ -1494,6 +1487,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     except GatewayCircuitOpen as exc:
                         circuit, rows = exc, list(exc.rows)
                         manifest["extra"]["gateway_circuit"] = exc.as_dict()
+                    except WorkspaceCustodyTimeout as exc:
+                        # A sibling's workspace start stayed unresolved for
+                        # the custody budget; the owned residue is retained
+                        # and the undispatched ids stay row-free.
+                        custody_stop, rows = exc, list(exc.rows)
+                        manifest["extra"]["workspace_custody"] = exc.as_dict()
                     except BudgetCapReached as exc:
                         # The cap refused further claims and no in-flight
                         # settlement freed headroom.  Undispatched tasks have
@@ -1512,13 +1511,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             manifest["extra"].update(_row_counts(rows))
             custody_pending = bool(manifest.get("extra", {}).get("close_skipped"))
             all_completed = args.dry_run or all(row.get("status") == "completed" for row in rows)
-            code = (
-                2
-                if custody_pending or circuit is not None or budget_stop is not None or not all_completed
-                else 0
-            )
+            stopped = circuit is not None or custody_stop is not None or budget_stop is not None
+            code = 2 if custody_pending or stopped or not all_completed else 0
+            # A typed stop names why admission ended; it precedes the
+            # custody_pending cleanup state that usually accompanies it.
             if circuit is not None:
                 final.update({"outcome": "gateway_unreachable", "exit_code": 2})
+            elif custody_stop is not None:
+                final.update({"outcome": "workspace_custody_timeout", "exit_code": 2})
             elif budget_stop is not None:
                 final.update({"outcome": "budget_cap_reached", "exit_code": 2})
             elif custody_pending:

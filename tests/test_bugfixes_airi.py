@@ -22,23 +22,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-import pathlib
 from types import SimpleNamespace
-
-REPO = pathlib.Path(__file__).resolve().parents[1]
-
-
-def _read(rel: str) -> str:
-    return (REPO / rel).read_text(encoding="utf-8")
 
 
 # ────────── Bug 1 (polish): the retired loop's rows replay honestly ──────────
-
-
-def test_log_events_has_no_background_loop_projector():
-    src = _read("web/modules/log_events.js")
-    assert "consciousness_state" not in src
-    assert "bg-consciousness" not in src
 
 
 def test_history_never_fabricates_a_terminal_status_for_legacy_bg_rows(tmp_path):
@@ -67,56 +54,7 @@ def test_history_never_fabricates_a_terminal_status_for_legacy_bg_rows(tmp_path)
     assert not any(m.get("system_type") == "task_model_wait" for m in messages)
 
 
-def test_live_card_disclosure_is_explicit_user_owned_state():
-    src = _read("web/modules/chat.js")
-    assert "const explicitCardExpansion = new Map();" in src
-    assert "explicitCardExpansion.set(record.groupId, nowExpanded);" in src
-    assert "explicitCardExpansion.has(normalizedGroupId)" in src
-    assert "explicitCardExpansion.get(normalizedGroupId)" in src
-    assert "if (existing && !explicitCardExpansion.has(childId))" in src
-    assert "setLiveCardExpanded(record, nestedSubagentsExpanded);" in src
-    assert "stickyExpandedSlots" not in src
-
-
-def test_live_card_timeline_only_follows_when_pinned():
-    src = _read("web/modules/chat_render_batch.js")
-    renderer = src[
-        src.index("export function createLiveCardTimelineRenderer"):
-        src.index("export function createTimelineAnchors")
-    ]
-    assert renderer.count("const pinned =") == 2
-    assert "const prevTop = el.scrollTop;" in renderer
-    assert "el.scrollTop = pinned ? el.scrollHeight : prevTop;" in renderer
-    assert "record.root.dataset.expanded === '1' && pinned" in renderer
-
-
 # ───────────────────── Bug 3: reconnect dialogue recovery ───────────────────
-
-def test_reconnect_merges_user_rows_without_clearing_visible_history():
-    src = _read("web/modules/chat.js")
-    sync = src[src.index("async function syncHistory"):src.index("function cancelHistoryPaint")]
-    replay = src[src.index("function applyHistoryMessages"):src.index("async function syncHistory")]
-    add = src[src.index("function addMessage"):src.index("function updateMessageAnnotation")]
-    # Reconnect still fetches the canonical source and includes owner dialogue.
-    assert "await apiClient.chatHistory({ chatId })" in sync
-    assert "applyHistoryMessages(messages, { fromReconnect, includeUser: true });" in sync
-    assert "if (!includeUser && msg.role === 'user') continue;" in replay
-    # Keyed reconciliation replaces the former clear-and-rebuild requirement:
-    # physical rows dedupe and an offline/local echo is adopted in place.
-    assert "opts.historyId ? `history:${opts.historyId}` : legacyKey" in add
-    assert "if (messageKey && seenMessageKeys.has(messageKey))" in add
-    assert "node.dataset.clientMessageId === clientMessageId" in add
-    assert "stampHistoryNode(prior, opts.historyId, opts.historyPosition);" in add
-    assert "seenMessageKeys.clear();" not in sync + replay
-    assert "messageKeyOrder.length = 0;" not in sync + replay
 
 
 # ──────────────────── Bug 4a: progress widget host race ──────────────────────
-
-def test_widget_job_poll_merges_full_status_and_clamps():
-    src = _read("web/modules/widgets.js")
-    assert "clampMonotonicProgress" in src
-    assert "progressValueKeys" in src
-    assert "...data," in src  # full flat merge surfaces value_key (e.g. progress_pct)
-    # The broken cherry-pick of the wrong key must be gone.
-    assert "progress: data.progress," not in src

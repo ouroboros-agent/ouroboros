@@ -17,7 +17,6 @@ from ouroboros.skill_publish_snapshot import (
 from ouroboros.skill_review_status import (
     STATUS_BLOCKERS,
     STATUS_CLEAN,
-    STATUS_PENDING,
     STATUS_WARNINGS,
 )
 from ouroboros.tools import skill_publish
@@ -77,7 +76,7 @@ def _snapshot(*, description: str = "A test skill.") -> SkillPublishSnapshot:
     )
 
 
-@pytest.mark.parametrize("status", [STATUS_CLEAN, STATUS_WARNINGS, "advisory", "advisory_pass"])
+@pytest.mark.parametrize("status", [STATUS_CLEAN, STATUS_WARNINGS, "advisory_pass"])
 def test_validate_accepts_clean_and_warnings(monkeypatch, status):
     loaded = _loaded(status=status)
     _patch_validate(monkeypatch, loaded)
@@ -86,7 +85,7 @@ def test_validate_accepts_clean_and_warnings(monkeypatch, status):
     assert returned is loaded
 
 
-@pytest.mark.parametrize("status", [STATUS_BLOCKERS, STATUS_PENDING, "fail", "weird-unknown"])
+@pytest.mark.parametrize("status", [STATUS_BLOCKERS, "fail", "weird-unknown"])
 def test_validate_rejects_blockers_and_pending(monkeypatch, status):
     _patch_validate(monkeypatch, _loaded(status=status))
     with pytest.raises(skill_publish._PublishFailure) as caught:
@@ -235,7 +234,9 @@ def test_catalog_and_payload_use_exact_snapshot_bytes():
     files = skill_publish._payload_files(snapshot)
     assert [row["path"] for row in files] == ["skill.json", "SKILL.md"]
     assert files[1]["size"] == len(b"# exact captured body\n")
-    entry = skill_publish._catalog_entry("demo", snapshot, files)
+    from ouroboros.skill_publish_destination import catalog_row
+
+    entry = catalog_row("demo", snapshot, files)
     assert entry["version"] == "1.0.0"
     assert entry["files"][1]["sha256"] == snapshot.public_files[1].sha256
 
@@ -258,3 +259,11 @@ def test_scanner_resolver_uses_canonical_budget_data_root(monkeypatch, tmp_path)
     executable = skill_publish._scanner_executable(ctx)
     assert executable.status == "missing"
     assert seen == [canonical_root.resolve(strict=False)]
+
+
+def test_missing_token_names_settings_in_one_plain_sentence(monkeypatch):
+    monkeypatch.setattr(skill_publish, "github_token_from_env_or_settings", lambda: "")
+    with pytest.raises(skill_publish._PublishFailure) as caught:
+        skill_publish._validate_local_skill(types.SimpleNamespace(), "demo")
+    assert caught.value.reason_code == "github_token_missing"
+    assert caught.value.repair_hint == "Add a GitHub token in Settings to publish"

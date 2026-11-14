@@ -18,7 +18,7 @@ from ouroboros.contracts.skill_payload_policy import (
     is_skill_owner_state_alias,
     is_skill_owner_state_target,
 )
-from ouroboros.presence_capabilities import (
+from tests.frozen_presence_capabilities import (
     PresenceArgumentBinding,
     PresenceResourceTarget,
     PresenceScriptTarget,
@@ -32,7 +32,7 @@ from ouroboros.presence_capabilities import (
     resolve_presence_profile_state,
     save_presence_state,
 )
-from ouroboros.presence_profile import (
+from tests.frozen_presence_profile import (
     PresenceCapabilityRequest,
     PresenceProfile,
     PresenceProfileError,
@@ -40,7 +40,7 @@ from ouroboros.presence_profile import (
     presence_profile_fingerprint,
     presence_request_fingerprint,
 )
-from ouroboros.presence_runtime import (
+from tests.frozen_presence_runtime import (
     PresenceRuntimeDefaults,
     PresenceRuntimeError,
     PresenceRuntimeOverrides,
@@ -48,6 +48,7 @@ from ouroboros.presence_runtime import (
 )
 from ouroboros.skill_loader import compute_content_hash
 from ouroboros.tools.registry import ToolContext
+from tests._cases import case_folders
 
 
 def _manifest(*, presence=..., skill_type: str = "instruction") -> SkillManifest:
@@ -145,7 +146,7 @@ def test_instruction_and_extension_profiles_are_allowed_but_script_is_not(tmp_pa
     assert caught.value.code == "presence_unsupported_skill_type"
 
 
-@pytest.mark.parametrize("raw", [None, [], "public", 7])
+@pytest.mark.parametrize("raw", [None, [], 7])
 def test_explicit_non_mapping_presence_fails(raw, tmp_path):
     with pytest.raises(PresenceProfileError) as caught:
         parse_presence_profile(_manifest(presence=raw), tmp_path)
@@ -158,17 +159,6 @@ def test_explicit_non_mapping_presence_fails(raw, tmp_path):
         ({"unknown": True}, "presence_unknown_field"),
         ({"schema_version": True}, "presence_unsupported_schema_version"),
         ({"runtime_defaults": None}, "presence_invalid_runtime_defaults"),
-        (
-            {"runtime_defaults": {"model_slot": "heavy"}},
-            "invalid_model_slot",
-        ),
-        ({"context_topics": None}, "presence_invalid_context_topics"),
-        ({"capability_requests": None}, "presence_invalid_capability_requests"),
-        ({"instructions": ""}, "presence_invalid_instructions"),
-        (
-            {"instructions": "inline", "instructions_file": "presence.md"},
-            "presence_instructions_conflict",
-        ),
     ],
 )
 def test_profile_shape_is_strict(raw, code, tmp_path):
@@ -202,11 +192,7 @@ def test_sidecar_is_confined_utf8_and_part_of_both_hashes(tmp_path):
     "path",
     [
         "../outside.md",
-        "/outside.md",
-        "~/outside.md",
         r"folder\presence.md",
-        "C:/presence.md",
-        "C:presence.md",
         "presence.md:stream",
     ],
 )
@@ -249,19 +235,22 @@ def test_sidecar_must_belong_to_the_reviewed_payload_surface(tmp_path):
     assert caught.value.code == "presence_instructions_file_unreviewed"
 
 
-@pytest.mark.parametrize("filename", sorted(SKILL_PAYLOAD_CONTROL_FILENAMES))
-def test_sidecar_rejects_skill_lifecycle_control_files(filename, tmp_path):
-    skill_dir = tmp_path / "community-helper"
-    skill_dir.mkdir()
-    (skill_dir / "SKILL.md").write_text("reviewed\n", encoding="utf-8")
-    (skill_dir / filename).write_text("control plane\n", encoding="utf-8")
+def test_sidecar_rejects_skill_lifecycle_control_files(subtests, tmp_path):
+    case_paths = case_folders(tmp_path)
+    for filename in sorted(SKILL_PAYLOAD_CONTROL_FILENAMES):
+        tmp_path = next(case_paths)
+        with subtests.test(filename=filename):
+            skill_dir = tmp_path / "community-helper"
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text("reviewed\n", encoding="utf-8")
+            (skill_dir / filename).write_text("control plane\n", encoding="utf-8")
 
-    with pytest.raises(PresenceProfileError) as caught:
-        parse_presence_profile(
-            _manifest(presence={"instructions_file": filename}),
-            skill_dir,
-        )
-    assert caught.value.code == "presence_instructions_file_control_plane"
+            with pytest.raises(PresenceProfileError) as caught:
+                parse_presence_profile(
+                    _manifest(presence={"instructions_file": filename}),
+                    skill_dir,
+                )
+            assert caught.value.code == "presence_instructions_file_control_plane"
 
 
 def test_capability_requests_are_strict_and_resource_operations_are_normalized(tmp_path):
@@ -390,9 +379,6 @@ def test_runtime_precedence_cap_and_reset():
     "factory",
     [
         lambda: PresenceRuntimeDefaults("vision", 10),
-        lambda: PresenceRuntimeDefaults("heavy", 10),
-        lambda: PresenceRuntimeOverrides("heavy", 10),
-        lambda: PresenceRuntimeDefaults("main", True),
         lambda: PresenceRuntimeOverrides(inline_max_rounds=0),
         lambda: resolve_presence_runtime(None, None, global_max_rounds=False),
     ],
@@ -762,7 +748,7 @@ def test_skill_preflight_absent_presence_keeps_output_shape(tmp_path, monkeypatc
     assert "presence" not in payload
 
 
-def test_skill_preflight_reports_valid_and_invalid_presence(tmp_path, monkeypatch):
+def test_skill_preflight_ignores_legacy_presence_blocks(tmp_path, monkeypatch):
     ctx = _preflight_ctx(tmp_path)
     skills_root = tmp_path / "skills"
     _write_skill(
@@ -782,13 +768,12 @@ def test_skill_preflight_reports_valid_and_invalid_presence(tmp_path, monkeypatc
     valid = json.loads(_handle_skill_preflight(ctx, skill="community-helper"))
     invalid = json.loads(_handle_skill_preflight(ctx, skill="invalid-helper"))
     assert valid["ok"] is True
-    assert valid["presence"][0]["ok"] is True
-    assert len(valid["presence"][0]["profile_fingerprint"]) == 64
-    assert invalid["ok"] is False
-    assert invalid["presence"][0]["code"] == "presence_invalid"
+    assert "presence" not in valid
+    assert invalid["ok"] is True
+    assert "presence" not in invalid
 
 
-def test_skill_preflight_unexpected_profile_failure_is_fail_closed(tmp_path, monkeypatch):
+def test_skill_preflight_never_calls_retired_profile_parser(tmp_path, monkeypatch):
     ctx = _preflight_ctx(tmp_path)
     skills_root = tmp_path / "skills"
     _write_skill(
@@ -797,7 +782,7 @@ def test_skill_preflight_unexpected_profile_failure_is_fail_closed(tmp_path, mon
     )
     monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
 
-    import ouroboros.presence_profile as profile_module
+    import tests.frozen_presence_profile as profile_module
     from ouroboros.tools.skill_preflight import _handle_skill_preflight
 
     def _crash(*_args, **_kwargs):
@@ -806,6 +791,5 @@ def test_skill_preflight_unexpected_profile_failure_is_fail_closed(tmp_path, mon
     monkeypatch.setattr(profile_module, "parse_presence_profile", _crash)
     payload = json.loads(_handle_skill_preflight(ctx, skill="community-helper"))
 
-    assert payload["ok"] is False
-    assert payload["presence"][0]["code"] == "presence_internal_error"
-    assert "synthetic parser crash" not in payload["presence"][0]["detail"]
+    assert payload["ok"] is True
+    assert "presence" not in payload

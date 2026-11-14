@@ -1,16 +1,17 @@
 """What a consciousness wake-up may do, and how that authority follows its work.
 
-Three autonomy levels (owner decision В10', PLAN 5.4): ``observe`` reads and
-talks, ``act`` (the default) starts and steers work but may not evolve,
-restart, change settings or touch its own alarm, ``full`` is an owner turn in
-everything the install's runtime mode allows. A wake carries the level it
+Three autonomy levels (owner decision В10', PLAN 5.4): ``observe`` researches,
+keeps internal notes and may read or stop/restore existing schedules while remaining
+resource-narrowed, ``act`` (the default) starts and steers work but may not evolve,
+restart, change settings (including Main/room models) or touch its own alarm.
+``full`` is an owner turn in everything the install's runtime mode allows. A wake carries the level it
 started under as ``metadata.consciousness_autonomy`` beside its origin label
 ``metadata.initiator = "consciousness"``; both are inherited by everything the
 wake starts (a promoted root, a follow-up, a subagent, an evolution cycle)
 through ``consciousness_origin_metadata``, so a second generation never
 falls out of the level or the allowance.
 
-One helper derives the level's two consequences at task build
+One helper derives the level's two structural consequences at task build
 (``apply_consciousness_authority``): the contract's ``disabled_tools`` (an
 exception list, never an allowlist — a new READ tool is available to Observe
 by default) and ``runtime_mode_cap`` (Act/Observe run under ``light`` even on
@@ -37,18 +38,47 @@ LEVELS = CONSCIOUSNESS_AUTONOMY_LEVELS
 LEVEL_OBSERVE, LEVEL_ACT, LEVEL_FULL = LEVELS
 
 # Act withholds the runtime's own posture: evolution, restart, the one
-# settings writer, its own alarm clock and owner-binding configuration.
+# settings writer and its own alarm clock. Place configuration is withheld on
+# the ARGUMENTS instead (``PLACE_READ_ACTIONS``): its reads are reads.
 ACT_DISABLED: tuple[str, ...] = (
     "toggle_evolution", "request_restart", "set_tool_timeout",
-    "toggle_consciousness", "configure_presence",
+    "toggle_consciousness",
 )
+# The two ``configure_presence`` actions every level keeps: a place and the rooms it
+# captured (the one model-facing reader of them). Every other action edits the
+# owner's place configuration (16.09: "конфигурация"), which below Full
+# ``observe_argument_refusal`` refuses for Act and Observe alike.
+PLACE_READ_ACTIONS: frozenset[str] = frozenset({"list", "inspect"})
+# Names Observe keeps even though they have mutating shapes,
+# because each has a real read-only or own-work path that withholding the NAME
+# would destroy along with the mutation. What the name may then be asked to DO
+# is narrowed by ``observe_argument_refusal`` at dispatch, on the arguments.
+OBSERVE_ARGUMENT_NARROWED: frozenset[str] = frozenset({
+    # Research children and delegated research sessions: read-only shapes only.
+    "schedule_subagent", "delegate_start",
+    # Its own task artifacts and project workpad/journal — not owner files,
+    # not source, not the runtime's own controls.
+    "write_file", "edit_text", "journal_write", "workpad_write",
+    # Its own children: starting one is narrowed above, and a mind that may start
+    # a child must be able to stop the one it started (the nanny's other half).
+    "cancel_task",
+    "manage_schedules",  # reads and lifecycle controls remain; authoring does not
+    "configure_presence",  # its reads remain, for Act too (``PLACE_READ_ACTIONS``)
+    "switch_model",  # own-work choices remain; room/Main writes require Full, for Act too
+})
 # Observe withholds every verb that starts work or changes the world beyond
 # this mind's own memory (the table beside ``ROUTING_VERBS``) plus publication.
 OBSERVE_DISABLED: tuple[str, ...] = ACT_DISABLED + tuple(sorted(
-    (OBSERVE_WORLD_MUTATION_TOOLS | FOREGROUND_MUTATIVE_TOOLS) - set(ACT_DISABLED)
+    (OBSERVE_WORLD_MUTATION_TOOLS | FOREGROUND_MUTATIVE_TOOLS)
+    - set(ACT_DISABLED)
+    - OBSERVE_ARGUMENT_NARROWED
 ))
 # The nanny verb of a running campaign is never withheld (owner decision В12 A).
-NEVER_DISABLED: frozenset[str] = frozenset({"steer_task"})
+NEVER_DISABLED: frozenset[str] = frozenset({"tell_task"})
+# The only file roots Observe may write: its own task drive and artifact store.
+# Both are already confined by the file tools; this is what it is ALLOWED to
+# choose, not a new path authority.
+OBSERVE_WRITE_ROOTS: frozenset[str] = frozenset({"task_drive", "artifact_store"})
 
 
 def normalize_level(value: Any) -> str:
@@ -77,24 +107,135 @@ def is_consciousness_origin(metadata: Any) -> bool:
     return str(source.get("initiator") or "").strip() == CONSCIOUSNESS_INITIATOR
 
 
-def consciousness_origin_metadata(parent_metadata: Any) -> Dict[str, Any]:
-    """The origin keys a task started from a consciousness turn/tree inherits.
+# Why a consciousness turn runs: its own clock, or a focus in a place room.
+# A host fact stamped at the wake's start; descendants never inherit it (they
+# are work the wake started, not the wake).
+WAKE_CAUSE_OWN_CLOCK = "own_clock"
+WAKE_CAUSE_FOCUS = "focus"
+WAKE_CAUSES = (WAKE_CAUSE_OWN_CLOCK, WAKE_CAUSE_FOCUS)
 
-    Empty for any other parent. The child is a *started* root, so its ledger
-    category is ``consciousness_task``; the level rides along so the child's
-    own build derives the same ``disabled_tools``/``runtime_mode_cap``.
+# Whose life a piece of work belongs to: the owner's work or consciousness
+# (own wakes, place focuses and everything they start). Host-minted at root
+# admission and inherited by value; never accepted from tool arguments.
+WORK_KIND_OWNER = "owner"
+WORK_KIND_CONSCIOUSNESS = "consciousness"
+WORK_KINDS = (WORK_KIND_OWNER, WORK_KIND_CONSCIOUSNESS)
+
+
+def wake_cause(metadata: Any) -> str:
+    """The typed wake cause of a consciousness turn, ``""`` for anything else."""
+    source = metadata if isinstance(metadata, Mapping) else {}
+    cause = str(source.get("wake_cause") or "").strip()
+    return cause if cause in WAKE_CAUSES else ""
+
+
+def is_own_clock_wake(metadata: Any) -> bool:
+    """A consciousness turn its own clock started (the census's only "live wake")."""
+    return is_consciousness_origin(metadata) and wake_cause(metadata) == WAKE_CAUSE_OWN_CLOCK
+
+
+def is_focus_wake(metadata: Any) -> bool:
+    """A consciousness turn focused on a place room."""
+    return is_consciousness_origin(metadata) and wake_cause(metadata) == WAKE_CAUSE_FOCUS
+
+
+def work_kind(metadata: Any) -> str:
+    """Whose work this is: ``owner`` only with a positive owner fact, else ``consciousness``.
+
+    Order: the host-minted ``work_kind`` stamp; a consciousness origin; an owner
+    ingress mark. Unknown provenance is not the owner's.
     """
-    if not is_consciousness_origin(parent_metadata):
-        return {}
-    return {
+    source = metadata if isinstance(metadata, Mapping) else {}
+    stamped = str(source.get("work_kind") or "").strip()
+    if stamped in WORK_KINDS:
+        return stamped
+    if is_consciousness_origin(source) or any(key in source for key in (
+        "presence", "presence_binding_authority", "presence_root_carrier",
+    )):
+        return WORK_KIND_CONSCIOUSNESS
+    if source.get("owner_ingress") or source.get("origin_message_ref") or source.get("origin_suppressed"):
+        return WORK_KIND_OWNER
+    return WORK_KIND_CONSCIOUSNESS
+
+
+def consciousness_origin_metadata(parent_metadata: Any, *, started_root: bool = False,
+                                  owner_basis: Any = None) -> Dict[str, Any]:
+    """Copy host origin by value, never the wake identity itself.
+
+    Children keep the root's kind/cause; independent roots use ``started``. A root a consciousness
+    focus starts is its own work unless ``owner_basis`` is the host-verified cite of my human's words
+    (``owner_words.cited_owner_basis``): no host flag and no argument mint owner kind. The focus
+    itself remains consciousness.
+    """
+    from copy import deepcopy
+
+    source = parent_metadata if isinstance(parent_metadata, Mapping) else {}
+    kind = work_kind(source)
+    if started_root and is_consciousness_origin(source) and isinstance(owner_basis, Mapping) and owner_basis.get("basis") == "cited":
+        kind = WORK_KIND_OWNER
+    inherited = {"work_kind": kind}
+    for key in ("focus", "schedule_writer_kind", "origin_wake_task_id"):
+        if key in source:
+            inherited[key] = deepcopy(source[key])
+    if wake_cause(source):
+        inherited["origin_wake_task_id"] = str(source.get("task_id") or source.get("origin_wake_task_id") or "")
+    if kind == WORK_KIND_OWNER:
+        return inherited
+    inherited["consciousness_cause"] = "started" if started_root else str(source.get("consciousness_cause") or wake_cause(source) or "started")
+    if not is_consciousness_origin(source):
+        return inherited
+    return {**inherited,
         "initiator": CONSCIOUSNESS_INITIATOR,
         "usage_category": CONSCIOUSNESS_TASK_CATEGORY,
-        "consciousness_autonomy": normalize_level(parent_metadata.get("consciousness_autonomy")),
+        "consciousness_autonomy": normalize_level(source.get("consciousness_autonomy")),
     }
 
 
+def schedule_owner_corpus(record: Mapping[str, Any]) -> list:
+    """The one durable home of a schedule's owner words: its next occurrence's ``task.metadata.owner_corpus`` (a
+    note's template holds only that metadata). The lifecycle stamp and the Off disclosure read nothing else."""
+    corpus = ((record.get("task") or {}).get("metadata") or {}).get("owner_corpus") if isinstance(record, Mapping) else None
+    return [row for row in corpus if isinstance(row, Mapping)] if isinstance(corpus, list) else []
+
+
+def stamp_schedule_writer(record: Dict[str, Any], writer_kind: str, writer_metadata: Any,
+                          *, started_root: bool, same_work: bool = False) -> None:
+    """Persist the next occurrence's origin from host writer facts, never the template.
+
+    Independent schedules use root-start semantics: a consciousness writer's schedule is its own work
+    unless the writer passed the host-verified cite of my human's words (``owner_basis`` in its
+    writer metadata). A lifecycle operation of the same work (``same_work``: pause, resume, restore,
+    an edit that leaves objective and context as they are) keeps the cite stored on the record's next
+    occurrence (``schedule_owner_corpus``); a creation or an authored replacement of the assignment
+    takes only the cite passed with that write, else the writer's kind: the host carries no old
+    declaration onto new work. A related continuation keeps its caller's kind and cause.
+    """
+    source = writer_metadata if isinstance(writer_metadata, Mapping) else {}
+    kind = WORK_KIND_OWNER if writer_kind == WORK_KIND_OWNER else WORK_KIND_CONSCIOUSNESS
+    basis = source.get("owner_basis") if started_root else None
+    if basis is None and same_work and started_root and record.get("writer_kind") == WORK_KIND_OWNER:
+        basis = next((row for row in schedule_owner_corpus(record) if row.get("basis") == "cited"), None)
+    origin = consciousness_origin_metadata({**source, "work_kind": kind}, started_root=started_root, owner_basis=basis)
+    record.update(writer_kind=origin["work_kind"], writer_origin=origin)
+
+
+def stamp_scheduled_work(task: Dict[str, Any], record: Mapping[str, Any], raw_metadata: Mapping[str, Any]) -> None:
+    """Apply the last host writer's origin; template stamps are never authority."""
+    from ouroboros.schedule_contract import RESERVED_TEMPLATE_FIELDS
+    writer_kind = record.get("writer_kind")
+    if writer_kind not in {"owner", "consciousness"}:
+        legacy = {k: v for k, v in raw_metadata.items() if k not in RESERVED_TEMPLATE_FIELDS}
+        writer_kind = work_kind({"owner_ingress": record.get("source") == "owner", **legacy})
+    from copy import deepcopy
+    if "writer_origin" in record:
+        for key in ("initiator", "usage_category", "consciousness_autonomy", "consciousness_cause", "origin_wake_task_id", "focus"):
+            task["metadata"].pop(key, None)
+    task["metadata"].update(deepcopy(record.get("writer_origin") or {}))
+    task["metadata"].update(work_kind=writer_kind, schedule_writer_kind=writer_kind)
+
+
 def apply_consciousness_authority(task: Dict[str, Any]) -> Dict[str, Any]:
-    """Derive the level's two consequences onto a consciousness-origin task's metadata.
+    """Derive the level's two structural consequences onto a consciousness-origin task's metadata.
 
     Called BEFORE the contract is attached (``attach_task_contract`` reads
     ``metadata.disabled_tools`` into the contract when the contract has none).
@@ -151,3 +292,83 @@ def effective_runtime_mode(install_mode: str, task_metadata: Any) -> str:
     if cap in VALID_RUNTIME_MODES and runtime_mode_at_least(str(install_mode), cap):
         return cap
     return str(install_mode)
+
+
+def is_observe_origin(task_metadata: Any) -> bool:
+    """Whether this task runs under a consciousness wake at the Observe level.
+
+    The one predicate every dispatch-time narrowing asks, so "what Observe is"
+    is decided here rather than re-derived, slightly differently, per call site.
+    """
+    metadata = task_metadata if isinstance(task_metadata, Mapping) else {}
+    return (is_consciousness_origin(metadata)
+            and normalize_level(metadata.get("consciousness_autonomy")) == LEVEL_OBSERVE)
+
+
+def observe_argument_refusal(task_metadata: Any, name: str, args: Mapping[str, Any]) -> str:
+    """The refusal text for an Observe call whose ARGUMENTS ask for mutation; '' to allow.
+
+    Observe keeps the names in ``OBSERVE_ARGUMENT_NARROWED`` visible because each
+    has a genuine read-only or own-work use. This is the seam that stops the
+    same name from carrying back the authority the level removed: a write root
+    outside its own drive, a mutating child, a writing delegated session. The
+    positive path is deliberately left open — a refusal here is about the
+    arguments, never about the tool.
+
+    The protected dispatch guard asks this on every call, so it also carries the
+    narrowings Act shares: below Full, ``configure_presence`` lists and inspects
+    places (``PLACE_READ_ACTIONS``), and ``switch_model`` writes no room/Main choice.
+    """
+    tool = str(name or "").strip()
+    values = args if isinstance(args, Mapping) else {}
+    metadata = task_metadata if isinstance(task_metadata, Mapping) else {}
+    if (tool == "configure_presence" and is_consciousness_origin(metadata)
+            and normalize_level(metadata.get("consciousness_autonomy")) != LEVEL_FULL
+            and str(values.get("action") or "") not in PLACE_READ_ACTIONS):  # exact, as the tool matches it
+        return (
+            "⚠️ RESOURCE_CONSTRAINT_BLOCKED: below Full autonomy a wake lists and inspects "
+            "places, it does not change one; your human changes a place on its sheet or by "
+            "a word in Main, a Full wake with configure_presence."
+        )
+    if (tool == "switch_model" and is_consciousness_origin(metadata)
+            and normalize_level(metadata.get("consciousness_autonomy")) != LEVEL_FULL
+            and str(values.get("scope") or "") in {"room", "main"}):
+        return (
+            "⚠️ RESOURCE_CONSTRAINT_BLOCKED: below Full autonomy a wake does not change Main "
+            "or a room's model; your human changes either in the Model capsule or by a word "
+            "in Main, a Full wake may carry the cite."
+        )
+    if not is_observe_origin(task_metadata):
+        return ""
+    if tool in {"write_file", "edit_text"}:
+        # The file tools already confine a resolved path inside the chosen base;
+        # this decides which base Observe may choose at all.
+        root = str(values.get("root") or "active_workspace").strip()
+        if root not in OBSERVE_WRITE_ROOTS:
+            return (
+                "⚠️ RESOURCE_CONSTRAINT_BLOCKED: Observe may write its own task_drive or "
+                "artifact_store only; use the cognitive-memory or project-note tools for "
+                "everything else it wants to keep."
+            )
+    elif tool == "schedule_subagent":
+        surface = str(values.get("write_surface") or "").strip().lower()
+        if surface not in ("", "read_only") or bool(values.get("may_mutate")):
+            return (
+                "⚠️ RESOURCE_CONSTRAINT_BLOCKED: Observe may schedule read-only research "
+                "children only; omit write_surface and may_mutate."
+            )
+    elif tool == "delegate_start":
+        # An omitted access is the READ-ONLY shape here (``_derive_authority``
+        # pins it), so only an explicit write request is refused.
+        if str(values.get("root") or "").strip() or str(values.get("access") or "").strip().lower() == "workspace_write":
+            return (
+                "⚠️ RESOURCE_CONSTRAINT_BLOCKED: Observe may start a delegated read-only "
+                "research session only; omit root and leave access readonly."
+            )
+    elif tool == "manage_schedules":
+        if str(values.get("action") or "list").strip().lower() == "update":
+            return (
+                "⚠️ RESOURCE_CONSTRAINT_BLOCKED: Observe may list, get, disable, delete or restore "
+                "schedules, not rewrite one; report the change you would make."
+            )
+    return ""

@@ -5,12 +5,13 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-    computeDerivedChatStatus,
     computeHydratedDirectActivities,
     partitionLocalEchoJournal,
     positiveTaskTerminalFact,
     reconcileHydratedDirectActivities,
 } from '../modules/chat_activity.js';
+import { emptyWorkState, roomStatusView } from '../modules/work_status.js';
+import { room } from './work_fixture.js';
 import {
     isTerminalTaskDetail,
     summarizeChatLiveEvent,
@@ -165,9 +166,17 @@ test('durable detail terminality is narrow and outcome labels stay unchanged', (
             assert.equal(isTerminalTaskDetail(record), false, `${status}/${post_task_synthesis}`);
             assert.equal(taskDoneIsTerminal(record), false);
             assert.equal(summarizeChatLiveEvent(record).terminal, false);
-            const headline = status === 'failed' ? 'Failed' : 'Working';
-            assert.equal(summarizeChatLiveEvent(record).headline, headline);
-            assert.equal(summarizeLogEvent(record).headline, headline);
+            // #1110: an unfinished frame paints Working, and the KNOWN outcome
+            // rides beside it as its own fact — the card states it in the chip
+            // with `Finalizing…` next to it, instead of the whole frame having
+            // to claim `Failed` before the run is terminal.
+            assert.equal(summarizeChatLiveEvent(record).headline, 'Working');
+            assert.equal(summarizeChatLiveEvent(record).observedOutcome,
+                status === 'failed' ? 'error' : 'done');
+            // Logs is an event ledger, not a card chip: its row keeps the
+            // outcome word this frame carries.
+            assert.equal(summarizeLogEvent(record).headline,
+                status === 'failed' ? 'Failed' : 'Working');
         }
     }
     assert.equal(isTerminalTaskDetail({
@@ -184,34 +193,22 @@ test('durable detail terminality is narrow and outcome labels stay unchanged', (
 });
 
 // ---------------------------------------------------------------------------
-// Header status: managed activities surface as Working... / Queued...
+// Header status: the server's room surfaces managed work as Working... / Queued...
 // ---------------------------------------------------------------------------
 
-test('admitted managed work shows Working... without a live card', () => {
-    const status = computeDerivedChatStatus({
-        isConnected: true,
-        hasActiveLiveCard: false,
-        activeManagedCount: 1,
-        activeDirectCount: 0,
-        pendingSubmissionsCount: 0,
-    });
-    assert.deepEqual(status, { kind: 'thinking', text: 'Working...', showDots: true });
+const inRoom = (activity, extra = {}) => ({ ...emptyWorkState(), room: room(activity, extra) });
+
+test('admitted managed work shows Working... without a live card (the room says it)', () => {
+    assert.deepEqual(roomStatusView(inRoom('working')),
+        { kind: 'thinking', text: 'Working', tone: 'live', mark: 'moving', owner: false, amber: '' });
 });
 
-test('managed status priority: working > thinking > sending > queued > online', () => {
-    assert.equal(computeDerivedChatStatus({
-        activeManagedCount: 1, activeDirectCount: 1, pendingSubmissionsCount: 1, queuedManagedCount: 1,
-    }).text, 'Working...');
-    assert.equal(computeDerivedChatStatus({
-        activeDirectCount: 1, pendingSubmissionsCount: 1, queuedManagedCount: 1,
-    }).text, 'Thinking...');
-    assert.equal(computeDerivedChatStatus({
-        pendingSubmissionsCount: 1, queuedManagedCount: 1,
-    }).text, 'Sending...');
-    assert.equal(computeDerivedChatStatus({
-        queuedManagedCount: 1,
-    }).text, 'Queued...');
-    assert.equal(computeDerivedChatStatus({}).text, 'Online');
+test('room status order: the room\'s work > the owner\'s send > Online; queued work yields to a send', () => {
+    assert.equal(roomStatusView(inRoom('working'), { sending: true }).text, 'Working');
+    assert.equal(roomStatusView(inRoom('working', { call: 'thinking' }), { sending: true }).text, 'Thinking');
+    assert.equal(roomStatusView(inRoom('queued'), { sending: true }).text, 'Sending');
+    assert.equal(roomStatusView(inRoom('queued')).text, 'Queued');
+    assert.equal(roomStatusView(emptyWorkState()).text, 'Online');
 });
 
 // ---------------------------------------------------------------------------

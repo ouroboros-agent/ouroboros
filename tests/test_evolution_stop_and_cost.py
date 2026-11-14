@@ -5,9 +5,9 @@ Covers:
   - reconstruct_task_cost using the durable physical-attempt ledger by task_id;
   - stop_evolution_tasks cancelling only evolution tasks (pending AND running)
     through the durable-intent + typed-custody ingress;
-  - the hard-timeout retry gate: a killed evolution task is NOT re-enqueued when
-    the campaign is stopped, IS re-enqueued when still enabled, and either way
-    records reconstructed cost/rounds (never zeros).
+  - the hard timeout: an evolution task killed at its execution ceiling is NOT
+    re-enqueued whether the campaign is stopped or still enabled (no timeout
+    retries since #1376), and records reconstructed cost/rounds (never zeros).
 """
 
 import json
@@ -52,8 +52,10 @@ def test_reconstruct_task_cost_never_fabricates_zero_when_ledger_unavailable(
     import supervisor.state as state
 
     monkeypatch.setattr(state, "DRIVE_ROOT", tmp_path)
+    from ouroboros import usage_store
+
     monkeypatch.setattr(
-        accounting, "ensure_legacy_imported",
+        usage_store, "store_tier",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(accounting.UsageLedgerCorrupt("bad")),
     )
     fields = state.reconstruct_task_cost("paid-task", fields=True)
@@ -67,7 +69,23 @@ def test_reconstruct_task_cost_never_fabricates_zero_when_ledger_unavailable(
         state.reconstruct_task_cost("paid-task")
 
 
-def test_stop_evolution_tasks_cancels_only_evolution_pending_and_running(monkeypatch):
+def _minting(monkeypatch, q, tmp_path):
+    """The real durable intent, observed: the stop drives custody only through an
+    open intent (A1/A2), so a fixture that mints nothing would stop nothing."""
+    from ouroboros.cancel_intents import request_cancel
+
+    monkeypatch.setattr(q, "DRIVE_ROOT", tmp_path)
+    intents: list = []
+
+    def _mint(root, tid, **kw):
+        intents.append((tid, kw.get("source")))
+        return request_cancel(root, tid, **kw)
+
+    monkeypatch.setattr("ouroboros.cancel_intents.request_cancel", _mint)
+    return intents
+
+
+def test_stop_evolution_tasks_cancels_only_evolution_pending_and_running(monkeypatch, tmp_path):
     """GR2-13: PENDING evolution tasks go through the same durable-intent +
     typed-custody ingress as running ones (never an in-place prune), and only
     evolution tasks are touched."""
@@ -82,11 +100,7 @@ def test_stop_evolution_tasks_cancels_only_evolution_pending_and_running(monkeyp
         {"id": "evo-pending", "type": "evolution"},
         {"id": "plain-pending", "type": "chat"},
     ])
-    intents: list = []
-    monkeypatch.setattr(
-        "ouroboros.cancel_intents.request_cancel",
-        lambda root, tid, **kw: intents.append((tid, kw.get("source"))) or {},
-    )
+    intents = _minting(monkeypatch, q, tmp_path)
     custody: list = []
     monkeypatch.setattr(q, "cancel_task_custody",
                         lambda tid, **_kw: custody.append(tid) or q.CANCEL_CANCELLED)
@@ -100,7 +114,7 @@ def test_stop_evolution_tasks_cancels_only_evolution_pending_and_running(monkeyp
     assert not any(bucket for key, bucket in out.items() if key != "cancelled")
 
 
-def test_stop_evolution_tasks_reports_settled_and_failed_honestly(monkeypatch):
+def test_stop_evolution_tasks_reports_settled_and_failed_honestly(monkeypatch, tmp_path):
     """GR2-13: 'cancelled' names only CANCEL_CANCELLED outcomes; already-settled
     and failed teardowns are separate buckets, and the report composer marks the
     stop incomplete only for still-live tasks."""
@@ -111,8 +125,7 @@ def test_stop_evolution_tasks_reports_settled_and_failed_honestly(monkeypatch):
         "evo-stuck": {"task": {"type": "evolution"}},
     })
     monkeypatch.setattr(q, "PENDING", [])
-    monkeypatch.setattr("ouroboros.cancel_intents.request_cancel",
-                        lambda root, tid, **kw: {})
+    _minting(monkeypatch, q, tmp_path)
     outcomes = {"evo-done": q.CANCEL_ALREADY_SETTLED, "evo-stuck": q.CANCEL_FAILED}
     monkeypatch.setattr(q, "cancel_task_custody", lambda tid, **_kw: outcomes[tid])
 
@@ -125,7 +138,7 @@ def test_stop_evolution_tasks_reports_settled_and_failed_honestly(monkeypatch):
     assert incomplete is True
     assert any("Already settled" in line and "evo-done" in line for line in lines)
     assert any("INCOMPLETE" in line and "evo-stuck" in line for line in lines)
-    assert not any(line.startswith("🛑 Cancelled") for line in lines)
+    assert not any(line.startswith("🛑 Stopped") for line in lines)
 
 
 def _drive_hard_timeout(tmp_path, monkeypatch, *, evolution_enabled):
@@ -140,6 +153,7 @@ def _drive_hard_timeout(tmp_path, monkeypatch, *, evolution_enabled):
     import ouroboros.tools.services as services_mod
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     q.init(tmp_path)
     campaign = evolution_lifecycle.start_evolution_campaign("Improve", source="test")
     state.update_state(lambda live: live.update(
@@ -153,11 +167,9 @@ def _drive_hard_timeout(tmp_path, monkeypatch, *, evolution_enabled):
     if not evolution_enabled:
         state.update_state(lambda live: live.update(evolution_mode_enabled=False))
     monkeypatch.setattr(q, "FINALIZATION_GRACE_SEC", 0)
-    # Activity model: drive an IDLE kill (no progress for the idle window), not a flat
-    # wall-clock/ceiling kill — small idle/ceiling getters + a recent started_at keep
-    # terminal_reason == "idle_timeout" so the evolution retry path is exercised.
-    monkeypatch.setattr(q, "get_task_idle_timeout_sec", lambda: 1)
-    monkeypatch.setattr(q, "get_per_call_timeout_ceiling_sec", lambda: 1)
+    # Silence only brings attention (#1376), so the kill comes from the execution
+    # ceiling: the task started 1000 s ago and its lifetime is 300 s.
+    monkeypatch.setattr(q, "get_task_abs_ceiling_sec", lambda: 300)
     monkeypatch.setattr(q, "_ensure_reaper_started", lambda: None)
     monkeypatch.setattr(q, "_reap_queue", q._stdqueue.Queue())
     # Three distinct legacy usage rows totalling $1.50 are imported into the
@@ -199,13 +211,23 @@ def _drive_hard_timeout(tmp_path, monkeypatch, *, evolution_enabled):
     monkeypatch.setattr(services_mod, "archive_task_service_logs", lambda *a, **k: None)
 
     enqueued = []
-    monkeypatch.setattr(q, "enqueue_task", lambda t, front=False: enqueued.append(t))
-    monkeypatch.setattr(q, "persist_queue_snapshot", lambda reason="": None)
+    for key, value in {"PENDING": [], "QUEUE_SEQ_COUNTER_REF": {"value": 0},
+                       "ADMISSION_RESERVATIONS": {}, "ACCEPTANCE_FENCES": {},
+                       "BUDGET_ROOT_FENCES": {}}.items():
+        monkeypatch.setattr(q, key, value)
+    real_enqueue = q.enqueue_task
+    def enqueue(task, front=False):
+        admitted = real_enqueue(task, front=front)
+        assert not admitted.get("_admission_blocked"), admitted
+        assert any(row is admitted for row in q.PENDING)
+        enqueued.append(admitted)
+        return admitted
+    monkeypatch.setattr(q, "enqueue_task", enqueue)
     monkeypatch.setattr(q, "send_with_budget", lambda *a, **k: None)
     monkeypatch.setattr(q, "load_state", lambda: {"evolution_mode_enabled": evolution_enabled, "owner_chat_id": 0})
 
     q.enforce_task_timeouts()
-    # Variant A: terminal write + retry happen in the off-loop reaper; drain it here.
+    # Variant A: the terminal write happens in the off-loop reaper; drain it here.
     while not q._reap_queue.empty():
         q._reap_timed_out_task(q._reap_queue.get_nowait())
 
@@ -266,6 +288,7 @@ def test_handle_task_done_reconstructs_cost_from_physical_ledger(tmp_path):
     from ouroboros.task_results import STATUS_CANCELLED, write_task_result
 
     supervisor_state.init(tmp_path)
+    supervisor_state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     queue.init(tmp_path)
     campaign = queue.start_evolution_campaign("Improve", source="test")
     supervisor_state.update_state(lambda live: live.update(
@@ -319,14 +342,14 @@ def test_handle_task_done_reconstructs_cost_from_physical_ledger(tmp_path):
     assert int(supervisor_state.load_state().get("evolution_consecutive_failures") or 0) == 1
 
 
-def test_hard_timeout_evolution_enabled_requeues(tmp_path, monkeypatch):
+def test_hard_timeout_evolution_enabled_settles_without_requeue(tmp_path, monkeypatch):
     enqueued, emitted, written = _drive_hard_timeout(tmp_path, monkeypatch, evolution_enabled=True)
 
-    # Campaign still enabled: the timed-out task is re-enqueued (one retry).
-    assert len(enqueued) == 1
-    assert enqueued[0].get("type") == "evolution"
-    assert enqueued[0].get("_attempt") == 2
-    # A retry keeps the live card active, so no terminal task_done is emitted.
-    assert [e for e in emitted if e.get("type") == "task_done"] == []
-    # The interrupted rollup still records reconstructed cost (not zeros).
+    # An enabled campaign buys no timeout retry: the ceiling is terminal.
+    assert enqueued == []
+    assert written.get("status") == "failed"
+    assert written.get("reason_code") == "absolute_ceiling"
+    # The terminal task_done carries the reconstructed cost (not zeros).
+    done = [e for e in emitted if e.get("type") == "task_done"]
+    assert done and round(float(done[0].get("accounted_upper_bound_usd") or 0), 6) == 1.5
     assert round(float(written.get("accounted_upper_bound_usd") or 0), 6) == 1.5

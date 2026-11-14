@@ -1,0 +1,388 @@
+"""The durable ``tools.jsonl`` call record: one host invocation, up to three rows (#1316).
+
+The loop freezes ONE ``invocation_id`` per tool call at wrapper entry, BEFORE the
+call is handed to an executor, together with the task attempt, execution, round,
+LLM call and provider ``tool_call_id`` it answers (providers reuse those ids, so
+the provider id alone is not an identity). Every row of that call carries the
+same frozen facts:
+
+- ``tool_call_started`` — the host began processing the call (an executor wait
+  included). It is NOT evidence that the handler ran or that any effect happened.
+- ``tool_call`` — the settlement: the handler's result (or a host refusal after
+  the start), with the host-measured ``elapsed_ms`` of the whole call, distinct
+  from a process's own ``duration_ms``. ``status`` is the outcome bucket and
+  ``tool_result_code`` the exact published code; a call a control ended before its
+  handler returned is ``interrupted`` with its ``control_reason``. A row the host
+  settles itself (``host_error``, ``interrupted``, a refused browser call) carries
+  no handler bucket or code; a pause can also refuse a launch through the handler,
+  whose typed refusal names it in ``tool_result_meta.control_reason``.
+- ``tool_call_timeout`` — the caller's wait ended; the worker may still settle
+  later. Timeout and settlement are independent facts and may land in either order.
+  It names where the worker stood at that moment (``worker_position``), so an
+  abandoned call stays diagnosable from its own record (BIBLE P1).
+
+Readers count invocations, never rows. A row without ``invocation_id`` is legacy
+and stands alone (never joined by guesswork); a start with no later row is
+``unknown`` — never running, never failed. Appends are ordinary appends with no
+power-loss promise; each target's outcome is returned so a missed start can be
+disclosed on the later rows. Nothing here vetoes execution.
+"""
+
+from __future__ import annotations
+
+import pathlib
+import threading
+import time
+import uuid
+from contextvars import ContextVar
+from contextlib import contextmanager
+from typing import Any, Dict, Iterable, List, Optional
+
+from ouroboros._outcome_tool_errors import SAFETY_HELD_STATUSES
+from ouroboros.utils import append_jsonl, truncate_for_log
+
+CALL_STARTED = "tool_call_started"
+CALL_SETTLED = "tool_call"
+CALL_WAIT_ENDED = "tool_call_timeout"
+# What the host settles when the handler returned nothing: its own failure (``host_error``), or
+# a control that ended the call (Pause, Cancel, a deadline), named in the row's ``control_reason``.
+HOST_INTERRUPTED = "interrupted"
+HOST_SETTLED_STATUSES = frozenset({"host_error", HOST_INTERRUPTED})
+_FROZEN_KEYS = ("invocation_id", "tool_call_id", "task_attempt", "execution_id", "round_id", "llm_call_id", "args_source_ref", "args_source_status", "chronicle_lead_rule")
+_ACTIVE_CALL = ContextVar("active_tool_call", default=None)
+
+
+def current_tool_call_id() -> str:
+    return str((_ACTIVE_CALL.get() or {}).get("tool_call_id") or "")
+
+
+def chronicle_lead_metadata() -> Dict[str, Any]:
+    """The producing attempt's lead fact, frozen before this worker was submitted."""
+    rule = (_ACTIVE_CALL.get() or {}).get("chronicle_lead_rule")
+    return {"lead_rule": rule} if rule is not None else {}
+
+
+def current_args_source() -> Dict[str, Any]:
+    """This call's persisted dispatch-input ref and status; ``{}`` outside a loop call."""
+    active = _ACTIVE_CALL.get() or {}
+    return {key: active[key] for key in ("args_source_ref", "args_source_status") if key in active}
+
+
+@contextmanager
+def invocation_scope(invocation):
+    invocation["_worker_thread"] = threading.get_ident()  # the thread a wait end inspects
+    token = _ACTIVE_CALL.set(invocation)
+    try:
+        yield
+    finally:
+        invocation["_worker_done"] = True  # the thread may serve another call from here on
+        _ACTIVE_CALL.reset(token)
+
+
+def new_invocation(tool_call_id: Any, correlation: Dict[str, Any], task_attempt: Any) -> Dict[str, Any]:
+    """The immutable identity of one call, captured before submission."""
+    frozen = {
+        "invocation_id": uuid.uuid4().hex,
+        "tool_call_id": str(tool_call_id or ""),
+        "task_attempt": task_attempt,
+        "execution_id": correlation.get("execution_id"),
+        "round_id": correlation.get("round_id"),
+        "llm_call_id": correlation.get("llm_call_id"),
+    }
+    return {**{key: value for key, value in frozen.items() if value not in (None, "")},
+            "_started_mono": time.monotonic(), "_settlement_lock": threading.Lock()}
+
+
+def invocation_fields(invocation: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """The frozen facts a row carries (never the private monotonic stamp)."""
+    return {key: invocation[key] for key in _FROZEN_KEYS if invocation and key in invocation}
+
+
+def persist_dispatch_source(meta: Dict[str, Any], drive_logs: pathlib.Path, task_id: str,
+                            invocation: Dict[str, Any], tool: str, arguments: Any) -> None:
+    """Full redacted dispatch input, in canonical observability before any execution.
+
+    The preview sanitizer is intentionally lossy; this existing CAS/manifest is
+    not. Readback verifies the actual bytes, including False/no-op writer failures.
+    Failure is evidence loss, never an execution veto or a fabricated source ref.
+    """
+    from ouroboros.observability import persist_call, read_call_payload
+
+    try:
+        root = pathlib.Path(meta.get("budget_drive_root") or pathlib.Path(drive_logs).parent).resolve()
+        call_id = f"tool_dispatch_{invocation['invocation_id']}"
+        persist_call(root, task_id=task_id, call_id=call_id, call_type="tool_dispatch",
+                     payload={"tool": tool, "arguments": arguments, **invocation_fields(invocation)},
+                     manifest={"tool": tool, **invocation_fields(invocation)}, keep_raw=False)
+        _manifest, payload, verified = read_call_payload(root, task_id=task_id, call_id=call_id)
+        if payload.get("invocation_id") != invocation["invocation_id"]:
+            raise ValueError("dispatch source identity mismatch")
+        invocation["args_source_ref"] = verified["manifest_ref"]
+        invocation["args_source_status"] = "ready"
+    except Exception as exc:
+        invocation["args_source_status"] = f"unavailable:{type(exc).__name__}"
+
+
+def elapsed_ms(invocation: Optional[Dict[str, Any]]) -> Optional[int]:
+    started = (invocation or {}).get("_started_mono")
+    return None if started is None else int((time.monotonic() - started) * 1000)
+
+
+def append_call_row(meta: Dict[str, Any], drive_logs: pathlib.Path, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Append one row to the task's log and its canonical copy; return each outcome.
+
+    ``meta`` is the task metadata (lineage, ``budget_drive_root``). The canonical
+    copy is ALWAYS attempted, even when the task-log append failed, and the result
+    names ``{"task_log": ok, "canonical": ok | None}`` (None: no separate copy)."""
+    from ouroboros.task_results import resolve_task_lineage
+
+    if task_id := str(payload.get("task_id") or "").strip():
+        # ONE lineage resolver (a direct root is its own root), so every task row
+        # carries root_task_id/delegation_role for the task log stream readers.
+        lineage = resolve_task_lineage(task_id, metadata=meta)
+        payload["root_task_id"] = lineage["root_task_id"]
+        if role := lineage["delegation_role"] or ("root" if lineage["is_root_task"] else ""):
+            payload["delegation_role"] = role
+    for key in ("parent_task_id", "task_depth"):
+        if meta.get(key) not in (None, ""):
+            payload[key] = meta.get(key)
+    local = pathlib.Path(drive_logs) / "tools.jsonl"
+    targets = {"task_log": local}
+    outcome: Dict[str, Any] = {"canonical": None}
+    root = str(meta.get("budget_drive_root") or "").strip()
+    if root:
+        try:
+            candidate = pathlib.Path(root).resolve(strict=False) / "logs" / "tools.jsonl"
+            if candidate != local.resolve(strict=False):
+                targets["canonical"] = candidate
+        except Exception:
+            outcome["canonical"] = False
+    # Every target gets its own attempt and outcome, including False returns.
+    for name, path in targets.items():
+        try:
+            outcome[name] = bool(append_jsonl(path, payload))
+        except Exception:
+            outcome[name] = False
+    return outcome
+
+
+def append_failed(outcome: Optional[Dict[str, Any]]) -> bool:
+    return bool(outcome) and (outcome.get("task_log") is False or outcome.get("canonical") is False)
+
+
+def worker_position(invocation: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Where an abandoned call's worker stands as its wait ends (BIBLE P1): ``worker_at`` names the
+    innermost frame of Ouroboros's own code and the frame it waits in, for the live row and the
+    model; ``worker_stack`` is the whole stack without locals, for the observability record.
+    ``worker_started: False`` when the call never reached a worker thread."""
+    import sys
+
+    from ouroboros.server_liveness import _innermost_repo_frame, _loop_thread_stack
+
+    if invocation is None:
+        return {}  # no invocation record: where the worker stood is unknown, not "never started"
+    ident = invocation.get("_worker_thread")
+    if not ident:
+        return {"worker_started": False}
+    stack = _loop_thread_stack(ident, limit=sys.getrecursionlimit())
+    if invocation.get("_worker_done"):  # read after the capture: its thread may already serve another call
+        return {"worker_at": "settled as its wait ended"}
+    if not stack:
+        return {"worker_at": "unknown (its stack could not be read)"}
+    own = _innermost_repo_frame(stack)
+    return {"worker_at": " <- ".join(dict.fromkeys(filter(None, (own, stack[-1])))), "worker_stack": stack}
+
+
+def worker_phrase(position: Dict[str, Any]) -> str:
+    """The same fact in the sentence the model reads."""
+    if position.get("worker_started") is False:
+        return " The call never reached a worker."
+    if not position.get("worker_at"):
+        return ""
+    return f" Its worker {'was at' if position.get('worker_stack') else 'stood:'} {position['worker_at']}."
+
+
+def start_log_field(invocation: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """``{"start_log": outcome}`` when the call's start append failed — the ONE field every
+    later row (settlement, host refusal, wait end) discloses it in; else nothing."""
+    outcome = (invocation or {}).get("start_log")
+    return {"start_log": outcome} if append_failed(outcome) else {}
+
+
+def claim_settlement(invocation: Optional[Dict[str, Any]]) -> bool:
+    """Claim operation settlement once. A wait end never owns this fact."""
+    if invocation is None:
+        return True
+    lock = invocation.setdefault("_settlement_lock", threading.Lock())
+    with lock:
+        first = not invocation.get("_settled")
+        invocation["_settled"] = True
+        return first
+
+
+def counts_as_call(row: Dict[str, Any]) -> bool:
+    """A per-row LOWER bound for sizing a read window: a start, or a legacy row.
+
+    A settlement or wait end whose start is missing (a lost append, or a start
+    outside the window) is not counted here, so a window only grows; the exact
+    count is ``len(logical_calls(rows))`` over the rows read, where such an
+    orphan is one call and a start with its later rows is one call."""
+    return row.get("type") == CALL_STARTED or not row.get("invocation_id")
+
+
+def logical_calls(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Group rows into calls in first-seen order.
+
+    Each call names its ``started``/``settled``/``wait_ended`` rows and ``state``:
+    ``settled`` (a result exists, in either order with a timeout), ``wait_ended``
+    (the caller stopped waiting, no result recorded), ``unknown`` (only a start),
+    ``legacy`` (a pre-identity row) or ``orphan`` (a result whose start row lies
+    outside the rows given). A duplicate settlement (pre-guard data) never
+    replaces a real one with a row the host settled (``HOST_SETTLED_STATUSES``)."""
+    calls: List[Dict[str, Any]] = []
+    by_id: Dict[str, Dict[str, Any]] = {}
+    slot = {CALL_STARTED: "started", CALL_SETTLED: "settled", CALL_WAIT_ENDED: "wait_ended"}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        invocation_id = str(row.get("invocation_id") or "")
+        if not invocation_id:
+            calls.append({"state": "legacy", "tool": row.get("tool"), "args": row.get("args"), "settled": row})
+            continue
+        call = by_id.get(invocation_id)
+        if call is None:
+            call = by_id[invocation_id] = {"invocation_id": invocation_id, "tool": row.get("tool"),
+                                           "args": row.get("args")}
+            calls.append(call)
+        key = slot.get(str(row.get("type") or ""), "settled")
+        held = call.get(key)
+        if held is None or (key == "settled" and held.get("status") in HOST_SETTLED_STATUSES
+                            and row.get("status") not in HOST_SETTLED_STATUSES):
+            call[key] = row
+    for call in calls:
+        if "state" not in call:
+            call["state"] = ("settled" if "settled" in call and "started" in call
+                             else "orphan" if "settled" in call
+                             else "wait_ended" if "wait_ended" in call else "unknown")
+    return calls
+
+
+def replay_evidence(drive_root: pathlib.Path, task_id: str, want: int = 200, *, iter_objects=None,
+                    list_archives=None, memory=None, stat=None) -> Dict[str, Any]:
+    """Bounded canonical invocation facts for history, independent of frozen wait metrics.
+
+    ``iter_objects``, ``list_archives`` and ``stat`` are the reader's parser, archive-listing and
+    metadata seams; ``memory`` a ``Memory`` of ``drive_root`` shared by one read's tasks."""
+    from ouroboros.memory import Memory
+    from ouroboros.tool_capabilities import routing_action_for_tool
+
+    rows, coverage = (memory or Memory(drive_root)).read_task_recent(
+        "tools.jsonl", task_id, want, iter_objects=iter_objects, list_archives=list_archives, stat=stat)
+    observations = []
+    legacy = {"calls": 0, "errors": 0, "wait_ended": False, "unknown": False}
+    for call in logical_calls(rows):
+        if not call.get("invocation_id"):
+            row = call.get("settled") or {}
+            legacy["calls"] += 1
+            legacy["errors"] += int(row.get("type") == CALL_SETTLED and bool(row.get("is_error")))
+            legacy["wait_ended"] |= row.get("type") == CALL_WAIT_ENDED
+            legacy["unknown"] |= row.get("type") == CALL_STARTED
+            continue  # separate observations, never guessed joins to modern/live calls
+        base = {"key": f"tool:{task_id}:{call['invocation_id']}", "tool": call.get("tool"),
+                "receipt": bool(routing_action_for_tool(call.get("tool")))}
+        for slot, fact in (("started", "started"), ("wait_ended", "wait_ended"), ("settled", "settled")):
+            row = call.get(slot)
+            if row is not None:
+                observations.append({**base, "fact": fact, "live": False,
+                    "receipt": base["receipt"] or row.get("completion_control") is True,
+                    "status": ("held" if row.get("status") in SAFETY_HELD_STATUSES else "error" if row.get("is_error")
+                               else "ok") if slot == "settled" else "unknown",  # the live step row's reading
+                    "hostError": row.get("status") == "host_error",
+                    # The row's own recorded host time, as written; a row without one stays without
+                    # (never reconstructed), so a reader can order a call by its first observation.
+                    **({"ts": row["ts"]} if isinstance(row.get("ts"), str) and row["ts"] else {}),
+                    **(_check_verdict(row) if slot == "settled" else {})})
+    return {"observations": observations, "legacy": legacy, "coverage": coverage}
+
+
+def _check_verdict(row: Dict[str, Any]) -> Dict[str, Any]:
+    """A settled check's recorded criterion verdict, so replay can draw the same
+    failed-check row as the live card (#1585): the producer's typed fact, its
+    process facts, and the live frame's bounded preview for a failure only."""
+    meta = row.get("tool_result_meta")
+    verification = meta.get("verification") if isinstance(meta, dict) else None
+    if not isinstance(verification, dict):
+        return {}
+    out = {"verification": verification,
+           **{key: row[key] for key in ("exit_code", "signal", "timed_out") if key in row}}
+    if verification.get("status") == "fail":
+        # Head+tail of the stored 2000-char preview at 500 is the live frame's own preview.
+        out["result_preview"] = truncate_for_log(str(row.get("result_preview") or ""), 500)
+    return out
+
+
+def replay_evidence_for_tasks(drive_root: pathlib.Path, task_ids: Iterable[str]) -> Dict[str, dict]:
+    """Share exact parsed windows and one ``archive/`` listing within ONE history read, keeping per-task quotas.
+
+    Only selected tasks are retained. Tail windows still double and archive
+    backfill stays bounded by the existing reader; no cache survives this request.
+    Each window is read in one call and an (immutable) archive stat'ed once: a buffered
+    4 KiB line walk (hundreds of reads per window) and stats per task and window each handed
+    the server's interpreter lock away, which under load made this stage seconds of the page.
+    The live file is stat'ed once per task, so a source that grows mid-request is re-read.
+    """
+    import io
+
+    from ouroboros.jsonl_tail import archive_segments
+    from ouroboros.utils import iter_jsonl_objects, jsonl_window
+
+    selected = dict.fromkeys(task_ids)
+    windows, listings, stats = {}, {}, {}
+
+    def stat(path):
+        info = stats.get(path)
+        if info is None:
+            info = stats[path] = path.stat()
+        return info
+
+    def list_archives(archive_dir, archive_prefix, gaps=None):
+        # One enumeration per request; its unreadable_source gap is replayed to every task.
+        key = (str(archive_dir), archive_prefix)
+        if key not in listings:
+            found: set = set()
+            listings[key] = archive_segments(archive_dir, archive_prefix, found), found
+        paths, found = listings[key]
+        if gaps is not None:
+            gaps.update(found)
+        return list(paths)
+
+    def parse(path, *, tail_bytes=None, gap_reasons=None):
+        info = stat(path)
+        stamp = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        if windows.get(path, (None,))[0] != stamp:
+            windows[path] = stamp, {}
+        parsed = windows[path][1]
+        if tail_bytes not in parsed:
+            gaps: set = set()
+            try:
+                with path.open("rb") as handle:
+                    data = jsonl_window(handle, info.st_size, tail_bytes)
+            except FileNotFoundError:
+                data = b""  # rotated away after its stat: the line reader's own absence answer
+            rows = [row for row in iter_jsonl_objects(path, gap_reasons=gaps, _handle=io.BytesIO(data))
+                    if str(row.get("task_id") or "").strip() in selected]
+            parsed[tail_bytes] = rows, gaps
+        rows, gaps = parsed[tail_bytes]
+        if gap_reasons is not None:
+            gap_reasons.update(gaps)
+        return iter(rows)
+
+    from ouroboros.memory import Memory
+
+    memory, evidence = Memory(drive_root), {}  # one log path resolution for every task of the read
+    for task_id in selected:
+        for path in [path for path in stats if path.parent.name != "archive"]:
+            del stats[path]  # archives never change; the live file is stat'ed again for each task
+        evidence[task_id] = replay_evidence(drive_root, task_id, iter_objects=parse, list_archives=list_archives,
+                                            memory=memory, stat=stat)
+    return evidence

@@ -3,9 +3,12 @@ blocks, eviction, image-aware token estimates, compaction safety, and
 non-vision lane placeholders."""
 
 import base64
+from copy import deepcopy
 import json
 
-from ouroboros.context_budget import IMAGE_BLOCK_CHAR_EQUIVALENT, MAX_LIVE_IMAGE_BLOCKS
+import pytest
+
+from ouroboros.context_budget import IMAGE_BLOCK_CHAR_EQUIVALENT, MAX_LIVE_IMAGE_BLOCKS, LIVE_IMAGE_BLOCKS_HIGH_WATER
 
 
 def _image_block(tag: str = "x", caption: str = "") -> dict:
@@ -17,69 +20,61 @@ def _image_block(tag: str = "x", caption: str = "") -> dict:
 
 
 class TestSupportsVision:
-    def test_static_map(self):
+    def test_names_are_not_evidence(self, tmp_path, monkeypatch):
+        """Without a route's own catalog statement every API route is unknown, the
+        names a former prefix table listed included; our local lane's limit is the
+        send policy's transport fact, not a model verdict."""
         from ouroboros.provider_models import supports_vision
 
-        assert supports_vision("openai/gpt-5.5") is True
-        assert supports_vision("google/gemini-3.5-flash") is True
-        assert supports_vision("anthropic::claude-opus-4-8") is True
-        # The v6.82.0 direct Anthropic defaults stay vision-capable.
-        assert supports_vision("anthropic::claude-sonnet-5") is True
-        assert supports_vision("anthropic::claude-opus-5") is True
-        assert supports_vision("deepseek/deepseek-chat") is False
-        assert supports_vision("") is False
-        assert supports_vision("some-model (local)") is False
+        monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path))
+        for model in ("openai/gpt-5.5", "google/gemini-3.5-flash", "anthropic::claude-opus-5",
+                      "deepseek/deepseek-chat", "openai::o3-mini", "", "some-model (local)"):
+            assert supports_vision(model) is None, model
 
-    def test_overlay_wins(self):
-        from ouroboros import provider_models
+    def test_a_recorded_catalog_statement_answers_only_for_its_route(self, tmp_path, monkeypatch):
+        from ouroboros.provider_models import supports_vision
+        from ouroboros.vision_routing import record_catalog_image_input
 
-        provider_models.update_vision_overlay("deepseek/deepseek-vl", True)
-        assert provider_models.supports_vision("deepseek/deepseek-vl") is True
-        provider_models.update_vision_overlay("openai/gpt-5.5", False)
-        try:
-            assert provider_models.supports_vision("openai/gpt-5.5") is False
-        finally:
-            provider_models._VISION_OVERLAY.pop("openai/gpt-5.5", None)
-            provider_models._VISION_OVERLAY.pop("deepseek/deepseek-vl", None)
+        monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path))
+        record_catalog_image_input("openrouter", "https://openrouter.ai/api/v1", [
+            {"id": "deepseek/deepseek-vl", "architecture": {"input_modalities": ["text", "image"]}},
+            {"id": "openai/gpt-5.5", "architecture": {"input_modalities": ["text"]}},
+        ], source="OpenRouter /models")
+        assert supports_vision("deepseek/deepseek-vl") is True
+        assert supports_vision("openai/gpt-5.5") is False
+        # The same slug on the direct OpenAI route is another route: still unknown.
+        assert supports_vision("openai::gpt-5.5") is None
 
 
 class TestWebAttachmentBlocks:
-    def test_first_image_attachment_resolves_upload(self, tmp_path, monkeypatch):
+    def test_attachment_acceptance_binds_bytes_without_a_redundant_inline_image(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
         import ouroboros.gateway.ws as ws_mod
+        from ouroboros.chat_uploads import store_upload
+        from tests.test_live_image_delivery import pixels
 
-        uploads = tmp_path / "uploads"
-        uploads.mkdir(parents=True)
-        (uploads / "abc_cat.png").write_bytes(b"\x89PNG fake")
+        stored, reference = store_upload(pixels(), "cat.png", data_dir=tmp_path)
         monkeypatch.setattr(ws_mod, "DATA_DIR", tmp_path)
-
-        b64, mime, caption = ws_mod._first_image_attachment([
-            {"filename": "abc_cat.png", "mime": "image/png", "display_name": "cat.png"},
+        calls = []
+        bridge = SimpleNamespace(ui_send=lambda text, **kwargs: calls.append((text, kwargs)))
+        ws_mod._accept_with_attachments(bridge, "look", {"task_metadata": {}}, [
+            {"filename": stored.name, "mime": "video/mp4", "display_name": "cat.png"},
+            {"filename": "../settings.json", "mime": "image/png"},
         ])
-        assert base64.b64decode(b64) == b"\x89PNG fake"
-        assert mime == "image/png"
-        assert "cat.png" in caption
-
-    def test_traversal_and_non_image_rejected(self, tmp_path, monkeypatch):
-        import ouroboros.gateway.ws as ws_mod
-
-        (tmp_path / "uploads").mkdir(parents=True)
-        secret = tmp_path / "settings.json"
-        secret.write_text("{}", encoding="utf-8")
-        monkeypatch.setattr(ws_mod, "DATA_DIR", tmp_path)
-
-        assert ws_mod._first_image_attachment(
-            [{"filename": "../settings.json", "mime": "image/png"}]
-        ) == ("", "", "")
-        assert ws_mod._first_image_attachment(
-            [{"filename": "doc.pdf", "mime": "application/pdf"}]
-        ) == ("", "", "")
+        _text, kwargs = calls[0]
+        assert "image_base64" not in kwargs
+        metadata = kwargs["task_metadata"]
+        assert metadata["chat_attachments"][0]["mime"] == "image/png"
+        assert metadata["chat_attachment_uploads"][0]["sha256"] == reference["sha256"]
+        assert metadata["chat_attachment_uploads"][1]["path"] == ""
 
     def test_build_user_content_attaches_caption_metadata(self):
         from ouroboros.context import build_user_content
 
+        from tests.test_live_image_delivery import pixels
         content = build_user_content({
             "text": "look",
-            "image_base64": "QUJD",
+            "image_base64": base64.b64encode(pixels()).decode(),
             "image_mime": "image/png",
             "image_caption": "[user attachment: cat.png]",
         })
@@ -89,11 +84,22 @@ class TestWebAttachmentBlocks:
 
 
 class TestImageEviction:
-    def test_keeps_only_newest_k(self):
+    def test_up_to_high_water_appends_without_changing_sent_images(self, subtests):
+        for count in range(6, LIVE_IMAGE_BLOCKS_HIGH_WATER + 1):
+            with subtests.test(count=count):
+                from ouroboros.loop_messages import _append_or_merge_user_content
+
+                messages = [{"role": "user", "content": [_image_block(str(idx))]} for idx in range(count - 1)]
+                sent = deepcopy(messages)
+                _append_or_merge_user_content(messages, [_image_block(str(count - 1))])
+                assert messages[:-1] == sent
+                assert sum(block.get("type") == "image_url" for msg in messages for block in msg["content"]) == count
+
+    def test_eleventh_image_retires_oldest_six_together(self):
         from ouroboros.loop_messages import _append_or_merge_user_content
 
         messages = []
-        for idx in range(MAX_LIVE_IMAGE_BLOCKS + 2):
+        for idx in range(LIVE_IMAGE_BLOCKS_HIGH_WATER + 1):
             _append_or_merge_user_content(
                 messages,
                 [
@@ -111,9 +117,51 @@ class TestImageEviction:
             if isinstance(block, dict) and block.get("type") == "image_url"
         ]
         assert len(live) == MAX_LIVE_IMAGE_BLOCKS
+        assert [block["_caption"] for block in live] == [f"shot-{idx}" for idx in range(6, 11)]
         rendered = json.dumps(messages, ensure_ascii=False)
-        assert "[image evicted: shot-0]" in rendered
-        assert "[image evicted: shot-1]" in rendered
+        assert all(f"[image evicted: shot-{idx}]" in rendered for idx in range(6))
+
+    @pytest.mark.parametrize(("prior", "incoming"), [(5, 6), (9, 3), (0, 11)])
+    def test_incoming_batch_keeps_five_newest_even_when_batch_exceeds_high_water(self, prior, incoming):
+        from ouroboros.loop_messages import _append_or_merge_user_content
+
+        messages = [{"role": "user", "content": [_image_block(str(idx), caption=f"shot-{idx}")]}
+                    for idx in range(prior)]
+        _append_or_merge_user_content(messages, [
+            _image_block(str(idx), caption=f"shot-{idx}") for idx in range(prior, prior + incoming)])
+        blocks = [block for row in messages for block in row["content"]]
+        live = [block["_caption"] for block in blocks if block.get("type") == "image_url"]
+        assert live == [f"shot-{idx}" for idx in range(prior + incoming - MAX_LIVE_IMAGE_BLOCKS, prior + incoming)]
+        assert sum("[image evicted:" in block.get("text", "") for block in blocks) == prior + incoming - len(live)
+
+    def test_eviction_names_its_change_of_sent_history_and_a_fit_names_none(self):
+        """The evicted bytes were already sent: the next observation says who changed them."""
+        from types import SimpleNamespace
+
+        from ouroboros.loop_messages import _append_or_merge_user_content
+        from ouroboros.transcript_prefix import SANCTION_ATTR
+
+        for prior, origin in ((LIVE_IMAGE_BLOCKS_HIGH_WATER, "image_eviction"), (1, None)):
+            slot = SimpleNamespace()
+            messages = [{"role": "user", "content": [_image_block(str(idx))]} for idx in range(prior)]
+            _append_or_merge_user_content(messages, [_image_block("new")], slot=slot)
+            assert getattr(slot, SANCTION_ATTR, None) == origin
+
+    def test_a_tool_image_names_its_eviction_on_the_live_slot(self, monkeypatch):
+        """view_image and the host's auto-attach run on a staged copy; the stamp belongs to the live slot."""
+        from types import SimpleNamespace
+
+        from ouroboros.tools import vision
+        from ouroboros.transcript_prefix import SANCTION_ATTR
+
+        live = SimpleNamespace(messages=[{"role": "user", "content": [_image_block(str(idx))]}
+                                         for idx in range(LIVE_IMAGE_BLOCKS_HIGH_WATER)])
+        monkeypatch.setattr(vision, "_load_local_image_payload", lambda _ctx, _path, retain_original=False: (
+            {"base64": "QUFB", "mime": "image/png", "source_path": "/tmp/shot.png", "source_sha256": "fixture"}, ""))
+        staged = SimpleNamespace(messages=live.messages)
+        ok, _note = vision.attach_local_image_to_context(staged, "shot.png", stamp=live)
+        assert ok and getattr(live, SANCTION_ATTR, None) == "image_eviction"
+        assert getattr(staged, SANCTION_ATTR, None) is None
 
     def test_placeholder_includes_reviewable_path(self):
         from ouroboros.loop_messages import _evict_stale_image_blocks
@@ -121,7 +169,7 @@ class TestImageEviction:
         block = _image_block("a", caption="screen")
         block["_source_path"] = "/data/uploads/screenshots/x.png"
         messages = [{"role": "user", "content": [block]}]
-        _evict_stale_image_blocks(messages, incoming=MAX_LIVE_IMAGE_BLOCKS)
+        _evict_stale_image_blocks(messages, incoming=LIVE_IMAGE_BLOCKS_HIGH_WATER)
         text = messages[0]["content"][0]["text"]
         # Re-view hint points at view_image (local-file, native context, NOT web-gated);
         # VLM tools are also outside _WEB_TOOLS as of v6.45.
@@ -190,20 +238,27 @@ class TestCompactionAndLanes:
             _image_block("a"),
         ])
         assert "hello" in text
-        assert "[image omitted: model has no vision" in text
+        # The marker names our lane, never the model.
+        assert "[image omitted: our GigaChat transport lane cannot carry images" in text
+        assert "model has no vision" not in text
 
     def test_provider_payload_strips_internal_metadata(self):
         from ouroboros.llm import LLMClient
 
         cleaned = LLMClient._copy_messages_with_cache_policy(
-            [{"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": "u"}, "_caption": "c", "_source_path": "p"},
+            [{"role": "tool", "tool_call_id": "i", "content": "staged", "_review_image_id": "1:i"},
+             {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "u"}, "_caption": "c", "_source_path": "p",
+                 "_source_sha256": "hash", "_review_image_id": "1:i"},
             ]}],
             allow_message_cache_control=False,
             flatten_tool_content_blocks=False,
         )
-        block = cleaned[0]["content"][0]
+        assert "_review_image_id" not in cleaned[0] and cleaned[0]["tool_call_id"] == "i"
+        block = cleaned[1]["content"][0]
         assert "_caption" not in block and "_source_path" not in block
+        assert "_source_sha256" not in block and "_review_image_id" not in block
+        assert block["image_url"] == {"url": "u"}
 
     def test_vision_preparation_runs_outside_main_physical_binding(self, tmp_path, monkeypatch):
         from ouroboros import usage_accounting as ua
@@ -243,32 +298,27 @@ class TestCompactionAndLanes:
 
 
 class TestNativeScreenshotInjection:
-    def test_injects_for_vision_model(self, tmp_path, monkeypatch):
+    def _inject(self, tmp_path, monkeypatch, model):
         import ouroboros.tools.browser as browser_mod
 
-        monkeypatch.setenv("OUROBOROS_MODEL", "openai/gpt-5.5")
+        monkeypatch.setenv("OUROBOROS_MODEL", model)
 
         class Ctx:
             drive_root = tmp_path
             messages = [{"role": "user", "content": "start"}]
 
         note = browser_mod._inject_native_screenshot(Ctx(), base64.b64encode(b"png").decode())
-        assert "natively" in note
-        content = Ctx.messages[-1]["content"]
-        assert isinstance(content, list)
-        assert any(b.get("type") == "image_url" for b in content if isinstance(b, dict))
-        shots = list((tmp_path / "uploads" / "screenshots").glob("*.png"))
-        assert shots, "screenshot must be persisted for re-view"
+        return Ctx, note
 
-    def test_skipped_for_non_vision_model(self, tmp_path, monkeypatch):
-        import ouroboros.tools.browser as browser_mod
-
-        monkeypatch.setenv("OUROBOROS_MODEL", "deepseek/deepseek-chat")
-
-        class Ctx:
-            drive_root = tmp_path
-            messages = [{"role": "user", "content": "start"}]
-
-        note = browser_mod._inject_native_screenshot(Ctx(), base64.b64encode(b"png").decode())
-        assert note == ""
-        assert Ctx.messages[-1]["content"] == "start"
+    def test_injects_into_canonical_context_whatever_the_model(self, tmp_path, monkeypatch):
+        """The screenshot is canonical input for every route; the send policy decides
+        what a route receives, so the attach step never judges the model."""
+        for index, model in enumerate(("openai/gpt-5.5", "deepseek/deepseek-chat")):
+            ctx, note = self._inject(tmp_path / str(index), monkeypatch, model)
+            # Stored in context is not the same as seen by the model: the note says so.
+            assert "in your context as an image" in note and "natively" not in note
+            content = ctx.messages[-1]["content"]
+            assert isinstance(content, list)
+            assert any(b.get("type") == "image_url" for b in content if isinstance(b, dict))
+            shots = list((tmp_path / str(index) / "uploads" / "screenshots").glob("*.png"))
+            assert shots, "screenshot must be persisted for re-view"

@@ -8,39 +8,46 @@ import contextlib
 import hashlib
 import pathlib
 import queue
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import logging
 
-from ouroboros import model_concurrency
-from ouroboros.llm_observability import persist_observed_call
+from ouroboros import model_concurrency, working_checkpoint
+from ouroboros.llm_observability import persist_observed_call, host_step, round_receipt, emit_main_call_state as _emit_main_llm_call_state
+from ouroboros.context_timing import timed
 from ouroboros.config import get_finalization_grace_sec, NETWORK_WAIT_BACKOFF_MAX_SEC  # noqa: F401 - legacy monkeypatch seam
 from ouroboros.deadline_utils import (
     owner_deadline_exhausted,
-    seconds_until,
     main_transport_timeout_sec as _main_transport_timeout,
 )
+from ouroboros.knowledge import observed_route_stamp
 from ouroboros.llm import LLMClient, LocalContextTooLargeError, add_usage
-from ouroboros.llm_claudexor import propagate_model_error
-from ouroboros.model_wait import propagate_model_control
-from ouroboros.openai_chat_dispatch import CUSTOM_RECEIPTS_USAGE_KEY, pop_custom_validation_receipts
-from ouroboros.llm_attempt import PROVIDER_POLICY_REFUSAL, _is_provider_policy_refusal  # typed-refusal contract owner
-from ouroboros.observability import new_call_id, new_execution_id, persist_call
-from ouroboros.pricing import emit_llm_usage_event, estimate_cost_optional, infer_model_category
-from ouroboros.task_pacing import main_loop_wire_options
-from ouroboros.transport_custody import attempt_custody_event_fields, is_pre_dispatch_transport_failure, is_retryable_transport_death
-from ouroboros._usage_response import provider_cost_value as _provider_cost_value
-from ouroboros.usage_accounting import (
-    PhysicalAttemptContext,
-    UsageAccountingError,
-    bind_physical_attempt_context,
+from ouroboros.llm_claudexor import ClaudexorModelNotDispatched, propagate_model_error, presence_refusal_unstarted
+from ouroboros.llm_substitution import same_route_refusal, stamp_substitutions
+from ouroboros.model_wait import (
+    OWNER_WORDS_WAITING, ModelWaitInterrupted, current_model_wait, model_wait_reason, propagate_model_control,
 )
+from ouroboros.openai_chat_dispatch import CUSTOM_RECEIPTS_USAGE_KEY, pop_custom_validation_receipts
+from ouroboros.llm_attempt import PROVIDER_POLICY_REFUSAL, _is_provider_policy_refusal, single_physical_send, track_physical_attempts
+from ouroboros.observability import mark_last_answer, new_call_id, new_execution_id, persist_call
+from ouroboros.pricing import emit_llm_usage_event, infer_model_category, normalize_usage_cost as _normalize_usage_cost
+from ouroboros.send_clock import main_send_scope
+from ouroboros.task_pacing import main_loop_wire_options
+from ouroboros.task_custody import canonical_owner_root
+from ouroboros.transport_custody import attempt_custody_event_fields, is_pre_dispatch_transport_failure, is_retryable_transport_death, outcome_unknown_on_chain
+from ouroboros._usage_response import CONTENT_REFUSAL_FINISH_REASONS, OUTPUT_LIMIT_FINISH_REASONS, TOOL_CALL_FINISH_REASONS, output_exhaustion_facts, response_finish_reason
+from ouroboros.usage_accounting import PhysicalAttemptContext, PhysicalAttemptPreconditionFailed, UsageAccountingError, bind_physical_attempt_context, current_usage_scope, last_physical_attempt_capture, physical_attempt_capture_from_exception
+from ouroboros.physical_attempt_context import observe_dispatch
+from ouroboros.primary_route_observation import note_content_refusal
+from ouroboros.transcript_prefix import note_prefix_answer, refresh_attempt_prefix, served_account_fields, settle_rewrite_reread
+from ouroboros.contracts.record_contract import RECORD_CONTRACT_VERSION
+from ouroboros.event_usage import REPORTED_TOKENS_KEY, event_token_counts
 from ouroboros.utils import (
     append_jsonl,
     emit_cognitive_operation_event,
-    emit_main_llm_call_state_event,
     emit_log_event,
     has_log_sink,
     sanitize_tool_result_for_log,
@@ -126,18 +133,19 @@ def fold_retrieval_usage(accumulated_usage: Dict[str, Any], usage: Dict[str, Any
     record["urls_identity_sha256"] = identity
     accumulated_usage["retrieval"] = record
 
-# Per-class retry policy: TRANSIENT provider failures (finish_reason=null
-# glitches, 429/5xx/overloaded) get a larger same-model attempt budget than
-# permanent classes, because the owner deliberately runs single-model setups
-# (all slots = one model, empty fallback) for clean measurement and a 3-attempt
-# cap turned recoverable provider blips into whole-task "No viable fallback
-# model configured" deaths. Permanent classes (auth/quota/bad_request/too
-# large) keep failing fast. There is NO cross-model fallback here — the same
-# request is retried on the SAME model.
+# Per-class retry policy: TRANSIENT provider failures (finish_reason=null glitches, 429/5xx/overloaded)
+# get a larger same-model attempt budget than permanent classes, because the owner deliberately runs
+# single-model setups (all slots = one model, empty fallback) for clean measurement and a 3-attempt cap
+# turned recoverable provider blips into whole-task "No viable fallback model configured" deaths.
+# Permanent classes (auth/quota/bad_request/too large) keep failing fast. There is NO cross-model
+# fallback here — the same request is retried on the SAME model. One narrower class (owner decision
+# 21.10.2026, #1886): a configured API child whose stream the provider ended with an explicit timeout
+# after model output gets at most ONE repeat (``TIMEOUT_REPEAT_KEY``); after it nothing more is sent on
+# the round and its parent, which chose that actor, decides.
 _TRANSIENT_RETRY_KINDS = frozenset({"provider_transient", "provider_incomplete_response"})
-# OB-01: stamped when THIS invocation spent its same-model retry wall without a
-# usable response; entry-cleared per invocation; PERMANENT classes leave it unspent.
-RETRY_WALL_EXHAUSTED_KEY = "_llm_retry_wall_exhausted"
+# OB-01: stamped when THIS invocation spent its same-model retry wall without a usable response; entry-cleared
+# per invocation; PERMANENT classes leave it unspent. Its twin: a series of 2+ attempts (not a deadline) ended it.
+RETRY_WALL_EXHAUSTED_KEY, RETRY_ATTEMPTS_SPENT_KEY = "_llm_retry_wall_exhausted", "_llm_retry_attempts_spent"
 # Error kinds that put a model on the F1 fallback cooldown. Superset of the same-model
 # retry kinds: a body-error 429 (HTTP 200 with an error in the body — the canonical
 # cloud.ru/OpenRouter rate-limit shape) is classified "rate_limit", which must cool the
@@ -147,8 +155,8 @@ _COOLDOWN_ERROR_KINDS = _TRANSIENT_RETRY_KINDS | frozenset({"rate_limit"})
 # A subscription window that is spent but heals on a timer. SSOT for the name.
 # Deliberately NOT `quota_exhausted`: that class is classified PERMANENT, which is
 # correct for a billing refusal (402, no credits) and wrong for a plan window whose
-# only cure is waiting. Scheduling follows `reset_at`, not the 60s-capped exponential
-# backoff, so a six-hour window never becomes sixty one-minute retries.
+# only cure is waiting. Its `reset_at` is a disclosed fact, never a sleep: configured
+# routes answer first, then model_wait's visible wait (or inline Presence's typed refusal).
 SUBSCRIPTION_WINDOW_EXHAUSTED = "subscription_window_exhausted"
 _TRANSIENT_RETRY_DEFAULT = 6
 _TRANSIENT_BACKOFF_CAP_SEC = NETWORK_WAIT_BACKOFF_MAX_SEC
@@ -158,16 +166,62 @@ _TRANSIENT_BACKOFF_CAP_SEC = NETWORK_WAIT_BACKOFF_MAX_SEC
 _DEADLINE_RETRY_FLOOR_SEC = 10.0
 # Bounded PAID repeat of a dispatched request whose socket died with a typed
 # transport death (transport_custody.is_retryable_transport_death — never a
-# timeout, status, body error or pre-dispatch failure): the primary main-loop
-# round dispatch alone opts in, at most this many extra physical sends per ROUND
-# (≤3 unresolved upper bounds), each its own ledger attempt; backoff by death
-# ordinal. Every other caller keeps the default 0 = the no-resend doctrine.
+# timeout, status, body error or pre-dispatch failure): an inline Presence turn's
+# primary round dispatch alone opts in, at most this many extra physical sends per
+# ROUND (≤3 unresolved upper bounds), each its own ledger attempt; backoff by death
+# ordinal. Every other caller passes 0: its new generation is the round's recovery.
 _TRANSPORT_DEATH_RETRIES = 2
 _TRANSPORT_DEATH_BACKOFF_SEC = (4.0, 8.0)
-# Round-keyed repeat counter on the shared usage dict ({"round_id", "count"}):
-# the wait episode's free redial re-enters call_llm_with_retry with the SAME
-# round id, so the budget must not re-arm per invocation.
+# Round-keyed repeat counter on the shared usage dict ({"round_id", "count"}): the wait episode's free
+# redial re-enters call_llm_with_retry with the SAME round id, so the budget must not re-arm per invocation.
 TRANSPORT_DEATHS_KEY = "_transport_deaths"
+# Stamped by the round gate before each round call: an open wait episode paces its own redials, so its call sends once.
+TRANSPORT_WAIT_REDIAL_KEY = "_transport_wait_redial"
+# A local pre-dispatch refusal's own candidate facts (``LocalContextTooLargeError.refused_candidate``), for the
+# round's one strict-shrink retry; a wait's reprepare rebinds the physical context of the remaining attempts.
+REFUSED_CANDIDATE_KEY, REBOUND_PHYSICAL_CONTEXT_KEY = "_refused_candidate", "_physical_context_rebound"
+# The logical round's first started frame ({"round_id", "at": monotonic}); retries, fallbacks and redials keep it.
+ROUND_STARTED_KEY = "_llm_round_started"
+# A round's timeout repeat ({"round_id", "first": the timed-out attempt's failure row, "budget_spent"}), written when
+# it is planned or refused: while it stands the round makes no call but that repeat; only a usable response clears it.
+TIMEOUT_REPEAT_KEY = "_llm_timeout_repeat"
+
+
+def _save_timeout_repeat(usage: Dict[str, Any], *, failed: bool = False) -> None:
+    record = usage.get(TIMEOUT_REPEAT_KEY)
+    if record is not None:
+        if failed:
+            record.update(state="spent", repeat={**record.get("repeat", {}), **(usage.get("_last_llm_failure") or {})})
+            receipt = last_physical_attempt_capture()
+            if "attempt_custody_state" not in (usage.get("_last_llm_failure") or {}):
+                record["repeat"]["attempt_custody_state"] = (receipt.state if receipt is not None
+                    and receipt.attempt_id == record["repeat"].get("physical_attempt_id") else None)
+        working_checkpoint.save_model_call()
+
+
+def timeout_repeat_blocked(usage: Dict[str, Any]) -> bool:
+    """A restored dispatch has no answer receipt; neither a new ID nor round renews it."""
+    record = usage.get(TIMEOUT_REPEAT_KEY) or {}
+    if record.get("state") not in {"dispatched", "spent"}:
+        return False
+    failure = record.get("repeat") or {}
+    if record["state"] == "dispatched":
+        failure = {**failure, "failure_code": "provider_outcome_unknown",
+                   "error": "Repeat dispatch was recorded; its provider outcome is UNKNOWN."}
+        record["repeat"] = failure
+    usage.update(execution_status="infra_failed", reason_code="provider_unavailable",
+                 _last_llm_failure=failure, _last_llm_error_kind=failure.get("failure_code", "provider_unavailable"),
+                 _last_llm_error=failure.get("error", ""))
+    return True
+
+
+def _claim_timeout_repeat(usage: Dict[str, Any], call_ids: Dict[str, Any], reservation: Any) -> None:
+    record = usage[TIMEOUT_REPEAT_KEY]
+    if record.get("state") != "granted":
+        raise PhysicalAttemptPreconditionFailed("timeout repeat already dispatched")
+    record.update(state="dispatched", repeat={**call_ids, "physical_attempt_id": reservation.attempt_id,
+                                              "attempt_custody_state": "reserved"})  # write-ahead, not a wire receipt
+    _save_timeout_repeat(usage)
 
 
 def transient_retry_max(default_retries: int) -> int:
@@ -190,29 +244,35 @@ def transient_retry_max(default_retries: int) -> int:
     return max(int(default_retries), value)
 
 
-def _empty_response_log_msg(usage: Dict[str, Any], is_provider_glitch: bool) -> str:
+def _empty_response_log_msg(usage: Dict[str, Any], is_provider_glitch: bool, exhausted: bool = False) -> str:
     """Honest message for an empty/incomplete LLM response: a transient provider
     body-error (OpenRouter 429/5xx inside an HTTP 200, surfaced as usage
     ``provider_error``) that a same-model reroute could not escape is named as
-    itself, not as a blank finish_reason=null glitch. Pure: the error KIND is owned
-    by the caller's typed assignment (``_cooldown_kind_for_empty_response``)."""
+    itself, not as a blank finish_reason=null glitch, and an output-exhausted reply
+    as itself. Pure: the error KIND is owned by the caller's typed assignment."""
     provider_error = usage.get("provider_error") if isinstance(usage, dict) else None
     if isinstance(provider_error, dict):
         return f"Provider returned a body error (code={provider_error.get('code')}): {provider_error.get('message')}"
     if is_provider_glitch:
         return "Provider returned incomplete response (finish_reason=null)"
+    if exhausted:
+        return "LLM reply ended on its output limit before any visible text or tool call"
     return "LLM returned empty response (no content, no tool_calls)"
 
 
 def _classify_empty_response(usage: Dict[str, Any], msg: Dict[str, Any]) -> Tuple[str, bool, bool]:
     """Classify an empty / no-tool-call response → (event_type, is_provider_glitch,
-    permanent_body_error). A TYPED non-transient body error (WA1 kind
-    ``provider_error``: auth / quota / bad_request) is PERMANENT — a same-model
-    reroute already failed in the transport, so retrying here only burns the
-    transient budget. Only rate_limit / provider_transient body errors and a bare
-    ``finish_reason=null`` glitch are retryable."""
-    finish_reason = msg.get("finish_reason") or msg.get("stop_reason")
-    if str(finish_reason or "").strip().lower() in _STRUCTURED_CONTEXT_OVERFLOW_CODES:
+    permanent), reading the finish once (``response_finish_reason``). Structured
+    overflow and a TYPED non-transient body error (WA1 kind ``provider_error``: auth /
+    quota / bad_request) are PERMANENT — a same-model reroute already failed in the
+    transport, so retrying here only burns the transient budget. So is output
+    exhaustion, an empty reply without a body error that ended on its output limit:
+    the same request ends the same way. It stays an ``llm_empty_response`` (the only
+    permanent one; its kind is ``llm_output_exhausted``). So is the provider's own
+    content refusal: ``provider_content_refusal``, kind ``content_filter``, a route fact.
+    Only rate_limit / provider_transient body errors and a missing or null finish (a glitch) retry."""
+    finish = str(response_finish_reason(usage, msg)[1] or "").strip().lower()
+    if finish in _STRUCTURED_CONTEXT_OVERFLOW_CODES:
         return "remote_context_overflow", False, True
     body_err = usage.get("provider_error") if isinstance(usage, dict) else None
     if isinstance(body_err, dict) and any(
@@ -220,16 +280,15 @@ def _classify_empty_response(usage: Dict[str, Any], msg: Dict[str, Any]) -> Tupl
         for key in ("code", "type")
     ):
         return "remote_context_overflow", False, True
-    is_provider_glitch = finish_reason is None
-    body_kind = str((body_err or {}).get("kind") or "") if isinstance(body_err, dict) else ""
-    permanent_body_error = bool(body_err) and body_kind not in ("rate_limit", "provider_transient")
-    if permanent_body_error:
-        event_type = "provider_body_error"
-    elif is_provider_glitch:
-        event_type = "provider_incomplete_response"
-    else:
-        event_type = "llm_empty_response"
-    return event_type, is_provider_glitch, permanent_body_error
+    if not body_err and finish in OUTPUT_LIMIT_FINISH_REASONS:
+        return "llm_empty_response", False, True
+    if not body_err and finish in CONTENT_REFUSAL_FINISH_REASONS:
+        return "provider_content_refusal", False, True
+    is_provider_glitch = not finish
+    transient_body = isinstance(body_err, dict) and body_err.get("kind") in ("rate_limit", "provider_transient")
+    permanent = bool(body_err) and not transient_body
+    event_type = "provider_body_error" if permanent else "provider_incomplete_response" if is_provider_glitch else "llm_empty_response"
+    return event_type, is_provider_glitch, permanent
 
 
 def _attempt_loop_budget(max_retries: int, attempt_cap: Optional[int]) -> int:
@@ -249,16 +308,20 @@ def _record_and_emit_empty_response(
 ) -> tuple:
     """Classify an empty / no-tool-call response, log + emit its events, and stamp
     accumulated_usage (last error / execution_status / reason_code / F1 cooldown kind).
-    Returns ``(event_type, is_provider_glitch, permanent_body_error)`` for the caller's
-    retry decision. Extracted from call_llm_with_retry to keep that loop readable."""
-    finish_reason = msg.get("finish_reason") or msg.get("stop_reason")
+    Returns ``(event_type, is_provider_glitch, permanent)`` for the caller's retry
+    decision. Extracted from call_llm_with_retry to keep that loop readable."""
+    finish_reason = response_finish_reason(usage, msg)[1]
     body_error = usage.get("provider_error") if isinstance(usage, dict) and isinstance(usage.get("provider_error"), dict) else {}
-    event_type, is_provider_glitch, permanent_body_error = _classify_empty_response(usage, msg)
-    log_msg = _empty_response_log_msg(usage, is_provider_glitch)
+    event_type, is_provider_glitch, permanent = _classify_empty_response(usage, msg)
+    exhausted = event_type == "llm_empty_response" and permanent  # the classifier's output exhaustion
+    refused = event_type == "provider_content_refusal"
+    words = note_content_refusal(accumulated_usage, usage, msg) if refused else {}  # its own words, for its round's row
+    log_msg = (f"The provider's content filter stopped this request (finish_reason={finish_reason})" if refused
+               else _empty_response_log_msg(usage, is_provider_glitch, exhausted))
     log.warning("%s, attempt %d/%d", log_msg, attempt + 1, transient_budget)
     _emit_empty_response_events(
         event_type, event_queue=event_queue, drive_logs=drive_logs,
-        base={"task_id": task_id, "execution_id": execution_id, "round_id": round_id,
+        base={"task_id": task_id, "execution_id": execution_id, "round_id": round_id, **_scope_lineage(),
               "llm_call_id": llm_call_id, "round": round_idx, "attempt": attempt + 1,
               "model": model, "finish_reason": finish_reason, "task_attempt": task_attempt,
               # WHICH upstream endpoint served (or refused) this round, plus the typed class
@@ -266,7 +329,7 @@ def _record_and_emit_empty_response(
               # naming only the MODEL cannot attribute a same-model provider incident.
               "response_provider": usage.get("response_provider"),
               "provider_error_kind": body_error.get("kind"),
-              **context_fit_event_fields},
+              **words, **context_fit_event_fields},
         task_type=task_type,
         details={"content": content, "tool_calls": tool_calls,
                  "request_ref": request_ref, "response_ref": response_ref},
@@ -274,16 +337,25 @@ def _record_and_emit_empty_response(
     if event_type == "remote_context_overflow":
         status, reason, kind = "infra_failed", "llm_api_error", "context_overflow"
     else:
-        status = "infra_failed" if (is_provider_glitch and not permanent_body_error) else "failed"
+        status = "infra_failed" if (is_provider_glitch and not permanent) else "failed"
         reason = event_type
-        # Cooldown signal for the F1 fallback gate (see helper; not a retry change).
-        kind = _cooldown_kind_for_empty_response(body_error, event_type)
+        # Cooldown signal for the F1 fallback gate (see helper; not a retry change); exhaustion never cools.
+        kind = ("llm_output_exhausted" if exhausted else "content_filter" if refused
+                else _cooldown_kind_for_empty_response(body_error, event_type))
     accumulated_usage.update({
         "_last_llm_error": _short_error_text(log_msg), "execution_status": status,
-        "reason_code": reason, "_last_llm_error_kind": kind,
+        "reason_code": reason, "_last_llm_error_kind": kind, "_last_llm_attempt_custody": "",  # a response arrived
     })
-    accumulated_usage.get("_last_llm_call_meta", {}).update(failure_code=kind)
-    return event_type, is_provider_glitch, permanent_body_error
+    if exhausted:  # this attempt's own facts for the next round's host fact (loop.run_llm_loop)
+        capture = last_physical_attempt_capture()  # the response's own receipt, read as send_clock reads it
+        sent = capture.max_completion_tokens if capture is not None and capture.state in {"settled", "dispatched"} else None
+        accumulated_usage["_last_llm_output_exhausted"] = output_exhaustion_facts(usage, sent)
+    from ouroboros.loop_transport import stamp_owner_provider_message
+    stamp_owner_provider_message(accumulated_usage, {"message": words.get("provider_message")} if refused else body_error)  # its own sentence
+    failure = accumulated_usage["_last_llm_failure"] = accumulated_usage.get("_last_llm_call_meta", {})
+    failure.update(failure_code=kind, error=accumulated_usage["_last_llm_error"])
+    _save_timeout_repeat(accumulated_usage, failed=True)
+    return event_type, is_provider_glitch, permanent
 
 
 def _cooldown_kind_for_empty_response(body_error: Dict[str, Any], event_type: str) -> str:
@@ -304,19 +376,8 @@ def _cooldown_kind_for_empty_response(body_error: Dict[str, Any], event_type: st
     return body_kind if body_kind in _COOLDOWN_ERROR_KINDS else event_type
 
 
-def _retry_backoff_sec(
-    accumulated_usage: Dict[str, Any], error_kind: str, attempt: int, is_transient: bool,
-) -> float:
-    """Seconds to wait before retrying the same request.
-
-    A KNOWN reset instant wins over guesswork: a spent subscription window is scheduled
-    against its own ``reset_at``, never through the 60s-capped exponential, so a
-    six-hour window never becomes sixty one-minute retries. ``_sleep_within_deadline``
-    then honestly refuses when the task deadline cannot absorb that wait.
-    """
-    retry_after = accumulated_usage.get("_last_llm_retry_after_sec")
-    if error_kind == SUBSCRIPTION_WINDOW_EXHAUSTED and retry_after is not None:
-        return max(0.0, float(retry_after))
+def _retry_backoff_sec(attempt: int, is_transient: bool) -> float:
+    """Seconds before retrying the same request; no reset instant ever schedules one."""
     return min(2.0 ** attempt * 4, _TRANSIENT_BACKOFF_CAP_SEC if is_transient else 30.0)
 
 
@@ -326,8 +387,8 @@ def _sleep_within_deadline(
     """Sleep ``seconds`` if the task deadline (epoch seconds) allows another
     attempt afterwards. Returns False — without sleeping — when the remaining
     time budget cannot absorb the backoff, signalling the caller to stop.
-    An optional typed-control wake also returns False after interrupting sleep;
-    only the paid transport-repeat caller opts into that control check."""
+    An optional wake also returns False after interrupting sleep: the paid
+    transport repeat's typed control, an ordinary repeat's unread owner words."""
     if deadline_ts and float(deadline_ts) - time.time() < float(seconds) + _DEADLINE_RETRY_FLOOR_SEC:
         return False
     if wake_check is not None:
@@ -339,26 +400,16 @@ def _sleep_within_deadline(
 
 
 def _emit_retry_deadline_exhausted(
-    drive_logs: pathlib.Path,
-    *,
-    task_id: str,
-    execution_id: str,
-    round_id: str,
-    round_idx: int,
-    attempt: int,
-    model: str,
-    error_kind: str,
+    drive_logs: pathlib.Path, *, task_id: str, execution_id: str, round_id: str,
+    round_idx: int, attempt: int, model: str, error_kind: str,
 ) -> None:
     """Durable record that retries stopped because the deadline could not
     absorb another backoff sleep (emitted by BOTH transient failure paths)."""
     append_jsonl(drive_logs / "events.jsonl", {
         "ts": utc_now_iso(), "type": "llm_retry_deadline_exhausted",
-        "task_id": task_id,
-        "execution_id": execution_id,
-        "round_id": round_id,
+        "task_id": task_id, "execution_id": execution_id, "round_id": round_id,
         "round": round_idx, "attempt": attempt + 1,
-        "model": model,
-        "error_kind": error_kind,
+        "model": model, "error_kind": error_kind,
     })
 
 
@@ -430,7 +481,11 @@ class _LlmErrorContext:
     transport_death_retries: int = 0
     transport_reserve_sec: Optional[float] = None
     stop_retry_check: Optional[Callable[[], bool]] = None
+    owner_input_check: Optional[Callable[[], List[str]]] = None  # unread owner input ids: a granted repeat yields to them
     requested_profile: Optional[str] = None
+    use_local: Optional[bool] = None  # the asked route's locality, for its failure row
+    configured_api_child: bool = False  # its parent chose this exact API actor (``TIMEOUT_REPEAT_KEY``)
+    prior_attempt_id: Optional[str] = None  # the attempt last captured before this call began (``_own_capture``)
 
 
 @dataclass(frozen=True)
@@ -449,8 +504,8 @@ class LlmErrorClassification:
 
 def _emit_live_log(event_queue: Optional[queue.Queue], payload: Dict[str, Any]) -> None:
     """Thin wrapper around the SSOT helper — keeps the call-site signature stable."""
-    emit_log_event(
-        event_queue,
+    timed(
+        "event_put", emit_log_event, event_queue,
         {"ts": utc_now_iso(), **payload},
         log_label="LLM live",
     )
@@ -468,23 +523,35 @@ from ouroboros.context_budget import (  # one overflow vocabulary for every seam
     context_overflow_message as _context_overflow_message,
     output_or_body_size_message as _output_or_body_size_message,
 )
-_FORCED_INCOMPLETE_FINISH_REASONS = _STRUCTURED_CONTEXT_OVERFLOW_CODES | frozenset({
-    "length", "max_tokens", "tool_calls", "function_call", "tool_use",
-})
+_FORCED_INCOMPLETE_FINISH_REASONS = (_STRUCTURED_CONTEXT_OVERFLOW_CODES | OUTPUT_LIMIT_FINISH_REASONS
+                                     | TOOL_CALL_FINISH_REASONS)
 
 
-def forced_response_is_incomplete(response_meta: Optional[Dict[str, Any]]) -> bool:
-    """Return whether a forced provider response is not a complete final."""
+def forced_response_is_incomplete(response_meta: Optional[Dict[str, Any]], *, completion_request: bool = False) -> bool:
+    """Return whether a forced provider response is not a complete final. ``completion_request`` waives
+    exactly the reply's one completion call (its count and tool-call finish) and a provider length cut
+    (owner 30 Oct, A: a whole request is the author's act; its own parse refuses a cut inside it, and
+    ``forced_response_cut`` keeps the fact); an overflowed or null-finished response stays incomplete.
+    The response facts are read, never rewritten."""
     if not isinstance(response_meta, dict):
         return False
     finish_reason = response_meta.get("finish_reason")
-    return bool(response_meta.get("tool_call_count")) or (
+    reasons = _FORCED_INCOMPLETE_FINISH_REASONS - (
+        TOOL_CALL_FINISH_REASONS | OUTPUT_LIMIT_FINISH_REASONS if completion_request else frozenset())
+    return int(response_meta.get("tool_call_count") or 0) > int(completion_request) or (
         response_meta.get("finish_reason_present") is True
         and (
             finish_reason is None
-            or str(finish_reason).strip().lower() in _FORCED_INCOMPLETE_FINISH_REASONS
+            or str(finish_reason).strip().lower() in reasons
         )
     )
+
+
+def forced_response_cut(response_meta: Optional[Dict[str, Any]]) -> str:
+    """The provider's output-limit finish of a forced response, '' when it named none."""
+    meta = response_meta if isinstance(response_meta, dict) else {}
+    finish = str(meta.get("finish_reason") or "").strip().lower()
+    return finish if meta.get("finish_reason_present") is True and finish in OUTPUT_LIMIT_FINISH_REASONS else ""
 
 
 _NON_RETRYABLE_PROVIDER_MARKERS = {
@@ -492,6 +559,7 @@ _NON_RETRYABLE_PROVIDER_MARKERS = {
         "insufficient credits",
         "insufficient_credit",
         "insufficient_quota",
+        "1113",  # Z.ai "Insufficient balance" (HTTP 429): billing, not a rate limit
         "quota exceeded",
         "billing",
         "payment required",
@@ -526,7 +594,6 @@ _NON_RETRYABLE_PROVIDER_MARKERS = {
 _RETRYABLE_PROVIDER_MARKERS = (
     "rate limit",
     "rate_limit",
-    "429",
     "timeout",
     "temporarily",
     "server error",
@@ -537,20 +604,19 @@ _RETRYABLE_PROVIDER_MARKERS = (
 _RATE_LIMIT_TEXT_MARKERS = (
     "rate limit",
     "rate_limit",
-    "429",
     "tokens per minute",
     "requests per minute",
     "token per minute",
     "request per minute",
-    "tpm",
-    "rpm",
 )
+# Short markers count only as whole tokens, so "1004290 tokens" or "req_1f429ab0" is not a rate limit.
+_RATE_LIMIT_TEXT_PATTERN = re.compile(r"(?<![a-z0-9])(?:429|tpm|rpm)(?![a-z0-9])")
 _RETRYABLE_PROVIDER_CODES = frozenset({"rate_limit_exceeded"})
 
 
 def _is_rate_limit_text(text: str) -> bool:
     low = str(text or "").lower()
-    return any(marker in low for marker in _RATE_LIMIT_TEXT_MARKERS)
+    return any(marker in low for marker in _RATE_LIMIT_TEXT_MARKERS) or bool(_RATE_LIMIT_TEXT_PATTERN.search(low))
 
 
 is_rate_limit_text = _is_rate_limit_text  # public SSOT aliases for the safety lane
@@ -680,16 +746,13 @@ def _exception_provider_message(exc: Exception, safe_error: str = "") -> str:
     cloud.ru content-filter ("guardrails") block vs an ``Extra inputs are not
     permitted`` reasoning_content echo. ``provider_code`` alone cannot tell them
     apart, so surface the body message (sanitized + truncated) into the durable
-    event for the owner. Pure read of ``exc.body``/repr; never changes routing."""
-    body = _exception_body(exc)
-    if isinstance(body, dict):
-        nested = body.get("error")
-        if isinstance(nested, dict) and str(nested.get("message") or "").strip():
-            return sanitize_tool_result_for_log(str(nested.get("message")))[:600]
-        if str(body.get("message") or "").strip():
-            return sanitize_tool_result_for_log(str(body.get("message")))[:600]
-    text = str(safe_error or "").strip()
-    return sanitize_tool_result_for_log(text)[:600] if text else ""
+    event for Logs, never the owner row. Pure read of ``exc.body``/repr; never changes routing."""
+    body = _exception_body(exc)  # always a dict
+    nested = body.get("error") if isinstance(body.get("error"), dict) else {}
+    for text in (nested.get("message"), body.get("message"), str(safe_error or "").strip()):
+        if str(text or "").strip():
+            return sanitize_tool_result_for_log(str(text))[:600]
+    return ""
 
 
 def _provider_code_kind(provider_code: str) -> str:
@@ -713,20 +776,19 @@ def classify_llm_exception(exc: Exception, safe_error: str = "") -> LlmErrorClas
     if getattr(exc, "stream_rejected", False): return LlmErrorClassification("provider_error", False)  # complete wire judged unusable: a local verdict, never a same-model repeat
     if getattr(exc, "code", "") == "model_outcome_unknown":
         return LlmErrorClassification("provider_outcome_unknown", False)
-    if getattr(exc, "code", "") in {"unsupported_parameter", "invalid_continuation", "auth_changed", "model_unavailable"}:
+    if getattr(exc, "code", "") == "model_substituted": return LlmErrorClassification("model_substituted", False, 0, exc.code)  # a well-formed request the route answered with another model: chain-eligible, never cools the requested one
+    if getattr(exc, "code", "") in {"unsupported_parameter", "invalid_continuation", "auth_changed", "model_unavailable", "model_source_unavailable", "model_catalog_identity_mismatch", "model_capability_refused", "model_retry_invalid"}:
         return LlmErrorClassification("bad_request", False, _exception_status_code(exc), exc.code)
-    if getattr(exc, "code", "") == "auth_required":
+    if getattr(exc, "code", "") in {"auth_required", "auth_unavailable", "auth_refresh_failed"}:
         return LlmErrorClassification("auth_error", False, _exception_status_code(exc), exc.code)
     if isinstance(exc, LocalContextTooLargeError):
         return LlmErrorClassification("context_overflow", False)
-    # Structured fact, not a keyword scan (Bible P5): a transport that KNOWS its
-    # window is spent carries the typed code plus the reset instant.
-    if str(getattr(exc, "code", "") or "") == SUBSCRIPTION_WINDOW_EXHAUSTED:
-        reset_at = str(getattr(exc, "reset_at", "") or "")
-        return LlmErrorClassification(
-            SUBSCRIPTION_WINDOW_EXHAUSTED, True, _exception_status_code(exc),
-            "", seconds_until(reset_at), reset_at,
-        )
+    # A reset forecast is evidence, not proof that an unavailable pool exhausted quota.
+    wcode, reset_at = str(getattr(exc, "code", "") or ""), str(getattr(exc, "reset_at", "") or "")
+    if wcode == SUBSCRIPTION_WINDOW_EXHAUSTED:
+        return LlmErrorClassification(wcode, False, _exception_status_code(exc), reset_at=reset_at)
+    if wcode == "credential_pool_exhausted" and reset_at:
+        return LlmErrorClassification("provider_error", False, _exception_status_code(exc), wcode, reset_at=reset_at)
     status_code = _exception_status_code(exc)
     provider_code = _exception_provider_code(exc, safe)
     # Typed refusal (llm_attempt.ProviderPolicyRefusal): nothing upstream answered,
@@ -777,10 +839,11 @@ def classify_llm_exception(exc: Exception, safe_error: str = "") -> LlmErrorClas
     if status_code is not None and 400 <= status_code <= 499:
         return LlmErrorClassification("provider_error", False, status_code, provider_code)
     capture = getattr(exc, "physical_attempt_capture", None)
-    if str(getattr(capture, "state", "") or "") in {"dispatched", "unresolved"}:
+    if outcome_unknown_on_chain(exc):
         # The provider may still finish a request whose socket outcome is
-        # unknown. Neither a same-model retry nor a different paid fallback is
-        # safe until a typed terminal provider fact exists.
+        # unknown, even when an earlier usage frame settled its exact price.
+        # Money does not establish a terminal response. Typed provider errors
+        # above retain their existing classifications and retry policy.
         return LlmErrorClassification(
             "provider_outcome_unknown", False, status_code, provider_code,
         )
@@ -788,16 +851,14 @@ def classify_llm_exception(exc: Exception, safe_error: str = "") -> LlmErrorClas
         str(getattr(capture, "state", "") or "") == "released"
         and str(getattr(capture, "provider", "") or "") != "local"
         and not bool(getattr(capture, "route_is_loopback", False))
-        and is_pre_dispatch_transport_failure(exc)
+        and is_pre_dispatch_transport_failure(exc) and not model_wait_reason(exc)  # an engine resource verdict is no outage
     ):
-        # Typed $0 fact: the request never left this host toward a REMOTE
-        # provider (released custody + typed pre-dispatch transport failure).
-        # Retrying the same request is free and safe; pacing/waiting is owned
-        # by the round-level episode in loop.py, never by this helper. A local
-        # provider's connect failure stays on the generic path — a stopped
-        # local server is not a network outage worth waiting out — and so does
-        # a loopback OpenAI-compatible route (Ollama / LM Studio / vLLM): its
-        # provider stamp is remote-shaped but the server is on this host.
+        # Typed $0 fact: the request never reached a REMOTE provider (released custody + typed pre-dispatch
+        # failure). Retrying the same request is free and safe; the engine's not-delivered receipt repeats within
+        # the ordinary bound (``_stop_after_llm_error``), other pacing is the round-level episode's in loop.py. A local
+        # provider's connect failure stays on the generic path — a stopped local server is not a network outage worth
+        # waiting out — and so does a loopback OpenAI-compatible route (Ollama / LM Studio / vLLM): its provider
+        # stamp is remote-shaped but the server is on this host.
         return LlmErrorClassification(
             "transport_unavailable", True, status_code, provider_code,
         )
@@ -807,87 +868,21 @@ def classify_llm_exception(exc: Exception, safe_error: str = "") -> LlmErrorClas
 
 
 def _remember_llm_call(
-    usage: Dict[str, Any],
-    *,
-    llm_call_id: str, execution_id: str, round_id: str,
-    round_idx: int, attempt: int, model: str, display_model: str, provider: str,
-    request_ref: Dict[str, Any],
-    response_ref: Dict[str, Any],
-    reported_model: Any = None,
-    use_local: Optional[bool] = None,
+    usage: Dict[str, Any], *, call_ids: Dict[str, Any], model: str, display_model: str, provider: str,
+    request_ref: Dict[str, Any], response_ref: Dict[str, Any],
+    reported_model: Any = None, use_local: Optional[bool] = None,
     requested_profile: Optional[str] = None, observed_route: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    call_meta = {"ts": utc_now_iso(),
-        "llm_call_id": llm_call_id,
-        "execution_id": execution_id,
-        "round_id": round_id,
-        "round": round_idx,
-        "attempt": attempt,
-        "model": model,
-        "resolved_model": display_model,
-        "provider": provider,
+) -> None:
+    call_meta = {"ts": utc_now_iso(), **call_ids,
+        "model": model, "resolved_model": display_model, "provider": provider,
         "reported_model": reported_model.strip() if isinstance(reported_model, str) and reported_model.strip() else None,
         "use_local": use_local,
         "request_ref": request_ref.get("manifest_ref") if request_ref else None,
         "response_ref": response_ref.get("manifest_ref") if response_ref else None,
-        "requested_profile": requested_profile,
-        "observed_route": dict(observed_route or {}),
+        "requested_profile": requested_profile, "observed_route": dict(observed_route or {}),
     }
     usage["_last_llm_call_meta"] = call_meta
     usage.setdefault("llm_call_refs", []).append(call_meta)
-    return call_meta
-
-
-def _normalize_usage_cost(
-    usage: Dict[str, Any],
-    *,
-    model: str,
-    use_local: bool,
-) -> tuple[Optional[float], str, str, bool]:
-    raw_cost = usage.get("cost")
-    provider_reported_cost = raw_cost is not None
-    cost = _provider_cost_value(raw_cost) if provider_reported_cost else None
-    display_model = str(usage.get("resolved_model") or model)
-    provider = "local" if use_local else str(usage.get("provider") or "openrouter")
-    if use_local:
-        cost = 0.0
-        display_model = f"{model} (local)"
-    elif provider_reported_cost and cost is None:
-        # Invalid reported cost stays unknown under the shared trust predicate.
-        log.warning(
-            "Provider reported an invalid cost (type=%s, value=%s) for %s; recording "
-            "cost as unknown and skipping estimation",
-            type(raw_cost).__name__,
-            truncate_review_artifact(repr(raw_cost), limit=120),
-            display_model,
-        )
-        usage["cost"] = None
-        usage["cost_final"] = False  # unknown cost is never a closed book
-        return None, display_model, provider, bool(usage.get("cost_estimated"))
-    elif cost is None and provider != "claudexor":
-        from ouroboros._usage_response import observed_processing_mode
-
-        processing_mode = observed_processing_mode(provider, usage)
-        cost = estimate_cost_optional(
-            display_model,
-            int(usage.get("prompt_tokens") or 0),
-            int(usage.get("completion_tokens") or 0),
-            cache_usage={
-                "cached_tokens": int(usage.get("cached_tokens") or 0),
-                "cache_write_tokens": int(usage.get("cache_write_tokens") or 0),
-                "prompt_cache_ttl": usage.get("prompt_cache_ttl"),
-                "cache_write_tokens_by_ttl": (
-                    usage.get("cache_write_tokens_by_ttl")
-                    if isinstance(usage.get("cache_write_tokens_by_ttl"), dict)
-                    else None
-                ),
-            },
-            provider=provider,
-            **({"processing_mode": processing_mode} if processing_mode else {}),
-        )
-    usage["cost"] = cost
-    cost_estimated = bool(usage.get("cost_estimated")) or (cost is not None and not provider_reported_cost)
-    return cost, display_model, provider, cost_estimated
 
 
 def _uncount_transport_death(accumulated_usage: Dict[str, Any]) -> None:
@@ -910,33 +905,41 @@ def _transport_death_repeats(accumulated_usage: Dict[str, Any], round_id: str) -
     return 0
 
 
+def _scope_lineage() -> Dict[str, str]:
+    """The producer's own known lineage, never a history walk."""
+    scope = current_usage_scope()
+    return {key: str(getattr(scope, key)) for key in ("root_task_id", "parent_task_id") if getattr(scope, key, "")}
+
+
 def _record_llm_call_error(
     error: Exception,
     ctx: _LlmErrorContext,
 ) -> bool:
-    """Record and classify an LLM-round exception.
-
-    Emits live/durable error evidence, marks usage as infra-failed, and returns
-    whether the caller must stop retrying the unchanged request.
-    """
+    """Classify an LLM-round exception, emit live/durable evidence and mark usage infra-failed.
+    Return whether the caller must stop retrying the unchanged request."""
     safe_error = sanitize_tool_result_for_log(repr(error))
     classification = classify_llm_exception(error, safe_error)
+    if ctx.task_type == "presence":  # stays True only while every attempt so far provably never started
+        ctx.accumulated_usage["_presence_pre_dispatch_only"] = bool(ctx.accumulated_usage.get("_presence_pre_dispatch_only", True) and presence_refusal_unstarted(error, ctx.round_idx))
     provider_message = _exception_provider_message(error, safe_error)
     # Display metadata must not enter the classifier's text heuristics.
     display_message = getattr(error, "display_message", None)
     display_error = sanitize_tool_result_for_log(display_message) if isinstance(display_message, str) and display_message else safe_error
     custody_fields = attempt_custody_event_fields(error)
-    will_retry = classification.retry_same_request
+    timed_out = bool(ctx.configured_api_child and custody_fields.get("explicit_timeout") and custody_fields.get("model_output_received"))
+    will_retry = classification.retry_same_request or timed_out  # a typed timeout after output, HTTP-shaped or not (#1886)
     repeats = _transport_death_repeats(ctx.accumulated_usage, ctx.round_id)
     backoff = None
     if classification.kind == "provider_outcome_unknown":
         ctx.accumulated_usage["_pending_transport_outcome"] = {
             **custody_fields, "model": ctx.model, "operation_id": str(getattr(error, "operation_id", "") or ""),
+            "model_role": str(getattr(error, "model_role", "") or ""),
             "route": dict(getattr(error, "route", {}) or {}), "outcome": "unknown",
             "request_ref": ctx.request_ref.get("manifest_ref") if ctx.request_ref else None,
+            **({"same_operation_recoverable": True} if getattr(error, "same_operation_recoverable", False) else {}),
         }
-        # Ordinary managed tasks require upstream recovery before a new attempt;
-        # other callers retain their bounded repeat rail.
+        # Only an explicit low-level repeat budget repeats here; each running turn's
+        # new generation belongs to the round's recovery (its continuation and the configured routes).
         if (
             is_retryable_transport_death(error)
             and repeats < ctx.transport_death_retries and ctx.attempt < ctx.transient_budget - 1
@@ -959,7 +962,7 @@ def _record_llm_call_error(
         # The granted repeat's own failure class (a grant writes no class; a later free redial finds it filled).
         ctx.accumulated_usage[TRANSPORT_DEATHS_KEY].setdefault("error_kind", classification.kind)
     identity = {
-        "task_id": ctx.task_id, "execution_id": ctx.execution_id, "round_id": ctx.round_id,
+        "task_id": ctx.task_id, "execution_id": ctx.execution_id, "round_id": ctx.round_id, **_scope_lineage(),
         "llm_call_id": ctx.llm_call_id, "round": ctx.round_idx, "attempt": ctx.attempt + 1,
         "model": ctx.model,
     }
@@ -972,30 +975,43 @@ def _record_llm_call_error(
         "provider_message": provider_message,
         "requested_profile": ((getattr(error, "usage", {}) or {}).get("claudexor") or {}).get("requested_profile", ctx.requested_profile),
         "observed_route": dict(getattr(error, "route", {}) or {}),
-        **custody_fields,
-        **(ctx.context_fit_event_fields or {}),
+        **custody_fields, **({"operation_id": str(error.operation_id)} if getattr(error, "operation_id", "") else {}),
+        **(ctx.context_fit_event_fields or {}), "ledger_attempt_ids": list(getattr(error, "ledger_attempt_ids", None) or []),
         "request_ref": ctx.request_ref.get("manifest_ref") if ctx.request_ref else None,
     }
     if not append_jsonl(ctx.drive_logs / "events.jsonl", error_event) or not has_log_sink():
         emit_log_event(ctx.event_queue, error_event, log_label="LLM call error")
-    ctx.accumulated_usage.setdefault("llm_call_refs", []).append({
-        **{key: error_event[key] for key in ("ts", "llm_call_id", "model", "requested_profile", "observed_route")},
-        "failure_code": classification.kind, "reset_at": classification.reset_at,
-    })
-    ctx.accumulated_usage.update(_last_llm_error=_short_error_text(display_error),
-                                 _last_llm_error_kind=classification.kind, _last_llm_retry_same_request=will_retry)
-    if classification.retry_after_sec is not None:
-        ctx.accumulated_usage.update(_last_llm_retry_after_sec=classification.retry_after_sec,
-                                     _last_llm_reset_at=classification.reset_at)
+    if (owner := canonical_owner_root(ctx.drive_logs.parent)) != ctx.drive_logs.parent.resolve(strict=False):
+        append_jsonl(owner / "logs" / "events.jsonl", error_event, live=False)  # REPLICA_RULE: the drive goes, the charge stays
+    failure = {"error": _short_error_text(display_error), "resource_refusal": model_wait_reason(error),
+        "operation_id": str(getattr(error, "operation_id", "") or ""),
+        "not_dispatched_provider": (getattr(getattr(error, "physical_attempt_capture", None), "provider", "")
+                                    if isinstance(error, ClaudexorModelNotDispatched) else ""),
+        **{key: error_event[key] for key in ("ts", "llm_call_id", "round", "model", "requested_profile", "observed_route", "status_code", "provider_code")},
+        "use_local": ctx.use_local, "failure_code": classification.kind, "reset_at": classification.reset_at, **{key: value for key, value in custody_fields.items()
+            if key in ("physical_attempt_id", "attempt_custody_state", "generation_id", "explicit_timeout", "model_output_received")}}
+    if timed_out or ctx.configured_api_child and TIMEOUT_REPEAT_KEY in ctx.accumulated_usage:
+        failure["manifest_ref"] = persist_call(ctx.drive_logs.parent, task_id=ctx.task_id,
+            call_id=ctx.llm_call_id + "_error", call_type="llm_error", payload=error_event)["manifest_ref"]
+    ctx.accumulated_usage.setdefault("llm_call_refs", []).append(failure)
+    ctx.accumulated_usage["_last_llm_failure"] = failure  # reuse this attempt's row, not the wait's kind
+    ctx.accumulated_usage.update(_last_llm_error=failure["error"], _last_llm_resource_refusal=failure["resource_refusal"],
+                                 _last_llm_error_kind=classification.kind, _last_llm_retry_same_request=will_retry, _last_llm_attempt_custody=custody_fields.get("attempt_custody_state", ""))
+    if classification.reset_at:  # a disclosed fact for the terminal hint, never a retry schedule
+        ctx.accumulated_usage["_last_llm_reset_at"] = classification.reset_at
     else:
-        ctx.accumulated_usage.pop("_last_llm_retry_after_sec", None)
         ctx.accumulated_usage.pop("_last_llm_reset_at", None)
-    for key, value in (("_last_llm_provider_message", provider_message), ("_last_llm_status_code", classification.status_code),
+    from ouroboros.loop_transport import stamp_owner_provider_message
+    stamp_owner_provider_message(ctx.accumulated_usage, error)  # the event above keeps the diagnostic provider_message
+    for key, value in (("_last_llm_status_code", classification.status_code),
                        ("_last_llm_provider_code", classification.provider_code)):
         if value:
             ctx.accumulated_usage[key] = value
+    stamp_substitutions(ctx.accumulated_usage, error)
     ctx.accumulated_usage.update(execution_status="infra_failed", reason_code="llm_api_error")
     if classification.kind == "context_overflow":
+        if getattr(error, "refused_candidate", None):  # the local lane's pre-dispatch refusal: its own comparison facts
+            ctx.accumulated_usage[REFUSED_CANDIDATE_KEY] = dict(error.refused_candidate)
         overflow_event_type = "local_context_overflow" if isinstance(error, LocalContextTooLargeError) else "remote_context_overflow"
         append_jsonl(ctx.drive_logs / "events.jsonl", {
             "ts": utc_now_iso(), "type": overflow_event_type, **identity, "error": safe_error,
@@ -1013,34 +1029,60 @@ def _record_llm_call_error(
 
 
 def _stop_after_llm_error(ctx: _LlmErrorContext) -> bool:
-    """Retry decision for the exception path: ``True`` stops the attempt loop, and
-    every stop except the two transport shapes stamps the OB-01 marker — permanent
-    classes stopped earlier, so a stop here means "the same-model wall is spent"."""
+    """Retry decision for the exception path: ``True`` stops the attempt loop. Every stop except a one-attempt
+    transport stop, an unknown outcome and a granted timeout repeat's own failure stamps the OB-01 marker (a spent
+    not-delivered burst does): permanent classes stopped earlier, so a stop here means "the same-model wall is spent"."""
     accumulated_usage = ctx.accumulated_usage
     error_kind = str(accumulated_usage.get("_last_llm_error_kind") or "")
-    if error_kind == "transport_unavailable":
-        # One free ($0) pre-dispatch attempt; the round-level wait episode owns
-        # redial pacing. NOT a spent wall — the transport-wait terminal owns this.
+    failure = accumulated_usage.get("_last_llm_failure") or {}
+    daemon_not_delivered = (failure.get("not_dispatched_provider") == "claudexor"
+        and failure.get("operation_id") == "" and failure.get("provider_code") in {
+            "daemon_unreachable", "daemon_not_answering", "daemon_starting", "daemon_descriptor_changed"})
+    if TIMEOUT_REPEAT_KEY in accumulated_usage:
+        return True  # its repeat failed, whatever the class: the no-call terminal reads the record and this row
+    if error_kind == "transport_unavailable" and (
+            (failure.get("provider_code") != "transport_not_delivered" and not daemon_not_delivered)
+            or accumulated_usage.get(TRANSPORT_WAIT_REDIAL_KEY) or isinstance(accumulated_usage.get(TRANSPORT_DEATHS_KEY), dict)):
+        # One free attempt: configured routes and the round's episode own an unreachable route's recovery, an open episode
+        # paces its own redials and a held paid repeat sends nothing more. The engine's not-delivered receipt and a typed
+        # Claudexor prepare failure before create first repeat within the ordinary bound, as an overloaded route does.
         return True
     if error_kind == "provider_outcome_unknown":
         from ouroboros.loop_transport import wait_transport_repeat
         return wait_transport_repeat(ctx)
     is_transient = error_kind in _TRANSIENT_RETRY_KINDS
-    # Non-transient retryables: max_retries capped by the loop ceiling (primary: no-op).
-    attempt_budget = ctx.transient_budget if is_transient else min(ctx.max_retries, ctx.transient_budget)
-    backoff = (
-        _retry_backoff_sec(accumulated_usage, error_kind, ctx.attempt, is_transient)
-        if ctx.attempt < attempt_budget - 1 else None
+    timed_out = ctx.configured_api_child and failure.get("explicit_timeout") and failure.get("model_output_received")
+    # Non-transient retryables: max_retries capped by the loop ceiling (primary: no-op); a timeout after output: one.
+    attempt_budget = (min(ctx.transient_budget, ctx.attempt + 2) if timed_out else ctx.transient_budget if is_transient
+                      else min(ctx.max_retries, ctx.transient_budget))
+    backoff = (  # a resource refusal or spent window never resends nor sleeps to a reset
+        _retry_backoff_sec(ctx.attempt, is_transient)
+        if ctx.attempt < attempt_budget - 1 and not accumulated_usage.get("_last_llm_resource_refusal")
+        and error_kind != SUBSCRIPTION_WINDOW_EXHAUSTED else None
     )
+    if timed_out:  # recorded before any sleep: a repeat the loop ceiling or the deadline refuses still hands over
+        accumulated_usage[TIMEOUT_REPEAT_KEY] = {"round_id": ctx.round_id, "first": dict(failure),
+            "state": "granted" if backoff is not None else "spent", "budget_spent": backoff is None}
+        _save_timeout_repeat(accumulated_usage)
     if backoff is not None:
-        if _sleep_within_deadline(backoff, ctx.deadline_ts):
+        # A granted repeat re-sends the request as built. Owner words that arrived meanwhile end its wait: the round start
+        # drains them and rebuilds, same route and round (#2996 joins Main follow-ups to this turn). Words a yield already
+        # met cannot wake again (a row that drain leaves unread); a timeout repeat resends its own bytes.
+        unread = None if timed_out else ctx.owner_input_check
+        fresh = (lambda: not set(unread()) <= set(accumulated_usage.get("_owner_words_met") or ())) if unread else None
+        if _sleep_within_deadline(backoff, ctx.deadline_ts, **({"wake_check": fresh} if fresh else {})):
             return False
+        if fresh is not None and fresh():  # woken for them, or out of time: the round start reads them first
+            accumulated_usage["_owner_words_met"] = [mark for mark in unread() if mark != "direct_incoming"]  # drained
+            append_jsonl(ctx.drive_logs / "events.jsonl", {"ts": utc_now_iso(), "type": "llm_not_dispatched", "task_id": ctx.task_id,
+                         "round": ctx.round_idx, "model": ctx.model, "reason_code": OWNER_WORDS_WAITING, "error_kind": error_kind})
+            raise ModelWaitInterrupted(OWNER_WORDS_WAITING)
         _emit_retry_deadline_exhausted(
             ctx.drive_logs, task_id=ctx.task_id, execution_id=ctx.execution_id,
             round_id=ctx.round_id, round_idx=ctx.round_idx, attempt=ctx.attempt,
             model=ctx.model, error_kind=error_kind,
         )
-    accumulated_usage[RETRY_WALL_EXHAUSTED_KEY] = True
+    accumulated_usage.update({RETRY_WALL_EXHAUSTED_KEY: True, RETRY_ATTEMPTS_SPENT_KEY: 1 < attempt_budget <= ctx.attempt + 1})
     return True
 
 
@@ -1053,26 +1095,29 @@ def _empty_response_wall_spent(is_provider_glitch: bool, permanent_body_error: b
 
 def provider_no_call_source(accumulated_usage: Dict[str, Any], deadline_exhausted: bool) -> Tuple[str, bool]:
     """The provider-unavailable rail's no-call decision → (typed source, wall_spent).
-    Unknown in-flight outcome forbids a RESEND (outranks the wall); a SPENT same-model
-    wall makes one more forced call a second full retry window; the deadline_local
-    rail keeps its grace call, so ``deadline_exhausted`` suppresses the wall. A round
-    still holding an unresolved attempt (its transport-death record: written at a grant,
-    cleared only by a usable response) forbids the resend whatever the sticky kind."""
-    if str(accumulated_usage.get("_last_llm_error_kind") or "") == "provider_outcome_unknown" or isinstance(accumulated_usage.get(TRANSPORT_DEATHS_KEY), dict):
+    Unknown in-flight outcome forbids a RESEND (outranks the wall); a SPENT same-model wall makes
+    one more forced call a second full retry window; the deadline_local rail keeps its grace call,
+    so ``deadline_exhausted`` suppresses the wall but not a granted timeout repeat (its parent
+    decides). A round still holding an unresolved attempt (its transport-death record: written at
+    a grant, cleared only by a usable response) forbids the resend whatever the sticky kind.
+    Sources: ``provider_outcome_unknown_no_resend``, ``resource_refusal_no_resend`` and
+    ``same_route_refusal_no_resend`` (typed refusals), ``timeout_repeat_spent_no_resend`` (``TIMEOUT_REPEAT_KEY``),
+    ``retry_wall_exhausted_no_repay`` (``RETRY_WALL_EXHAUSTED_KEY``, a per-invocation bool on the shared
+    usage dict). The rail stamps ``provider_unavailable`` except for ``resource_refusal_no_resend``."""
+    if (str(accumulated_usage.get("_last_llm_error_kind") or "") == "provider_outcome_unknown"
+            or accumulated_usage.get("_pending_transport_outcome") or isinstance(accumulated_usage.get(TRANSPORT_DEATHS_KEY), dict)):
         return "provider_outcome_unknown_no_resend", False
+    if accumulated_usage.get("resource_refusal"): return "resource_refusal_no_resend", True  # typed temporary refusal: no route or owner wait recovered it
+    if same_route_refusal(accumulated_usage): return "same_route_refusal_no_resend", False  # a salvage call is the same request on the same route, and the accounts that refused it were just marked
+    if TIMEOUT_REPEAT_KEY in accumulated_usage: return "timeout_repeat_spent_no_resend", True  # its repeat answered nothing
     if not deadline_exhausted and bool(accumulated_usage.get(RETRY_WALL_EXHAUSTED_KEY)):
         return "retry_wall_exhausted_no_repay", True
     return "", False
 
 
 def _emit_empty_response_events(
-    event_type: str,
-    *,
-    event_queue: Optional[queue.Queue],
-    drive_logs: pathlib.Path,
-    base: Dict[str, Any],
-    task_type: str,
-    details: Dict[str, Any],
+    event_type: str, *, event_queue: Optional[queue.Queue], drive_logs: pathlib.Path,
+    base: Dict[str, Any], task_type: str, details: Dict[str, Any],
 ) -> None:
     """Emit the live log + durable event for an empty/incomplete LLM response.
 
@@ -1100,6 +1145,8 @@ def _context_fit_event_fields(usage: Dict[str, Any]) -> Dict[str, Any]:
         "context_profile": str(usage.get("_context_profile") or ""),
         "context_measurement_basis": str(usage.get("_context_measurement_basis") or ""),
         "context_measurement_density": float(usage.get("_context_measurement_density") or 0.0),
+        "context_raw_input_tokens": int(usage.get("_context_raw_input_tokens") or 0),
+        "context_reply_allowance_tokens": int(usage.get("_context_reply_allowance_tokens") or 0),  # planned, not sent
         "context_target_total_tokens": usage.get("_context_target_total_tokens"),
         "context_capacity_total_tokens": usage.get("_context_capacity_total_tokens"),
         "context_target_deficit_tokens": usage.get("_context_target_deficit_tokens"),
@@ -1118,36 +1165,40 @@ def _record_round_cache_facts(
     usage: Dict[str, Any],
     *,
     round_idx: int,
+    round_id: str = "",
+    model: str = "",
+    provider: str = "",
 ) -> tuple:
-    """Cold-restart telemetry — FACTS of this round only (no dollar counterfactuals).
+    """Cache facts of this round only (no dollar counterfactuals).
 
-    Returns ``(prompt_cache_ttl, cache_hit_rate, cache_cold_restart,
-    gap_since_prev_round_sec)``: a later round whose prompt was almost entirely
-    re-written is a provider-cache expiry/invalidation made structurally visible,
-    and the gap since the previous successful round is the datum that separates a
-    TTL expiry (long wait) from a prefix rewrite. Also records the APPLIED TTL of
-    this task's latest send — the recorded fact the wait-tool cache-horizon
-    disclosure reads (one place, never re-derived).
+    Returns ``(prompt_cache_ttl, cache_hit_rate, gap_since_prev_round_sec, duration_ms)``: the
+    provider's cached share and the gap since the previous successful round, which separates a
+    TTL expiry (long wait) from a prefix rewrite. Also records the APPLIED TTL of this task's
+    latest send — the recorded fact the wait-tool cache-horizon disclosure reads (one place, never
+    re-derived). ``duration_ms`` spans the logical round from its first started frame (retries,
+    fallbacks and waits included) and settles it: a later call on the same round id (a wrap-up)
+    measures only itself. No verdict ("cold restart") is derived from these counters: on a
+    Codex route the provider reports no cache writes, so one would never fire there.
     """
-    prompt_tokens = int(usage.get("prompt_tokens") or 0)
-    cached_tokens = int(usage.get("cached_tokens") or 0)
-    cache_write_tokens = int(usage.get("cache_write_tokens") or 0)
+    reported = event_token_counts(usage)  # #1578: REPORTED counters; an unreported one makes these null
+    prompt_tokens, cached_tokens = reported["prompt_tokens"], reported["cached_tokens"]
     prompt_cache_ttl = str(usage.get("prompt_cache_ttl") or "")
-    cache_hit_rate = (cached_tokens / prompt_tokens) if prompt_tokens > 0 else 0.0
-    prev_finished = accumulated_usage.get("_last_llm_round_finished_monotonic")
-    gap_since_prev_round_sec = (
-        round(max(0.0, time.monotonic() - float(prev_finished)), 1)
-        if isinstance(prev_finished, (int, float)) else None
-    )
-    cache_cold_restart = bool(
-        round_idx > 1
-        and prompt_tokens > 0
-        and cached_tokens < 0.2 * prompt_tokens
-        and cache_write_tokens > 0.5 * prompt_tokens
-    )
-    accumulated_usage["_last_llm_round_finished_monotonic"] = time.monotonic()
+    known = None not in (prompt_tokens, cached_tokens)
+    cache_hit_rate = (cached_tokens / prompt_tokens if prompt_tokens else 0.0) if known else None
+    now, prev_finished = time.monotonic(), accumulated_usage.get("_last_llm_round_finished_monotonic")
+    gap_since_prev_round_sec = round(max(0.0, now - float(prev_finished)), 1) if isinstance(prev_finished, (int, float)) else None
+    started = accumulated_usage.pop(ROUND_STARTED_KEY, None)
+    duration_ms = round(max(0.0, now - float(started["at"])) * 1000) if isinstance(started, dict) and started.get("round_id") == round_id else None
+    accumulated_usage["_last_llm_round_finished_monotonic"] = now
     accumulated_usage["_last_prompt_cache_ttl"] = prompt_cache_ttl
-    return prompt_cache_ttl, cache_hit_rate, cache_cold_restart, gap_since_prev_round_sec
+    earlier = accumulated_usage.get("_last_round_cache_usage") or {}
+    accumulated_usage["_last_round_cache_usage"] = {  # also this accepted call's own money, as its producer stated it
+        "round": round_idx, "model": model, "provider": provider, "billing": (usage.get("cost_evidence") or {}).get("billing"),
+        **{key: usage.get(key) for key in ("prompt_tokens", "cached_tokens", "cache_write_tokens", "cost", "cost_final")},
+        "finished_at": time.time(), **served_account_fields(usage, earlier, provider, model),  # wall clock: survives a restart
+        REPORTED_TOKENS_KEY: reported}  # cache routing reads the billing-shaped counters above; route facts these
+    settle_rewrite_reread(accumulated_usage)  # this answer measures the history change it carried
+    return prompt_cache_ttl, cache_hit_rate, gap_since_prev_round_sec, duration_ms
 
 
 def _prepare_main_messages(
@@ -1165,93 +1216,80 @@ def _prepare_main_messages(
     model_role: str = "main",
     model_account_override: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    try:
-        from ouroboros.vision_routing import VisionRoutingContext, prepare_messages_for_send
+    from ouroboros import vision_routing
 
-        return prepare_messages_for_send(
+    try:
+        return vision_routing.prepare_messages_for_send(
             messages,
-            routing=VisionRoutingContext(
+            routing=vision_routing.VisionRoutingContext(
                 model=model, llm=llm, accumulated_usage=accumulated_usage,
                 drive_root=drive_root, task_id=task_id, event_queue=event_queue,
                 use_local=use_local, task_attempt=task_attempt, deadline_ts=deadline_ts,
                 model_role=model_role, model_account_override=model_account_override,
             ),
         )
-    except Exception as error:
+    except Exception as error:  # a failed projection never falls back to the canonical pixels
         propagate_model_error(error)
-        log.debug("vision routing preparation failed; falling back to canonical messages", exc_info=True)
-        return messages
+        log.warning("image preparation failed; images withheld per the image-input mode", exc_info=True)
+        return vision_routing.withhold_images(messages, error)
 
 
 def _send_main_candidate(
-    llm: LLMClient,
-    kwargs: Dict[str, Any],
-    *,
-    model: str,
-    use_local: bool,
-    deadline_ts: Optional[float],
+    llm: LLMClient, kwargs: Dict[str, Any], *, model: str, use_local: bool, deadline_ts: Optional[float],
     physical_context: Optional[PhysicalAttemptContext],
     candidate_predicate: Optional[Callable[[Any], Any]],
-    model_context_observer: Any = None,
+    physical_fit_predicate: Optional[Callable[[Any], Any]] = None,
+    send_clock_policy: Any = None, canonical_messages: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    binding = (
-        contextlib.nullcontext() if physical_context is None and candidate_predicate is None
-        else bind_physical_attempt_context(physical_context, candidate_predicate=candidate_predicate)
-    )
-    with model_concurrency.model_call_slot(model, use_local, deadline_ts), binding:
-        result = llm.chat(**kwargs)
-        if callable(model_context_observer):
-            model_context_observer(kwargs["messages"])
-        return result
+    predicate = candidate_predicate if candidate_predicate is not None else physical_fit_predicate
+    if candidate_predicate is not None and physical_fit_predicate is not None:
+        predicate = lambda request: candidate_predicate(request) is not False and physical_fit_predicate(request) is not False
+    binding = (contextlib.nullcontext() if physical_context is None and predicate is None else
+               bind_physical_attempt_context(physical_context, candidate_predicate=predicate))
+    # Main's clock line per physical send; the consumed one joins ``canonical_messages``.
+    with model_concurrency.model_call_scope(model, use_local, deadline_ts), binding, main_send_scope(send_clock_policy, canonical_messages):
+        return llm.chat(**kwargs)
 
 
-def _take_custom_receipts(
-    usage: Dict[str, Any],
-    msg: Dict[str, Any],
-    accumulated_usage: Dict[str, Any],
-) -> None:
+def _take_response_facts(usage: Dict[str, Any], msg: Dict[str, Any], accumulated_usage: Dict[str, Any]) -> None:
+    model_facts = usage.get("claudexor") or {}
+    accumulated_usage["_model_route"] = dict(model_facts.get("route") or {})
+    accumulated_usage["_model_substitutions"] = model_facts.get("substituted") or []
+    for stale in ("_last_llm_error", "_last_llm_error_kind", "_last_llm_failure", "_acting_route_failure", "_last_llm_retry_same_request",
+                  "_last_llm_status_code", "_last_llm_provider_code", "_last_llm_provider_message",
+                  "_last_llm_provider_fields", "_last_llm_provider_message_cut", "_last_llm_resource_refusal",
+                  "_last_llm_output_exhausted", "_last_llm_attempt_custody"):
+        accumulated_usage.pop(stale, None)
     receipts = pop_custom_validation_receipts(usage, msg.get("tool_calls") or [])
     accumulated_usage.pop(CUSTOM_RECEIPTS_USAGE_KEY, None)
     if receipts:
         accumulated_usage[CUSTOM_RECEIPTS_USAGE_KEY] = receipts
 
 
-def _emit_main_llm_call_state(
-    event_queue: Optional[queue.Queue],
-    identity: Tuple[Any, ...],
-    phase: str,
-) -> None:
-    task_id, task_attempt, llm_call_id, execution_id, round_id, call_attempt = identity
-    if phase != "started":
-        # Completion closes both observations together. Start is intentionally
-        # split: preparation begins before the actual in-flight provider call.
-        _emit_llm_operation(event_queue, task_id, llm_call_id, phase, task_attempt, execution_id, round_id)
-    emit_main_llm_call_state_event(
-        event_queue,
-        task_id=task_id,
-        task_attempt=task_attempt,
-        llm_call_id=llm_call_id,
-        execution_id=execution_id,
-        round_id=round_id,
-        call_attempt=call_attempt,
-        phase=phase,
-    )
+def _own_capture(capture: Any, prior_attempt_id: Optional[str]) -> Any:
+    """``capture`` when it is the current logical call's own physical attempt, else None: the attempt captured last
+    before the call began (``prior_attempt_id``) stays its own call's fact, so a call that dispatched nothing (a
+    fallback refused before its send) carries none rather than borrowing the preceding attempt's."""
+    return capture if capture is not None and getattr(capture, "attempt_id", None) != prior_attempt_id else None
 
 
 def _handle_main_llm_call_exception(
     error: Exception, ctx: _LlmErrorContext, call_identity: Tuple[Any, ...],
 ) -> bool:
     """Close the exact call and decide whether the attempt loop must stop."""
-    _emit_main_llm_call_state(ctx.event_queue, call_identity, "failed")
+    _emit_main_llm_call_state(ctx.event_queue, call_identity, "failed",
+                              capture=_own_capture(physical_attempt_capture_from_exception(error), ctx.prior_attempt_id))
     ctx.accumulated_usage.pop(CUSTOM_RECEIPTS_USAGE_KEY, None)
     propagate_model_control(error)  # Task control never enters provider fallback/retry.
-    return _record_llm_call_error(error, ctx) or _stop_after_llm_error(ctx)
+    repeat = TIMEOUT_REPEAT_KEY in ctx.accumulated_usage
+    stopped = _record_llm_call_error(error, ctx) or _stop_after_llm_error(ctx)
+    if repeat:
+        _save_timeout_repeat(ctx.accumulated_usage, failed=True)
+    return stopped
 
 
 def _replace_response_meta(
-    target: Optional[Dict[str, Any]],
-    usage: Optional[Dict[str, Any]] = None,
-    msg: Optional[Dict[str, Any]] = None,
+    target: Optional[Dict[str, Any]], usage: Optional[Dict[str, Any]] = None, msg: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Replace one caller-owned, attempt-local response fact projection."""
     if target is None:
@@ -1259,17 +1297,9 @@ def _replace_response_meta(
     target.clear()
     if usage is None or msg is None:
         return
-    for source, key in ((usage, "response_finish_reason"), (msg, "finish_reason"), (msg, "stop_reason")):
-        if key in source:
-            finish_present, finish_reason = True, source.get(key)
-            break
-    else:
-        finish_present, finish_reason = False, None
-    target.update({
-        "finish_reason_present": finish_present,
-        "finish_reason": finish_reason,
-        "tool_call_count": len(msg.get("tool_calls") or []),
-    })
+    finish_present, finish_reason = response_finish_reason(usage, msg)
+    target.update(finish_reason_present=finish_present, finish_reason=finish_reason,
+                  tool_call_count=len(msg.get("tool_calls") or []))
 
 
 def forced_response_parts(
@@ -1289,95 +1319,94 @@ def _emit_llm_operation(
     event_queue: Optional[queue.Queue], task_id: str, operation_id: str,
     phase: str, task_attempt: Any, execution_id: str, round_id: str,
 ) -> None:
-    emit_cognitive_operation_event(
-        event_queue, task_id=task_id, operation_id=operation_id, phase=phase,
-        kind="llm", task_attempt=task_attempt, execution_id=execution_id,
+    timed(
+        "event_put", emit_cognitive_operation_event, event_queue, task_id=task_id, operation_id=operation_id,
+        phase=phase, kind="llm", task_attempt=task_attempt, execution_id=execution_id,
         round_id=round_id,
     )
 
 
 def call_llm_with_retry(
-    llm: LLMClient,
-    messages: List[Dict[str, Any]],
-    model: str,
-    tools: Optional[List[Dict[str, Any]]],
-    effort: str,
-    max_retries: int,
-    drive_logs: pathlib.Path, task_id: str,
-    round_idx: int,
-    event_queue: Optional[queue.Queue],
-    accumulated_usage: Dict[str, Any],
-    task_type: str = "", use_local: bool = False,
+    llm: LLMClient, messages: List[Dict[str, Any]], model: str,
+    tools: Optional[List[Dict[str, Any]]], effort: str, max_retries: int,
+    drive_logs: pathlib.Path, task_id: str, round_idx: int, event_queue: Optional[queue.Queue],
+    accumulated_usage: Dict[str, Any], task_type: str = "", use_local: bool = False,
     deadline_ts: Optional[float] = None,
     attempt_cap: Optional[int] = None,
     allow_server_web_search: bool = False,
     physical_context: Optional[PhysicalAttemptContext] = None,
     candidate_predicate: Optional[Callable[[Any], Any]] = None,
-    task_attempt: Any = None,
-    response_meta_out: Optional[Dict[str, Any]] = None,
+    task_attempt: Any = None, response_meta_out: Optional[Dict[str, Any]] = None,
     transport_reserve_sec: Optional[float] = None, transport_death_retries: int = 0,
     initial_messages: Optional[List[Dict[str, Any]]] = None,
-    stop_retry_check: Optional[Callable[[], bool]] = None,
-    model_role: str = "main", model_turn_state: Any = None,
-    model_account_override: Optional[str] = None, processing_preference: Optional[str] = None,
-    model_context_observer: Any = None,
+    stop_retry_check: Optional[Callable[[], bool]] = None, owner_input_check: Optional[Callable[[], List[str]]] = None,
+    model_role: str = "main", model_turn_state: Any = None, model_account_override: Optional[str] = None,
+    processing_preference: Optional[str] = None, physical_send_claim: Optional[Callable[[Any], None]] = None,
+    send_clock_policy: Any = None, max_tokens: int = MAIN_LOOP_MAX_TOKENS, configured_api_child: bool = False,
+    physical_fit_predicate: Optional[Callable[[Any], Any]] = None,  # every send; candidate_predicate is first-attempt-only
 ) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
-    """Call one model with bounded retries and deadline-aware transport."""
-    from ouroboros.model_slots import resolve_processing_preference
+    """Call one model with bounded retries and deadline-aware transport.
 
+    ``max_tokens`` is the LOGICAL caller ceiling (the strict-shrink retry passes the failed
+    attempt's sent allowance); the sent value lives on the physical candidate."""
+    from ouroboros.model_slots import resolve_processing_preference
     processing_preference = resolve_processing_preference(model_role, override=processing_preference)
     _replace_response_meta(response_meta_out)
     drive_root = pathlib.Path(drive_logs).parent
-    accumulated_usage.pop(RETRY_WALL_EXHAUSTED_KEY, None)  # last-invocation marker (see key)
+    for key in (RETRY_WALL_EXHAUSTED_KEY, RETRY_ATTEMPTS_SPENT_KEY, REFUSED_CANDIDATE_KEY, REBOUND_PHYSICAL_CONTEXT_KEY):
+        accumulated_usage.pop(key, None)  # last-invocation markers (see the keys)
     execution_id = str(accumulated_usage.setdefault("execution_id", new_execution_id()))
     round_id = f"{execution_id}:round:{round_idx}"
     _transport_death_repeats(accumulated_usage, round_id)  # drops another round's record before anything reads it
+    record = accumulated_usage.get(TIMEOUT_REPEAT_KEY) or {}
+    if timeout_repeat_blocked(accumulated_usage): return None, None
+    if record and not record.get("state") and record.get("round_id") != round_id:
+        accumulated_usage.pop(TIMEOUT_REPEAT_KEY, None)  # legacy, unrelated round
     context_fit_event_fields = _context_fit_event_fields(accumulated_usage) if physical_context is not None else {}
     transient_budget = _attempt_loop_budget(max_retries, attempt_cap)
     if task_attempt is not None:
         accumulated_usage["_task_attempt"] = task_attempt
     task_attempt = accumulated_usage.get("_task_attempt")
-    response_cache_bypass_requested = False
+    owner = current_model_wait()
+    activity_attempt = task_attempt if task_attempt is not None or not owner or owner.task_id != task_id else owner.attempt
+    response_cache_bypass_requested, send_messages = False, None
     for attempt in range(transient_budget):
+        for stale in ("_last_llm_failure", "_acting_route_failure"): accumulated_usage.pop(stale, None)  # a pre-send refusal cannot borrow the previous attempt
         if _deadline_not_dispatched(
             deadline_ts, accumulated_usage, drive_logs,
             task_id=task_id, model=model, round_idx=round_idx, round_id=round_id, reserve_sec=transport_reserve_sec,
         ):
             return None, None
         llm_call_id = new_call_id("llm")
-        call_identity = (task_id, task_attempt, llm_call_id, execution_id, round_id, attempt + 1)
+        call_identity = (task_id, activity_attempt, llm_call_id, execution_id, round_id, attempt + 1)
+        prior = getattr(last_physical_attempt_capture(), "attempt_id", None)  # never this call's context
+        call_ids = {"llm_call_id": llm_call_id, "execution_id": execution_id, "round_id": round_id,
+                    "round": round_idx, "attempt": attempt + 1}  # this physical call in every record of it below
         request_ref: Dict[str, Any] = {}
         try:
             _emit_llm_operation(event_queue, task_id, llm_call_id, "started", task_attempt, execution_id, round_id)
-            send_messages = initial_messages if attempt == 0 and initial_messages is not None else _prepare_main_messages(
-                messages, model=model, model_role=model_role, model_account_override=model_account_override,
-                llm=llm, accumulated_usage=accumulated_usage, drive_root=drive_root, task_id=task_id,
-                event_queue=event_queue, use_local=use_local, task_attempt=task_attempt, deadline_ts=deadline_ts,
-            )
+            if send_messages is None or TIMEOUT_REPEAT_KEY not in accumulated_usage:  # a timeout repeat resends the projection it timed out on (#1886)
+                send_messages = initial_messages if attempt == 0 and initial_messages is not None else _prepare_main_messages(
+                    messages, model=model, model_role=model_role, model_account_override=model_account_override,
+                    llm=llm, accumulated_usage=accumulated_usage, drive_root=drive_root, task_id=task_id,
+                    event_queue=event_queue, use_local=use_local, task_attempt=task_attempt, deadline_ts=deadline_ts,
+                )
+            if (accumulated_usage.get(ROUND_STARTED_KEY) or {}).get("round_id") != round_id:
+                accumulated_usage[ROUND_STARTED_KEY] = {"round_id": round_id, "at": time.monotonic()}
             _emit_live_log(event_queue, {
-                "type": "llm_round_started",
-                "task_id": task_id,
-                "task_type": task_type,
-                "execution_id": execution_id,
-                "round_id": round_id,
-                "llm_call_id": llm_call_id,
-                "round": round_idx,
-                "task_attempt": task_attempt,
-                "attempt": attempt + 1,
-                "model": model,
-                "reasoning_effort": effort,
-                "use_local": bool(use_local),
+                "type": "llm_round_started", "task_id": task_id, "task_type": task_type, **call_ids, "task_attempt": task_attempt,
+                "model": model, "reasoning_effort": effort, "use_local": bool(use_local),
             })
             kwargs = {
-                "messages": send_messages,
-                "tools": tools,
-                "model": model,
+                "messages": send_messages, "tools": tools, "model": model,
                 "model_role": model_role, "model_turn_state": model_turn_state,
+                "model_operation_observer": lambda fact, identity=call_identity, prior=prior: _emit_main_llm_call_state(
+                    event_queue, identity, "observed", fact.get("model_activity"),
+                    _own_capture(last_physical_attempt_capture(), prior)),  # sent: its own attempt's fact
                 "model_account_override": model_account_override,
                 "processing_preference": processing_preference,
-                "context_mode": getattr(physical_context, "rendered_mode", None),
                 "reasoning_effort": effort,
-                "max_tokens": MAIN_LOOP_MAX_TOKENS,
+                "max_tokens": max_tokens,
                 **main_loop_wire_options(model, allow_server_web_search=allow_server_web_search,
                                          bypass_response_cache=response_cache_bypass_requested),
                 "caller_deadline_ts": (None if deadline_ts is None
@@ -1385,28 +1414,23 @@ def call_llm_with_retry(
                 "use_local": use_local,
                 "timeout": _main_transport_timeout(model, deadline_ts, reserve_sec=transport_reserve_sec),
             }
+            host_step("model_call")  # the round's own facts, fit and send copy, before its first record
             request_ref = persist_observed_call(
-                drive_root,
-                task_id=task_id,
-                call_id=f"{llm_call_id}_request",
-                call_type="llm_request",
+                drive_root, task_id=task_id, call_id=f"{llm_call_id}_request", call_type="llm_request",
                 payload={
                     "messages": messages,
-                    "send_messages": send_messages,
+                    "send_messages": send_messages,  # shares its equal elements with ``messages`` (stored once)
                     "tools": tools or [],
                     "model": model,
                     "reasoning_effort": effort,
-                    "max_tokens": MAIN_LOOP_MAX_TOKENS,
+                    "max_tokens": max_tokens,  # the logical caller ceiling; the sent allowance is the physical candidate's
                     "use_local": bool(use_local),
                     "allow_server_web_search": bool(allow_server_web_search),
                     "response_cache_bypass_requested": response_cache_bypass_requested,
                 },
                 manifest={
-                    "execution_id": execution_id,
-                    "round_id": round_id,
-                    "llm_call_id": llm_call_id,
-                    "round": round_idx,
-                    "attempt": attempt + 1,
+                    "first_request_at": accumulated_usage.setdefault("first_request_at", utc_now_iso()),
+                    **call_ids,
                     "model": model,
                     "reasoning_effort": effort,
                     "response_cache_bypass_requested": response_cache_bypass_requested,
@@ -1414,6 +1438,7 @@ def call_llm_with_retry(
                 },
                 writer=persist_call,
             )
+            host_step("request_record")
             if _deadline_not_dispatched(
                 deadline_ts, accumulated_usage, drive_logs,
                 task_id=task_id, model=model, round_idx=round_idx,
@@ -1423,21 +1448,25 @@ def call_llm_with_retry(
             ):
                 return None, None
             _emit_main_llm_call_state(event_queue, call_identity, "started")
-            msg, usage = _send_main_candidate(
-                llm, kwargs, model=model, use_local=use_local, deadline_ts=deadline_ts,
-                physical_context=physical_context, candidate_predicate=candidate_predicate if attempt == 0 else None, model_context_observer=model_context_observer,
-            )
+            repeat = TIMEOUT_REPEAT_KEY in accumulated_usage
+            if repeat: kwargs["wait_for_resources"] = False
+            strict = single_physical_send(lambda reservation: _claim_timeout_repeat(accumulated_usage, call_ids, reservation)) if repeat else contextlib.nullcontext()
+            physical_context = refresh_attempt_prefix(physical_context, accumulated_usage, model, use_local)  # a retry after its own answer
+            with strict, track_physical_attempts(physical_send_claim), observe_dispatch(
+                    lambda capture, identity=call_identity: _emit_main_llm_call_state(event_queue, identity, "dispatched", capture=capture)):
+                msg, usage = _send_main_candidate(
+                    llm, kwargs, model=model, use_local=use_local, deadline_ts=deadline_ts,
+                    physical_context=physical_context, candidate_predicate=candidate_predicate if attempt == 0 else None,
+                    physical_fit_predicate=physical_fit_predicate, send_clock_policy=send_clock_policy, canonical_messages=messages)
+            mark_last_answer(accumulated_usage)
             host_route = usage.get("model_role_route") or {}
             model, use_local = host_route.get("model", model), host_route.get("use_local", use_local)
-            accumulated_usage["_model_route"], accumulated_usage["_options"] = dict((usage.get("claudexor") or {}).get("route") or {}), ({key: (usage.get("claudexor") or {}).get(key) for key in ("requested_options", "applied_options", "options_honored", "route")} if usage.get("claudexor") else {})
+            note_prefix_answer(accumulated_usage, usage, model, use_local)  # a reply that read its input moves its route's base
+            physical_context = accumulated_usage.pop(REBOUND_PHYSICAL_CONTEXT_KEY, physical_context)
             context_fit_event_fields = _context_fit_event_fields(accumulated_usage) if physical_context is not None else {}
-            _take_custom_receipts(usage, msg, accumulated_usage)
-            for stale in ("_last_llm_error", "_last_llm_error_kind", "_last_llm_retry_same_request",
-                          "_last_llm_status_code", "_last_llm_provider_code"):
-                accumulated_usage.pop(stale, None)
-            cost, display_model, provider, cost_estimated = _normalize_usage_cost(
-                usage, model=model, use_local=use_local,
-            )
+            _take_response_facts(usage, msg, accumulated_usage)
+            cost, display_model, provider, cost_estimated = _normalize_usage_cost(usage, model=model, use_local=use_local)
+            accumulated_usage["_observed_route"] = observed_route_stamp(usage)
             add_usage(accumulated_usage, usage)
             fold_retrieval_usage(accumulated_usage, usage)
             response_ref = persist_observed_call(
@@ -1450,11 +1479,8 @@ def call_llm_with_retry(
                     "usage": usage,
                 },
                 manifest={
-                    "execution_id": execution_id,
-                    "round_id": round_id,
-                    "llm_call_id": llm_call_id,
-                    "round": round_idx,
-                    "attempt": attempt + 1,
+                    "first_answer_at": accumulated_usage.setdefault("first_answer_at", utc_now_iso()),
+                    **call_ids,
                     "model": model,
                     "resolved_model": display_model,
                     "provider": provider,
@@ -1462,33 +1488,25 @@ def call_llm_with_retry(
                 writer=persist_call,
             )
             _remember_llm_call(
-                accumulated_usage,
-                llm_call_id=llm_call_id, execution_id=execution_id, round_id=round_id,
-                round_idx=round_idx, attempt=attempt + 1, model=model,
-                display_model=display_model, provider=provider,
-                request_ref=request_ref,
+                accumulated_usage, call_ids={**call_ids, "physical_attempt_id": (usage.get("ledger_attempt_ids") or [None])[-1]}, model=model,
+                display_model=display_model, provider=provider, request_ref=request_ref,
                 response_ref=response_ref, reported_model=usage.get("resolved_model"), use_local=bool(use_local),
                 requested_profile=(usage.get("claudexor") or {}).get("requested_profile", host_route.get("credential_profile_id", model_account_override)),
                 observed_route=(usage.get("claudexor") or {}).get("route"),
             )
             category = task_type if task_type in ("evolution", "consciousness", "review", "summarize") else "task"
             emit_llm_usage_event(
-                event_queue,
-                task_id,
-                display_model,
+                event_queue, task_id, display_model,
                 {**usage, "llm_call_id": llm_call_id, "execution_id": execution_id,
                  "round_id": round_id, "round": round_idx},
-                cost,
-                category,
-                provider=provider,
-                source="loop",
-                cost_estimated=cost_estimated,
+                cost, category, provider=provider, source="loop", cost_estimated=cost_estimated,
             )
             tool_calls = msg.get("tool_calls") or []
             content = msg.get("content")
+            if task_type == "presence": accumulated_usage["_presence_pre_dispatch_only"] = False  # a response reached the model
             _replace_response_meta(response_meta_out, usage, msg)
             if not tool_calls and (not content or not content.strip()):
-                event_type, is_provider_glitch, permanent_body_error = _record_and_emit_empty_response(
+                event_type, is_provider_glitch, permanent = _record_and_emit_empty_response(
                     usage=usage, msg=msg, accumulated_usage=accumulated_usage,
                     event_queue=event_queue, drive_logs=drive_logs, task_id=task_id,
                     execution_id=execution_id, round_id=round_id, llm_call_id=llm_call_id,
@@ -1497,98 +1515,84 @@ def call_llm_with_retry(
                     response_ref=response_ref, transient_budget=transient_budget,
                     context_fit_event_fields=context_fit_event_fields, task_attempt=task_attempt)
                 _emit_main_llm_call_state(event_queue, call_identity, "failed")
-                if event_type == "provider_incomplete_response" and not usage.get("provider_error"):
-                    response_cache_bypass_requested = True
-                if not permanent_body_error and attempt < transient_budget - 1 and TRANSPORT_DEATHS_KEY not in accumulated_usage:
-                    if _sleep_within_deadline(
-                        min(2.0 ** attempt, _TRANSIENT_BACKOFF_CAP_SEC), deadline_ts
-                    ):
+                if not permanent and attempt < transient_budget - 1 and accumulated_usage.keys().isdisjoint((TRANSPORT_DEATHS_KEY, TIMEOUT_REPEAT_KEY)):
+                    if _sleep_within_deadline(min(2.0 ** attempt, _TRANSIENT_BACKOFF_CAP_SEC), deadline_ts):
+                        # Only a glitch that is actually retried asks the gateway for a fresh response.
+                        response_cache_bypass_requested |= (
+                            event_type == "provider_incomplete_response" and not usage.get("provider_error"))
                         continue
                     _emit_retry_deadline_exhausted(
                         drive_logs, task_id=task_id, execution_id=execution_id,
                         round_id=round_id, round_idx=round_idx, attempt=attempt,
                         model=model, error_kind=event_type,
                     )
-                if _empty_response_wall_spent(is_provider_glitch, permanent_body_error, usage):
+                if _empty_response_wall_spent(is_provider_glitch, permanent, usage):
                     accumulated_usage[RETRY_WALL_EXHAUSTED_KEY] = True
                 return None, cost
-            for stale in ("execution_status", "result_status", "reason_code", RETRY_WALL_EXHAUSTED_KEY, TRANSPORT_DEATHS_KEY):
-                accumulated_usage.pop(stale, None)  # a USABLE response closes the round's repeat record
+            for stale in ("execution_status", "result_status", "reason_code", RETRY_WALL_EXHAUSTED_KEY, RETRY_ATTEMPTS_SPENT_KEY,
+                          TRANSPORT_DEATHS_KEY, TIMEOUT_REPEAT_KEY, "_pending_transport_outcome"):
+                accumulated_usage.pop(stale, None)  # a USABLE response closes the round's repeat records
             accumulated_usage["rounds"] = accumulated_usage.get("rounds", 0) + 1
-            prompt_tokens = int(usage.get("prompt_tokens") or 0)
-            completion_tokens = int(usage.get("completion_tokens") or 0)
-            cached_tokens = int(usage.get("cached_tokens") or 0)
-            cache_write_tokens = int(usage.get("cache_write_tokens") or 0)
-            prompt_cache_ttl, cache_hit_rate, cache_cold_restart, gap_since_prev_round_sec = (
-                _record_round_cache_facts(accumulated_usage, usage, round_idx=round_idx))
+            prompt_cache_ttl, cache_hit_rate, gap_since_prev_round_sec, duration_ms = (
+                _record_round_cache_facts(accumulated_usage, usage, round_idx=round_idx, round_id=round_id,
+                                          model=display_model, provider=provider))
+            ledger_ids = list(usage.get("ledger_attempt_ids") or [])  # the last one carried this response (#807)
             _round_event = {
-                "ts": utc_now_iso(), "type": "llm_round",
-                "task_id": task_id,
-                "execution_id": execution_id,
-                "round_id": round_id,
-                "llm_call_id": llm_call_id,
-                "round": round_idx, "model": display_model,
+                "ts": utc_now_iso(), "type": "llm_round", "record_contract_version": RECORD_CONTRACT_VERSION,
+                **{key: accumulated_usage[key] for key in ("first_request_at", "first_answer_at")},
+                "task_id": task_id, "execution_id": execution_id, **_scope_lineage(),
+                "round_id": round_id, "llm_call_id": llm_call_id, "round": round_idx, "model": display_model,
                 "reasoning_effort": effort,
-                "provider": provider,
-                "source": "loop",
-                "model_category": infer_model_category(display_model),
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "cached_tokens": (cached_tokens if usage.get("cached_tokens") is not None else None),
-                "cache_write_tokens": cache_write_tokens,
-                "prompt_cache_ttl": prompt_cache_ttl,
-                "cache_hit_rate": cache_hit_rate,
-                "cache_cold_restart": cache_cold_restart,
+                **{key: usage[key] for key in ("effort", "effort_resolution", "request_wire", "claudexor") if key in usage},
+                "provider": provider, "source": "loop", "model_category": infer_model_category(display_model),
+                **event_token_counts(usage),  # each counter reported, a reported 0, or null (#1578)
+                "prompt_cache_ttl": prompt_cache_ttl, "cache_hit_rate": cache_hit_rate,
                 "gap_since_prev_round_sec": gap_since_prev_round_sec,
-                "cost_usd": cost,
-                **context_fit_event_fields,
+                "duration_ms": duration_ms, "cost_usd": cost, **context_fit_event_fields,
+                "ledger_attempt_ids": ledger_ids, "physical_attempt_id": ledger_ids[-1] if ledger_ids else None,
                 "request_ref": request_ref.get("manifest_ref") if request_ref else None,
                 "response_ref": response_ref.get("manifest_ref") if response_ref else None,
+                **round_receipt(),  # what the host did to prepare this round, counted (``llm_observability``)
             }
             _emit_live_log(event_queue, {
-                "type": "llm_round_finished",
-                "task_id": task_id,
-                "task_type": task_type,
-                "execution_id": execution_id,
-                "round_id": round_id,
-                "llm_call_id": llm_call_id,
-                "round": round_idx,
-                "task_attempt": task_attempt,
-                "attempt": attempt + 1,
-                "model": display_model,
-                "reasoning_effort": effort,
+                "type": "llm_round_finished", "task_id": task_id, "task_type": task_type, **call_ids,
+                "task_attempt": task_attempt, "model": display_model,
                 **{key: _round_event[key] for key in (
-                    "prompt_tokens", "completion_tokens", "cached_tokens", "cache_write_tokens", "prompt_cache_ttl")},
-                "cost_usd": cost,
+                    "record_contract_version", "reasoning_effort", "cost_usd", "prompt_tokens", "completion_tokens", "cached_tokens", "cache_write_tokens",
+                    "prompt_cache_ttl", "effort", "effort_resolution", "request_wire", "claudexor", "duration_ms") if key in _round_event},
                 "response_kind": "tool_calls" if tool_calls else "message",
-                "tool_call_count": len(tool_calls),
+                "tool_call_count": len(tool_calls), "rounds": accumulated_usage["rounds"],
                 "has_text": bool(content and str(content).strip()),
             })
             append_jsonl(drive_logs / "events.jsonl", _round_event)
-            _emit_main_llm_call_state(event_queue, call_identity, "finished")
+            _emit_main_llm_call_state(event_queue, call_identity, "finished",
+                                      capture=_own_capture(last_physical_attempt_capture(), prior))
             return msg, cost
         except UsageAccountingError:
             _emit_main_llm_call_state(event_queue, call_identity, "failed")
             raise  # Monetary/ledger rails are not provider failures.
         except Exception as e:
-            if isinstance(getattr(e, "route", None), dict):
-                accumulated_usage["_model_route"] = dict(e.route)
             host_route = getattr(e, "model_role_route", {}) or {}
             model, use_local = host_route.get("model", model), host_route.get("use_local", use_local)
-            if _handle_main_llm_call_exception(
-                e,
-                _LlmErrorContext(
+            if isinstance(getattr(e, "route", None), dict):  # a failed operation's route may name no model: the one it asked
+                accumulated_usage["_model_route"] = {**e.route, "model": e.route.get("model") or str(model).partition("=")[2]}
+            if REBOUND_PHYSICAL_CONTEXT_KEY in accumulated_usage:  # a wait's reprepare bound a new route inside this attempt
+                physical_context = accumulated_usage.pop(REBOUND_PHYSICAL_CONTEXT_KEY)
+                context_fit_event_fields = _context_fit_event_fields(accumulated_usage)
+            if _handle_main_llm_call_exception(e, _LlmErrorContext(
                     task_id=task_id, task_type=task_type, execution_id=execution_id,
                     round_id=round_id, llm_call_id=llm_call_id, round_idx=round_idx,
-                    attempt=attempt, model=model, request_ref=request_ref,
+                    attempt=attempt, model=model, use_local=bool(use_local), request_ref=request_ref,
                     drive_logs=drive_logs, event_queue=event_queue,
                     accumulated_usage=accumulated_usage,
                     context_fit_event_fields=context_fit_event_fields,
                     task_attempt=task_attempt, deadline_ts=deadline_ts,
                     max_retries=max_retries, transient_budget=transient_budget,
                     transport_death_retries=transport_death_retries, transport_reserve_sec=transport_reserve_sec,
-                    stop_retry_check=stop_retry_check,
+                    stop_retry_check=stop_retry_check, owner_input_check=owner_input_check,
+                    configured_api_child=configured_api_child,
                     requested_profile=host_route.get("credential_profile_id", model_account_override),
+                    prior_attempt_id=prior,
                 ),
                 call_identity,
             ):

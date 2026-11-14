@@ -31,6 +31,8 @@ Full egress interception (socket-level deny + evidence) is Ф4 scope, not Ф0.
 
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import hashlib
 import json
 import os
@@ -52,16 +54,24 @@ from devtools.benchmarks.common.server_runner import (  # noqa: E402
     IsolatedServer,
     _PROVIDER_ENV_KEYS,
     _is_secret_env_key,
+    alarm_deferred,
     supervisor_state_is_ready,  # noqa: F401 (re-export: THE readiness contract)
 )
 from ouroboros.provider_models import (  # noqa: E402
     ACTIVE_MODEL_SETTING_KEYS,
     ALL_PROVIDER_CREDENTIAL_KEYS,
+    CONNECTIONS_KEY,
     LEGACY_MODEL_SETTING_KEYS,
+    PROVIDER_KINDS,
 )
 from ouroboros.tools.scope_review_contract import SCOPE_REQUIRED_ITEMS  # noqa: E402
+from tests.candidate_checkout import (  # noqa: E402
+    CandidateCheckout, CandidateError, assert_served_candidate,
+    require_candidate_interpreter, verify_checkout,
+)
 
 LANE_MOCK = "mock"
+LANE_CONTAINER = "container"  # real Docker through an explicitly named context (test_s39)
 
 # The scenario inventory of this suite (plan §8) — the manifest is DATA and the pin
 # is a gen/verify pair: an id losing its test is red (a scenario must be retired
@@ -84,25 +94,25 @@ SCENARIOS = {
     "S10": ("managed update rollback: typed future/null-marker refusals + byte-for-byte tree restore", LANE_MOCK),
     # Ф4 wave 3b (plan §8: delegated transport + skills lifecycle).
     "S11": ("delegated transport: full nanny run over FakeClaudexorDaemon, wire/custody truth, typed refusals", LANE_MOCK),
-    "S12": ("delegated no-orphans: SIGKILL mid-run -> restart -> boot custody sweep settles the run, one physical attempt", LANE_MOCK),
+    "S12": ("delegated no-orphans: SIGKILL mid-run -> boot holds saved parent and preserves live run -> later boot settles its completion once, one physical attempt", LANE_MOCK),
     # S13 carries TWO tests: the full lifecycle across a restart, and the
     # hot-adoption variant that removes the restart (W3B-F1) — enable after boot
     # must reach the workers already running, not only the pool's next generation.
     "S13": ("skills lifecycle E2E: payload -> stub review -> grants -> enable -> dispatch -> disable/delete + Model Experience; hot-adoption variant: enable after boot dispatches in an ALREADY-SPAWNED worker with no restart", LANE_MOCK),
-    # Ф4 wave 3a (plan §8: plan review; commit triad+scope BOTH enforcement
-    # classes + stale-rejection; acceptance loop). Renumbered S14-S17 at
-    # integration: the parallel wave-3b lane claimed S11-S13 first.
-    "S14": ("plan review: scripted REVISE->ACCEPT cycle, honest durable chronicle, cycle-cap refusal", LANE_MOCK),
-    "S15": ("commit triad+scope, ADVISORY class: red verdicts recorded + waved through with durable override, commit lands", LANE_MOCK),
-    "S16": ("commit triad+scope, BLOCKING class: red blocks (HEAD unmoved), identical resubmit refused free, green lands; stale advisory refresh and post-verdict revalidation", LANE_MOCK),
-    "S17": ("acceptance loop (required+blocking): reject -> rework -> accept; paid-identity / free-replay invariants", LANE_MOCK),
+    # Ф4 wave 3a (plan §8: commit triad+scope after critical feedback +
+    # stale-rejection; the two enforcement classes it once pinned became one when
+    # Blocking retired). Renumbered at integration: the parallel
+    # wave-3b lane claimed S11-S13 first; S14 (plan review) retired with its engine.
+    "S15": ("commit triad+scope, critical feedback: red verdicts return before Git, the author's explicit continuation goes over them with a durable override, commit lands", LANE_MOCK),
+    "S16": ("commit triad+scope, revision: a red outcome returns before Git (HEAD unmoved), an identical resubmit returns it again at $0, the revised diff's clean PASS returns first too and lands on the author's continuation; post-verdict revalidation", LANE_MOCK),
+    # S17 (the acceptance loop) retired with the task-acceptance machine.
     # Ф4 wave 4 (plan §8 remainder: update variations, chat-lineage cancel,
     # absorb kill-recovery, delegated interactive answer).
     "S18": ("managed update carrier path: diverged fork, span-confined VERSION conflict auto-resolved, carriers transferred to the official version", LANE_MOCK),
     "S19": ("managed update conflicting: typed budget refusal at the assisted gate, tree byte-identical, dirty work restored", LANE_MOCK),
     "S20": ("managed update crash mid-apply: boot-finalize honesty across stash-crash / half-written tx / applied-but-unrestarted", LANE_MOCK),
     "S21": ("cancellation with chat lineage: outbox-delivered receipt, chat.jsonl row, cancel_receipt block, intent forensics", LANE_MOCK),
-    "S22": ("evolution absorb kill-recovery: SIGKILL after the reviewed commit, markerless boot reconcile absorbs once, never twice", LANE_MOCK),
+    "S22": ("evolution absorb kill-recovery: explicit Cyber Pro in-place authoring, SIGKILL after the reviewed commit, markerless boot reconcile absorbs once, never twice", LANE_MOCK),
     "S23": ("delegated interactive answer: waiting_on_user -> delegate_answer -> run continues; wire + custody truth", LANE_MOCK),
     # Ф4 wave 5: the MUTATING delegated runs the earlier waves carried and never
     # landed (ADOPTION row DEFER-E2E-DELEG-MUT). The one delegation branch that
@@ -113,33 +123,64 @@ SCENARIOS = {
     # in-process DIRECT-CHAT turn — no queue row, no worker process — stopped by
     # the owner through the same cancel endpoint the UI drives, caught MID-ROUND
     # on an event-gated model hold (ModelGate), never a timed race.
-    "S26": ("direct-chat owner stop: an in-flight direct turn is addressable (running list + activity snapshot), stop-now mid-round answers the typed 'still live' with the cooperative control armed ONCE (a repeat is idempotent), the turn ends at its next step with ZERO further model rounds under the owner-stop reason, the chat concludes, custody settles already_settled against the turn's own terminal, and a later stop is the typed 404", LANE_MOCK),
+    "S26": ("direct-chat owner stop: an in-flight direct turn is addressable (running list + activity snapshot), stop-now mid-round records intent and answers 202 pending (teardown_unconfirmed) with the cooperative control armed ONCE (a repeat is idempotent), the turn ends at its next step with ZERO further model rounds under the owner-stop reason, the chat concludes, custody settles already_settled against the turn's own terminal, and a later stop is the typed 404", LANE_MOCK),
     "S27": ("ordinary Main/Project capability: real stdio MCP reads and writes, correct built-in room target, and a second native turn completes while the first model call is held", LANE_MOCK),
+    # Serial addressed turns (owner 2026-09-23 21:12: the GENERAL capability of
+    # continuable addressed participant turns, native children and session agents,
+    # with an explicit end of participation; planning the first consumer). Stub
+    # models prove the HOST wiring only — never a live model's or vendor's quality.
+    "S28": ("serial addressed turns, NATIVE: A->B->A peer contributions through forward_to_worker + await_messages (a contribution does not end participation; FINAL only after the awaited reply), selected originals addressed to the planning parent and present in its plan evidence, sibling-only originals absent", LANE_MOCK),
+    "S29": ("serial addressed turns, SESSION: one fake-engine run pauses twice; a native child's original is relayed byte-exact through delegate_answer free_text, the run resumes in the SAME session (continuation=same_session on every waiting payload, the re-wait included) and echoes the exact bytes; the codex-shaped input_required terminal names continuation=new_physical_run and is continued by a NEW start", LANE_MOCK),
+    # Wave 8: the exact mid-run budget pause / owner Resume lifecycle (#1196) as a
+    # real consumer: priced stub, tiny wallet, the ledger fence pauses the task
+    # nonterminally under its own id; an increase wakes nothing; Resume grants once.
+    "S30": ("exact budget pause -> owner Resume, MANAGED root: priced rounds hit the global ledger fence, the task parks nonterminal under its SAME id (durable paused row + PENDING _budget_pause carrier, no task_done, no paid wrap-up, /api/state budget_paused); Resume while exhausted is the typed 409; raising TOTAL_BUDGET alone wakes nothing (bounded watch); Resume after the increase mints ONE single-use grant, the loop consumes it, the task completes with cumulative rounds/spend and task_done exactly once; a repeated Resume is the typed 404", LANE_MOCK),
+    "S31": ("exact budget pause -> owner Resume, DIRECT owner-chat turn: an ordinary WS chat turn hits the known-spend dispatch fence mid-turn, the live actor ends and its own record parks inline as the PENDING _budget_pause carrier with _is_direct_chat under the SAME id (no second actor, no task_done, no paid wrap-up; census direct_chat/budget_paused); a budget increase wakes nothing; Resume mints one grant, a pooled worker continues the checkpoint without a graceful-threshold refresh, and the turn concludes in the chat (durable chat row + keyed final frame over the same /ws); a repeated Resume is the typed 404", LANE_MOCK),
+    "S32": ("exact budget pause survives the physical epoch: a paused MANAGED root rides a GRACEFUL server SIGTERM (the lifespan teardown's kill_workers ran: server_shutdown row) untouched — no task_done, no cancel, the same paused row and PENDING _budget_pause carrier in the final snapshot; the next boot parks the SAME id again unheld and un-dispatched (census budget_paused, public detail scheduled/budget_paused, Resume still the typed 409 while exhausted); after the increase one Resume grant completes the same id with cumulative rounds/spend", LANE_MOCK),
+    # Presence resilience: Host responsiveness and turn custody under real waits.
+    # FOUR tests: executor starvation alone, a held Host authentication alone,
+    # both together, and the owner's Panic under the combined load.
+    "S33": ("Presence waits keep owner controls answering: 12 events (2 held at the model, slot and same-conversation waits) on a 12-thread default executor and/or one held Host authentication; while held, /api/state, a v1 receipt and the owner's Stop (durable cancel intent, cancelled terminal) answer inside 10s/15s windows (health alone never passes); a disconnected turn and its retry are ONE model call and a later replay answers the same projection; Panic under the combined load ends the whole tree", LANE_MOCK),
+    # #1539 own-body candidates: the smallest real consumer of the authoring seam.
+    "S36": ("own-body candidate on a real server: the root's first body write in the installation's spelling binds a candidate, later repo/… and absolute serving spellings reach the same candidate files, the serving clone is byte-identical, a refused resume is the typed CANDIDATE_MISSING in the tool log, and a process in the candidate sees its isolated data root", LANE_MOCK),
+    "S37": ("restart-bound adoption on one real server: a reviewed candidate commit, request_restart(adopt_commit) arms on the stop evidence, the in-place re-exec switches the clean serving checkout before its imports, generation B settles it adopted and verifies the restart on the serving SHA", LANE_MOCK),
+    "S38": ("evolution crash between the candidate commit and its receipts: the supervisor's cycle commits in its candidate through the review organ (its clean outcome returned first, the commit its explicit continuation), the tree is SIGKILLed and the post-commit receipts removed; a fresh boot recovers the exact commit and its reviewed provenance at worker boot and does not absorb it (the serving checkout never held it)", LANE_MOCK),
+    # Deployment: both container modes on real Docker, keyless (stub models through an exec relay).
+    "S39": ("container lifecycle: the managed image boots a released seed into a body checkout and runtime venv on volumes (parent and split layouts), keeps code, packages and data across recreation, stays stopped after Panic until an owner start, refuses a mounted repository and a second container on shared data; the immutable image admits one server per data volume and, networkless, serves onboarding, a project, a task with a child and an artifact across a restart; an Update adding a local-wheel dependency survives an offline recreation, a task imports it, and rollback restores the old lock with the package disclosed", LANE_CONTAINER),
+    # #1729/#1730 in real processes: the owner's doors on one live task that keeps its id (no retry exists since #1376).
+    "S40": ("owner Pause / Resume / Stop on one live task, same id: after a Pause and a consumed Resume (and without them) the same id runs again and continues its saved work; a Pause of the running task fences its logical root, a model write served after the acceptance never lands while one before it did, one Resume reopens the tree and Stop ends it Cancelled with no late effect and no successor row", LANE_MOCK),
+    "S41": ("live skill-smoke adapter: ordinary author, one independent rebuttal, immutable payload, true/unknown criticism red, tool-policy and identity controls", LANE_MOCK),
+    "S42": ("direct Project turn across an application stop: a WS turn in a Project room writes in the room, the tree is SIGTERMed while its next model round is held, the next boot restores the same id with its saved working state, one owner Resume over HTTP releases the stop hold and the Project verification, and a worker continues the saved loop to a completed result carrying the continuation's answer; in a folderless room the resumed write still lands in the turn's task drive after a sibling start_task gives the room its first folder (#2547)", LANE_MOCK),
+    "S43": ("the production-shaped stand, real half (tests/_stand.py; its counted half: tests/test_stand_counts.py): a root restored with paused trees, pending rows, held runs, schedules, markers, rooms and a story; real tasks, owner turns and a Presence burst held at the model; no server stack runs cognition (E1), the door and the controls answer and Panic ends the whole tree under load (E5, E9), the owner is answered with no pool: a worker storm, a refused spawn, a marker window (E7), Stop finalizes then kills a carrier (E9); WAL and PERSIST (E10)", LANE_MOCK),
 }
 
 MOCK_SLUG = "openai-compatible::mock-model"
+# The three DISTINCT reviewer slugs of the per-seat scenarios: seat t<i> rides
+# ``<MOCK_SLUG>-t<i>``, so ``default_slot_binder`` (the wire ``model`` field) names
+# the seat that made the call and a ReviewScript step can answer per seat.
+DISTINCT_MOCK_MODEL_IDS = tuple(f"mock-model-t{i}" for i in (1, 2, 3))
 
 # ---------------------------------------------------------------------------
 # Prompt markers the stub classifies review-organ calls by (roast F22).
 #
 # These are VERBATIM literals from the tree under test and WILL drift with upstream:
 #   REVIEWER_SLOT_MARKER   — ouroboros/review_execution.py::_render_prompt_parts
-#   ACCEPTANCE_KEYS_MARKER — same function, the task_acceptance criteria_used key list
 #   TRIAD_USER_MARKER      — ouroboros/tools/review.py::_dispatch_unified_review
-#   SCOPE_USER_MARKER      — ouroboros/tools/scope_review.py::_call_scope_llm
-#   PLAN_REVIEW_MARKER     — ouroboros/tools/plan_packet.py::build_plan_review_system_prompt
+#   TWO_PART_SURFACE       — ouroboros/triad_review.py::REVIEW_OUTPUT_SHAPES (the commit gate's
+#                            native inspection episode names it on its "Surface:" line)
+#   PLAN_REVIEW_MARKER     — ouroboros/tools/plan_packet.py::_ROLE (the stable prompt's first line)
 #   NATIVE_EPISODE_MARKER  — ouroboros/review_native_episode.py::episode_prompt
 # The default-lane marker-pin test greps them out of the source files so drift is a
 # named test failure, not a silently mute stub.
 # ---------------------------------------------------------------------------
 REVIEWER_SLOT_MARKER = "You are an independent Ouroboros reviewer slot."
-ACCEPTANCE_KEYS_MARKER = "criteria_used (the acceptance criteria you re-derived"
 TRIAD_USER_MARKER = "Review the staged diff and context provided in the instructions above."
-SCOPE_USER_MARKER = "Review the staged change and context above. Output ONLY a JSON array."
+# The one wave's native inspection episode (one brief, two parts — contract B):
+# classified by the surface NAME on its prompt line, never by a packet marker.
+TWO_PART_SURFACE = "multi_model_review"
 SKILL_REVIEW_MARKER = "You are performing a SKILL review, not a repo-commit review."
 PLAN_REVIEW_MARKER = (
-    "You are one independent reviewer of an INTENTION — a plan spec — "
-    "before the work starts."
+    "You are one independent participant of the council that weighs an INTENTION before the work"
 )
 # Deliberately the FIRST source line of the two-literal prompt head only: the
 # marker-pin test greps the SOURCE file, where the concatenated sentence is
@@ -154,12 +195,24 @@ FINALIZATION_MARKERS = ("[OWNER_STOP]", "[FINALIZE_NOW]")
 # pre-review episode and any future native surface classify by NAME.
 _SURFACE_LINE_RE = re.compile(r"^Surface: ([A-Za-z_]+)$", re.MULTILINE)
 
+# A pool row delivers as a packet or as a native episode (catalog ``delivery``),
+# and both forms of ONE surface answer that surface's output contract — so the
+# stub names the native episode by the SAME kind as the surface's packet: a
+# scripted verdict or a call count reaches a native seat and a packet seat alike.
+# The native skill-review episode carries only the dynamic tail of the skill
+# pack (skill_review_passes: the stable prefix with SKILL_REVIEW_MARKER stays
+# behind); its surface line is the only name it has. An unknown surface stays a
+# typed ``native_episode``.
+_NATIVE_SURFACE_KINDS = {
+    TWO_PART_SURFACE: "two_part_review",   # the commit gate's one brief of two parts (contract B)
+    "skill_review": "skill_review",
+    "advisory_review": "advisory_review",
+}
+
 MARKER_SOURCES = {
     REVIEWER_SLOT_MARKER: "ouroboros/review_execution.py",
-    ACCEPTANCE_KEYS_MARKER: "ouroboros/review_execution.py",
     TRIAD_USER_MARKER: "ouroboros/tools/review_multi_model.py",   # TRIAD_USER_TURN: the one literal the send and the admission share
-    SCOPE_USER_MARKER: "ouroboros/tools/scope_review.py",
-    SKILL_REVIEW_MARKER: "ouroboros/skill_review_prompt.py",
+    SKILL_REVIEW_MARKER: "ouroboros/tools/review_skill.py",
     PLAN_REVIEW_MARKER: "ouroboros/tools/plan_packet.py",
     NATIVE_EPISODE_MARKER: "ouroboros/review_native_episode.py",
 }
@@ -207,9 +260,9 @@ def body_text(body: dict) -> str:
 def classify_call(body: dict) -> str:
     """Name the branch a chat-completion body belongs to.
 
-    Returns one of: ``safety``, ``skill_review``, ``scope_review``, ``triad_review``,
-    ``acceptance``, ``reviewer_slot``, ``plan_review``, ``advisory_review``,
-    ``native_episode``, ``finalization``, ``agent``. ORDER MATTERS (roast F22):
+    Returns one of: ``safety``, ``skill_review``, ``two_part_review``, ``triad_review``,
+    ``reviewer_slot``, ``plan_review``, ``advisory_review``, ``native_episode``,
+    ``finalization``, ``agent``. ORDER MATTERS (roast F22):
     every review-organ branch is checked BEFORE the finalization-turn check,
     because a review packet may quote a transcript that itself contains a
     finalization marker — a stub that answered such a packet with a final chat
@@ -231,19 +284,15 @@ def classify_call(body: dict) -> str:
     # another branch's marker; its own opening sentence is the most specific.
     if SKILL_REVIEW_MARKER in full:
         return "skill_review"
-    # Scope before triad: both user messages start with "Review the staged".
-    if SCOPE_USER_MARKER in user_tail:
-        return "scope_review"
     if TRIAD_USER_MARKER in user_tail:
         return "triad_review"
     if PLAN_REVIEW_MARKER in full:
         return "plan_review"
     if NATIVE_EPISODE_MARKER in full:
         match = _SURFACE_LINE_RE.search(full)
-        surface = match.group(1) if match else ""
-        return surface if surface in {"advisory_review", "scope_review"} else "native_episode"
+        return _NATIVE_SURFACE_KINDS.get(match.group(1) if match else "", "native_episode")
     if REVIEWER_SLOT_MARKER in full:
-        return "acceptance" if ACCEPTANCE_KEYS_MARKER in full else "reviewer_slot"
+        return "reviewer_slot"
     if any(marker in full for marker in FINALIZATION_MARKERS):
         return "finalization"
     return "agent"
@@ -253,7 +302,7 @@ def classify_call(body: dict) -> str:
 # consume an agent script step or a ReplayModel fixture row, and a scenario's
 # ReviewScript may override their canned answers.
 REVIEW_KINDS = frozenset({
-    "safety", "scope_review", "triad_review", "acceptance", "reviewer_slot",
+    "safety", "two_part_review", "triad_review", "reviewer_slot",
     "plan_review", "advisory_review", "native_episode",
 })
 
@@ -261,8 +310,10 @@ REVIEW_KINDS = frozenset({
 # ---------------------------------------------------------------------------
 # Canned review-organ verdicts (all-clean). Shapes come from the tree's own parsers:
 # triad — triad_review.REVIEW_JSON_ARRAY_CONTRACT ([] + NO_FINDINGS sentinel);
-# scope — scope_review_contract.normalize_scope_items (required matrix, PASS reasons
-# must be non-terse); reviewer slot — review_execution's "Return JSON with keys" list.
+# two-part — triad_review.REVIEW_TWO_PART_OBJECT_CONTRACT: one object {change, change_clean,
+# coupling}, the coupling matrix per scope_review_contract.normalize_scope_items (required
+# matrix, every row carries a reason); reviewer slot — review_execution's "Return JSON
+# with keys" list.
 # ---------------------------------------------------------------------------
 
 TRIAD_CLEAN_TEXT = "[]\nNO_FINDINGS"
@@ -278,19 +329,21 @@ def canned_review_answer(kind: str) -> dict | None:
     if kind == "safety":
         return {"role": "assistant",
                 "content": json.dumps({"status": "SAFE", "reason": "stub"})}
-    if kind == "skill_review":
-        return {"role": "assistant", "content": skill_review_clean_text()}
-    if kind == "scope_review":
-        return {"role": "assistant", "content": scope_clean_text()}
-    if kind == "triad_review":
+    if kind == "two_part_review":
+        return {"role": "assistant", "content": two_part_clean_text()}
+    if kind in ("triad_review", "skill_review"):
         return {"role": "assistant", "content": TRIAD_CLEAN_TEXT}
-    if kind in ("acceptance", "reviewer_slot"):
-        return {"role": "assistant", "content": reviewer_slot_clean_text(kind)}
-    if kind in ("plan_review", "advisory_review", "native_episode"):
-        # One shared clean shape: the plan-review findings contract
-        # (plan_spec.parse_findings) and the advisory episode's clean predicate
-        # (triad_review.empty_array_is_verified_clean) both accept the bare
-        # empty array + NO_FINDINGS sentinel as a verified-clean verdict.
+    if kind == "reviewer_slot":
+        return {"role": "assistant", "content": reviewer_slot_clean_text()}
+    if kind == "plan_review":
+        # The planning organ's reply contract (plan_packet.PLAN_REPLY_CONTRACT, parsed by
+        # plan_record.parse_reply): prose plus the participant's own objections and
+        # withdrawals; a clean answer raises nothing. Nobody votes, so no verdict token.
+        return {"role": "assistant", "content": json.dumps(
+            {"prose": "Stub participant: no objection to starting as planned.", "objections": [], "withdrawn": []})}
+    if kind in ("advisory_review", "native_episode"):
+        # The advisory episode's clean predicate (triad_review.empty_array_is_verified_clean)
+        # accepts the bare empty array + NO_FINDINGS sentinel as a verified-clean verdict.
         return {"role": "assistant", "content": TRIAD_CLEAN_TEXT}
     return None
 
@@ -298,13 +351,13 @@ def canned_review_answer(kind: str) -> dict | None:
 def skill_review_clean_text() -> str:
     """All-PASS skill-review verdict over the tree's OWN checklist items.
 
-    The item list is imported from the prompt module (its ``_SKILL_REVIEW_ITEMS``
-    is both the prompt's expected-items contract and the parser's required set),
+    The item list is imported from the skill subject module (its ``SKILL_REVIEW_ITEMS``
+    is the closed list a finding may name),
     so an upstream checklist change re-derives the canned verdict instead of
     silently failing coverage. Lazy import: the skill-review module tree is heavy
     and only skill scenarios pay for it.
     """
-    from ouroboros.skill_review_prompt import _SKILL_REVIEW_ITEMS
+    from ouroboros.tools.review_skill import SKILL_REVIEW_ITEMS
 
     return json.dumps([
         {
@@ -313,29 +366,28 @@ def skill_review_clean_text() -> str:
             "severity": "advisory",
             "reason": "Stub skill reviewer: checked and clean for the scripted E2E payload.",
         }
-        for item in _SKILL_REVIEW_ITEMS
+        for item in SKILL_REVIEW_ITEMS
     ])
 
 
-def scope_clean_text() -> str:
-    return json.dumps([
-        {
-            "item": item,
-            "verdict": "PASS",
-            "severity": "advisory",
-            "reason": "Stub scope reviewer: checked and clean for this scripted smoke diff.",
-        }
-        for item in sorted(SCOPE_REQUIRED_ITEMS)
-    ])
+def two_part_clean_text() -> str:
+    """Contract B, all clean: no change findings and a full PASS coupling matrix."""
+    return json.dumps({
+        "change": [], "change_clean": True,
+        "coupling": [
+            {
+                "item": item,
+                "verdict": "PASS",
+                "severity": "advisory",
+                "reason": "Stub coupling reviewer: checked and clean for this scripted smoke diff.",
+            }
+            for item in sorted(SCOPE_REQUIRED_ITEMS)
+        ],
+    })
 
 
-def reviewer_slot_clean_text(kind: str) -> str:
-    verdict = {"verdict": "PASS", "findings": [], "summary": "stub reviewer slot: clean."}
-    if kind == "acceptance":
-        verdict["outcome_tier"] = "solved"
-        verdict["dialogue_status"] = "continue_actionable"
-        verdict["criteria_used"] = []
-    return json.dumps(verdict)
+def reviewer_slot_clean_text() -> str:
+    return json.dumps({"verdict": "PASS", "findings": [], "summary": "stub reviewer slot: clean."})
 
 
 class ReviewScript:
@@ -343,7 +395,7 @@ class ReviewScript:
 
     The wave-1 stub answers every review-organ call with the canned ALL-CLEAN
     verdict; the review-surface scenarios need the organ to say something else
-    first (a REVISE plan finding, a critical triad FAIL, an acceptance reject)
+    first (a REVISE plan finding, a critical triad FAIL)
     and only then converge. A ReviewScript maps ``kind`` (a ``REVIEW_KINDS``
     member) to an ORDERED queue of verdicts; each review call of that kind
     consumes one entry, and an exhausted or absent queue falls back to the
@@ -474,6 +526,16 @@ class ModelGate:
                 f"ModelGate: the scenario never released the held round within {self.timeout:.0f}s")
 
 
+class StubHttpError(Exception):
+    """A scenario's deliberate provider failure: the model answers this HTTP status
+    instead of a completion (a 503 is the provider's own transient refusal), never
+    the loud ``e2e_script_error`` 500 of a broken step."""
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = int(status)
+
+
 class LoopbackModelServer:
     """Shared HTTP plumbing of the loopback OpenAI-compatible model servers.
 
@@ -487,6 +549,7 @@ class LoopbackModelServer:
     def __init__(self, *, latency_sec: float = 0.0, gate: "ModelGate | None" = None) -> None:
         self.latency_sec = latency_sec
         self.gate = gate
+        self.window_tokens = 2_000_000  # what /models advertises (below); a test may set its own before the first probe
         self.calls: list = []          # (kind, body) in arrival order
         self._lock = threading.Lock()
         outer = self
@@ -494,15 +557,16 @@ class LoopbackModelServer:
         class _Handler(BaseHTTPRequestHandler):
             def do_GET(self):  # noqa: N802 - stdlib callback name
                 if self.path.rstrip("/").endswith("/models"):
-                    # >=1M ON PURPOSE, and it is load-bearing twice: the capability-
-                    # evidence /models probe stores this as a CONFIRMED window, which
-                    # (a) sizes the triad fit budget (a 400K window under the cold
-                    # 1.65 density floor caps input at ~202K — BELOW the ~226K
-                    # governance pack, blocking every commit_reviewed before
-                    # dispatch), and (b) satisfies the BIBLE P3 >=1M floor that
-                    # scope review's BLOCKING authority requires.
+                    # The default is >=1M ON PURPOSE: the capability-evidence /models probe stores
+                    # this as a CONFIRMED window, which (a) sizes the triad fit
+                    # budget (a 400K window under the cold 1.65 density floor caps
+                    # input at ~202K — BELOW the ~226K governance pack, so every
+                    # commit_reviewed would return without a verdict, nothing
+                    # dispatched), and (b) keeps the seats' absolute output reserves
+                    # (reviewer_window). A window is sizing only, never a condition
+                    # of a review's authority (owner 2026-09-17, BIBLE P3).
                     return self._send({"data": [
-                        {"id": model_id, "max_model_len": 2_000_000}
+                        {"id": model_id, "max_model_len": outer.window_tokens}
                         for model_id in outer._model_ids()
                     ]})
                 self.send_error(404)
@@ -521,9 +585,19 @@ class LoopbackModelServer:
                     outer.gate(body)
                 if outer.latency_sec:
                     time.sleep(outer.latency_sec)
-                return self._send(outer._completion(body), stream=bool(body.get("stream")))
+                try:
+                    completion = outer._completion(body)
+                except StubHttpError as exc:
+                    return self._send({"error": {"message": str(exc), "type": "server_error"}}, status=exc.status)
+                except Exception as exc:  # a scenario-script bug must fail LOUDLY, never hang the client
+                    import traceback
 
-            def _send(self, payload, *, stream=False):
+                    sys.stderr.write("LoopbackModelServer: scenario step raised\n" + traceback.format_exc())
+                    return self._send({"error": {"message": f"scenario step raised {type(exc).__name__}: {exc}",
+                                                 "type": "e2e_script_error"}}, status=500)
+                return self._send(completion, stream=bool(body.get("stream")))
+
+            def _send(self, payload, *, stream=False, status=200):
                 content_type = "application/json"
                 if stream:
                     content_type = "text/event-stream"
@@ -543,7 +617,7 @@ class LoopbackModelServer:
                             + "data: [DONE]\n\n").encode("utf-8")
                 else:
                     data = json.dumps(payload).encode("utf-8")
-                self.send_response(200)
+                self.send_response(status)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
@@ -599,7 +673,7 @@ class ScriptedStubModel(LoopbackModelServer):
     fixed keepalive tool, a scenario hands the stub an ORDERED list of tool steps
     (``{"tool": name, "arguments": {...}}``); each plain agent turn consumes one step,
     and an exhausted script yields the tool-less final answer. Review-organ calls
-    (triad / scope / reviewer-slot / acceptance) NEVER consume script steps — they are
+    (triad / scope / reviewer-slot) NEVER consume script steps — they are
     classified by prompt markers and answered with canned all-clean verdicts, and that
     classification runs BEFORE the finalization-turn check (roast F22). Safety
     supervisor calls (json_object response_format) always get a SAFE verdict.
@@ -610,12 +684,20 @@ class ScriptedStubModel(LoopbackModelServer):
 
     def __init__(self, script=None, *, final_answer: str = "Final answer: scripted scenario complete.",
                  latency_sec: float = 0.0, review_script: "ReviewScript | None" = None,
-                 gate: "ModelGate | None" = None) -> None:
+                 gate: "ModelGate | None" = None, model_ids=None) -> None:
         super().__init__(latency_sec=latency_sec, gate=gate)
         self.script = list(script or [])
         self.final_answer = final_answer
         self.review_script = review_script
+        # As on ReplayModel: extra wire ids to advertise on /models, so the
+        # capability-evidence window probe confirms a window for each distinct slot route.
+        self._explicit_model_ids = [str(m) for m in model_ids] if model_ids else None
         self._script_index = 0
+
+    def _model_ids(self) -> list[str]:
+        if self._explicit_model_ids is not None:
+            return sorted(set(self._explicit_model_ids) | {"mock-model"})
+        return super()._model_ids()
 
     def _next_step(self, _body) -> dict | None:
         if self._script_index >= len(self.script):
@@ -654,6 +736,23 @@ def default_slot_binder(body: dict) -> str:
     slugs per model slot in settings, so the wire's ``model`` field names the slot
     that made the call (no guessing from prompt shape)."""
     return str(body.get("model") or "")
+
+
+class HeldStep:
+    """Marker a CALLABLE ReplayModel step returns to serve ``step`` now and be
+    consulted AGAIN on the next call of the same (lineage, slot).
+
+    The attempt ordinal does not advance, so a wait that must repeat a
+    timing-dependent number of times (until a mailbox delivery is visible in the
+    transcript) keeps ONE fixture row instead of guessing the count — the
+    ReplayModel twin of the wave-3a ``_Again`` hold for the scripted stub.
+    ``assert_consumed()`` still requires the held row to have been served.
+    """
+
+    __slots__ = ("step",)
+
+    def __init__(self, step: dict) -> None:
+        self.step = step
 
 
 class ReplayModel(LoopbackModelServer):
@@ -729,6 +828,9 @@ class ReplayModel(LoopbackModelServer):
         self.consumed.append(key)
         if callable(step):
             step = step(body)
+            if isinstance(step, HeldStep):
+                self._attempts[(lineage, slot)] = attempt - 1  # consult this row again
+                step = step.step
         if "message" in step:
             return "replay", dict(step["message"])
         if "final" in step:
@@ -784,7 +886,10 @@ def runtime_credential_env_key_reads() -> set:
             for name in _ENV_READ_RE.findall(source):
                 if _CREDENTIAL_SHAPE_RE.search(name):
                     keys.add(name)
-    return keys
+    # The resolver reads every kind's secret settings and the added-key rows by name through the
+    # kind table, which no literal shows (``provider_connections.connection_values``).
+    keys.update(flat for spec in PROVIDER_KINDS.values() for _field, flat, secret in spec.fields if secret)
+    return keys | {CONNECTIONS_KEY}
 
 
 def proc_environ(pid: int) -> dict:
@@ -942,7 +1047,7 @@ def retired_cost_alias_paths(payload) -> list:
 # Everything the child environment must NOT carry in the keyless lane. The env union
 # closes the documented hole: IsolatedServer._is_secret_env_key EXEMPTS provider keys,
 # so an inherited ANTHROPIC_API_KEY survives the base sanitization by design.
-STRIPPED_PROVIDER_ENV_KEYS = frozenset(_PROVIDER_ENV_KEYS) | frozenset(ALL_PROVIDER_CREDENTIAL_KEYS)
+STRIPPED_PROVIDER_ENV_KEYS = frozenset(_PROVIDER_ENV_KEYS) | frozenset(ALL_PROVIDER_CREDENTIAL_KEYS) | {CONNECTIONS_KEY}
 PROXY_ENV_KEYS = frozenset({
     "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
     "http_proxy", "https_proxy", "all_proxy", "no_proxy",
@@ -956,7 +1061,17 @@ class KeylessIsolatedServer(IsolatedServer):
     servers authenticate from them). This lane's contract is the opposite: the ONLY
     provider config a scenario server may see is what the scenario's settings.json
     says, and that file only ever names the loopback stub.
+
+    Browser callers pass a CandidateCheckout to retain the dirty snapshot until
+    its contained process tree is proven gone. Plain Path callers keep the
+    mutable HEAD-clone contract used by self-modification E2E scenarios.
     """
+
+    def __init__(self, clone, *args, **kwargs):
+        self.candidate = clone if isinstance(clone, CandidateCheckout) else None
+        self._candidate_container = None
+        self._candidate_cleanup_error = ""
+        super().__init__(self.candidate.path if self.candidate else clone, *args, **kwargs)
 
     def _env(self) -> dict:
         env = super()._env()
@@ -965,31 +1080,126 @@ class KeylessIsolatedServer(IsolatedServer):
                 env.pop(key, None)
         return env
 
+    def start(self, ready_timeout: float = 180):
+        if self.candidate is None:
+            return super().start(ready_timeout)
+        from ouroboros.process_containment import ProcessContainer
 
-def keyless_reviewer_slots(*, advisory: bool = False) -> str:
-    """The structured ``OUROBOROS_REVIEWER_SLOTS`` value pinning every reviewer row
-    to the loopback stub.
+        if self._candidate_container is not None or self._candidate_cleanup_error:
+            raise CandidateError("CANDIDATE_CUSTODY: previous server tree was not released")
+        verify_checkout(self.clone, self.candidate)
+        self._patch_settings_ports()
+        env = self._env()
+        python = sys.executable
+        if os.name == "nt":
+            # As in the shared UI fixture, the base interpreter owns the serving
+            # PID; the venv launcher would return a different parent PID.
+            python = str(getattr(sys, "_base_executable", sys.executable))
+            site = pathlib.Path(sys.executable).resolve().parent.parent / "Lib" / "site-packages"
+            if site.is_dir():
+                env["PYTHONPATH"] = os.pathsep.join([str(site), env.get("PYTHONPATH", "")])
+        require_candidate_interpreter(python, env, self.clone)
+        self._candidate_container = ProcessContainer()
+        self.candidate.hold()
+        self.proc = None
+        try:
+            self.proc = self._candidate_container.spawn(
+                [python, "server.py"], cwd=self.clone, env=env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            self._wait_ready(ready_timeout)
+            assert_served_candidate(self.base_url, self.clone, self.data_root,
+                                    self.proc.pid, self.candidate)
+        except BaseException:
+            self.stop()
+            raise
+        return self
 
-    ABI 7.0 (ABI-10): the comma-list reviewer settings keys are RETIRED —
-    ``load_settings`` drops them from the file, so pinning them there is a silent
-    no-op and the review organ falls back to the shipped OpenRouter default panel
-    (observed live on this tree: S2's triad dispatched gemini/terra/opus with no
-    credential and deterministically blocked at pack assembly). The structured key
-    is the ONE configuration surface, so the keyless lane pins THAT.
+    def stop(self) -> None:
+        if self.candidate is None:
+            return super().stop()
+        if self._candidate_cleanup_error:
+            raise CandidateError(self._candidate_cleanup_error)
+        container, self._candidate_container = self._candidate_container, None
+        if container is None:
+            return
+        # A scenario's timeout alarm landing in here is held until the container is reaped: the
+        # reap consumes its handles once, so an alarm inside it would leave members running.
+        with alarm_deferred():
+            try:
+                try:
+                    super().stop()
+                finally:
+                    try:
+                        error = container.reap()
+                    finally:
+                        container.close()
+                    if error:
+                        raise CandidateError(f"CANDIDATE_RETAINED: process cleanup failed: {error}")
+                    if self.proc is not None:
+                        self.proc.wait(timeout=5)
+            except BaseException as exc:
+                from ouroboros.test_environment import retain_tree
 
-    ``advisory=True`` additionally pins the ONE optional advisory reviewer row to
-    the stub (wave 3a): the advisory pre-review then runs the bounded NATIVE
-    inspection episode against the loopback model instead of being unavailable
-    keyless (which the commit gate compensates with an audited bypass).
+                self._candidate_cleanup_error = f"CANDIDATE_RETAINED: {exc}"
+                retain_tree(self.data_root, self._candidate_cleanup_error)
+                raise
+            self.candidate.release()
+
+
+# The pool rows of ``keyless_review_catalog``: seat ``t<i>`` is catalog row
+# ``review-t<i>`` — a reviewer's seat id IS its catalog row id, so the durable wave
+# artifacts (plan-review actors, finding ids ``<row>:<id>``) name seats by these.
+KEYLESS_REVIEW_ROWS = ("review-t1", "review-t2", "review-t3")
+# The rows that deliver as PACKETS (contract A: the JSON array + NO_FINDINGS); the
+# remaining row keeps the catalog default, a native inspection episode (contract B).
+KEYLESS_PACKET_ROWS = KEYLESS_REVIEW_ROWS[:2]
+
+
+def keyless_review_catalog(*, distinct_models: bool = False) -> str:
+    """The ``OUROBOROS_SUBAGENTS`` catalog whose rows marked Reviewer are the whole
+    review pool, every one an API route onto the loopback stub.
+
+    The review pool is the enabled catalog rows marked Reviewer (``review_eligible``),
+    and a never-configured catalog reads the factory reviewers instead: live
+    OpenRouter routes that dispatch with no credential and deterministically block
+    at pack assembly keyless. So the keyless lane pins THIS catalog. Three rows keep
+    the shipped panel's width. The catalog itself is switched off: review stays on
+    for rows marked Reviewer, while delegation stays as unconfigured as on a bare
+    keyless install.
+
+    The panel is MIXED on purpose: ``KEYLESS_PACKET_ROWS`` deliver as packets
+    (``delivery: packet`` — the triad/skill packet the stub classifies
+    by its marker) and the last row keeps the catalog default, a native inspection
+    episode (the stub classifies it by its ``Surface:`` line). One wave therefore
+    exercises both delivery classes end to end and their aggregate: a scripted red
+    packet verdict blocks beside a clean native seat, and a hooked native seat
+    (the post-verdict freshness probe) runs beside clean packets.
+
+    ``distinct_models=True`` pins row ``review-t<i>`` to its own slug
+    (``DISTINCT_MOCK_MODEL_IDS``) so a per-seat ReviewScript can tell the seats
+    apart on the wire; the stub must advertise those ids (``model_ids``). A
+    scenario that passes its own catalog owns its pool: it marks its own reviewers
+    or reviews nothing — ``keyless_review_rows()`` are the rows to add to such a
+    roster when the scenario still reviews.
     """
-    row = {"kind": "api_chat", "target_id": MOCK_SLUG}
-    payload = {
-        "triad": [{"slot_id": f"t{i}", "route": dict(row)} for i in (1, 2, 3)],
-        "scope": [{"slot_id": "s1", "route": dict(row)}],
-    }
-    if advisory:
-        payload["advisory"] = {"enabled": True, "route": dict(row)}
-    return json.dumps(payload)
+    return json.dumps({"enabled": False, "items": keyless_review_rows(distinct_models=distinct_models)})
+
+
+def keyless_review_rows(*, distinct_models: bool = False) -> list:
+    """The reviewer rows of ``keyless_review_catalog`` (see there), as catalog items."""
+    items = []
+    for i, row_id in enumerate(KEYLESS_REVIEW_ROWS, 1):
+        row = {
+            "subagent_id": row_id,
+            "recommended_use": "Keyless reviewer on the loopback stub.",
+            "route": {"kind": "api_model", "target_id": f"{MOCK_SLUG}-t{i}" if distinct_models else MOCK_SLUG},
+            "review_eligible": True,
+        }
+        if row_id in KEYLESS_PACKET_ROWS:
+            row["delivery"] = "packet"
+        items.append(row)
+    return items
 
 
 def keyless_settings(stub: ScriptedStubModel, **overrides) -> dict:
@@ -997,9 +1207,9 @@ def keyless_settings(stub: ScriptedStubModel, **overrides) -> dict:
 
     Every model-slot key the TREE declares is pinned — un-listed keys default to the
     empty string (slot disabled / no fallback), the live loop slots to the stub slug,
-    and the review organ through the structured ``OUROBOROS_REVIEWER_SLOTS`` (the one
-    ABI-10 configuration surface; the retired comma keys in the ACTIVE list are pinned
-    empty for hygiene but are dropped by ``load_settings`` either way). Deriving the
+    and the review pool through catalog rows marked Reviewer (``keyless_review_catalog``;
+    the retired comma keys in the ACTIVE list are pinned empty for hygiene but are
+    dropped by ``load_settings`` either way). Deriving the
     slot list from ``provider_models`` (instead of an enumerated literal, as the
     cancellation-harness precedent did) means an upstream slot added tomorrow is
     pinned by construction rather than silently defaulting to a live OpenRouter
@@ -1026,7 +1236,10 @@ def keyless_settings(stub: ScriptedStubModel, **overrides) -> dict:
         "OUROBOROS_PER_TASK_COST_USD": 10.0,
         "OPENAI_COMPATIBLE_BASE_URL": stub.base_url,
         "OPENAI_COMPATIBLE_API_KEY": "stub-key-not-a-credential",
-        "OUROBOROS_REVIEWER_SLOTS": keyless_reviewer_slots(),
+        "OUROBOROS_SUBAGENTS": keyless_review_catalog(),
+        # A fresh root with a ready provider would clone the skill hub from GitHub at boot
+        # (#1995); no scenario is about the starter, so the lane stays off the network.
+        "OUROBOROS_STARTER_SKILLS": "[]",
     })
     for slot in ("OUROBOROS_MODEL", "OUROBOROS_MODEL_LIGHT"):
         cfg[slot] = MOCK_SLUG
@@ -1055,7 +1268,9 @@ def clone_repo(destination: pathlib.Path) -> pathlib.Path:
     depend on the operator's global git config.
     """
     clone = pathlib.Path(destination) / "clone"
-    subprocess.run(["git", "clone", "--no-hardlinks", "-q", str(REPO_ROOT), str(clone)],
+    # Full-history transport clone: omit unreachable source objects, not history
+    # or refs. No alternates; source deletion cannot invalidate this checkout.
+    subprocess.run(["git", "clone", "--no-local", "-q", str(REPO_ROOT), str(clone)],
                    check=True, capture_output=True)
     subprocess.run(["git", "checkout", "-B", "ouroboros"], cwd=str(clone),
                    check=True, capture_output=True)
@@ -1084,6 +1299,8 @@ def write_settings_file(settings_path: pathlib.Path, settings: dict) -> None:
 
 def start_server(clone, root, settings: dict, *, ready_timeout: float = 300) -> KeylessIsolatedServer:
     assert_settings_keyless(settings)
+    # A body write prepares a candidate checkout under this root (#1539): keep it in the scenario.
+    settings = {"OUROBOROS_SUBAGENT_WORKTREE_ROOT": str(pathlib.Path(root) / "worktrees"), **settings}
     data_root = pathlib.Path(root) / "data"
     data_root.mkdir(parents=True, exist_ok=True)
     settings_path = data_root / "settings.json"
@@ -1109,7 +1326,7 @@ class ArtifactOracle:
         On this tree a headless task's ToolContext drive root is
         ``state/headless_tasks/<task_id>/data`` under the server's data root, so the
         durable review evidence (state/advisory_review.json, the
-        advisory_review_bypassed / scope_review_complete events) lands THERE, not in
+        advisory_review_bypassed event, the review ledger record) lands THERE, not in
         the server-level files. Falls back to the server root when the task has no
         forked drive (e.g. a direct-chat turn)."""
         forked = self.data_root / "state" / "headless_tasks" / str(task_id) / "data"
@@ -1133,6 +1350,11 @@ class ArtifactOracle:
     def advisory_review(self) -> dict:
         return self._json("state/advisory_review.json")
 
+    def review_ledger_records(self) -> list:
+        """Every review ledger record under this root (state/review_ledger/*.json)."""
+        ledger = self.data_root / "state" / "review_ledger"
+        return [self._json(f"state/review_ledger/{path.name}") for path in sorted(ledger.glob("*.json"))]
+
     def cancel_intents(self) -> dict:
         blob = self._json("state/cancel_intents.json")
         return blob.get("intents") if isinstance(blob.get("intents"), dict) else {}
@@ -1144,30 +1366,26 @@ class ArtifactOracle:
         return self._json("state/terminal_deliveries.json")
 
     def task_result(self, task_id: str) -> dict:
-        return self._json(f"task_results/{task_id}.json")
-
-    def task_result_bytes(self, task_id: str) -> bytes:
-        return (self.data_root / "task_results" / f"{task_id}.json").read_bytes()
+        from ouroboros.task_results import load_task_result
+        return load_task_result(self.data_root, task_id) or {}
 
     def child_task_ids(self, parent_task_id: str) -> list:
-        """Direct children of *parent_task_id* per the durable task_results rows.
+        """Direct children from the canonical current-facts store (#1733)."""
+        from ouroboros.task_store import task_facts
+        return list(task_facts(self.data_root, where="parent_task_id=?", params=(str(parent_task_id),)))
 
-        The parent's own stored row deliberately does NOT list children ids (only a
-        derived swarm rollup), so lineage enumeration reads the children's rows —
-        the same truth ``find_child_tasks`` derives from.
-        """
-        results_dir = self.data_root / "task_results"
-        if not results_dir.is_dir():
-            return []
-        children = []
-        for path in sorted(results_dir.glob("*.json")):
-            try:
-                row = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue
-            if isinstance(row, dict) and str(row.get("parent_task_id") or "") == str(parent_task_id):
-                children.append(str(row.get("task_id") or path.stem))
-        return children
+    def copy_records(self) -> list:
+        """Every private copy's record (``state/private_copies/<name>.json``, one file per copy)."""
+        folder = self.data_root / "state" / "private_copies"
+        return [self._json(f"state/private_copies/{path.name}") for path in sorted(folder.glob("*.json"))
+                if not path.name.startswith(".")]
+
+    def body_candidate(self, task_id: str = "") -> dict:
+        """One authoring candidate; callbacks before submit returns may omit its owner."""
+        rows = [row for row in self.copy_records()
+                if row.get("kind") == "body_candidate" and (not task_id or row.get("task_id") == task_id)]
+        assert len(rows) == 1, rows
+        return rows[0]
 
     def tree_blackboard(self, root_task_id: str) -> list:
         """Rows of the task-tree ledger (task_trees/<root>/blackboard.jsonl)."""
@@ -1177,6 +1395,9 @@ class ArtifactOracle:
 
     def _jsonl(self, relpath: str, *, type_filter: str = "") -> list:
         path = self.data_root / relpath
+        if relpath in {"logs/chat.jsonl", "logs/progress.jsonl"}:
+            return [row for row in dialogue_test.log_rows(path)
+                    if not type_filter or str(row.get("type") or "") == type_filter]
         if not path.exists():
             return []
         rows = []
@@ -1207,7 +1428,7 @@ class ArtifactOracle:
 
     def chat_bytes(self) -> bytes:
         path = self.data_root / "logs" / "chat.jsonl"
-        return path.read_bytes() if path.exists() else b""
+        return dialogue_test.log_bytes(path)
 
     def running_ids(self) -> set:
         return {
@@ -1215,6 +1436,16 @@ class ArtifactOracle:
             for row in (self.queue_snapshot().get("running") or [])
             if isinstance(row, dict)
         }
+
+    def running_row(self, task_id: str) -> dict:
+        """The published RUNNING row of ``task_id``, or ``{}`` when the snapshot names none."""
+        return next((row for row in (self.queue_snapshot().get("running") or [])
+                     if isinstance(row, dict) and str(row.get("id") or "") == str(task_id)), {})
+
+    def pending_rows(self, task_id: str) -> list:
+        """Every published PENDING row of ``task_id``: a task id owns at most one queue row."""
+        return [row for row in (self.queue_snapshot().get("pending") or [])
+                if isinstance(row, dict) and str(row.get("id") or "") == str(task_id)]
 
     # -- boot surface ---------------------------------------------------------
 
@@ -1265,6 +1496,38 @@ def submit_running(server: IsolatedServer, description: str, *,
     running = wait_until(lambda: task_id in oracle.running_ids(), timeout)
     assert running, f"task {task_id} never reached the RUNNING set"
     return task_id
+
+
+def conversation_turn_row(oracle: ArtifactOracle, task_id: str, *, timeout: float = 30) -> dict:
+    """The RUNNING row of an owner Main/room turn, held by a conversation-lane worker carrier.
+
+    Since #2654 an owner turn is not an in-process actor without a queue row: routing
+    admits it to a ``WORKERS`` slot with ``lane="conversation"``
+    (``supervisor/conversation_lane.py``), publishing its RUNNING row first and never
+    PENDING, outside ``MAX_WORKERS`` and the project leases, with ``_execution_owner``
+    naming its origin (``direct``) and carrier (``worker``); a ready carrier process
+    holds it. Fails by name on a missing row (the retired in-process actor), a PENDING
+    row, a project-lane or pooled row, a disclosed inline executor, or a slot no live
+    custodied worker process backs. Returns the row with ``carrier_pid`` added.
+    """
+    from ouroboros.task_carrier import EXECUTOR_WORKER, LANE_CONVERSATION
+    from tests._shared import live_worker_slots
+
+    def held() -> dict:
+        row = oracle.running_row(task_id)
+        return row if row.get("worker_id") is not None else {}
+
+    row = wait_until(held, timeout) or oracle.running_row(task_id)
+    assert row, f"the turn {task_id} has no RUNNING row: {oracle.queue_snapshot().get('running')}"
+    assert not oracle.pending_rows(task_id), f"the turn {task_id} is also PENDING: {oracle.pending_rows(task_id)}"
+    owner = (row.get("task") or {}).get("_execution_owner") or {}
+    assert (owner.get("kind"), owner.get("lane"), owner.get("executor")) == (
+        "direct", LANE_CONVERSATION, EXECUTOR_WORKER), f"not a conversation-lane worker turn: {row}"
+    assert row.get("worker_id") is not None, f"no carrier holds the turn {task_id}: {row}"
+    slots = live_worker_slots(oracle.data_root)
+    carrier = slots.get(int(row["worker_id"]))
+    assert carrier, f"slot {row['worker_id']} of {task_id} has no live custodied worker process: {slots}"
+    return {**row, "carrier_pid": carrier}
 
 
 def wait_durable_result(oracle: ArtifactOracle, task_id: str, *, timeout: float = 180) -> dict:

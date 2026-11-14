@@ -114,33 +114,33 @@ else:
     assert "OK" in proc.stdout
 
 
-# ── restricted-child reads protect runtime stores and VCS metadata ──────────
+# ── retained command controls identify runtime stores and VCS metadata ──────
 
-def test_child_secret_shape_contract_preserved():
-    from ouroboros.tools.core import (
-        _is_subagent_secret_data_path,
-        _is_subagent_secret_repo_path,
+def test_runtime_command_secret_shape_contract_preserved():
+    from ouroboros.tools.core_secret_paths import (
+        _is_runtime_secret_data_path,
+        _is_runtime_secret_repo_path,
     )
 
     for norm in ("state/settings.json", "secrets/x.txt", ".env.production", "keys.json",
                  "claudexor/profile/auth.json", "state/skills/alpha/auth_token.json"):
-        assert _is_subagent_secret_data_path(norm), norm
+        assert _is_runtime_secret_data_path(norm), norm
     for norm in ("memory/identity.md", "logs/progress.jsonl", "notes.txt",
                  "foo.pem", "my_api_key.json", "source/auth/service.py"):
-        assert not _is_subagent_secret_data_path(norm), norm
+        assert not _is_runtime_secret_data_path(norm), norm
     for norm in (".git/config", "config/.env", "config/prod.env", "config/.env.local"):
-        assert _is_subagent_secret_repo_path(norm), norm
+        assert _is_runtime_secret_repo_path(norm), norm
     # Ordinary project files are not owner stores merely because of their name.
     for norm in ("README.md", "src/main.py", "docs/token_economics.md", "settings.json",
                  "auth/service.py", "ordinary.config", "deploy.key", "foo.pem", "my_api_key.json",
                  "token.json", "deploy/credentials.json", "auth_token.json", "config/auth_token.json"):
-        assert not _is_subagent_secret_repo_path(norm), norm
+        assert not _is_runtime_secret_repo_path(norm), norm
 
 
 def test_shape_vocabulary_is_single_sourced():
     from ouroboros import credential_shapes as cs
 
-    assert "settings.json" in cs.SUBAGENT_CREDENTIAL_FILE_NAMES
+    assert "settings.json" in cs.RUNTIME_SECRET_FILE_NAMES
     assert ".ssh" in cs.CREDENTIAL_COMPONENT_NAMES
     assert cs.user_files_mutation_shape_reason(
         pathlib.Path("/h/.ssh/id_rsa"), pathlib.Path("/h")
@@ -200,6 +200,6 @@ def test_child_search_keeps_named_project_files_and_reports_actual_exclusions(tm
 
     result = core_mod._code_search(ctx, "needle", root="active_workspace", path=".")
     assert "secrets.json" in result
-    assert ".env.local" not in result
+    assert ".env.local" in result
     assert "notes.txt" in result
-    assert "secret/control file(s) omitted from this subagent's search" in result
+    assert "omitted" not in result

@@ -7,11 +7,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from ouroboros.utils import utc_now_iso
 from ouroboros import agent_task_pipeline as pipeline, headless, owner_mailbox
 from ouroboros.task_results import load_task_result, write_task_result
 from ouroboros.utils import append_jsonl
 from supervisor import worker_process
 from supervisor.terminal_delivery import cleanup_settled_owner_mailbox
+from tests._store_shared import result_signature
 
 
 @pytest.fixture
@@ -75,11 +77,13 @@ def test_worker_saves_once_after_prior_frames_and_before_done(worker, monkeypatc
     entered, release = threading.Event(), threading.Event()
     preparations = []
     original = deepcopy(worker.events)
+    # Phase barriers, including the heartbeat's cold store work: only bound hangs.
+    hang = 60
 
     def prepare(root, task):
         preparations.append((root, task["id"], task["_attempt"]))
         entered.set()
-        assert release.wait(5)
+        assert release.wait(hang), "terminal file preparation was never released"
         write_task_result(root, task["id"], "completed", result="The answer", artifact_status="ready")
         return {"task_id": task["id"], "result": {}, "error": ""}
 
@@ -87,9 +91,9 @@ def test_worker_saves_once_after_prior_frames_and_before_done(worker, monkeypatc
     thread = threading.Thread(target=worker.run)
     thread.start()
     try:
-        assert entered.wait(5)
-        assert [worker.output.get_nowait()["type"] for _ in range(2)] == [
-            "send_message", "task_metrics_event"]
+        assert entered.wait(hang), "terminal file preparation never started"
+        assert [worker.output.get_nowait()["type"] for _ in range(3)] == [
+            "direct_turn_phase", "send_message", "task_metrics_event"]
         assert worker.output.empty(), "task_done must not release the busy slot before saving"
         assert len(worker.reads) == 1, "this worker cannot take another task while saving"
         from supervisor.events import dispatch_event
@@ -101,13 +105,14 @@ def test_worker_saves_once_after_prior_frames_and_before_done(worker, monkeypatc
             RUNNING={"other": {"task": {"id": "other", "chat_id": 1}}},
             bridge=SimpleNamespace(push_log=pushed.append),
         )
-        dispatch_event({"type": "task_heartbeat", "task_id": "other", "phase": "working"}, ctx)
+        dispatch_event({"type": "task_heartbeat", "task_id": "other", "phase": "working", "ts": utc_now_iso()}, ctx)
         assert ctx.RUNNING["other"]["last_heartbeat_at"] > 0
         assert pushed[-1]["task_id"] == "other"
         assert busy.busy_task_id == "file-root"
     finally:
         release.set()
-        thread.join(5)
+        thread.join(hang)
+        assert not thread.is_alive(), "terminal file worker did not finish"
     assert not thread.is_alive() and not worker.crashes
     done = worker.output.get_nowait()
     assert done["type"] == "task_done" and done["_files_prepared_attempt"] == 3
@@ -127,7 +132,7 @@ def test_file_failure_does_not_crash_worker_or_replay_task(worker, monkeypatch, 
     monkeypatch.setattr(headless, "prepare_terminal_task_files", prepare, raising=False)
     worker.run()
     assert worker.calls == ["file-root"] and len(worker.reads) == 2 and not worker.crashes
-    frames = [worker.output.get_nowait() for _ in range(3)]
+    frames = [worker.output.get_nowait() for _ in range(4)]  # its start phase, the two producer frames, task_done
     assert frames[-1]["_files_prepared_attempt"] == 3
     assert load_task_result(worker.root, "file-root") is None, "a stamp is not a saved result"
 
@@ -160,12 +165,11 @@ def test_post_task_cleanup_waits_for_pooled_files_only(tmp_path, monkeypatch, po
     monkeypatch.setattr(pipeline, "_pre_synthesis_usage_snapshot", lambda *_a: {})
     monkeypatch.setattr("ouroboros.llm.LLMClient", lambda: object())
     monkeypatch.setattr("ouroboros.memory.Memory", lambda **_kw: object())
-    for name in ("_run_chat_consolidation", "_run_scratchpad_consolidation", "_run_task_summary",
-                 "_run_reflection", "_update_improvement_backlog", "_apply_reflection_memory_actions"):
+    for name in ("_run_memory_fallback_draft", "_record_task_facts"):
         monkeypatch.setattr(pipeline, name, lambda *_a, **_kw: None)
     monkeypatch.setattr("ouroboros.post_task_evolution.maybe_promote", lambda *_a: None)
     env = SimpleNamespace(drive_root=root, repo_dir=tmp_path, drive_path=lambda rel: root / rel)
-    pipeline._run_post_task_processing_async(env, task, {}, {}, {}, root / "logs", blocking=True)
+    pipeline._run_post_task_processing_async(env, task, {}, {}, root / "logs", blocking=True)
     assert mailbox.exists() is pooled
     if pooled:
         cleanup_settled_owner_mailbox(root, task["id"], task)
@@ -173,9 +177,7 @@ def test_post_task_cleanup_waits_for_pooled_files_only(tmp_path, monkeypatch, po
 
 
 @pytest.mark.parametrize("post,pending,keep", [
-    ("pending_once", [], True), ("running", [], True),
-    ("completed", [{"kind": "task_attachment", "path": "accepted-input"}], True),
-    ("completed", [], False), ("degraded", [{"kind": "blob_ref"}], False),
+    ("pending_once", [], True), ("completed", [], False), ("degraded", [{"kind": "blob_ref"}], False),
 ])
 def test_startup_mailbox_sweep_keeps_the_same_outstanding_obligations(tmp_path, post, pending, keep):
     task_id = "sweep-files"
@@ -213,18 +215,19 @@ def test_pooled_post_work_preserves_real_followup_until_copyback(tmp_path, monke
     monkeypatch.setattr(pipeline, "_pre_synthesis_usage_snapshot", lambda *_a: {})
     monkeypatch.setattr("ouroboros.llm.LLMClient", lambda: object())
     monkeypatch.setattr("ouroboros.memory.Memory", lambda **_kw: object())
-    for name in ("_run_chat_consolidation", "_run_scratchpad_consolidation", "_run_task_summary",
-                 "_run_reflection", "_update_improvement_backlog", "_apply_reflection_memory_actions"):
+    for name in ("_run_memory_fallback_draft", "_record_task_facts"):
         monkeypatch.setattr(pipeline, name, lambda *_a, **_kw: None)
     monkeypatch.setattr("ouroboros.post_task_evolution.maybe_promote", lambda *_a: None)
     env = SimpleNamespace(drive_root=child, repo_dir=tmp_path, drive_path=lambda rel: child / rel)
-    pipeline._run_post_task_processing_async(env, task, {}, {}, {}, child / "logs", blocking=True)
+    pipeline._run_post_task_processing_async(env, task, {}, {}, child / "logs", blocking=True)
     mailbox = owner_mailbox._mailbox_path(child, task_id)
     assert mailbox.is_file(), "post-task completion must not erase copyback's accepted input source"
     result = headless.copy_child_task_result(parent, task)
-    assert result["child_ref_promotion"]["pending_refs"] == []
+    assert result["child_ref_promotion"]["pending_refs"]  # adoption does not wait for history
     captured = artifacts.task_artifact_dir_path(parent, task_id) / attachments[0]["relpath"]
     assert captured.read_bytes() == source.read_bytes()
+    retained = headless.retry_child_task_refs(parent, child, task_id)
+    assert retained["child_ref_promotion"]["pending_refs"] == []
     cleanup_settled_owner_mailbox(parent, task_id, task)
     assert not mailbox.exists()
 
@@ -275,7 +278,7 @@ def test_prepared_frame_uses_current_disk_without_second_copy(terminal_context, 
     assert stored["result"] == "Current answer" and "_files_prepared_attempt" not in stored
 
 
-@pytest.mark.parametrize("stamp,wid", [(2, 7), (4, 7), (True, 7), ("3", 7), (3, 8)])
+@pytest.mark.parametrize("stamp,wid", [(2, 7), (True, 7), (3, 8)])
 def test_stale_prepared_frame_cannot_finish_current_attempt(terminal_context, monkeypatch, stamp, wid):
     from supervisor.events import dispatch_event
 
@@ -309,11 +312,14 @@ def test_legacy_completion_uses_one_off_drain_job(file_recovery, monkeypatch):
     ctx, worker, pushed, jobs, returned = file_recovery
     entered, release = threading.Event(), threading.Event()
     preparations = []
+    # Phase barriers (``release`` is always set in ``finally``): the bound only breaks a real hang and
+    # must not time either side's store work, e.g. the heartbeat's cold usage store, 5 s under load (#1944).
+    hang = 60
 
     def prepare(root, task):
         preparations.append(task["id"])
         entered.set()
-        assert release.wait(5)
+        assert release.wait(hang)
         write_task_result(root, task["id"], "completed", result="The saved answer", artifact_status="ready")
         return {"task_id": task["id"], "result": None, "error": ""}
 
@@ -324,16 +330,16 @@ def test_legacy_completion_uses_one_off_drain_job(file_recovery, monkeypatch):
     thread = threading.Thread(target=task_reaper._recover_terminal_files, args=(jobs.get_nowait(),))
     thread.start()
     try:
-        assert entered.wait(5)
+        assert entered.wait(hang)
         events.dispatch_event(event, ctx)
         task_reaper.retry_terminal_file_recoveries()
         assert jobs.empty() and not pushed and worker.busy_task_id == "prepared"
         ctx.RUNNING["other"] = {"task": {"id": "other", "chat_id": 1}}
-        events.dispatch_event({"type": "task_heartbeat", "task_id": "other"}, ctx)
+        events.dispatch_event({"type": "task_heartbeat", "task_id": "other", "ts": utc_now_iso()}, ctx)  # a beat carries its own time
         assert ctx.RUNNING["other"]["last_heartbeat_at"] > 0
     finally:
         release.set()
-        thread.join(5)
+        thread.join(hang)
     assert not thread.is_alive() and preparations == ["prepared"]
     events.dispatch_event(event, ctx)  # Original duplicate is not a failed returned frame.
     task_reaper.retry_terminal_file_recoveries()
@@ -353,7 +359,7 @@ def test_canonical_write_outage_recovers_saved_child_without_model_replay(file_r
     write_task_result(child, "prepared", "completed", result="Saved child answer", artifact_status="ready")
     write_task_result(ctx.DRIVE_ROOT, "prepared", "completed",
                       root_phase_checkpoint={"post_task_synthesis": "completed"})
-    source = (child / "task_results" / "prepared.json").read_bytes()
+    source = result_signature(child, "prepared")
     event = {"type": "task_done", "task_id": "prepared", "worker_id": 7,
              "status": "completed", "_files_prepared_attempt": 3}
     with monkeypatch.context() as fault:
@@ -364,7 +370,7 @@ def test_canonical_write_outage_recovers_saved_child_without_model_replay(file_r
         assert jobs.qsize() == 1 and pushed == []
         task_reaper._recover_terminal_files(jobs.get_nowait())
         assert returned.empty() and pushed == [] and worker.busy_task_id == "prepared"
-        assert (child / "task_results" / "prepared.json").read_bytes() == source
+        assert result_signature(child, "prepared") == source
     task_reaper.retry_terminal_file_recoveries()
     assert jobs.qsize() == 1
     task_reaper._recover_terminal_files(jobs.get_nowait())

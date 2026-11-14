@@ -39,14 +39,10 @@ def _active_transaction(tmp_path: pathlib.Path, task_id: str = "evo-task"):
     state.init(tmp_path)
     queue.init(tmp_path)
     queue.init_queue_refs([], {}, {"value": 0})
+    # An initialized install first (#1307): a campaign on a root without state is a
+    # history whose state was lost, which no whole-state write may re-mint.
+    state.save_state({"owner_chat_id": 1, "evolution_mode_enabled": True, "evolution_owner_stopped": False})
     campaign = evolution_lifecycle.start_evolution_campaign("Improve", source="test")
-    live = state.load_state()
-    live.update({
-        "owner_chat_id": 1,
-        "evolution_mode_enabled": True,
-        "evolution_owner_stopped": False,
-    })
-    state.save_state(live)
     tx = evolution_lifecycle.begin_evolution_transaction(task_id, cycle=1, campaign=campaign)
     return campaign, tx
 

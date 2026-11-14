@@ -15,6 +15,7 @@ import json
 import types
 import pytest
 from ouroboros import cancel_intents as ci
+from ouroboros.terminal_time import terminal_time_fact
 from ouroboros.task_results import (
     STATUS_CANCEL_REQUESTED,
     STATUS_CANCELLED,
@@ -25,6 +26,7 @@ from ouroboros.task_results import (
 )
 
 from tests._cancel_intents_shared import qenv as _qenv
+from tests.worker_pool_support import affirm_ready
 
 # The fixture is requested by name as a test parameter, so it is re-bound through a
 # module attribute: a direct import of a name that reappears as a parameter is an F811
@@ -32,7 +34,8 @@ from tests._cancel_intents_shared import qenv as _qenv
 qenv = _qenv
 
 
-def test_drop_cancelled_pending_consults_the_intent_projection(qenv, monkeypatch):
+@pytest.mark.parametrize("attempt", [1, 2])
+def test_drop_cancelled_pending_consults_the_intent_projection(qenv, monkeypatch, attempt):
     from supervisor import workers
 
     emitted: list = []
@@ -43,7 +46,7 @@ def test_drop_cancelled_pending_consults_the_intent_projection(qenv, monkeypatch
 
     qenv.q.PENDING[:] = [
         {"id": "keepme", "chat_id": 1},
-        {"id": "dropme", "chat_id": 1},
+        {"id": "dropme", "chat_id": 1, "_attempt": attempt},
     ]
     write_task_result(qenv.drive, "dropme", "scheduled")
     ci.request_cancel(qenv.drive, "dropme", reason="parent stopped the plan")
@@ -53,7 +56,10 @@ def test_drop_cancelled_pending_consults_the_intent_projection(qenv, monkeypatch
     assert [t["id"] for t in qenv.q.PENDING] == ["keepme"]
     stored = load_task_result(qenv.drive, "dropme")
     assert stored["status"] == STATUS_CANCELLED
+    assert stored["result"] == ("Cancelled before start." if attempt == 1
+                                else "Cancelled before this continuation started.")
     assert "cost_accounting_status" in stored  # reconstructed, not omitted
+    assert terminal_time_fact(stored)["source"] == "supervisor_cancel"  # the supervisor dropped it and saw the end
     assert ci.active_intent(qenv.drive, "dropme") is None
     assert emitted and emitted[0][0] == "dropme" and emitted[0][1] == "cancelled"
 
@@ -64,12 +70,12 @@ def test_assignment_blocks_when_cancel_intent_projection_is_unreadable(
     from supervisor import queue, state, workers
 
     delivered: list[dict] = []
-    worker = types.SimpleNamespace(
+    worker = affirm_ready(types.SimpleNamespace(
         wid=1,
         busy_task_id=None,
         reaping=False,
         in_q=types.SimpleNamespace(put=lambda task: delivered.append(dict(task))),
-    )
+    ))
     task = {
         "id": "blocked-by-intent-corruption",
         "type": "task",
@@ -117,12 +123,12 @@ def test_assignment_retains_pending_when_claim_authority_raises(qenv, monkeypatc
     task_id = "claim-authority-failure"
     pending = [{"id": task_id, "type": "task", "chat_id": 1, "depth": 0}]
     delivered: list[dict] = []
-    worker = types.SimpleNamespace(
+    worker = affirm_ready(types.SimpleNamespace(
         wid=1,
         busy_task_id=None,
         reaping=False,
         in_q=types.SimpleNamespace(put=lambda task: delivered.append(dict(task))),
-    )
+    ))
     monkeypatch.setattr(workers, "DRIVE_ROOT", qenv.drive)
     monkeypatch.setattr(workers, "PENDING", pending)
     monkeypatch.setattr(workers, "RUNNING", {})
@@ -154,12 +160,17 @@ def test_assignment_retains_pending_when_claim_authority_raises(qenv, monkeypatc
 def test_timeout_reaper_does_not_clone_over_unreadable_cancel_authority(
     tmp_path, monkeypatch,
 ):
-    """Every physical retry must prove that the old id has no cancel intent."""
+    """Every physical retry must prove that the old id has no cancel intent.
+
+    Silence alone reaps nothing (#1376); the task's explicit deadline is the timeout."""
+    import datetime as dt
+
     from supervisor import queue, workers
 
     now = 10_000.0
     task_id = "timeout-over-corrupt-intent-store"
-    task = {"id": task_id, "type": "task", "chat_id": 0}
+    task = {"id": task_id, "type": "task", "chat_id": 0,
+            "deadline_at": dt.datetime.fromtimestamp(now + 100.0, tz=dt.timezone.utc).isoformat()}
     meta = {
         "task": task,
         "started_at": now - 1000.0,
@@ -173,7 +184,6 @@ def test_timeout_reaper_does_not_clone_over_unreadable_cancel_authority(
     monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
     monkeypatch.setattr(queue, "FINALIZATION_GRACE_SEC", 0.0)
     monkeypatch.setattr(queue, "get_task_idle_timeout_sec", lambda: 60.0)
-    monkeypatch.setattr(queue, "get_per_call_timeout_ceiling_sec", lambda: 0.0)
     monkeypatch.setattr(queue, "get_task_abs_ceiling_sec", lambda: 10_000_000.0)
     monkeypatch.setattr(queue, "_ensure_reaper_started", lambda: None)
     monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": True)
@@ -186,11 +196,15 @@ def test_timeout_reaper_does_not_clone_over_unreadable_cancel_authority(
     projection.write_bytes(b'{"intents": [broken')
 
     queue._enforce_task_timeouts_locked(workers, now, 0, {})
+    assert jobs == [] and task_id in running  # silent before its deadline: attention only
+    assert meta["silence_attention"]["state"] == "pending_attention"
+
+    queue._enforce_task_timeouts_locked(workers, now + 200.0, 0, {})
 
     assert len(jobs) == 1
     assert jobs[0]["task_id"] == task_id
-    assert jobs[0]["will_retry"] is False
-    assert jobs[0]["retry_task_id"] == ""
+    assert jobs[0]["terminal_reason"] == "deadline"
+    assert not {"will_retry", "retry_task_id"} & set(jobs[0])  # a hard bound requests no retry
     assert task_id not in running
 
 def test_snapshot_restore_refuses_a_task_with_active_intent(qenv, monkeypatch):
@@ -274,12 +288,12 @@ def test_snapshot_restore_blocks_when_cancel_intent_projection_is_unreadable(
     from supervisor import state, workers
 
     delivered: list[dict] = []
-    worker = types.SimpleNamespace(
+    worker = affirm_ready(types.SimpleNamespace(
         wid=1,
         busy_task_id=None,
         reaping=False,
         in_q=types.SimpleNamespace(put=lambda row: delivered.append(dict(row))),
-    )
+    ))
     monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
     monkeypatch.setattr(workers, "PENDING", pending)
     monkeypatch.setattr(workers, "RUNNING", running)
@@ -319,12 +333,12 @@ def test_cancel_authority_hold_never_releases_a_terminal_row_to_dispatch(
     pending = [task]
     running: dict = {}
     delivered: list[dict] = []
-    worker = types.SimpleNamespace(
+    worker = affirm_ready(types.SimpleNamespace(
         wid=1,
         busy_task_id=None,
         reaping=False,
         in_q=types.SimpleNamespace(put=lambda row: delivered.append(dict(row))),
-    )
+    ))
     monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
     monkeypatch.setattr(workers, "PENDING", pending)
     monkeypatch.setattr(workers, "RUNNING", running)
@@ -386,14 +400,14 @@ def test_preserve_pending_shutdown_keeps_cancel_authority_hold_nonterminal(
 def test_steering_is_refused_while_a_cancel_intent_is_active(tmp_path, monkeypatch):
     """A1.8: no NEW steering writes into a task whose cancellation is pending."""
     import supervisor.events as events_mod
-    from ouroboros.owner_mailbox import drain_owner_messages
+    from ouroboros.owner_mailbox import drain_owner_entries
     from supervisor.events import _handle_steer_task
 
     ci.request_cancel(tmp_path, "steerme", reason="tearing down")
     receipts: list = []
-    monkeypatch.setattr(
+    monkeypatch.setattr(  # no bridge hands an ACK over, so the receipt selects the System row
         events_mod, "_emit_routing_receipt",
-        lambda ctx, evt, **kw: receipts.append(kw) or {},
+        lambda ctx, evt, **kw: receipts.append(kw) or {"routing_notice_carrier": "system"},
     )
     sent: list = []
     ctx = types.SimpleNamespace(
@@ -409,10 +423,12 @@ def test_steering_is_refused_while_a_cancel_intent_is_active(tmp_path, monkeypat
     )
     assert receipts and receipts[0]["status"] == "rejected"
     assert receipts[0]["reason"] == "cancel_pending"
-    assert drain_owner_messages(tmp_path, "steerme") == []
+    assert drain_owner_entries(tmp_path, "steerme") == []
     assert sent == [((1, "Task · Not delivered: that task is being stopped"), {
         "role": "system", "system_type": "steer_not_delivered", "task_id": "steerme",
+        "progress_meta": {"routing_notice_carrier": "system", "reply_to": {}},
     })]
+
 
 def test_drop_cancelled_pending_stamps_the_decision_and_honors_the_stored_status(
     qenv, monkeypatch,
@@ -638,7 +654,7 @@ def test_drop_cancelled_pending_leaves_the_intent_open_when_the_write_fails(
 def test_steering_refusal_covers_the_legacy_latch_too(tmp_path, monkeypatch):
     """A-F19: a pre-migration wedged task must not accept new owner messages."""
     import supervisor.events as events_mod
-    from ouroboros.owner_mailbox import drain_owner_messages
+    from ouroboros.owner_mailbox import drain_owner_entries
     from supervisor.events import _handle_steer_task
 
     write_task_result(tmp_path, "legacy-steer", STATUS_CANCEL_REQUESTED, result="wedged")
@@ -658,7 +674,8 @@ def test_steering_refusal_covers_the_legacy_latch_too(tmp_path, monkeypatch):
         {"target_task_id": "legacy-steer", "message": "new orders", "chat_id": 1}, ctx,
     )
     assert receipts and receipts[0]["reason"] == "cancel_pending"
-    assert drain_owner_messages(tmp_path, "legacy-steer") == []
+    assert drain_owner_entries(tmp_path, "legacy-steer") == []
+
 
 def test_drop_cancelled_pending_yields_to_a_live_claim_owner(qenv, monkeypatch):
     """AR2-2: the pre-assignment drop CLAIMS before it settles. A live custody's
@@ -698,12 +715,12 @@ def test_drop_cancelled_pending_defers_when_intent_vanishes_before_settle(
     task_id = "drop-intent-race"
     pending = [{"id": task_id, "type": "task", "chat_id": 1, "depth": 0}]
     delivered: list[dict] = []
-    worker = types.SimpleNamespace(
+    worker = affirm_ready(types.SimpleNamespace(
         wid=1,
         busy_task_id=None,
         reaping=False,
         in_q=types.SimpleNamespace(put=lambda task: delivered.append(dict(task))),
-    )
+    ))
     monkeypatch.setattr(workers, "PENDING", pending, raising=False)
     monkeypatch.setattr(workers, "RUNNING", {}, raising=False)
     monkeypatch.setattr(workers, "WORKERS", {1: worker}, raising=False)
@@ -828,9 +845,10 @@ def test_steer_refusal_removes_the_just_staged_attachments(tmp_path, monkeypatch
     attach_dir = task_artifact_dir_path(tmp_path, "steer-stage") / "attachments"
     staged = list(attach_dir.glob("*")) if attach_dir.exists() else []
     assert staged == [], f"staged inputs must be removed on refusal: {staged}"
-    from ouroboros.owner_mailbox import drain_owner_messages
+    from ouroboros.owner_mailbox import drain_owner_entries
 
-    assert drain_owner_messages(tmp_path, "steer-stage") == []
+    assert drain_owner_entries(tmp_path, "steer-stage") == []
+
 
 
 def _restart_snapshot(qenv, monkeypatch, *, running: list, pending: list = (), ts: str = ""):

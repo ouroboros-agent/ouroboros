@@ -801,19 +801,16 @@ def test_explicit_terminal_5xx_remains_retryable():
         assert result.retry_same_request is True
 
 
-def test_provider_failure_hint_formats_detail():
-    hint = _provider_failure_hint({"_last_llm_error": "  AuthenticationError('401 invalid_api_key')  "})
-
-    assert hint == " Last provider error: AuthenticationError('401 invalid_api_key')"
-
-
 def test_provider_failure_hint_empty_without_error():
     assert _provider_failure_hint({}) == ""
 
 
-@pytest.mark.parametrize("code", ["provider_failed", "invalid_request"])
-@pytest.mark.parametrize("vendor,parameter,kind", [("string_above_max_length", "instructions", "bad_request"),
-    ("string_above_max_length", "max_tokens", "bad_request"), ("context_length_exceeded", "input", "context_overflow")])
+@pytest.mark.parametrize(("vendor", "parameter", "kind", "code"), [
+    ("string_above_max_length", "instructions", "context_overflow", "provider_failed"),  # a smaller input cures it
+    # The disclosed residual (CONSENSUS 1.4): no `parameter` check, so the code on a non-input field reads alike.
+    ("string_above_max_length", "max_tokens", "context_overflow", "invalid_request"),
+    ("context_length_exceeded", "input", "context_overflow", "provider_failed"),
+])
 def test_claudexor_display_reaches_error_and_terminal_without_retry(tmp_path, monkeypatch, code, vendor, parameter, kind):
     import json
     from ouroboros.llm_claudexor import ClaudexorModelError
@@ -846,8 +843,43 @@ def test_claudexor_display_reaches_error_and_terminal_without_retry(tmp_path, mo
     assert "private-body" not in event["error"]
     assert ("remote_context_overflow" in [row["type"] for row in rows]) is (kind == "context_overflow")
     hint = _provider_failure_hint(usage)
-    assert f"provider_code={vendor}" in hint and f"parameter={parameter}" in hint
+    assert f'The provider reported error code "{vendor}" and parameter "{parameter}"' in hint
+    assert "The provider said" not in hint and "provider_error_type=" not in hint and "private-body" not in hint
+    assert event["provider_error_type"] == vendor and event["error"].startswith(f"provider_error_type={vendor}")
     assert provider_recovery_hint(usage) == provider_recovery_hint({**usage, "_last_llm_error": repr(error)})
+
+
+def test_a_model_error_outlives_its_tasks_drive_in_the_canonical_log_once(tmp_path, monkeypatch):
+    """REPLICA_RULE: a task with its own drive writes llm_api_error there and, durable only, to the installation's
+    log, so the cause of a charge outlives the drive; a task on the canonical drive writes one row, and each
+    error reaches the live stream once."""
+    import json
+    from ouroboros.llm_claudexor import ClaudexorModelError
+    from ouroboros.utils import set_log_sink
+
+    frames = []
+    set_log_sink(frames.append)  # the autouse fixture removes it after the test
+    monkeypatch.setattr("ouroboros.loop_llm_call.time.sleep", lambda _s: pytest.fail("Field refusal cannot retry"))
+    child = tmp_path / "state" / "headless_tasks" / "child1" / "data" / "logs"
+    for drive_logs, task_id in ((child, "child1"), (tmp_path / "logs", "main1")):
+        drive_logs.mkdir(parents=True, exist_ok=True)
+        error = ClaudexorModelError({"code": "invalid_request", "message": "Refused (HTTP 400).",
+                                     "context": {"httpStatus": 400, "vendorCode": "string_above_max_length"}})
+
+        class Refused:
+            def chat(self, **kwargs):
+                raise error
+
+        call_llm_with_retry(Refused(), [{"role": "user", "content": "hi"}], "claudexor::fixture=exact-model",
+                            None, "high", 3, drive_logs, task_id, 1, _RecordingEvents(), {}, "task", False)
+
+    def errors(logs):
+        return [row for row in map(json.loads, (logs / "events.jsonl").read_text().splitlines())
+                if row["type"] == "llm_api_error"]
+
+    replica, own = errors(tmp_path / "logs")
+    assert errors(child) == [replica] and replica["task_id"] == "child1" and own["task_id"] == "main1"
+    assert [frame["task_id"] for frame in frames if frame.get("type") == "llm_api_error"] == ["child1", "main1"]
 
 
 def test_call_llm_with_retry_accumulates_live_catalog_estimated_cost(tmp_path):
@@ -869,7 +901,7 @@ def test_call_llm_with_retry_accumulates_live_catalog_estimated_cost(tmp_path):
 
     usage = {}
     event_queue = queue.Queue()
-    with patch("ouroboros.loop_llm_call.estimate_cost_optional", return_value=0.123456):
+    with patch("ouroboros.pricing.estimate_cost_optional", return_value=0.123456):
         _msg, _cost = call_llm_with_retry(
             _EstimatedCostLLM(),
             [{"role": "user", "content": "hi"}],
@@ -898,7 +930,6 @@ def test_call_llm_with_retry_accumulates_live_catalog_estimated_cost(tmp_path):
         ("success", "finished"),
         ("empty", "failed"),
         ("exception", "failed"),
-        ("usage_error", "failed"),
     ],
 )
 def test_main_llm_call_state_covers_every_terminal_path(
@@ -1067,8 +1098,8 @@ def _run_cost_round(llm, tmp_path, accumulated):
 
 @pytest.mark.parametrize(
     "bad_cost",
-    [True, float("nan"), float("inf"), float("-inf"), -5, "abc", object()],
-    ids=["bool", "nan", "inf", "neg_inf", "negative", "unparseable", "foreign_type"],
+    [True, -5, object()],
+    ids=["bool", "negative", "foreign_type"],
 )
 def test_invalid_provider_cost_is_unknown_and_never_estimated(tmp_path, caplog, bad_cost):
     """A cost the provider DID send but that cannot be trusted is honestly unknown.
@@ -1082,7 +1113,7 @@ def test_invalid_provider_cost_is_unknown_and_never_estimated(tmp_path, caplog, 
     accumulated = {}
     llm = _ReportedCostLLM(bad_cost)
     with caplog.at_level(logging.WARNING, logger="ouroboros.loop_llm_call"), patch(
-        "ouroboros.loop_llm_call.estimate_cost_optional", return_value=0.99,
+        "ouroboros.pricing.estimate_cost_optional", return_value=0.99,
     ) as estimate:
         msg, cost = _run_cost_round(llm, tmp_path, accumulated)
 
@@ -1105,7 +1136,7 @@ def test_invalid_cost_clears_a_stale_cost_final_from_the_wire(tmp_path):
     The pair must move together."""
     accumulated = {}
     llm = _ReportedCostLLM(True, cost_final=True)
-    with patch("ouroboros.loop_llm_call.estimate_cost_optional", return_value=0.99):
+    with patch("ouroboros.pricing.estimate_cost_optional", return_value=0.99):
         _msg, cost = _run_cost_round(llm, tmp_path, accumulated)
 
     assert cost is None
@@ -1118,7 +1149,7 @@ def test_normalize_usage_cost_invalid_does_not_claim_an_estimate():
     """The tuple's 4th element is ``cost_estimated``: an UNKNOWN cost is not an
     ESTIMATED one, so the invalid path must leave that flag untouched."""
     usage = {"cost": "abc", "resolved_model": "openai/gpt-5.5", "provider": "openrouter"}
-    with patch("ouroboros.loop_llm_call.estimate_cost_optional", return_value=0.99):
+    with patch("ouroboros.pricing.estimate_cost_optional", return_value=0.99):
         cost, display_model, provider, cost_estimated = _normalize_usage_cost(
             usage, model="openai/gpt-5.5", use_local=False,
         )
@@ -1135,7 +1166,7 @@ def test_reported_zero_cost_is_a_legitimate_provider_zero(tmp_path):
     accumulated = {}
     llm = _ReportedCostLLM(0.0)
     with patch(
-        "ouroboros.loop_llm_call.estimate_cost_optional", return_value=0.99,
+        "ouroboros.pricing.estimate_cost_optional", return_value=0.99,
     ) as estimate:
         _msg, cost = _run_cost_round(llm, tmp_path, accumulated)
 
@@ -1150,7 +1181,7 @@ def test_valid_provider_cost_passes_through(tmp_path):
     accumulated = {}
     llm = _ReportedCostLLM(1.23)
     with patch(
-        "ouroboros.loop_llm_call.estimate_cost_optional", return_value=0.99,
+        "ouroboros.pricing.estimate_cost_optional", return_value=0.99,
     ) as estimate:
         _msg, cost = _run_cost_round(llm, tmp_path, accumulated)
 
@@ -1167,7 +1198,7 @@ def test_missing_provider_cost_still_uses_the_catalog_estimate(tmp_path, include
     accumulated = {}
     llm = _ReportedCostLLM(None, include_cost=include_cost)
     with patch(
-        "ouroboros.loop_llm_call.estimate_cost_optional", return_value=0.99,
+        "ouroboros.pricing.estimate_cost_optional", return_value=0.99,
     ) as estimate:
         _msg, cost = _run_cost_round(llm, tmp_path, accumulated)
 

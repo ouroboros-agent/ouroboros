@@ -3,8 +3,9 @@
 The calibration, thoroughness, severity and anti-thrashing text every review
 surface injects verbatim, the history/obligation/rebuttal sections rendered from
 prior rounds, and the prompt-text plumbing they all need: collision-proof code
-fences, obligation excerpts, and secret redaction before any text reaches a
-prompt. Reads nothing from the repository — callers hand it records and strings.
+fences and obligation excerpts. Reviewer findings and obligation reasons reach the
+prompt as written; nothing here rewrites their content by pattern. Reads nothing
+from the repository — callers hand it records and strings.
 Extracted from ouroboros/tools/review_helpers.py (v7 D06 split, re-cut on the
 v7next tip); review_helpers.py re-exports every name.
 """
@@ -13,30 +14,6 @@ from __future__ import annotations
 
 import json
 import re
-
-
-def _rh():
-    """The parent review-helpers module, read at call time.
-
-    The helpers' members stay monkeypatch-addressable at their historical
-    ``ouroboros.tools.review_helpers`` bindings (tests rebind them there), so
-    this leaf resolves every such cross-reference through the module at each
-    call instead of freezing whatever object a from-import saw at import time.
-    """
-    from ouroboros.tools import review_helpers
-
-    return review_helpers
-
-
-_SECRET_LINE_RE = re.compile(
-    r'(?im)^(\s*(?:export\s+)?[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|API[_-]?KEY|AUTHORIZATION)[A-Z0-9_]*\s*[:=]\s*)(.+)$'
-)
-
-
-_JSON_SECRET_RE = re.compile(
-    r'(?i)("?(?:token|api[_-]?key|authorization|secret|password|passwd|passphrase)"?\s*:\s*)"([^"\n\r]{4,})"'
-)
-
 
 CRITICAL_FINDING_CALIBRATION = """\
 ## Critical severity threshold — READ BEFORE MARKING ANY FINDING CRITICAL
@@ -47,7 +24,8 @@ Before marking any finding CRITICAL you MUST:
 2. Confirm this artifact actually exists in the repo context you have been given.
 3. If the concern depends on a hypothetical plugin, future integration, custom
    environment, fixture, or finalizer that does NOT appear in this repo's
-   codebase — mark it **advisory**, not critical.
+   codebase — mark it **advisory**, not critical. An extension installed through
+   the public extension API is not hypothetical (item 8).
 4. One root cause = one FAIL entry. Do NOT split one problem into multiple FAIL
    items that all require the same fix.
 5. If a previous CRITICAL finding was concretely fixed and only a broader
@@ -61,6 +39,16 @@ Before marking any finding CRITICAL you MUST:
    or instructions a user/reviewer must rely on to use the changed feature correctly.
    Examples that should normally stay advisory: README test counts, descriptive
    "N fixes" summaries, or marketing-style numeric claims.
+8. Name who or what triggers the problem on a supported install — a user flow,
+   a crash or restart, a concurrent writer Ouroboros itself runs, a platform it
+   ships on. A fault that needs someone who already holds the power (the owner
+   or Ouroboros editing, planting or restoring files under its own data root) is
+   **advisory**, and disclosure is a valid fix. Ordinary use of a supported
+   capability — installing an official or OuroborosHub skill through the public
+   extension API, choosing a supported provider or setting — is a supported-install
+   trigger, not such a power: the extension need not ship in this repo. A remedy
+   that adds a check, re-read, proof or refusal states what it costs on the path it
+   sits on at today's history size, or what work it refuses.
 
 When in doubt: use "advisory". Reserve "critical" for clear, concrete,
 repo-local, reachable defects.
@@ -71,6 +59,22 @@ REVIEW_PREAMBLE = (
     "You are a pre-commit reviewer for Ouroboros, a self-modifying AI agent.\n"
     "Its Constitution is BIBLE.md. Its engineering handbook is DEVELOPMENT.md.\n"
 )
+
+
+# The core layer: the subject is a repository that is NOT Ouroboros's body, so
+# the preamble names neither the constitution nor the handbook — the universal
+# checklist is the whole rule set and the subject's own documents are evidence.
+REVIEW_PREAMBLE_CORE = (
+    "You are a pre-commit reviewer for a change that Ouroboros, an AI agent, is\n"
+    "landing in a repository that is not its own body. Judge the change by the\n"
+    "universal checklist below and by what the subject repository itself promises\n"
+    "in its documents and tests; no other project's rules apply to it.\n"
+)
+
+
+def review_preamble(layer: str = "body") -> str:
+    """The reviewer preamble for a checklist layer (`review_body_fact.layer_for`)."""
+    return REVIEW_PREAMBLE if layer == "body" else REVIEW_PREAMBLE_CORE
 
 
 REVIEW_THOROUGHNESS_BLOCK = """\
@@ -92,16 +96,22 @@ REVIEW_SEVERITY_THRESHOLDS = """\
 
 
 REPO_ANTI_PATTERN_LOCK_GUARD = """\
-Before returning, do a deliberate SECOND pass focused on a materially
-DIFFERENT concern class. This is a semantic breadth check, not a numeric
-finding quota: zero or one FAIL is valid, and you must never manufacture a
-finding merely to increase the count. For example:
-if your FAIL is `code_quality`, re-examine `tests_affected` and
-`self_consistency`; if `cross_platform`, re-examine `security_issues` and
-`architecture_doc`; if `version_bump`, re-examine `changelog_and_badge`
-and `self_consistency`. Update PASS entries in-place if your second pass
-uncovers new FAILs — return only one JSON array, not two.
+Before returning, challenge the behavior promised by this change and by your
+proposed fixes with a realistic supported counterexample or event sequence.
+Check what the facts establish and whether they justify the resulting decision
+for the actor and resource involved. Use existing evidence where sufficient.
+This check adds no required output or review stage; the checklist's existing
+evidence requirements still apply.
 """
+
+
+# Both layers use the same behavioral countercheck; keep the exported core name.
+REPO_ANTI_PATTERN_LOCK_GUARD_CORE = REPO_ANTI_PATTERN_LOCK_GUARD
+
+
+def anti_pattern_lock_guard(layer: str = "body") -> str:
+    """The shared behavioral countercheck for either checklist layer."""
+    return REPO_ANTI_PATTERN_LOCK_GUARD if layer == "body" else REPO_ANTI_PATTERN_LOCK_GUARD_CORE
 
 
 _ANTI_THRASHING_RULE_VERDICT = (
@@ -131,7 +141,10 @@ _CONVERGENCE_RULE_TEXT = (
 _HISTORY_VERIFICATION_ONLY_RULE = (
     "Use prior review history and obligation records for verification only. "
     "Do NOT manufacture a new FAIL from historical text alone. Any new FAIL must be "
-    "grounded in the CURRENT diff or CURRENT repository artifacts shown in this prompt."
+    "grounded in the CURRENT diff or CURRENT repository artifacts shown in this prompt. "
+    "An author's rejection is not reviewer agreement, and a verdict on an earlier subject "
+    "does not approve this revision. To revisit a rejected alternative, address its earlier "
+    "rationale and explain the new evidence or changed requirement."
 )
 
 
@@ -146,10 +159,15 @@ def format_review_history_entry(entry: object, *, default_severity: str = "advis
         tags += [f"model={entry['model']}"] if entry.get("model") else []
         tags += [f"obligation={entry['obligation_id']}"] if entry.get("obligation_id") else []
         label = str(entry.get("item") or entry.get("reason") or "?")
-        reason = single_line(entry.get("reason", ""))
+        reason = str(entry.get("reason") or "")
         tag_prefix = " ".join(f"[{tag}]" for tag in tags)
-        return f"[{severity}] {tag_prefix} {label}: {reason}".strip()
-    return single_line(entry)
+        rendered = f"[{severity}] {tag_prefix} {label}: {reason}".strip()
+        details = {key: value for key, value in entry.items()
+                   if key not in {"severity", "tag", "model", "obligation_id", "item", "reason"}}
+        if details:
+            rendered += "\n" + format_prompt_code_block(json.dumps(details, ensure_ascii=False, indent=2, default=str), "json")
+        return rendered
+    return str(entry or "")
 
 
 def build_review_history_section(
@@ -178,6 +196,12 @@ def build_review_history_section(
                 f"{prefix}{format_review_history_entry(finding, default_severity=default)}"
                 for finding in findings
             )
+        # Preserve the recorded subject, raw answers, author rationale and
+        # verdicts as data. A findings-only rendering loses the resolved dispute.
+        details = {key: value for key, value in entry.items()
+                   if key not in {"attempt", "commit_message", "critical", "advisory"}}
+        if details:
+            lines.append(format_prompt_code_block(json.dumps(details, ensure_ascii=False, indent=2, default=str), "json"))
         lines.append("")
 
     obligations_block = build_obligations_block(open_obligations)
@@ -188,6 +212,27 @@ def build_review_history_section(
         convergence_fires=bool(history and len(history) >= 2),
     ))
     return "\n".join(lines)
+
+
+def author_questions_block(questions, *, note: str = "") -> str:
+    """The author's own questions to the panel, numbered as asked — the ONE rendering
+    every surface uses (``review_change``'s wave, the public brief builder, the
+    system review's task), so a brief rebuilt outside the gate reads as the brief
+    the seat was sent. The questions are passed verbatim (``review_change``'s
+    contract); blank entries are dropped. ``note`` qualifies the heading (the system
+    review asks them after its own questionnaire). ``""`` without questions."""
+    asked = [str(question) for question in (questions or ()) if str(question or "").strip()]
+    if not asked:
+        return ""
+    heading = f"Author questions (answer each as asked{', ' + note if note else ''}):"
+    return heading + "".join(f"\n{number}. {question}" for number, question in enumerate(asked, 1))
+
+
+def goal_with_author_questions(goal: str, questions) -> str:
+    """The goal text a wave hands its seats: the author's goal, then the questions
+    block; the goal alone when nothing was asked."""
+    block = author_questions_block(questions)
+    return f"{goal}\n\n{block}".lstrip("\n") if block else str(goal or "")
 
 
 def build_obligations_block(open_obligations: list | None) -> str:
@@ -205,7 +250,7 @@ def build_obligations_block(open_obligations: list | None) -> str:
             "obligation_id": getattr(ob, "obligation_id", "?"),
             "item": getattr(ob, "item", "?"),
             "severity": getattr(ob, "severity", ""),
-            "reason_excerpt": format_obligation_excerpt(getattr(ob, "reason", "")),
+            "reason": str(getattr(ob, "reason", "")),
         }
         for ob in open_obligations
     ]
@@ -237,6 +282,21 @@ def build_anti_thrashing_rules_section(
     return "\n".join(lines)
 
 
+# The author's duty toward open review findings (docs/CHECKLISTS.md "Before
+# retrying after review findings"): the outcome is owed, the procedure is the
+# author's (BIBLE P13).
+REVIEW_REPAIR_JUDGMENT = (
+    "Consider the open findings together against the evidence and the accepted goal. "
+    "Repair what the requirement still needs, or replace or remove a means that is "
+    "yours to change, with evidence that the requirement still holds. An owner- or "
+    "parent-fixed requirement or method stays binding. A changed means does not make "
+    "a true historical finding false. Rebut unsupported findings or their current "
+    "applicability with reasons, preserving the record and anything unresolved. "
+    "How to inspect, group, order and explain that work, and whether to "
+    "seek more feedback first, is your judgment for this case."
+)
+
+
 def build_self_verification_template(
     findings: list,
     *,
@@ -244,7 +304,11 @@ def build_self_verification_template(
     tool_name: str = "commit_reviewed",
     context_noun: str = "diff",
 ) -> str:
-    """Return retry self-verification text, with circuit-breaker hint at attempt 3+."""
+    """Return the retry note from round 2: the open findings and the author's
+    outcome duties, without a prescribed procedure, fix-count STOP or escalating
+    prescription. It also renders beside findings that have no aggregate
+    verdict (a skill review that missed quorum keeps its partial FAILs), so it
+    names the recorded review state and defers paid/free retry to the gate."""
     if attempt_idx < 2:
         return ""
     finding_lines = "\n".join(
@@ -253,34 +317,24 @@ def build_self_verification_template(
     )
     if not finding_lines:
         finding_lines = "  (no findings captured — check review output above)"
-    self_verify = (
-        f"\n\n⚠️ Self-verification required before next {tool_name}:\n"
-        "For EACH finding listed above, explicitly state:\n"
-        "  Finding: [item name]\n"
-        "  Status: addressed / rebutted / pending\n"
-        "  Evidence: [file:line or symbol or test name]\n"
-        "  Note: [one sentence]\n\n"
-        "After the first blocked review, stop patching one finding at a time.\n"
-        f"Re-read the full {context_noun}, group obligations by root cause, rewrite the plan, then continue.\n\n"
-        f"Do NOT call {tool_name} until this table is filled in your response.\n"
+    return (
+        f"\n\nBefore the next {tool_name}:\n"
+        "The recorded review state and the individual findings below stand; your "
+        "response does not rewrite them.\n"
+        f"{REVIEW_REPAIR_JUDGMENT}\n"
+        f"Whether the next {tool_name} is replayed or refused for free, rejoins "
+        "unresolved review work, or pays for a new review follows the gate's "
+        "recorded replay eligibility, custody, budget and cycle limit, not this "
+        f"note. An eligible recorded verdict on an unchanged {context_noun} under "
+        "the same review contract is not re-reviewed without a genuinely new "
+        "review_rebuttal; an infrastructure outcome such as a missed reviewer "
+        f"quorum neither replays nor lapses a verdict, so an unchanged {context_noun} "
+        "without an eligible verdict may be reviewed again.\n"
+        "If attempts stop converging, reconsider the approach "
+        f"(for example split the {context_noun}, plan_task, or escalate) rather "
+        "than repeat it.\n"
         f"Open findings:\n{finding_lines}"
     )
-    if attempt_idx < 3:
-        return self_verify
-    circuit_breaker = (
-        f"\n\nCircuit-breaker hint (attempt {attempt_idx}+):\n"
-        f"Before calling {tool_name} again, pause and answer honestly:\n"
-        "- Am I patching one finding at a time, or did I re-read ALL findings together?\n"
-        "  (BIBLE P2: if the same class recurs with different wording, the fix is at\n"
-        "  the wrong level — do not keep patching instances.)\n"
-        "- Is my commit message growing each attempt? Long prose creates claim surface\n"
-        "  that reviewers then fact-check. Shrink to ONE subject line.\n"
-        "- Would `plan_task` surface the missing touchpoints cheaper than another\n"
-        "  blocked retry? Use it now if yes.\n"
-        "- If the same critical persists after two concrete fixes, STOP retrying:\n"
-        f"  split the {context_noun} or use `send_user_message` to escalate."
-    )
-    return self_verify + circuit_breaker
 
 
 _OBLIGATION_SUFFIX_RE = re.compile(r"\s*\(obligation\s+([a-z0-9][a-z0-9_-]*)\)\s*$", re.IGNORECASE)
@@ -339,14 +393,9 @@ def build_rebuttal_section(review_rebuttal: str) -> str:
 
 
 def format_obligation_excerpt(reason: str, max_chars: int = 120) -> str:
-    """Sanitize an obligation reason excerpt with explicit omission text."""
-    # Redact before whitespace collapse so line-anchored secret patterns still match.
-    try:
-        redacted, _ = redact_prompt_secrets(str(reason or ""))
-    except Exception:
-        redacted = str(reason or "")  # redact is best-effort; never crash the review pipeline
+    """One-line obligation reason excerpt with explicit omission text."""
     # Collapse whitespace to prevent multi-line prompt injection.
-    sanitized = re.sub(r"\s+", " ", redacted).strip()
+    sanitized = re.sub(r"\s+", " ", str(reason or "")).strip()
     if len(sanitized) > max_chars:
         return (
             sanitized[:max_chars]
@@ -354,17 +403,6 @@ def format_obligation_excerpt(reason: str, max_chars: int = 120) -> str:
             " (full reason preserved in durable state)"
         )
     return sanitized
-
-
-def redact_prompt_secrets(text: str) -> tuple[str, bool]:
-    """Redact secret-like values before prompt injection."""
-    if not isinstance(text, str) or not text:
-        return text, False
-
-    redacted = _rh().sanitize_tool_result_for_log(text)
-    redacted = _SECRET_LINE_RE.sub(r"\1***REDACTED***", redacted)
-    redacted = _JSON_SECRET_RE.sub(r'\1"***REDACTED***"', redacted)
-    return redacted, redacted != text
 
 
 def _make_fence(content: str) -> str:
@@ -384,3 +422,18 @@ def format_prompt_code_block(content: str, language: str = "") -> str:
     fence = _make_fence(content)
     lang = language or ""
     return f"{fence}{lang}\n{content}\n{fence}"
+
+
+def round_material() -> list:
+    """Review-contract material (``commit_gate.commit_review_contract_fingerprint``): the later-round sections
+    rendered over fixed placeholder records in these branches (rebuttal, author questions, earlier rounds with and
+    without open obligations and the convergence rule). The records are data; their frames and rules count."""
+    from types import SimpleNamespace
+
+    finding = {"severity": "critical", "tag": "⟨tag⟩", "model": "⟨model⟩", "obligation_id": "⟨id⟩",
+               "item": "⟨item⟩", "reason": "⟨reason⟩", "detail": "⟨detail⟩"}
+    rounds = [{"attempt": 1, "commit_message": "⟨message⟩", "critical": [finding], "advisory": [finding],
+               "detail": "⟨detail⟩"}, {}]
+    held = [SimpleNamespace(obligation_id="⟨id⟩", item="⟨item⟩", severity="⟨severity⟩", reason="⟨reason⟩")]
+    return [build_rebuttal_section("⟨rebuttal⟩"), author_questions_block(["⟨question⟩"]),
+            *(build_review_history_section(rounds[:count], obligations) for count in (1, 2) for obligations in (None, held))]

@@ -7,8 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from ouroboros import dialogue_import, dialogue_store as ds
 from ouroboros.gateway import history
-from ouroboros.gateway.history_paging import HistorySource, decode_cursor
+from ouroboros.gateway.history_paging import HistorySource, decode_cursor, encode_cursor
+from ouroboros.store import StoreError
+from tests._store_shared import seed_result
 
 
 @pytest.fixture(autouse=True)
@@ -37,7 +40,16 @@ def row(index, source="chat", **extra):
                else {"content": f"progress-{index}", "task_id": "root"}), **extra}
 
 
+def imported(root):
+    """What the boot and the maintenance child do before a reader runs: the cutover takes the
+    chain files a fixture wrote (or an older body appended since), the job imports the archive."""
+    dialogue_import.cutover(root)
+    if dialogue_import.pending_segments(root):
+        assert dialogue_import.run_dialogue_import(root)["state"] == "done"
+
+
 def request(root, **params):
+    imported(root)
     response = asyncio.run(history.make_chat_history_endpoint(root)(SimpleNamespace(query_params=params)))
     return response.status_code, json.loads(response.body)
 
@@ -84,29 +96,39 @@ def test_quota_deferred_backdated_system_row_is_not_skipped(tmp_path):
     assert "backdated final" in {message["text"] for page in loaded for message in page["messages"]}
 
 
-def test_lineage_cap_does_not_permanently_remove_older_rows(tmp_path):
+def test_lineage_cap_keeps_the_newest_rows_and_discloses_the_cap(tmp_path):
+    """The conversation decides whether older pages exist: a room holding narration
+    alone has none, so a swarm larger than the cap keeps its newest lineage on the
+    recent page, and the window says the cap cut it."""
     write(tmp_path / "logs" / "progress.jsonl", [
         row(index, "progress", delegation_role="subagent", parent_task_id="parent",
             task_id="child", subagent_event="running") for index in range(310)
     ])
     loaded = list(pages(tmp_path))
-    messages = [message for page in loaded for message in page["messages"]]
-    assert len(loaded[0]["messages"]) == 300
-    assert len(messages) == 310
-    assert all(message["parent_task_id"] == "parent" for message in messages)
+    assert len(loaded) == 1 and len(loaded[0]["messages"]) == 300
+    assert loaded[0]["messages"][-1]["text"] == "progress-309"
+    assert "lineage_cap" in loaded[0]["window"]["truncated_by"]
+    assert all(message["parent_task_id"] == "parent" for message in loaded[0]["messages"])
 
 
-def test_sparse_project_empty_page_advances_without_false_eof(tmp_path):
+def test_sparse_project_opens_at_its_rows_without_parsing_other_rooms_archives(tmp_path, monkeypatch):
     from ouroboros.projects_registry import create_project
 
     project = create_project(tmp_path, "sparse", name="Sparse")
-    write(tmp_path / "archive" / "chat_20260901T000000.jsonl", [row(0, chat_id=project["chat_id"])])
-    for segment in range(1, 6):
-        write(tmp_path / "archive" / f"chat_20260901T00000{segment}.jsonl",
-              [row(index, text="foreign" + "x" * 2000) for index in range(350)])
+    archives = [tmp_path / "archive" / f"chat_20260901T00000{segment}.jsonl" for segment in range(6)]
+    write(archives[0], [row(index, chat_id=project["chat_id"]) for index in range(3)])
+    for archive in archives[1:]:
+        write(archive, [row(index, text="foreign" + "x" * 2000) for index in range(350)])
+    write(tmp_path / "logs" / "chat.jsonl", [row(9, text="foreign live")])
+    decoded, entries = [], HistorySource._entries
+    monkeypatch.setattr(HistorySource, "_entries", lambda self, rows: (
+        decoded.extend((self.source, entry.seq) for entry in rows), entries(self, rows))[1])
     loaded = list(pages(tmp_path, chat_id=str(project["chat_id"])))
-    assert any(not page["messages"] and page["has_more"] for page in loaded[1:])
-    assert [message["text"] for page in loaded for message in page["messages"]] == ["human-0"]
+    assert len(loaded) == 1 and loaded[0]["window"]["complete"] is True
+    assert [message["text"] for message in loaded[0]["messages"]] == ["human-0", "human-1", "human-2"]
+    own_end = archives[0].stat().st_size
+    assert decoded and all(seq < own_end for source, seq in decoded if source == "chat"), \
+        "the five foreign archives' rows are addressed out of the room's page, never decoded"
 
 
 def test_frozen_page_and_older_cursor_survive_rotation_and_live_append(tmp_path):
@@ -140,17 +162,20 @@ def test_page_handle_replays_its_exact_archive_range(tmp_path):
     assert replayed["next_cursor"] == second["next_cursor"]
 
 
-def test_accepted_quiz_answer_is_hidden_replay_evidence_across_pages(tmp_path):
+@pytest.mark.parametrize("kind", ["quiz_answer", "quiz_closed"])
+def test_quiz_disposition_is_hidden_replay_evidence_across_pages(tmp_path, kind):
     quiz = {"quiz_id": "old", "question": "Choose?", "state": "open",
             "options": [{"label": "First"}, {"label": "Second", "recommended": True}]}
-    winning = {**quiz, "state": "answered", "comment": "  My own answer\nnext line  "}
+    winning = ({**quiz, "state": "answered", "comment": "  My own answer\nnext line  "} if kind == "quiz_answer"
+               else {**quiz, "state": "closed", "closed_reason": "Superseded", "closed_actor": "owner",
+                     "closed_request_id": "close-1"})
     write(tmp_path / "logs" / "chat.jsonl", [
         row(0, direction="out", type="quiz", task_id="quiz-task", quiz=quiz),
         *[row(index) for index in range(1, 170)],
-        row(171, direction="system", type="quiz_answer", task_id="quiz-task", quiz=winning),
+        row(171, direction="system", type=kind, task_id="quiz-task", quiz=winning),
     ])
     loaded = list(pages(tmp_path))
-    [evidence] = [message for message in loaded[0]["messages"] if message.get("system_type") == "quiz_answer"]
+    [evidence] = [message for message in loaded[0]["messages"] if message.get("system_type") == kind]
     assert evidence["text"] == "" and evidence["quiz"] == winning
     assert "answered_index" not in evidence["quiz"]
     [ask] = [message for page in loaded[1:] for message in page["messages"] if message.get("msg_type") == "quiz"]
@@ -158,7 +183,7 @@ def test_accepted_quiz_answer_is_hidden_replay_evidence_across_pages(tmp_path):
     assert ask["quiz"]["options"][1]["recommended"] is True
 
 
-@pytest.mark.parametrize("current", ["running", "finalizing", "missing", "malformed", "future"])
+@pytest.mark.parametrize("current", ["running", "missing", "future"])
 def test_historical_terminal_never_overrides_current_result_authority(tmp_path, current):
     write(tmp_path / "logs" / "progress.jsonl", [row(0, "progress", task_id="old-task")])
     terminal = row(0, direction="system", type="task_summary", task_id="old-task", status="completed",
@@ -169,11 +194,15 @@ def test_historical_terminal_never_overrides_current_result_authority(tmp_path, 
     result.parent.mkdir(exist_ok=True)
     if current == "malformed":
         result.write_text("{broken", encoding="utf-8")
+    elif current == "future":
+        result.write_text(json.dumps({"_schema_version": 2, "task_id": "old-task", "status": "running"}), encoding="utf-8")
     elif current != "missing":
-        result.write_text(json.dumps({"_schema_version": 2 if current == "future" else 1,
+        seed_result(tmp_path, "old-task", {"_schema_version": 1,
                                       "task_id": "old-task", "status": "completed" if current == "finalizing" else "running",
                                       **({"root_phase_checkpoint": {"post_task_synthesis": "running"}}
-                                         if current == "finalizing" else {})}), encoding="utf-8")
+                                         if current == "finalizing" else {})})
+    from ouroboros.store_import import ensure_current_store
+    ensure_current_store(tmp_path)  # the boot door's import judges the planted file; a GET never imports
     status, payload = request(tmp_path)
     assert status == 200
     [narration] = [message for message in payload["messages"] if message.get("is_progress")]
@@ -194,12 +223,12 @@ def test_historical_terminal_never_overrides_current_result_authority(tmp_path, 
 def test_required_source_failure_retries_the_same_page(tmp_path, monkeypatch):
     write(tmp_path / "logs" / "chat.jsonl", [row(index) for index in range(200)])
     first = request(tmp_path)[1]
-    original = HistorySource._read
-    monkeypatch.setattr(HistorySource, "_read", lambda *_a: (_ for _ in ()).throw(OSError("injected read failure")))
+    original = ds.probe_rows
+    monkeypatch.setattr(ds, "probe_rows", lambda *_a, **_k: (_ for _ in ()).throw(StoreError("injected store failure")))
     status, failed = request(tmp_path, cursor=first["next_cursor"])
     assert status == 503 and failed["reason_code"] == "history_source_unavailable"
     assert failed["next_cursor"] == first["next_cursor"] and failed["has_more"] is True
-    monkeypatch.setattr(HistorySource, "_read", original)
+    monkeypatch.setattr(ds, "probe_rows", original)
     status, retried = request(tmp_path, cursor=failed["next_cursor"])
     assert status == 200 and any(message["text"] == "human-0" for message in retried["messages"])
 
@@ -226,32 +255,67 @@ def test_continuation_reads_only_before_its_position(tmp_path, monkeypatch):
     state = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
     cursor = decode_cursor(encoded, 1, state["view"])
     seen = []
-    original = HistorySource._read
+    original = ds.probe_rows
 
-    def read(source, start, end):
-        seen.append((source.source, start, end))
-        return original(source, start, end)
+    def probe(root, stream, keys, **kwargs):
+        seen.append((stream, kwargs["lower"], kwargs["before"]))
+        return original(root, stream, keys, **kwargs)
 
-    monkeypatch.setattr(HistorySource, "_read", read)
+    monkeypatch.setattr(ds, "probe_rows", probe)
     assert request(tmp_path, cursor=encoded)[0] == 200
     assert seen and all(end <= cursor["before"][source] for source, _start, end in seen)
 
 
-def test_partial_live_line_is_outside_frozen_history_even_after_rotation(tmp_path):
+def test_a_torn_line_an_older_body_left_is_a_gap_outside_frozen_history(tmp_path):
+    """A store-unaware body appended after the cutover and did not finish its last line: the next
+    cutover imports its rows at their place and records the torn line as a skipped interval -- a
+    disclosed gap above the frozen page, never a row and never a change to that page."""
     path = tmp_path / "logs" / "chat.jsonl"
     write(path, [row(index) for index in range(200)])
-    with path.open("ab") as handle:
-        handle.write(b'{"direction":"in","text":"later')
     first = request(tmp_path)[1]
     with path.open("ab") as handle:
-        handle.write(b'"}\n')
-    archive = tmp_path / "archive" / "chat_20260912T000000.jsonl"
-    archive.parent.mkdir()
-    os.replace(path, archive)
-    path.touch()
+        handle.write(json.dumps(row(200, text="whole")).encode() + b"\n" + b'{"direction":"in","text":"later')
     replayed = request(tmp_path, cursor=first["page_cursor"])[1]
     assert replayed["messages"] == first["messages"]
-    assert not any(message["text"] == "later" for page in pages(tmp_path, cursor=first["next_cursor"]) for message in page["messages"])
+    status, fresh = request(tmp_path)
+    assert status == 200 and "chat_malformed_jsonl" in fresh["window"]["truncated_by"]
+    assert any(message["text"] == "whole" for message in fresh["messages"])
+    assert not any(message["text"] == "later" for page in pages(tmp_path) for message in page["messages"])
+
+
+def recoded(encoded, **fields):
+    """The same cursor with ``fields`` replaced; ``None`` drops a field."""
+    import base64
+
+    cursor = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+    for key, value in fields.items():
+        if value is None:
+            cursor.pop(key, None)
+        else:
+            cursor[key] = value
+    return encode_cursor(cursor)
+
+
+def test_a_cursor_minted_before_the_unfinished_boundary_field_reads_as_a_clean_boundary(tmp_path):
+    write(tmp_path / "logs" / "chat.jsonl", [row(index) for index in range(200)])
+    first = request(tmp_path)[1]
+    for name in ("next_cursor", "page_cursor"):
+        current = request(tmp_path, cursor=first[name])
+        legacy = request(tmp_path, cursor=recoded(first[name], unfinished=None))
+        assert current[0] == legacy[0] == 200
+        assert legacy[1]["messages"] == current[1]["messages"]
+        assert legacy[1]["next_cursor"] == current[1]["next_cursor"], "re-minted with the field, unchanged"
+
+
+@pytest.mark.parametrize("unfinished", [
+    "chat", False, [{}],
+])
+def test_a_malformed_unfinished_boundary_is_an_invalid_cursor(tmp_path, unfinished):
+    write(tmp_path / "logs" / "chat.jsonl", [row(index) for index in range(200)])
+    first = request(tmp_path)[1]
+    for name in ("next_cursor", "page_cursor"):
+        status, payload = request(tmp_path, cursor=recoded(first[name], unfinished=unfinished))
+        assert status == 400 and payload["reason_code"] == "history_cursor_invalid", unfinished
 
 
 def test_de_roled_recent_child_final_is_enriched_when_older_parent_arrives(tmp_path):
@@ -264,7 +328,7 @@ def test_de_roled_recent_child_final_is_enriched_when_older_parent_arrives(tmp_p
     for task in ("parent", "child"):
         result = tmp_path / "task_results" / f"{task}.json"
         result.parent.mkdir(exist_ok=True)
-        result.write_text(json.dumps({"_schema_version": 1, "task_id": task, "status": "completed"}), encoding="utf-8")
+        seed_result(tmp_path, task, {"_schema_version": 1, "task_id": task, "status": "completed"})
     loaded = list(pages(tmp_path, n_human="1"))
     first = next(message for message in loaded[0]["messages"] if message.get("task_id") == "child")
     assert "parent_task_id" not in first
@@ -324,3 +388,76 @@ def test_a_closed_bounded_wait_reaches_the_replayed_card(tmp_path):
     [ask] = [message for page in pages(tmp_path) for message in page["messages"] if message.get("msg_type") == "quiz"]
     assert ask["quiz"]["state"] == "open" and ask["quiz"]["wait_ended_at"]
     assert "wait_for_answer" not in ask["quiz"]
+
+
+def test_main_refuses_its_recent_read_while_no_row_of_the_project_registry_can_be_read(tmp_path, monkeypatch, caplog):
+    """Main is "every room that is not a Project": decided from an empty set (a registry no row of
+    which can be read) it would take the owner's rows typed in Project rooms (#3067's mechanism). It
+    answers the typed unavailable refusal instead. An invalid row beside readable ones is no such
+    case: the rooms the readable rows name are still Projects, and Main reads on. The refusal names its cause,
+    in its body and once in the server log, since nothing else would say why Main stays empty."""
+    from ouroboros import projects_registry
+    from ouroboros.projects_registry import bind_task_to_project, create_project
+
+    monkeypatch.setattr(projects_registry, "_UNREADABLE_SAID", set())  # this process has named no cause yet
+    said = lambda: [r.levelname for r in caplog.records if "vouches for no room" in r.getMessage()]  # noqa: E731
+
+    rooms = [create_project(tmp_path, slug, name=slug) for slug in ("alpha", "beta")]
+    bind_task_to_project(tmp_path, "bound", rooms[0]["id"], origin={"absent": "system"})
+    write(tmp_path / "logs" / "chat.jsonl", [
+        row(0, text="main owner"),
+        *(row(1, text=f"room owner {room['chat_id']}", chat_id=room["chat_id"]) for room in rooms),
+        row(2, direction="out", text="bound reply", task_id="bound", chat_id=rooms[0]["chat_id"]),
+    ])
+    room_rows = {f"room owner {room['chat_id']}" for room in rooms} | {"bound reply"}
+    texts = lambda payload: {message.get("text") for message in payload["messages"]}  # noqa: E731
+    status, healthy = request(tmp_path)
+    assert status == 200 and "main owner" in texts(healthy) and not texts(healthy) & room_rows
+    assert "detail" not in healthy
+
+    registry = tmp_path / "state" / "projects.json"
+    intact = registry.read_bytes()
+    registry.write_bytes(intact[: len(intact) // 2])  # no row can be read
+    status, refused = request(tmp_path)
+    assert not texts(refused) & room_rows, "a Project room's row reached Main's window"
+    assert status == 503 and refused["reason_code"] == "history_source_unavailable"
+    assert refused["has_more"] is True and refused["window"]["complete"] is False
+    assert refused["detail"] == "Project registry unavailable", "the refusal names its cause"
+    assert said() == ["WARNING"] and request(tmp_path)[0] == 503 and said() == ["WARNING"], "once a cause"
+
+    data = json.loads(intact)
+    registry.write_text(json.dumps({**data, "projects": [*data["projects"], {"chat_id": 7}]}), encoding="utf-8")
+    status, beside = request(tmp_path)
+    assert status == 200 and "main owner" in texts(beside) and not texts(beside) & room_rows
+
+    for unknown in ("lost beside its commit witness", "only an invalid row"):  # neither is "no Projects"
+        registry.unlink(missing_ok=True)
+        if unknown == "only an invalid row":
+            registry.write_text(json.dumps({**data, "projects": [{"chat_id": 7}]}), encoding="utf-8")
+        status, refused = request(tmp_path)
+        assert status == 503 and not texts(refused) & room_rows, unknown
+        assert refused["detail"] == "Project registry unavailable", unknown
+
+    registry.write_bytes(intact)
+    restored = list(pages(tmp_path))
+    assert "main owner" in {text for page in restored for text in texts(page)}
+    assert not {text for page in restored for text in texts(page)} & room_rows
+
+    # One lenient read decides the request: the rooms it named stay Projects even when a second read would fail
+    # (an open that fails on and off), never "no Projects" within the same request.
+    from ouroboros.gateway import history as history_module
+
+    named, lenient = projects_registry.readable_rooms(tmp_path), projects_registry.reserved_project_chat_ids
+    answers = iter([named])
+    monkeypatch.setattr(projects_registry, "reserved_project_chat_ids", lambda root, *, strict=False: (
+        (_ for _ in ()).throw(OSError("too many open files")) if strict else lenient(root)))
+    monkeypatch.setattr(projects_registry, "readable_rooms", lambda root: next(answers, None))
+    context = history_module._project_history_context(tmp_path, 1)
+    assert named and context[0] == named and context[-1] is False
+
+
+def test_main_reads_on_a_fresh_install_without_a_project_registry(tmp_path):
+    write(tmp_path / "logs" / "chat.jsonl", [row(0, text="main owner")])
+    assert not (tmp_path / "state" / "projects.json").exists()
+    status, payload = request(tmp_path)
+    assert status == 200 and [message["text"] for message in payload["messages"]] == ["main owner"]

@@ -32,7 +32,7 @@ def _session_snapshot() -> dict:
     return select_subagent_snapshot(settings, subagent_id="session-builder")[0]
 
 
-def _pending_handoff(tmp_path, task_id: str):
+def _pending_handoff(tmp_path, task_id: str, *, input_files=None):
     import ouroboros.delegate_recovery as recovery
     from ouroboros import delegate_custody as custody
     from ouroboros.subagent_work_order import work_order_fingerprint
@@ -47,6 +47,8 @@ def _pending_handoff(tmp_path, task_id: str):
         "task_constraint": {},
         "task_contract": {"objective": "Build", "expected_output": "Patch"},
     }
+    if input_files is not None:
+        task["prepared_input_files"] = input_files
     authority = recovery.authority_fingerprint_from_task(task)
     fingerprint = work_order_fingerprint(task)
     invocation_id = f"inv-{task_id}"
@@ -189,8 +191,8 @@ def test_retry_refusal_preserves_live_owner_handoff_and_pending_invocation(
 
     assert result["reason"] == "pending_recovery_deferred"
     assert result["pending_invocation_id"] == invocation_id
-    assert recovery._read(tmp_path, task["id"])["status"] == "adopted"
-    assert task["id"] not in recovery.recoverable_task_ids(tmp_path)
+    assert recovery._read(tmp_path, task["id"])["holders"][0]["status"] == "deferred"
+    assert task["id"] in recovery.recoverable_task_ids(tmp_path)
     assert [row["invocation_id"] for row in custody.pending_invocations(tmp_path)] == [
         invocation_id
     ]
@@ -213,8 +215,9 @@ def test_retry_refusal_preserves_live_owner_handoff_and_pending_invocation(
         running_task_ids=set(),
         recoverable_task_ids=recovery.recoverable_task_ids(tmp_path),
         gateway_factory=lambda: OrphanGateway(),
+        replay_pending=lambda: True,  # the admitted sweep is the one surface that replays
     )
-    assert replayed == [invocation_id]
+    assert replayed == []  # the exact deferred handle remains reserved
     custody._CUSTODY.clear()
 
 
@@ -290,7 +293,7 @@ def test_started_retry_race_adopts_same_durable_invocation(monkeypatch, tmp_path
 
     result = recovery.adopt_handoff(ctx, task)
 
-    assert result == {
+    assert {key: result[key] for key in ("status", "run_id", "cause")} == {
         "status": "adopted",
         "run_id": "run-started-race",
         "cause": recovery.CAUSE_WORKER_CRASH,
@@ -354,7 +357,8 @@ def test_a_review_panels_work_never_displaces_the_actors_own_handoff_holder(
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id=task["id"])
     ctx.budget_drive_root = str(tmp_path)
 
-    assert recovery.adopt_handoff(ctx, task) == {
+    adopted = recovery.adopt_handoff(ctx, task)
+    assert {key: adopted[key] for key in ("status", "run_id", "cause")} == {
         "status": "adopted",
         "run_id": "run-leaf",
         "cause": recovery.CAUSE_WORKER_CRASH,

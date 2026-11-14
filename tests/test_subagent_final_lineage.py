@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import asyncio
 import json
 from types import SimpleNamespace
 
 from ouroboros.gateway.history import make_chat_history_endpoint
 from supervisor import events, message_bus
+from tests._store_shared import seed_result
 
 
 def _logs(root):
@@ -44,7 +47,7 @@ def test_final_chat_row_persists_only_compact_subagent_identity(tmp_path, monkey
         },
     )
 
-    row = json.loads((tmp_path / "logs" / "chat.jsonl").read_text().strip())
+    row = json.loads(dialogue_test.log_text(tmp_path / "logs" / "chat.jsonl").strip())
     assert row["delegation_role"] == "subagent"
     assert row["subagent_task_id"] == "child-1"
     assert row["parent_task_id"] == "parent-1"
@@ -70,7 +73,7 @@ def test_history_recovers_legacy_final_only_row_from_task_result(tmp_path):
     }) + "\n", encoding="utf-8")
     results = tmp_path / "task_results"
     results.mkdir()
-    (results / "child-old.json").write_text(json.dumps({
+    seed_result(tmp_path, "child-old", {
         "_schema_version": 1,
         "task_id": "child-old",
         "status": "completed",
@@ -79,7 +82,7 @@ def test_history_recovers_legacy_final_only_row_from_task_result(tmp_path):
         "root_task_id": "root-old",
         "role": "art-critic",
         "model": "anthropic/claude-opus-5",
-    }), encoding="utf-8")
+    })
 
     final = next(item for item in _history(tmp_path) if item.get("task_id") == "child-old")
     assert final["delegation_role"] == "subagent"
@@ -97,11 +100,11 @@ def test_history_leaves_root_final_unclassified(tmp_path):
     }) + "\n", encoding="utf-8")
     results = tmp_path / "task_results"
     results.mkdir()
-    (results / "root-only.json").write_text(json.dumps({
+    seed_result(tmp_path, "root-only", {
         "_schema_version": 1,
         "task_id": "root-only", "status": "completed", "delegation_role": "root",
         "root_task_id": "root-only",
-    }), encoding="utf-8")
+    })
 
     final = next(item for item in _history(tmp_path) if item.get("task_id") == "root-only")
     assert "subagent_task_id" not in final
@@ -137,12 +140,12 @@ def test_supervisor_enriches_live_final_but_not_root_from_running_truth(tmp_path
 def test_supervisor_recovers_final_lineage_after_running_row_is_gone(tmp_path):
     results = tmp_path / "task_results"
     results.mkdir()
-    (results / "child-replay.json").write_text(json.dumps({
+    seed_result(tmp_path, "child-replay", {
         "_schema_version": 1,
         "task_id": "child-replay", "status": "completed",
         "delegation_role": "subagent", "parent_task_id": "parent-replay",
         "root_task_id": "root-replay", "role": "recovery-reviewer",
-    }), encoding="utf-8")
+    })
     sent = []
     ctx = SimpleNamespace(
         DRIVE_ROOT=tmp_path,

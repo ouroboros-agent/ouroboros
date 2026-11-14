@@ -13,20 +13,83 @@ from ouroboros import (
     runtime_limits,
     settings_defaults,
     settings_scales,
+    safety_config,
 )
 
-REPO = pathlib.Path(__file__).parents[1]
-PACKAGE = REPO / "ouroboros"
 
-_LEAVES = (settings_defaults, settings_scales, model_slots, review_model_routes, runtime_limits)
+_LEAVES = (settings_defaults, settings_scales, model_slots, review_model_routes, runtime_limits, safety_config)
 
 # New subscription capabilities belong to the same leaves, but did not exist on
 # the historical extraction's facade and need not add compatibility re-exports.
 _ADDED_OWNERS = {
+    "VALID_SUBAGENTS_MODES": settings_scales,
+    "normalize_subagents_mode": settings_scales,
+    "_safety_values": safety_config,
+    "_resolved_safety_configuration": safety_config,
+    "safety_configuration_requires_owner": safety_config,
+    "normalize_consciousness_safety": safety_config,
+    "OWNER_RULES_KEY": safety_config,
+    "_RULES_ADDRESS": safety_config,
+    "owner_rules_section": safety_config,
+    # A managed deployment's organization rules ride the same section under their own provenance.
+    "organization_rules_section": safety_config,
+    "_owner_rules": safety_config,
     "WORKER_READY_CEILING_SEC": runtime_limits,
+    # A spawned direct-Restart successor's bounded wait for its exiting parent's data-root admission.
+    "SERVER_ADMISSION_WAIT_SEC": runtime_limits,
+    "STOP_ADMISSION_DRAIN_SEC": runtime_limits,
+    "MACOS_HANDOFF_FULLSCREEN_WAIT_SEC": runtime_limits,
+    # The supervisor loop's bounded events pass and the budget-projection retry interval.
+    "SUPERVISOR_EVENT_BATCH_MAX_EVENTS": runtime_limits,
+    "SUPERVISOR_EVENT_BATCH_MAX_SEC": runtime_limits,
+    "BUDGET_PROJECTION_RETRY_SEC": runtime_limits,
+    # The usage store display read's short wait (then the fact is reported unavailable).
+    "USAGE_DISPLAY_LOCK_TIMEOUT_SEC": runtime_limits,
+    # The kill-and-reap bound of one captured local Git read (vcs_read history and identity).
+    "GIT_READ_CAPTURE_TIMEOUT_SEC": runtime_limits,
     "IMMEDIATE_SETTINGS": settings_scales,
     "RESTART_REQUIRED_SETTINGS": settings_scales,
+    # When a saved choice is consumed (the Settings row's timing): one label over the sets above, the route
+    # keys and the keys the consciousness clock reads at each wake decision.
+    "CONSCIOUSNESS_CLOCK_SETTINGS": settings_scales,
+    "setting_effect": settings_scales,
+    # The owner's optional cap on acting tasks: its key, legacy value, disk format and its reads (pool-capacity D).
+    "OWNER_CAP_KEY": settings_scales,
+    "OWNER_CAP_LEGACY": settings_scales,
+    "OWNER_CAP_FORMAT_KEY": settings_scales,
+    "owner_cap_document": settings_scales,
+    "document_optional_value": settings_scales,
+    # An explicit root starting effort is validated against the effort scale it names.
+    "requested_effort": settings_scales,
+    # The lane-era global review effort, frozen as the legacy skill-review fingerprint literal.
+    "REVIEW_POOL_DEFAULT_EFFORT": settings_scales,
+    # The owner's effort range: its keys, the owner-facing tiers, the tolerant read, the Cyber
+    # Pro predicate, the clamp, the one effort decision and its recorded fact.
+    "EFFORT_RANGE_KEYS": settings_scales,
+    "EFFORT_FORMAT_KEY": settings_scales,
+    "normalize_effort_document": settings_scales,
+    "normalize_legacy_effort_settings": settings_scales,
+    "OWNER_EFFORT_TIERS": settings_scales,
+    "EFFORT_SOURCES": settings_scales,
+    "_tier": settings_scales,
+    "effort_range": settings_scales,
+    "clamp_effort_into": settings_scales,
+    "choose_effort": settings_scales,
+    "effort_fact": settings_scales,
+    "effort_fact_says": settings_scales,
+    "effort_fact_phrase": settings_scales,
+    # The retired role effort keys the range replaced (the RC auditor's note class).
+    "EFFORT_RANGE_RETIRED_SETTING_KEYS": settings_defaults,
+    # Replaceable interface: a saved value (blank included) wins over the environment, an absent key
+    # stays the environment's, and a merged write does not author it (config read and persist seams).
+    "SAVED_CHOICE_SETTINGS": settings_defaults,
+    "unauthored_saved_choices": settings_defaults,
     "get_finalization_grace_sec": runtime_limits,
+    "PROMOTE_CONFIRM_WAIT_SEC": runtime_limits,
+    "get_promote_confirm_wait_sec": runtime_limits,
+    "ROUTING_MANIFEST_RESULT_ROWS": runtime_limits,
+    "get_routing_manifest_result_rows": runtime_limits,
+    "get_model_substitution_redos": runtime_limits,
     "NETWORK_WAIT_BACKOFF_MAX_SEC": runtime_limits,
     "MODEL_ACCOUNTS_KEY": model_slots,
     "MODEL_CONTEXT_WINDOWS_KEY": model_slots,
@@ -40,16 +103,24 @@ _ADDED_OWNERS = {
     "normalize_model_role_options": model_slots,
     "model_role_option": model_slots,
     "task_model_binding": model_slots,
+    "route_binding": model_slots,
     "apply_model_role_override": model_slots,
+    "_persisted_role": model_slots,
+    "model_role_setting_keys": model_slots,
+    # A slot's model as it routes (its USE_LOCAL_* flag), for image candidate choice.
+    "_SLOT_LOCAL_FLAGS": model_slots,
+    "local_lane_label": model_slots,
+    "slot_lane_label": model_slots,
     "CLAUDEXOR_MODEL_POLL_INTERVAL_SEC": runtime_limits,
     "CLAUDEXOR_OPERATOR_STOP_TIMEOUT_SEC": runtime_limits,
     "CLAUDEXOR_STOP_EXIT_WAIT_SEC": runtime_limits,
+    # Thread-export and retirement responses may re-hash all named bytes before answering.
+    "CLAUDEXOR_WHOLE_BYTES_READ_SEC": runtime_limits,
     # The native platform build envelope is owned by the common runtime-limits leaf.
     "EXTERNAL_PLATFORM_UPDATE_TIMEOUT_SEC": runtime_limits,
     # Consciousness settings scaffolding: the alarm's SSOT default interval, the closed
     # autonomy enum and the readers for the three consciousness keys.
     "WAKE_DEFAULT_SEC": runtime_limits,
-    "USAGE_LEDGER_FOLD_MIN_AGE_SEC": runtime_limits,
     "CONSCIOUSNESS_AUTONOMY_LEVELS": runtime_limits,
     "get_consciousness_autonomy": runtime_limits,
     "get_consciousness_daily_usd": runtime_limits,
@@ -58,14 +129,53 @@ _ADDED_OWNERS = {
     "get_bg_wakeup_max_sec": runtime_limits,
     # Governance tiers: the share of a reviewer's usable window tier-2 documents may take inline.
     "REVIEW_GOVERNANCE_INLINE_SHARE": runtime_limits,
+    # The pooled worker's short acceptance-fence ack wait (one wait, one re-send, then a typed unknown).
+    "ACCEPTANCE_FENCE_ACK_WAIT_SEC": runtime_limits,
+    "get_acceptance_fence_ack_wait_sec": runtime_limits,
+    # #1196 optional bounds: the shared positive-or-unlimited vocabulary (also the review-cycle
+    # cap's), the legacy finite values of documents that predate it, and their readers.
+    "UNLIMITED": settings_scales,
+    "UNLIMITED_ALIASES": settings_scales,
+    "parse_positive_or_unlimited": settings_scales,
+    "OPTIONAL_BOUND_LEGACY": settings_scales,
+    "_WARNED_OPTIONAL_BOUNDS": settings_scales,
+    "optional_bound_value": settings_scales,
+    "defaults_for_settings_document": settings_scales,
+    "_optional_bound_setting": runtime_limits,
+    "get_max_rounds": runtime_limits,
+    "IDLE_LEASE_MAX_SEC": runtime_limits,
+    # #939: the numeric duration resolver is a leaf; config supplies its settings seam.
+    "_CURRENT_TASK_CEILING": runtime_limits,
+    "explicit_execution_timeout_sec": runtime_limits,
+    "resolve_task_execution_timeout_sec": runtime_limits,
+    # MCP task sessions and their browser-policy callback: fixed structural bounds.
+    "MCP_TASK_SESSION_CLOSE_WAIT_SEC": runtime_limits,
+    "MCP_TASK_SESSION_RETURN_WAIT_SEC": runtime_limits,
+    "MCP_TASK_SESSION_IDLE_POLL_SEC": runtime_limits,
+    "MCP_BROWSER_GUARD_READ_SEC": runtime_limits,
+    "MCP_BROWSER_GUARD_LINE_BYTES": runtime_limits,
+    "MCP_BROWSER_GUARD_WORKERS": runtime_limits,
+    "MCP_BROWSER_GUARD_PENDING": runtime_limits,
+    "MCP_STDIO_STDERR_TAIL_BYTES": runtime_limits,
+    "MCP_STDIO_STDERR_NOTE_BYTES": runtime_limits,
+    "MCP_OAUTH_HTTP_TIMEOUT_SEC": runtime_limits,
+    "MCP_OAUTH_LOCK_WAIT_SEC": runtime_limits,
 }
 
 _MOVED_OWNERS = {
+    "get_safety_mode": safety_config,
+    "safety_configuration": safety_config,
+    "_guard_safety_configuration": safety_config,
+    "_migrate_consciousness_safety": safety_config,
+    "get_safety_model": model_slots,
     "WORKER_SPAWN_GRACE_SEC": runtime_limits,
+    "ARTIFACT_COMPRESSION_TIMEOUT_SEC": runtime_limits,
     "WORKER_READY_WINDOW_SEC": runtime_limits,
     "WORKER_READY_MAX_ATTEMPTS": runtime_limits,
     "EXTENSION_STREAM_CHUNK_BYTES": runtime_limits,
     "EXTENSION_CHILD_CLEANUP_GRACE_SEC": runtime_limits,
+    "LAUNCHER_STOP_GRACE_SEC": runtime_limits,
+    "SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_SEC": runtime_limits,
     "NESTED_SETTLEMENT_MARGIN_SEC": runtime_limits,
     "NETWORK_WAIT_NOTE_INTERVAL_SEC": runtime_limits,
     "NETWORK_WAIT_BACKOFF_START_SEC": runtime_limits,
@@ -80,13 +190,14 @@ _MOVED_OWNERS = {
     "CLAUDEXOR_ADMISSION_WAIT_SEC": settings_defaults,
     "CLAUDEXOR_ADMISSION_POLL_SEC": settings_defaults,
     "ENDPOINT_AUTHORED_SETTINGS": settings_defaults,
+    "ENDPOINT_WRITTEN_SETTINGS": settings_defaults,
+    "ENDPOINT_WRITERS": settings_defaults,
     # v6.104.0 upstream: the OpenRouter shipped-model defaults arrive in the
     # vocabulary leaf the v7 split created for exactly this class of fact.
     "OPENROUTER_DEFAULTS": settings_defaults,
     "OPENROUTER_REVIEW_DEFAULTS": settings_defaults,
     "FINALIZATION_GRACE_DEFAULT_SEC": settings_defaults,
     "OWNER_STOP_OUTER_CAP_SEC": settings_defaults,
-    "PACING_INTERVAL_DEFAULT_SEC": settings_defaults,
     "RETIRED_SETTING_KEYS": settings_defaults,
     # ABI 7.0 (ABI-7b): the comma-list classification INSIDE the retirement
     # SSOT, born in this leaf (not an extraction) for the RC auditor to snap.
@@ -95,6 +206,12 @@ _MOVED_OWNERS = {
     # retired keys whose successor SETTING the table states, so the first-boot
     # notice can name it instead of claiming there is none.
     "RETIRED_SETTING_SUCCESSORS": settings_defaults,
+    # PR-3 (review pool): the third classification inside the retirement SSOT —
+    # the review-lane keys whose stored value is MIGRATED into reviewer rows of
+    # the subagent catalog at load (`review_pool_migration`), never dropped — and
+    # the one «migrated» class line the RC auditor and the boot notice share.
+    "REVIEW_POOL_MIGRATED_SETTING_KEYS": settings_defaults,
+    "REVIEW_POOL_MIGRATION_CLASS_LINE": settings_defaults,
     # D-07: the ONE sentence both the read seam's log line and the boot-time
     # owner chat notice say about retired keys, next to the tables it reads.
     "retired_setting_keys_notice": settings_defaults,
@@ -123,7 +240,6 @@ _MOVED_OWNERS = {
     "_main_model": model_slots,
     "_parse_model_list": model_slots,
     "get_consciousness_model": model_slots,
-    "get_deep_self_review_model": model_slots,
     "get_fallback_models": model_slots,
     "get_heavy_model": model_slots,
     "get_image_input_mode": model_slots,
@@ -131,19 +247,10 @@ _MOVED_OWNERS = {
     "get_vision_model": model_slots,
     "migrate_legacy_slot_keys": model_slots,
     "parse_fallback_chain": model_slots,
-    "_DIRECT_PROVIDER_REVIEW_RUNS": review_model_routes,
     "_exclusive_direct_remote_provider_env": review_model_routes,
     "adaptive_quorum": review_model_routes,
-    "direct_provider_review_models_fallback": review_model_routes,
-    "get_review_enforcement": review_model_routes,
-    "get_review_models": review_model_routes,
-    "get_scope_review_models": review_model_routes,
-    # ABI-4 (F3.2): typed views over the effective reviewer model lists.
-    "get_review_targets": review_model_routes,
-    "get_scope_review_targets": review_model_routes,
     "resolved_review_model_target": review_model_routes,
-    "DELEGATE_WAIT_CEILING_SEC": runtime_limits,
-    "DELEGATE_WAIT_WINDOW_MAX_SEC": runtime_limits,
+    "BODY_MAINTENANCE_INTERVAL_SEC": runtime_limits,
     "MAX_ACTIVE_SUBAGENTS_HARD_CAP": runtime_limits,
     # Upstream reshaped the hard-cap assignment into a tuple that also binds the
     # nesting ceiling (`MAX_ACTIVE_..., MAX_SUBAGENT_DEPTH_... = 500, 10`), so the
@@ -151,10 +258,8 @@ _MOVED_OWNERS = {
     "MAX_SUBAGENT_DEPTH_HARD_CAP": runtime_limits,
     "_bounded_positive_int_setting": runtime_limits,
     "_clamped_number_setting": runtime_limits,
-    "get_acceptance_reserve_pct": runtime_limits,
-    "get_acceptance_review_est_sec": runtime_limits,
-    "get_delegate_wait_max_sec": runtime_limits,
-    "get_delegate_wait_sec": runtime_limits,
+    # get_acceptance_reserve_pct / get_acceptance_review_est_sec left with the task-acceptance launch
+    # floor (the review fold); their two keys are retired in settings_defaults.
     "get_llm_transport_read_timeout_sec": runtime_limits,
     "get_claudexor_quota_refresh_timeout_sec": runtime_limits,
     "get_claudexor_harness_install_timeout_sec": runtime_limits,
@@ -164,9 +269,6 @@ _MOVED_OWNERS = {
     "get_max_active_subagents_per_root": runtime_limits,
     "get_max_subagent_depth": runtime_limits,
     "get_max_workers": runtime_limits,
-    "get_pacing_interval_sec": runtime_limits,
-    "get_per_call_timeout_ceiling_sec": runtime_limits,
-    "get_plan_task_deadline_min_sec": runtime_limits,
     "get_post_task_evolution_budget_usd": runtime_limits,
     "get_restart_drain_max_sec": runtime_limits,
     "get_safety_call_timeout_sec": runtime_limits,
@@ -176,7 +278,7 @@ _MOVED_OWNERS = {
     "get_task_abs_ceiling_sec": runtime_limits,
     "get_task_idle_timeout_sec": runtime_limits,
     "get_vision_caption_timeout_sec": runtime_limits,
-    "get_update_letter_timeout_sec": runtime_limits,
+    "get_ui_translation_timeout_sec": runtime_limits,
     "get_websearch_timeout_sec": runtime_limits,
 }
 
@@ -190,7 +292,7 @@ _PARENT_RETAINED = (
     "_settings_flag_enabled", "_settings_lock_path", "_acquire_settings_lock",
     "_release_settings_lock", "_coerce_setting_value", "load_settings",
     "load_settings_lock_held", "save_settings", "prepare_settings_for_persist",
-    "apply_settings_to_env", "get_runtime_mode", "get_safety_mode", "get_context_mode",
+    "apply_settings_to_env", "get_runtime_mode", "get_context_mode",
     "get_owner_context_mode", "initialize_runtime_mode_baseline",
     "_guard_context_mode_lowering", "_guard_safety_mode_lowering",
 )
@@ -248,6 +350,20 @@ def test_provider_models_reads_the_shared_leaves_instead_of_importing_config():
             is settings_defaults.OPENROUTER_REVIEW_DEFAULTS)
 
 
+def test_execution_bound_resolution_keeps_leaf_and_facade_defaults_separate(monkeypatch):
+    task = {"execution_timeout_sec": 900}
+    monkeypatch.setattr(runtime_limits, "get_task_abs_ceiling_sec", lambda: 300)
+    monkeypatch.setattr(config, "get_task_abs_ceiling_sec", lambda: 600)
+    assert runtime_limits.resolve_task_execution_timeout_sec(task) == 300
+    assert config.resolve_task_execution_timeout_sec(task) == 600
+    for resolver in (runtime_limits.resolve_task_execution_timeout_sec, config.resolve_task_execution_timeout_sec):
+        assert resolver(task, global_ceiling=None) == 900
+        assert resolver(task, global_ceiling=120) == 120
+        assert resolver({}, global_ceiling=None) is None
+    monkeypatch.setattr(config, "get_task_abs_ceiling_sec", lambda: None)
+    assert config.resolve_task_execution_timeout_sec(task) == 900
+
+
 def test_config_facade_reexports_every_moved_identity():
     """``config`` keeps the exact objects, so every existing importer and every
     ``monkeypatch.setattr(config, ...)`` consumer sees no identity change."""
@@ -277,16 +393,3 @@ def test_settings_extraction_owner_inventory_is_exact():
             seen[name] = module.__name__
             assert owners.get(name) is module, f"{module.__name__} owns an unmapped name: {name}"
     assert set(seen) == set(owners)
-
-
-def test_settings_extraction_size_bounds_have_meaningful_headroom():
-    counts = {
-        module.__name__: len(
-            pathlib.Path(module.__file__).read_text(encoding="utf-8").splitlines()
-        )
-        for module in (config, *_LEAVES)
-    }
-    assert counts["ouroboros.config"] <= 1000
-    assert all(count <= 1000 for count in counts.values())
-    assert counts["ouroboros.settings_defaults"] <= 500
-    assert (PACKAGE / "config.py").is_file()

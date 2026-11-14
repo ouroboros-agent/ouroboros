@@ -6,7 +6,7 @@ import {
     boundActivityPreview,
     clearStickyCardState,
     projectCollapsedActivity,
-} from '../modules/chat.js';
+} from '../modules/chat_activity.js';
 import { summarizeChatLiveEvent } from '../modules/log_events.js';
 import { bindContentButton, plainActivityText, selectionInside, subagentIdentityTitle, subagentTwin } from '../modules/chat_activity.js';
 
@@ -68,7 +68,7 @@ test('clearStickyCardState resets the recycled record activity + cost (reusable 
     const record = {
         collapsedActivity: 'Old cycle activity',
         costMeta: { meta: ['$1.00'], ts: 1, final: true },
-        executorChip: { harness: 'codex', icon: '◇', label: 'codex · no run yet' },
+        executorChip: { harness: 'codex', label: 'Codex · no run yet', hasEvidence: true },
         // Models the real element closely enough for attribute handling.
         activityEl: {
             textContent: 'Old cycle activity',
@@ -109,7 +109,9 @@ test('the collapsed projection is whitespace-normalized, bounded and explicit', 
     assert.equal(out.length, COLLAPSED_ACTIVITY_MAX);
     assert.ok(out.endsWith('…'), 'the cut is visible, never silent');
     assert.equal(boundActivityPreview('  Reading\n  the   ledger  '), 'Reading the ledger');
-    assert.equal(projectCollapsedActivity({ suggestedName: 'X', headline: long }), out);
+    // A child's line is that bounded preview; an ordinary root's line is whole (owner 30.10, B; root_full_text.test.js).
+    assert.equal(projectCollapsedActivity({ isSubagent: true, body: long }), out);
+    assert.equal(projectCollapsedActivity({ suggestedName: 'X', headline: long }), long);
 });
 
 test('root progress keeps a bounded activity preview and a complete timeline companion', () => {
@@ -285,4 +287,13 @@ test('a content button toggles on click and keyboard, but not on a selecting dra
     handlers.keydown({ key: 'a', preventDefault: () => { prevented += 1; } });
     assert.deepEqual([clicks, activated, prevented], [2, 3, 2]);
     globalThis.getSelection = saved;
+});
+
+
+test('collapsed activity uses the same punctuation-labelled fences as the expanded timeline', () => {
+    for (const label of ['c++', 'c#', 'objective-c', 'md-js']) {
+        const source = '```' + label + '  \r\n# comment\r\nint value = 2;\r\n```';
+        assert.equal(plainActivityText(source), '# comment\nint value = 2;');
+        assert.equal(boundActivityPreview(source), '# comment int value = 2;');
+    }
 });

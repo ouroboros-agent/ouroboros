@@ -1,16 +1,19 @@
 import importlib.util
 import pathlib
+import sys
 import struct
+import urllib.request
 
 
 def _load_plugin():
     root = pathlib.Path(__file__).resolve().parents[1]
+    plugin_path = root / "skills" / "unix_computer_use" / "plugin.py"
     spec = importlib.util.spec_from_file_location(
-        "unix_computer_use_plugin",
-        root / "skills" / "unix_computer_use" / "plugin.py",
+        "unix_computer_use_plugin", plugin_path, submodule_search_locations=[str(plugin_path.parent)],
     )
     mod = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
+    sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     return mod
 
@@ -62,9 +65,11 @@ def test_connection_registry_and_tool_surface(tmp_path):
     assert "screenshot" in api.tools
     assert "click" in api.tools
 
+    import json as _json_mod
+
     impl = mod._ComputerUse(api)
     result = impl.add_connection(name="osw", backend="osworld_http", target="http://127.0.0.1:5000", activate=True)
-    assert '"ok": true' in result
+    assert _json_mod.loads(result)["ok"] is True
     assert impl._active_backend_name() == "osworld_http"
     assert "osw" in impl.list_connections()
 
@@ -73,6 +78,8 @@ def test_connection_registry_and_tool_surface(tmp_path):
 
 
 def test_remote_screenshot_result_confined_and_transform(tmp_path):
+    import json as _json_mod
+
     mod = _load_plugin()
     api = _API(tmp_path)
     impl = mod._ComputerUse(api)
@@ -88,19 +95,21 @@ def test_remote_screenshot_result_confined_and_transform(tmp_path):
         input_h=1080,
     )
 
-    assert '"ok": true' in out
+    shot = _json_mod.loads(out)
+    assert shot["ok"] is True
+    assert "observed_effect" not in shot  # Reading a screenshot is not an input effect.
     # Path confinement: screenshots are returned in place (job/state dir), never
     # copied to a data/uploads directory (OS-agnostic: check both separators).
     assert "/uploads/" not in out and "\\uploads\\" not in out
-    assert '"view_image_ready": true' in out
+    assert shot["view_image_ready"] is True
     # 1920x1080 capped at 1280x800 downscales to 1280x720, so the transform maps
     # image space back to input space at 1.5x. The previous expectation of sx=1.0
     # only held because the stub PNG was undecodable and _downscale silently
     # no-oped on it — an identity transform over a full-resolution image is the
     # coordinate-space mismatch this transform exists to prevent.
-    assert '"image_width": 1280' in out and '"image_height": 720' in out
-    assert '"sx": 1.5' in out
-    assert '"input_w": 1920' in out
+    assert (shot["image_width"], shot["image_height"]) == (1280, 720)
+    assert shot["coord_transform"]["sx"] == 1.5
+    assert shot["coord_transform"]["input_w"] == 1920
 
 # ---------------------------------------------------------------------------
 # Remote-backend honesty fixes (PR #64 finalization).
@@ -119,6 +128,10 @@ def _osworld_impl(tmp_path, captured, canned):
     calls = {"n": 0}
 
     def _fake_exec(conn, command, *, timeout=60):
+        from tests.test_unix_computer_use_safety_contract import guest_key_validation
+        validation = guest_key_validation(command[-1])
+        if validation:
+            return validation
         captured.append(command)
         i = min(calls["n"], len(canned) - 1)
         calls["n"] += 1
@@ -136,7 +149,8 @@ def test_remote_scroll_is_one_to_one_wheel_detents(tmp_path):
 
     cap: list = []
     _mod, impl = _osworld_impl(tmp_path, cap, [_OK])
-    assert _json_mod.loads(impl.scroll(clicks=5, direction="down"))["ok"]
+    out = _json_mod.loads(impl.scroll(clicks=5, direction="down"))
+    assert out["ok"] and out["observed_effect"] is True
     assert "pyautogui.scroll(-5)" in cap[-1][-1]
     impl.scroll(clicks=50, direction="up")  # clamps to 20
     assert "pyautogui.scroll(20)" in cap[-1][-1]
@@ -152,8 +166,9 @@ def test_osworld_nonzero_returncode_is_not_ok(tmp_path):
     _mod, impl = _osworld_impl(tmp_path, cap, [fail])
     out = _json_mod.loads(impl.remote_exec(command="false"))
     assert out["ok"] is False and "boom" in out["error"]
-    out2 = _json_mod.loads(impl.click(x=10, y=10))
+    out2 = _json_mod.loads(impl.click(x=10, y=10, raw=True))
     assert out2["ok"] is False
+    assert "observed_effect" not in out2
 
     # status=="error" also not ok
     _mod, impl = _osworld_impl(tmp_path, [], [{"status": 200, "result": {"status": "error", "message": "kaboom"}}])
@@ -166,6 +181,8 @@ def test_osworld_nonzero_returncode_is_not_ok(tmp_path):
     # returncode 0 -> ok
     _mod, impl = _osworld_impl(tmp_path, [], [_OK])
     assert _json_mod.loads(impl.remote_exec(command="true"))["ok"] is True
+    assert "observed_effect" not in _json_mod.loads(impl.remote_exec(command="true"))
+    assert "observed_effect" not in _json_mod.loads(impl.cursor_position())
 
 
 def test_remote_type_text_unicode_uses_clipboard_ascii_uses_typewrite(tmp_path):
@@ -183,6 +200,7 @@ def test_remote_type_text_unicode_uses_clipboard_ascii_uses_typewrite(tmp_path):
     assert "hotkey('ctrl','v')" in code and "hotkey('ctrl','shift','v')" in code
     assert "getwindowclassname" in code
     assert out.get("method") == "clipboard"
+    assert out["observed_effect"] is True
 
     cap.clear()
     impl.type_text(text="hello world")
@@ -200,6 +218,7 @@ def test_remote_type_text_unicode_falls_back_to_typewrite(tmp_path):
     assert "pyperclip" in cap[0][-1]
     assert "pyautogui.typewrite('caf" in cap[1][-1]
     assert out.get("method") == "typewrite" and out.get("clipboard_fallback") is True
+    assert out["observed_effect"] is True
 
 
 def test_remote_backspace_and_delete_press_backspace(tmp_path):
@@ -226,7 +245,7 @@ def test_disabled_active_connection_fails_closed(tmp_path, monkeypatch):
     # Local backends must never be invoked for a disabled remote connection.
     monkeypatch.setattr(mod, "_run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("local _run called")))
 
-    for out in (impl.click(x=1, y=1), impl.screenshot(), impl.remote_exec(command="ls")):
+    for out in (impl.click(x=1, y=1, raw=True), impl.screenshot(), impl.remote_exec(command="ls")):
         parsed = _json_mod.loads(out)
         assert parsed["ok"] is False and "disabled" in parsed["error"]
 
@@ -254,14 +273,14 @@ def test_remote_screenshot_cap_and_invalid_png_cleanup(tmp_path, monkeypatch):
 
     # Oversized download -> not ok, nothing kept.
     big = b"\x89PNG\r\n\x1a\n" + b"x" * (mod._MAX_REMOTE_SHOT_BYTES + 10)
-    monkeypatch.setattr(mod.urllib.request, "urlopen", lambda *a, **k: _Resp(big))
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Resp(big))
     out = _json_mod.loads(impl.screenshot())
     assert out["ok"] is False and "cap" in out["error"]
 
     # Garbage (non-PNG) bytes -> not ok, file removed. The fetch path retries a
     # corrupt body a bounded number of times and then fails CLOSED; nothing is
     # published either way, which is the property this test guards.
-    monkeypatch.setattr(mod.urllib.request, "urlopen", lambda *a, **k: _Resp(b"not-a-png-body"))
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Resp(b"not-a-png-body"))
     monkeypatch.setattr(mod.time, "sleep", lambda s: None)
     out = _json_mod.loads(impl.screenshot())
     assert out["ok"] is False and "screenshot_corrupt" in out["error"]
@@ -276,7 +295,7 @@ def test_remote_screenshot_cap_and_invalid_png_cleanup(tmp_path, monkeypatch):
     _buf = _io.BytesIO()
     _Image.new("RGB", (8, 8), (1, 2, 3)).save(_buf, format="PNG")
     header_ok_body_dead = _buf.getvalue()[:40] + b"\x00" * 200
-    monkeypatch.setattr(mod.urllib.request, "urlopen",
+    monkeypatch.setattr(urllib.request, "urlopen",
                         lambda *a, **k: _Resp(header_ok_body_dead))
     out = _json_mod.loads(impl.screenshot())
     assert out["ok"] is False and "screenshot_corrupt" in out["error"]
@@ -333,7 +352,7 @@ def test_stale_active_pointer_with_missing_registry_fails_closed(tmp_path):
     name, conn = impl._active_connection()
     assert name == "osw" and conn.get("disabled") is True and conn.get("missing") is True
     assert impl._is_remote() is True  # non-local name → routed to the guarded remote path
-    for out in (impl.click(x=1, y=1), impl.type_text(text="x"), impl.key(keys="a"),
+    for out in (impl.click(x=1, y=1, raw=True), impl.type_text(text="x"), impl.key(keys="a"),
                 impl.scroll(clicks=1), impl.screenshot(), impl.remote_exec(command="ls")):
         parsed = _json_mod.loads(out)
         assert parsed["ok"] is False
@@ -352,7 +371,7 @@ def test_unsupported_enabled_backend_fails_closed(tmp_path):
                     '{"active": "bad", "connections": {"local": {"backend": "local", "enabled": true}, "bad": {"backend": "bogus", "enabled": true}}}', "bad")
 
     assert impl._is_remote() is True
-    for out in (impl.click(x=2, y=2), impl.type_text(text="y"), impl.screenshot(), impl.remote_exec(command="ls")):
+    for out in (impl.click(x=2, y=2, raw=True), impl.type_text(text="y"), impl.screenshot(), impl.remote_exec(command="ls")):
         parsed = _json_mod.loads(out)
         assert parsed["ok"] is False
         assert "unusable" in parsed.get("error", "")

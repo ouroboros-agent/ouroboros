@@ -32,7 +32,7 @@ def test_selective_windows_tree_uses_one_snapshot_without_taskkill_tree(monkeypa
     # Worker 10 owns ordinary 11/12 and shared daemon 20 with client work 21/22.
     children = {10: [11, 20], 11: [12], 20: [21], 21: [22]}
     monkeypatch.setattr(pl, "IS_WINDOWS", True)
-    monkeypatch.setattr(pl, "_windows_process_children", lambda: snapshots.append(True) or children)
+    monkeypatch.setattr(pl, "_process_children", lambda: snapshots.append(True) or children)
     monkeypatch.setattr(pl, "_hidden_run", lambda argv, **kw: calls.append(argv))
     pl.kill_pid_tree(10, exclude_pids={20})
     assert snapshots == [True]
@@ -46,14 +46,58 @@ def test_posix_forced_tree_preserves_shared_branch_even_in_same_group(monkeypatc
     if pl.IS_WINDOWS:
         pytest.skip("POSIX group branch")
     killed, groups = [], []
-    descendants = {10: [12, 11, 21, 20], 20: [21]}
-    monkeypatch.setattr(pl, "_collect_descendants", lambda pid, out: out.extend(descendants.get(pid, [])))
+    monkeypatch.setattr(pl, "_process_children", lambda: {10: [11, 20], 11: [12], 20: [21]})
     monkeypatch.setattr(pl, "process_group_id", lambda pid: 10)
     monkeypatch.setattr(pl, "kill_process_group_id", lambda pgid, **kw: groups.append(pgid))
     monkeypatch.setattr(pl, "force_kill_pid", killed.append)
     pl.kill_process_tree(SimpleNamespace(pid=10), exclude_pids={20})
     assert groups == []
     assert killed == [12, 11, 10]
+
+
+@pytest.mark.parametrize(("attached", "count"), [(False, 1), (True, 15)])
+def test_posix_tree_reads_one_snapshot_for_target_and_whole_retained_branch(monkeypatch, count, attached):
+    monkeypatch.setattr(pl, "IS_WINDOWS", False)
+    calls = []
+    # A nested retained branch, either under the worker or owned by another worker.
+    lines = ["10 1", "11 10", "12 11", f"20 {10 if attached else 1}"]
+    lines.extend(f"{21 + index} {20 + index}" for index in range(count))
+    def snapshot(argv, **kwargs):
+        calls.append(argv)
+        assert argv == ["ps", "-axo", "pid=,ppid="]
+        assert kwargs["timeout"] == 3 and kwargs["check"] is True
+        return SimpleNamespace(stdout="\n".join(lines), returncode=0)
+    monkeypatch.setattr(pl.subprocess, "run", snapshot)
+    targets, spared = pl._tree_kill_targets(10, {20})
+    assert targets == [12, 11, 10]
+    assert spared == set(range(20, 21 + count))
+    assert len(calls) == 1, "retained subtree size must not add subprocesses per worker"
+
+
+@pytest.mark.parametrize("failure", ["missing", "malformed", "negative"])
+def test_posix_snapshot_failure_retains_legacy_descendants_and_sparing(monkeypatch, failure):
+    monkeypatch.setattr(pl, "IS_WINDOWS", False)
+    calls = []
+    children = {10: [11, 20], 11: [12], 20: [21]}
+    def run(argv, **kwargs):
+        calls.append(argv)
+        if argv[0] == "ps":
+            if failure == "missing":
+                raise FileNotFoundError("ps unavailable")
+            if failure == "timeout":
+                raise subprocess.TimeoutExpired(argv, 3)
+            if failure == "failed":
+                raise subprocess.CalledProcessError(1, argv)
+            return SimpleNamespace(stdout={"empty": "", "malformed": "10 1\nunreadable",
+                                           "negative": "10 1\n-20 10"}[failure])
+        assert argv[:2] == ["pgrep", "-P"]
+        return SimpleNamespace(stdout="\n".join(map(str, children.get(int(argv[-1]), []))))
+    monkeypatch.setattr(pl.subprocess, "run", run)
+    targets, spared = pl._tree_kill_targets(10, {20})
+    assert targets == [12, 11, 10]
+    assert spared == {20, 21}
+    assert calls[0] == ["ps", "-axo", "pid=,ppid="]
+    assert any(call[0] == "pgrep" for call in calls)
 
 
 def test_windows_legacy_argv_hash_is_not_native_measurement(monkeypatch):
@@ -82,7 +126,6 @@ def test_stop_snapshot_does_not_signal_a_new_custody_row(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("receipt,rc,accepted", [
     ({"ok": True, "stopped": True, "outcome": "exited"}, 0, True),
-    ({"ok": True, "stopped": True, "outcome": "killed"}, 0, True),
     ({"ok": True}, 0, False),
     ({"ok": True, "stopped": True, "outcome": "still_alive"}, 0, False),
     ({"ok": True, "stopped": True, "outcome": "exited"}, 1, False),
@@ -256,7 +299,6 @@ def _gone(pid):
     return not pl.pid_is_alive(pid) or custody.pid_is_zombie(pid)
 
 
-@pytest.mark.serial
 def test_loopback_fixture_bind_does_not_require_reverse_dns(monkeypatch):
     import ast
     import http.server
@@ -276,6 +318,7 @@ def test_loopback_fixture_bind_does_not_require_reverse_dns(monkeypatch):
 @pytest.fixture
 def shared_tree(tmp_path, monkeypatch, request):
     from ouroboros import config
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
     source = str(pathlib.Path(__file__).resolve().parents[1])
@@ -377,7 +420,6 @@ def _fixture_cli(root, monkeypatch):
     ))
 
 
-@pytest.mark.serial
 def test_real_ancestor_cleanup_spares_daemon_and_other_client(tmp_path, shared_tree):
     parent, info = shared_tree
     roots = custody.live_daemon_root_pids(tmp_path)
@@ -388,7 +430,6 @@ def test_real_ancestor_cleanup_spares_daemon_and_other_client(tmp_path, shared_t
     _continues(tmp_path, info)
 
 
-@pytest.mark.serial
 def test_real_cli_process_stops_legacy_custody_without_signalling(tmp_path, monkeypatch, shared_tree):
     _, info = shared_tree
     _fixture_cli(tmp_path, monkeypatch)
@@ -405,7 +446,6 @@ def test_real_cli_process_stops_legacy_custody_without_signalling(tmp_path, monk
     assert custody._read_ledger(tmp_path)[0]["fingerprint"]["start_time"] == ""
 
 
-@pytest.mark.serial
 def test_prior_session_custody_tree_reap_preserves_shared_daemon(tmp_path, shared_tree):
     _, info = shared_tree
     worker = custody.record_process(
@@ -427,6 +467,8 @@ def test_launcher_forced_stop_passes_retained_subtree(monkeypatch):
     class Process:
         pid = 9990011
         waits = 0
+        def terminate(self):
+            calls.append("graceful")
         def wait(self, timeout):
             self.waits += 1
             if self.waits == 1:
@@ -435,10 +477,8 @@ def test_launcher_forced_stop_passes_retained_subtree(monkeypatch):
     monkeypatch.setattr(launcher, "_agent_proc", Process())
     monkeypatch.setattr(launcher, "_agent_job", None)
     monkeypatch.setattr(launcher, "_retained_shared_daemon_pids", lambda: {9990022})
-    monkeypatch.setattr(launcher, "terminate_process_tree", lambda proc: calls.append("graceful"))
     monkeypatch.setattr(launcher, "kill_process_tree", lambda proc, **kw: calls.append((proc.pid, kw)))
     monkeypatch.setattr(launcher, "_cleanup_recorded_server_group_for_pid", lambda *a: None)
-    monkeypatch.setattr(launcher, "_kill_stale_on_port", lambda *a: None)
     launcher.stop_agent()
     assert calls == ["graceful", (9990011, {"exclude_pids": {9990022}})]
 
@@ -449,11 +489,11 @@ def test_recorded_server_cleanup_preserves_daemon_exclusions(tmp_path, monkeypat
     path.write_text(json.dumps({"pid": 9990011, "pgid": 0}))
     calls = []
     monkeypatch.setattr(launcher, "_server_process_record_path", lambda: path)
-    monkeypatch.setattr(launcher, "_server_process_identity_matches", lambda row: True)
+    monkeypatch.setattr(launcher, "_recorded_server_identity", lambda row: "ours")
     monkeypatch.setattr(launcher, "_retained_shared_daemon_pids", lambda: {9990022})
-    monkeypatch.setattr(launcher, "pid_is_alive", lambda pid: True)
+    monkeypatch.setattr(launcher, "pid_provably_gone", lambda pid: bool(calls))  # gone once its tree was killed
     monkeypatch.setattr(launcher, "kill_pid_tree", lambda pid, **kw: calls.append((pid, kw)))
-    launcher._cleanup_recorded_server_process()
+    assert launcher._cleanup_recorded_server_process() == []
     assert calls == [(9990011, {"exclude_pids": {9990022}})]
     assert not path.exists()
 
@@ -462,21 +502,19 @@ def test_stray_reaper_filters_descendants_before_final_root_revalidation(monkeyp
     from ouroboros import launcher_server_reaper as reaper
     events = []
     monkeypatch.setattr(pl, "IS_WINDOWS", False)
-    descendants = {10: [12, 11, 21, 20], 20: [21]}
-    def collect(pid, out):
-        events.append(("collect", pid))
-        out.extend(descendants.get(pid, []))
-    monkeypatch.setattr(pl, "_collect_descendants", collect)
+    def snapshot():
+        events.append("snapshot")
+        return {10: [11, 20], 11: [12], 20: [21]}
+    monkeypatch.setattr(pl, "_process_children", snapshot)
     monkeypatch.setattr(reaper, "_runs_our_server", lambda *a: events.append("command") or True)
     monkeypatch.setattr(reaper, "_is_launcher_managed", lambda *a: events.append("environment") or True)
     monkeypatch.setattr(reaper, "_signal_pid", lambda pid: events.append(("signal", pid)))
     monkeypatch.setattr(reaper, "_pid_gone", lambda pid: True)
     assert reaper._revalidate_and_kill(10, set(), set(), {20})
-    assert events == [("collect", 10), ("collect", 20), "command", "environment",
+    assert events == ["snapshot", "command", "environment",
                       ("signal", 10), ("signal", 12), ("signal", 11)]
 
 
-@pytest.mark.serial
 @pytest.mark.skipif(sys.platform != "win32", reason="requires native Windows Job inheritance")
 def test_windows_forced_launcher_exit_preserves_previous_generation_daemon_then_panic_stops_it(
     tmp_path, monkeypatch, shared_tree,
@@ -505,7 +543,6 @@ def test_windows_forced_launcher_exit_preserves_previous_generation_daemon_then_
     assert _gone(info["pid"]) and _gone(info["harness_pid"])
 
 
-@pytest.mark.serial
 @pytest.mark.skipif(sys.platform != "win32", reason="requires native Windows process identity")
 def test_windows_birth_and_full_command_round_trip():
     argv = [sys.executable, "-c", "import time;time.sleep(30)", 'путь с пробелом', 'quoted"value', "tail\\"]
@@ -519,7 +556,6 @@ def test_windows_birth_and_full_command_round_trip():
         proc.wait(timeout=5)
 
 
-@pytest.mark.serial
 @pytest.mark.skipif(sys.platform != "win32", reason="requires native Windows Job capability")
 @pytest.mark.parametrize("shared_tree", ["legacy", "headless"], indirect=True)
 def test_windows_first_use_keeps_working_with_legacy_job_or_without_launcher_job(

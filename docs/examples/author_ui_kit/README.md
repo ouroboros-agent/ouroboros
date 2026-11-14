@@ -5,7 +5,8 @@ designed HTML route. Install/review/enable it through the ordinary extension
 lifecycle. If you change its skill name, change the route prefix in widget.js.
 
 The module asks its own `author-kit` route for the installed `web/ui.css` and
-self-contained `web/modules/ui_primitives.js`. `OuroborosWidget.fetch` uses the
+self-contained `web/modules/ui_primitives.js`: the core's builtin files, whatever
+main interface `OUROBOROS_UI_DIR` selects. `OuroborosWidget.fetch` uses the
 existing authenticated parent bridge. The application inserts the CSS as text
 and imports the primitives through a frame-owned Blob URL, revoked after import.
 The module's existing sandbox and CSP remain unchanged.
@@ -38,11 +39,19 @@ Settings → Appearance controls the host document only. Module and route iframe
 have independent roots: CSS variables and `ouroboros.theme` do not propagate.
 The kit delivers a stylesheet snapshot, not the host's current choice; without
 an author-set `data-theme="light"` it uses that stylesheet's default palette.
-There is no theme message, poller or forced remount. Do not assume that fetching
-the kit again synchronizes appearance.
+Modules may opt into the host's resolved palette with
+`OuroborosWidget.onTheme(theme => { document.documentElement.dataset.theme = theme; })`.
+Keep the returned unsubscribe in the module disposer. The bridge delivers
+`light` or `dark` without applying styles or forcing a remount; route iframes
+have no bridge. Fetching the kit again alone does not synchronize appearance.
 
 Authors may set their own root's `data-theme`, track their document's media
-query, or keep a fixed palette. Native `Canvas`/`CanvasText` colours follow the
-document's supported `color-scheme`, not necessarily the host's pinned choice or
-the OS. Declare that scheme deliberately if following the OS. The example keeps
-its own native-colour surface readable before kit loading and on kit failure.
+query, or keep a fixed palette. `data-theme` selects only that palette. Every
+document that loads the kit gets the product's one capsule recipe for buttons
+and chips. Only a document whose root element is itself `.ouro-ui` (the app,
+setup and login) also locks a control's box (`:root:where(.ouro-ui)` in
+`ui.css`); an inner `.ouro-ui` area like this example's is not locked, so later
+author CSS such as `.ouro-ui .btn` still wins. Native `Canvas`/`CanvasText` colours follow the document's supported
+`color-scheme`, not necessarily the host's pinned choice or the OS. Declare that
+scheme deliberately if following the OS. The example keeps its own native-colour
+surface readable before kit loading and on kit failure.

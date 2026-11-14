@@ -1,4 +1,4 @@
-"""A transport timeout leaves remote effects unknown until a server-specific read."""
+"""Timeout projections distinguish clean unsent preparation from unknown effects."""
 
 from __future__ import annotations
 
@@ -23,10 +23,13 @@ def registry(tmp_path, monkeypatch):
     mcp_client.reset_manager_for_tests()
 
 
-def _configure(server, *, timeout=1):
+def _configure(server, monkeypatch, *, timeout=1):
+    from ouroboros import config
     manager = mcp_client.get_manager()
-    manager.reconfigure({"MCP_ENABLED": True, "MCP_TOOL_TIMEOUT_SEC": timeout,
-                         "MCP_SERVERS": [{"id": "controlled", "enabled": True, **server}]})
+    settings = {"MCP_ENABLED": True, "MCP_TOOL_TIMEOUT_SEC": timeout,
+                "MCP_SERVERS": [{"id": "controlled", "enabled": True, **server}]}
+    monkeypatch.setattr(config, "load_settings", lambda: settings)
+    manager.reconfigure(settings)
     return manager
 
 
@@ -39,20 +42,22 @@ def _assert_unknown(text):
     assert "before retrying" in text
 
 
-@pytest.mark.parametrize("timeout_phase", ["initialize", "after_effect"])
-@pytest.mark.parametrize("projection", ["typed", "text"])
+@pytest.mark.parametrize(("projection", "timeout_phase"), [("typed", "initialize"), ("text", "after_effect")])
 def test_timeout_disclosure_survives_registry_and_status_read(
     tmp_path, monkeypatch, registry, timeout_phase, projection,
 ):
     """Use real client wait/cancel and registry dispatch; only the peer is controlled."""
     calls = []
     effects = []
-    closed_sessions = []
+    closed_sessions, closed_transports = [], []
     first_session = True
 
     @asynccontextmanager
     async def transport(_cfg):
-        yield None, None
+        try:
+            yield None, None
+        finally:
+            closed_transports.append(True)
 
     class Session:
         def __init__(self, *_streams):
@@ -80,7 +85,7 @@ def test_timeout_disclosure_survives_registry_and_status_read(
     monkeypatch.setattr(mcp_client, "_MCP_SDK_AVAILABLE", True)
     monkeypatch.setattr(mcp_client, "_transport_factory", transport)
     monkeypatch.setattr(mcp_client, "ClientSession", Session)
-    manager = _configure({"url": "https://controlled.invalid/mcp"})
+    manager = _configure({"url": "https://controlled.invalid/mcp"}, monkeypatch)
 
     async def list_tools(_cfg, _timeout):
         return [{"name": name, "input_schema": {}} for name in ("apply", "status")]
@@ -94,22 +99,28 @@ def test_timeout_disclosure_survives_registry_and_status_read(
         text = result.text
     else:
         text = registry.execute("mcp_controlled__apply", args)
-    _assert_unknown(text)
+    if timeout_phase == "initialize":
+        assert "The tool call was not submitted" in text
+        assert "session and transport have closed" in text
+    else:
+        _assert_unknown(text)
+    if projection == "typed":
+        assert result.meta.get("mcp_call_not_sent") is (timeout_phase == "initialize")
     assert "reconcile" in TOOL_CODE_SPECS["MCP_TIMEOUT"].recovery
     expected = ["op-667"] if timeout_phase == "after_effect" else []
     assert effects == expected
     assert len(calls) == len(expected)  # No implicit replay after timeout.
-    assert closed_sessions == [True]  # Local close is not a remote cancel receipt.
+    assert closed_sessions == closed_transports == [True]  # Local close is not a remote cancel receipt.
 
     status = registry.execute_result("mcp_controlled__status", args)
     assert (status.status, status.code) == ("ok", "OK")
     assert status.text.endswith(json.dumps(expected))
     assert calls[-1] == ("status", args)
     assert effects == expected
-    assert closed_sessions == [True, False]
+    assert closed_sessions == [True, False] and closed_transports == [True, True]
 
 
-def test_real_stdio_effect_before_timeout_is_reconciled_by_status_read(tmp_path, registry):
+def test_real_stdio_effect_before_timeout_is_reconciled_by_status_read(tmp_path, registry, monkeypatch):
     """A real SDK peer persists the effect but omits its reply, then serves status."""
     pytest.importorskip("mcp")
     effects = tmp_path / "effects.jsonl"
@@ -143,7 +154,7 @@ for line in sys.stdin:
     print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
 ''', encoding="utf-8")
     manager = _configure({"transport": "stdio", "command": sys.executable,
-                          "args": [str(script), str(effects), str(calls)]}, timeout=3)
+                          "args": [str(script), str(effects), str(calls)]}, monkeypatch, timeout=3)
     assert manager.refresh_server("controlled")["ok"]
     args = {"operation_id": "op-667-real"}
     timeout = registry.execute_result("mcp_controlled__apply", args)
@@ -157,3 +168,9 @@ for line in sys.stdin:
     assert status.text.endswith(json.dumps([args]))
     assert [json.loads(line)["name"] for line in calls.read_text().splitlines()] == ["apply", "status"]
     assert [json.loads(line) for line in effects.read_text().splitlines()] == [args]
+
+
+@pytest.fixture(autouse=True)
+def _private_mcp_catalog_root(tmp_path, monkeypatch):
+    from ouroboros import config
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)

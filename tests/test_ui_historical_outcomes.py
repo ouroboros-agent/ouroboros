@@ -4,9 +4,12 @@ import json
 from types import SimpleNamespace
 
 
+from ouroboros import dialogue_store
 from ouroboros.gateway.history import make_chat_history_endpoint, _load_terminal_result
 from ouroboros.project_dialogue import append_terminal_task_projection
-from ouroboros.task_results import write_task_result, task_results_dir
+from ouroboros.task_results import write_task_result
+from tests import _dialogue as dialogue_test
+from tests._store_shared import delete_result, read_result, result_exists, unreadable_result
 
 
 def test_retained_terminal_is_history_only_until_client_checks_current_activity(tmp_path):
@@ -19,16 +22,12 @@ def test_retained_terminal_is_history_only_until_client_checks_current_activity(
         tmp_path, task["id"], "cancelled", result="Preserved work",
         model_execution=model_execution, **{k: v for k, v in task.items() if k != "id"},
     )
-    (tmp_path / "logs").mkdir(exist_ok=True)
-    (tmp_path / "logs" / "progress.jsonl").write_text(json.dumps({
+    dialogue_store.append(tmp_path, "progress", {
         "task_id": task["id"], "chat_id": 1, "content": "Inspecting the source",
         "ts": "2026-09-06T00:00:00Z",
-    }) + "\n")
+    })
     assert append_terminal_task_projection(tmp_path, task["id"], task, result, {"chat_id": 1})
-    path = task_results_dir(tmp_path) / "past-root.json"
-    quarantine = tmp_path / "preserved-quarantine.json"
-    path.rename(quarantine)
-    before = quarantine.read_bytes()
+    delete_result(tmp_path, "past-root")  # the row is gone; the history alone carries the evidence
     response = asyncio.run(make_chat_history_endpoint(tmp_path)(SimpleNamespace(query_params={"chat_id": "1"})))
     rows = json.loads(response.body)["messages"]
     assert len(rows) == 1  # synthetic summary text stays hidden
@@ -38,29 +37,35 @@ def test_retained_terminal_is_history_only_until_client_checks_current_activity(
     assert rows[0]["historical_terminal"]["model_execution"] == model_execution
     assert "task_terminal_status" not in rows[0]
     assert "outcome_axes" not in rows[0]
-    assert quarantine.read_bytes() == before
-    assert not path.exists()
+    assert not result_exists(tmp_path, "past-root")  # the read recreated nothing
 
 
 def test_terminal_evidence_survives_when_its_narration_is_on_an_older_page(tmp_path):
     task = {"id": "archived-root", "chat_id": 1, "root_task_id": "archived-root", "delegation_role": "root"}
     result = write_task_result(tmp_path, task["id"], "cancelled", result="Preserved work",
                                **{key: value for key, value in task.items() if key != "id"})
-    assert append_terminal_task_projection(tmp_path, task["id"], task, result, {"chat_id": 1})
-    (task_results_dir(tmp_path) / "archived-root.json").unlink()
-    archive = tmp_path / "archive"
-    archive.mkdir()
+    archives = {}
     for index in range(5):
-        (archive / f"progress_2026090{index + 1}T000000.jsonl").write_text(json.dumps({
+        archives[f"progress_2026090{index + 1}T000000.jsonl"] = [{
             "task_id": task["id"] if index == 0 else f"newer-{index}", "chat_id": 1,
             "content": "First saved narration" if index == 0 else f"Later work {index}",
             "ts": f"2026-09-0{index + 1}T00:00:00Z",
-        }) + "\n")
+        }]
+        # Older pages follow the conversation, so the room has older dialogue to page
+        # through while its narration pages alongside (owner decision 2026-10-05).
+        archives[f"chat_2026090{index + 1}T000000.jsonl"] = [{
+            "direction": "in", "chat_id": 1, "text": f"Older dialogue {index}",
+            "ts": f"2026-09-0{index + 1}T00:00:00Z",
+        }]
+    dialogue_test.seed(tmp_path, archives=archives)
+    dialogue_test.import_all(tmp_path)
+    assert append_terminal_task_projection(tmp_path, task["id"], task, result, {"chat_id": 1})
+    delete_result(tmp_path, "archived-root")
     endpoint = make_chat_history_endpoint(tmp_path)
 
     def read(cursor=None):
         response = asyncio.run(endpoint(SimpleNamespace(query_params={
-            "chat_id": "1", "n_progress": "1", **({"cursor": cursor} if cursor else {}),
+            "chat_id": "1", "n_human": "1", "n_progress": "1", **({"cursor": cursor} if cursor else {}),
         })))
         assert response.status_code == 200
         return json.loads(response.body)
@@ -84,8 +89,8 @@ def test_terminal_evidence_survives_when_its_narration_is_on_an_older_page(tmp_p
 
 def test_unreadable_effective_result_is_not_proven_absent(tmp_path, monkeypatch):
     from ouroboros import task_status
-    path = task_results_dir(tmp_path) / "unreadable.json"
-    path.write_text("malformed")
+    write_task_result(tmp_path, "unreadable", "completed", result="kept")
+    unreadable_result(monkeypatch, "unreadable")  # the store cannot answer for this row
     monkeypatch.setattr(task_status, "load_effective_task_result", lambda *_a, **_k: None)
     assert _load_terminal_result(tmp_path, "unreadable", {}) == {}
     assert _load_terminal_result(tmp_path, "absent", {}) == {"_history_result_absent": True}
@@ -147,15 +152,16 @@ def test_existing_malformed_bindings_keep_activity_coverage_unknown(tmp_path):
 def test_task_get_distinguishes_unreadable_result_from_absence(tmp_path, monkeypatch):
     from ouroboros.gateway import tasks
 
-    path = task_results_dir(tmp_path) / "unreadable.json"
-    path.write_text("preserved unreadable bytes")
+    write_task_result(tmp_path, "unreadable", "completed", result="preserved")
+    switch = unreadable_result(monkeypatch, "unreadable")
     monkeypatch.setattr(tasks, "load_effective_task_result", lambda *_a, **_k: None)
     request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(drive_root=tmp_path)),
                               path_params={"task_id": "unreadable"})
     assert asyncio.run(tasks.api_task_get(request)).status_code == 503
     request.path_params["task_id"] = "missing"
     assert asyncio.run(tasks.api_task_get(request)).status_code == 404
-    assert path.read_text() == "preserved unreadable bytes"
+    switch["on"] = False
+    assert read_result(tmp_path, "unreadable")["result"] == "preserved"  # the row was never touched
 
 
 def test_history_conversion_does_not_need_or_recreate_a_task_result(tmp_path, monkeypatch):
@@ -171,5 +177,5 @@ def test_history_conversion_does_not_need_or_recreate_a_task_result(tmp_path, mo
     response = asyncio.run(api_project_from_task(request))
     assert response.status_code == 200
     assert project_binding_for_task(tmp_path, "historical-only")
-    assert not (task_results_dir(tmp_path) / "historical-only.json").exists()
+    assert not result_exists(tmp_path, "historical-only")
     assert queue.RUNNING == {} and queue.PENDING == []

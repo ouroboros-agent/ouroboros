@@ -14,7 +14,12 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Dict, Optional
 
-from ouroboros.config import SETTINGS_DEFAULTS, normalize_settings_raw, serialize_settings
+from ouroboros.config import (
+    SETTINGS_DEFAULTS, defaults_for_settings_document, normalize_settings_raw, serialize_settings,
+)
+from ouroboros.settings_scales import (
+    EFFORT_FORMAT_KEY, OWNER_CAP_FORMAT_KEY, OWNER_CAP_KEY, normalize_effort_document, optional_bound_value,
+)
 from ouroboros.update_channels import get_managed_update_fetch_timeout_sec, normalize_update_channel
 from ouroboros.utils import atomic_write_json, write_text_atomic
 
@@ -22,7 +27,7 @@ DEFAULT_COLAB_APP_ROOT = "/content/drive/MyDrive/Ouroboros"
 DEFAULT_COLAB_REPO_DIR = "/content/ouroboros_repo"
 DEFAULT_OFFICIAL_REPO_URL = "https://github.com/razzant/ouroboros.git"
 
-_SECRET_KEYS = ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "MINIMAX_API_KEY", "DEEPSEEK_API_KEY", "CLOUDRU_FOUNDATION_MODELS_API_KEY", "GITHUB_TOKEN", "TELEGRAM_BOT_TOKEN")
+_SECRET_KEYS = ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "MINIMAX_API_KEY", "DEEPSEEK_API_KEY", "ZAI_API_KEY", "CLOUDRU_FOUNDATION_MODELS_API_KEY", "GITHUB_TOKEN", "TELEGRAM_BOT_TOKEN")
 
 
 def _run_colab_git_network(args: list[str], *, cwd: pathlib.Path | None = None) -> str:
@@ -85,7 +90,7 @@ def collect_colab_secrets() -> Dict[str, str]:
     """
     # Providers the one-click Colab launch can auto-route models for via
     # apply_runtime_provider_defaults (OpenRouter is the default aggregator;
-    # OpenAI/Anthropic/MiniMax/DeepSeek/Cloud.ru have direct model defaults). OpenAI-compatible
+    # OpenAI/Anthropic/MiniMax/DeepSeek/Z.ai/Cloud.ru have direct model defaults). OpenAI-compatible
     # endpoints have no universal model default and need explicit OUROBOROS_MODEL_*
     # config, so they are an advanced manual path, not part of the quick launch.
     provider_keys = (
@@ -94,6 +99,7 @@ def collect_colab_secrets() -> Dict[str, str]:
         "ANTHROPIC_API_KEY",
         "MINIMAX_API_KEY",
         "DEEPSEEK_API_KEY",
+        "ZAI_API_KEY",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY",
     )
     out: Dict[str, str] = {}
@@ -112,75 +118,130 @@ def masked_secret_status(settings: Dict[str, Any]) -> Dict[str, bool]:
     return {key: bool(str(settings.get(key, "") or "").strip()) for key in _SECRET_KEYS}
 
 
+_COLAB_MODEL_OVERRIDE_KEYS = frozenset({
+    "OUROBOROS_MODEL", "OUROBOROS_MODEL_HEAVY", "OUROBOROS_MODEL_LIGHT", "OUROBOROS_MODEL_VISION",
+    "OUROBOROS_MODEL_CONSCIOUSNESS", "OUROBOROS_MODEL_FALLBACKS", "OUROBOROS_MODEL_SAFETY",
+})
+
+
+# What a launch gives a Drive document that holds no value of its own for a launch knob: the first-launch pair.
+# The worker cap has none: blank, the machine's memory is the limit (owner decision 09.11, migration A).
+_COLAB_FIRST_LAUNCH = {
+    "TOTAL_BUDGET": float(SETTINGS_DEFAULTS["TOTAL_BUDGET"]),
+    "OUROBOROS_RUNTIME_MODE": "advanced",
+}
+
+
 def build_colab_settings(
     secrets: Dict[str, str],
     *,
     github_repo: str = "",
-    total_budget: float = float(SETTINGS_DEFAULTS["TOTAL_BUDGET"]),
-    runtime_mode: str = "advanced",
-    max_workers: int = 1,
+    total_budget: Optional[float] = None,
+    runtime_mode: Optional[str] = None,
+    max_workers: Optional[int] = None,
     models: Dict[str, str] | None = None,
     network_password: str = "",
     existing: Optional[Dict[str, Any]] = None,
+    drive_document_present: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Build a Drive-persisted settings payload for Colab.
 
     On a re-run, ``existing`` (the current Drive ``settings.json``) is merged over
     the defaults FIRST, so prior owner choices that the Colab launch does not set
     explicitly — a pinned ``TELEGRAM_CHAT_ID``, tweaked model slots, an auto-grant
-    preference — survive instead of being reset to defaults. The launch knobs
-    below (secrets, budget, runtime mode, workers, host, repo) then win.
+    preference — survive instead of being reset to defaults. The launch's secrets,
+    host and repo then win. Budget, runtime mode and workers are launch knobs
+    only when given (``None`` is "not given"): an explicit value wins, even one equal to
+    the first-launch value, else the Drive document's own value stays, else a document
+    that holds none takes the first-launch 200 / advanced and no worker cap. A document
+    from before the optional cap reads the 1 an earlier first launch wrote as blank.
+    ``drive_document_present`` says whether that Drive file existed (default: a
+    non-empty ``existing``): an existing document keeps the finite optional bounds it
+    ran under when it lacks them (``config.defaults_for_settings_document``).
     """
-    settings = dict(SETTINGS_DEFAULTS)
-    if existing:
-        # The Drive document is an install's settings document, so it is read the way
-        # every reader reads one: the raw-stage normalization (coercion, retention fold,
-        # review-cycle seed, retired purge, slot rename, secret repair) runs BEFORE the
-        # defaults are merged — after the merge the renamed key is already present as its
-        # default and the customization under the former key is lost, then written back
-        # to Drive as the owner's choice. Private sentinel keys stay out of the document.
-        settings.update({
-            k: v for k, v in normalize_settings_raw(existing).items() if not str(k).startswith("_")
-        })
+    present = bool(existing) if drive_document_present is None else bool(drive_document_present)
+    settings = defaults_for_settings_document(present)
+    document: Dict[str, Any] = dict(existing or {})
     for key, value in secrets.items():
         # Only overwrite when the freshly collected secret is non-empty, so a
         # re-run that omits an optional provider/GitHub key (collect_colab_secrets
         # returns "") does NOT wipe a credential already persisted on Drive.
-        if (key in settings or key == "TELEGRAM_BOT_TOKEN") and str(value or "").strip():
-            settings[key] = str(value)
+        if (key in SETTINGS_DEFAULTS or key == "TELEGRAM_BOT_TOKEN") and str(value or "").strip():
+            document[key] = str(value)
+    for key, value in (models or {}).items():
+        if key in _COLAB_MODEL_OVERRIDE_KEYS and value:
+            document[key] = str(value)
+    # The Drive document is an install's settings document, so it is read the way
+    # every reader reads one: the raw-stage normalization (coercion, retention fold,
+    # review-cycle seed, retired purge, slot rename, secret repair, the historical
+    # review-lane migration) runs BEFORE the defaults are merged — after the merge the
+    # renamed key is already present as its default and the customization under the
+    # former key is lost, then written back to Drive as the owner's choice. Private
+    # sentinel keys stay out of the document.
+    loaded = {k: v for k, v in normalize_settings_raw(document).items()
+              if not str(k).startswith("_") or k in (EFFORT_FORMAT_KEY, OWNER_CAP_FORMAT_KEY)} if document else {}
+    if OWNER_CAP_FORMAT_KEY not in document and optional_bound_value(OWNER_CAP_KEY, document.get(OWNER_CAP_KEY)) == 1:
+        loaded[OWNER_CAP_KEY] = ""  # Colab's own first-launch 1, read once as blank (migration A)
+    settings.update(normalize_effort_document(loaded))
     if github_repo:
         settings["GITHUB_REPO"] = github_repo
-    settings["TOTAL_BUDGET"] = float(total_budget)
-    settings["OUROBOROS_RUNTIME_MODE"] = runtime_mode
-    settings["OUROBOROS_MAX_WORKERS"] = int(max_workers)
+    for key, explicit in (
+        ("TOTAL_BUDGET", None if total_budget is None else float(total_budget)),
+        ("OUROBOROS_RUNTIME_MODE", runtime_mode),
+        ("OUROBOROS_MAX_WORKERS", None if max_workers is None else int(max_workers)),
+    ):
+        if explicit is not None:
+            settings[key] = explicit
+        elif key not in loaded and key in _COLAB_FIRST_LAUNCH:  # the document's own value stays when it holds one
+            settings[key] = _COLAB_FIRST_LAUNCH[key]
     settings["OUROBOROS_SERVER_HOST"] = "127.0.0.1"
     settings["OUROBOROS_UPDATE_CHANNEL"] = normalize_update_channel(
         settings.get("OUROBOROS_UPDATE_CHANNEL")
     )
     if network_password:
         settings["OUROBOROS_NETWORK_PASSWORD"] = network_password
-    for key, value in (models or {}).items():
-        if key in {"OUROBOROS_MODEL", "OUROBOROS_MODEL_HEAVY", "OUROBOROS_MODEL_LIGHT", "OUROBOROS_MODEL_VISION", "OUROBOROS_MODEL_CONSCIOUSNESS", "OUROBOROS_MODEL_FALLBACKS"} and value:
-            settings[key] = str(value)
-    # Route model slots to the configured provider (same SSOT the desktop
-    # onboarding wizard uses): an OpenAI-only / Anthropic-only / Cloud.ru-only
-    # Colab config gets correct provider model defaults instead of OpenRouter-style
-    # ones. Explicitly supplied model overrides above are preserved.
-    from ouroboros.server_runtime import apply_runtime_provider_defaults
+    # Slots the document does not author take the configured provider's proposals (the
+    # loader's rule): an OpenAI-only Colab gets OpenAI's ids, while saved values and the
+    # explicit model overrides above stay. The freshly collected secrets are in the
+    # document, so a first launch's factory catalog (never-configured cell) is minted from
+    # the provider it holds credentials for and pinned on Drive by this very write.
+    from ouroboros.review_pool_migration import apply_at_read_seam
+    from ouroboros.server_runtime import (
+        apply_runtime_provider_defaults, authored_model_slots, propose_unauthored_model_slots,
+    )
+    propose_unauthored_model_slots(settings, authored_model_slots(loaded))
     settings, _changed, _changed_keys = apply_runtime_provider_defaults(settings)
+    apply_at_read_seam(settings, merged=True)
     return settings
 
 
 def write_colab_settings(data_dir: pathlib.Path, settings: Dict[str, Any]) -> pathlib.Path:
     """Persist the generated document for the Drive data root, in the one on-disk spelling.
 
-    Deliberately NOT routed through the persistence prologue: it proves the owner-only
-    ratchets against THIS process's ``config.SETTINGS_PATH``, and the Drive root is another
-    path (the quickstart exports the Colab paths only after this write). The bytes are
-    still ``serialize_settings`` bytes, so the next reader of the Drive file meets the
-    spelling every other writer produces."""
+    Exempt from the persistence prologue only for ANOTHER root, judged by the physical target:
+    the prologue proves the ratchets and a deployment policy against THIS process's
+    ``config.SETTINGS_PATH``, and the Drive root is normally another path (the quickstart exports
+    the Colab paths only after this write). A target that is this process's own document under
+    any spelling (a symlinked alias included) is this deployment's write: the owner's whole-document
+    writer persists the notebook owner's document, as onboarding's, so a deployment policy judges
+    it first while the owner-only ratchets pass it as before. The foreign bytes are still ``serialize_settings`` bytes, so the
+    next reader of the Drive file meets the spelling every other writer produces. The one prologue
+    duty it shares: a review-pool
+    migration ``build_colab_settings`` computed for the Drive document gets its durable
+    receipts under the Drive root (``review_pool_receipts.persist_write_receipts``) BEFORE this
+    write replaces the pre-image — the kernel is a different process from the server that later tells the owner."""
+    from ouroboros import config
+    from ouroboros.gateway.owner_settings import _owner_write_settings
+    from ouroboros.launch_roots import same_location
+    from ouroboros.review_pool_receipts import persist_write_receipts
+
     path = pathlib.Path(data_dir) / "settings.json"
+    if same_location(path, config.SETTINGS_PATH):
+        _owner_write_settings(dict(settings), authored_keys=tuple(settings),
+                              allow_context_lowering=True, allow_safety_lowering=True)
+        return path
     path.parent.mkdir(parents=True, exist_ok=True)
+    persist_write_receipts(data_dir, settings, path)
     write_text_atomic(path, serialize_settings(dict(settings)))
     return path
 
@@ -193,6 +254,11 @@ def export_colab_env(repo_dir: pathlib.Path, data_dir: pathlib.Path, settings_pa
     # export it explicitly here and respect an explicit override.
     start_method = (os.environ.get("OUROBOROS_WORKER_START_METHOD") or "forkserver").strip().lower()
     env = {"OUROBOROS_APP_ROOT": str(pathlib.Path(data_dir).parent), "OUROBOROS_REPO_DIR": str(repo_dir), "OUROBOROS_DATA_DIR": str(data_dir), "OUROBOROS_SETTINGS_PATH": str(settings_path), "OUROBOROS_WORKER_START_METHOD": start_method, "PYTHONUNBUFFERED": "1", "PYTHONPATH": str(repo_dir)}
+    # Disposable worktrees stay on local disk, never Drive FUSE, for existing and new installs alike;
+    # a new install's projects (their git clones included) and Deliverables follow APP_ROOT onto Drive
+    # so they persist with its memory (#1239). A saved setting or the operator's own export wins.
+    if not os.environ.get("OUROBOROS_SUBAGENT_WORKTREE_ROOT"):
+        env["OUROBOROS_SUBAGENT_WORKTREE_ROOT"] = os.path.expanduser(os.path.join("~", "Ouroboros", "subagent_worktrees"))
     os.environ.update(env)
     return env
 
@@ -411,54 +477,92 @@ def _gateway_request(host: str, port: int) -> Callable[..., tuple]:
     return _call
 
 
+def wait_for_dialogue(call: Callable[..., tuple], *, alive: Optional[Callable[[], bool]] = None,
+                      timeout: Optional[float] = None, report: Callable[[str], Any] = print) -> Dict[str, Any]:
+    """Wait until the server accepts owner messages: ``/api/health`` answers and its ``boot``
+    says ``dialogue_ready`` (an older core without ``boot`` counts as ready at its first 200), or
+    the boot is ``ready`` without them (no model provider configured yet).
+
+    No clock decides that a live server failed: the wait ends when the dialogue is ready, when
+    the boot reports ``failed`` (its error is returned), when ``alive`` says the server process
+    is gone, or at ``timeout`` for a caller that owns its own bound. Each phase change is
+    printed once (``report``), so the notebook shows where the start is.
+    """
+    deadline = None if timeout is None else time.time() + timeout
+    last_phase = ""
+    while deadline is None or time.time() < deadline:
+        if alive is not None and not alive():
+            return {"ok": False, "error": "server exited before it became ready"}
+        try:
+            code, payload = call("GET", "/api/health")
+        except Exception:
+            code, payload = 0, {}
+        boot = payload.get("boot") if code == 200 and isinstance(payload, dict) else None
+        if code == 200 and not isinstance(boot, dict):
+            return {"ok": True, "boot": None}
+        if isinstance(boot, dict):
+            phase = f"{boot.get('phase')} (dialogue_ready={boot.get('dialogue_ready')}, tasks_ready={boot.get('tasks_ready')})"
+            if phase != last_phase:
+                report(f"Ouroboros boot: {phase}")
+                last_phase = phase
+            if boot.get("phase") == "failed":
+                return {"ok": False, "error": f"server start failed: {boot.get('error') or 'unknown'}", "boot": boot}
+            if boot.get("dialogue_ready") is True:
+                return {"ok": True, "boot": boot}
+            if boot.get("phase") == "ready":  # no model provider yet, or the dialogue's opening failed
+                report("Ouroboros is ready, but its chat is not accepting messages yet: configure a model "
+                       "provider, or see the failed boot step in /api/health")
+                return {"ok": True, "boot": boot}
+        time.sleep(1.0)
+    return {"ok": False, "error": "server did not become ready"}
+
+
 def ensure_native_telegram_live(
     host: str = "127.0.0.1",
     port: int = 8765,
     *,
     settings: Optional[Dict[str, Any]] = None,
-    timeout: float = 180.0,
+    timeout: Optional[float] = None,
     request: Optional[Callable[..., tuple]] = None,
+    alive: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, Any]:
-    """Grant, enable, and configure the bundled native Telegram skill.
+    """Grant, enable, and configure the built-in Telegram skill.
 
-    The native payload is seeded and hash-trusted by the launcher. Headless
+    The starter selection installs the built-in with its install record (trusted
+    by default, so the gate admits exactly those bytes). Headless
     Colab only performs the same owner-policy steps the Skills UI would perform:
     grant the API-projected missing items when persisted auto-grant is enabled,
     enable the skill, then save its Telegram settings. It never installs from a
-    marketplace or runs a skill review.
+    marketplace or runs a skill review. ``alive`` reports whether the server
+    process still runs (the notebook's subprocess); ``timeout`` is a caller's own
+    bound, never this function's verdict about a live server.
     """
     settings = settings or {}
     call = request or _gateway_request(host, port)
     status: Dict[str, Any] = {"ok": False, "skill": "telegram", "steps": []}
 
-    # 1. Wait until the server accepts loopback requests (the gateway client has
-    #    no built-in retry, and the notebook starts the server as a subprocess).
-    deadline = time.time() + timeout
-    ready = False
-    while time.time() < deadline:
-        try:
-            code, _ = call("GET", "/api/health")
-            if code == 200:
-                ready = True
-                break
-        except Exception:
-            pass
-        time.sleep(1.0)
-    if not ready:
-        status["error"] = "server did not become ready"
+    # 1. Wait until the server accepts owner messages (the gateway client has no
+    #    built-in retry, and the notebook starts the server as a subprocess).
+    waited = wait_for_dialogue(call, alive=alive, timeout=timeout)
+    if not waited["ok"]:
+        status["error"] = waited["error"]
         return status
     status["steps"].append("ready")
+    deadline = None if timeout is None else time.time() + timeout
 
     if not str(settings.get("TELEGRAM_BOT_TOKEN") or "").strip():
         status["warning"] = "TELEGRAM_BOT_TOKEN is empty; Telegram cannot poll messages"
 
     quoted = urllib.parse.quote("telegram")
 
-    # 2. Discover the launcher-seeded native skill and read its authoritative
-    #    grant/conflict projection. Missing native payloads are packaging errors,
-    #    not a reason to fall back to a Hub install.
+    # 2. Discover the built-in skill (installed by the starter selection) and read
+    #    its authoritative grant/conflict projection. A missing built-in is a
+    #    packaging or starter-selection error, not a reason to fall back to a Hub install.
     skill = None
-    while time.time() < deadline:
+    while deadline is None or time.time() < deadline:
+        if alive is not None and not alive():
+            status["error"] = "server exited before the skill index answered"
+            return status
         try:
             code, payload = call("GET", "/api/extensions")
         except Exception:
@@ -477,15 +581,13 @@ def ensure_native_telegram_live(
             and code < 400
             and candidate is not None
             and str(candidate.get("source") or "").lower() == "native"
-            and str(candidate.get("review_profile") or "") == "native_seed"
             and candidate.get("executable_review") is True
-            and candidate.get("review_stale") is False
         ):
             skill = candidate
             break
         time.sleep(1.0)
     if skill is None:
-        status["error"] = "bundled native skill 'telegram' did not reach a fresh executable native-trust verdict"
+        status["error"] = "built-in skill 'telegram' is not installed with an executable acceptance basis"
         return status
     conflict = skill.get("conflict") if isinstance(skill.get("conflict"), dict) else None
     if conflict:
@@ -536,6 +638,10 @@ def ensure_native_telegram_live(
         if (isinstance(code, int) and code >= 400) or err:
             status["error"] = f"grant failed: {err or f'HTTP {code}'}"
             return status
+        if isinstance(payload, dict) and (payload.get("pending") or payload.get("setup_error")):
+            status.update(pending=bool(payload.get("pending")), job_id=payload.get("job_id", ""),
+                          error=payload.get("setup_error", ""), warning=payload.get("message", "Skill setup is still running."))
+            return status
         status["steps"].append("granted")
 
     # 4. Enable through the canonical lifecycle endpoint.
@@ -547,6 +653,9 @@ def ensure_native_telegram_live(
     err = str((payload or {}).get("error") or "") if isinstance(payload, dict) else ""
     if (isinstance(code, int) and code >= 400) or err:
         status["error"] = f"enable failed: {err or f'HTTP {code}'}"
+        return status
+    if isinstance(payload, dict) and payload.get("pending"):
+        status.update(pending=True, job_id=payload.get("job_id", ""), warning=payload.get("message", "Skill setup is still running."))
         return status
     status["steps"].append("enabled")
 

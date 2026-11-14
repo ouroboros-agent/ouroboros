@@ -44,8 +44,26 @@
 #             across three OSes, cold daemons, and someone else's rate limits. Paying
 #             that on every push would make PR feedback on the seam hostage to vendor
 #             availability, which is the same trade this repository already made for
-#             `integration-test` in ci.yml. So it runs where the other paid lanes run:
+#             `skill-smoke` in ci.yml. So it runs where that paid lane runs:
 #             ouroboros-stable, manual dispatch, and tags.
+#
+# lifecycle — production exact_start/delegate_wait/custody against the pinned
+# engine: cancel and crash recovery, continuation, then retirement by owner
+# lifetime. Fake manifests alone are projected into the host capability catalog
+# (the engine deliberately excludes fakes there); no run response is substituted.
+# Readonly fake runs prove no vendor session or child-process containment.
+#
+# toolchain proves engine CLI runtime delivery with no ambient Node/npm: exact
+# official archives, offline local-tarball npm witness, reselect and immutable repair.
+# Vendor maintenance does not use npm; this lane claims no vendor install.
+#
+# consumer additionally starts the isolated owned engine on Windows and installs
+# Codex through the shared maintenance service used by Connect, Settings and tools.
+# It requires an initially absent program, an available vendor install action, a
+# settled selected-version receipt and a selected executable inside disposable HOME.
+# Direct --version and engine doctor must agree with that receipt; every exit stops
+# the owned daemon. An engine without the new contract fails, never skips. No login,
+# OAuth, account or model task is attempted.
 #
 # WHAT MAKES IT RED, ON PURPOSE. There is no "harness unavailable, skipping" branch
 # anywhere below. An absent seam, an engine below the delegated-marker floor, an
@@ -71,6 +89,8 @@ on:
     paths:
       - 'ouroboros/gateways/**'
       - 'ouroboros/claudexor_daemon.py'
+      - 'ouroboros/harness_maintenance.py'
+      - 'ouroboros/harness_program_facts.py'
       - 'ouroboros/claudexor_runtime.py'
       - 'ouroboros/claudexor_runtime_pin.json'
       - 'ouroboros/platform_layer.py'
@@ -78,11 +98,13 @@ on:
       - 'ouroboros/tools/delegate_integration.py'
       - 'ouroboros/tools/subagent_integration.py'
       - 'ouroboros/subagent_worktrees.py'
-      - 'ouroboros/delegate_custody.py'
+      - 'ouroboros/delegate_*.py'
       - 'ouroboros/review_execution.py'
       - 'ouroboros/subagents.py'
       - 'ouroboros/config.py'
       - 'scripts/claudexor_platform_smoke.py'
+      - 'scripts/claudexor_lifecycle_smoke.py'
+      - 'scripts/claudexor_toolchain_smoke.py'
       - 'scripts/fetch_claudexor_runtime.py'
       - 'Ouroboros.spec'
       - 'build.sh'
@@ -100,6 +122,8 @@ on:
     paths:
       - 'ouroboros/gateways/**'
       - 'ouroboros/claudexor_daemon.py'
+      - 'ouroboros/harness_maintenance.py'
+      - 'ouroboros/harness_program_facts.py'
       - 'ouroboros/claudexor_runtime.py'
       - 'ouroboros/claudexor_runtime_pin.json'
       - 'ouroboros/platform_layer.py'
@@ -107,11 +131,13 @@ on:
       - 'ouroboros/tools/delegate_integration.py'
       - 'ouroboros/tools/subagent_integration.py'
       - 'ouroboros/subagent_worktrees.py'
-      - 'ouroboros/delegate_custody.py'
+      - 'ouroboros/delegate_*.py'
       - 'ouroboros/review_execution.py'
       - 'ouroboros/subagents.py'
       - 'ouroboros/config.py'
       - 'scripts/claudexor_platform_smoke.py'
+      - 'scripts/claudexor_lifecycle_smoke.py'
+      - 'scripts/claudexor_toolchain_smoke.py'
       - 'scripts/fetch_claudexor_runtime.py'
       - 'Ouroboros.spec'
       - 'build.sh'
@@ -184,6 +210,69 @@ jobs:
           path = pathlib.Path(os.environ["OUROBOROS_DATA_DIR"]) / "claudexor" / "daemon.log"
           if path.is_file(): print(path.read_text(encoding="utf-8", errors="replace")[-20000:])
           PY
+
+  # Production custody and real-engine continuation, without vendor credentials.
+  lifecycle:
+    name: lifecycle · ${{ matrix.os }} · custody, cancel, crash, continue, retire
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python-env
+      - name: Exercise production custody with the pinned engine and fake harnesses
+        # The inner command names the environment's own interpreter: on Windows a bare
+        # `python` under the scrubbed environment resolved outside the virtualenv (#1641).
+        run: |
+          py="$(python -c 'import pathlib, sys; print(pathlib.Path(sys.executable).as_posix(), end="")')"
+          "$py" -I -S scripts/safe_test.py --temp-parent "$RUNNER_TEMP" -- "$py" scripts/claudexor_lifecycle_smoke.py
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Toolchain lane — free, credential-free. Real managed Node/npm for the CLI.
+  # ────────────────────────────────────────────────────────────────────────────
+  toolchain:
+    name: toolchain · ${{ matrix.os }} · real managed Node/npm, no ambient Node, no harness install
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python-env
+      - name: Install the pinned CLI toolchain from official archives and exercise it without ambient Node/npm
+        # Isolate Python *at startup* before the script scrubs PATH, npm/Node
+        # config, harness overrides and Ouroboros roots; no setup-node here.
+        run: python -I scripts/claudexor_toolchain_smoke.py --root "$RUNNER_TEMP/cx-toolchain"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Consumer lane — free, credential-free. Real vendor Codex install on Windows.
+  # ────────────────────────────────────────────────────────────────────────────
+  consumer:
+    name: consumer · windows-latest · real vendor Codex maintenance + doctor, no login, no model task
+    runs-on: windows-latest
+    # Bounds vendor network reads beyond the production install timeout the witness applies.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python-env
+      - name: Install the pinned toolchain, then Codex through the shared maintenance service
+        # Same isolated start as the toolchain job; no setup-node, no npm, no harness override.
+        # PowerShell, the way a desktop install starts: Git Bash puts its own Unix tools ahead
+        # of Windows's on PATH, and the vendor installer's bare `tar` then cannot open a
+        # drive-letter path (razzant/claudexor#680).
+        shell: pwsh
+        run: python -I scripts/claudexor_toolchain_smoke.py --root "$env:RUNNER_TEMP/cx-consumer" --harness-install codex
 
   # ────────────────────────────────────────────────────────────────────────────
   # Live lane — real harness, explicit API key, one README edit. Costs money.

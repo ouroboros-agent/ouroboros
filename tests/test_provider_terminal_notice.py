@@ -1,14 +1,16 @@
 """Outage facts reach real delivery projections without rewriting model sources."""
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from ouroboros import agent_task_pipeline as pipeline, cancel_intents, loop, loop_llm_call, loop_transport
+from ouroboros.gateway.host_service_places import _presence_exception
 from ouroboros.outcomes import REASON_OWNER_REQUESTED_FINALIZATION
 from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, write_owner_message
-from ouroboros.presence_runner import PresenceTurnGate, run_presence_turn
+from ouroboros.presence_runner import PresenceTurnError, PresenceTurnGate, presence_result_from_stored, run_presence_turn
 from ouroboros.task_finalization import send_provider_death_notice
 from ouroboros.task_results import load_task_result
 from ouroboros.tools.registry import ToolRegistry
@@ -36,14 +38,13 @@ def _terminal(tmp_path, *, current, task_id="parent1"):
     text, usage, trace = loop._handle_provider_unavailable(ctx, error_kind="provider_outcome_unknown",
         wait_cause="transport_unavailable", waited_sec=125.0)
     assert text == RAW
-    assert "waited and redialed for 2.1 min" in usage["terminal_provider_notice"]
-    assert "no terminal provider outcome" in usage["terminal_provider_notice"]
-    assert "no further retry or paid fallback was sent" in usage["terminal_provider_notice"]
+    assert "spent 2.1 min in the provider wait" in usage["terminal_provider_notice"]
+    assert "no confirmed provider outcome" in usage["terminal_provider_notice"]
+    assert "waited and redialed" not in usage["terminal_provider_notice"]
     return text, usage, trace
 
 
-@pytest.mark.parametrize("mode", ["managed", "direct"])
-@pytest.mark.parametrize("current", [False, True])
+@pytest.mark.parametrize(("current", "mode"), [(False, "managed"), (True, "direct")])
 def test_pipeline_delivery_and_rebuild_keep_raw_bytes_and_known_wait_custody(tmp_path, monkeypatch, mode, current):
     monkeypatch.setattr(pipeline, "_run_post_task_processing_async", lambda *_a, **_k: None)
     text, usage, trace = _terminal(tmp_path, current=current)
@@ -76,16 +77,31 @@ def test_pipeline_delivery_and_rebuild_keep_raw_bytes_and_known_wait_custody(tmp
         assert "Retry when connectivity returns" not in incidents[0][0][1]
 
 
-@pytest.mark.parametrize("outcome", ["message", "deferred", "silent", "tool_delivered"])
-@pytest.mark.parametrize("current", [False, True])
-def test_actual_presence_render_and_cached_read_keep_failure_notice_over_pending_outcome(tmp_path, monkeypatch, outcome, current):
+@pytest.mark.parametrize(("current", "outcome"), [
+    (False, "message"),
+    (False, "silent"),
+    (True, "deferred"),
+    (True, "tool_delivered"),
+])
+def test_actual_presence_and_cached_read_keep_authored_speech_and_owner_notice_separate(tmp_path, monkeypatch, outcome, current):
+    """An unresolved dispatched attempt is a typed empty 409 on the first call and on replay.
+
+    The forced rail still words the durable row ``provider_unavailable`` and keeps the authored
+    draft as its result; the pipeline stamps the loop's own no-resend predicate on that row and
+    the Host guard reads the marker back. Neither RAW nor the owner notice becomes speech,
+    whatever outcome the envelope claims, and the admitted child keeps its custody.
+    """
     monkeypatch.setattr(pipeline, "_run_post_task_processing_async", lambda *_a, **_k: None)
+    notices = []
+    monkeypatch.setattr("ouroboros.presence_runner._write_unresolved_notice",
+                        lambda _root, task_id: notices.append(task_id))
     repo, data = tmp_path / "repo", tmp_path / "data"
     repo.mkdir()
     data.mkdir()
-    created = []
+    created, invoked = [], []
     class Agent:
         def handle_task(self, task):
+            invoked.append(task["id"])
             text, usage, trace = _terminal(data, current=current, task_id=task["id"])
             task["_skip_post_task_synthesis"] = True
             ctx = SimpleNamespace(_presence_completion={"outcome": outcome, "message": "Typed Presence reply"},
@@ -99,17 +115,36 @@ def test_actual_presence_render_and_cached_read_keep_failure_notice_over_pending
         return Agent()
     args = dict(admission=_admission(), event=_event(), repo_dir=repo, drive_root=data,
                 agent_factory=factory, gate=PresenceTurnGate(2))
-    first = run_presence_turn(**args)
-    cached = run_presence_turn(**args)
-    assert cached == first and len(created) == 1
-    assert first.outcome == "deferred"  # failure does not abandon already admitted work
-    stored = load_task_result(data, first.task_id)
-    assert stored["result"] == RAW
-    assert "no terminal provider outcome" in stored["terminal_provider_notice"]
-    assert first.text.startswith(RAW + "\n\n[Host status]")
-    assert first.text.count("[Host status]") == 1
-    assert stored["metadata"]["presence_result_text"] == first.text
-    assert first.work_ref == "next-task"
+    with pytest.raises(PresenceTurnError) as first:
+        run_presence_turn(**args)
+    with pytest.raises(PresenceTurnError) as replay:
+        run_presence_turn(**args)
+    task_id = first.value.turn_ref
+    assert invoked == [task_id] and len(created) == 1  # replay never regenerates
+    stored = load_task_result(data, task_id)
+    notice = stored["terminal_provider_notice"]
+    assert stored["result"] == RAW and "no terminal provider outcome" in notice
+    marker = stored["metadata"]["presence_unknown_outcome"]
+    assert marker["source"] == "provider_outcome_unknown_no_resend"
+    assert marker["error_kind"] == "provider_outcome_unknown"
+    assert "presence_retry_proof" not in stored["metadata"]  # unknown is not not_started
+    assert stored["metadata"]["presence_work_ref"] == "next-task"
+    assert stored["metadata"]["presence_result_text"] == (RAW if current else "")  # the envelope, not speech
+    for err in (first.value, replay.value):
+        assert err.code == "presence_attempt_outcome_unknown"
+        assert (err.turn_ref, err.work_ref) == (task_id, "next-task")  # admitted child custody preserved
+        response = _presence_exception(err, 409)
+        body = json.loads(response.body)
+        assert response.status_code == 409 and body["code"] == "presence_attempt_outcome_unknown"
+        assert body["disposition"] == "retained" and not body.get("text") and "outcome" not in body
+        assert body["error"] == "presence_attempt_outcome_unknown: source_event_id"
+        assert (body["turn_ref"], body["work_ref"]) == (task_id, "next-task")
+        assert all(RAW not in str(value) and notice not in str(value) for value in body.values())
+    # Each refusal consults the recovery-fact writer (mocked here); production deduplicates
+    # its nonfinal room observation through presence_recovery_recorded, without owner speech.
+    assert notices == [task_id] * 2
+    view = presence_result_from_stored(stored, task_id)
+    assert (view.outcome, view.text, view.work_ref) == ("silent", "", "next-task")
 
 
 @pytest.mark.parametrize("reason", [REASON_OWNER_REQUESTED_FINALIZATION, "deadline", "budget ceiling reached"])
@@ -136,7 +171,7 @@ def test_real_mailbox_wait_exit_carries_the_control_cause_without_another_call(t
         assert "owner requested Wrap up" in text and "own limits ran out" not in text
         assert "no new summary request was sent" in usage["terminal_provider_notice"].lower()
     else:
-        assert "owner requested Wrap up" not in text and "provider outage" in text
+        assert "owner requested Wrap up" not in text and "ended as an outage" in text
 
 
 def test_deadline_text_does_not_hide_an_existing_unknown_attempt():
@@ -165,41 +200,6 @@ def test_provider_terminal_text_claims_only_recorded_recovery_facts():
     assert "same-model reroute" not in unknown
 
 
-@pytest.mark.parametrize("honored", ["confirmed", "unknown"])
-def test_applied_options_without_mismatch_emit_no_owner_line(honored):
-    progress = []
-    usage = {"_options": {"options_honored": honored}}
-
-    loop_transport.emit_model_effort_mismatch(
-        usage, task_id="task-7",
-        emit_progress=lambda text, *, incident=None: progress.append((text, incident)),
-    )
-
-    assert progress == []
-
-
-def test_owner_line_speaks_only_for_a_changed_reasoning_effort():
-    """A mismatch on another submitted option is durable, never an effort claim."""
-    progress = []
-    route = {"credentialProfileId": "acct-a", "model": "codex=model"}
-    usage = {"_model_route": dict(route), "_options": {
-        "options_honored": "mismatch", "route": dict(route),
-        "requested_options": {"reasoningEffort": "high", "cacheKey": "execution-a"},
-        "applied_options": {"reasoningEffort": "high", "cacheKey": "engine-b"}}}
-
-    def emit(text, *, incident=None):
-        progress.append(text)
-
-    loop_transport.emit_model_effort_mismatch(usage, task_id="task-7", emit_progress=emit)
-    assert progress == [] and usage["_options"]["options_honored"] == "mismatch"
-
-    # The silent round spent no dedupe slot: a real effort change still speaks.
-    usage["_options"]["applied_options"] = {"reasoningEffort": "low", "cacheKey": "engine-b"}
-    loop_transport.emit_model_effort_mismatch(usage, task_id="task-7", emit_progress=emit)
-    assert progress == ["⚠️ Claudexor served at low effort while high was requested"
-                        " (Claudexor account acct-a)."]
-
-
 def _mismatch_round_context(tmp_path, monkeypatch, *, emit_progress, applied_values):
     """A Main round whose subscription answer reports a lowered effort."""
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
@@ -214,23 +214,22 @@ def _mismatch_round_context(tmp_path, monkeypatch, *, emit_progress, applied_val
 
     route = {"credentialProfileId": "account-a", "model": "codex=model"}
 
-    def call(_llm, _messages, _model, _tools, _effort, _retries, _logs, _tid,
-             _round, _queue, usage, *_args, **_kwargs):
-        usage["_options"] = {
-            "requested_options": {"reasoningEffort": "high"},
-            "applied_options": {"reasoningEffort": next(applied_values)},
-            "options_honored": "mismatch",
-            "route": dict(route),
+    def chat(**_kwargs):
+        reported = next(applied_values)
+        return {"role": "assistant", "content": "done"}, {
+            "provider": "claudexor", "cost": 0.0,
+            "effort": {"requested": "high", "sent": {"options.reasoningEffort": "high"},
+                       "reported": reported, "report_source": "provider_applied_options"},
+            "claudexor": {"route": dict(route), "requested_options": {"reasoningEffort": "high"},
+                          "applied_options": {"reasoningEffort": reported}},
         }
-        usage["_model_route"] = dict(route)
-        return {"role": "assistant", "content": "done"}, 0.0
 
-    monkeypatch.setattr(loop, "call_llm_with_retry", call)
+    ctx.llm = SimpleNamespace(chat=chat)
     monkeypatch.setattr(loop, "_server_web_allowed_by_task", lambda _ctx: False)
     return ctx
 
 
-def test_effort_mismatch_emits_one_typed_owner_line_per_task_and_model(tmp_path, monkeypatch):
+def test_effort_mismatch_emits_no_chat_toast_or_incident_across_rounds(tmp_path, monkeypatch):
     progress = []
     ctx = _mismatch_round_context(
         tmp_path, monkeypatch, applied_values=iter(("medium", "low")),
@@ -239,29 +238,26 @@ def test_effort_mismatch_emits_one_typed_owner_line_per_task_and_model(tmp_path,
     loop._dispatch_round_model(ctx, None, attempt_cap=None)
     loop._dispatch_round_model(ctx, None, attempt_cap=None)
 
-    assert len(progress) == 1
-    text, incident = progress[0]
-    assert "served at medium effort while high was requested" in text
-    assert "Claudexor account account-a" in text
-    assert incident == {
-        "task_incident": "model_effort_mismatch",
-        "toast_once": "task-7:model_effort_mismatch:codex=model",
-    }
+    assert progress == []
+    rows = [json.loads(line) for line in (ctx.drive_logs / "events.jsonl").read_text().splitlines()]
+    rounds = [row for row in rows if row.get("type") == "llm_round"]
+    assert [row["effort"]["reported"] for row in rounds] == ["medium", "low"]
+    assert "_options" not in ctx.accumulated_usage
 
 
 def test_failed_round_route_never_borrows_the_previous_applied_options(tmp_path, monkeypatch):
-    """Only the route that reported applied options can be named in its line."""
+    """Failed rounds cannot borrow previous options into a fresh success log."""
     from ouroboros.llm_claudexor import ClaudexorModelError
 
     logs = tmp_path / "logs"
     logs.mkdir(parents=True, exist_ok=True)
-    usage, progress = {}, []
+    usage = {}
     route_a = {"model": "MODEL-A", "credentialProfileId": "acct-a", "source": "codex"}
     route_b = {"model": "MODEL-B", "credentialProfileId": "acct-b", "source": "claude"}
 
     def served(route, requested, applied):
         return {"role": "assistant", "content": "done"}, {"claudexor": {
-            "route": dict(route), "options_honored": "mismatch",
+            "route": dict(route), "applied_options_source": "provider_response",
             "requested_options": {"reasoningEffort": requested},
             "applied_options": {"reasoningEffort": applied}}}
 
@@ -271,7 +267,6 @@ def test_failed_round_route_never_borrows_the_previous_applied_options(tmp_path,
 
     rounds = [lambda: served(route_a, "xhigh", "low"), lambda: failed(route_b),
               lambda: served(route_b, "high", "medium")]
-    lines_after = []
 
     for index, step in enumerate(rounds):
         monkeypatch.setattr(loop_llm_call, "_send_main_candidate",
@@ -279,18 +274,16 @@ def test_failed_round_route_never_borrows_the_previous_applied_options(tmp_path,
         loop_llm_call.call_llm_with_retry(
             SimpleNamespace(), [], "MODEL", [], "xhigh", 1, logs, "task-1", index, None, usage,
             "task", attempt_cap=1, initial_messages=[])
-        loop_transport.emit_model_effort_mismatch(
-            usage, task_id="task-1",
-            emit_progress=lambda text, *, incident=None: progress.append((text, incident)))
-        lines_after.append(len(progress))
-        if index == 1:  # the failed round names its own route and carries no applied options
-            assert usage["_model_route"] == route_b and usage["_options"]["route"] == route_a
+        assert "_options" not in usage
+        if index == 1:
+            assert usage["_model_route"] == route_b
 
-    assert lines_after == [1, 1, 2]  # the failed round adds nothing; MODEL-B speaks for itself
-    assert [incident["toast_once"] for _text, incident in progress] == [
-        "task-1:model_effort_mismatch:MODEL-A", "task-1:model_effort_mismatch:MODEL-B"]
-    assert progress[1][0] == ("⚠️ Claudexor served at medium effort while high was requested"
-                              " (Claudexor account acct-b).")
+    rows = [json.loads(line) for line in (logs / "events.jsonl").read_text().splitlines()]
+    rounds = [row for row in rows if row.get("type") == "llm_round"]
+    assert [row["claudexor"]["route"] for row in rounds] == [route_a, route_b]
+    assert [row["claudexor"]["requested_options"]["reasoningEffort"] for row in rounds] == ["xhigh", "high"]
+    assert [row["claudexor"]["applied_options"]["reasoningEffort"] for row in rounds] == ["low", "medium"]
+    assert all(row["claudexor"]["applied_options_source"] == "provider_response" for row in rounds)
 
 
 def test_mismatch_round_never_calls_the_one_argument_tool_context_emitter(tmp_path, monkeypatch):
@@ -302,7 +295,7 @@ def test_mismatch_round_never_calls_the_one_argument_tool_context_emitter(tmp_pa
 
     loop._dispatch_round_model(ctx, None, attempt_cap=None)
 
-    assert seen == [] and ctx.accumulated_usage["_options"]["options_honored"] == "mismatch"
+    assert seen == [] and "_options" not in ctx.accumulated_usage
 
 
 def test_body_error_diagnostic_is_masked_before_terminal_publication(tmp_path, monkeypatch):
@@ -327,3 +320,65 @@ def test_body_error_diagnostic_is_masked_before_terminal_publication(tmp_path, m
     assert text == RAW
     assert secret not in usage["_last_llm_error"] + usage["terminal_provider_notice"] + notices[0]
     assert "***" in notices[0]
+
+
+# ---- 12.10 incident: owner-facing terminal truth (transport-not-delivered sprint) ----
+
+def test_host_authored_primary_carries_its_own_notice_without_a_second_row():
+    """A host-authored primary (the notice itself, or a salvage receipt) already
+    says it; a model-authored primary still gets the separate not-completed row."""
+    sent = []
+    ctx = SimpleNamespace(send_with_budget=lambda *a, **k: sent.append(a[1]))
+    for origin in ("host_notice", "host_salvage"):
+        assert send_provider_death_notice(ctx, 7, "t1", {"terminal_origin": origin,
+                                                         "terminal_provider_notice": "⚠️ n"}) is False
+    assert sent == []
+    assert send_provider_death_notice(ctx, 7, "t1", {"terminal_origin": "model_final",
+                                                     "terminal_provider_notice": "⚠️ n"}) is True
+    assert sent and "⚠️ n" in sent[0]
+
+
+def test_a_request_that_never_started_generation_is_not_called_a_provider_reply():
+    from ouroboros.loop_transport import provider_terminal_fallback_text
+
+    flags = dict(is_context_overflow=False, is_transport_wait=False, waited_sec=0.0, is_deadline_exhausted=False)
+    released = provider_terminal_fallback_text(
+        {"_last_llm_error_kind": "auth_error", "_last_llm_attempt_custody": "released"}, **flags)
+    assert released.startswith("⚠️ The model request did not start generation.")
+    assert "returned no usable response" not in released and "provider rejected" not in released
+    answered = provider_terminal_fallback_text(
+        {"_last_llm_error_kind": "provider_error", "_last_llm_attempt_custody": "settled"}, **flags)
+    assert answered.startswith("⚠️ The model provider returned no usable response.")
+    # A stale released fact never hides a dispatched attempt whose outcome is unknown.
+    unknown = provider_terminal_fallback_text(
+        {"_last_llm_error_kind": "provider_outcome_unknown", "_last_llm_attempt_custody": "released"}, **flags)
+    assert "did not start generation" not in unknown
+
+
+def test_no_terminal_promises_a_retry_that_nothing_performs():
+    from ouroboros.loop_transport import provider_recovery_hint, provider_terminal_fallback_text
+
+    flags = dict(is_context_overflow=False, is_transport_wait=False, waited_sec=0.0, is_deadline_exhausted=False)
+    for kind in ("provider_error", "provider_transient", "rate_limit", "llm_empty_response"):
+        assert provider_recovery_hint({"_last_llm_error_kind": kind}) == ""
+        assert "consciousness" not in provider_terminal_fallback_text({"_last_llm_error_kind": kind}, **flags)
+
+
+@pytest.mark.parametrize("code", ["transport_not_delivered", "model_account_unavailable"])
+def test_a_waited_out_delivery_failure_names_its_typed_code(code):
+    from ouroboros.loop_transport import provider_terminal_fallback_text
+
+    text = provider_terminal_fallback_text(
+        {"_last_llm_error_kind": "transport_unavailable", "_last_llm_provider_code": code},
+        is_context_overflow=False, is_transport_wait=True, waited_sec=300.0, is_deadline_exhausted=False)
+    assert text.startswith("⚠️ The request did not reach the provider; the task waited and redialed for 5.0 min")
+    assert text.endswith(f" Last reported code: {code}.")
+    assert "Could not establish" not in text and "provider outage" not in text
+
+
+def test_a_usable_response_clears_the_released_attempt_fact():
+    from ouroboros.loop_llm_call import _take_response_facts
+
+    usage = {"_last_llm_attempt_custody": "released", "_last_llm_error_kind": "transport_unavailable"}
+    _take_response_facts({}, {"role": "assistant", "content": "ok"}, usage)
+    assert "_last_llm_attempt_custody" not in usage and "_last_llm_error_kind" not in usage

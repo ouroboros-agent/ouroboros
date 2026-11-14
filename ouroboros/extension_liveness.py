@@ -1,7 +1,8 @@
 """The liveness authority for one extension: what it should be, and what it is.
 
 Every gate an extension passes before it may run — manifest type, load error,
-enabled flag, skill conflict, executable review freshness, owner grants,
+a deployment's trust in its code (``deployment_extensions.trust_gap``), enabled
+flag, skill conflict, executable review freshness, owner grants,
 isolated-dependency readiness — is answered once here, as a projection over the
 discovered skill and the live registries. Callers decide what to do about it;
 this module never loads or unloads anything.
@@ -16,13 +17,17 @@ from typing import Any, Dict, List, Optional
 from ouroboros.extension_registry_state import _extensions, _load_failures, _lock
 from ouroboros.skill_loader import (
     LoadedSkill,
+    _SkillLocationCandidate,
     _sanitize_skill_name,
-    discover_skills,
+    _skill_location_inventory,
+    discover_skill_identity,
     grant_status_for_skill,
     skill_conflict_status,
 )
+from ouroboros.skill_peer_inventory import discover_conflict_peers
 
 log = logging.getLogger(__name__)
+
 
 def _extension_runtime_state(
     skill: LoadedSkill,
@@ -34,9 +39,12 @@ def _extension_runtime_state(
 ) -> Dict[str, Any]:
     """Return the liveness authority for one extension."""
     from ouroboros.config import get_runtime_mode
+    from ouroboros.deployment_extensions import TRUST_SENTENCES, UNTRUSTED_REASON, trust_gap
 
     hash_now = current_hash or skill.content_hash
     skill_dir_now = str(skill.skill_dir.resolve())
+    untrusted = (trust_gap(skill.name, skill_dir_now, hash_now)
+                 if skill.manifest.is_extension() and not skill.load_error else "")
     review_stale = skill.review.is_stale_for(hash_now)
     with _lock:
         live_bundle = _extensions.get(skill.name)
@@ -56,9 +64,9 @@ def _extension_runtime_state(
     review_gate = skill.review.gate_for(hash_now)
     if drive_root is None:
         drive_root = pathlib.Path(skill.skill_dir).parent.parent.parent
-    peers = list(skills) if skills is not None else discover_skills(
-        pathlib.Path(drive_root), repo_path=repo_path
-    )
+    peers = list(skills) if skills is not None else list(discover_conflict_peers(
+        pathlib.Path(drive_root), skill.name, repo_path=repo_path
+    ))
     if not any(peer.name == skill.name for peer in peers):
         peers.append(skill)
     conflict = skill_conflict_status(skill, peers)
@@ -72,6 +80,9 @@ def _extension_runtime_state(
     elif skill.load_error:
         desired_live = False
         reason = "load_error"
+    elif untrusted:  # an execution domain's service runs only the code of its trusted packages
+        desired_live = False
+        reason = UNTRUSTED_REASON
     elif not skill.enabled:
         desired_live = False
         reason = "disabled"
@@ -99,7 +110,8 @@ def _extension_runtime_state(
         "executable_review": review_gate["executable_review"],
         "grant_status": grant_status,
         "conflict": conflict,
-        "load_error": skill.load_error or (load_failure.error if matched_failure and load_failure else None),
+        "load_error": skill.load_error or (TRUST_SENTENCES[untrusted] if untrusted else None)
+        or (load_failure.error if matched_failure and load_failure else None),
         "desired_live": desired_live,
         "live_loaded": live_loaded,
         "loaded_present": loaded_present,
@@ -158,10 +170,13 @@ def _deps_block_reason(drive_root: pathlib.Path, skill: LoadedSkill) -> str:
 
 
 def _apply_deps_block(state: Dict[str, Any], drive_root: pathlib.Path, skill: LoadedSkill) -> Dict[str, Any]:
+    """``reason`` keeps the typed code; ``load_error`` carries the owner's sentence for it."""
     if state.get("desired_live"):
         deps_reason = _deps_block_reason(pathlib.Path(drive_root), skill)
         if deps_reason:
-            state.update(desired_live=False, reason=deps_reason, load_error=deps_reason)
+            from ouroboros.skill_dependencies import dependency_sentence
+
+            state.update(desired_live=False, reason=deps_reason, load_error=dependency_sentence(deps_reason))
     return state
 
 
@@ -179,15 +194,23 @@ def runtime_state_for_skill_name(
     *,
     repo_path: str | None = None,
     skills: Optional[List[LoadedSkill]] = None,
+    selected_skill: LoadedSkill | None = None,
+    locations: tuple[_SkillLocationCandidate, ...] | None = None,
 ) -> Dict[str, Any]:
     from ouroboros.config import get_skills_repo_path
 
     resolved_repo_path = get_skills_repo_path() if repo_path is None else repo_path
-    peers = list(skills) if skills is not None else discover_skills(
-        drive_root, repo_path=resolved_repo_path
-    )
+    # Share only this observation's directory inventory, not manifest/state bytes.
+    if skills is None and locations is None:
+        locations = _skill_location_inventory(drive_root, repo_path=resolved_repo_path)
+    if selected_skill is not None:
+        selected = [selected_skill]
+    elif skills is not None:
+        selected = list(skills)
+    else:
+        selected = discover_skill_identity(drive_root, skill_name, repo_path=resolved_repo_path, locations=locations)
     safe_name = _sanitize_skill_name(skill_name)
-    skill = next((item for item in peers if item.name == safe_name), None)
+    skill = next((item for item in selected if item.name == safe_name), None)
     if skill is None:
         with _lock:
             live_loaded = skill_name in _extensions
@@ -206,6 +229,9 @@ def runtime_state_for_skill_name(
             "reason": "missing",
         }
     else:
+        peers = list(skills) if skills is not None else list(
+            discover_conflict_peers(drive_root, safe_name, repo_path=resolved_repo_path, locations=locations)
+        )
         state = _apply_durable_extension_health(
             _apply_deps_block(
                 _extension_runtime_state(
@@ -252,6 +278,54 @@ def is_extension_live(
 ) -> bool:
     state = runtime_state_for_skill_name(skill_name, drive_root, repo_path=repo_path)
     return bool(state.get("desired_live")) and bool(state.get("live_loaded"))
+
+
+def live_context_publishers(drive_root: pathlib.Path) -> Dict[str, Dict[str, Any]]:
+    """Published declarations using the existing readiness authority.
+
+    Publication froze manifest/hash identity. Only enable/review/grant controls
+    are reread; no payload hashing or filesystem peer discovery on a prompt
+    path. A worker observes its loaded generation, not an atomic cross-process
+    view. Standard unload removes the declaration.
+    """
+    with _lock:
+        published = [(name, bundle.loaded_skill, dict(bundle.context_snapshot), bundle.content_hash)
+                     for name, bundle in _extensions.items()
+                     if bundle.loaded_skill is not None and bundle.context_snapshot]
+        peers = [bundle.loaded_skill for bundle in _extensions.values() if bundle.loaded_skill is not None]
+    result = {}
+    for name, skill, descriptor, revision in published:
+        state = _published_skill_readiness(skill, drive_root, peers)
+        result[name] = {**descriptor, "revision": str(revision or ""),
+                        "eligible": bool(state["desired_live"] and state["live_loaded"]),
+                        "reason": state["reason"]}
+    return result
+
+
+def _published_skill_readiness(skill, drive_root, peers):
+    """Refresh small authority controls against a captured identity, without rehashing payload bytes."""
+    from dataclasses import replace
+
+    from ouroboros.deployment_extensions import effective_enabled
+    from ouroboros.skill_loader import load_enabled, load_review_state
+
+    current = replace(skill, enabled=effective_enabled(skill.name, load_enabled(drive_root, skill.name), skill.skill_dir,
+                                                       skill.content_hash),
+                      review=load_review_state(drive_root, skill.name, skill_type="extension", skill_dir=skill.skill_dir))
+    return _apply_durable_extension_health(_apply_deps_block(_extension_runtime_state(
+        current, drive_root=drive_root, skills=peers), drive_root, current), drive_root, current)
+
+
+def widget_publication_ready(skill_name: str, generation: str, drive_root: pathlib.Path) -> bool:
+    """Leases use the same review, enablement, grants and health owner as live context publishers."""
+    with _lock:
+        bundle = _extensions.get(skill_name)
+        if bundle is None or bundle.generation_digest != generation or bundle.loaded_skill is None:
+            return False
+        skill = bundle.loaded_skill
+        peers = [item.loaded_skill for item in _extensions.values() if item.loaded_skill is not None]
+    state = _published_skill_readiness(skill, drive_root, peers)
+    return bool(state["desired_live"] and state["live_loaded"])
 
 
 def _revert_enabled_after_load_error(

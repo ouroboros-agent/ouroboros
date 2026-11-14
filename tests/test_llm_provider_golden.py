@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import copy
 import hashlib
 import json
@@ -89,12 +90,6 @@ _ROUTE_ENV_NAMES = (
 _CLASS_CACHE_NAMES = (
     "_SUPPORTED_PARAMS_CACHE",
     "_CONTEXT_LENGTH_CACHE",
-    "_REJECTED_PARAMS_CACHE",
-    "_REJECTED_PARAMS_LOADED",
-    "_EFFORT_CEILING_CACHE",
-    "_EFFORT_CEILING_LOADED",
-    "_EFFORT_FLOOR_CACHE",
-    "_EFFORT_FLOOR_LOADED",
 )
 
 
@@ -177,7 +172,6 @@ class _FakeResponse:
     def model_dump(self) -> Dict[str, Any]:
         return copy.deepcopy(self._body)
 
-    # probe_oversized_context reads the SDK object shape directly.
     @property
     def choices(self) -> Any:
         raw = self._body.get("choices") or []
@@ -489,41 +483,35 @@ def _install_model_operation_fake(stack: contextlib.ExitStack, recorder: _Record
     gateway.lose_create = bool(spec.get("lose_model_create_reply"))
     gateway.pending = bool(spec.get("cancel_model_after_create"))
     recorder.model_gateway = gateway
-    stack.enter_context(mock.patch.object(llm_claudexor, "ensure_owned_gateway", lambda: gateway))
+    stack.enter_context(mock.patch.object(llm_claudexor, "ensure_owned_gateway", lambda **_kw: gateway))
 
 
 # ---------------------------------------------------------------------------
 # Case execution
 # ---------------------------------------------------------------------------
 def _ledger_projection(root: pathlib.Path) -> List[Dict[str, Any]]:
-    """Ordered physical attempts with their stable accounting facts."""
-    path = root / "state" / "usage_attempts.jsonl"
-    if not path.is_file():
-        return []
+    """Ordered physical attempts (by their first transition) with their stable
+    accounting facts. The usage store keeps one current row per attempt, so the
+    golden records its final state and durable row revisions (state transitions
+    and retained evidence updates) under the historical ``transitions`` key."""
+    from tests._usage_store_testing import attempt_rows_in_start_order
+
     attempts: List[Dict[str, Any]] = []
-    index: Dict[str, Dict[str, Any]] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        row = json.loads(line)
-        attempt_id = str(row.get("attempt_id") or "")
-        entry = index.get(attempt_id)
-        if entry is None:
-            entry = {
-                "source": row.get("source"),
-                "model": row.get("model"),
-                "provider": row.get("provider"),
-                "candidate_raw_sha256": row.get("candidate_raw_sha256"),
-                "candidate_raw_size_bytes": row.get("candidate_raw_size_bytes"),
-                "candidate_measurement_kind": row.get("candidate_measurement_kind"),
-                "states": [],
-            }
-            index[attempt_id] = entry
-            attempts.append(entry)
-        entry["states"].append(row.get("state"))
+    for row in attempt_rows_in_start_order(root):
+        entry = {
+            "source": row.get("source"),
+            "model": row.get("model"),
+            "provider": row.get("provider"),
+            "candidate_raw_sha256": row.get("candidate_raw_sha256"),
+            "candidate_raw_size_bytes": row.get("candidate_raw_size_bytes"),
+            "candidate_measurement_kind": row.get("candidate_measurement_kind"),
+            "state": row.get("state"),
+            "transitions": row.get("revision"),
+        }
         if row.get("state") == "settled":
             entry["prompt_cache_ttl"] = row.get("prompt_cache_ttl")
             entry["cost_final"] = row.get("cost_final")
+        attempts.append(entry)
     return attempts
 
 
@@ -582,9 +570,9 @@ def _observe(spec: Dict[str, Any]) -> Dict[str, Any]:
         for key, value in (spec.get("env") or {}).items():
             os.environ[key] = str(value)
 
-        # Durable capability evidence is read through the frozen ``config.DATA_DIR``
-        # constant, so the env override alone would let host state leak into (and a
-        # learned rejection leak out of) a recorded projection.
+        # Route code still reads the frozen ``config.DATA_DIR`` constant (the subscription
+        # lane, stream evidence), so the env override alone would let host state leak into
+        # (and a case's writes leak out of) a recorded projection.
         import ouroboros.config as config_module
 
         stack.enter_context(mock.patch.object(config_module, "DATA_DIR", root))
@@ -598,15 +586,10 @@ def _observe(spec: Dict[str, Any]) -> Dict[str, Any]:
             LLMClient._SUPPORTED_PARAMS_CACHE[model_id] = set(params)
 
         durable = spec.get("durable_evidence") or {}
-        if durable:
-            from ouroboros import capability_evidence as ce
+        if durable:  # rows older releases learned: negative controls, never dispatch authority
+            from tests._shared import write_legacy_capability_rows
 
-            for key, value in (durable.get("effort_ceilings") or {}).items():
-                ce.record_effort_ceiling(root, key, value)
-            for key, value in (durable.get("effort_floors") or {}).items():
-                ce.record_effort_floor(root, key, value)
-            for key, value in (durable.get("rejected_params") or {}).items():
-                ce.record_rejected_params(root, key, value)
+            write_legacy_capability_rows(root, **durable)
 
         _install_fakes(stack, recorder, spec)
 
@@ -616,7 +599,10 @@ def _observe(spec: Dict[str, Any]) -> Dict[str, Any]:
         if spec.get("cancel_model_after_create"):
             call["kwargs"]["model_poll_control"] = lambda: "cancelled" if recorder.model_gateway.accepted_operations else None
         try:
-            result = _call_route(client, call)
+            # An empty call context, for the same reason as the env and class caches
+            # above: a per-call disclosure (effort clamp note, last physical attempt)
+            # another test staged on this worker must not ride into the projection.
+            result = contextvars.Context().run(_call_route, client, call)
         except BaseException as exc:  # noqa: BLE001 - the raise IS the projection
             observed["raised"] = {"type": type(exc).__name__, "message": str(exc)}
             if spec.get("model_operation"):
@@ -707,13 +693,14 @@ def test_golden_fixture_ids_are_unique_and_documented():
         assert case.get("route"), f"{case['id']} has no route description"
 
 
-@pytest.mark.parametrize("case", _CASES, ids=[case["id"] for case in _CASES])
-def test_llm_provider_route_matches_golden(case):
-    observed = _observe(case["spec"])
-    assert observed == case["expected"], (
-        f"route {case['id']} drifted from {case['_file']}:\n"
-        f"observed={json.dumps(observed, indent=2, sort_keys=True)}"
-    )
+def test_llm_provider_route_matches_golden(subtests):
+    for case in _CASES:
+        with subtests.test(case=case):
+            observed = _observe(case["spec"])
+            assert observed == case["expected"], (
+                f"route {case['id']} drifted from {case['_file']}:\n"
+                f"observed={json.dumps(observed, indent=2, sort_keys=True)}"
+            )
 
 
 
@@ -733,6 +720,22 @@ def test_processing_environment_isolated_but_explicit_case_options_apply(monkeyp
     assert explicit["returned"]["usage"]["processing"]["requested"] == "standard"
 
 
+def test_call_context_left_by_an_earlier_test_does_not_reach_the_replay():
+    """A parallel worker runs other modules first; a per-call disclosure one of them
+    staged and never consumed (a native effort mapping built without a send) must not
+    be attributed to the recorded route."""
+    from ouroboros.llm_capability_policy import _EFFORT_CLAMP_CVAR
+
+    case = next(case for case in _CASES if case["id"] == "anthropic.dispatch.happy_path")
+    token = _EFFORT_CLAMP_CVAR.set({
+        "requested": "ultra", "applied": "max", "reason": "provider_wire_mapping", "model": "future",
+    })
+    try:
+        assert _observe(case["spec"]) == case["expected"]
+    finally:
+        _EFFORT_CLAMP_CVAR.reset(token)
+
+
 def test_golden_covers_every_declared_provider_lane():
     """Coverage floor: dropping a lane's fixtures must fail, not go unnoticed."""
     covered = {case["id"].split(".", 1)[0] for case in _CASES}
@@ -747,7 +750,7 @@ def test_golden_covers_every_declared_provider_lane():
     }
     assert ledger_sources >= {
         "llm.chat", "llm.local", "llm.anthropic", "llm.gigachat",
-        "capability_probe", "web_search.openrouter", "web_search.anthropic",
+        "web_search.openrouter", "web_search.anthropic",
     }
 
 

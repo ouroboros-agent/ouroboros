@@ -20,6 +20,8 @@ from __future__ import annotations
 import json
 import pathlib
 
+import pytest
+
 from ouroboros.contracts.task_constraint import TaskConstraint
 from ouroboros.tools.registry import ToolContext, ToolRegistry
 
@@ -250,8 +252,8 @@ class TestChildDriveSkillPayload:
         assert "launcher-seed" in marker
         assert "nativeDependency" in dependency
         assert "node_modules/" in listing and ".seed-origin" in listing
-        assert ".clawhub.json" not in listing
-        assert "BLOCKED" in control
+        assert ".clawhub.json" in listing
+        assert '{"origin":"catalog"}' in control
         assert "SKILL.md" in search
 
         write = registry.execute("write_file", {
@@ -267,11 +269,18 @@ class TestChildDriveSkillPayload:
 # ---------------------------------------------------------------------------
 
 class TestBudgetDriftOpenRouterOnly:
+    def _update_budget(self, sup_state, *, expected=True):
+        assert sup_state.update_budget_from_usage({}) is expected
+        diagnostic = sup_state._OPENROUTER_DIAGNOSTIC
+        assert diagnostic.latch.acquire(timeout=5), "diagnostic did not finish"
+        diagnostic.latch.release()
+
     def _setup_state(self, tmp_path, monkeypatch, *, or_settled: float, accounted: float,
                      calls: int = 50, integrity_degraded: bool = False):
         from supervisor import state as sup_state
 
         sup_state.init(tmp_path, total_budget_limit=0.0)
+        sup_state.save_state({})  # an initialized install: only explicit init creates state (#1307)
         monkeypatch.setenv("OPENROUTER_API_KEY", "unit-test-key-1")
 
         breakdown = {
@@ -290,11 +299,11 @@ class TestBudgetDriftOpenRouterOnly:
             "attempt_counts": {"settled": calls},
             "integrity_degraded": integrity_degraded,
             "by_provider": {"openrouter": {"settled_usd": or_settled}},
+            "_ledger_high_water_seq": [0, calls],
         }
         import ouroboros.usage_accounting as ua
 
-        monkeypatch.setattr(ua, "ensure_legacy_imported", lambda *_a, **_k: None)
-        monkeypatch.setattr(ua, "usage_breakdown", lambda *_a, **_k: dict(breakdown))
+        monkeypatch.setattr(ua, "usage_writer_snapshot", lambda *_a, **_k: dict(breakdown))
         return sup_state
 
     def _seed_session(self, sup_state, *, total_snap: float, or_snap: float):
@@ -312,10 +321,10 @@ class TestBudgetDriftOpenRouterOnly:
         self._seed_session(sup_state, total_snap=1000.0, or_snap=0.0)
         monkeypatch.setattr(
             sup_state, "check_openrouter_ground_truth",
-            lambda: {"total_usd": 1030.0, "daily_usd": 30.0},
+            lambda _key: {"total_usd": 1030.0, "daily_usd": 30.0},
         )
 
-        sup_state.update_budget_from_usage({})
+        self._update_budget(sup_state)
         st = sup_state.load_state()
         assert st["budget_drift_alert"] is False
         assert st["budget_drift_pct"] is not None
@@ -328,10 +337,10 @@ class TestBudgetDriftOpenRouterOnly:
         self._seed_session(sup_state, total_snap=1000.0, or_snap=0.0)
         monkeypatch.setattr(
             sup_state, "check_openrouter_ground_truth",
-            lambda: {"total_usd": 1100.0, "daily_usd": 100.0},
+            lambda _key: {"total_usd": 1100.0, "daily_usd": 100.0},
         )
 
-        sup_state.update_budget_from_usage({})
+        self._update_budget(sup_state)
         st = sup_state.load_state()
         assert st["budget_drift_alert"] is True
         events = (tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8")
@@ -346,10 +355,10 @@ class TestBudgetDriftOpenRouterOnly:
         monkeypatch.setenv("OPENROUTER_API_KEY", "unit-test-key-2-DIFFERENT")
         monkeypatch.setattr(
             sup_state, "check_openrouter_ground_truth",
-            lambda: {"total_usd": 5555.0, "daily_usd": 1.0},
+            lambda _key: {"total_usd": 5555.0, "daily_usd": 1.0},
         )
 
-        sup_state.update_budget_from_usage({})
+        self._update_budget(sup_state)
         st = sup_state.load_state()
         assert st["budget_drift_alert"] is False
         assert st["budget_drift_pct"] is None
@@ -370,14 +379,41 @@ class TestBudgetDriftOpenRouterOnly:
         sup_state.update_state(_mut)
         monkeypatch.setattr(
             sup_state, "check_openrouter_ground_truth",
-            lambda: {"total_usd": 1100.0, "daily_usd": 100.0},
+            lambda _key: {"total_usd": 1100.0, "daily_usd": 100.0},
         )
 
-        sup_state.update_budget_from_usage({})
+        self._update_budget(sup_state)
         st = sup_state.load_state()
         assert st["budget_drift_alert"] is False
         assert st["budget_drift_pct"] is None
         assert st["session_openrouter_settled_snapshot"] == 40.0
+
+    @pytest.mark.parametrize("rows,alerts", [
+        ([{"kind": "openrouter", "name": "claude-credits", "label": "Claude credits"}], False),
+        ('[{"kind": "openrouter", "name": "byok", "enabled": true}]', False),  # an environment-shaped value
+        ([{"kind": "openrouter", "name": "byok", "enabled": False}], True),
+    ])
+    def test_another_enabled_openrouter_connection_skips_the_percentage(self, tmp_path, monkeypatch, rows, alerts):
+        """Every OpenRouter connection settles into the ledger's one ``openrouter`` bucket while
+        the diagnostic queries only the built-in key: with another enabled one the comparison is
+        no longer like for like, so it rebaselines instead of raising a false drift alarm."""
+        import ouroboros.config as config
+
+        sup_state = self._setup_state(tmp_path, monkeypatch, or_settled=40.0, accounted=40.0)
+        self._seed_session(sup_state, total_snap=1000.0, or_snap=0.0)
+        monkeypatch.setattr(config, "runtime_settings", lambda: {"OUROBOROS_CONNECTIONS": rows})
+        monkeypatch.setattr(
+            sup_state, "check_openrouter_ground_truth",
+            lambda _key: {"total_usd": 1100.0, "daily_usd": 100.0},
+        )
+
+        self._update_budget(sup_state)
+        st = sup_state.load_state()
+        assert st["budget_drift_alert"] is alerts
+        assert (st["budget_drift_pct"] is None) is not alerts
+        assert st["openrouter_total_usd"] == 1100.0  # the key observation is still published
+        if not alerts:
+            assert (st["session_total_snapshot"], st["session_openrouter_settled_snapshot"]) == (1100.0, 40.0)
 
     def test_integrity_degraded_suppresses_comparison(self, tmp_path, monkeypatch):
         sup_state = self._setup_state(
@@ -386,10 +422,10 @@ class TestBudgetDriftOpenRouterOnly:
         self._seed_session(sup_state, total_snap=1000.0, or_snap=0.0)
         monkeypatch.setattr(
             sup_state, "check_openrouter_ground_truth",
-            lambda: {"total_usd": 1100.0, "daily_usd": 100.0},
+            lambda _key: {"total_usd": 1100.0, "daily_usd": 100.0},
         )
 
-        sup_state.update_budget_from_usage({})
+        self._update_budget(sup_state, expected=False)
         st = sup_state.load_state()
         assert st["budget_drift_alert"] is False
         assert st["budget_drift_pct"] is None
@@ -399,12 +435,14 @@ class TestBudgetDriftOpenRouterOnly:
         self._seed_session(sup_state, total_snap=1000.0, or_snap=0.0)
         monkeypatch.setattr(
             sup_state, "check_openrouter_ground_truth",
-            lambda: {"total_usd": 1030.0, "daily_usd": 30.0},
+            lambda _key: {"total_usd": 1030.0, "daily_usd": 30.0},
         )
-        sup_state.update_budget_from_usage({})
+        self._update_budget(sup_state)
 
         text = sup_state.status_text(sup_state.load_state(), [], {})
         assert "budget_drift" in text
         assert "openrouter tracked: $30.00" in text
         # The all-provider delta ($130) must not masquerade as the tracked side.
         assert "tracked: $130.00" not in text
+        # Reservations and price-less bounds are never one blended "open holds" figure.
+        assert "open_holds_usd" not in text

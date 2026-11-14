@@ -2,21 +2,42 @@
 
 from __future__ import annotations
 
+import copy
 import pathlib
 from typing import Any, Dict, List, Optional
 
 
+def request_shape(body):
+    """Bounded no-write evidence, never an envelope that could authorize replay."""
+    body = body if isinstance(body, dict) else {}
+    return {"access": str(body.get("access") or ""), "mode": str(body.get("mode") or ""),
+            "execution": bool(body.get("execution"))}
+
+
+def store_facts(row: Dict[str, Any]) -> Dict[str, Any]:
+    """The engine-store facts of one START_REQUESTED row, as ``replay_store_unproven`` reads them."""
+    return {"daemon_store_id": str(row.get("daemon_store_id") or ""),
+            "handshake_store_id": str(row.get("handshake_store_id") or ""),
+            "store_identity_unproven": row.get("store_identity_unproven") is True}
+
+
 def pending_invocations(
-    drive_root: Any, rows: Optional[List[Dict[str, Any]]] = None,
+    drive_root: Any, rows: Optional[List[Dict[str, Any]]] = None, *, materialize: bool = True,
 ) -> List[Dict[str, Any]]:
-    """Return request rows with no bound run and no definite refusal."""
+    """Return request rows with no bound run and no definite refusal.
+
+    Without ``rows`` the store answers from its pending invocation rows (one read);
+    ``rows`` folds a chain snapshot (the importer, the forensic replays, the tests)."""
 
     from ouroboros import delegate_custody as c
 
+    if rows is None:
+        from ouroboros.delegate_custody_current import pending
+
+        return pending(drive_root)
     found: Dict[str, Dict[str, Any]] = {}
     state: Dict[str, str] = {}
-    source = rows if rows is not None else c._iter_rows(c.event_log_path(drive_root))
-    for row in source:
+    for row in c._unique_rows(rows):
         invocation_id = str(row.get("invocation_id") or "")
         if not invocation_id:
             continue
@@ -30,6 +51,8 @@ def pending_invocations(
                 "operation_id": str(row.get("operation_id") or ""),
                 "request": row.get("request") if isinstance(row.get("request"), dict) else None,
                 "request_ref": row.get("request_ref"),
+                **({"request_shape": copy.deepcopy(row["request_shape"])} if "request_shape" in row else
+                   {"request_shape": request_shape(row["request"])} if isinstance(row.get("request"), dict) else {}),
                 "route": str(row.get("route") or ""),
                 "project_id": str(row.get("project_id") or ""),
                 "project_owned": bool(row.get("project_owned")),
@@ -38,6 +61,7 @@ def pending_invocations(
                 **({"project_persistent": bool(row["project_persistent"])}
                    if "project_persistent" in row else {}),
                 "idempotency_key": str(row.get("idempotency_key") or ""),
+                **store_facts(row),  # the facts replay_store_unproven reads
                 "root_task_id": str(row.get("root_task_id") or ""),
                 "parent_task_id": str(row.get("parent_task_id") or ""),
                 "category": str(row.get("category") or "subagent"),
@@ -48,14 +72,21 @@ def pending_invocations(
                 "baseline_sha": str(row.get("baseline_sha") or ""),
                 "target_root": str(row.get("target_root") or ""),
                 "authority_source": str(row.get("authority_source") or ""),
-                "resource_ref": row.get("resource_ref") if isinstance(row.get("resource_ref"), dict) else {},
+                # A pending continuation names the run whose snapshot it takes over.
+                **{key: str(row.get(key) or "") for key in ("continuation_of", "capture_id", "snapshot_task_id")},
+                **{key: copy.deepcopy(row[key]) for key in ("execution_mode", "effective_access", "thread_id", "authority_ceiling", "promotion") if key in row},
+                # Copies: the source rows are the caller's snapshot.
+                "resource_ref": copy.deepcopy(row.get("resource_ref")) if isinstance(row.get("resource_ref"), dict) else {},
+                # The engine bound before the POST (``execution_domain``): a replay goes there or nowhere.
+                **({"engine_ref": copy.deepcopy(row["engine_ref"])} if isinstance(row.get("engine_ref"), dict)
+                   and row["engine_ref"] else {}),
                 "selected_subagent_id": str(row.get("selected_subagent_id") or ""),
                 "config_fingerprint": str(row.get("config_fingerprint") or ""),
                 "work_order_fingerprint": str(row.get("work_order_fingerprint") or ""),
                 "work_order_coverage": str(row.get("work_order_coverage") or ""),
                 "authority_fingerprint": str(row.get("authority_fingerprint") or ""),
                 "work_order_source_request": (
-                    row.get("work_order_source_request")
+                    copy.deepcopy(row.get("work_order_source_request"))
                     if isinstance(row.get("work_order_source_request"), dict) else {}
                 ),
             }
@@ -72,20 +103,112 @@ def pending_invocations(
         if state.get(invocation_id, "pending") != "pending":
             continue
         # Resolve only survivors, not every historical start on each sweep.
-        body = request_body(drive_root, record)
+        body = request_body(drive_root, record) if materialize else record.get("request")
         ref = record.pop("request_ref")
         # An unreadable stored body does not discharge the pending start.
         if body or ref is not None:
             record["request"] = body
+            if body is None and ref is not None:
+                record["request_ref"] = ref  # an addressed replay can retry an unavailable source
             pending.append(record)
     return pending
+
+
+def current_rows(root, rows):
+    """Typed open facts only. Legacy gaps keep their identity until the child backfills them."""
+    pending = []
+    for facts in rows:
+        projected = (copy.deepcopy(facts["pending"]) if "pending" in facts else
+                     pending_invocations(root, [facts["request"]], materialize=False))
+        source = facts["request"]
+        for record in projected:
+            record.update(store_facts(source))  # a cached projection may predate a store fact its row holds
+        if source.get("request_ref") is not None and not (isinstance(source.get("request"), dict) and source["request"]):
+            for record in projected:
+                # Older projections cached a body without its ref. The source row
+                # keeps replay addressed even after that blob is lost or packed.
+                record.update(request=None, request_ref=copy.deepcopy(source["request_ref"]))
+        pending.extend(projected)
+    return pending
+
+
+JOB = "pending_invocations"
+
+
+def backfill_due(root, row, facts, child):
+    return row.get("state") != "done" or not row.get("request_shapes")
+
+
+def backfill(root, should_stop):
+    """One addressed pass over already-open requests, CAS against start/refusal races."""
+    from ouroboros import maintenance_jobs, store
+
+    with store.open_store(root, write=False) as txn:
+        request = txn.meta("job:" + JOB)
+        rows = txn.set_rows("custody_open")
+    done = 0
+    for key, facts in rows.items():
+        if should_stop():
+            return {"state": "pending", "items": done}
+        if not key.startswith("invocation:") or ("pending" in facts and
+                all("request_shape" in record for record in facts["pending"])):
+            continue
+        source = facts["request"]
+        shape = source.get("request_shape")
+        if shape is None:
+            shape = request_shape(request_body(root, source))
+        projected = pending_invocations(root, [{**source, "request_shape": shape}], materialize=False)
+        with store.open_store(root, write=True) as txn:
+            if txn.get_row("custody_open", key) == facts:
+                txn.put_row("custody_open", key, {**facts, "pending": projected})
+        done += 1
+    with store.open_store(root, write=True) as txn:
+        if txn.meta("job:" + JOB) != request:
+            return {"state": "pending", "items": done}  # an import/repair added open rows meanwhile
+        maintenance_jobs.record_in(txn, JOB, state="done", items=done, request_shapes=True)
+    return {"state": "done", "items": done}
+
+
+def replay_store_unproven(record: Dict[str, Any], serving_store_id: Any) -> str:
+    """Why a recorded invocation key must not be re-sent to the serving store now, or "".
+
+    Claudexor keeps idempotency keys inside each store's own database, so only the store that
+    received the original POST can answer its key with the run it accepted; another store would
+    start a second run while the first may live on where it was accepted. A row whose admitting
+    store is still unproven (``store_identity_unproven``: a fresh start, before its POST receipt)
+    is not replayed into a named store; ``handshake_store_id``, only the store its handshake saw,
+    refuses a store that differs from it and never proves admission. A row naming the store it
+    is for (``daemon_store_id``, as a review continuation names the stopped run's admitting store)
+    replays only while the serving store is that one; a row naming none keeps the earlier replay.
+    A refusal decides nothing about whether the first POST started a run."""
+    if record.get("store_identity_unproven") is True:
+        # Engines naming no identity retain legacy single-store replay. A handshake observed before
+        # an unknown POST cannot certify its admission: the store may have changed before that POST.
+        recorded_handshake = str(record.get("handshake_store_id") or "")
+        serving = str(serving_store_id or "")
+        if not recorded_handshake and not serving:
+            return ""
+        if recorded_handshake and recorded_handshake != serving:
+            return (f"the original handshake named store {recorded_handshake}, but the current handshake "
+                    f"names {serving or 'no store identity'}; the unknown POST is not replayable here")
+        return ("the original POST's admitting store was not proven by a receipt; the current handshake "
+                "identity cannot authorize replay, so the outcome remains unknown")
+    recorded = str(record.get("daemon_store_id") or "")
+    serving = str(serving_store_id or "")
+    if not recorded or recorded == serving:
+        return ""
+    return (f"this start is for Claudexor store {recorded}, but the engine now serves "
+            f"{'store ' + serving if serving else 'a store that names no identity'}, which is not shown to hold "
+            "its key or the run it continues")
 
 
 def request_body(drive_root: Any, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Resolve the canonical replay envelope, legacy inline first, then raw CAS.
 
-    Unreadable references leave the request unknown for the caller's existing
-    refusal paths; never rebuild a paid invocation from current settings.
+    The raw CAS blob holds the full unredacted envelope, stored before the
+    start-requested row. Unreadable references leave the request unknown for
+    the caller's existing refusal paths; never rebuild a paid invocation from
+    current settings.
     """
     inline = row.get("request")
     if isinstance(inline, dict) and inline:
@@ -102,4 +225,4 @@ def request_body(drive_root: Any, row: Dict[str, Any]) -> Optional[Dict[str, Any
     return body if isinstance(body, dict) and body else None
 
 
-__all__ = ["pending_invocations", "request_body"]
+__all__ = ["pending_invocations", "replay_store_unproven", "request_body"]

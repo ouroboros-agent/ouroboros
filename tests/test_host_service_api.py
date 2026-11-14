@@ -1,12 +1,39 @@
 import pathlib
+import threading
 from types import SimpleNamespace
 
+import pytest
 from starlette.testclient import TestClient
+
+from ouroboros.task_results import write_task_result
 
 from ouroboros.gateway.host_service import AUTH_TOKEN_FILENAME, create_host_service_app
 from ouroboros.event_bus import CHAT_OUTBOUND, publish_event
 from ouroboros.skill_loader import compute_content_hash, save_enabled, save_review_state, save_skill_grants, SkillReviewState
 from ouroboros.utils import atomic_write_json
+from tests._store_shared import seed_result
+from tests.test_launcher_handoff_stop import native_guard  # noqa: F401
+
+@pytest.fixture(autouse=True)
+def _host_lane_roots(tmp_path, monkeypatch):
+    """A Host-only process: its turns run on the disclosed degraded executor in this process (no pool generation)."""
+    from tests.conversation_carrier_support import host_lane
+
+    host_lane(monkeypatch, tmp_path)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_presence_runner(monkeypatch):
+    """The injected-runner registry is process-global; keep each test's own out of the next."""
+    from ouroboros import presence_carrier
+    monkeypatch.setattr(presence_carrier, "_RUNNERS", {})
+
+
+def _inject(tmp_path, runner):
+    """Create a Host app whose conversation-lane carrier runs this test's presence runner (1A seam)."""
+    from ouroboros.presence_carrier import set_presence_runner
+    set_presence_runner(tmp_path, runner)
+    return create_host_service_app(tmp_path, presence_runner=runner)
 
 
 class FakeBridge:
@@ -27,21 +54,32 @@ class FakeBridge:
         self._subs.pop(subscription_id, None)
 
 
+@pytest.fixture
+def panic_bridge(native_guard, monkeypatch):  # noqa: F811 — imported pytest fixture
+    from ouroboros.server_control import PanicIngress
+
+    bridge = FakeBridge()
+    bridge.stopped = threading.Event()
+    bridge.panic = PanicIngress(bridge.stopped.set)  # no process coordinator
+    monkeypatch.setattr('ouroboros.panic_source.record_source', lambda *a, **kw: None)
+    yield bridge
+    for thread in threading.enumerate():
+        if thread.name == 'panic-ingress':
+            thread.join(timeout=3)
+            assert not thread.is_alive()
+
+
 def _seed_presence_behavior(data_dir: pathlib.Path, *, account_wide: bool = False) -> str:
-    from ouroboros.presence_bindings import (
-        PresenceBinding,
-        PresenceEndpoint,
-        new_presence_binding_id,
-        save_presence_binding,
-    )
-    from ouroboros.presence_capabilities import (
+    from ouroboros.presence_bindings import PresenceBinding, PresenceEndpoint
+    from tests.frozen_presence_bindings import new_presence_binding_id, save_presence_binding
+    from tests.frozen_presence_capabilities import (
         PresenceSelection,
         PresenceState,
         PresenceToolTarget,
         presence_state_fingerprint,
         save_presence_state,
     )
-    from ouroboros.presence_profile import parse_presence_profile, presence_request_fingerprint
+    from tests.frozen_presence_profile import parse_presence_profile, presence_request_fingerprint
     from ouroboros.skill_loader import load_skill
 
     skill_dir = data_dir / "skills" / "external" / "community-helper"
@@ -129,7 +167,7 @@ subscribe_events: [{", ".join(topics)}]
         requested_keys=[],
         granted_permissions=list(permissions or []),
         requested_permissions=[
-            *(permission for permission in ("inject_chat", "presence") if permission in manifest_perms),
+            *(permission for permission in ("inject_chat", "presence", "notify_owner") if permission in manifest_perms),
             *(
                 f"subscribe_event:{topic}"
                 for topic in topics
@@ -205,20 +243,27 @@ def test_identity_accepts_advisory_pass_review(tmp_path: pathlib.Path) -> None:
     assert client.get("/identity", headers={"X-Skill-Token": "token"}).status_code == 200
 
 
-def test_chat_inject_allows_slash_commands_from_reviewed_skill(tmp_path: pathlib.Path) -> None:
+@pytest.mark.parametrize('text', [' /panic', '/status'])
+def test_chat_inject_reviewed_skill_cannot_bind_panic_owner(tmp_path: pathlib.Path, panic_bridge, text) -> None:
     _seed_token(tmp_path, permissions=["inject_chat"])
-    bridge = FakeBridge()
+    bridge = panic_bridge
     app = create_host_service_app(tmp_path, bridge_getter=lambda: bridge)
     client = TestClient(app)
 
     response = client.post(
         "/chat/inject",
         headers={"X-Skill-Token": "token"},
-        json={"text": " /panic", "chat_id": 1},
+        json={"text": text, "chat_id": 1},
     )
 
-    assert response.status_code == 202
-    assert bridge.messages[0]["text"] == " /panic"
+    if text.strip() == '/panic':
+        assert response.status_code == 503
+        assert 'not authorized' in response.json()['error']
+        assert bridge.messages == []
+    else:
+        assert response.status_code == 202
+        assert bridge.messages[0]['text'] == text
+    assert not bridge.stopped.is_set()
 
 
 def test_presence_turn_resolves_binding_and_returns_typed_result(tmp_path: pathlib.Path) -> None:
@@ -236,7 +281,7 @@ def test_presence_turn_resolves_binding_and_returns_typed_result(tmp_path: pathl
         captured.update(kwargs)
         return SimpleNamespace(outcome="message", text="Hello back", task_id="turn-1", work_ref="")
 
-    app = create_host_service_app(tmp_path, presence_runner=run_presence)
+    app = _inject(tmp_path, run_presence)
     client = TestClient(app)
     response = client.post(
         "/presence/turn",
@@ -298,18 +343,15 @@ def test_presence_turn_attachment_refusal_returns_complete_typed_manifest(
     class Agent:
         def handle_task(self, task):
             agent_calls.append(task)
+            write_task_result(tmp_path, task["id"], "completed", metadata=task["metadata"], result="ok")
             return [{"type": "presence_result", "outcome": "message", "text": "ok"}]
 
     def run_real_presence(**kwargs):
-        return run_presence_turn(
-            repo_dir=repo,
-            drive_root=tmp_path,
-            agent_factory=lambda **_kwargs: Agent(),
-            gate=PresenceTurnGate(1),
-            **kwargs,
-        )
+        # The carrier's body calls the runner with its own repo, drive and factory; the test's win.
+        kwargs.update(repo_dir=repo, drive_root=tmp_path, agent_factory=lambda **_kwargs: Agent())
+        return run_presence_turn(gate=PresenceTurnGate(1), **kwargs)
 
-    client = TestClient(create_host_service_app(tmp_path, presence_runner=run_real_presence))
+    client = TestClient(_inject(tmp_path, run_real_presence))
     response = client.post(
         "/presence/turn",
         headers={"X-Skill-Token": "presence-token"},
@@ -369,19 +411,16 @@ def test_presence_turn_host_passes_attachment_limit_to_canonical_staging_owner(
     class Agent:
         def handle_task(self, task):
             agent_calls.append(task)
+            write_task_result(tmp_path, task["id"], "completed", metadata=task["metadata"], result="ok")
             return [{"type": "presence_result", "outcome": "message", "text": "ok"}]
 
     def run_real_presence(**kwargs):
-        return run_presence_turn(
-            repo_dir=repo,
-            drive_root=tmp_path,
-            agent_factory=lambda **_kwargs: Agent(),
-            gate=PresenceTurnGate(1),
-            **kwargs,
-        )
+        # The carrier's body calls the runner with its own repo, drive and factory; the test's win.
+        kwargs.update(repo_dir=repo, drive_root=tmp_path, agent_factory=lambda **_kwargs: Agent())
+        return run_presence_turn(gate=PresenceTurnGate(1), **kwargs)
 
     response = TestClient(
-        create_host_service_app(tmp_path, presence_runner=run_real_presence)
+        _inject(tmp_path, run_real_presence)
     ).post(
         "/presence/turn",
         headers={"X-Skill-Token": "presence-token"},
@@ -441,19 +480,16 @@ def test_presence_turn_host_passes_internal_missing_and_directory_to_staging_own
     class Agent:
         def handle_task(self, task):
             agent_calls.append(task)
+            write_task_result(tmp_path, task["id"], "completed", metadata=task["metadata"], result="ok")
             return [{"type": "presence_result", "outcome": "message", "text": "ok"}]
 
     def run_real_presence(**kwargs):
-        return run_presence_turn(
-            repo_dir=repo,
-            drive_root=tmp_path,
-            agent_factory=lambda **_kwargs: Agent(),
-            gate=PresenceTurnGate(1),
-            **kwargs,
-        )
+        # The carrier's body calls the runner with its own repo, drive and factory; the test's win.
+        kwargs.update(repo_dir=repo, drive_root=tmp_path, agent_factory=lambda **_kwargs: Agent())
+        return run_presence_turn(gate=PresenceTurnGate(1), **kwargs)
 
     response = TestClient(
-        create_host_service_app(tmp_path, presence_runner=run_real_presence)
+        _inject(tmp_path, run_real_presence)
     ).post(
         "/presence/turn",
         headers={"X-Skill-Token": "presence-token"},
@@ -618,9 +654,7 @@ def test_presence_work_returns_only_correlated_terminal_result(tmp_path: pathlib
     )
     binding_id = _seed_presence_behavior(tmp_path)
     work_ref = "presence-work-1"
-    atomic_write_json(
-        tmp_path / "task_results" / f"{work_ref}.json",
-        {
+    seed_result(tmp_path, work_ref, {
             "_schema_version": 1,
             "task_id": work_ref,
             "status": "completed",
@@ -630,8 +664,7 @@ def test_presence_work_returns_only_correlated_terminal_result(tmp_path: pathlib
                 "presence_outcome": "message",
                 "presence_result_text": "late answer",
             },
-        },
-    )
+        })
     app = create_host_service_app(tmp_path, presence_runner=lambda **_kwargs: None)
     client = TestClient(app)
 
@@ -647,12 +680,13 @@ def test_presence_work_returns_only_correlated_terminal_result(tmp_path: pathlib
         "outcome": "message",
         "text": "late answer",
         "work_ref": work_ref,
+        "task_id": work_ref,
+        "output_ref": "",
+        "child_work_ref": "",
         "delivery_reporting_version": 0,
     }
 
-    atomic_write_json(
-        tmp_path / "task_results" / f"{work_ref}.json",
-        {
+    seed_result(tmp_path, work_ref, {
             "_schema_version": 1,
             "task_id": work_ref,
             "status": "completed",
@@ -662,8 +696,7 @@ def test_presence_work_returns_only_correlated_terminal_result(tmp_path: pathlib
                 "presence_outcome": "deferred",
                 "presence_result_text": "late deferred answer",
             },
-        },
-    )
+        })
     deferred = client.get(
         f"/presence/work/{work_ref}",
         params={"binding_id": binding_id},
@@ -671,6 +704,8 @@ def test_presence_work_returns_only_correlated_terminal_result(tmp_path: pathlib
     )
     assert deferred.status_code == 200
     assert deferred.json()["text"] == "late deferred answer"
+    assert {key: deferred.json()[key] for key in ("task_id", "output_ref", "child_work_ref")} == {
+        "task_id": work_ref, "output_ref": "", "child_work_ref": ""}
 
     wrong = client.get(
         f"/presence/work/{work_ref}",
@@ -717,21 +752,28 @@ def test_chat_inject_preserves_transport_metadata(tmp_path: pathlib.Path) -> Non
     assert bridge.messages[0]["transport"] == {"kind": "messenger", "conversation_id": "abc", "sender_label": "Messenger"}
 
 
-def test_chat_inject_defaults_missing_ids_to_non_owner_sentinel(tmp_path: pathlib.Path) -> None:
+@pytest.mark.parametrize('text', ['/panic', 'hello'])
+def test_chat_inject_defaults_missing_ids_to_non_owner_sentinel(tmp_path: pathlib.Path, panic_bridge, text) -> None:
     _seed_token(tmp_path, skill="transport_bridge", token="token", permissions=["inject_chat"])
-    bridge = FakeBridge()
+    bridge = panic_bridge
+    bridge.panic._owner = [True, (17, 23)]  # positively observed owner; absent ids cannot borrow it
     app = create_host_service_app(tmp_path, bridge_getter=lambda: bridge)
     client = TestClient(app)
 
     response = client.post(
         "/chat/inject",
         headers={"X-Skill-Token": "token"},
-        json={"text": "/panic"},
+        json={"text": text},
     )
 
-    assert response.status_code == 202
-    assert bridge.messages[0]["chat_id"] == 0
-    assert bridge.messages[0]["user_id"] == 0
+    if text == '/panic':
+        assert response.status_code == 503
+        assert bridge.messages == []
+    else:
+        assert response.status_code == 202
+        assert bridge.messages[0]["chat_id"] == 0
+        assert bridge.messages[0]["user_id"] == 0
+    assert not bridge.stopped.is_set()
 
 
 def test_chat_inject_wait_for_response_unsubscribes(tmp_path: pathlib.Path) -> None:
@@ -815,9 +857,19 @@ def test_chat_inject_rejects_disabled_skill_token(tmp_path: pathlib.Path) -> Non
     assert response.status_code == 403
 
 
-def test_chat_inject_rejects_failed_review_token(tmp_path: pathlib.Path, monkeypatch) -> None:
-    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
-    _seed_token(tmp_path, skill="failed", token="token", permissions=["inject_chat"], review_status="blockers")
+def _seed_blocker_token(data_dir: pathlib.Path, strict_source: bool) -> None:
+    """A token of a skill whose review found blockers; a source that reviews each skill keeps them for the owner."""
+    from ouroboros.skill_install_record import write_install_record
+
+    _seed_token(data_dir, skill="failed", token="token", permissions=["inject_chat"], review_status="blockers")
+    if strict_source:
+        write_install_record(data_dir, "failed", {"basis": "review", "release": {"digest": "d"}, "source": {"id": "hub"}})
+
+
+@pytest.mark.parametrize("strict_source,status", [(False, 202), (True, 403)])
+def test_chat_inject_follows_the_review_gate_of_a_token_with_blocker_findings(tmp_path: pathlib.Path, strict_source,
+                                                                              status) -> None:
+    _seed_blocker_token(tmp_path, strict_source)
     app = create_host_service_app(tmp_path, bridge_getter=FakeBridge)
     client = TestClient(app)
 
@@ -827,18 +879,19 @@ def test_chat_inject_rejects_failed_review_token(tmp_path: pathlib.Path, monkeyp
         json={"text": "hello", "chat_id": 1},
     )
 
-    assert response.status_code == 403
+    assert response.status_code == status
 
 
-def test_identity_rejects_failed_review_token(tmp_path: pathlib.Path, monkeypatch) -> None:
-    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
-    _seed_token(tmp_path, skill="failed", token="token", permissions=["inject_chat"], review_status="blockers")
+@pytest.mark.parametrize("strict_source,status", [(False, 200), (True, 403)])
+def test_identity_follows_the_review_gate_of_a_token_with_blocker_findings(tmp_path: pathlib.Path, strict_source,
+                                                                           status) -> None:
+    _seed_blocker_token(tmp_path, strict_source)
     app = create_host_service_app(tmp_path, bridge_getter=FakeBridge)
     client = TestClient(app)
 
     response = client.get("/identity", headers={"X-Skill-Token": "token"})
 
-    assert response.status_code == 403
+    assert response.status_code == status
 
 
 def test_events_websocket_receives_granted_topic(tmp_path: pathlib.Path) -> None:
@@ -880,20 +933,30 @@ def test_events_websocket_rejects_ungranted_topic(tmp_path: pathlib.Path) -> Non
     assert "lacks grant" in message["error"]
 
 
-def test_chat_inject_allows_slash_command_caption(tmp_path: pathlib.Path) -> None:
+@pytest.mark.parametrize('user_id,chat_id', [(0, 1), (17, 99), (99, 23)])
+def test_chat_inject_panic_caption_requires_bound_owner(tmp_path: pathlib.Path, panic_bridge, user_id, chat_id) -> None:
     _seed_token(tmp_path, permissions=["inject_chat"])
-    bridge = FakeBridge()
+    bridge = panic_bridge
+    bridge.panic._owner = [True, (17, 23)]  # same cached binding as the production emergency door
     app = create_host_service_app(tmp_path, bridge_getter=lambda: bridge)
     client = TestClient(app)
 
+    assert client.post('/chat/inject', json={'text': '/panic', 'chat_id': 23, 'user_id': 17}).status_code == 403
+    assert not bridge.stopped.is_set() and bridge.messages == []
     response = client.post(
         "/chat/inject",
         headers={"X-Skill-Token": "token"},
-        json={"text": "", "image_caption": "/panic", "chat_id": 1},
+        json={"text": "", "image_caption": "/panic", "chat_id": chat_id, "user_id": user_id},
     )
 
-    assert response.status_code == 202
-    assert bridge.messages[0]["image_caption"] == "/panic"
+    if (user_id, chat_id) == (17, 23):
+        assert response.status_code == 202
+        assert response.json() == {"ok": True, "status": "accepted"}
+        assert bridge.stopped.wait(3)
+    else:
+        assert response.status_code == 503
+        assert not bridge.stopped.is_set()
+    assert bridge.messages == [], 'accepted and refused Panic both bypass ordinary admission'
 
 
 def test_chat_inject_allows_slash_command_caption_even_with_text(tmp_path: pathlib.Path) -> None:
@@ -911,3 +974,9 @@ def test_chat_inject_allows_slash_command_caption_even_with_text(tmp_path: pathl
     assert response.status_code == 202
     assert bridge.messages[0]["text"] == "photo"
     assert bridge.messages[0]["image_caption"] == "/panic"
+
+
+@pytest.fixture(autouse=True)
+def _focus_authority_available(monkeypatch):
+    monkeypatch.setattr("ouroboros.presence_admission.focus_enabled", lambda _root: True)
+    monkeypatch.setattr("ouroboros.presence_admission.focus_allowance", lambda _root: {"status": "available", "remaining_usd": 10})

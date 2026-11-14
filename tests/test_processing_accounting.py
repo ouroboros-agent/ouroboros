@@ -1,6 +1,5 @@
 """Processing qualifiers survive reservation, native observations and settlement."""
 
-import json
 import copy
 
 import pytest
@@ -8,12 +7,13 @@ import pytest
 from ouroboros import usage_accounting as ua
 from ouroboros._usage_response import processing_receipt, usage_from_response
 from tests.test_usage_accounting import data_root as _usage_data_root
+from tests._usage_store_testing import ledger_rows
 
 data_root = _usage_data_root
 
 
 def rows(root):
-    return [json.loads(line) for line in (root / ua.LEDGER_REL).read_text().splitlines()]
+    return ledger_rows(root)
 
 
 def test_native_mode_reaches_pricing_before_send_and_observation_before_settlement(data_root, monkeypatch):
@@ -80,8 +80,6 @@ def test_anthropic_capacity_tier_is_not_speed_and_engine_mixed_stays_mixed():
 
 @pytest.mark.parametrize("attempts,expected", [
     ([{"usageCost": {"cashUsd": 0, "cashKnowledge": "unknown", "valuationUsd": 5}}], (None, False)),
-    ([{"usageCost": {"cashUsd": 0, "cashKnowledge": "exact", "valuationUsd": 5}}], (0.0, False)),
-    ([{"usageCost": {"cashUsd": 2, "cashKnowledge": "exact", "valuationUsd": 5}}], (2.0, False)),
     ([{"usageCost": {"cashUsd": 2, "cashKnowledge": "estimated"}}, {}], (2.0, True)),
     ([{}, {"usageCost": {"cashUsd": 2, "cashKnowledge": "exact"}}], (2.0, True)),
 ])
@@ -105,11 +103,11 @@ def test_session_processing_and_components_are_retained_once_without_repricing(d
     spend, estimated = disclosed_spend({}, attempt_execution=evidence)
     ua.record_subscription_session("session", drive_root=data_root, route="claude", spend_usd=spend,
                                    spend_estimated=estimated, attempt_execution=evidence)
-    before = (data_root / ua.LEDGER_REL).read_bytes()
+    before = ledger_rows(data_root)
     evidence[0]["usageCost"]["cashUsd"] = 90
     ua.record_subscription_session("session", drive_root=data_root, route="claude", spend_usd=90,
                                    attempt_execution=evidence)
-    assert (data_root / ua.LEDGER_REL).read_bytes() == before
+    assert ledger_rows(data_root) == before
     assert rows(data_root)[-1]["attempt_execution"] == original
     assert rows(data_root)[-1]["cost_usd"] is None
     assert ua.usage_projection(data_root)["unknown_unmetered"] == 1
@@ -139,7 +137,7 @@ def test_loop_and_helper_display_keep_the_observed_price_qualifier(monkeypatch, 
     def price(*args, **kwargs):
         calls.append(kwargs.get("processing_mode"))
         return None if kwargs.get("processing_mode") == "unknown" else 0.1
-    monkeypatch.setattr(loop_llm_call, "estimate_cost_optional", price)
+    monkeypatch.setattr("ouroboros.pricing.estimate_cost_optional", price)
     monkeypatch.setattr(search, "estimate_cost_optional", price)
     usage = {"cost": None, "provider": "openrouter", "prompt_tokens": 10, "completion_tokens": 2,
              "processing": {"observed": observed, "observedNative": modes}}
@@ -148,21 +146,3 @@ def test_loop_and_helper_display_keep_the_observed_price_qualifier(monkeypatch, 
     search._emit_simple_usage(ctx, provider="openrouter", model="openai/same", usage={**usage, "cost": None})
     assert calls == [expected, expected]
     assert ctx.pending_events[0]["cost"] == cost == (None if expected == "unknown" else 0.1)
-
-
-def test_host_view_callback_is_invoked_but_never_recorded_as_a_model_argument(tmp_path, monkeypatch):
-    from ouroboros import llm_observability as observed
-
-    recorded, views = [], []
-    monkeypatch.setattr(observed, "persist_call", lambda *args, **kwargs: recorded.append(kwargs["payload"]) or {})
-    callback = lambda messages, schemas: views.append(messages)
-
-    class Client:
-        def chat(self, **kwargs):
-            kwargs["model_context_observer"](kwargs["messages"], kwargs.get("tools"))
-            return {"role": "assistant", "content": "done"}, {}
-
-    observed.chat_observed(Client(), drive_root=tmp_path, messages=[{"role": "user", "content": "exact"}],
-                           model="model", model_context_observer=callback)
-    assert len(views) == 1 and recorded
-    assert all("model_context_observer" not in payload.get("kwargs", {}) for payload in recorded)

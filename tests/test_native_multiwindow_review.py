@@ -10,10 +10,11 @@ import pytest
 
 from ouroboros import review_native_episode as native
 from ouroboros.artifacts import read_actor_source_bytes
+from ouroboros.tools.scope_required_sources import REQUIRED_SOURCE_ROOT
 from tests.test_native_tool_round_executor import _assignment, _tool_call, _ScriptedLLM
 
 
-def _source(path, root="system_repo"):
+def _source(path, root=REQUIRED_SOURCE_ROOT):
     raw = path.read_bytes()
     text = raw.decode().replace("\r\n", "\n").replace("\r", "\n")
     return {"root": root, "path": path.name, "source_revision": hashlib.sha256(raw).hexdigest(),
@@ -41,7 +42,14 @@ class ContractReviewer:
         tools = [m for m in messages if m.get("role") == "tool"]
         response = tools[-1]["content"] if tools else None
         if self.stage in {"writer", "reader"} and response is not None and self.cursor:
-            body = response.partition("\n")[2].partition("\n⚠️ RESULT TRUNCATED:")[0]
+            from ouroboros.tools.core_file_tools import _render_line_slice, delivered_source_prefix
+
+            view = {}
+            _render_line_slice("source", (self.repo / f"{self.stage}.py").read_text(encoding="utf-8"),
+                               start_line=1, max_lines=3, start_char=len(self.buffer), extent=view)
+            view["body_start"] = response.find("\n") + 1
+            visible = response.partition("\n⚠️ RESULT TRUNCATED:")[0]
+            body = delivered_source_prefix(view, visible, len(visible))
             assert body
             self.buffer += body
             if "RESULT TRUNCATED:" not in response:
@@ -71,10 +79,15 @@ class ContractReviewer:
                             "recommendation": "Use matching producer and consumer units."})
                 return {"content": json.dumps(self.findings)}, {"cost": 0.0}
         if self.stage == "inspect":
-            inspected = json.loads(response)
+            # This actor only needs the revision to replace all completed units.
+            # The richer unit/source inventory may be a disclosed partial JSON
+            # view under this deliberately tiny 8K result cap. Decode the exact
+            # visible revision field, not the incomplete object or unseen units.
+            revision, _ = json.JSONDecoder().raw_decode(
+                response.split('"view_revision":', 1)[1].lstrip())
             self.stage = "apply"
             note, self.note = self.note, None
-            return self._call("compact_context", {"expected_view_revision": inspected["view_revision"],
+            return self._call("compact_context", {"expected_view_revision": revision,
                                                     "working_note": note, "keep_unit_ids": []})
         if self.stage == "apply":
             # No producer source, table or witness remains in the fake model.
@@ -100,13 +113,13 @@ def test_native_review_reads_beyond_one_window_and_computes_cross_file_finding(t
     if broken:
         table["route_2137"] = 1
     reader = "FROM_WIRE = " + repr(table) + "\ndef decode(message): return message['ttl'] / FROM_WIRE[message['route']]\n"
-    (repo / "writer.py").write_text(writer)
-    (repo / "reader.py").write_text(reader)
-    bound = 120_000
-    assert len(writer) + len(reader) > bound
-    monkeypatch.setattr(native, "review_native_transcript_bound", lambda *a, **k: bound)
+    (repo / "writer.py").write_text(writer, encoding="utf-8")
+    (repo / "reader.py").write_text(reader, encoding="utf-8")
+    # The reviewer chooses two working views; the read page is a delivery limit.
+    assert len(writer) + len(reader) > 140_000
     monkeypatch.setattr(native, "_EPISODE_TOOL_RESULT_CHAR_CAP", 8000)
     llm = ContractReviewer()
+    llm.repo = repo
     executor = _native(repo, data, llm, [_source(repo / "writer.py"), _source(repo / "reader.py")])
     result = executor.execute()
     findings = json.loads(result.raw_text)
@@ -117,7 +130,8 @@ def test_native_review_reads_beyond_one_window_and_computes_cross_file_finding(t
     assert result.usage["native_read_coverage"]["status"] == "complete"
     assert "native_incomplete" not in result.message
     sizes = [native._wire_size(call["messages"], call["tools"]) for call in llm.calls]
-    assert max(sizes) <= bound and any(b < a / 2 for a, b in zip(sizes, sizes[1:]))
+    assert any(b < a / 2 for a, b in zip(sizes, sizes[1:]))
+    assert "native_transcript_bound" not in result.usage
     assert any(r.get("text_chars", 0) > 0 and r["end_line"] < r["start_line"] for r in executor._tool_receipts)
     history = json.loads(read_actor_source_bytes(data, "t-native", result.usage["native_history_source"]))
     assert len(history["round_sources"]) == len(llm.calls)
@@ -130,7 +144,7 @@ def test_native_review_reads_beyond_one_window_and_computes_cross_file_finding(t
 def test_more_than_200_observed_reads_close_the_required_source(tmp_path):
     repo, data = tmp_path / "repo", tmp_path / "data"
     repo.mkdir()
-    (repo / "part.txt").write_text("first\nsecond\n")
+    (repo / "part.txt").write_text("first\nsecond\n", encoding="utf-8")
     calls = [{"tool_calls": [_tool_call("read_file", {"path": "part.txt", "max_lines": 1}, f"c{i}")]}
              for i in range(200)]
     calls += [{"tool_calls": [_tool_call("read_file", {"path": "part.txt", "start_line": 2}, "last")]},
@@ -168,7 +182,7 @@ def test_same_normalized_text_on_a_new_raw_revision_cannot_complete_old_coverage
 def test_read_not_carried_by_another_physical_send_does_not_count_as_delivered(tmp_path):
     repo, data = tmp_path / "repo", tmp_path / "data"
     repo.mkdir()
-    (repo / "file.txt").write_text("source\n")
+    (repo / "file.txt").write_text("source\n", encoding="utf-8")
 
     class FailsBeforeSend(_ScriptedLLM):
         def chat(self, **kwargs):
@@ -185,22 +199,22 @@ def test_read_not_carried_by_another_physical_send_does_not_count_as_delivered(t
     assert usage["native_read_coverage"]["status"] == "incomplete"
 
 
-def test_scope_brief_states_the_read_provenance_each_delivery_produces(tmp_path):
-    """The brief's pre-run manifest states WHICH provenance this row's receipts
+def test_two_part_brief_states_the_read_provenance_each_delivery_produces(tmp_path):
+    """The brief's pre-run manifest states WHICH provenance this seat's receipts
     will carry — host-executed for a native episode, parsed from the harness
     journal for a delegated session — instead of the blanket `unobserved` that
     described neither. It is never a claim that a source WAS read: that is the
     post-run coverage fact. (Window size still never rewrites a finding; that
-    invariant is pinned in tests/test_review_session_scope_wiring.py.)"""
-    from ouroboros.tools import scope_review_session as session
+    invariant is pinned in tests/test_review_brief_coupling.py.)"""
+    from ouroboros.tools import review_brief_coupling as brief_mod
     from ouroboros.tools.scope_required_sources import required_sources_ref
     path = tmp_path / "source.py"
     path.write_text("def actual_behavior(): return 1\n", encoding="utf-8")
     required = [_source(path)]
     ref = required_sources_ref(required)
-    task, manifest = session.build_scope_session_task(tmp_path, session.ScopeBriefInputs(
+    task, manifest = brief_mod.build_retrieving_brief(tmp_path, brief_mod.BriefInputs(
         commit_message="Review the change",
-        intent=session.ScopeIntentContext(goal="Check the actual behavior"),
+        intent=brief_mod.BriefIntent(goal="Check the actual behavior"),
         required_sources=required, required_sources_ref=ref))
     assert manifest["native_required_sources"] == required
     assert manifest["native_required_sources_ref"] == ref
@@ -208,7 +222,7 @@ def test_scope_brief_states_the_read_provenance_each_delivery_produces(tmp_path)
     assert "host_file_read_attestation" not in manifest
     assert ref["sha256"] in task and "independent from your working window" in task
 
-    _task, delegated = session.build_scope_session_task(tmp_path, session.ScopeBriefInputs(
+    _task, delegated = brief_mod.build_retrieving_brief(tmp_path, brief_mod.BriefInputs(
         commit_message="Review the change", delegated=True,
         required_sources=required, required_sources_ref=ref))
     assert delegated["read_provenance_expected"] == "harness_observed"
@@ -256,6 +270,50 @@ def test_no_declared_manifest_at_all_stays_unobserved(tmp_path):
     assert coverage["status"] == "unobserved"
     assert coverage["reason"] == "required_source_manifest_missing"
     assert "native_incomplete" not in result.usage
+
+
+@pytest.mark.parametrize("required", ["absent", "empty", "unread"])
+def test_the_required_key_decides_the_fold_and_an_observed_source_stays_apart(tmp_path, required):
+    """As a session chooses: a required manifest's key, an empty one included, decides what `native_read_coverage`
+    folds; without the key it is the observed sources. Only a required source can owe a capability delta, and a read
+    of an observed source is measured either way. The answer and the sends are the same in all three."""
+    repo, data = tmp_path / "repo", tmp_path / "data"
+    repo.mkdir()
+    (repo / "owed.txt").write_text("owed body\n", encoding="utf-8")
+    (repo / "room.txt").write_text("first\nsecond\n", encoding="utf-8")
+    llm = _ScriptedLLM([{"tool_calls": [_tool_call("read_file", {"path": "room.txt", "max_lines": 1})]}, {"content": "[]"}])
+    assignment = dataclasses.replace(_assignment(repo, llm), custody_root=data)
+    assignment.request.policy["observed_sources"] = [_source(repo / "room.txt")]
+    if required != "absent":
+        assignment.request.policy["native_required_sources"] = [] if required == "empty" else [_source(repo / "owed.txt")]
+    result = native.NativeToolRoundReviewExecutor(assignment, llm=llm).execute()
+    coverage = result.usage["native_read_coverage"]
+    observed = coverage if required == "absent" else result.usage["observed_read_coverage"]
+    assert [(row["path"], row["status"], row["covered_chars"]) for row in observed["sources"]] == [("room.txt", "incomplete", 6)]
+    if required == "absent":
+        assert "observed_read_coverage" not in result.usage and "native_incomplete" not in result.usage
+    elif required == "empty":
+        assert (coverage["status"], coverage["reason"]) == ("complete", "declared_empty") and "native_incomplete" not in result.usage
+    else:
+        assert coverage["sources"][0]["path"] == "owed.txt" and result.usage["native_incomplete"] == "required_source_coverage_incomplete"
+    assert bool(result.usage.get("capability_delta")) is (required == "unread")
+    assert result.raw_text == "[]" and len(llm.calls) == 2
+    history = json.loads(read_actor_source_bytes(data, "t-native", result.usage["native_history_source"]))
+    assert history["observed_sources"][0]["path"] == "room.txt" and history["read_receipts"]
+
+
+def test_a_required_row_with_no_inspection_context_implies_no_measurement(tmp_path):
+    """Nothing was measured: the fold says so, the row holds no count and it is still listed as not covered."""
+    from ouroboros.tools.scope_required_sources import coverage_state, uncovered_sources
+
+    repo, data = tmp_path / "repo", tmp_path / "data"
+    repo.mkdir()
+    (repo / "owed.txt").write_text("owed body\n", encoding="utf-8")
+    executor = _native(repo, data, _ScriptedLLM([]), [_source(repo / "owed.txt")])
+    coverage = executor._read_coverage()
+    assert coverage["reason"] == "native_inspection_unavailable" and coverage_state(coverage) == "unobserved"
+    assert "covered_chars" not in coverage["sources"][0]
+    assert uncovered_sources(coverage) == ["owed.txt"]
 
 
 @pytest.mark.parametrize("inline", [False, True])

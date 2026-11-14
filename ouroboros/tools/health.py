@@ -1,6 +1,6 @@
 """Codebase health tool — complexity metrics and self-assessment."""
 
-from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, completed_local_read
 
 import logging
 import pathlib
@@ -10,6 +10,7 @@ from ouroboros.tools.registry import ToolContext, ToolEntry
 log = logging.getLogger(__name__)
 
 
+@completed_local_read
 def _codebase_health(ctx: ToolContext) -> str:
     """Compute and format codebase health report."""
     try:
@@ -45,11 +46,17 @@ def _codebase_health(ctx: ToolContext) -> str:
         lines.append(f"**Max function length:** {metrics['max_function_length']} lines")
         lines.append("\n### Size Headroom (information; official CI enforces the limits)")
         lines.extend(size_headroom_lines(inventory))
+        from ouroboros.reference_books import BOOK_GROWTH_RULE, book_balances, render_book_balance
+
+        books = book_balances(repo_dir)
+        if books:
+            lines.append("\n### Text growth (information; contribution-base measurement)")
+            lines.extend(f"  {render_book_balance(balance)}" for balance in books)
+            lines.append(f"  {BOOK_GROWTH_RULE}")
 
         from ouroboros.review import (
             MAX_FUNCTION_LINES,
             MAX_MODULE_LINES,
-            MAX_TOTAL_FUNCTIONS,
             TARGET_FUNCTION_LINES,
             TARGET_MODULE_LINES,
         )
@@ -85,7 +92,6 @@ def _codebase_health(ctx: ToolContext) -> str:
         grandfathered_mods = metrics.get("grandfathered_modules", [])
         oversized_funcs = metrics.get("oversized_functions", [])
         oversized_mods = metrics.get("oversized_modules", [])
-        function_count_violation = int(metrics.get("total_functions") or 0) > MAX_TOTAL_FUNCTIONS
 
         if (
             oversized_funcs
@@ -94,11 +100,8 @@ def _codebase_health(ctx: ToolContext) -> str:
             or grandfathered_mods
             or target_drift_funcs
             or target_drift_mods
-            or function_count_violation
         ):
             lines.append("\n### Complexity Status (Principle 7: Minimalism)")
-            if function_count_violation:
-                lines.append(f"  Hard-limit total functions > {MAX_TOTAL_FUNCTIONS}: {metrics['total_functions']}")
             if oversized_funcs:
                 lines.append(f"  Hard-limit functions > {MAX_FUNCTION_LINES} lines: {len(oversized_funcs)}")
                 for path, start, length in oversized_funcs:
@@ -124,11 +127,11 @@ def _codebase_health(ctx: ToolContext) -> str:
         else:
             lines.append(
                 "\n✅ No hard P7 limit violations detected "
-                f"(all functions <= {MAX_FUNCTION_LINES} lines, total function count <= {MAX_TOTAL_FUNCTIONS}, "
+                f"(all functions <= {MAX_FUNCTION_LINES} lines, "
                 f"all non-grandfathered modules <= {MAX_MODULE_LINES} lines)"
             )
 
-        # Size-ratchet validator findings (manifest exactness + shrink-only
+        # Size-ratchet validator findings (manifest matches the tree + shrink-only
         # transition). The official repository CI `size_ratchet` lane is the
         # enforcing surface; this report and check_worktree_readiness only warn.
         try:
@@ -143,7 +146,10 @@ def _codebase_health(ctx: ToolContext) -> str:
                 for finding in ratchet_findings:
                     lines.append(f"  - {finding}")
             else:
-                lines.append("\n✅ Size-ratchet manifest is exact and shrink-only against the committed authority")
+                lines.append(
+                    "\n✅ Size-ratchet manifest matches the live tree and is shrink-only "
+                    "against the committed authority"
+                )
 
         return "\n".join(lines)
 
@@ -158,7 +164,7 @@ def get_tools():
             "codebase_health",
             {
                 "name": "codebase_health",
-                "description": "Get codebase complexity metrics: file sizes, longest functions, modules exceeding limits. Useful for self-assessment per Bible Principle 7 (Minimalism).",
+                "description": "Measure the complexity of Ouroboros's own checkout: file sizes, longest functions, modules exceeding limits. Useful for self-assessment per Bible Principle 7 (Minimalism).",
                 "parameters": {"type": "object", "properties": {}, "required": []},
             },
             _codebase_health,

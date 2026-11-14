@@ -1,21 +1,47 @@
-import { escapeHtmlAttr, escapeHtmlText as escapeHtml } from './utils.js';
-import { destroyChatMarkdown, enhanceChatMarkdown, renderChatMarkdown } from './chat_markdown.js';
+import { escapeHtmlAttr, isoMicros } from './utils.js';
+import { bindMarkdownTables, destroyChatMarkdown, enhanceChatMarkdown, mountChatMarkdown } from './chat_markdown.js';
 import { renderPageHeader } from './page_header.js';
-import { PAGE_ICONS } from './page_icons.js';
+import { renderSkillIcon, strokeIcon } from './page_icons.js';
+import { bindScrollFade } from './scroll_fade.js';
+import { createRoomHeader, mainHeaderActionsHtml } from './chat_header.js';
+import { pageLabel } from './pages.js';
 import { showToast } from './toast.js';
-import { createSystemMessageAction, createSystemMessageActions, renderProjectChip } from './ui_helpers.js';
-import { bindComposerFileTargets, cleanupUploadedAttachments, createChatMedia, showTaskIncidentToast } from './chat_media.js';
+import { ORIGIN_ADDRESSED_NOTICE_TYPES, childRowPlacement, replayConcludesTask } from './chat_row_placement.js';
+import { appendProjectRow, PROJECT_ROW_TYPES, refreshProjectAnswerFold, syncSavedProjectContext } from './project_answer.js';
+import { createWorkPortals, isPortal, reconcilePortalNotes } from './work_portal.js';
+import { createTaskEpisodes } from './task_episodes.js';
+import { markSwarmLabel, syncSwarmReceipt } from './swarm_presentation.js';
+import { syncCostBreakdown } from './cost_breakdown_presentation.js';
+import { createChatMedia, showTaskIncidentToast } from './chat_media.js';
+import { createTextBubbles } from './chat_text_bubble.js';
+import { createCatchUp } from './room_retire.js';
+import { createChatPreview } from './chat_preview.js';
+import { createUnconfirmedSends } from './chat_attachments.js';
 import { createChatDecision } from './chat_decision.js';
-import { bindProjectWorkPointer } from './project_work_pointer.js';
+import { createRoomWork } from './room_work.js';
+import { SERVER_ANSWERS_EVENT } from './ws.js';
+import { applyCardWorkViews, cardControls, cardMenuActions, changedOffers, emptyWorkState, openCardControls, ownStopPress, reconcileWorkState, roomStatusView } from './work_status.js';
+import { statusMarkHtml } from './status_mark.js';
+import { createMainWaiting } from './main_waiting.js';
+import { createHostStart } from './host_starting_status.js';
 import { createModelWaitController, isModelWaitReference } from './model_wait.js';
-import { clientSurfaceField } from './client_surface.js';
-import { createChatHistoryPager } from './chat_history.js';
-import { mergeHistoricalTimelineItem, historyNodeIsProtected, historyRowIds, stampHistoryNode, compareHistoryPosition } from './chat_history_replay.js';
-import { apiClient, apiFetch, fetchTaskDetail, fetchTaskDetailStrict } from './api_client.js';
+import { closingLine, syncClosingSentence, syncSettledItems } from './settled_card.js';
+import { createChatReadingPosition } from './chat_reading_position.js';
+import { createRowSleep } from './chat_row_sleep.js';
+import { onRefit } from './text_fit.js';
+import { createChatHistoryPager, historyCoverage, historyIslandAtEdge } from './chat_history.js';
+import { createProjectReadReceipt, isAtNewestMessage, newestMessageOffset, readBand } from './project_read_state.js';
+import { createSharedReadTracker } from './read_ahead.js';
+import { createReplayKeys, mergeHistoricalTimelineItem, historyNodeIsProtected, historyRowIds, historyStamps, stampHistoryNode, compareHistoryPosition } from './chat_history_replay.js';
+import { apiClient, apiFetch, fetchTaskDetail, fetchTaskDetailStrict, isStoreMigrating } from './api_client.js';
+import { readStateSnapshot } from './state_snapshots.js';
+import { syncHistoryRetentionItem } from './history_retention.js';
 import {
+    childReportLabel,
     getLogTaskGroupId,
     isGroupedTaskEvent,
     isTerminalTaskDetail,
+    lateOutcomeIsCurrent,
     normalizeLogTs,
     ownerHurryProjection,
     summarizeChatLiveEvent,
@@ -30,34 +56,32 @@ import {
 } from './log_events.js';
 import {
     ACTION_FINALIZE,
-    ACTION_HURRY,
     REUSABLE_TASK_IDS,
-    ACTION_RESUME,
     TASK_CONTROL_TRIGGER_LABEL,
     cancelRunEligibility,
-    hurryTaskAction,
-    openTaskControlMenu,
+    createTaskResumeButton,
     requestStop,
-    resumeTaskAction,
-    taskControlBusy,
 } from './task_control_menu.js';
-import { openConfirmDialog } from './confirm_dialog.js';
+import { composerMarkup, createComposer } from './composer.js';
+import { effortFact } from './effort_chip.js';
+import { mountEmptyChatWelcome } from './welcome_preference.js';
+import { createChatReplies } from './chat_reply.js';
+import { createHistoryReveal } from './chat_history_reveal.js';
+import { createChatRowMenu } from './chat_row_menu.js';
+import { clearTransientRoutingAnnotations } from './routing_receipt.js';
 import {
     captureLiveCardPhaseState,
+    censusTaskFacts,
     desiredLiveCardPhase,
+    liveCardCountBits,
+    markOwnerHurry,
     replayTerminalPhase,
     restoreLiveCardPhaseState,
     setLiveCardPhase,
-    setLiveCardTypingVisible,
     setHistoricalUnavailable,
     setHistoricalUnconfirmed,
+    syncParkedPhase,
 } from './task_phase_chip.js';
-import {
-    loadSkillReviewDetail,
-    nestedSkillReviewRef,
-    renderSkillReviewDisclosure,
-    wireSkillReviewDisclosure,
-} from './skill_review_card.js';
 import {
     classifyReviewLifecycle,
     classifyReviewLifecyclePointer,
@@ -77,97 +101,72 @@ import {
     createTimelineAnchors,
     insertTimelineNode,
     liveCardProjectionChanged,
+    keepSelection,
+    replayedEvidenceTs,
     syncLiveCardToggle,
+    timelineScroll,
     updateLiveTimelineItem,
+    childProgressKey,
     upsertToolFoldRow,
 } from './chat_render_batch.js';
+import { measure } from './layout_batch.js';
+import { placeCheckRow, placeReplayedEvidence } from './verification_presentation.js';
 import {
-    COLLAPSED_ACTIVITY_MAX,
     boundActivityPreview,
+    authoredLine,
+    authoredTitle,
     buildTimelineItemHtml,
     buildMessageKey,
     chatLogThreadAccepts,
     chatMediaMessageKey,
     chatThreadAccepts,
     clearStickyCardState,
-    clearTransientRoutingAnnotations,
-    confirmAndSendPanic,
-    computeDerivedChatStatus,
-    computeHydratedDirectActivities,
     documentMessageKey,
     durableChatMediaUrl,
     formatMsgTime,
     getOrCreateChatSessionId,
-    headerBudgetPresentation,
     isForegroundLiveCard,
-    isNonTerminalMediaHistoryRow,
     isReplayEvidenceRow,
     isTerminalTaskPhase,
-    loadChatInputHistory,
-    liveLineRowToggleKey,
-    bindContentButton,
+    markIngressSaved,
     bindLiveCardTimeline,
     subagentIdentityTitle,
     subagentTwin,
     mergeStickyCostMeta,
     applyToolObservation,
     noteToolHostMetrics,
+    toolEvidenceIncomplete,
     partitionLocalEchoJournal,
     projectCollapsedActivity,
     positiveTaskTerminalFact,
-    projectIdFromTask,
-    rawTimestampEpoch,
+    unkeyedFrameEndsTurn,
     stampNodeTimestamp,
     reconcileHydratedDirectActivities,
-    reconnectBannerText,
-    saveChatInputHistory,
+    restartNoticeText,
     senderLabel,
-    shouldFirePanic,
-    taskCostMeta,
     taskCostProjection,
     unconfirmedForegroundCardIds,
     withTaskCostMeta,
     applyHistoricalModelExecution,
     cardMetaKeys,
     renderCollapsedActivity,
+    syncCandidateRemainderItem,
+    readCandidateRemainder,
     renderLiveCardMeta as renderCardMeta,
     ensureLiveActionsEl,
-    ownLiveActionsEl,
+    dockChildReviewDoor,
+    cardRowEvidenceRef,
+    cardRowSummary,
+    refitCollapsedActivity,
 } from './chat_activity.js';
 
-export {
-    COLLAPSED_ACTIVITY_MAX,
-    boundActivityPreview,
-    chatMediaMessageKey,
-    clearStickyCardState,
-    clearTransientRoutingAnnotations,
-    confirmAndSendPanic,
-    computeDerivedChatStatus,
-    computeHydratedDirectActivities,
-    headerBudgetPresentation,
-    insertTimelineNode,
-    isTerminalTaskDetail,
-    isTerminalTaskPhase,
-    durableChatMediaUrl,
-    isNonTerminalMediaHistoryRow,
-    liveLineRowToggleKey,
-    mergeStickyCostMeta,
-    projectCollapsedActivity,
-    rawTimestampEpoch,
-    reconcileHydratedDirectActivities,
-    taskCostMeta,
-    taskCostProjection,
-    shouldFirePanic,
-};
 
-const PROJECT_ROW_TYPES = new Set(['project_started', 'project_completion_summary']);
-// The host's card placement values and the timeline phase each one reads as: a
-// custody fact warns, a settled review reads as a result.
+// Host placement: custody warns; settled reviews show results.
 const CARD_ROW_PHASES = new Map([['timeline', 'warn'], ['reviews', 'result']]);
-const CHAT_STORAGE_KEY = 'ouro_chat';
-const CHAT_DRAFT_KEY = 'ouro_chat_draft';
-const CHAT_INPUT_HISTORY_KEY = 'ouro_chat_input_history';
-const ATTACHMENT_PREVIEW_COUNT = 25;
+const SUBAGENT_LIFECYCLE_EVENTS = new Set(['scheduled', 'running', 'completed', 'completed_warn', 'failed',
+    'cancelled', 'rejected', 'interrupted']);  // a helper's narration is `progress`
+// Details and Reviews use the shared control glyph; ::after remains the touch hit area.
+const CHEVRON = renderSkillIcon('chevron', { size: 14, className: 'chat-live-chevron' });
 
 export function initChat(ctx) {
     // Back-compat main-chat entry: one full-page instance bound to chat 1.
@@ -177,13 +176,15 @@ export function initChat(ctx) {
 const taskKey = (value) => String(value || '').trim();
 
 export function createChatInstance({
-    ws, state, updateUnreadBadge, openSettingsTab, openDashboardTab,
+    ws, state, openSettings, openDashboardTab,
     stateSnapshots,
     chatId = 1, projectId = '', idPrefix = 'chat', mountEl = null,
-    asPanel = false, title = 'Chat', initialScrollState = null,
+    asPanel = false, title = pageLabel('chat'),
     // app.js signal "a project panel is opening right now" — Main
     // defers its first hydration to it (bounded by an unconditional deadline).
     isProjectOpening = null,
+    onHistoryRetry = null,
+    onReadingLatest, revealQuotedSource,
 }) {
     const container = mountEl || document.getElementById('content');
     const chatSessionId = getOrCreateChatSessionId(sessionStorage, globalThis.crypto);
@@ -194,72 +195,33 @@ export function createChatInstance({
     const page = document.createElement('div');
     page.id = asPanel ? `panel-${idPrefix}` : 'page-chat';
     page.className = asPanel ? 'chat-instance-panel' : 'page active';
-    // A project panel reuses the lean `.project-panel-bar` (title + close) from
-    // index.html, so it renders a minimal status-only header — NOT the overlay
-    // page header (that would duplicate the title and drag in the GLOBAL
-    // Evolve/Restart/Panic/budget chrome, which belongs to the one agent, not a
-    // single project thread). The main chat keeps the full overlay header.
+    // A Project panel's bar comes from app.js (page_header.js); the instance seeds only its status badge.
     const headerHtml = asPanel
-        ? `<div class="chat-panel-statusbar"><span id="chat-status" class="status-badge offline">Connecting...</span></div>`
+        ? `<div class="chat-panel-statusbar"><span id="chat-status" class="status-badge offline">Connecting…</span></div>`
         : renderPageHeader({
             title: title,
-            icon: PAGE_ICONS.chat,
             variant: 'overlay',
             className: 'chat-page-header',
-            actionsHtml: `
-                <div class="chat-header-actions" id="chat-header-actions">
-                    <button class="chat-header-btn" type="button" data-chat-command="restart" title="Restart agent">Restart</button>
-                    <button class="chat-header-btn danger" type="button" data-chat-command="panic" title="Stop all workers">Panic</button>
-                    <details class="chat-header-more">
-                        <summary class="chat-header-btn" title="More agent controls">More</summary>
-                        <div class="chat-header-menu">
-                            <button class="chat-header-menu-item" type="button" data-chat-command="bg" title="Toggle background consciousness">Consciousness</button>
-                            <button class="chat-header-menu-item" type="button" data-chat-command="evolve" title="Toggle evolution mode">Evolve</button>
-                            <button class="chat-header-menu-item" type="button" data-chat-command="review" title="Run review now">Review</button>
-                        </div>
-                    </details>
-                </div>
-                <button class="chat-budget-pill" id="chat-budget-pill" type="button" title="Open budget controls" aria-label="Open budget controls">
-                    <span class="chat-budget-text" id="chat-budget-text">Loading…</span>
-                    <div class="chat-budget-bar">
-                        <div class="chat-budget-bar-fill" id="chat-budget-bar-fill"></div>
-                    </div>
-                </button>
-                <span id="chat-status" class="status-badge offline">Connecting...</span>
-            `,
+            toolbarClass: 'ui-chrome-group',
+            actionsHtml: mainHeaderActionsHtml(),
+            showMobileNav: false,  // a room's ☰ is its composer row's first control
         });
+    // Main: a failed read or approximate restoration floats under the bar; Project keeps its status bar.
     page.innerHTML = `
-        ${headerHtml}
+        ${headerHtml}${asPanel ? '' : '<div class="chat-page-note"></div>'}
         <div id="chat-messages"></div>
         <div id="chat-input-area">
             <div class="chat-input-wrap">
-                <button class="chat-scroll-bottom-btn" id="chat-scroll-bottom" type="button" aria-label="Scroll to latest message" title="Scroll to latest message">
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14"/><path d="M19 12l-7 7-7-7"/></svg>
+                <button class="chat-scroll-bottom-btn ui-hit-area" id="chat-scroll-bottom" type="button" aria-label="Scroll to latest message" title="Scroll to latest message">
+                    ${strokeIcon('<path d="M12 5v14"/><path d="M19 12l-7 7-7-7"/>', 16)}
                     <span class="chat-scroll-activity-dot" aria-hidden="true" hidden></span>
                 </button>
-                <div id="chat-attachment-preview" class="chat-attachment-preview"></div>
-                <div class="chat-toolbar-row">
-                    <div class="chat-composer-pills" id="chat-composer-pills">
-                        <button class="chat-swarm" id="chat-swarm" type="button" data-armed="false" title="Swarm: route your next message into a new managed task, run a deep plan review with plan_task, then delegate when parallel work helps. Auto-disarms after sending.">Swarm</button>
-                        <div class="chat-context-mode" id="chat-context-mode" data-context-mode="max" role="group" aria-label="Context size mode" title="Context mode (owner setting). Nano is the compact owner window, Low fits ~200K / local models, Max is full. Saves immediately; lowering requires Ouroboros to be idle."><button class="chat-seg" type="button" data-mode="nano">Nano</button><button class="chat-seg" type="button" data-mode="low">Low</button><button class="chat-seg" type="button" data-mode="max">Max</button></div>
-                    </div>
-                </div>
-                <div class="chat-text-row">
-                    <button class="chat-attach-btn" id="chat-attach" type="button" title="Attach file">
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
-                    </button>
-                    <input type="file" id="chat-file-input" class="chat-file-input-hidden" accept="*/*" multiple>
-                    <textarea id="chat-input" placeholder="Message Ouroboros..." rows="1" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
-                    <div class="chat-send-group">
-                        <button class="chat-send-inline" id="chat-send" title="Send message">Send</button>
-                    </div>
-                </div>
+                ${composerMarkup()}
             </div>
         </div>
     `;
     if (idPrefix !== 'chat') {
-        // Instance-namespaced ids + mirror classes so the shared #chat-* CSS
-        // (extended with .chat-* twins) keeps styling secondary instances.
+        // Namespace ids; mirror classes retain the shared composer styling.
         page.querySelectorAll('[id]').forEach((el) => {
             if (el.id.startsWith('chat-')) {
                 el.classList.add(el.id);
@@ -273,45 +235,52 @@ export function createChatInstance({
     const messagesDiv = byId('messages');
     const input = byId('input');
     const inputArea = byId('input-area');
-    const sendBtn = byId('send');
     const statusBadge = byId('status');
-    const headerActions = byId('header-actions');
-    const pageHeader = page.querySelector('.chat-page-header');
-    const budgetPill = byId('budget-pill');
-    const attachBtn = byId('attach');
-    const fileInput = byId('file-input');
-    const attachmentPreview = byId('attachment-preview');
+    const pageHeader = page.querySelector('.chat-page-header') || (asPanel ? container?.closest?.('.project-panel')?.querySelector?.('.project-panel-bar') : null);
+    const pageNote = page.querySelector('.chat-page-note');
     const scrollBottomBtn = byId('scroll-bottom');
     const scrollActivityDot = scrollBottomBtn?.querySelector('.chat-scroll-activity-dot');
-    let pendingAttachments = [];
-    let attachmentsUploading = false;
     let nestedSubagentsExpanded = false;
     let _remoteActivityDepth = 0;
+    // The composer (composer.js), wired once the room's feed owners exist; Main's bar (chat_header.js), once its status.
+    let composer = null, header = null;
 
-    // Instance lifecycle (P3): destroy() flips this so rAF loops and late async
-    // continuations become no-ops instead of touching a removed DOM subtree.
+    // Destroyed instances ignore late async work and animation frames.
     let destroyed = false;
     // Every ws.on subscription's disposer, released together in destroy().
     const wsDisposers = [];
     const onWs = (event, fn) => wsDisposers.push(ws.on(event, fn));
+    const replies = createChatReplies({ chatId, feed: messagesDiv, input, composerArea: inputArea, key: storeKey('ouro_chat_reply'),
+        reading: () => reading, onDomWrite: withStableViewport, history: () => historyReveal,
+        navigate: revealQuotedSource, present: () => !destroyed && isInstanceVisible() });
     const chatMedia = createChatMedia({
-        chatSessionId,
         durableChatMediaUrl,
         formatMsgTime,
         insertMessageNode,
         senderLabel,
         stampNodeTimestamp,
+        onDomWrite: withStableViewport,
+        replies, composer: () => composer,
     });
+    // A text row as its bubble and doors (chat_text_bubble.js); addMessage keeps its identity and its place.
+    const drawTextBubble = createTextBubbles({ chatMedia, replies, feed: messagesDiv, isMain, ownProjectId: projectId,
+        onDomWrite: withStableViewport });
+    const mainWaiting = isMain ? createMainWaiting({ page, messagesDiv, insertMessageNode, stampNodeTimestamp,
+        openSettings, refresh: refreshHeaderControlState, mutate: withStableViewport,
+        decision: () => chatDecision, revealQuestion: (...a) => revealQuestion(...a), reading: () => reading }) : null;
     const chatDecision = createChatDecision({
         apiFetch,
         frameNode: chatMedia.bubbleFrameNode,
-        renderMarkdown: renderChatMarkdown,
+        renderMaterial: chatMedia.buildDocumentBubble,
+        releaseMaterials: chatMedia.release,
+        mountMarkdown: mountChatMarkdown,
         enhanceMarkdown: enhanceMountedMarkdown,
         showToast,
         fetchDetail: fetchTaskDetailStrict,
         onDomWrite: withStableViewport,
-        isMain, chatId,
+        isMain, chatId, projectId,
         insertMessageNode,
+        onQuestionsChanged: mainWaiting?.refresh,
         // A settled Main question mirror leaves through the ordinary retirement path.
         removeMessageNode: (node) => withStableViewport(() => { releaseMessageNode(node); return true; },
             { excludeAnchorNode: node }),
@@ -323,165 +292,97 @@ export function createChatInstance({
             const prefs = await apiClient.uiPreferences();
             if (destroyed) return;
             nestedSubagentsExpanded = prefs?.nested_subagents_expanded === true;
+            emptyWelcome?.setPreference(prefs?.welcome);
         } catch {
             nestedSubagentsExpanded = false;
         }
     }
 
-    function updateAttachmentPreview() {
-        if (!pendingAttachments.length) {
-            attachmentPreview.classList.remove('visible');
-            attachmentPreview.innerHTML = '';
-            requestAnimationFrame(() => updateMessagesPadding());
-            return;
-        }
-        attachmentPreview.classList.add('visible');
-        attachmentPreview.innerHTML = pendingAttachments.map((item) => `
-            <span class="attach-badge" data-attachment-id="${escapeHtmlAttr(item.id)}">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
-                <span class="attach-name" title="${escapeHtmlAttr(item.display_name)}">${escapeHtml(item.display_name)}</span>
-                <button class="attach-remove" type="button" title="Remove" aria-label="Remove attachment ${escapeHtmlAttr(item.display_name)}" data-attachment-remove="${escapeHtmlAttr(item.id)}" ${attachmentsUploading ? 'disabled aria-disabled="true"' : ''}>×</button>
-            </span>
-        `).join('');
-        requestAnimationFrame(() => updateMessagesPadding());
-        attachmentPreview.querySelectorAll('[data-attachment-remove]').forEach((button) => {
-            button.addEventListener('click', () => {
-                if (attachmentsUploading) return;
-                const removeId = button.getAttribute('data-attachment-remove') || '';
-                pendingAttachments = pendingAttachments.filter((item) => item.id !== removeId);
-                updateAttachmentPreview();
-            });
-        });
-    }
-
-    // Shared paperclip/paste stager; upload still happens only on Send.
-    function stagePendingFiles(files) {
-        const incoming = Array.from(files || []).filter(Boolean);
-        if (!incoming.length) return;
-        if (attachmentsUploading) {
-            showToast('Wait for the current upload to finish before changing attachments.', 'error');
-            return;
-        }
-        pendingAttachments = pendingAttachments.concat(incoming.map((file) => ({
-            id: (globalThis.crypto && typeof crypto.randomUUID === 'function')
-                ? crypto.randomUUID()
-                : `attachment-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-            file,
-            display_name: file.name || 'upload',
-        })));
-        updateAttachmentPreview();
-    }
-
-    function setAttachmentUploadState(uploading) {
-        attachmentsUploading = uploading;
-        attachBtn.disabled = uploading;
-        attachBtn.classList.toggle('uploading', uploading);
-        fileInput.disabled = uploading;
-        input.disabled = uploading;
-        updateAttachmentPreview();
-    }
-
-    attachBtn.addEventListener('click', () => fileInput.click());
-
-    // Local-only staging avoids orphan uploads and fast-send races.
-    fileInput.addEventListener('change', () => {
-        const files = Array.from(fileInput.files || []);
-        fileInput.value = '';
-        stagePendingFiles(files);
-    });
-
-    bindComposerFileTargets({ page, inputArea, input, stagePendingFiles });
+    // Sent attachment messages not yet confirmed saved: "Send again" with one id, kept by this tab across a reload.
+    const unconfirmed = createUnconfirmedSends({ send: (frame, options) => ws.send(frame, options),
+        root: () => messagesDiv, onDomWrite: withStableViewport, showToast, compose: replies.compose,
+        storage: sessionStorage, storageKey: storeKey('ouro_chat_unconfirmed') });
 
     let _syncPass1Active = false;
     let _historyReplayActive = false;
     let _historyRow = null;
     let _historyAppending = false;
+    // During a page replay, the keys its mounted bubbles carry (createReplayKeys)...
+    let replayKeys = null;
+    // ...and the selection as the reader left it: every mounted row the page moves keeps it (one read per page, not
+    // per move: in Chromium a selection read lays the page out).
+    let replaySelection = null;
+    function noteBubbleKeys(node) { replayKeys?.note(node); }
 
-    const persistedHistory = [];
     const seenMessageKeys = new Set();
     const messageKeyOrder = [];
     const pendingUserBubbles = new Map();
-    const inputHistory = loadChatInputHistory(sessionStorage, CHAT_INPUT_HISTORY_KEY);
-    let inputHistoryIndex = inputHistory.length;
-    let inputDraft = '';
+    // A source read has painted the room (the saved preview never counts).
     let historyLoaded = false;
-    let inputHistorySeededFromServer = false; // set true only after a successful server-side recall seed
     let historySyncPromise = null;
     let lastHistorySyncSucceeded = false;
-    let historyPaintGeneration = 0;
-    // STICKY single-flight hydration promise.
-    // Unlike historySyncPromise it survives success, so hydration triggers
-    // (bootstrap IIFE, first non-reconnect socket open, refreshHistory without
-    // a new revision) short-circuit instead of refetching. Any FAILED sync
-    // resets it; scheduleHistorySync and the reconnect path never consult it.
+    // Initial hydration stays shared after success; failure resets it. Reconnect and scheduled reads bypass it.
     let initialHydrationPromise = null;
-    // highest project revision whose history has been fetched;
-    // refreshHistory only bypasses the sticky promise for a NEWER revision.
-    let lastLoadedHistoryRevision = 0;
     // one-shot idle gate for Main's deferred first hydration.
     let hydrationGatePromise = null;
-    // The server retains whole-history coverage independently of the DOM window.
+    // One derived physical coverage/status for the mounted reading window.
     let historyWindow = null;
-    let welcomeShown = false;
-    // Cross-instance hide/show position; visible mutations use live geometry.
-    let _savedScrollTop = Math.max(0, Number(initialScrollState?.scrollTop) || 0);
-    let _savedStick = initialScrollState ? initialScrollState.stick !== false : true;
-    let _initialScrollPending = Boolean(initialScrollState) && !_savedStick;
-    let _resumeAnchor = initialScrollState?.historyAnchor || null;
     let _hasNewActivity = false;
-    let _restoring = false;
-    let restoreGeneration = 0;
-    let _viewportMutationDepth = 0;
+    // A room leaving the screen or away (room_retire.js): not shown, not read; `outageAway`: the sends a disconnect doubted.
+    let leaving = false;
+    let visit = 0, historyReadAbort = null, outageAway = null;
     const isInstanceVisible = () =>
-        Boolean(messagesDiv) && messagesDiv.offsetParent !== null && !document.hidden;
+        !leaving && Boolean(messagesDiv) && messagesDiv.offsetParent !== null && !document.hidden;
     const LIVE_CARD_CAP = 200;
     const liveCardBound = createLiveCardBound(LIVE_CARD_CAP);
     const liveCardRecords = new Map();
-    const workPointer = asPanel ? bindProjectWorkPointer(page.querySelector('.chat-panel-statusbar'), {
-        records: liveCardRecords, getWindow: () => historyWindow,
-        onNavigate: (root) => {
-            messagesDiv.scrollTop += root.getBoundingClientRect().top - messagesDiv.getBoundingClientRect().top;
-            _savedStick = false;
-            _savedScrollTop = messagesDiv.scrollTop;
-            updateScrollButton();
-        },
-    }) : null;
-    // A wait materializes the real task record; its open/closed state is one
-    // input of the block predicate, so the block appears with the controls and
-    // leaves with them (the record and its no-reopen wait ledger stay).
+    // The server's work projection (work_status.js), re-read on facts only.
+    let roomWork = null, workState = emptyWorkState();
+    const reread = () => void refreshHeaderControlState();
+    // A wait creates its task record; its open/closed state feeds the block predicate, so the block appears and leaves
+    // with the controls (the record and its no-reopen wait ledger stay).
     const modelWaits = createModelWaitController({
         getRecord: (id, create = true) => (create ? getLiveCardRecord(id) : liveCardRecords.get(id)),
-        openSettings: openSettingsTab, onDomWrite: withStableViewport,
+        openSettings, onDomWrite: withStableViewport, notify: showToast,
         onChange: (id) => { ensureLiveCardVisible(liveCardRecords.get(id)); syncChatStatus(); },
     });
+    // A card let go for good: its node and per-card facts beside it (a reusable slot keeps them: disposeLiveCard).
+    function forgetLiveCard(id) {
+        disposeLiveCard(id);
+        for (const facts of [subagentChildParents, subagentTerminalChildren, explicitCardExpansion, reviewDisclosureByTask]) facts.delete(id);
+    }
     function disposeLiveCard(id, preserveWaits = false) {
         if (!preserveWaits) modelWaits.forget(id);
-        liveCardRecords.get(id)?.timelineDispose?.();
-        liveCardRecords.get(id)?.root?.remove();
+        const record = liveCardRecords.get(id);
+        record?.timelineDispose?.();
+        record?.regions?.forEach((dispose) => dispose());
+        record?.episodeDisclosureDispose?.();
+        if (record?.episodeDisclosure) releaseMessageNode(record.episodeDisclosure);
+        if (record?.root) releaseMessageNode(record.root);
         liveCardRecords.delete(id);
     }
     const markReviewAnchor = (r, on = false) => setReviewAnchor(r, on, setLiveCardPhase);
     const explicitCardExpansion = new Map();
     const reviewDisclosureByTask = new Map();
-    const skillReviewDetailStore = new Map();
     const reviewHydrator = createReviewHydrator({
         fetchDetail: fetchTaskDetailStrict,
+        onSettled: () => !destroyed && reading.position(),
         applyDetail: (id, detail) => !destroyed && attachTaskDetailReviews(id, detail),
         onState: (id, status) => !destroyed
             && (liveCardRecords.get(id)?.reviewController?.setHydrateStatus?.(status) ?? false),
     });
-    // A task_named frame can arrive before the card's record exists; buffer it.
+    // Buffer task_named frames that precede their card.
     const pendingSuggestedNames = new Map();
-    // Server-confirmed in-flight direct/managed activities.
+    // Server-confirmed direct/managed activities.
     const activeDirectActivities = new Map();
     // Local user submissions awaiting server confirmation (clientMessageId
     // -> { clientMessageId, timestamp }).
     const pendingSubmissions = new Map();
-    // Bounded conclusions block stale state snapshots; reusable logical task
-    // slots are cleared whenever their cycle settles.
+    const hostStart = createHostStart(); // В9 readiness and boot phases; a disconnect forgets both
+    // Bounded conclusions retain known outcomes for later cards; reusable slots clear on settlement.
     const concludedDirectActivities = new Map();
     const CONCLUDED_ACTIVITY_LEDGER_MAX = 200;
-    // Retryable queue-loss candidates plus process-local single-flight reads.
+    // Queue-loss candidates and single-flight detail reads.
     const missingManagedTaskIds = new Set();
     const managedTaskDetailReads = new Set();
     // Owner rows kept until history confirms client_message_id.
@@ -496,29 +397,28 @@ export function createChatInstance({
         }
     }
 
-    function recordConcludedActivity(activityId) {
+    function recordConcludedActivity(activityId, phase = '') {
         const aid = taskKey(activityId);
         if (!aid) return;
         missingManagedTaskIds.delete(aid);
+        phase ||= concludedDirectActivities.get(aid) || '';
         concludedDirectActivities.delete(aid);
-        concludedDirectActivities.set(aid, Date.now());
+        concludedDirectActivities.set(aid, phase);
         while (concludedDirectActivities.size > CONCLUDED_ACTIVITY_LEDGER_MAX) {
-            const oldest = concludedDirectActivities.keys().next().value;
-            concludedDirectActivities.delete(oldest);
+            concludedDirectActivities.delete(concludedDirectActivities.keys().next().value);
         }
     }
-    function recordTerminalActivity(taskId) {
+    function recordTerminalActivity(taskId, phase = '') {
         const id = taskKey(taskId);
         if (!id) return;
         activeDirectActivities.delete(id);
         missingManagedTaskIds.delete(id);
         if (REUSABLE_TASK_IDS.has(id)) concludedDirectActivities.delete(id);
-        else recordConcludedActivity(id);
+        else recordConcludedActivity(id, phase);
         settleTerminalRootChildren(id);
     }
-    // A root proven terminal settles descendant cards a lost child terminal left
-    // open (#300): one single-flight durable read each, through the ordinary
-    // child-terminal path; no proven terminal fact = the child keeps its state.
+    // A terminal root reconciles open descendants through single-flight detail
+    // reads; only proven child terminality changes their state (#300).
     function settleTerminalRootChildren(rootId) {
         for (const [childId, info] of subagentChildParents) {
             if (info.parentId !== rootId) continue;
@@ -527,18 +427,58 @@ export function createChatInstance({
             if (!record || record.finished || managedTaskDetailReads.has(childId)) continue;
             managedTaskDetailReads.add(childId);
             fetchTaskDetail(childId).then((detail) => {
-                if (destroyed || !isTerminalTaskDetail(detail)) return;
+                if (destroyed || leaving || !isTerminalTaskDetail(detail)) return;
                 withStableViewport(() => routeSubagentTerminalToCard(childId, { ...detail, task_id: childId }));
+            }).catch(() => {}).finally(() => managedTaskDetailReads.delete(childId));
+        }
+    }
+    // Root census rows omit children; complete work membership can admit their own result read before the root ends.
+    // Unknown/nonterminal replies retry on the next refresh; a confirmed 404 waits for new card evidence or reconnect.
+    function settleAbsentChildren(snapshotRequestedAt) {
+        for (const [childId, record] of liveCardRecords) {
+            if (!record.isSubagent || record.finished || !record.root?.isConnected) continue;
+            if (workState.members.has(childId)) {
+                record.childDetailRead = undefined;
+                if (record.historicalUnavailable) withStableViewport(() => {
+                    setHistoricalUnavailable(record, false);
+                    renderLiveCardMeta(record);
+                    return true;
+                });
+                continue;
+            }
+            const observedAt = record.lastLiveObservedAt || 0;
+            const updates = record.updates;
+            if (!workState.complete || observedAt >= snapshotRequestedAt
+                    || (record.childDetailRead?.missing && record.childDetailRead.updates === updates)
+                    || managedTaskDetailReads.has(childId)
+                    || !subagentChildParents.has(childId)) continue;
+            // Queue departure and membership share this read; keep the visible hold
+            // until actual recovery or terminal evidence, not just absence.
+            record.projectHoldQueued = false;
+            const observation = record.childDetailRead = { updates };
+            managedTaskDetailReads.add(childId);
+            fetchTaskDetailStrict(childId).then((detail) => {
+                if (destroyed || ws.isConnected?.() === false || !workState.complete
+                        || liveCardRecords.get(childId) !== record || record.finished
+                        || workState.members.has(childId) || record.updates !== updates
+                        || record.childDetailRead !== observation) return;
+                if (detail === null) {
+                    observation.missing = true;
+                    withStableViewport(() => settleMissingTaskRecord(record));
+                } else if (isTerminalTaskDetail(detail)) {
+                    withStableViewport(() => routeSubagentTerminalToCard(childId, { ...detail, task_id: childId }));
+                }
             }).catch(() => {}).finally(() => managedTaskDetailReads.delete(childId));
         }
     }
     let activeLiveGroupId = '';
     let pendingReconnectSync = false;  // Set when a fromReconnect sync arrives while one is already in-flight.
-    let pendingReconnectBannerText = '';
+    const catchUp = createCatchUp(syncChatStatus);  // a return's or reconnect's read still out after its bound
+    let pendingRestartNotice = '';
     try {
-        pendingReconnectBannerText = reconnectBannerText(new URL(window.location.href).searchParams.get('_ouro_reason') || '');
+        pendingRestartNotice = restartNoticeText(new URL(window.location.href).searchParams.get('_ouro_reason') || '');
     } catch {}
-    function clearPendingReconnectBanner() {
+    function clearReloadParams() {
         try {
             const url = new URL(window.location.href);
             if (!url.searchParams.has('_ouro_reason') && !url.searchParams.has('_ouro_refresh')) return;
@@ -558,138 +498,133 @@ export function createChatInstance({
         }
     }
 
-    function setStatus(kind, text) {
-        // replay frames never touch the badge; the reducer
-        // (syncChatStatus) writes it once after the batch.
+    function setStatus({ kind, text, step = '', tone, mark, owner, amber, title = '' }) {
+        // Replay frames never touch the badge; syncChatStatus writes it once.
         if (!statusBadge) return;
         statusBadge.className = `status-badge ${kind}`;
         statusBadge.textContent = text;
+        statusBadge.title = title; // a failed boot step's cause, or the server-answers sentence; empty otherwise
+        Object.assign(statusBadge.dataset, { tone, mark, owner: owner ? '1' : '', amber, step });
+        roomWork?.update();
     }
 
     function syncHeaderControlState(data) {
-        headerActions?.querySelectorAll('[data-chat-command]').forEach((button) => {
-            const cmd = button.dataset.chatCommand;
-            const state = cmd === 'evolve' ? [data?.evolution_enabled, data?.evolution_state?.detail]
-                : cmd === 'bg' ? [data?.bg_consciousness_enabled, data?.bg_consciousness_state?.detail] : null;
-            if (state) {
-                button.classList.toggle('on', !!state[0]);
-                if (state[1]) button.title = state[1];
-            }
-        });
-        // Mark More while background mode is active in the menu.
-        const moreSummary = headerActions?.querySelector('.chat-header-more > summary');
-        if (moreSummary) {
-            const anyActive = !!data?.evolution_enabled || !!data?.bg_consciousness_enabled;
-            moreSummary.classList.toggle('has-active', anyActive);
-        }
-        const ctxBtn = byId('context-mode');
-        if (ctxBtn && typeof data?.context_mode === 'string') {
-            ctxBtn.dataset.contextMode = ['nano', 'low', 'max'].includes(data.context_mode) ? data.context_mode : 'max';
-        }
-        const budget = headerBudgetPresentation(data);
-        const budgetText = byId('budget-text');
-        const budgetFill = byId('budget-bar-fill');
-        if (budgetText) budgetText.textContent = budget.label;
-        if (budgetFill) budgetFill.style.width = `${budget.fillPct}%`;
+        composer?.syncState(data);
+        header?.update(data);
+    }
+
+    // Main: a moved work's card is its portal (work_portal.js); Continue episodes share a card (task_episodes.js).
+    const portals = createWorkPortals({ isMain, feed: messagesDiv, records: liveCardRecords, onDomWrite: withStableViewport,
+        isConnected: () => ws.isConnected?.() !== false, onConverted: () => composer?.signalFreed(), remember: rememberMessageKey,
+        append: (msg, text, opts) => appendProjectRow(addMessage, msg, text, opts), actionsOf: ensureLiveActionsEl,
+        card: { get: getLiveCardRecord, show: ensureLiveCardVisible, reanchor: reanchorTaskCard, restore: restoreCardActivity,
+            meta: renderLiveCardMeta, controls: syncCancelRunButton, finish: finishLiveCardMutation, note: noteTaskDetails,
+            missing: observeMissingManagedTask, summary: appendTaskSummaryToLiveCard,
+            collapse: (record) => (explicitCardExpansion.delete(record.groupId), record.root.dataset.expanded === '1'
+                && setLiveCardExpanded(record, false)) } });
+    const episodes = createTaskEpisodes({ records: liveCardRecords, reanchor: reanchorTaskCard, renamed: (record) => (portals.relabel(record), syncCardHeadline(record)),
+        activity: (record) => currentActivity(record), follow: portals.follow,
+        expand: (record) => { setLiveCardExpanded(record, true); hydrateCardReviews(record.groupId); } });
+    const rowMenu = createChatRowMenu({ feed: messagesDiv, replies, cardOf: (id) => liveCardRecords.get(id),
+        actionsOf: (record) => cardMenuActions(workState, record, currentActivity(record)), afterAction: reread });
+
+    let childHoldRead = false;
+    async function refreshChildProjectHolds() {
+        const children = [...liveCardRecords.values()].filter(r => r.isSubagent && !r.finished && r.root?.isConnected);
+        if (destroyed || childHoldRead || !children.length) return;
+        childHoldRead = true;
+        const started = Date.now();
+        try {
+            const response = await apiFetch('/api/tasks?queue_only=1');
+            if (!response.ok) return;
+            const { queue } = await response.json();
+            if (destroyed || leaving || !Array.isArray(queue?.pending) || !Array.isArray(queue?.running)) return;
+            const tasks = new Map([[queue.pending, 'queued'], [queue.running, 'working']]
+                .flatMap(([rows, phase]) => rows.map(row => [row.id, { ...row.task, phase }])));
+            withStableViewport(() => {
+                for (const record of children) {
+                    if (record.finished || !record.root?.isConnected || record.lastLiveObservedAt > started) continue;
+                    const task = tasks.get(record.groupId);
+                    if (task && 'project_admission_hold' in task) {
+                        missingManagedTaskIds.delete(record.groupId);
+                        restoreCardActivity(record, task.project_admission_hold);
+                        syncParkedPhase(record, ws.isConnected?.() === false ? 'unknown' : task.phase, task);
+                        record.projectHoldQueued = Boolean(record.projectHold);
+                    } else if (!task && record.projectHoldQueued) {
+                        record.projectHoldQueued = false;
+                        missingManagedTaskIds.add(record.groupId);
+                        void reconcileMissingManagedTask(record.groupId);
+                    }
+                }
+            });
+        } catch { /* Keep the last fact; absence or a failed read proves no recovery. */ }
+        finally { childHoldRead = false; }
     }
 
     function hydrateStateSnapshot(data, snapshotRequestedAt = Infinity) {
-        syncHeaderControlState(data);
+        if (destroyed || leaving) return;
+        if (data) void refreshChildProjectHolds();
+        const before = workState;
+        workState = reconcileWorkState(workState, data, chatId, ws.isConnected?.() !== false);
+        if (Array.isArray(data?.works)) settleAbsentChildren(snapshotRequestedAt);
+        applyCardWorkViews(liveCardRecords, workState);
+        chatDecision.syncWorks(workState);
+        changedOffers(liveCardRecords, before, workState).forEach(syncCancelRunButton);
+        syncHeaderControlState(data ?? { accounting: { available: false } });
+        portals.sync(data);
+        mainWaiting?.snapshot(data, snapshotRequestedAt);
+        hostStart.read(data);
         const activities = Array.isArray(data?.active_chat_activities)
             ? data.active_chat_activities
             : data?.active_direct_turns;
         if (Array.isArray(activities)) {
-            hydrateDirectActivities(activities, snapshotRequestedAt,
-                data.active_chat_activities_complete === true && data.supervisor_ready === true);
+            withStableViewport(() => {
+                hydrateDirectActivities(activities, snapshotRequestedAt,
+                    data.active_chat_activities_complete === true && data.supervisor_ready === true);
+                return true;
+            });
             for (const activity of activities) {
                 if (activity.required_question) chatDecision.appendActivityQuestion(activity.required_question, snapshotRequestedAt);
                 if (Number(activity.chat_id ?? 1) === chatId) modelWaits.observe(activity.activity_id, activity);
             }
         }
+        syncChatStatus();
     }
 
-    async function refreshHeaderControlState(force = false) {
-        if (!force && state.activePage !== 'chat') return;
-        const request = stateSnapshots.begin();
-        try {
-            const resp = await apiFetch('/api/state', { cache: 'no-store' });
-            if (!resp.ok) throw new Error(`State read failed: HTTP ${resp.status}`);
-            const data = await resp.json();
-            stateSnapshots.apply(request, data);
-        } catch {
-            if (stateSnapshots.isCurrent(request)) {
-                syncHeaderControlState({ accounting: { available: false } });
-            }
-        }
+    // A page-wide state read taken after this room's own change, coalesced behind one in flight (app.js polls).
+    async function refreshHeaderControlState() {
+        if (destroyed || leaving) return;
+        const request = await stateSnapshots.gate(true);
+        if (request) await readStateSnapshot(stateSnapshots, request);
     }
 
-    function persistVisibleHistory() {
-        try {
-            sessionStorage.setItem(storeKey(CHAT_STORAGE_KEY), JSON.stringify(persistedHistory.slice(-200)));
-        } catch {}
-    }
-
-    const NEAR_BOTTOM_THRESHOLD_PX = 48;
     const ACTUAL_BOTTOM_TOLERANCE_PX = 6;
 
-    function isNearBottom(threshold = NEAR_BOTTOM_THRESHOLD_PX) {
-        const remaining = messagesDiv.scrollHeight - messagesDiv.scrollTop - messagesDiv.clientHeight;
-        return remaining <= threshold;
-    }
+    const isNearBottom = threshold => reading.nearBottom(threshold);
 
-    const { captureVisibleTimelineAnchor, restoreVisibleTimelineAnchor } =
+    const { captureVisibleTimelineAnchor, restoreVisibleTimelineAnchor, serializeTimelineAnchor, anchorOwnersReady } =
         createTimelineAnchors({ messagesDiv, liveCardRecords });
+    // Far rows skipped once laid out (style.css); a restyle may change every row's size at once, and the reading owner
+    // places the passage again.
+    let rowSleep = createRowSleep({ feed: messagesDiv, onRestyle: () => reading.reflow() });
+    // A fitted line re-fits on the frame after its width changed (text_fit.js): a reader at the newest message is placed
+    // there again once the room's lines are sized (Main shown again laid out its newest message first).
+    const offRefit = onRefit((els) => { if (reading.stick && els.some((el) => messagesDiv.contains(el))) reading.reflow(); });
+    const reading = createChatReadingPosition({
+        feed: messagesDiv, alive: () => !destroyed,
+        // A row asleep that the write changed is laid out before the place is restored (chat_row_sleep.js).
+        afterWrite: () => { rowSleep.flush(); roomWork?.update(); }, activity: () => { _hasNewActivity = true; },
+        updateButton: updateScrollButton,
+        visible: () => !destroyed && isInstanceVisible(),
+        ready: () => historyLoaded && anchorOwnersReady(reading.target?.historyAnchor, reviewHydrator.ready),
+        anchors: { serialize: serializeTimelineAnchor, restore: restoreVisibleTimelineAnchor, capture: captureVisibleTimelineAnchor },
+        // A settled place is where the reader is (the read receipt).
+        changed: () => { syncLoadOlderControl(); updateScrollButton(); readReceipt.note({ discrete: true }); },
+    });
 
-    function withStableViewport(mutate, {
-        forceFollow = false,
-        remoteContent = false,
-        excludeAnchorNode = null,
-    } = {}) {
-        if (typeof mutate !== 'function') return undefined;
-        if (destroyed) return false;
-        if (_viewportMutationDepth > 0) return mutate();
-        if (_restoring || !isInstanceVisible()) {
-            const result = mutate();
-            workPointer?.update();
-            if (remoteContent && result && !_savedStick) _hasNewActivity = true;
-            return result;
-        }
-
-        const followBottom = forceFollow || isNearBottom();
-        const anchor = followBottom ? null : captureVisibleTimelineAnchor(excludeAnchorNode);
-        // Pre-mutation geometry, not the mutate() return, decides restore/
-        // follow (survives throws and lying change-flags); booleans keep only
-        // the activity-marker and write-idempotence duties.
-        const preScrollHeight = messagesDiv.scrollHeight;
-        const preScrollTop = messagesDiv.scrollTop;
-        let result;
-        _viewportMutationDepth = 1;
-        try {
-            result = mutate();
-            workPointer?.update();
-            return result;
-        } finally {
-            _viewportMutationDepth = 0;
-            if (isInstanceVisible()) {
-                if (followBottom) {
-                    if (forceFollow || messagesDiv.scrollHeight !== preScrollHeight) {
-                        messagesDiv.scrollTop = messagesDiv.scrollHeight;
-                    } else if (messagesDiv.scrollTop !== preScrollTop) {
-                        // Engine drift on a no-op frame: put the reader back.
-                        messagesDiv.scrollTop = preScrollTop;
-                    }
-                } else {
-                    // Restores the captured offset; a zero-delta frame re-lands
-                    // on the same position.
-                    restoreVisibleTimelineAnchor(anchor);
-                }
-                if (remoteContent && result && !followBottom) _hasNewActivity = true;
-                _savedScrollTop = messagesDiv.scrollTop;
-                _savedStick = isNearBottom();
-                updateScrollButton();
-            }
-        }
-    }
+    function withStableViewport(mutate, options) { return reading.mutate(mutate, options); }
+    // Turned back into history, or on the way to a place: not following the newest message.
+    const readingHistory = () => !reading.stick || reading.pending;
 
     function withRemoteActivity(mutate) {
         _remoteActivityDepth += 1;
@@ -701,9 +636,16 @@ export function createChatInstance({
     }
 
     function enhanceMountedMarkdown(root) {
+        // Late diagrams/fallbacks can add keyboard stops after the fold was measured.
+        // Refresh only their own bubble, inside the existing viewport transaction.
+        const foldedWrite = writer => (mutate, options) => writer(() => {
+            const changed = mutate();
+            refreshProjectAnswerFold(root.closest?.('.project-answer'));
+            return changed;
+        }, options);
         return enhanceChatMarkdown(root, {
-            onDomWrite: _remoteActivityDepth > 0 ? withRemoteActivity : withStableViewport,
-            onThemeDomWrite: withStableViewport,
+            onDomWrite: foldedWrite(_remoteActivityDepth > 0 ? withRemoteActivity : withStableViewport),
+            onThemeDomWrite: foldedWrite(withStableViewport),
         });
     }
     const {
@@ -711,6 +653,7 @@ export function createChatInstance({
         appendTimelineItem,
         patchLastTimelineItem,
         patchTimelineItemAt,
+        oweTimeline, drawOwedTimelines,
     } = createLiveCardTimelineRenderer({
         withStableViewport, buildTimelineItemHtml, isReplayActive: () => _historyReplayActive,
     });
@@ -722,10 +665,13 @@ export function createChatInstance({
             return false;
         }
         return withStableViewport(() => {
-            // Scope to THIS instance's column — a global id lookup would resolve to
-            // the first panel's typing node and misplace project-thread messages.
-            const typing = messagesDiv.querySelector('.typing-bubble');
-            insertTimelineNode(messagesDiv, node, typing);
+            // Scope to THIS instance's column: a global id lookup finds the first panel's typing node and misplaces
+            // project-thread messages. It is the feed's last child (rows go before it): no walk of the feed per row.
+            const last = messagesDiv.lastElementChild;
+            const typing = last?.classList?.contains('typing-bubble') ? last : messagesDiv.querySelector('.typing-bubble');
+            insertTimelineNode(messagesDiv, node, typing, replaySelection);
+            noteBubbleKeys(node);
+            replies.syncDerivedQuotes(node);  // a landing row may repeat, or stop repeating, the quote below it
             return true;
         }, {
             forceFollow: Boolean(options.forceStick),
@@ -764,215 +710,171 @@ export function createChatInstance({
         return true;
     }
 
-    // The ONE rule for a task's block being in the transcript (docs/DESIGN.md
-    // "Conversation activity block"): facts the record holds, re-read at every
-    // mutation, no sticky flag; the completion note and receipt rows are not content.
+    // DESIGN's activity-block predicate rechecks facts on each mutation;
+    // completion notes and receipts are not content, and visibility is not sticky.
     function blockVisible(record) {
         if (!record || record.isSubagent) return true;
-        return blockHasWork(record)
+        // A moved work's portal never leaves Main (one work, one card).
+        return isPortal(record) || blockHasWork(record)
             || !!(record.modelWaiting || record.cancelPendingPolicy || record.reviewAnchor)
             || stopEligible(record)
             || (record.finished && record.phaseEl?.dataset?.phase !== 'done');
     }
 
-    // The host's lane fact (census kind, rebuilt task_done, history rows) is
-    // kept on the record for the header pill only: a direct turn keeps the
-    // census verdict (Thinking…) beside its block. It never chooses chrome.
-    function noteDirectTurn(record, direct) {
-        if (record && typeof direct === 'boolean') record.direct = direct;
-    }
-
-    // The work the block stands on — the presence facts minus open attention and
-    // minus a bare terminal outcome. It selects the chrome (owner decision 16.09):
-    // a block with work is the task card whatever lane produced it (a title, the
-    // conversion control in Main); a block that exists only for open attention or
-    // a non-Done ending keeps no title placeholder and offers no conversion. The
-    // host's lane fact (`_is_direct_chat`) keeps its host jobs and never chooses chrome.
+    // Work chooses card chrome (owner 16.09): title and Main conversion, whatever the lane; attention-only or non-Done
+    // endings have neither. Bare outcome/receipts are not work; _is_direct_chat keeps its host duties.
     function blockHasWork(record) {
         const id = record.groupId;
-        // No lane is always shown: the retired bg-consciousness card kind is gone.
+        // Visibility depends on work, never the lane.
         return record.reviewController?.groups.size > 0
             || [...subagentChildParents.values()].some((info) => info.parentId === id)
             || record.items.some((item) => !item.receipt && !String(item.dedupeKey || '').startsWith('task_done|'))
             || record.toolErrors > 0;
     }
 
-    // Tool accounting from a metrics or terminal fact: the meta counts and the
-    // block's one folded evidence row. A field the fact does not carry stays
-    // absent, so a partial snapshot cannot reclassify the row.
+    // Child, else project, identity names the card; authored activity stays in its timeline. An unnamed
+    // root with work takes its newest narration, `Task activity` once ended (#1369).
+    function cardTitle(record, work = blockHasWork(record)) {
+        return record.isSubagent ? childTitle(record) : record.suggestedName
+            || (work ? authoredTitle(record) || (record.finished ? 'Task activity' : '') : '');
+    }
+
+    // Change only (a rewrite loses a copy selection). A finished root's own sentence, not narration, is its line
+    // or its sole head (owner 01.11, A); a held cause stays.
+    function syncCardHeadline(record) {
+        const title = cardTitle(record);
+        const line = record.finished && !record.isSubagent && record.wakeSummary ? closingLine(record, title) : record.collapsedActivity;
+        if (record.titleEl.textContent !== title) { record.titleEl.textContent = title; portals.relabel(record); }
+        return renderCollapsedActivity(record, projectCollapsedActivity({ record, suggestedName: title, headline: line, body: line }));
+    }
+
+    // Fold host facts; absent counters stay absent.
     function noteToolMetrics(taskId, metrics, rawTs, { suppressDomInsert = false } = {}) {
-        const known = (key) => (Number.isInteger(metrics?.[key]) ? metrics[key] : null);
-        const [calls, errors, routing] = ['tool_calls', 'tool_errors', 'routing_tool_calls'].map(known);
-        if ((!calls && !errors) || subagentChildParents.has(taskId)) return false;
+        const rounds = Number.isInteger(metrics?.rounds) && metrics.rounds >= 0 ? metrics.rounds : null;
+        const [calls, errors, routing, completion] = ['tool_calls', 'tool_errors', 'routing_tool_calls', 'completion_tool_calls']
+            .map(key => Number.isInteger(metrics?.[key]) && metrics[key] >= 0 ? metrics[key] : null);
+        const hasToolEvidence = calls > 0 || errors > 0 || metrics.tool_evidence?.observations?.length
+            || metrics.tool_evidence?.legacy?.calls || toolEvidenceIncomplete(metrics.tool_evidence?.coverage);
+        if (rounds === null && calls === null && !hasToolEvidence) return false;
         return withStableViewport(() => {
             const record = getLiveCardRecord(taskId);
             const before = captureLiveCardProjection(record);
             const duration = Number(metrics.duration_sec);
-            if (Number.isFinite(duration)) record.durationSec = duration;
-            const summary = noteToolHostMetrics(record, { calls, errors, routing, counts: metrics.tool_call_counts });
-            record.toolCalls = summary.calls;
-            record.toolErrors = summary.errors;
-            const { timelineUpdate } = upsertToolFoldRow(record, summary, normalizeLogTs(rawTs), rawTs);
-            const changed = ['none', 'duplicate-skip'].includes(timelineUpdate)
-                ? false : renderLiveCardTimeline(record);
+            if (rounds !== null) record.rounds = Math.max(record.rounds ?? 0, rounds);
+            if (metrics.duration_sec != null && Number.isFinite(duration)) record.durationSec = duration;
+            if (calls !== null) record.toolCalls = Math.max(record.toolCalls ?? 0, calls);
+            let changed = false;
+            // Rounds and a known zero are facts, not a tool invocation or a row of work.
+            if (hasToolEvidence) {
+                const summary = noteToolHostMetrics(record, { calls, errors, routing, completion, counts: metrics.tool_call_counts, evidence: metrics.tool_evidence });
+                if (summary.calls > 0 || record.toolCalls != null) record.toolCalls = summary.calls;
+                record.toolErrors = summary.errors;
+                changed = placeReplayedEvidence(record, summary, metrics.tool_evidence, rawTs, normalizeLogTs)
+                    && renderLiveCardTimeline(record);
+            }
             updateLiveCardCount(record);
             renderLiveCardMeta(record);
-            reanchorTaskCard(record, rawTs, { suppressDomInsert });
+            // A timestamp-free current-work carrier intentionally belongs at the page end.
+            // Dated carriers may carry earlier evidence past an intervening owner message.
+            const anchor = Number.isFinite(Date.parse(rawTs)) ? replayedEvidenceTs(metrics.tool_evidence, rawTs) : rawTs;
+            reanchorTaskCard(record, anchor, { suppressDomInsert });
             ensureLiveCardVisible(record, { suppressDomInsert });
             return Boolean(changed || liveCardProjectionChanged(before, record));
         });
     }
 
-    // P5: task ids whose progress carried the supervisor's host-attested
-    // `cancelable` marker (queue tasks the cancel endpoint can genuinely reach).
-    // Learned from live WS frames and history replay alike, possibly before the
-    // card exists, so it lives beside the card records rather than on them.
+    // P5: task ids whose progress carried the supervisor's host-attested `cancelable` marker (queue tasks the cancel
+    // endpoint reaches), from live frames and replay alike, maybe before their card: kept beside the records.
     const cancelableTaskIds = new Set();
 
-    function queueTaskLiveUpdate(summary, taskId, ts, dedupeKey = '', rawTs = '') {
-        return withStableViewport(() => queueTaskLiveUpdateMutation(
-            summary, taskId, ts, dedupeKey, rawTs,
-        ));
+    function queueTaskLiveUpdate(summary, taskId, rawTs) {
+        return withStableViewport(() => {
+            // Explicit task/review identity owns a card; viewport position never does.
+            if (!taskId) return false;
+            let changed = false;
+            const record = liveCardRecords.get(taskId);
+            // Only reusable slots replace finished cards; other late frames update
+            // cost/model facts in applyLiveCardState without reviving the phase.
+            if (!_historyRow && record?.finished && REUSABLE_TASK_IDS.has(taskId)
+                    && !isTerminalTaskPhase(summary.phase || '', summary.terminal)) {
+                changed = Boolean(record.root?.isConnected);
+                disposeLiveCard(taskId);
+            }
+            return Boolean(applyLiveCardState(summary, taskId, rawTs) || changed);
+        });
     }
 
-    function queueTaskLiveUpdateMutation(summary, taskId, ts, dedupeKey = '', rawTs = '') {
-        const resolvedTaskId = taskId || activeLiveGroupId || '';
-        if (!resolvedTaskId) return false;
-        let changed = false;
-        const record = liveCardRecords.get(resolvedTaskId);
-        // A reusable slot's new cycle replaces its finished card; every other
-        // finished record absorbs late frames in applyLiveCardState (cost and
-        // model facts only, never a revived phase).
-        if (!_historyRow && record?.finished && REUSABLE_TASK_IDS.has(resolvedTaskId)
-                && !isTerminalTaskPhase(summary.phase || '', summary.terminal)) {
-            changed = Boolean(record.root?.isConnected);
-            disposeLiveCard(resolvedTaskId);
-        }
-        return Boolean(applyLiveCardState(summary, resolvedTaskId, ts, dedupeKey, { rawTs }) || changed);
-    }
-
-    async function turnTaskIntoProject(record) {
-        if (!record || record.root?.dataset?.projectCreating === '1' || record.root?.dataset?.projectCreated === '1') return;
-        const taskId = taskKey(record.groupId);
-        const projectId = projectIdFromTask(taskId);
-        record.root.dataset.projectCreating = '1';
-        const actions = record.turnProjectBtn?.parentElement || ownLiveActionsEl(record);
-        if (actions) {
-            withStableViewport(() => {
-                actions.innerHTML = '<button type="button" class="btn btn-xs btn-default" disabled>Creating project…</button>';
-                record.cancelRunBtn = null;
-            });
-        }
-        try {
-            // One-click convert (owner P1): no name prompt, no extra LLM call.
-            // The SERVER names the project (gateway/projects.py: explicit
-            // title, coined name, then the task's own origin text) and adopts
-            // the project the task's owner message already has.
-            const payload = await apiClient.projectFromTask(taskId, projectId, '');
-            const project = payload.project || { id: projectId, name: projectId };
-            showToast(`${payload.adopted ? 'Project opened' : 'Project created'}: ${project.name || project.id}`, 'ok');
-            window.dispatchEvent(new CustomEvent('ouro:project-created', { detail: { project } }));
-            markCardConverted(record, project);
-        } catch (exc) {
-            showToast(`Project creation failed: ${exc.message || exc}`, 'error');
-            delete record.root.dataset.projectCreating;
-            // innerHTML replaced both controls: the chrome and cancel writers
-            // put back exactly what the record's facts still call for.
-            if (actions) withStableViewport(() => {
-                actions.innerHTML = '';
-                record.turnProjectBtn = null;
-                record.cancelRunBtn = null;
-                syncBlockChrome(record);
-                syncCancelRunButtonMutation(record);
-                return true;
-            });
-        }
-    }
-
-    // The conversion control from the record's facts: a block with work in Main
-    // offers "Turn into project" unless its origin is already bound to a Project
-    // (the one binding fact the /api/state sweep in app.js reads too); the title
-    // writers apply the same work predicate.
+    // Main blocks with work offer conversion unless their origin is bound (the same /api/state fact app.js
+    // reads); titles use the same work predicate. Every root work card offers Reply in its row menu.
     function syncBlockChrome(record) {
-        if (record.root.dataset.projectCreated === '1') return;
+        replies.syncCard(record, !record.isSubagent && (isPortal(record) || blockHasWork(record)));
         // A child is never a convertible unit (it inherits its root's Project by
         // lineage) and its title is its role: both root writers skip it.
         const work = !record.isSubagent && blockHasWork(record);
-        // The first row of work lands after the title writers ran for its frame:
-        // an empty title takes the placeholder here, the writers own it from then on.
-        if (work && !record.titleEl.textContent) {
-            record.titleEl.textContent = record.suggestedName || record.lastHumanHeadline
-                || (record.finished ? 'Task activity' : 'Working...');
-        }
-        const wanted = isMain && work && record.root.dataset.projectBound !== '1'
-            && !(window.__ouroTaskBindings || {})[record.groupId];
-        if (wanted === Boolean(record.turnProjectBtn)) return;
-        if (!wanted) {
-            record.turnProjectBtn.remove();
-            record.turnProjectBtn = null;
-            return;
-        }
-        const actions = ensureLiveActionsEl(record);
-        if (!actions) return;
-        const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.className = 'btn btn-xs btn-default';
-        btn.dataset.turnIntoProject = '1';
-        btn.textContent = 'Turn into project';
-        btn.addEventListener('click', (event) => {
-            event.stopPropagation();
-            turnTaskIntoProject(record);
-        });
-        actions.prepend(btn);
-        record.turnProjectBtn = btn;
+        // The first row of work lands after the title writers ran for its frame: an empty title
+        // takes a name here (Working is the chip's word, #1369); the writers own it from then on.
+        if ((work || isPortal(record)) && !record.titleEl.textContent) record.titleEl.textContent = cardTitle(record, true);
+        portals.syncConvert(record, isMain && work && !isPortal(record) && !(window.__ouroTaskBindings || {})[record.groupId]);
     }
 
     function syncCancelRunButton(record) {
         return withStableViewport(() => syncCancelRunButtonMutation(record));
     }
 
-    // The one reading of "this record offers Stop": the block predicate and the
-    // control share it, so a block never stands on a Stop it hides.
+    // The live activity a card's controls act on: this chat's census row, or — for a Main portal —
+    // its work's row in the room's chat (the portal carries the same Stop/Resume on every surface).
+    const currentActivity = (record) => activeDirectActivities.get(record?.groupId) || portals.activity(record);
+
+    // Shared Stop predicate: a hidden button cannot justify a visible block.
     const stopEligible = (record) => cancelRunEligibility({
         groupId: record.groupId, isSubagent: record.isSubagent, finished: record.finished,
-        cancelable: !record.historicalUnavailable && !record.historicalUnconfirmed && cancelableTaskIds.has(record.groupId),
-        converted: record.root.dataset.projectCreated === '1',
+        cancelable: !record.historicalUnavailable && !record.historicalUnconfirmed
+            && (cancelableTaskIds.has(record.groupId) || activeDirectActivities.has(record.groupId) && blockHasWork(record)
+                || Boolean(portals.activity(record))),
     });
 
     function syncCancelRunButtonMutation(record) {
         if (!record?.root) return false;
-        const eligible = stopEligible(record);
+        // Resume where the card's work offers it.
+        const canResume = () => cardControls(workState, record.groupId).resume;
+        const resumable = canResume();
+        let changed = false;
+        if (resumable && !record.resumeRunBtn) {
+            record.resumeRunBtn = createTaskResumeButton(record.groupId, { canResume,
+                onSettled: refreshHeaderControlState });
+            // One order everywhere: [Turn into project] [Resume] [Stop…].
+            const actions = ensureLiveActionsEl(record);
+            actions?.insertBefore(record.resumeRunBtn, actions.querySelector('[data-cancel-run]'));
+            changed = true;
+        } else if (!resumable && record.resumeRunBtn) {
+            record.resumeRunBtn.remove(); record.resumeRunBtn = null; changed = true;
+        }
+        const eligible = stopEligible(record) || resumable || cardControls(workState, record.groupId).menu;
         const existing = record.root.querySelector('[data-cancel-run]');
         if (!eligible) {
-            if (!existing) return false;
+            if (!existing) return changed;
             existing.remove();
             record.cancelRunBtn = null;
             return true;
         }
         if (existing) {
             record.cancelRunBtn = existing;
-            return false;
+            if (record.finished) existing.disabled = false;
+            return changed;
         }
         const actions = ensureLiveActionsEl(record);
         if (!actions) return false;
         const btn = document.createElement('button');
         btn.type = 'button';
-        btn.className = 'btn btn-xs btn-danger';
+        // Neutral trigger: Resume or Continue stays the card's one primary.
+        btn.className = 'btn btn-sm btn-default ui-hit-area';
         btn.dataset.cancelRun = '1';
         btn.textContent = TASK_CONTROL_TRIGGER_LABEL;
         // Pending cancel offers only hard escalation; dismiss keeps the run.
         btn.addEventListener('click', (event) => {
             event.stopPropagation();
-            openTaskControlMenu(btn, {
-                cancelPending: Boolean(record.cancelPendingPolicy),
-                budgetPaused: activeDirectActivities.get(record.groupId)?.phase === 'budget_paused',
-                busy: taskControlBusy(record.groupId),
-                onAction: (action) => {
-                    if (action === ACTION_HURRY) return hurryTaskAction(record.groupId);
-                    if (action === ACTION_RESUME) return resumeTaskAction(record.groupId);
-                    return cancelRunFromCard(record, action);
-                },
-            });
+            openCardControls(btn, record, cardControls(workState, record.groupId).work, { activity: currentActivity(record),
+                stop: (action) => cancelRunFromCard(record, action), afterAction: reread });
         });
         actions.appendChild(btn);
         record.cancelRunBtn = btn;
@@ -991,16 +893,18 @@ export function createChatInstance({
         );
     }
 
-    // Early final stays live while post-task synthesis runs.
-    function markLiveCardFinalizing(taskId = '') {
+    // Early outcome is not completion.
+    function markLiveCardFinalizing(taskId = '', fact = {}) {
         return withStableViewport(() => {
             const record = liveCardRecords.get(taskKey(taskId));
             if (!record || record.finished || !record.phaseEl) return false;
             const anchored = markReviewAnchor(record);
             if (record.cancelPendingPolicy) return anchored;
+            record.observedOutcome = taskTerminalSummary({ ...fact, task_phase: 'finalizing' }).observedOutcome || record.observedOutcome;
             record.finalizingHold = true;
+            const desired = desiredLiveCardPhase(record);
             const phased = setLiveCardPhase(
-                record, 'working', 'Finalizing…', 'chat-live-phase working finalizing',
+                record, desired.phase, desired.text, desired.className, desired.secondary,
             );
             return Boolean(anchored || phased);
         });
@@ -1043,6 +947,8 @@ export function createChatInstance({
                 btn.disabled = false;
             }
         } catch (exc) {
+            // Said once, by the request; 404 is the task already gone.
+            if (exc?.status !== 404) showToast(`Cancel failed: ${exc?.message || exc}`, 'error');
             if (exc?.status === 404 || record.finished) {
                 // Completion won: remove the dead action, then reconcile detail.
                 revokeManagedTaskCancelAuthority(taskId);
@@ -1053,7 +959,6 @@ export function createChatInstance({
                 }
                 return;
             }
-            showToast(`Cancel failed: ${exc?.message || exc}`, 'error');
             // Reconcile durable truth before restoring any optimistic UI.
             let stored = null;
             try {
@@ -1071,6 +976,7 @@ export function createChatInstance({
                 if (restoredPhase) {
                     changed = setLiveCardPhase(
                         record, restoredPhase.phase, restoredPhase.text, restoredPhase.className,
+                        restoredPhase.secondary,
                     ) || changed;
                 }
                 return changed;
@@ -1078,58 +984,29 @@ export function createChatInstance({
         }
     }
 
-    function restoreCardActivity(record) {
-        if (!setHistoricalUnavailable(record, false)) return;
+    function restoreCardActivity(record, held = {}) {
+        if (!setHistoricalUnavailable(record, false, held)) return;
         renderLiveCardMeta(record);
         syncCancelRunButton(record);
+    }
+
+    function settleMissingTaskRecord(record) {
+        const historical = record.historicalTerminal;
+        if (historical) {
+            const changed = applyHistoricalModelExecution(record, historical) && renderLiveCardMeta(record);
+            return finishLiveCard(record.groupId, historical.phase) || changed;
+        }
+        const changed = setHistoricalUnavailable(record, true);
+        renderLiveCardMeta(record);
+        syncChatStatus();
+        return changed;
     }
 
     function markTaskCancelable(taskId = '') {
         const id = taskKey(taskId);
         if (!id) return false;
         cancelableTaskIds.add(id);
-        const record = liveCardRecords.get(id);
-        return record ? syncCancelRunButton(record) : false;
-    }
-
-    // One-way conversion (P3): the WHOLE card becomes a calm "project identity"
-    // chip. The live task is now owned by the project panel (it's bound there),
-    // so the main chat is freed — the card stops being a busy red task and
-    // recolors to the project fuchsia. Plain wording (no "ack"); click opens the panel.
-    function markCardConverted(record, project) {
-        return withStableViewport(() => markCardConvertedMutation(record, project));
-    }
-
-    function markCardConvertedMutation(record, project) {
-        modelWaits.forget(record.groupId);
-        delete record.root.dataset.projectCreating;
-        record.root.dataset.projectCreated = '1';
-        record.root.dataset.projectId = project.id || '';
-        const chip = renderProjectChip({
-            name: String(project.name || project.id || 'Project').trim(),
-            status: 'running in background ↗',
-            onClick: () => window.dispatchEvent(new CustomEvent('ouro:open-project', { detail: { project } })),
-        });
-        // Atomic detach-and-reparent (C4.5): replaceChildren swaps the whole live
-        // timeline (subagent cards, working bubble) for the chip in one paint.
-        record.root.replaceChildren(chip);
-        record.turnProjectBtn = null;
-        record.cancelRunBtn = null;
-        record.finished = true;
-        // Recolor on the next frame so the 250ms fuchsia fade actually animates.
-        requestAnimationFrame(() => record.root.classList.add('is-project'));
-        signalChatFreed();  // subtle "this chat is free again" composer cue
-    }
-
-    // A brief composer brighten when a task leaves the main chat for a project —
-    // a calm "you're free to start something else" signal (P3). Self-clearing.
-    let _chatFreedTimer = null;
-    function signalChatFreed() {
-        const row = page.querySelector('.chat-text-row');
-        if (!row) return;
-        row.classList.add('chat-freed');
-        if (_chatFreedTimer) clearTimeout(_chatFreedTimer);
-        _chatFreedTimer = setTimeout(() => row.classList.remove('chat-freed'), 900);
+        return syncCancelRunButton(liveCardRecords.get(id));
     }
 
     const reviewAnchorEligible = (id) => !liveCardRecords.has(id) && !activeDirectActivities.has(id);
@@ -1159,16 +1036,33 @@ export function createChatInstance({
         return withStableViewport(() => {
             const id = taskKey(taskId);
             modelWaits.observe(id, detail);
+            const filed = noteTaskDetails(liveCardRecords.get(id), detail);
             const groups = reviewGroupsFromTaskDetail(detail, id);
-            if (!id || groups.length === 0) return false;
+            if (!id || groups.length === 0) return filed;
             const fresh = !liveCardRecords.has(id);
             const record = getLiveCardRecord(id);
             if (fresh) reanchorTaskCard(record, detail?.ts || detail?.timestamp || '');
             const changed = record.reviewController.updateMany(groups);
             ensureLiveCardVisible(record);
             const reconciled = reconcileCancelCardFromDetail(record, id, detail);
-            return Boolean(changed || reconciled);
+            return Boolean(changed || reconciled || filed);
         });
+    }
+
+    // Refresh files/history and a Swarm root's receipt line; retain lifecycle.
+    function noteTaskDetails(record, detail) {
+        const files = syncSettledItems(record, detail, { write: withStableViewport });
+        const words = syncClosingSentence(record, detail);
+        if (words) syncCardHeadline(record);
+        const origin = record && detail?.schedule_name && record.scheduleName !== detail.schedule_name;
+        if (origin) record.scheduleName = detail.schedule_name;
+        const history = syncHistoryRetentionItem(record, detail);
+        const candidate = syncCandidateRemainderItem(record, detail);
+        const chain = episodes.note(record, detail);
+        const receipt = syncSwarmReceipt(record, detail);
+        const money = syncCostBreakdown(record, detail);  // a root's "Spent on" / "Ran on" rows in its Details
+        return Boolean((words || origin || files || history || candidate || money) && (renderLiveCardMeta(record), updateLiveCardCount(record), renderLiveCardTimeline(record), true))
+            || chain || receipt;
     }
 
     function hydrateCardReviews(taskId, revision = null) {
@@ -1212,35 +1106,29 @@ export function createChatInstance({
         return lifecycle.classification === 'source_incomplete' ? false : undefined;
     }
 
-    // The host's placement fact is the ONE rule for a task-keyed System row: the
-    // row becomes one content-only timeline item of that task's card, keyed by the
-    // host's row identity, and never touches the card's chip, phase, finality or
-    // expansion. `reviews` additionally asks the Reviews group to re-read the
-    // projection that carries the same fact, and the timeline item is what remains
-    // when that read fails. A row with no placement fact, no task, or no card
-    // record for its task keeps the ordinary bubble path — the client holds no
-    // list of system types that attach. A record the two-pass replay has not
-    // mounted yet still owns its rows; pass 2 mounts the card with them.
+    // Host keys place content without changing phase/expansion.
+    // Reviews rehydrate; failures retain rows, unkeyed rows stay bubbles.
+    // Pass 2 uses pass-1 cards without a type allowlist.
+    function isPlacedCardRow(msg) {
+        return CARD_ROW_PHASES.has(taskKey(msg?.card_row)) && !!taskKey(msg?.task_id);
+    }
+
     function attachCardRow(msg, rawTs = '', { suppressDomInsert = false } = {}) {
         const placement = taskKey(msg?.card_row);
         const phase = CARD_ROW_PHASES.get(placement);
         const taskId = taskKey(msg?.task_id);
         const record = phase && taskId ? liveCardRecords.get(taskId) : null;
         if (!record) return undefined;
-        const lines = String(msg.text ?? msg.content ?? '').split('\n');
-        const headline = lines[0].trim();
-        const rowId = taskKey(msg.card_row_id) || `${taskKey(msg.system_type)}|${rawTs}`;
-        const summary = { phase, headline, body: lines.slice(1).join('\n').trim(), dedupeKey: `cardrow|${rowId}` };
+        const summary = cardRowSummary(msg, phase, rawTs);
         return withStableViewport(() => {
             const before = captureLiveCardProjection(record);
             let fresh;
             if (msg.history_id) {
-                // A replayed row keeps its history identity: the item sorts by its
-                // source position and leaves the card with its page.
+                // Replay keeps source/order/page identity.
                 fresh = mergeHistoricalTimelineItem(record, summary, msg, normalizeLogTs(rawTs));
             } else {
                 const { timelineUpdate } = updateLiveTimelineItem(record, summary, {
-                    ts: normalizeLogTs(rawTs), rawTs, syntheticKey: summary.dedupeKey, headline, inPlaceByKey: true,
+                    ts: normalizeLogTs(rawTs), rawTs, syntheticKey: summary.dedupeKey, headline: summary.headline, inPlaceByKey: true,
                 });
                 fresh = !['none', 'duplicate-skip'].includes(timelineUpdate);
             }
@@ -1248,13 +1136,28 @@ export function createChatInstance({
             updateLiveCardCount(record);
             reanchorTaskCard(record, rawTs, { suppressDomInsert });
             ensureLiveCardVisible(record, { suppressDomInsert });
-            // A row that repeats a fact the card already holds asks for no new read.
+            // Only new review rows trigger a read; a live receipt on a settled card re-reads its stored line.
             if (fresh && placement === 'reviews') hydrateCardReviews(taskId);
+            if (fresh && !msg.history_id && record.finished && msg.terminal_receipt) scheduleHistorySync();
             return Boolean(changed || liveCardProjectionChanged(before, record));
         });
     }
 
-    function handleCardReference(row) {
+    function admitCardMetadata(row) {
+        // Carrier facts precede presentation returns.
+        if ((row.tool_evidence || Number.isInteger(row.rounds)) && row.task_id) noteToolMetrics(row.task_id, row, row.ts || row.timestamp || '');
+        if (row.system_type === 'task_evidence') {
+            // The task's own evidence: mints its card at the carrier's row (zero tools included).
+            const record = getLiveCardRecord(row.task_id);
+            const activity = activeDirectActivities.get(row.task_id);
+            if (row.ts) reanchorTaskCard(record, row.ts);
+            if (row.suggested_name) applySuggestedName(row.task_id, row.suggested_name);
+            if (row.task_phase === 'finalizing') markLiveCardFinalizing(row.task_id, row);
+            else if (!row.task_terminal_status && !activity) setHistoricalUnconfirmed(record);
+            if (activity) syncParkedPhase(record, activity.phase, activity);
+            syncCancelRunButton(record);
+            return true;
+        }
         if (isModelWaitReference(row)) {
             const changed = modelWaits.observe(row.task_id, row);
             return row.outcome_axes ? appendTaskSummaryToLiveCard(row) || changed : changed;
@@ -1265,7 +1168,7 @@ export function createChatInstance({
             const owner = reference.presentationOwnerTaskId;
             const anchor = reviewAnchorEligible(owner);
             const record = getLiveCardRecord(owner);
-            const wasVisible = Boolean(record.root?.isConnected);
+            const wasVisible = record.root?.isConnected;
             if (row?.ts) reanchorTaskCard(record, row.ts);
             const anchored = anchor && markReviewAnchor(record, true);
             ensureLiveCardVisible(record);
@@ -1273,7 +1176,7 @@ export function createChatInstance({
             // Task money follows its carrier, not the review owner.
             const costChanged = renderLiveCardMeta(liveCardRecords.get(taskKey(row.task_id)),
                 taskCostProjection(row, row.ts || row.timestamp || ''));
-            return Boolean((!wasVisible && Boolean(record.root?.isConnected)) || anchored || costChanged);
+            return Boolean((!wasVisible && record.root?.isConnected) || anchored || costChanged);
         });
     }
 
@@ -1294,49 +1197,64 @@ export function createChatInstance({
             ? explicitCardExpansion.get(normalizedGroupId)
             : Boolean(options.isSubagent && nestedSubagentsExpanded);
         root.dataset.expanded = initialExpanded ? '1' : '0';
+        // Selectable summary; Reviews and Details have independent native controls.
         root.innerHTML = `
-            <div class="chat-live-summary-button" role="button" tabindex="0" data-live-summary-button aria-expanded="false" aria-controls="${escapeHtmlAttr(timelineId)}">
+            <div class="chat-live-summary-button" data-live-summary-button>
                 <div class="chat-live-summary">
                     <div class="chat-live-summary-main">
                         <span class="chat-live-phase working" data-live-phase role="status" aria-live="polite" aria-atomic="true" aria-label="${options.isSubagent ? 'Subagent' : 'Task'} status: Working">Working</span>
-                        <div class="chat-live-typing" data-live-typing aria-hidden="true">
-                            <span></span><span></span><span></span>
-                        </div>
+                        <span class="chat-live-phase-secondary" data-live-phase-secondary hidden></span>
+                        <span class="chat-live-hurry" data-live-hurry role="img" hidden></span>
+                        <span class="chat-live-when" data-live-when hidden></span>
                     </div>
                     <span class="chat-live-title" data-live-title>Waiting for work</span>
-                    <div class="chat-live-summary-side">
-                        <span class="chat-live-count" data-live-count hidden>2 notes</span>
-                        <span class="chat-live-toggle" data-live-toggle>Show details</span>
-                        <svg class="chat-live-chevron" width="14" height="14" viewBox="0 0 20 20" fill="none" aria-hidden="true">
-                            <path d="M5 7.5 10 12.5 15 7.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"></path>
-                        </svg>
-                    </div>
+                    <div class="chat-live-doors">
+                    <button type="button" class="chat-live-review-summary ui-hit-area" data-live-review-summary aria-expanded="false" hidden>${CHEVRON}</button>
+                    <button type="button" class="chat-live-summary-side ui-hit-area" data-live-disclosure aria-expanded="false" aria-controls="${escapeHtmlAttr(timelineId)}">
+                        <span class="chat-live-count" data-live-count hidden></span>
+                        <span class="chat-live-toggle" data-live-toggle>Details</span>
+                        ${CHEVRON}
+                    </button></div>
                 </div>
+                <div class="chat-live-episodes" data-live-episodes hidden></div>
                 <div class="chat-live-activity" data-live-activity></div>
+            </div>
+            <div class="chat-live-foot" data-live-foot>
                 <div class="chat-live-meta" data-live-meta></div>
-                <div class="chat-live-review-summary" data-live-review-summary hidden></div>
+                <div class="chat-live-foot-end" data-live-foot-end></div>
+            </div>
+            <div data-live-reviews-host></div>
+            <div class="chat-live-details">
+                <div data-live-phase-detail hidden></div>
+                <dl class="chat-live-facts" data-live-facts hidden></dl>
+                <div data-live-cost-detail hidden></div>
             </div>
             <div class="chat-live-timeline" data-live-timeline id="${escapeHtmlAttr(timelineId)}"></div>
-            <div data-live-reviews-host></div>
+            <div class="chat-live-episode-history" data-live-episode-history hidden></div>
         `;
+        const part = (name) => root.querySelector(`[data-live-${name}]`);  // the card's own named parts
         const record = {
             groupId: normalizedGroupId,
             root,
-            summaryButtonEl: root.querySelector('[data-live-summary-button]'),
-            phaseEl: root.querySelector('[data-live-phase]'),
-            inlineTypingEl: root.querySelector('[data-live-typing]'),
-            titleEl: root.querySelector('[data-live-title]'),
-            activityEl: root.querySelector('[data-live-activity]'),
-            countEl: root.querySelector('[data-live-count]'),
-            metaEl: root.querySelector('[data-live-meta]'),
-            reviewSummaryEl: root.querySelector('[data-live-review-summary]'),
-            toggleEl: root.querySelector('[data-live-toggle]'),
+            summaryButtonEl: part('summary-button'),
+            phaseEl: part('phase'),
+            titleEl: part('title'),
+            episodesEl: part('episodes'),
+            episodeHistoryEl: part('episode-history'),
+            activityEl: part('activity'),
+            countEl: part('count'),
+            disclosureEl: part('disclosure'),
+            footEl: part('foot'),
+            footEndEl: part('foot-end'),
+            metaEl: part('meta'),
+            reviewSummaryEl: part('review-summary'),
+            toggleEl: part('toggle'),
             // Both actions render lazily from the record's facts (syncBlockChrome,
             // syncCancelRunButton).
             turnProjectBtn: null,
             cancelRunBtn: null,
-            timelineEl: root.querySelector('[data-live-timeline]'),
-            reviewsHostEl: root.querySelector('[data-live-reviews-host]'),
+            timelineEl: part('timeline'),
+            reviewsHostEl: part('reviews-host'),
             expandedLineKeys: new Set(),
             isSubagent: Boolean(options.isSubagent),
             parentGroupId: String(options.parentGroupId || ''),
@@ -1345,14 +1263,10 @@ export function createChatInstance({
             // The proactively-coined LLM name; becomes the card title when set.
             suggestedName: '',
             reviewOwnerDetailObserved: false,
-            // Host fact for the header pill: a direct conversation turn (census
-            // kind, rebuilt task_done, history rows) vs a managed/Swarm root.
-            direct: String(activeDirectActivities.get(normalizedGroupId)?.kind || 'managed_task') !== 'managed_task',
         };
         const reviewDisclosure = reviewDisclosureByTask.get(normalizedGroupId) || {
             sectionExpanded: false,
             expandedGroups: new Set(),
-            expandedAttempts: new Set(),
         };
         reviewDisclosureByTask.set(normalizedGroupId, reviewDisclosure);
         record.reviewController = createReviewPresentationController({
@@ -1360,18 +1274,12 @@ export function createChatInstance({
             summary: record.reviewSummaryEl,
             disclosure: reviewDisclosure,
             onHydrate: () => hydrateCardReviews(normalizedGroupId),
-            onLoadSkillDetail: (detail, detailOptions = {}) => loadSkillReviewDetail(
-                detail,
-                nestedSkillReviewRef(detail),
-                {
-                    store: skillReviewDetailStore,
-                    retry: detailOptions.retry === true,
-                    onDomWrite: withStableViewport,
-                },
-            ),
+            onRead: (file, trigger, event) => chatMedia.openReview(file, record.root, trigger, event),
             onDomWrite: withStableViewport,
         });
-        bindContentButton(record.summaryButtonEl, () => {
+        // A native button: Enter and Space press it. A portal hides it (its room holds what it would open).
+        record.disclosureEl?.addEventListener('click', () => {
+            if (isPortal(record)) return;
             const nowExpanded = record.root.dataset.expanded !== '1';
             explicitCardExpansion.set(record.groupId, nowExpanded);
             setLiveCardExpanded(record, nowExpanded);
@@ -1382,9 +1290,7 @@ export function createChatInstance({
             if (nowExpanded) record.expandedLineKeys.add(lineKey);
             else record.expandedLineKeys.delete(lineKey);
             renderLiveCardTimeline(record);
-            // P3: on expand, lazily fetch the genuinely-full output for a server-truncated
-            // line (the WS preview was capped at 4000); cached on the item so a re-render
-            // keeps it. Best-effort — the capped preview stays on failure.
+            // Expand fetches full output once; failures retain the preview.
             if (nowExpanded) {
                 const item = record.items.find((it) => it.lineKey === lineKey);
                 if (item && item.truncated && item.fullRef && !item.fetchedFull && !item._fetchingFull) {
@@ -1392,6 +1298,9 @@ export function createChatInstance({
                 }
             }
         });
+        // While a part Details opens scrolls inside (style.css) it is a named region the keyboard reaches.
+        record.regions = [['.chat-live-details', 'Scrollable task details'], ['.chat-live-timeline', 'Scrollable task notes']]
+            .map(([part, region]) => bindScrollFade(root.querySelector(part), { region }));
         liveCardRecords.set(normalizedGroupId, record);
         liveCardBound.observe(liveCardRecords.size);
         // apply a name that arrived (task_named) before this card existed.
@@ -1399,12 +1308,22 @@ export function createChatInstance({
         if (_pendingName && !record.isSubagent) {
             pendingSuggestedNames.delete(normalizedGroupId);
             record.suggestedName = _pendingName;
-            if (record.titleEl) record.titleEl.textContent = _pendingName;
         }
         resetLiveCardRecord(record);
+        // A card the last complete body does not name asks for a read.
+        if (!_historyReplayActive && workState.complete && !workState.members.has(normalizedGroupId)) reread();
+        applyCardWorkViews(new Map([[normalizedGroupId, record]]), workState);
+        const activity = activeDirectActivities.get(normalizedGroupId);
+        if (activity) syncParkedPhase(record, activity.phase, activity);
+        const ended = concludedDirectActivities.get(normalizedGroupId);
+        if (ended) finishLiveCardMutation(normalizedGroupId, ended);
         // P5: the cancelable marker may have arrived (scheduled progress frame /
         // history replay) before this card was minted.
         syncCancelRunButton(record);
+        // Children that arrived before their parent's evidence nest under it now.
+        for (const [childId, info] of subagentChildParents) {
+            if (info.parentId === normalizedGroupId) ensureLiveCardVisible(liveCardRecords.get(childId));
+        }
         return record;
     }
 
@@ -1429,30 +1348,21 @@ export function createChatInstance({
         if (!tid || !nm) return false;
         const record = liveCardRecords.get(tid);
         if (!record) {
-            // task_named is broadcast to every instance, so bound the early-name buffer.
+            // task_named reaches every instance, so bound the early-name buffer.
             pendingSuggestedNames.set(tid, nm);
             if (pendingSuggestedNames.size > 100) {
-                const oldest = pendingSuggestedNames.keys().next().value;
-                pendingSuggestedNames.delete(oldest);
+                pendingSuggestedNames.delete(pendingSuggestedNames.keys().next().value);
             }
             return false;
         }
-        if (record.isSubagent) return false;
-        const titleChanged = Boolean(record.titleEl && record.titleEl.textContent !== nm);
-        let changed = record.suggestedName !== nm || titleChanged;
-        record.suggestedName = nm;
-        if (titleChanged) record.titleEl.textContent = nm;
-        // Restore the deferred collapsed activity after naming.
-        changed = renderCollapsedActivity(record, projectCollapsedActivity({
-            suggestedName: nm,
-            headline: record.collapsedActivity,
-            previous: record.collapsedActivity,
-        })) || changed;
-        return Boolean(changed && record.root?.isConnected);
+        return episodes.rename(record, nm);
     }
 
+    // A parent card comes only from the parent's OWN evidence here (its record, a census
+    // activity, a replayed row of its own), never a child's bare parent_task_id (A5).
     function ensureSubagentContainer(parentId = '', depth = 0) {
-        if (!parentId) return null;
+        if (!parentId || !(liveCardRecords.has(parentId) || activeDirectActivities.has(parentId)
+                || evidencedTaskIds.has(parentId))) return null;
         // A lineage-known parent is minted as the nested card ITS parent owns,
         // never as a root-shaped shell (#636); depth bounds a lineage cycle.
         const lineage = depth < 32 ? subagentChildParents.get(parentId) : null;
@@ -1466,20 +1376,25 @@ export function createChatInstance({
             container.dataset.subagentsFor = parentId;
             parentRecord.subagentsEl = container;
         }
-        const anchor = parentRecord.reviewsHostEl || parentRecord.timelineEl;
+        // Children follow what the card's Details opens (its facts and notes), under the card's own lines, never behind
+        // them; earlier episodes follow the children, an episode's disclosure keeping them after its Reviews.
+        const own = parentRecord.timelineEl?.parentNode === parentRecord.root;
+        const anchor = own ? parentRecord.timelineEl : parentRecord.reviewsHostEl || parentRecord.timelineEl;
         if (container.parentNode !== parentRecord.root || container.previousElementSibling !== anchor) {
             anchor?.insertAdjacentElement('afterend', container);
         }
         return container;
     }
 
-    function getSubagentCardRecord(childId = '', parentId = '', role = '') {
+    // A child's frame reanchors its parent's card (one this room has or just minted) at the frame's time.
+    function getSubagentCardRecord(childId = '', parentId = '', role = '', rawTs = '') {
         const existing = liveCardRecords.get(childId);
         const childBefore = captureLiveCardProjection(existing);
         const parentBefore = captureLiveCardProjection(liveCardRecords.get(parentId));
         let record = null;
         withStableViewport(() => {
             record = getSubagentCardRecordMutation(childId, parentId, role);
+            if (rawTs) reanchorTaskCard(liveCardRecords.get(parentId), rawTs);
             return liveCardProjectionChanged(childBefore, record)
                 || liveCardProjectionChanged(parentBefore, liveCardRecords.get(parentId));
         });
@@ -1498,12 +1413,14 @@ export function createChatInstance({
         record.isSubagent = true;
         record.parentGroupId = parentId;
         record.subagentRole = role || record.subagentRole || '';
+        dockChildReviewDoor(record);
         if (promoted) {
             record.root.classList.add('subagent');
             record.root.dataset.subagent = '1';
             // A frame that outran its lineage minted this shell root-shaped:
             // the conversion a root earned is re-derived from the child's facts.
             syncBlockChrome(record);
+            refitCollapsedActivity(record);  // a child shows one line
         }
         if (record.root.dataset.parentTaskId !== parentId) record.root.dataset.parentTaskId = parentId;
         if (record.root.dataset.subagentRole !== record.subagentRole) {
@@ -1523,32 +1440,33 @@ export function createChatInstance({
 
     function resetLiveCardRecord(record) {
         record.updates = 0;
+        record.wakeSummary = '';
         record.finished = false;
         record.items = [];
         record.lastHumanHeadline = '';
+        record.lastHumanHeadlineSource = null;
         record.expandedLineKeys.clear();
         record._anchorOrderDirty = false;
         // collapsed timelines defer DOM building; the flag says
         // the rendered timeline DOM is stale relative to record.items.
         record._timelineDirty = false;
-        // last frame's summary meta strings — meta renders from
-        // record state (renderLiveCardMeta), once per card in a batch.
+        // Render metadata once per card in a batch.
         record._lastFrameMeta = [];
         // P1: last bounded activity projection (remembered even while
         // the collapsed line is suppressed on unnamed root cards) + sticky cost.
         clearStickyCardState(record);
-        record.titleEl.textContent = record.suggestedName || (blockHasWork(record) ? 'Working...' : '');
+        record.titleEl.textContent = record.suggestedName || '';
         setLiveCardPhase(record, 'working');
         record.countEl.hidden = true;
         record.countEl.textContent = '0 notes';
         record.metaEl.innerHTML = '';
         record.timelineEl.innerHTML = '';
         record.root.dataset.finished = '0';
-        setLiveCardTypingVisible(record, true);
         const expanded = explicitCardExpansion.has(record.groupId)
             ? explicitCardExpansion.get(record.groupId)
             : Boolean(record.isSubagent && nestedSubagentsExpanded);
         setLiveCardExpanded(record, expanded);
+        syncLiveCardToggle(record);  // a card born expanded says so from its first paint
     }
 
     function ensureLiveCardVisible(
@@ -1556,19 +1474,18 @@ export function createChatInstance({
         { suppressDomInsert = false, reorderExisting = false } = {},
     ) {
         if (!record || suppressDomInsert || _syncPass1Active) return;
-        if (record.isSubagent && record.parentGroupId) {
-            // The container mints a lineage-known parent nested (#636); the
-            // recursion carries the chain up to the inserted root.
-            const container = ensureSubagentContainer(record.parentGroupId);
-            if (container && record.root.parentNode !== container) {
-                container.appendChild(record.root);
-            }
+        const container = record.isSubagent ? ensureSubagentContainer(record.parentGroupId) : null;
+        if (container) {
+            // The container nests a lineage-known parent (#636); the recursion
+            // carries the chain up to the inserted root.
+            if (record.root.parentNode !== container) container.appendChild(record.root);
             const parentRecord = liveCardRecords.get(record.parentGroupId);
             ensureLiveCardVisible(parentRecord);
             updateLiveCardCount(parentRecord);
             return;
         }
         syncBlockChrome(record);
+        episodes.sync(record);
         if (blockVisible(record)) insertMessageNode(record.root, { reorderExisting });
         else if (record.root.parentNode === messagesDiv) record.root.remove();
     }
@@ -1582,6 +1499,7 @@ export function createChatInstance({
             // First expansion materializes its deferred timeline.
             if (expanded && record._timelineDirty) renderLiveCardTimeline(record);
             syncLiveCardToggle(record);
+            refitCollapsedActivity(record);
             return Boolean(record.root.isConnected);
         };
         return record?.root?.isConnected ? withStableViewport(mutate) : mutate();
@@ -1593,179 +1511,190 @@ export function createChatInstance({
 
     function updateLiveCardCount(record) {
         if (!record?.countEl) return;
-        const bits = [];
-        if (record.items.length >= 2) bits.push(`${record.items.length} notes`);
         const children = directSubagentCount(record);
-        if (children) bits.push(`${children} ${children === 1 ? 'child' : 'children'}`);
+        // Children keep the card's opened facts and notes short (style.css), so they stay in reach below them.
+        const flagged = 'children' in record.root.dataset;
+        if (children > 0 && !flagged) record.root.dataset.children = '1';
+        else if (!children && flagged) delete record.root.dataset.children;
+        const bits = liveCardCountBits(record.items.length, children);
         const hidden = bits.length === 0;
         const text = bits.join(' · ');
         if (record.countEl.hidden !== hidden) record.countEl.hidden = hidden;
         if (record.countEl.textContent !== text) record.countEl.textContent = text;
     }
 
-    // Re-showing a hidden instance still restores its saved viewport. Live-card
-    // geometry itself has no deferred layout work; every real DOM mutation is
-    // stabilized at its write boundary.
-    const handlePageShown = (event) => {
-        if (
-            event?.detail?.page === 'chat'
-            || (event?.type === 'visibilitychange' && !document.hidden)
-        ) restoreScrollPosition();
+    // A window shown again keeps the reading intent (data readiness positions it); hidden, it ends an unread opening
+    // still owed; a room away stays put (its return: `resume`).
+    const handleVisibility = () => {
+        if (leaving) return;
+        if (document.hidden) reading.land(() => 0, reading.arriving);
+        else { reading.request(); historyControls.showNotice(); }
     };
-    window.addEventListener('ouro:page-shown', handlePageShown);
-    document.addEventListener('visibilitychange', handlePageShown);
+    document.addEventListener('visibilitychange', handleVisibility);
 
-    // P3: fetch the genuinely-full text of a server-truncated timeline line (the WS
-    // preview is capped at 4000 chars) on demand, not over the socket; cache it on
-    // the item, re-render if the line is still expanded, and show it in a
-    // bounded-scroll box. Best-effort: the capped preview stays on failure.
+    // Beyond the 4000-char preview: fetch/cache on expansion, bounded scroll, render while expanded.
     async function fetchFullLineOutput(item, record) {
         item._fetchingFull = true;
+        item.fullReadError = '';
         let changed = false;
         try {
             const resp = await apiFetch(`/api/tasks/${encodeURIComponent(item.fullRef)}`, { cache: 'no-store' });
             const data = resp && typeof resp.json === 'function' ? await resp.json() : resp;
-            // Compose ALL available full fields — a subagent line can carry both a result AND a
-            // (separately truncated) trace_summary, so `result || trace_summary` would hide the
-            // full trace. Label each section when both are present.
+            // Keep result and trace: the preview can truncate either independently.
             const result = String((data && data.result) || '').trim();
             const trace = String((data && data.trace_summary) || '').trim();
+            const report = result && ['done', 'warn'].includes(taskOutcomeSeverity(data))
+                ? childReportLabel(data.status) : '';  // the label the capped body led with
             let full = '';
-            if (result && trace) full = `[RESULT]\n${result}\n\n[TRACE]\n${trace}`;
-            else full = result || trace;
+            if (result && trace) full = `${report ? `## ${report}` : '[RESULT]'}\n${result}\n\n[TRACE]\n${trace}`;
+            else full = report ? `## ${report}\n${result}` : result || trace;
+            if (item.fullField === 'candidate_remainder') {
+                full = readCandidateRemainder(item, data, resp?.ok !== false);
+                changed = true;
+            }
             if (full && item.fetchedFull !== full) {
                 item.fetchedFull = full;
                 changed = true;
             }
         } catch {
             // best-effort: leave the capped preview on failure
+            if (item.fullField === 'candidate_remainder') {
+                readCandidateRemainder(item, null, false);
+                changed = true;
+            }
         } finally {
             item._fetchingFull = false;
             if (changed && !destroyed && record.expandedLineKeys.has(item.lineKey)) {
-                renderLiveCardTimeline(record);
+                (leaving ? oweTimeline : renderLiveCardTimeline)(record);
             }
+            reading.position();
         }
     }
 
     function scheduleHistorySync() {
+        if (destroyed || leaving) return;
         historyResyncScheduler.schedule(liveCardBound.isArmed());
     }
 
     const historyResyncScheduler = createHistoryResyncScheduler({
         isReplayActive: () => _historyReplayActive,
-        // A joined run's timer was spent on a window fetched before the arm: re-arm.
-        run: () => syncHistory({ includeUser: false }).catch(() => {}).then(() => {
-            if (!destroyed && lastHistorySyncSucceeded && liveCardBound.isArmed()) scheduleHistorySync();
+        // Re-arm if the joined sync fetched its window before the arm.
+        run: () => historyPager.read().catch(() => {}).then(() => {
+            if (!destroyed && !leaving && lastHistorySyncSucceeded && liveCardBound.isArmed()) scheduleHistorySync();
         }),
     });
 
-    function applyLiveCardState(summary, groupId, ts, dedupeKey = '', options = {}) {
-        return withStableViewport(() => applyLiveCardStateMutation(
-            summary, groupId, ts, dedupeKey, options,
-        ));
+    function applyLiveCardState(summary, groupId, rawTs, options) {
+        return withStableViewport(() => applyLiveCardStateMutation(summary, groupId, rawTs, options));
     }
 
-    function applyLiveCardStateMutation(summary, groupId, ts, dedupeKey = '', { suppressDomInsert = false, rawTs = '' } = {}) {
+    // Authored naming has its own clock: newer execution or a terminal outcome may own the card before its saved
+    // narration arrives here. A root's collapsed line shows narration unless a cause holds.
+    function reconcileAuthoredHeadline(record, summary, rawTs) {
+        if (!summary.human || !summary.headline) return;
+        const previous = record.lastHumanHeadlineSource, shown = previous?.preview || '';
+        const incoming = { time: Date.parse(rawTs), position: _historyRow?.history_position,
+            preview: authoredLine(record, summary) || shown };
+        if (Number.isFinite(previous?.time) && (!Number.isFinite(incoming.time) || incoming.time < previous.time)) return;
+        if (incoming.time === previous?.time && (compareHistoryPosition(incoming.position, previous.position) < 0
+                || previous.position && !incoming.position)) return;
+        if (!record.isSubagent && !record.causeHeld && record.collapsedActivity === shown) record.collapsedActivity = incoming.preview;
+        record.lastHumanHeadline = summary.headline;
+        record.lastHumanHeadlineSource = incoming;
+        return true;
+    }
+
+    function applyLiveCardStateMutation(summary, groupId, rawTs, { suppressDomInsert = false } = {}) {
+        const ts = normalizeLogTs(rawTs);
         const nextGroupId = groupId || activeLiveGroupId || 'active';
         const record = getLiveCardRecord(nextGroupId);
-        if (record.root?.dataset?.projectCreated === '1') return false;
         const before = captureLiveCardProjection(record);
         const typingBefore = typingEl.style.display;
         let timelineChanged = false;
         const nextPhase = summary.phase || '';
-        if (_historyRow?.history_id && record.updates > 0 && !summary.terminal
+        const closedPhase = record.finished && !isTerminalTaskPhase(nextPhase, summary.terminal) ? replayTerminalPhase(record) : '';
+        const initialContent = record.finished && (!record.updates || (summary.human && !record.lastHumanHeadline));
+        // A closed card drops a late live row (below); saved narration joins its timeline and may name it.
+        const newest = (!closedPhase || initialContent || _historyRow?.history_id) && reconcileAuthoredHeadline(record, summary, rawTs);
+        if (_historyRow?.history_id && record.updates > 0 && !initialContent && !summary.terminal
                 && (record.finished || _historyAppending
                     || Date.parse(rawTs) < Date.parse(record.latestSourceTs || ''))) {
             const changed = mergeHistoricalTimelineItem(record, summary, _historyRow, ts);
             reanchorTaskCard(record, rawTs, { suppressDomInsert });
             if (changed) { renderLiveCardTimeline(record); updateLiveCardCount(record); }
-            return changed;
+            if (newest) syncCardHeadline(record);
+            return changed || liveCardProjectionChanged(before, record);
         }
-        if (record.finished && !isTerminalTaskPhase(nextPhase, summary.terminal)) {
+        // One tool evidence row per block.
+        const foldView = summary.toolCall ? applyToolObservation(record, summary.toolCall) : null;
+        if (summary.toolCall?.fact === 'wait_ended' && record.toolFold.calls.get(summary.toolCall.key)?.settlement) {
+            summary = { ...summary, visible: false }; // wait history remains in the fold
+        }
+        if (closedPhase && !initialContent) {
+            if (foldView) {
+                upsertToolFoldRow(record, foldView, ts, rawTs);
+                if (summary.dedupeKey?.endsWith(':check')) placeCheckRow(record, summary, ts, rawTs);
+                renderLiveCardTimeline(record);
+                updateLiveCardCount(record);
+            }
             if (summary.modelExecution) record.modelExecution = summary.modelExecution;
             renderLiveCardMeta(record, summary.costProjection);
             return liveCardProjectionChanged(before, record);
         }
-        if (summary.terminal || (!_historyReplayActive && !_syncPass1Active
-                && ['working', 'thinking'].includes(summary.phase))) {
+        if (!closedPhase && (summary.terminal || (!_historyReplayActive && !_syncPass1Active
+                && ['working', 'thinking'].includes(summary.phase)))) {
             restoreCardActivity(record);
             if (!summary.terminal) {
+                if (record.isSubagent && record.parkedPhase === 'unknown' && ws.isConnected?.() !== false) syncParkedPhase(record, summary.phase);
                 record.lastLiveObservedAt = Date.now();
                 missingManagedTaskIds.delete(nextGroupId);
             }
         }
         markReviewAnchor(record);
-        // Routine execution folds into ONE evidence row per block.
-        const foldView = summary.toolCall ? applyToolObservation(record, summary.toolCall) : null;
+        if (foldView?.clearedNotice) { renderLiveCardTimeline(record); timelineChanged = true; }
 
         if (!record.isSubagent) {
-            activeLiveGroupId = nextGroupId;
+            if (!closedPhase) activeLiveGroupId = nextGroupId;
             reanchorTaskCard(record, rawTs, { suppressDomInsert });
         }
         record.updates += 1;
         const wasFinished = record.finished;
-        const headline = summary.headline || record.lastHumanHeadline || 'Working...';
-        const syntheticKey = summary.dedupeKey || dedupeKey || `${summary.phase || 'working'}|${headline}|${summary.body || ''}`;
+        if (summary.terminal && typeof summary.quietEffective === 'boolean') record.quietEffective = summary.quietEffective;
+        // Empty frames name nothing (#1369).
+        const headline = summary.headline || record.lastHumanHeadline || '';
+        const syntheticKey = summary.dedupeKey || `${summary.phase || 'working'}|${headline}|${summary.body || ''}`;
         const isLegacyParentSubagentKey = syntheticKey.startsWith('parent-subagent:');
-        // A call's failure and timeout evolve one row; success feeds the fold.
+        // Failure/timeout update one row; success feeds the fold.
         const inPlaceByKey = isLegacyParentSubagentKey
             || ['subagent-lifecycle:', 'subagent-progress:', 'subagent-result:', 'task_done|', 'tool:']
                 .some((prefix) => syntheticKey.startsWith(prefix));
         if (!isLegacyParentSubagentKey) {
-            record.finished = isTerminalTaskPhase(nextPhase, summary.terminal);
-        }
-        if (summary.human && headline) {
-            record.lastHumanHeadline = headline;
+            record.finished = Boolean(closedPhase) || isTerminalTaskPhase(nextPhase, summary.terminal);
         }
         if (summary.model) record.agentModel = summary.model;
-        // The origin label (a consciousness wake-up) is sticky once any frame names it.
+        // Keep the observed initiator.
         if (summary.initiator) record.initiator = summary.initiator;
+        if (summary.continueRequester) record.continueRequester = summary.continueRequester;
 
-        const shouldPromote = Boolean(summary.promote) || record.finished;
-        const activeHeadline = shouldPromote
-            ? headline
-            : (record.lastHumanHeadline
-                || (record.updates > 1 ? record.titleEl.textContent : '')
-                || 'Working...');
-        const activePhase = record.finished
-            ? (summary.phase || 'done')
-            : (shouldPromote ? (summary.phase || 'working') : (record.phaseEl.dataset.phase || 'working'));
-
-        const desiredPhase = desiredLiveCardPhase(record, activePhase);
-        setLiveCardPhase(record, desiredPhase.phase, desiredPhase.text, desiredPhase.className);
-        // A coined project name takes the title slot (the activity headline stays in the
-        // timeline); a child's title is its lineage identity; a block without work
-        // (open attention, a bare non-Done ending) carries no title; otherwise the
-        // activity headline.
-        // A Failed outcome reported during the finalizing hold keeps the title slot: the chip says
-        // only "Finalizing…" then, so narration must not be the one thing that hides the failure.
-        if (shouldPromote && !record.finished && taskPresentation(summary.phase).headline === 'Failed') record.failedHeadline = headline;
-        const title = record.suggestedName || (record.isSubagent ? childTitle(record)
-            : !blockHasWork(record) ? ''
-                : (record.finished ? record.lastHumanHeadline || 'Task activity'
-                    : record.failedHeadline || record.lastHumanHeadline || activeHeadline));
-        if (record.titleEl.textContent !== title) record.titleEl.textContent = title;
-        // The collapsed line is a compact projection; the full activity stays in the
-        // expanded timeline. Every card, a child's included, takes activity only from
-        // a frame in the turn's own voice: a host note and a terminal "Done" cannot
-        // overwrite the last action.
-        const previewSource = record.isSubagent && summary.human !== false
+        // Only task facts own the outcome chip under a hold; failed tools are diagnostics.
+        if (summary.observedOutcome && !record.finished) record.observedOutcome = summary.observedOutcome;
+        const desiredPhase = desiredLiveCardPhase(record, closedPhase || (record.finished ? summary.phase || 'done' : ''));
+        setLiveCardPhase(record, desiredPhase.phase, desiredPhase.text, desiredPhase.className,
+            desiredPhase.secondary);
+        // Collapsed: voice or outcome cause, never host notes; a cleared late cause restores voice. Expand keeps all activity.
+        const activityCandidate = (record.isSubagent && summary.human !== false
             ? String(summary.activityPreview ?? summary.body ?? '')
-            : (summary.human ? String(summary.activityPreview ?? activeHeadline ?? '') : '');
-        const activityCandidate = previewSource.trim();
-        if (activityCandidate) record.collapsedActivity = boundActivityPreview(activityCandidate);
-        const activityText = projectCollapsedActivity({
-            isSubagent: record.isSubagent,
-            suggestedName: title,
-            headline: record.isSubagent ? '' : record.collapsedActivity,
-            body: record.isSubagent ? record.collapsedActivity : '',
-            previous: record.collapsedActivity,
-        });
-        renderCollapsedActivity(record, activityText);
+            : String(!summary.human && summary.terminal && summary.activityPreview || '')).trim();
+        if (activityCandidate) {
+            record.collapsedActivity = boundActivityPreview(activityCandidate);
+            record.collapsedActivityLead = summary.activityLead || '';  // a child's "Report to parent"
+            record.causeHeld = !record.isSubagent;  // a root's line is its outcome's cause
+        } else if (summary.currentOutcome && record.causeHeld) {
+            record.collapsedActivity = record.lastHumanHeadlineSource?.preview || '', record.causeHeld = false;
+        }
+        syncCardHeadline(record);
 
         const shouldRenderLine = summary.visible !== false && Boolean(headline || summary.body);
-        // Legacy parent-subagent rows update in place if replayed from old
-        // history. Child-card lifecycle/progress rows also evolve in place.
         let timelineUpdate = 'none';
         let patchIndex = -1;
         if (_historyRow?.history_id) {
@@ -1774,7 +1703,7 @@ export function createChatInstance({
             ({ timelineUpdate, patchIndex } = updateLiveTimelineItem(record, summary,
                 { ts, rawTs, syntheticKey, headline, inPlaceByKey }));
         }
-        // A failure keeps its own row where it happened AND feeds the fold.
+        // Failures keep their row and feed the fold.
         if (foldView && !_historyRow?.history_id) {
             const fold = upsertToolFoldRow(record, foldView, ts, rawTs);
             if (timelineUpdate === 'none') ({ timelineUpdate, patchIndex } = fold);
@@ -1782,13 +1711,14 @@ export function createChatInstance({
         }
         updateLiveCardCount(record);
         // Cost does not move the activity clock.
-        if (ts && (summary.human || activityCandidate)) record.latestActivityTs = ts;
+        if (ts && (summary.human || summary.reasoning || activityCandidate)) record.latestActivityTs = ts, record.latestActivityRaw = rawTs || '';
         if (summary.executorChip
                 && !keepStickyExecutorChip(record.executorChip, summary.executorChip)) {
             record.executorChip = summary.executorChip;
         }
         if (summary.modelExecution) record.modelExecution = summary.modelExecution;
-        if (Number.isInteger(summary.toolCalls)) record.toolCalls = summary.toolCalls;
+        if (summary.effort) record.effort = summary.effort;
+        if (Number.isInteger(summary.toolCalls)) record.toolCalls = Math.max(record.toolCalls ?? 0, summary.toolCalls);
         record._lastFrameMeta = Array.isArray(summary.meta) ? summary.meta : [];
         if (rawTs) record.latestSourceTs = rawTs;
         renderLiveCardMeta(record, summary.costProjection);
@@ -1804,13 +1734,8 @@ export function createChatInstance({
         }
         ensureLiveCardVisible(record, { suppressDomInsert });
         hideTypingIndicatorOnly();
-        // A log-channel task_done settles here without finishLiveCard: remove
-        // its Cancel run action and retained cancelable marker.
-        if (record.finished) {
-            settleLiveCard(record, summary.phase || 'done', wasFinished);
-        } else {
-            setLiveCardTypingVisible(record, true);
-        }
+        // Log task_done bypasses finishLiveCard; settle Cancel and its marker.
+        if (record.finished) settleLiveCard(record, wasFinished);
         syncChatStatus();
         return Boolean(timelineChanged
             || typingBefore !== typingEl.style.display
@@ -1821,10 +1746,15 @@ export function createChatInstance({
         return withStableViewport(() => finishLiveCardMutation(groupId, phase));
     }
 
-    // Every terminal route releases controls and subscriptions together.
-    function settleLiveCard(record, phase, wasFinished) {
+    // Author controls end; paid-review waits retain their own lifetime.
+    function settleLiveCard(record, wasFinished) {
         record.root.dataset.finished = '1';
+        if (record.toolFold) {
+            upsertToolFoldRow(record, noteToolHostMetrics(record, {}), '', '');
+            renderLiveCardTimeline(record);
+        }
         cancelableTaskIds.delete(record.groupId);
+        missingManagedTaskIds.delete(record.groupId);
         syncCancelRunButton(record);
         modelWaits.finish(record.groupId);
         // A lost task_done is healed only by refetching; a block nobody sees
@@ -1834,29 +1764,19 @@ export function createChatInstance({
     }
 
     function finishLiveCardMutation(groupId = '', phase = '') {
-        const record = groupId
-            ? liveCardRecords.get(groupId)
-            : (activeLiveGroupId ? liveCardRecords.get(activeLiveGroupId) : null);
+        const record = groupId ? liveCardRecords.get(groupId) : null;
         if (!record) return false;
-        // A converted card is a terminal project chip now — ignore late terminal
-        // frames so they neither overwrite the chip nor touch its element refs (T4).
-        if (record.root?.dataset?.projectCreated === '1') return false;
         const before = captureLiveCardProjection(record);
         const typingBefore = typingEl.style.display;
-        if (setHistoricalUnavailable(record, false)) renderLiveCardMeta(record);
+        setHistoricalUnavailable(record, false);
         markReviewAnchor(record);
         const wasFinished = record.finished;
         record.finished = true;
         record.finalizingHold = false;
-        const presentation = taskPresentation(phase || 'done');
-        const activePhase = presentation.phase;
-        setLiveCardPhase(record, activePhase, presentation.headline);
-        if (record.isSubagent) record.titleEl.textContent = childTitle(record);
-        else if (!record.suggestedName && !record.lastHumanHeadline
-                && record.titleEl.textContent !== presentation.headline) {
-            record.titleEl.textContent = blockHasWork(record) ? 'Task activity' : '';
-        }
-        settleLiveCard(record, activePhase, wasFinished);
+        const presentation = taskPresentation(phase || 'done', record.quietEffective ?? record.historicalTerminal?.quiet_effective);
+        setLiveCardPhase(record, presentation.phase, presentation.headline);
+        syncCardHeadline(record); renderLiveCardMeta(record);
+        settleLiveCard(record, wasFinished);
         ensureLiveCardVisible(record);
         if (activeLiveGroupId === record.groupId) activeLiveGroupId = '';
         syncChatStatus();
@@ -1865,26 +1785,27 @@ export function createChatInstance({
     }
 
     function appendTaskSummaryToLiveCard(msg, { suppressDomInsert = false } = {}) {
-        const taskId = msg?.task_id || activeLiveGroupId || '';
+        const taskId = msg?.task_id || '';
         const rawTs = msg?.ts || new Date().toISOString();
         if (!taskId) {
-            return finishLiveCard(taskId, 'done');
+            // Unkeyed summaries keep durable/log evidence but close no card.
+            return false;
         }
         let changed = false;
-        // Restore task name from history.
-        if (msg?.suggested_name) {
-            changed = applySuggestedName(taskId, msg.suggested_name) || changed;
-        }
+        // Restore historical task name.
+        if (msg?.suggested_name) changed = applySuggestedName(taskId, msg.suggested_name) || changed;
         const finalizing = msg?.task_phase === 'finalizing' || msg?.outcome_final === false;
         changed = noteToolMetrics(taskId, msg, rawTs, { suppressDomInsert }) || changed;
-        const summary = taskTerminalSummary({ ...msg, task_id: taskId });
         const record = getLiveCardRecord(taskId);
-        noteDirectTurn(record, msg?._is_direct_chat);
+        msg = { quiet_effective: record.quietEffective ?? record.historicalTerminal?.quiet_effective, ...msg };
+        const summary = taskTerminalSummary({ ...msg, task_id: taskId });
+        changed = noteTaskDetails(record, msg) || changed;
+        syncSettledItems(record, msg, { write: withStableViewport });
         changed = Boolean(record.reviewController?.updateMany(reviewGroupsFromTaskDetail(msg, taskId))) || changed;
         if (finalizing && !record.finished) record.finalizingHold = true;
         changed = applyLiveCardState(
             { ...summary, costProjection: taskCostProjection(msg, rawTs) },
-            taskId, normalizeLogTs(rawTs), summary.dedupeKey, { suppressDomInsert, rawTs },
+            taskId, rawTs, { suppressDomInsert },
         ) || changed;
         if (finalizing) return changed;
         changed = finishLiveCard(taskId, summary.phase) || changed;
@@ -1893,6 +1814,8 @@ export function createChatInstance({
 
     // Child lineage retains model-less updates; child finality is independent.
     const subagentChildParents = new Map();
+    // Tasks whose own rows this room replayed: a parent card's evidence (A5).
+    const evidencedTaskIds = new Set();
     // Late progress must not revive a terminal child.
     const subagentTerminalChildren = new Set();
 
@@ -1918,10 +1841,7 @@ export function createChatInstance({
         }
         for (const sid of subagentChildParents.keys()) {
             const rec = liveCardRecords.get(sid);
-            // Write only on change: a rewrite would destroy a selection being copied.
-            const next = rec?.isSubagent ? childTitle(rec) : '';
-            if (next && rec.titleEl.textContent !== next) rec.titleEl.textContent = next;
-            if (rec?.isSubagent) renderLiveCardMeta(rec);
+            if (rec?.isSubagent) { syncCardHeadline(rec); renderLiveCardMeta(rec); }
         }
     }
 
@@ -1954,12 +1874,13 @@ export function createChatInstance({
             model,
             ...overrides,
         });
-        return summary ? withTaskCostMeta(summary, evt, { rawTs }) : null;
+        // The child's effort fact rides every frame that states a level (live, terminal, replay).
+        return summary ? withTaskCostMeta({ ...summary, ...(evt.effort_level ? { effort: effortFact(evt) } : {}) }, evt, { rawTs }) : null;
     }
 
-    // A child's title is its lineage identity plus, for twins (same displayed identity
-    // under one parent), the short id; re-projected on every title write and lineage
-    // change (terminal children included).
+    // A child's title is its lineage identity plus, for twins (one displayed identity under
+    // one parent), the short id; re-projected on every title write and lineage change
+    // (terminal children too).
     function childTitle(record) {
         const twin = subagentTwin(subagentChildParents, record.groupId);
         return subagentIdentityTitle(subagentChildParents.get(record.groupId))
@@ -1967,52 +1888,45 @@ export function createChatInstance({
     }
 
     function updateLiveCardFromProgressMessage(msg, { grantCancelAuthority = true } = {}) {
-        const taskId = msg?.task_id || activeLiveGroupId || '';
+        if (msg?.system_type === 'task_checkpoint') return updateLiveCardFromLogEvent({ ...msg, type: 'task_checkpoint', is_progress: false });
+        const taskId = msg?.task_id || '';
         const rawTs = msg?.ts || new Date().toISOString();
-        const review = attachReviewFromRow(msg, rawTs);
-        if (review !== undefined) return review;
         if (!taskId) return false;
         modelWaits.observe(taskId, msg);
-        let changed = false;
+        let changed = msg.tool_evidence || Number.isInteger(msg.rounds) ? noteToolMetrics(taskId, msg, rawTs) : false;
         // Only host-attested progress grants Stop authority.
-        if (grantCancelAuthority && msg?.cancelable === true && msg?.task_id) {
-            changed = markTaskCancelable(String(msg.task_id));
+        if (grantCancelAuthority && msg.cancelable === true) {
+            changed = markTaskCancelable(String(taskId)) || changed;
         }
-        const lifecycleParent = taskKey(msg?.parent_task_id);
-        if (msg?.subagent_event && lifecycleParent) {
+        const lifecycleParent = taskKey(msg.parent_task_id);
+        if (msg.subagent_event && lifecycleParent) {
             const updated = updateSubagentCardFromEvent(msg, rawTs);
             if (updated !== undefined) return Boolean(changed || updated);
         }
         if (subagentChildParents.has(taskId)) {
-            const updated = routeSubagentProgressToCard(taskId, msg);
-            return Boolean(changed || updated);
+            return Boolean(routeSubagentProgressToCard(taskId, msg) || changed);
         }
         const summary = summarizeChatLiveEvent({
             type: 'send_message',
             is_progress: true,
-            content: msg?.content || msg?.text || '',
-            text: msg?.content || msg?.text || '',
+            content: msg.content || msg.text || '',
             task_id: taskId,
             ...Object.fromEntries(['subagent_event', 'subagent_task_id', 'root_task_id',
                 'parent_task_id', 'delegation_role', 'subagent_role', 'status', 'result',
-                'trace_summary', 'error', 'artifact_status'].map((key) => [key, msg?.[key] || ''])),
+                'trace_summary', 'error', 'artifact_status'].map((key) => [key, msg[key] || ''])),
             ...cardMetaKeys(msg),
-            lifecycle: msg?.lifecycle || null,
-            // The frame's voice, live and on replay; absent stays absent.
-            narration: msg?.narration,
+            lifecycle: msg.lifecycle || null,
+            // Preserve source authorship and kind, live and on replay.
+            role: msg.role, system_type: msg.system_type, narration: msg.narration,
         });
         if (!summary) return changed;
-        const presented = withTaskCostMeta(summary, msg, { rawTs });
-        changed = Boolean(queueTaskLiveUpdate(
-            presented, taskId, normalizeLogTs(rawTs), presented.dedupeKey || '', rawTs,
-        )) || changed;
-        noteDirectTurn(liveCardRecords.get(taskId), msg?._is_direct_chat);
-        // History may carry the coined name that live frames deliver separately.
-        if (msg?.suggested_name) changed = applySuggestedName(taskId, msg.suggested_name) || changed;
+        changed = queueTaskLiveUpdate(withTaskCostMeta(summary, msg, { rawTs }), taskId, rawTs) || changed;
+        // History carries task_named's title.
+        if (msg.suggested_name) changed = applySuggestedName(taskId, msg.suggested_name) || changed;
         // Outcome survives a lost summary even while post-work keeps controls live.
         if (
-            (msg?.task_phase === 'finalizing' || taskDoneIsTerminal(msg))
-            && (msg?.outcome_axes || msg?.review_projection || msg?.reason_code)
+            (msg.task_phase === 'finalizing' || taskDoneIsTerminal(msg))
+            && (msg.outcome_axes || msg.review_projection || msg.reason_code)
         ) {
             changed = appendTaskSummaryToLiveCard(msg) || changed;
         }
@@ -2028,13 +1942,9 @@ export function createChatInstance({
         const event = String(evt.subagent_event || '').toLowerCase();
         const role = taskKey(evt.subagent_role);
         setSubagentParent(childId, { parentId, role, model: evt.model });
-        // Worker narration carries subagent_event="progress" too. It is activity,
-        // not a lifecycle row: route it through the progress key so the later
-        // terminal frame cannot overwrite the only full narration disclosure.
-        if (![
-            'scheduled', 'running', 'completed', 'completed_warn',
-            'failed', 'cancelled', 'rejected', 'interrupted',
-        ].includes(event)) {
+        // Worker narration also carries subagent_event="progress": activity, not a lifecycle row. Its key keeps a later
+        // terminal frame from overwriting the only full narration disclosure.
+        if (!SUBAGENT_LIFECYCLE_EVENTS.has(event)) {
             return routeSubagentProgressToCard(childId, evt);
         }
         const rawTs = tsValue || new Date().toISOString();
@@ -2044,48 +1954,43 @@ export function createChatInstance({
         // Interrupted is retryable and therefore non-terminal; the canonical
         // projector owns that distinction for both live and replay paths.
         if (summary.terminal) subagentTerminalChildren.add(childId);
-        reanchorTaskCard(getLiveCardRecord(parentId), rawTs);
-        stampNodeTimestamp(getSubagentCardRecord(childId, parentId, role)?.root, rawTs, { anchor: true });
+        stampNodeTimestamp(getSubagentCardRecord(childId, parentId, role, rawTs)?.root, rawTs, { anchor: true });
         const reviewsChanged = attachTaskDetailReviews(childId, evt);
-        const updated = queueTaskLiveUpdate(
-            summary,
-            childId,
-            normalizeLogTs(rawTs),
-            summary.dedupeKey,
-            rawTs,
-        );
+        const updated = queueTaskLiveUpdate(summary, childId, rawTs);
         return Boolean(reviewsChanged || updated);
     }
 
     // A known child's own (non-lifecycle) progress updates the linked child card.
-    function routeSubagentProgressToCard(childId, msg) {
+    function routeSubagentProgressToCard(childId, msg, ownLine = false) {  // ownLine: the child's own words
         const info = subagentChildParents.get(childId);
         if (!info) return false;
         const { parentId, role } = info;
         const content = String(msg?.content || msg?.text || '').trim();
         if (!content) return false;
         const rawTs = msg?.ts || new Date().toISOString();
-        reanchorTaskCard(getLiveCardRecord(parentId), rawTs);
-        const record = getSubagentCardRecord(childId, parentId, role);
-        const preserveTerminal = Boolean(record?.finished && subagentTerminalChildren.has(childId));
+        const record = getSubagentCardRecord(childId, parentId, role, rawTs);
+        const preserveTerminal = Boolean(record?.finished && (ownLine || subagentTerminalChildren.has(childId)));
         const summary = summarizeSubagentCardFrame(msg, childId, {
             content,
             text: content,
             subagent_event: 'running',
-            // A replayed progress row may follow a terminal record because the
-            // history pre-pass already knows the child's final state. Do not add
-            // contradictory `status=running` metadata in that case.
+            // A replayed progress row may follow a terminal record (the history pre-pass knows the child's final state):
+            // no contradictory `status=running` metadata then.
             status: preserveTerminal ? '' : (msg?.status || ''),
         }, rawTs);
         if (!summary) return false;
-        summary.dedupeKey = `subagent-progress:${childId}`;
+        // One frame is one source occurrence, live or saved; only a live note's row is a line the next note replaces.
+        const occurrence = `${childId}:${rawTs}:${content}`;
+        if (summary.reasoning) summary.dedupeKey = `reasoning:${occurrence}`;
+        else if (!summary.activity) {
+            summary.occurrenceKey = `subagent-line:${occurrence}`;
+            summary.dedupeKey = ownLine || _historyRow?.history_id ? summary.occurrenceKey : childProgressKey(record, summary.occurrenceKey);
+        }
         if (preserveTerminal && !_historyReplayActive) {
             summary.phase = String(record.phaseEl?.dataset?.phase || 'done');
             summary.terminal = true;
         }
-        return queueTaskLiveUpdate(
-            summary, childId, normalizeLogTs(rawTs), summary.dedupeKey, rawTs,
-        );
+        return queueTaskLiveUpdate(summary, childId, rawTs);
     }
 
     function routeSubagentFinalMessageToCard(taskId, msg) {
@@ -2095,8 +2000,7 @@ export function createChatInstance({
         const { parentId, role } = info;
         const text = String(msg?.content || msg?.text || '').trim();
         const rawTs = msg?.ts || new Date().toISOString();
-        reanchorTaskCard(getLiveCardRecord(parentId), rawTs);
-        const record = getSubagentCardRecord(childId, parentId, role);
+        const record = getSubagentCardRecord(childId, parentId, role, rawTs);
         const priorTerminalPhase = record?.finished ? String(record.phaseEl?.dataset?.phase || '') : '';
         const summary = summarizeSubagentCardFrame(msg, childId, {
             content: '',
@@ -2110,13 +2014,10 @@ export function createChatInstance({
             summary.phase = priorTerminalPhase;
             summary.terminal = true;
         }
-        return queueTaskLiveUpdate(
-            summary, childId, normalizeLogTs(rawTs), summary.dedupeKey, rawTs,
-        );
+        return queueTaskLiveUpdate(summary, childId, rawTs);
     }
 
-    // Resolve a child's card from the child's terminal task_done
-    // (which arrives on the log channel without subagent metadata).
+    // A child's card from its task_done or a late review's current outcome (log frames without subagent metadata).
     function routeSubagentTerminalToCard(childId, evt) {
         const info = subagentChildParents.get(childId);
         if (!info) return false;
@@ -2149,32 +2050,31 @@ export function createChatInstance({
     function updateLiveCardFromLogEvent(evt) {
         if (!evt) return false;
         const eventType = evt.type || evt.event || '';
-        const reference = handleCardReference(evt);
+        if (eventType === 'history_retention' || evt.review_overrides) {
+            return withStableViewport(() => noteTaskDetails(liveCardRecords.get(taskKey(evt.work_task_id || evt.task_id)), evt));
+        }
+        const reference = admitCardMetadata(evt);
         if (reference !== undefined) return reference;
+        // owner_hurry.py marks an existing card, never progress.
+        if (eventType === 'owner_hurry') {
+            return markOwnerHurry(ownerHurryProjection(evt).applied ? liveCardRecords.get(getLogTaskGroupId(evt)) : null);
+        }
         if (!isGroupedTaskEvent(evt)) return false;
-        const taskId = getLogTaskGroupId(evt) || activeLiveGroupId || '';
-        if (!taskId) return false;
-        const rawTs = evt.ts || evt.timestamp || new Date().toISOString();
-        // Task-bound Skill lifecycle is presentation on its explicit owner,
-        // never a synthetic lifecycle task card.
+        const taskId = getLogTaskGroupId(evt) || '', late = evt.current_outcome;
+        if (!taskId || (late && !lateOutcomeIsCurrent(liveCardRecords.get(taskId), evt))) return false;
+        const rawTs = late?.revision || evt.ts || evt.timestamp || new Date().toISOString();
+        // Skill lifecycle belongs to its explicit owner.
         const review = attachReviewFromRow(evt, rawTs);
         if (review !== undefined) return review;
-        if (eventType === 'owner_hurry') {
-            const root = ownerHurryProjection(evt).applied
-                ? liveCardRecords.get(taskId)?.root : null;
-            if (!root || root.getAttribute('data-owner-hurry') === '1') return false;
-            root.setAttribute('data-owner-hurry', '1');
-            return true;
-        }
         const childInfo = subagentChildParents.get(taskId);
-        if (childInfo && eventType === 'task_done') return routeSubagentTerminalToCard(taskId, evt);
-        if (childInfo && subagentTerminalChildren.has(taskId)) return false;
-        // Tool accounting (metrics or the terminal) is the same fact for a
-        // child and its owner; the rows themselves come from the summarizer.
-        let changed = ['task_metrics_event', 'task_eval', 'task_done'].includes(eventType)
+        if (childInfo && (late || eventType === 'task_done')) return routeSubagentTerminalToCard(taskId, { ...evt, ...late, ts: rawTs });
+        const summary = summarizeChatLiveEvent(evt);
+        // Finished children still receive settled costs.
+        if (childInfo && subagentTerminalChildren.has(taskId) && !summary?.toolCall && eventType !== 'task_cost_finalized') return false;
+        // Root/child fold: metrics, terminal and replay.
+        let changed = evt.tool_evidence || Number.isInteger(evt.rounds) || ['task_metrics_event', 'task_eval', 'task_done'].includes(eventType)
             ? noteToolMetrics(taskId, evt, rawTs) : false;
         if (!childInfo) changed = attachTaskDetailReviews(taskId, evt) || changed;
-        const summary = summarizeChatLiveEvent(evt);
         if (!summary) return changed;
         if (childInfo) {
             getSubagentCardRecord(taskId, childInfo.parentId, childInfo.role);
@@ -2184,143 +2084,77 @@ export function createChatInstance({
             replace: eventType === 'task_done' || eventType === 'task_cost_finalized',
             rawTs,
         });
-        const queued = queueTaskLiveUpdate(
-            presented, taskId, normalizeLogTs(rawTs), presented.dedupeKey || '', rawTs,
-        );
+        const queued = queueTaskLiveUpdate(presented, taskId, rawTs);
         if (childInfo) return Boolean(changed || queued);
         const subagentChanged = updateSubagentCardFromEvent(evt, rawTs);
-        // The host stamps the lane on the turn's own frames (task_done always,
-        // a direct turn's tool frames too), so the header pill never waits for
-        // a census; the host-attested Stop marker rides a direct turn's tool
-        // frames the way it rides its narration rows, so a tool-only turn offers Stop.
-        if (typeof evt._is_direct_chat === 'boolean') noteDirectTurn(liveCardRecords.get(taskId), evt._is_direct_chat);
+        // Host-attested Stop facts also travel on tool-only turns.
         if (evt.cancelable === true) markTaskCancelable(taskId);
         if (eventType === 'task_done' && summary.terminal) {
-            recordTerminalActivity(taskId);
+            recordTerminalActivity(taskId, summary.phase);
             syncChatStatus();
         }
         return Boolean(changed || queued || subagentChanged);
     }
 
     function addMessage(text, role, markdown = false, timestamp = null, isProgress = false, opts = {}) {
-        const pending = !!opts.pending;
-        const ephemeral = !!opts.ephemeral;
-        const clientMessageId = opts.clientMessageId || '';
-        const senderLabelOverride = opts.senderLabel || '';
-        const senderSessionId = opts.senderSessionId || '';
-        const source = opts.source || '';
-        const initiator = opts.initiator || '';
-        const systemType = opts.systemType || '';
-        const taskId = opts.taskId || '';
-        const projectId = opts.projectId || '';
-        const projectName = opts.projectName || '';
+        // Normalize the persisted identity once; the same fields label and deduplicate a row.
+        const meta = Object.fromEntries([
+            'clientMessageId', 'senderLabel', 'senderSessionId', 'source', 'initiator',
+            'systemType', 'taskId', 'projectId', 'projectName', 'taskName', 'handoffId',
+            'originId', 'completionLimitation', 'deliveryId',
+        ].map(key => [key, opts[key] || '']));
+        const { clientMessageId } = meta;
         const ts = timestamp || new Date().toISOString();
-        const legacyKey = buildMessageKey(role, text, ts, {
-            clientMessageId,
-            systemType,
-            isProgress,
-            source,
-            senderLabel: senderLabelOverride,
-            senderSessionId,
-            taskId,
-        });
+        const legacyKey = buildMessageKey(role, text, ts, { ...meta, isProgress });
+        const bubbles = () => [...messagesDiv.querySelectorAll('.chat-bubble')];
         const messageKey = opts.historyId ? `history:${opts.historyId}` : legacyKey;
-        if (opts.historyId || _historyReplayActive) {
-            const prior = opts.historyId
-                ? historyNodes(opts.historyId).find(node => node.classList.contains('chat-bubble'))
-                : Array.from(messagesDiv.querySelectorAll('.chat-bubble')).find(node => node.dataset.messageKey === legacyKey);
-            if (prior) {
-                rememberMessageKey(messageKey);
-                return chatDecision.renderRoutingDecision(prior, opts.chatAnnotation);
-            }
-        }
-        if (messageKey && seenMessageKeys.has(messageKey)) {
+        const deliveryKey = opts.deliveryId ? `delivery:${opts.deliveryId}` : '';
+        // A delivery is one bubble while that bubble is mounted; a released page mounts it again.
+        const delivered = deliveryKey && seenMessageKeys.has(deliveryKey)
+            && bubbles().find(node => node.dataset.deliveryId === opts.deliveryId);
+        if (delivered) {
+            stampHistoryNode(delivered, opts.historyId, opts.historyPosition);
+            noteBubbleKeys(delivered);
+            rememberMessageKey(messageKey);
             return false;
         }
+        const prior = opts.historyId
+            ? (replayKeys && !replayKeys.history.has(opts.historyId) ? null
+                : historyNodes(opts.historyId).find(node => node.classList.contains('chat-bubble')))
+            : (replayKeys && !replayKeys.legacy.has(legacyKey) ? null
+                : Array.from(messagesDiv.querySelectorAll('.chat-bubble')).find(node => node.dataset.messageKey === legacyKey));
+        if (prior && (opts.historyId || _historyReplayActive)) {
+            rememberMessageKey(messageKey);
+            const originChanged = syncSavedProjectContext(prior, opts.originProjected, opts.originId);
+            noteBubbleKeys(prior);
+            return chatDecision.renderRoutingDecision(prior, opts.chatAnnotation) || originChanged;
+        }
+        // History may land first; a live copy adds no new facts.
+        if (prior || (messageKey && seenMessageKeys.has(messageKey))) return false;
         if (opts.historyId) {
-            const prior = Array.from(messagesDiv.querySelectorAll('.chat-bubble')).find(node =>
+            const mounted = !replayKeys || (clientMessageId && replayKeys.client.has(clientMessageId))
+                || (opts.originId && replayKeys.origin.has(opts.originId)) || replayKeys.legacy.has(legacyKey);
+            const prior = mounted && bubbles().find(node =>
                 (clientMessageId && node.dataset.clientMessageId === clientMessageId)
+                || (opts.originId && node.dataset.originId === opts.originId)
                 || (!node.dataset.historyId && node.dataset.messageKey === legacyKey));
             if (prior) {
                 stampHistoryNode(prior, opts.historyId, opts.historyPosition);
+                noteBubbleKeys(prior);
                 rememberMessageKey(messageKey);
                 chatDecision.renderRoutingDecision(prior, opts.chatAnnotation);
-                return false;
+                return syncSavedProjectContext(prior, opts.originProjected);
             }
         }
 
-        if (!isProgress && !ephemeral && !_historyAppending) {
-            persistedHistory.push({
-                text,
-                role,
-                ts,
-                markdown: !!markdown,
-                systemType,
-                source,
-                initiator,
-                senderLabel: senderLabelOverride,
-                senderSessionId,
-                clientMessageId,
-                taskId,
-                projectId,
-                projectName,
-                skillReview: opts.skillReview || null,
-            });
-            // Mirror the sessionStorage slice(-200): the in-memory copy exists
-            // only to feed that snapshot, so it obeys the same cap (P3).
-            if (persistedHistory.length > 200) {
-                persistedHistory.splice(0, persistedHistory.length - 200);
-            }
-            if (!_historyReplayActive) persistVisibleHistory();
-        }
-
-        const bubble = document.createElement('div');
-        bubble.className = `chat-bubble ${role}` + (isProgress ? ' progress' : '');
-        if (pending) bubble.classList.add('pending');
-        if (ephemeral) bubble.dataset.ephemeral = '1';
-        if (clientMessageId) bubble.dataset.clientMessageId = clientMessageId;
-        if (systemType) bubble.dataset.systemType = systemType;
-        if (senderSessionId) bubble.dataset.senderSessionId = senderSessionId;
-        if (taskId) bubble.dataset.taskId = taskId;
-        if (legacyKey) bubble.dataset.messageKey = legacyKey;
-        stampHistoryNode(bubble, opts.historyId, opts.historyPosition);
-
-        const sender = senderLabel(role, isProgress, systemType, {
-            source, senderLabel: senderLabelOverride, senderSessionId, initiator,
-        }, chatSessionId);
-        const rendered = role === 'user'
-            ? escapeHtml(text)
-            : role === 'system' && systemType === 'skill_review'
-                ? renderSkillReviewDisclosure(text, opts.skillReview || null)
-                : role === 'system' && systemType !== 'skill_review' && markdown !== true
-                    ? escapeHtml(text)
-                    : renderChatMarkdown(text);
-        const timeFmt = formatMsgTime(ts);
-        const timeHtml = timeFmt ? `<div class="msg-time" title="${escapeHtmlAttr(timeFmt.full)}">${escapeHtml(timeFmt.short)}</div>` : '';
-        const pendingHtml = pending ? `<div class="msg-pending">Queued until reconnect</div>` : '';
-        bubble.innerHTML = `
-            <div class="sender">${escapeHtml(sender)}</div>
-            <div class="message">${rendered}</div>
-            ${pendingHtml}
-            ${timeHtml}
-        `;
-        if (!isProgress && text) chatMedia.attachCopyControl(bubble, String(text));
-        if (PROJECT_ROW_TYPES.has(systemType) && projectId) {
-            const actions = createSystemMessageActions(createSystemMessageAction({
-                label: 'Open Project ↗',
-                onClick: () => window.dispatchEvent(new CustomEvent('ouro:open-project', {
-                    detail: { project: { id: projectId, name: projectName || 'Project' } },
-                })),
-            }));
-            bubble.querySelector('.message')?.after(actions);
-        }
-        wireSkillReviewDisclosure(bubble, { onDomWrite: withStableViewport });
-        stampNodeTimestamp(bubble, ts);
+        const { bubble, rich } = drawTextBubble(text, role, { markdown, ts, isProgress, meta, legacyKey, opts });
         insertMessageNode(bubble, { forceStick: !!opts.forceStick });
-        if (role !== 'user' && systemType !== 'skill_review' && (role !== 'system' || markdown === true)) enhanceMountedMarkdown(bubble);
+        if (rich) enhanceMountedMarkdown(bubble);
         chatDecision.renderRoutingDecision(bubble, opts.chatAnnotation);
+        if (isMain) reconcilePortalNotes(messagesDiv, bubble);
         rememberMessageKey(messageKey);
-        if (pending && clientMessageId) pendingUserBubbles.set(clientMessageId, bubble);
+        if (deliveryKey) rememberMessageKey(deliveryKey);
+        if (opts.pending && clientMessageId) pendingUserBubbles.set(clientMessageId, bubble);
         return bubble;
     }
 
@@ -2332,7 +2166,9 @@ export function createChatInstance({
         if (journalEntry) journalEntry.annotation = annotation || null;
         const bubble = Array.from(messagesDiv.querySelectorAll('.chat-bubble.user[data-client-message-id]'))
             .find((candidate) => candidate.dataset.clientMessageId === messageId);
-        return chatDecision.renderRoutingDecision(bubble, annotation);
+        const changed = chatDecision.renderRoutingDecision(bubble, annotation);
+        if (bubble && isMain) reconcilePortalNotes(messagesDiv, bubble);
+        return changed;
     }
 
     function markPendingDelivered(clientMessageId, dropped = false) {
@@ -2353,23 +2189,11 @@ export function createChatInstance({
 
     const markPendingDropped = (clientMessageId) => markPendingDelivered(clientMessageId, true);
 
-    function ensureWelcomeMessage() {
-        if (!isMain) return;
-        if (welcomeShown) return;
-        const hasRealBubbles = Array.from(messagesDiv.querySelectorAll('.chat-bubble')).some(
-            bubble => !bubble.classList.contains('typing-bubble')
-        );
-        if (hasRealBubbles) return;
-        welcomeShown = true;
-        addMessage('Ouroboros has awakened', 'assistant', false, null, false, { ephemeral: true });
-    }
+    // Host-owned empty state: never a bubble, a history row or a model reply.
+    const emptyWelcome = isMain ? mountEmptyChatWelcome(messagesDiv) : null;
 
-    // Hydration triggers share one sticky request; reconnect/resync still refetch.
-    function awaitInitialHydration({ includeUser = false } = {}) {
-        if (initialHydrationPromise) return initialHydrationPromise;
-        initialHydrationPromise = syncHistory({ includeUser });
-        return initialHydrationPromise;
-    }
+    // Hydration triggers share one sticky request; reconnect/resync read again.
+    const awaitInitialHydration = () => leaving ? Promise.resolve(false) : (initialHydrationPromise ||= syncHistory());
 
     // Main briefly yields hydration to an opening Project, with a hard bound.
     const MAIN_HYDRATION_MAX_DEFER_MS = 3500;
@@ -2403,36 +2227,47 @@ export function createChatInstance({
     const pendingHistoryUpserts = new Map();
     const pendingLiveEvictions = new Set();
     function releaseLiveOverflow() {
-        for (const id of pendingLiveEvictions) {
+        // Every card is judged as the reader sees the page, before the first one leaves.
+        const due = [...pendingLiveEvictions].filter((id) => {
             const record = liveCardRecords.get(id);
-            if (!record) { pendingLiveEvictions.delete(id); continue; }
-            if (record.historyIds?.size || activeDirectActivities.has(id)
+            if (!record) { pendingLiveEvictions.delete(id); return false; }
+            return !(record.historyIds?.size || activeDirectActivities.has(id)
+                    // A retained successor still owns this physical episode's content/controller.
+                    || record.episodeDisclosure?.isConnected
                     || (!record.finished && !record.historicalUnavailable)
-                    || historyNodeIsProtected(record.root, messagesDiv)) continue;
-            disposeLiveCard(id);
-            subagentChildParents.delete(id); subagentTerminalChildren.delete(id);
-            explicitCardExpansion.delete(id); reviewDisclosureByTask.delete(id);
+                    || historyNodeIsProtected(record.root, messagesDiv));
+        });
+        for (const id of due) {
+            forgetLiveCard(id);
             pendingLiveEvictions.delete(id);
         }
     }
-    function applyHistoryMessages(messages, { fromReconnect = false, includeUser = true, archived = false } = {}) {
+    function applyHistoryMessages(messages, { fromReconnect = false, archived = false } = {}) {
         const knownCards = new Set(liveCardRecords.keys());
         _historyReplayActive = true;
         _historyAppending = archived;
         liveCardBound.beginReplay();
         try {
             withStableViewport(() => {
+                preview.retire();
+                replayKeys = createReplayKeys();
+                noteBubbleKeys(messagesDiv);
+                replaySelection = keepSelection(document);
                 // A formerly unbound final can gain its real child lineage on a
-                // deeper page. Keep a selected old bubble until it can move.
+                // deeper page. A selected old bubble stays until it can move: every old one is judged before one leaves.
+                const olds = new Map(messages.filter(row => row.history_id && row.delegation_role === 'subagent' && !row.is_progress
+                    && replayKeys.history.has(row.history_id))
+                    .map(row => [row, historyNodes(row.history_id).find(node => node.classList.contains('chat-bubble'))])
+                    .filter(([, old]) => old));
+                const held = new Set([...olds].filter(([, old]) => historyNodeIsProtected(old, messagesDiv)).map(([row]) => row));
                 messages = messages.filter(row => {
-                    if (!row.history_id || row.delegation_role !== 'subagent' || row.is_progress) return true;
-                    const old = historyNodes(row.history_id).find(node => node.classList.contains('chat-bubble'));
-                    if (!old) return true;
-                    if (historyNodeIsProtected(old, messagesDiv)) {
+                    const old = olds.get(row);
+                    if (!old?.isConnected) return true;
+                    if (held.has(row)) {
                         pendingHistoryUpserts.set(row.history_id, row); return false;
                     }
                     pendingHistoryUpserts.delete(row.history_id);
-                    releaseMessageNode(old);
+                    releaseMessageNode(old); seenMessageKeys.delete(`history:${row.history_id}`);
                     return true;
                 });
                 // Retire only local echoes this source snapshot confirms.
@@ -2442,11 +2277,16 @@ export function createChatInstance({
                 for (const entry of localEcho.confirmed) {
                     localEchoJournal.delete(entry.clientMessageId);
                 }
-                for (const msg of messages) learnSubagentLineage(msg);
+                for (const msg of messages) {
+                    learnSubagentLineage(msg);
+                    // A notice names its target, not a speaker: no evidence of that task here.
+                    if (msg.task_id && !ORIGIN_ADDRESSED_NOTICE_TYPES.has(msg.system_type)
+                            && msg.system_type !== 'project_question_pointer') evidencedTaskIds.add(msg.task_id);
+                }
 
                 const historicalTerminalProjections = new Set();
                 for (const msg of messages) if (msg.historical_terminal && msg.task_id) {
-                    historicalTerminals.set(msg.task_id, msg.historical_terminal);
+                    historicalTerminals.set(msg.task_id, { ...msg.historical_terminal, ...(msg.current_outcome && { phase: msg.current_outcome.outcome_phase }), wake_summary: msg.wake_summary, suggested_name: msg.suggested_name, schedule_name: msg.schedule_name });
                     if (msg.summary_kind === 'terminal_root_projection' || msg.outcome_final === true) {
                         historicalTerminalProjections.add(msg.task_id);
                     }
@@ -2457,208 +2297,156 @@ export function createChatInstance({
                 _syncPass1Active = true;
                 try { for (const msg of messages) {
                     _historyRow = msg;
-                    if (msg.system_type === 'quiz_answer') chatDecision.applyQuizStateFrame(messagesDiv, { ...msg.quiz, task_id: msg.task_id });
+                    if (['quiz_answer', 'quiz_closed'].includes(msg.system_type)) chatDecision.applyQuizStateFrame(messagesDiv, { ...msg.quiz, task_id: msg.task_id });
+                    if (msg.system_type === 'task_evidence') { admitCardMetadata(msg); continue; }
                     if (isReplayEvidenceRow(msg) || msg.system_type === 'project_question_pointer') continue;
-                    if (handleCardReference(msg) !== undefined) continue;
+                    if (admitCardMetadata(msg) !== undefined) continue;
                     if (attachReviewFromRow(msg, msg.ts || '') !== undefined) continue;
                     if (attachCardRow(msg, msg.ts || '', { suppressDomInsert: true }) !== undefined) {
                         cardRowsAttached.add(msg);
                         continue;
                     }
+                    // Placement precedes progress; later rows may create the card.
+                    if (isPlacedCardRow(msg)) continue;
                     const taskId = msg.task_id || '';
                     if (!taskId) continue;
                     if (msg.is_progress) {
+                        if (msg.suggested_name) applySuggestedName(taskId, msg.suggested_name);
                         updateLiveCardFromProgressMessage(msg, { grantCancelAuthority: msg.project_mirror !== true });
                         const historyCard = liveCardRecords.get(taskId);
+                        if (msg.review_overrides) noteTaskDetails(historyCard, msg);
                         if (historyCard && !historyCard.isSubagent && !activeDirectActivities.has(taskId)
-                                && !msg.task_terminal_status && msg.task_phase !== 'finalizing') {
-                            if (setHistoricalUnconfirmed(historyCard)) {
-                                syncCancelRunButton(historyCard);
-                                renderLiveCardMeta(historyCard);
-                            }
+                                && !msg.task_terminal_status && msg.task_phase !== 'finalizing'
+                                && setHistoricalUnconfirmed(historyCard)) {
+                            syncCancelRunButton(historyCard);
+                            renderLiveCardMeta(historyCard);
                         }
                         if (historyCard && historicalTerminals.has(taskId)) historyCard.historicalTerminal = historicalTerminals.get(taskId);
                         continue;
                     }
-                    // Pass 2 mounts the block in its transcript position.
+                    if (msg.historical_terminal) getLiveCardRecord(taskId).quietEffective = msg.historical_terminal.quiet_effective;
                     if (msg.system_type === 'task_summary') appendTaskSummaryToLiveCard(msg, { suppressDomInsert: true });
                 } } finally { _syncPass1Active = false; _historyRow = null; }
 
                 // Pass 2 inserts cards at the first visible task message, then finishes them.
                 const insertedCardTaskIds = new Set();
-                function reorderDirtyCardIfNeeded(rec) {
-                    if (!rec?._anchorOrderDirty || rec.isSubagent || !rec.root?.isConnected) return;
-                    insertMessageNode(rec.root, { reorderExisting: true });
-                    rec._anchorOrderDirty = false;
+                function mountReplayedCard(rec) {
+                    if (rec?._anchorOrderDirty && !rec.isSubagent && rec.root?.isConnected) {
+                        insertMessageNode(rec.root, { reorderExisting: true });
+                        rec._anchorOrderDirty = false;
+                    }
+                    ensureLiveCardVisible(rec);
                 }
                 function insertCardIfNeeded(taskId) {
                     if (!taskId || insertedCardTaskIds.has(taskId)) return;
                     insertedCardTaskIds.add(taskId);
-                    const rec = liveCardRecords.get(taskId);
-                    reorderDirtyCardIfNeeded(rec);
-                    ensureLiveCardVisible(rec);
+                    mountReplayedCard(liveCardRecords.get(taskId));
                 }
+                // A stored row as its bubble: its own identity and labels, plus what its kind adds.
+                const addStoredRow = (msg, taskId, extra) => addMessage(msg.text, msg.role, !!msg.markdown, msg.ts || null, false, {
+                    presenceContact: msg.presence_contact,
+                    historyId: msg.history_id, historyPosition: msg.history_position,
+                    systemType: msg.system_type || '', narration: msg.narration, taskId,
+                    source: msg.source || '', initiator: msg.initiator || '',
+                    senderLabel: msg.sender_label || '', senderSessionId: msg.sender_session_id || '', reply: msg,
+                    ...extra,
+                });
                 for (const msg of messages) {
                     _historyRow = msg;
                     const taskId = msg.task_id || '';
                     if (msg.system_type === 'project_question_pointer') { chatDecision.appendQuestionPointer(msg); continue; }
                     if (isReplayEvidenceRow(msg)) continue;
-                    // Owner-bound reviews attached in pass 1 are not terminal chat bubbles.
+                    // Owner-bound reviews attached in pass 1 are not terminal bubbles.
                     if (
-                        handleCardReference(msg) !== undefined
+                        admitCardMetadata(msg) !== undefined
                         || attachReviewFromRow(msg, msg.ts || '', true) !== undefined
-                        || cardRowsAttached.has(msg)
+                        // A record minted after its row in pass 1 takes the row here.
+                        || cardRowsAttached.has(msg) || attachCardRow(msg, msg.ts || '') !== undefined
                     ) continue;
-                    // Reconnect: a durably recorded submission must not stay
-                    // `Sending...` — history + snapshot are the authorities
-                    // (a live turn re-links via census hydration).
+                    if (isPlacedCardRow(msg)) {
+                        addStoredRow(msg, taskId, { evidenceRef: cardRowEvidenceRef(msg) });
+                        continue;
+                    }
+                    // History clears Sending; census re-links live turns.
                     if (fromReconnect && msg.role === 'user' && msg.client_message_id) {
                         pendingSubmissions.delete(String(msg.client_message_id));
                     }
-                    if (!includeUser && msg.role === 'user') continue;
                     if (msg.is_progress) {
                         // Progress-only/failed tasks still anchor at their first event.
                         insertCardIfNeeded(taskId);
                         // Open post-task checkpoint replays as "Finalizing…".
-                        if (msg.task_phase === 'finalizing') markLiveCardFinalizing(taskId);
+                        if (msg.task_phase === 'finalizing') markLiveCardFinalizing(taskId, msg);
                         continue;
                     }
                     if (msg.system_type === 'task_summary') continue;
                     if (PROJECT_ROW_TYPES.has(msg.system_type)) {
-                        addMessage(msg.text, 'system', !!msg.markdown, msg.ts || null, false, {
-                            historyId: msg.history_id, historyPosition: msg.history_position,
-                        systemType: msg.system_type,
-                            taskId,
-                            projectId: msg.project_id || '',
-                            projectName: msg.project_name || '',
-                        });
+                        portals.row(msg, msg.text, { historyId: msg.history_id, historyPosition: msg.history_position, taskId });
                         continue;
                     }
-                    // Delivered media is a bubble, not a task-final
-                    // message — render it BEFORE the taskId/finishLiveCard block so
-                    // a mid-task delivery replayed while its task is still
-                    // running does not falsely finalize that task's live card.
-                    if (['document', 'photo', 'video', 'links', 'quiz'].includes(msg.msg_type)) {
-                        if (msg.msg_type === 'document') appendDocumentBubble(msg);
-                        else if (msg.msg_type === 'links') appendLinksMessage(msg);
-                        else if (msg.msg_type === 'quiz') appendQuizMessage(msg);
-                        else appendMediaBubble(msg);
-                        continue;
+                    if (appendDelivery(msg)) continue;
+                    if (subagentChildParents.has(taskId) && childRowPlacement(msg) === 'line') {
+                        insertCardIfNeeded(taskId); routeSubagentProgressToCard(taskId, msg, true); continue;
                     }
-                    // Replay conclusion: a typed terminal fact OR a plain
-                    // untyped final (replay has no later task_done frame, so
-                    // the bare final is the task's last word; marked rows —
-                    // system_type/msg_type — still never conclude).
-                    const plainUntypedFinal = !msg.system_type && !msg.msg_type;
-                    if (
-                        taskId
-                        && (msg.role === 'assistant' || msg.role === 'system')
-                        && (positiveTaskTerminalFact(msg) || plainUntypedFinal)
-                        && !isNonTerminalMediaHistoryRow(msg)
-                    ) {
-                        if (subagentChildParents.has(taskId)) {
-                            insertCardIfNeeded(taskId);
-                            routeSubagentFinalMessageToCard(taskId, msg);
-                            const record = liveCardRecords.get(taskId);
-                            finishLiveCard(taskId, msg.task_terminal_status ? taskTerminalPhase(msg) : replayTerminalPhase(record));
-                            continue;
-                        }
+                    if (taskId && replayConcludesTask(msg)) {
                         insertCardIfNeeded(taskId);
-                        // A replayed early final must not finalize the card.
-                        if (msg.task_phase === 'finalizing') {
-                            markLiveCardFinalizing(taskId);
-                        } else if (!msg.historical_terminal || positiveTaskTerminalFact(msg)) {
-                            const record = liveCardRecords.get(taskId);
-                            finishLiveCard(taskId, msg.task_terminal_status ? taskTerminalPhase(msg) : replayTerminalPhase(record));
+                        const child = subagentChildParents.has(taskId);
+                        if (child) routeSubagentFinalMessageToCard(taskId, msg);
+                        // A replayed early final must not finalize a root's card.
+                        if (!child && msg.task_phase === 'finalizing') markLiveCardFinalizing(taskId, msg);
+                        else if (child || !msg.historical_terminal || positiveTaskTerminalFact(msg)) {
+                            finishLiveCard(taskId, msg.task_terminal_status ? taskTerminalPhase(msg) : replayTerminalPhase(liveCardRecords.get(taskId)));
                         }
+                        if (child) continue;
                     }
-                    // A replayed durable routing receipt carries the same
-                    // authority as its live WS frame: a receipt that landed
-                    // while the socket was down still retires `Sending...`.
+                    // A durable routing receipt retires Sending like its live frame.
                     if (msg.chat_annotation && msg.client_message_id) {
                         pendingSubmissions.delete(String(msg.client_message_id));
                     }
-                    addMessage(msg.text, msg.role, !!msg.markdown, msg.ts || null, false, {
-                        historyId: msg.history_id, historyPosition: msg.history_position,
-                        systemType: msg.system_type || '',
-                        source: msg.source || '',
-                        initiator: msg.initiator || '',
-                        senderLabel: msg.sender_label || '',
-                        senderSessionId: msg.sender_session_id || '',
-                        clientMessageId: msg.client_message_id || '',
-                        taskId,
+                    addStoredRow(msg, taskId, {
+                        clientMessageId: msg.client_message_id || '', attachments: msg.attachments,
+                        projectId: msg.role === 'assistant' ? msg.project_id || '' : '', projectName: msg.project_name || '',
+                        textPlaceholder: msg.text_placeholder === true,
+                        originProjected: msg.origin_projected === true,
+                        originId: msg.origin_id || '',
                         chatAnnotation: msg.chat_annotation || null,
                         skillReview: msg.system_type === 'skill_review' && msg.skill && msg.job_id
-                            ? { skill: msg.skill, jobId: msg.job_id }
+                            ? { skill: msg.skill, jobId: msg.job_id, ...(msg.record_id ? { recordId: msg.record_id } : {}) }
                             : null,
                     });
+                    if (msg.role === 'user') { markIngressSaved(messagesDiv, msg); markSwarmLabel(messagesDiv, msg); replies.adopt(msg); unconfirmed.settle(msg); }
                 }
                 _historyRow = null;
-                // Resolve cards whose task is already terminal on the server
-                // (crash storm / hard timeout / cancellation write a terminal
-                // status but no task_summary). Without this their progress-only
-                // cards re-inflate as "Working" forever on reload/reconnect.
-                const terminalTaskRecords = new Map();
-                for (const msg of messages) {
-                    const tid = msg.task_id || '';
-                    if (tid && msg.task_terminal_status) {
-                        terminalTaskRecords.set(tid, {
-                            ...msg,
-                            status: String(msg.task_terminal_status),
-                        });
-                    }
-                }
+                // Durable terminal facts settle the named card, including progress-only replays.
+                const settleReplayedTerminal = (tid, terminalRecord, phase, summary = false) => {
+                    if (!taskDoneIsTerminal(terminalRecord)) return;
+                    if (subagentChildParents.has(tid)) return routeSubagentTerminalToCard(tid, terminalRecord);
+                    const record = liveCardRecords.get(tid);
+                    if (!record) return;
+                    if (terminalRecord.suggested_name) applySuggestedName(tid, terminalRecord.suggested_name);  // evidence names a card whose own rows lie elsewhere
+                    record.quietEffective = terminalRecord.quiet_effective ?? record.quietEffective;
+                    noteTaskDetails(record, terminalRecord);
+                    insertCardIfNeeded(tid);
+                    if (summary) appendTaskSummaryToLiveCard(terminalRecord); else finishLiveCard(tid, phase);
+                };
+                const terminalTaskRecords = new Map(messages.filter((msg) => msg.task_id && msg.task_terminal_status)
+                    .map((msg) => [msg.task_id, { ...msg, status: String(msg.task_terminal_status) }]));
                 for (const [tid, terminalRecord] of terminalTaskRecords) {
                     _historyRow = terminalRecord;
-                    if (!taskDoneIsTerminal(terminalRecord)) continue;
-                    // Subagent terminal status resolves the child card, not the
-                    // parent. Otherwise reload can revive a crashed/cancelled child.
-                    if (subagentChildParents.has(tid)) {
-                        routeSubagentTerminalToCard(tid, terminalRecord);
-                        continue;
-                    }
-                    const rec = liveCardRecords.get(tid);
-                    if (rec) {
-                        insertCardIfNeeded(tid);
-                        if (terminalRecord.outcome_axes || terminalRecord.review_projection || terminalRecord.reason_code) {
-                            appendTaskSummaryToLiveCard(terminalRecord);
-                        } else {
-                            // P5: shared terminal mapping — a cancelled root replays
-                            // as "Cancelled", never as a generic "Done".
-                            finishLiveCard(tid, taskTerminalPhase(terminalRecord));
-                        }
-                    }
+                    settleReplayedTerminal(tid, terminalRecord, taskTerminalPhase(terminalRecord),
+                        Boolean(terminalRecord.outcome_axes || terminalRecord.review_projection || terminalRecord.reason_code));
                 }
                 _historyRow = null;
 
-                // A terminal-root projection is the durable result authority,
-                // even though it is an intentionally hidden history row.  Do
-                // not let a later authored_root_summary (which may still say
-                // `finalizing`) leave the card open after restart.  Resolve it
-                // only after replay has seen all narrative rows so the
-                // terminal fact cannot itself be downgraded by later prose.
+                // Durable phase outranks narrative rows that may still say finalizing.
                 for (const [tid, historicalTerminal] of historicalTerminals) {
                     if (!historicalTerminalProjections.has(tid)) continue;
-                    const terminalRecord = { ...historicalTerminal, task_id: tid };
-                    if (!taskDoneIsTerminal(terminalRecord)) continue;
-                    if (subagentChildParents.has(tid)) {
-                        routeSubagentTerminalToCard(tid, terminalRecord);
-                        continue;
-                    }
-                    const rec = liveCardRecords.get(tid);
-                    if (!rec) continue;
-                    insertCardIfNeeded(tid);
-                    finishLiveCard(tid, taskTerminalPhase(terminalRecord));
+                    settleReplayedTerminal(tid, { ...historicalTerminal, task_id: tid }, historicalTerminal.phase);
                 }
 
-                // Every block the predicate admits is in the transcript after a rebuild.
-                for (const rec of liveCardRecords.values()) {
-                    reorderDirtyCardIfNeeded(rec);
-                    ensureLiveCardVisible(rec);
-                }
-
+                // Cards without terminal or census evidence remain unconfirmed.
                 for (const [id, record] of liveCardRecords) {
-                    if (!knownCards.has(id) && !record.finished && !activeDirectActivities.has(id)) {
+                    mountReplayedCard(record);
+                    if (!knownCards.has(id) && !record.finished && !currentActivity(record)) {
                         setHistoricalUnconfirmed(record);
                         syncCancelRunButton(record);
                         renderLiveCardMeta(record);
@@ -2667,34 +2455,38 @@ export function createChatInstance({
                 for (const row of messages) {
                     const record = liveCardRecords.get(row.presentation_owner_task_id || row.task_id);
                     if (!record) continue;
+                    const revision = row.current_outcome?.revision;
+                    if (revision && !(isoMicros(revision) < isoMicros(record.latestSourceTs))) record.latestSourceTs = revision;
                     record.historyIds ||= new Set();
                     for (const id of historyRowIds(row)) record.historyIds.add(id);
                 }
                 _historyReplayActive = false;
-                for (const record of liveCardRecords.values()) {
-                    if (record._timelineDirty) renderLiveCardTimeline(record);
-                }
-                persistVisibleHistory();
+                // The cards this page changed are drawn with the scroll and selection they had, read for all at once.
+                const dirty = [...liveCardRecords.values()].filter(record => record._timelineDirty);
+                measure(() => { const kept = keepSelection(document); return dirty.map(record => ({ scroll: timelineScroll(record), kept })); },
+                    (before) => dirty.forEach((record, index) => renderLiveCardTimeline(record, before[index])));
                 return true;
             });
         } finally {
             _historyRow = null;
             _historyReplayActive = false;
             _historyAppending = false;
+            replayKeys = null; replaySelection = null;
         }
         syncChatStatus();
     }
 
-    async function syncHistory({ includeUser = false, fromReconnect = false } = {}) {
+    async function syncHistory({ fromReconnect = false } = {}) {
+        if (destroyed || leaving) return false;
         if (historySyncPromise) {
-            // Preserve reconnect intent across an in-flight ordinary sync.
+            // A reconnect joining an older read still owes a rebuild.
             if (fromReconnect) {
                 pendingReconnectSync = true;
                 return historySyncPromise.then(() => {
                     // One waiter consumes the queued rebuild; peers await it.
                     if (pendingReconnectSync) {
                         pendingReconnectSync = false;
-                        return syncHistory({ includeUser: false, fromReconnect: true });
+                        return syncHistory({ fromReconnect: true });
                     }
                     return historySyncPromise || lastHistorySyncSucceeded;
                 });
@@ -2702,48 +2494,41 @@ export function createChatInstance({
             return historySyncPromise;
         }
         historySyncPromise = (async () => {
+            const startedVisit = visit;
+            const abort = historyReadAbort = new AbortController();
             const armedAtStart = liveCardBound.begin();
             const cardsAtStart = new Set(liveCardRecords.keys());
+            // Replay can refill the feed without moving the reader's intent.
+            const followingAtStart = reading.stick, generationAtStart = reading.generation;
+            const landedAtStart = historyPager.arrivalsLanded();
             try {
-                const data = await apiClient.chatHistory({ chatId });
-                // Closed rooms do not consume late responses.
-                if (destroyed) {
+                // No welcome until this read lands.
+                emptyWelcome?.historyPending();
+                // An empty feed shows the read in flight (#1102); a painted one stays.
+                if (historyControls.beginRecent()) syncLoadOlderControl();
+                const data = await fetchHistory(null, { signal: abort.signal });
+                // Closed or left since (`leave` counts a visit), a room takes no late response.
+                if (destroyed || startedVisit !== visit) {
                     lastHistorySyncSucceeded = false;
                     initialHydrationPromise = null;
                     return false;
                 }
+                if (data.recentVersion < recentApplied) return lastHistorySyncSucceeded;
                 const messages = Array.isArray(data.messages) ? data.messages : [];
-                if (!historyLoaded && initialScrollState?.history && !historyPager.getState().initialized) {
-                    await historyPager.restore(initialScrollState.history);
-                    if (destroyed) return false;
-                }
-                historyWindow = (data && typeof data.window === 'object' && data.window)
-                    ? data.window
-                    : null;
-                const scrollBeforeSync = {
-                    top: messagesDiv.scrollTop,
-                    nearBottom: isNearBottom(),
-                    anchor: captureVisibleTimelineAnchor(),
-                };
-
                 const oldRecentIds = recentHistoryIds;
-                recentHistoryIds = new Set(messages.flatMap(historyRowIds));
+                const admitted = acceptRecentWindow(data, messages);
                 const pagerBeforeRecent = historyPager.getState();
-                const rechainRecent = !data.reason_code && pagerBeforeRecent.initialized && !pagerBeforeRecent.canNewer
-                    && [...oldRecentIds].some(id => !recentHistoryIds.has(id));
-                for (const id of oldRecentIds) {
-                    if (data.window?.truncated_by?.includes(`${id.split(':')[0]}_source_unavailable`)) recentHistoryIds.add(id);
-                }
-                if ((!historyPager.getState().initialized && data.page_cursor)
-                        || data.reason_code === 'history_source_unavailable') {
-                    const result = historyPager.acceptRecent(data);
-                    if (result.status !== 'applied') applyHistoryMessages(messages, { fromReconnect, includeUser: true });
-                }
-                else applyHistoryMessages(messages, { fromReconnect, includeUser: true });
-                const recentState = historyPager.getState();
-                const releasableRecentIds = rechainRecent || recentState.canNewer ? [] : oldRecentIds;
-                withStableViewport(() => releaseHistoryIds(releasableRecentIds));
-                if (rechainRecent && !destroyed) void historyPager.latest();
+                // A reader in older history keeps the chain `Load more history` goes on from, the rows the newest read
+                // let go staying below; a shifted window re-anchors only a reader following the newest message.
+                const reader = readingHistory();
+                const rechainRecent = admitted && !reader && !data.reason_code && pagerBeforeRecent.initialized
+                    && !pagerBeforeRecent.canNewer && [...oldRecentIds].some(id => !recentHistoryIds.has(id));
+                const result = historyPager.acceptRecent(data, rechainRecent && { fromReconnect });
+                if (result.status !== 'applied') applyHistoryMessages(messages, { fromReconnect });
+                withStableViewport(() => releaseHistoryIds(!admitted || rechainRecent || reader
+                    || historyPager.getState().canNewer ? [] : oldRecentIds));
+                // Arrivals that landed meanwhile may lie past this page: read them again.
+                if (historyPager.arrivalsLanded() !== landedAtStart) void historyPager.read();
                 if (armedAtStart) {
                     const represented = new Set(messages.map(row => row.presentation_owner_task_id || row.task_id));
                     for (const id of cardsAtStart) if (!represented.has(id)) pendingLiveEvictions.add(id);
@@ -2751,273 +2536,122 @@ export function createChatInstance({
                 }
                 syncChatStatus();
 
-                if (!inputHistorySeededFromServer) {
-                    const serverTexts = [];
-                    for (const msg of messages) {
-                        if (msg.role !== 'user') continue;
-                        let text = (msg.text || '').trim();
-                        if (text) serverTexts.push(text);
-                    }
-                    const combined = [...serverTexts, ...inputHistory];
-                    const deduped = [];
-                    const seen = new Set();
-                    for (let i = combined.length - 1; i >= 0; i--) {
-                        if (!seen.has(combined[i])) {
-                            deduped.unshift(combined[i]);
-                            seen.add(combined[i]);
-                        }
-                    }
-                    inputHistory.length = 0;
-                    inputHistory.push(...deduped.slice(-50));
-                    saveChatInputHistory(sessionStorage, CHAT_INPUT_HISTORY_KEY, inputHistory);
-                    inputHistoryIndex = inputHistory.length;
-                    inputHistorySeededFromServer = true;
-                }
+                composer.seedInputHistory(messages);
 
                 const wasFirstLoad = !historyLoaded;
+                // The first source read opens at the newest message unless the reader moved.
+                const opensAfterPreview = wasFirstLoad && followingAtStart && reading.generation === generationAtStart;
                 historyLoaded = true;
                 lastHistorySyncSucceeded = true;
+                messagesDiv.dataset.historyHydrated = 'true';
+                emptyWelcome?.historyRead(data.window?.complete === true);
                 liveCardBound.settle({ rebuilt: wasFirstLoad || armedAtStart, size: liveCardRecords.size });
                 modelWaits.retainCards(liveCardRecords);
-                // ANY successful sync leaves the instance hydrated
-                // — later hydration triggers ride this sticky promise.
+                // Later hydration joins this successful source read.
                 initialHydrationPromise = historySyncPromise;
                 syncLoadOlderControl();
-                // A recreated project instance restores its predecessor's stashed
-                // mid-history position on first paint instead of pinning to newest.
-                if (wasFirstLoad && _initialScrollPending) {
-                    _initialScrollPending = false;
+                // A first opening follows the newest message (owner 2026-07-10,
+                // 2026-10-05); an in-room intent still awaiting data lands first.
+                if (reading.pending) {
                     updateMessagesPadding(false);
-                    restoreScrollPosition();
-                } else
-                // First load jumps to latest; reconnect preserves older-message reading.
-                if (wasFirstLoad || (fromReconnect ? scrollBeforeSync.nearBottom : isNearBottom())) {
+                    reading.position();
+                } else if ((wasFirstLoad && reading.stick) || opensAfterPreview) {
                     updateMessagesPadding();
-                    // Bootstrap pin: a fresh feed starts at scrollTop 0, where
-                    // the ordinary boundary would not land on the newest row.
-                    if (wasFirstLoad) scrollToBottomAfterLayout();
-                } else if (fromReconnect) {
-                    // Reconnect can add rows on either side. Restore the same
-                    // nested reading anchor after layout, never a height delta.
-                    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-                    const restoredFromAnchor = restoreVisibleTimelineAnchor(scrollBeforeSync.anchor);
-                    if (!restoredFromAnchor) messagesDiv.scrollTop = scrollBeforeSync.top;
-                    updateScrollButton();
+                    reading.followAfterLayout();
                 }
+                readReceipt.settle();
                 return messages.length > 0;
             } catch (err) {
+                if (destroyed || startedVisit !== visit) { initialHydrationPromise = null; return false; }
                 lastHistorySyncSucceeded = false;
+                preview.failed(err);
+                emptyWelcome?.historyRead(false);
                 initialHydrationPromise = null;
-                const socketState = ws?.ws?.readyState;
-                const expectedDisconnect = socketState !== WebSocket.OPEN;
-                if (expectedDisconnect && err instanceof TypeError) {
-                    return false;
-                }
-                console.error('Failed to load chat history:', err);
+                // Migration keeps a calm note and retries through the existing 700 ms scheduler.
+                historyControls.endRecent(err); syncLoadOlderControl();
+                if (isStoreMigrating(err)) { historyResyncScheduler.schedule(true); return false; }
+                // A fetch that failed while the socket is down is that outage, not an error to report.
+                const expectedDisconnect = ws?.ws?.readyState !== WebSocket.OPEN && err instanceof TypeError;
+                if (!expectedDisconnect) console.error('Failed to load chat history:', err);
                 return false;
             } finally {
+                if (historyReadAbort === abort) historyReadAbort = null;
                 historySyncPromise = null;
-                // A reconnect caller waiting on the active promise owns replay of
-                // pendingReconnectSync above, so its own promise resolves only after
-                // the authoritative rebuild.
+                // A reconnect caller waiting on the active promise owns replay of pendingReconnectSync above; its promise
+                // resolves only after the authoritative rebuild.
             }
         })();
         return historySyncPromise;
     }
 
-    function cancelHistoryPaint() {
-        historyPaintGeneration += 1;
-    }
-
-    async function refreshHistory({ revision = 0 } = {}) {
-        const generation = ++historyPaintGeneration;
-        const targetRevision = Math.max(0, Number(revision) || 0);
-        // only a NEW revision (or a never-hydrated instance)
-        // forces a real fetch; otherwise the sticky hydration promise answers
-        // and the paint receipt below still runs.
-        if (targetRevision > lastLoadedHistoryRevision || !initialHydrationPromise) {
-            await syncHistory({ includeUser: true });
-        } else {
-            await awaitInitialHydration({ includeUser: true });
-        }
-        if (lastHistorySyncSucceeded && targetRevision > lastLoadedHistoryRevision) {
-            lastLoadedHistoryRevision = targetRevision;
-        }
-        if (destroyed || !lastHistorySyncSucceeded || generation !== historyPaintGeneration || page.hidden) {
-            return { painted: false, revision: targetRevision };
-        }
-        // A successful fetch is not a read acknowledgement until the rebuilt
-        // DOM has crossed an actual browser paint while this Project remains
-        // visible. Two frames cover layout followed by paint/composite. A
-        // destroyed page reports hidden===false, so the paint receipt must also
-        // consult the lifecycle flag — a late paint on a torn-down instance
-        // would otherwise acknowledge a revision that was never shown.
-        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-        return {
-            painted: !destroyed && generation === historyPaintGeneration && !page.hidden,
-            revision: targetRevision,
-        };
-    }
+    // A new revision needs a read begun after it: one in flight is awaited, never
+    // joined; the sticky hydration answers a covered one (project_read_state.js).
+    const newestFacts = { delivered: id => retainedHistoryIds().has(id), nodes: id => historyNodes(id),
+        viewport: messagesDiv, header: pageHeader, composer: inputArea };
+    // A message this room shares with another is read once wherever it was shown whole (read_ahead.js).
+    const sharedRead = createSharedReadTracker({ chatId, feed: messagesDiv, band: () => readBand(messagesDiv, pageHeader, inputArea),
+        shown: () => !destroyed && !leaving && !page.hidden && isInstanceVisible() });
+    const readReceipt = createProjectReadReceipt({ onNote: sharedRead.sample,
+        read: async (fresh, whole) => {
+            await (!fresh && initialHydrationPromise || historyPager.read({ whole }));
+            return lastHistorySyncSucceeded;
+        },
+        // A destroyed page reports hidden===false, hence the lifecycle flag.
+        isShown: () => !destroyed && !leaving && !page.hidden,
+        // A place still being restored is not where the reader is.
+        isReadingLatest: latest => !destroyed && !reading.pending && !replies.revealing && isInstanceVisible() && isAtNewestMessage(latest, {
+            ...newestFacts, atBottom: () => isNearBottom() && !historyPager.getState().canNewer,
+        }),
+        onReadingLatest, arriving: () => reading.arriving, delivered: newestFacts.delivered,
+        older: async current => {
+            await historyPager.whenIdle();
+            if (!current()) return {};
+            const direction = readReceipt.continuation(pagerRecent);
+            // A failed present keeps the existing horizon repair.
+            if (direction === 'latest' || (direction && !historyPager.getState().error)) return historyPager[direction]();
+            return loadHistoryAtEdge('older', current);
+        },
+        present: current => historyPager.whenIdle().then(() => current() && historyPager.getState().canNewer && historyPager.latest()),
+        land: (latest, token) => reading.land(() => newestMessageOffset(latest, newestFacts), token),
+    });
 
     (async () => {
+        // The owners below exist first: no read stands between an opening and the saved text.
+        await null;
+        if (!destroyed && preview.show()) { updateMessagesPadding(); reading.followAfterLayout(); }
         await loadUiPreferences();
-        // Main waits for the (bounded) idle hydration window;
-        // project instances pass straight through. The sticky single-flight
-        // below folds this trigger with the first socket open / refreshHistory.
+        // Main waits for hydration; Projects pass through. History reads share one flight.
         await waitForHydrationWindow();
         if (destroyed) return;
-        if (await awaitInitialHydration({ includeUser: true })) return;
-        try {
-            const saved = JSON.parse(sessionStorage.getItem(storeKey(CHAT_STORAGE_KEY)) || '[]');
-            for (const msg of saved) {
-                addMessage(msg.text, msg.role, !!msg.markdown, msg.ts || null, false, {
-                    systemType: msg.systemType || '',
-                    source: msg.source || '',
-                    initiator: msg.initiator || '',
-                    senderLabel: msg.senderLabel || '',
-                    senderSessionId: msg.senderSessionId || '',
-                    clientMessageId: msg.clientMessageId || '',
-                    taskId: msg.taskId || '',
-                    projectId: msg.projectId || '',
-                    projectName: msg.projectName || '',
-                    skillReview: msg.skillReview || null,
-                });
-            }
-        } catch {}
-        historyLoaded = true;
-        // The next successful source read reconciles this offline preview.
-        if (!lastHistorySyncSucceeded) liveCardBound.arm();
-        ensureWelcomeMessage();
+        await awaitInitialHydration();
+        // A message this tab kept across a reload that the first read did not show saved is in doubt.
+        if (!destroyed) unconfirmed.reconcile(({ frame, views, ts }) => addMessage(frame.content, 'user', false, ts || null,
+            false, { source: 'web', senderSessionId: chatSessionId, clientMessageId: frame.client_message_id, attachments: views }));
     })();
 
-    function rememberInput(text) {
-        if (!text) return;
-        if (inputHistory[inputHistory.length - 1] !== text) inputHistory.push(text);
-        saveChatInputHistory(sessionStorage, CHAT_INPUT_HISTORY_KEY, inputHistory);
-        inputHistoryIndex = inputHistory.length;
-        inputDraft = '';
-    }
+    // The composer (composer.js): its field, the room's capsules, attachments and the send path.
+    composer = createComposer({ page, byId, ws, replies, chatSessionId, isMain, chatId, projectId, storeKey,
+        refreshState: refreshHeaderControlState, openSettings, onLayout: () => updateMessagesPadding(),
+        onSent: showSent, readingBack: () => !reading.stick && reading.ownMove });
 
-    function resizeChatInput() {
-        const caretAtEnd = input.selectionEnd >= input.value.length - 1;
-        const previousScrollTop = input.scrollTop;
-        input.style.height = 'auto';
-        input.style.height = Math.min(input.scrollHeight, 120) + 'px';
-        input.scrollTop = caretAtEnd ? input.scrollHeight : previousScrollTop;
-        updateMessagesPadding();
-    }
-
-    function restoreInputHistory(step) {
-        if (!inputHistory.length) return;
-        if (step < 0) {
-            if (input.selectionStart !== 0 || input.selectionEnd !== 0) return;
-            if (inputHistoryIndex === inputHistory.length) inputDraft = input.value;
-            inputHistoryIndex = Math.max(0, inputHistoryIndex - 1);
-            input.value = inputHistory[inputHistoryIndex] || '';
-        } else {
-            if (input.selectionStart !== input.value.length || input.selectionEnd !== input.value.length) return;
-            inputHistoryIndex = Math.min(inputHistory.length, inputHistoryIndex + 1);
-            input.value = inputHistoryIndex === inputHistory.length ? inputDraft : (inputHistory[inputHistoryIndex] || '');
-        }
-        resizeChatInput();
-        const cursor = input.value.length;
-        input.setSelectionRange(cursor, cursor);
-    }
-
-    async function sendMessage(planMode = false) {
-        if (sendBtn.disabled) return;  // guard against Enter re-entry during async upload
-        let text = input.value.trim();
-        const hasAttachments = pendingAttachments.length > 0;
-        let uploadedAttachments = [];
-        let attachmentMeta = [];
-        if (!text && !pendingAttachments.length) return;
-        if (pendingAttachments.length) {
-            // Upload immediately before send; offline queueing would orphan files.
-            if (ws.ws?.readyState !== WebSocket.OPEN) {
-                showToast('Cannot attach file while offline. Reconnect and try again.', 'error');
-                return;
-            }
-            const staged = [...pendingAttachments];
-            const uploaded = [];
-            setAttachmentUploadState(true);
-            setSendBusy(true, staged.length > 1 ? 'Uploading files' : 'Uploading');
-            try {
-                for (const stagedItem of staged) {
-                    if (ws.ws?.readyState !== WebSocket.OPEN) throw new Error('Connection closed during upload. Reconnect and try again.');
-                    const formData = new FormData();
-                    formData.append('file', stagedItem.file);
-                    const resp = await apiFetch('/api/chat/upload', { method: 'POST', body: formData });
-                    const data = await resp.json().catch(() => ({}));
-                    if (!resp.ok || !data.ok) {
-                        throw new Error(data.error || resp.statusText);
-                    }
-                    uploaded.push({
-                        filename: data.filename || '',
-                        path: data.path || '',
-                        display_name: data.display_name || stagedItem.display_name,
-                        mime: data.mime || stagedItem.file?.type || '',
-                    });
-                }
-                if (ws.ws?.readyState !== WebSocket.OPEN) throw new Error('Connection closed after upload. Reconnect and try again.');
-                uploadedAttachments = uploaded;
-                const attachmentLines = uploaded.slice(0, ATTACHMENT_PREVIEW_COUNT)
-                    .map((item) => `[Attached file: ${item.display_name}]`)
-                    .concat(uploaded.length > ATTACHMENT_PREVIEW_COUNT ? [`[${uploaded.length - ATTACHMENT_PREVIEW_COUNT} more attached files]`] : [])
-                    .join('\n');
-                text += (text ? '\n\n' : '') + attachmentLines;
-                // Structured attachment metadata rides the WS frame so the
-                // gateway can hand image uploads to the model as NATIVE image
-                // blocks (vision models) instead of only a path label.
-                attachmentMeta = uploaded.map((item) => ({
-                    filename: item.filename,
-                    display_name: item.display_name,
-                    mime: item.mime || '',
-                }));
-            } catch (e) {
-                await cleanupUploadedAttachments(uploaded);
-                showToast('Upload error: ' + e.message, 'error');
-                return;  // pending attachments and preview remain so the user can retry
-            } finally {
-                setAttachmentUploadState(false);
-                setSendBusy(false);
-            }
-        }
-        if (!text) return;
-        const forcePlan = !!planMode && !text.startsWith('/');
-        const result = ws.send({
-            type: 'chat',
-            content: text,
-            sender_session_id: chatSessionId,
-            force_plan: forcePlan,
-            ...(isMain ? {} : { chat_id: chatId }),
-            ...(projectId ? { project_id: projectId } : {}),
-            ...(attachmentMeta.length ? { attachments: attachmentMeta } : {}),
-            ...clientSurfaceField(),
-        }, hasAttachments ? { queue: false } : undefined);
-        if (hasAttachments && result?.status !== 'sent') {
-            await cleanupUploadedAttachments(uploadedAttachments);
-            showToast('Connection lost before send. Reconnect and try again.', 'error');
-            return;
-        }
-        // One-shot: disarm Swarm now that the message is sent.
-        if (planMode) setSwarm(false);
-        if (hasAttachments) {
-            pendingAttachments = [];
-            updateAttachmentPreview();
-        }
-        rememberInput(text);
-        input.value = '';
-        clearInputDraft();
+    // A send the composer made, shown in the feed: the bubble, its doubt until the host's saved echo, `Sending...`.
+    function showSent({ text, frame, result, views }) {
         const sentTs = new Date().toISOString();
-        addMessage(text, 'user', false, sentTs, false, {
+        reading.cancel(); // an accepted Send supersedes any saved place
+        const row = addMessage(text, 'user', false, sentTs, false, {
             pending: result?.status === 'queued',
             source: 'web',
             senderSessionId: chatSessionId,
             clientMessageId: result?.clientMessageId || '',
-            forceStick: true,
+            forceStick: true, reply: replies.echoRow(),
+            attachments: views,
         });
-        // ws.send always coins a client_message_id for chat frames; guard
-        // only against a non-chat result shape.
+        replies.clear();
+        // Only the host's saved echo proves acceptance: every message's frame stays (a bare slash command is a
+        // command); a queued one is the socket queue's until it is written.
+        if (views.length || !text.startsWith('/')) unconfirmed.track({ ...frame, client_message_id: result.clientMessageId },
+            { views, ts: sentTs, queued: result?.status === 'queued' });
+        // Chat sends carry their minted client_message_id.
         const pendingId = result?.clientMessageId || '';
         if (pendingId) {
             pendingSubmissions.set(pendingId, {
@@ -3027,109 +2661,22 @@ export function createChatInstance({
             recordLocalEcho(pendingId, text, sentTs);
         }
         syncChatStatus();
-        resizeChatInput();
-        scrollToBottomAfterLayout();
+        composer.resize();
+        reading.followAfterLayout();
+        return row;  // the sent draft rises into it (send_flight.js)
     }
-
-    // Send mode lives on DOM so CSS and click/Enter share one source.
-    const sendGroup = page.querySelector('.chat-send-group');
-
-    // Swarm is a one-shot arm: the next send goes through plan_task multi-model
-    // brainstorm/planning, then the pill auto-disarms so it never sticks.
-    const swarmBtn = byId('swarm');
-    function swarmArmed() {
-        return swarmBtn?.dataset.armed === 'true';
-    }
-    function setSwarm(armed) {
-        if (swarmBtn) swarmBtn.dataset.armed = armed ? 'true' : 'false';
-    }
-
-    function setSendBusy(busy, label = '') {
-        sendGroup.dataset.busy = busy ? '1' : '0';
-        sendBtn.disabled = busy;
-        if (busy) {
-            sendBtn.textContent = label || 'Sending';
-            sendBtn.title = label || 'Sending';
-        } else {
-            sendBtn.textContent = 'Send';
-            sendBtn.title = 'Send message';
-        }
-    }
-
-    swarmBtn?.addEventListener('click', () => setSwarm(!swarmArmed()));
-
-    // Context-mode quick toggle: the owner endpoint hot-applies the setting
-    // without a restart; Max -> Low is accepted only while Ouroboros is idle.
-    const contextModeBtn = byId('context-mode');
-    contextModeBtn?.addEventListener('click', async (event) => {
-        const seg = event.target.closest('.chat-seg');
-        if (!seg || contextModeBtn.dataset.disabled === 'true') return;
-        const next = ['nano', 'low', 'max'].includes(seg.dataset.mode) ? seg.dataset.mode : 'max';
-        const current = ['nano', 'low', 'max'].includes(contextModeBtn.dataset.contextMode) ? contextModeBtn.dataset.contextMode : 'max';
-        if (next === current) return;
-        contextModeBtn.dataset.disabled = 'true';
-        const postMode = (mode) => apiFetch('/api/owner/context-mode', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ mode }),
-        });
-        try {
-            const resp = await postMode(next);
-            if (resp.ok) {
-                contextModeBtn.dataset.contextMode = next;
-            } else {
-                let message = 'Could not change context mode.';
-                try { const p = await resp.json(); if (p?.error) message = p.error; } catch {}
-                showToast(message, 'error');
-            }
-        } catch (e) {
-            showToast(`Could not change context mode: ${e.message || e}`, 'error');
-            /* leave the current value; /api/state refresh will resync */
-        } finally {
-            contextModeBtn.dataset.disabled = 'false';
-            refreshHeaderControlState(true);
-        }
-    });
-
-    // Arrow wrappers avoid MouseEvent leaking into sendMessage(planMode).
-    sendBtn.addEventListener('click', () => sendMessage(swarmArmed()));
-    input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && !e.shiftKey) {
-            e.preventDefault();
-            sendMessage(swarmArmed());
-            return;
-        }
-        if (e.key === 'ArrowUp' && !e.shiftKey) {
-            restoreInputHistory(-1);
-        } else if (e.key === 'ArrowDown' && !e.shiftKey) {
-            restoreInputHistory(1);
-        }
-    });
     // Dynamic CSS reserve keeps the absolute composer from covering messages.
-    function scrollToBottom() {
-        messagesDiv.scrollTop = messagesDiv.scrollHeight;
-        updateScrollButton();
-    }
 
-    function scrollToBottomAfterLayout() {
-        requestAnimationFrame(() => {
-            if (destroyed) return;
-            scrollToBottom();
-            requestAnimationFrame(() => {
-                if (destroyed) return;
-                scrollToBottom();
-            });
-        });
-    }
-
-    // Ignore hidden/restoring scroll events so browser resets cannot corrupt saved intent.
-    messagesDiv?.addEventListener('scroll', () => {
-        if (!isInstanceVisible()) return;
-        if (_restoring) { updateScrollButton(); return; }
-        _savedScrollTop = messagesDiv.scrollTop;
-        _savedStick = isNearBottom();
-        updateScrollButton();
-    }, { passive: true });
+    // Scroll events observe position; only positive navigation changes follow intent.
+    messagesDiv?.addEventListener('scroll', () => { reading.scroll(); settleHistoryViewport(); readReceipt.note(); }, { passive: true });
+    // An image's load reflows in the next frame, after its scroll events: a load between a move (a wheel step, a
+    // scrollIntoView) and the scroll event it still owes would else restore the anchor of the place just left.
+    let loadReflowQueued = false;
+    messagesDiv?.addEventListener('load', () => {
+        if (loadReflowQueued) return;
+        loadReflowQueued = true;
+        requestAnimationFrame(() => { loadReflowQueued = false; if (!destroyed) reading.reflow(); });
+    }, true);
 
     // Navigation plus one coalesced, non-live-region remote-activity bit.
     function updateScrollButton() {
@@ -3143,61 +2690,83 @@ export function createChatInstance({
         scrollBottomBtn.setAttribute('aria-label', label);
         scrollBottomBtn.title = label;
         if (scrollActivityDot) scrollActivityDot.hidden = !_hasNewActivity;
-        scrollBottomBtn.classList.toggle('visible', isInstanceVisible() && !isNearBottom());
+        scrollBottomBtn.classList.toggle('visible', isInstanceVisible() && (!isNearBottom() || (!reading.stick && historyWindow?.gaps)));
     }
-    scrollBottomBtn?.addEventListener('click', async () => {
-        if (historyPager.getState().canNewer) await historyPager.latest();
-        _savedStick = true;
-        scrollToBottomAfterLayout();
+    // The one way to the present: ↓, and a return to a room that followed it, unread at what arrived last.
+    async function showLatest({ arrive = false } = {}) {
+        const current = reading.claim(arrive === true);
+        if (historySyncPromise) await historySyncPromise;
+        await historyPager.whenIdle();
+        if (destroyed || !current()) return;
+        if (historyPager.getState().away || historyWindow?.horizonGap) {
+            if ((await historyPager.latest()).status !== 'applied') return;
+        }
+        if (destroyed || !current()) return;
+        reading.stick = true;
+        for (const record of liveCardRecords.values()) record.childDetailRead = undefined;
+        reading.followAfterLayout();
         updateScrollButton();
-    });
+        historyControls.showNotice();
+    }
+    scrollBottomBtn?.addEventListener('click', showLatest);
+    // A return: from the newest message to the present; from an older passage back there, ↓ marked, the rest unread
+    // (owner 2026-11-03). Leaving the screen keeps the place and stops a pending move.
+    const resume = (arrive = false) => ((reading.target || reading).stick === false
+        ? (_hasNewActivity ||= arrive, reading.position(), updateScrollButton()) : showLatest({ arrive }));
+    const keepPlace = () => { if (isInstanceVisible()) { reading.cancel(); reading.request(); } };
 
-    function restoreScrollPosition() {
-        if (!isInstanceVisible()) return;  // hidden column has no geometry yet
-        // Reapply across relayout frames for pre-scroll-anchoring WKWebView.
-        _restoring = true;
-        const generation = ++restoreGeneration;
-        const targetStick = _savedStick;
-        const targetTop = _savedScrollTop;
-        const historicalAnchor = _resumeAnchor;
-        let frames = 0;
-        const apply = () => {
-            if (generation !== restoreGeneration) return;
-            if (destroyed || !isInstanceVisible()) { _restoring = false; return; }
-            const node = !targetStick && historicalAnchor
-                ? historyNodes(historicalAnchor.id)[0] : null;
-            if (node) messagesDiv.scrollTop += node.getBoundingClientRect().top
-                - messagesDiv.getBoundingClientRect().top - historicalAnchor.offset;
-            else messagesDiv.scrollTop = targetStick ? messagesDiv.scrollHeight : targetTop;
-            updateScrollButton();
-            if (++frames < 12) requestAnimationFrame(apply);
-            else { _restoring = false; _resumeAnchor = null; }
-        };
-        requestAnimationFrame(apply);
+    // The composer's height once its reply strip moved (chat_reply.js `data-motion`): opening, the full strip
+    // (`--reply-h`) plus the wrap's gap; leaving, none. One reserve move per motion, never per frame: each write
+    // restyles the whole room (~90 ms on a 34k-element WebKit Main; four in a row stuttered the close).
+    function composerHeightAtRest() {
+        const strips = inputArea.querySelectorAll('.chat-quote--composer[data-motion]');
+        if (!strips.length) return inputArea.offsetHeight || 0;
+        // Mid-motion heights are fractional: whole pixels would differ by one from frame to frame and write again.
+        let height = inputArea.getBoundingClientRect().height;
+        for (const strip of strips) {
+            // The room a strip takes is its box and its margins (style.css): opening it ends at --reply-room, shut at none.
+            const { marginTop, marginBottom } = getComputedStyle(strip);
+            const now = strip.getBoundingClientRect().height + (parseFloat(marginTop) || 0) + (parseFloat(marginBottom) || 0);
+            const end = strip.dataset.motion === 'open' ? (parseFloat(strip.style.getPropertyValue('--reply-room')) || 0) : 0;
+            height += end - now;
+        }
+        return height;
     }
 
     function updateMessagesPadding(preserveStickiness = true) {
+        // A room not displayed (Main behind a page) measures its bars as 0: it keeps the reserves it was laid out
+        // with, or it would come back with its newest message under the composer.
+        if (leaving || !page.getClientRects().length) return false;
+        // The room's measured layout variables, each written only when it changes (true then).
+        const layout = { setProperty: (name, value) => page.style.getPropertyValue(name) !== value
+            && (page.style.setProperty(name, value), true) };
+        let chromeMoved = false;
         const mutate = () => {
             let changed = false;
             if (pageHeader && messagesDiv) {
-                const headerReserve = Math.max(56, Math.ceil(pageHeader.offsetHeight || 0));
-                const value = `${headerReserve}px`;
-                if (page.style.getPropertyValue('--chat-header-reserve') !== value) {
-                    page.style.setProperty('--chat-header-reserve', value);
-                    changed = true;
-                }
+                // The bar's own height places the note under it; the transcript clears both.
+                const bar = Math.ceil(pageHeader.offsetHeight || 0);
+                const note = pageNote?.offsetParent ? Math.ceil(pageNote.offsetHeight || 0) : 0;
+                changed = layout.setProperty('--chat-header-bar', `${bar}px`);
+                changed = layout.setProperty('--chat-header-reserve', `${Math.max(56, bar + note)}px`) || changed;
             }
             if (inputArea && messagesDiv) {
-                const reserve = Math.max(92, Math.ceil(inputArea.offsetHeight || 0) + 16);
-                const value = `${reserve}px`;
-                if (page.style.getPropertyValue('--chat-input-reserve') !== value) {
-                    page.style.setProperty('--chat-input-reserve', value);
-                    changed = true;
+                const reserve = Math.max(92, Math.ceil(composerHeightAtRest()) + 16);
+                changed = layout.setProperty('--chat-input-reserve', `${reserve}px`) || changed;
+                // Keyboard up: all but feed and field text is chrome (style.css), read at rest.
+                const box = el => el.getBoundingClientRect();
+                if (pageHeader && document.body.classList.contains('keyboard-open')
+                        && !inputArea.querySelector('[data-motion]')) {
+                    chromeMoved = layout.setProperty('--chat-keyboard-chrome', `${Math.round(box(messagesDiv).top
+                        - box(pageHeader).top + box(inputArea).height - box(input).height)}px`);
                 }
             }
-            return changed;
+            return changed || chromeMoved;
         };
         const changed = preserveStickiness ? withStableViewport(mutate) : mutate();
+        if (chromeMoved) composer?.resize();  // a grown cap sends no resize
+        // The scrollbar this feed draws (none where scrollbars overlay the page): a Project's focus corners keep off it.
+        if (asPanel) layout.setProperty('--chat-feed-lane', `${messagesDiv.offsetWidth - messagesDiv.clientWidth}px`);
         updateScrollButton();
         return changed;
     }
@@ -3214,136 +2783,83 @@ export function createChatInstance({
             queued = true;
             requestAnimationFrame(() => {
                 queued = false;
-                if (destroyed) return;
+                if (destroyed || leaving) return;
+                reading.reflow();
                 updateMessagesPadding();
             });
         };
         chatResizeObserver = new ResizeObserver(schedule);
+        chatResizeObserver.observe(messagesDiv);
         if (pageHeader) chatResizeObserver.observe(pageHeader);
+        if (pageNote) chatResizeObserver.observe(pageNote);
         if (inputArea) chatResizeObserver.observe(inputArea);
     }
 
     installChatResizeObservers();
 
-    // Per-thread input draft (P3): destroy-on-close would otherwise lose typed
-    // but unsent text. Saved on every input (cheap), restored at instance
-    // creation, cleared on send.
-    function saveInputDraft() {
-        try {
-            if (input.value) sessionStorage.setItem(storeKey(CHAT_DRAFT_KEY), input.value);
-            else sessionStorage.removeItem(storeKey(CHAT_DRAFT_KEY));
-        } catch {}
-    }
+    // An open Project room's feed holds the keys (app.js focusProjectRoom), focus drawn as two corners (style.css): a
+    // pointer in the panel quiets them; any key in the room restores them (Back to reading from the composer too) but
+    // lone modifiers and non-scrolling shortcuts (Cmd+C, Cmd+Shift+4).
+    const focusPanel = asPanel ? container.closest?.('.project-panel') : null;
+    const quietFocus = () => messagesDiv.classList.add('is-quiet-focus');
+    const showFocus = ({ key, metaKey, ctrlKey, altKey }) => {
+        if (metaKey || ctrlKey || altKey ? /^(Arrow|Page|Home$|End$| $)/.test(key)
+            : !/^(Shift|CapsLock|Fn)$/.test(key)) messagesDiv.classList.remove('is-quiet-focus');
+    };
+    focusPanel?.addEventListener('pointerdown', quietFocus);
+    focusPanel?.addEventListener('keydown', showFocus);
 
-    function clearInputDraft() {
-        try { sessionStorage.removeItem(storeKey(CHAT_DRAFT_KEY)); } catch {}
-    }
-
-    try {
-        const savedDraft = sessionStorage.getItem(storeKey(CHAT_DRAFT_KEY)) || '';
-        if (savedDraft && !input.value) {
-            input.value = savedDraft;
-            inputDraft = savedDraft;
-            resizeChatInput();
-        }
-    } catch {}
-
-    input.addEventListener('input', () => {
-        if (inputHistoryIndex === inputHistory.length) inputDraft = input.value;
-        resizeChatInput();
-        saveInputDraft();
-    });
-
-    headerActions?.addEventListener('click', async (event) => {
-        const button = event.target.closest('[data-chat-command]');
-        if (!button) return;
-        button.closest('details')?.removeAttribute('open');
-        const command = button.dataset.chatCommand;
-        if (command === 'evolve') {
-            const next = !button.classList.contains('on');
-            button.classList.toggle('on', next);
-            ws.send({ type: 'command', cmd: `/evolve ${next ? 'start' : 'stop'}` });
-            return;
-        }
-        if (command === 'bg') {
-            const next = !button.classList.contains('on');
-            button.classList.toggle('on', next);
-            ws.send({ type: 'command', cmd: `/bg ${next ? 'start' : 'stop'}` });
-            return;
-        }
-        if (command === 'review') {
-            ws.send({ type: 'command', cmd: '/review' });
-            return;
-        }
-        if (command === 'restart') {
-            ws.send({ type: 'command', cmd: '/restart' });
-            return;
-        }
-        if (command === 'panic') {
-            // CRITICAL CONTROL: the whole confirm-and-send flow lives in the
-            // node-tested confirmAndSendPanic (dialog options + strict
-            // shouldFirePanic gate + the exact /panic command); this handler
-            // only injects the real deps. Manual check on release: click
-            // Panic → dialog → "Kill all workers" sends /panic;
-            // Cancel/Escape/backdrop send nothing.
-            await confirmAndSendPanic({ openConfirmDialog, ws });
-        }
-    });
-
-    // The More menu is a native <details> (no auto-dismiss): collapse it when a
-    // click/tap lands outside it, or on Escape, so it never stays stuck open.
-    // Handler refs are kept so destroy() can remove them (P3 lifecycle).
-    let documentClickHandler = null;
-    let documentKeydownHandler = null;
-    if (!asPanel) {
-        const collapseHeaderMenus = (predicate) => {
-            page.querySelectorAll('details.chat-header-more[open]').forEach((details) => {
-                if (predicate(details)) details.removeAttribute('open');
-            });
-        };
-        documentClickHandler = (event) => {
-            collapseHeaderMenus((details) => !details.contains(event.target));
-        };
-        document.addEventListener('click', documentClickHandler);
-        documentKeydownHandler = (event) => {
-            if (event.key === 'Escape') collapseHeaderMenus(() => true);
-        };
-        document.addEventListener('keydown', documentKeydownHandler);
-    }
-
-    budgetPill?.addEventListener('click', () => {
-        if (typeof openDashboardTab === 'function') openDashboardTab('costs');
-        else if (typeof openSettingsTab === 'function') openSettingsTab('costs');
-    });
-
-    let headerControlInterval = null;
     if (asPanel) {
-        // A panel has no global controls/budget to poll; seed the status from
-        // the live socket so a late-created panel never gets stuck on
-        // "Connecting…" (the one-shot WS `open` already fired before it existed;
-        // future reconnects still update it via the shared `open` handler).
-        if (ws.isConnected?.()) setStatus('online', 'Online');
-        // 1A a panel created AFTER the socket opened missed the `open`-driven
-        // refresh — hydrate in-flight turns once from the census (the
-        // per-instance closure filters to this panel's chat_id).
-        refreshHeaderControlState(true);
-    } else {
-        refreshHeaderControlState(true);
-        headerControlInterval = setInterval(refreshHeaderControlState, 3000);
+        // Late panels missed socket open; seed from the socket and latest snapshot, its works included: a working
+        // Project opened from its row said Online until its own first read (owner 20.10).
+        const latest = stateSnapshots.latest?.();
+        hostStart.read(latest);
+        workState = reconcileWorkState(workState, latest, chatId, ws.isConnected?.() !== false);
+        const seed = deriveChatStatus();
+        if (ws.isConnected?.()) setStatus(seed);
     }
+    // Both Main and late panels hydrate once; each instance filters its chat. The page's poll is app.js's.
+    refreshHeaderControlState();
 
     const typingEl = document.createElement('div');
-    // Per-instance id (main stays 'typing-indicator'; panels get a unique id) so
-    // multiple open chat columns never collide on a duplicate DOM id.
+    // A per-instance id (Main's stays 'typing-indicator'): open chat columns never share one.
     typingEl.id = idPrefix === 'chat' ? 'typing-indicator' : `${idPrefix}-typing-indicator`;
     typingEl.className = 'chat-bubble assistant typing-bubble';
     typingEl.style.display = 'none';
-    typingEl.innerHTML = `<div class="typing-dots"><span></span><span></span><span></span></div>`;
+    typingEl.innerHTML = statusMarkHtml('typing-mark', { shape: 'moving', hue: 'ink' });
     messagesDiv.appendChild(typingEl);
 
     const pageHistoryIds = new Map();
-    const pageWindows = new Map();
+    let recentCoverage = null;
+    let pagerRecent = {};
+    let recentHasOrigins = false;
     let recentHistoryIds = new Set();
+    let recentRequest = 0, recentApplied = 0;
+    // Every read of this room (newest, a page, ↓, arrivals): a current one refused for authentication takes the saved text.
+    async function fetchHistory(cursor, options = {}) {
+        const recentVersion = cursor == null ? ++recentRequest : 0;
+        try {
+            return { ...await apiClient.chatHistory({ chatId, cursor, ...options }), recentVersion };
+        } catch (error) {
+            if (!destroyed && !leaving && !options.signal?.aborted) preview.refused(error);
+            throw error;
+        }
+    }
+    // Both newest reads (the room's own, ↓'s `latest` page) are admitted here once: the saved preview follows.
+    function acceptRecentWindow(data, messages) {
+        if (data.recentVersion <= recentApplied) return false;
+        recentApplied = data.recentVersion;
+        preview.save(messages, data);
+        // The newest admitted window (↓ too) owns the failure note.
+        historyControls.endRecent(data.reason_code ? new Error('Some saved history could not be loaded.') : null);
+        recentCoverage = data.coverage ?? null;
+        recentHasOrigins = messages.some(row => row.origin_projected);
+        readReceipt.recent(data);
+        const ids = new Set(messages.flatMap(historyRowIds));
+        for (const id of recentHistoryIds) if (data.window?.truncated_by?.includes(`${id.split(':')[0]}_source_unavailable`)) ids.add(id);
+        recentHistoryIds = ids;
+        return true;
+    }
     const pendingHistoryEvictions = new Set();
     const historyNodes = (id) => Array.from(messagesDiv.querySelectorAll('[data-history-id]'))
         .filter(node => node.dataset.historyId === id);
@@ -3351,15 +2867,15 @@ export function createChatInstance({
         ...[...pageHistoryIds.values()].flatMap(ids => [...ids])]);
     function isHistoryPageProtected(descriptor) {
         const ids = pageHistoryIds.get(descriptor.id) || new Set();
-        if (Array.from(messagesDiv.querySelectorAll('[data-history-id]'))
-            .some(node => ids.has(node.dataset.historyId) && historyNodeIsProtected(node, messagesDiv))) return true;
+        if (historyStamps(messagesDiv).some(([id, node]) => ids.has(id) && historyNodeIsProtected(node, messagesDiv))) return true;
         return [...liveCardRecords.values()].some(record =>
             [...(record.historyIds || [])].some(id => ids.has(id))
-            && [record.summaryButtonEl, record.reviewsHostEl].some(node => historyNodeIsProtected(node, messagesDiv)));
+            && [record.summaryButtonEl, record.footEl, record.reviewsHostEl].some(node => historyNodeIsProtected(node, messagesDiv)));
     }
 
-    // One retirement path for a message node: its media, decision views and markdown go with it.
+    // One retirement path per message node: media, decision views and markdown go with it.
     function releaseMessageNode(node) {
+        sharedRead.release(node);
         chatMedia.release(node); chatDecision.releaseViews(node); destroyChatMarkdown(node); node.remove();
     }
 
@@ -3368,15 +2884,22 @@ export function createChatInstance({
         const retained = retainedHistoryIds();
         const released = new Set();
         const byId = new Map();
-        for (const node of messagesDiv.querySelectorAll('[data-history-id]')) {
-            const key = node.dataset.historyId;
+        for (const [key, node] of historyStamps(messagesDiv)) {
             if (!byId.has(key)) byId.set(key, []);
             byId.get(key).push(node);
         }
+        // The page as the reader sees it decides, before any row leaves: a row or card read, focused or selected stays,
+        // a card keeps its timeline's selection. All are read first, in one layout.
+        const due = new Set([...ids].filter(id => !retained.has(id)));
+        const held = new Set([...due].filter(id => (byId.get(id) || []).some(node => historyNodeIsProtected(node, messagesDiv))));
+        const kept = keepSelection(document);
+        const heldCards = new Set([...liveCardRecords].filter(([, record]) => ([...(record.historyIds || [])].some(key => due.has(key))
+            || record.items.some(item => due.has(item.historyId || item.sourceHistoryId)))
+            && historyNodeIsProtected(record.root, messagesDiv)).map(([id]) => id));
         for (const id of ids) {
             if (retained.has(id)) { pendingHistoryEvictions.delete(id); continue; }
             const nodes = byId.get(id) || [];
-            if (nodes.some(node => historyNodeIsProtected(node, messagesDiv))) {
+            if (held.has(id)) {
                 pendingHistoryEvictions.add(id); continue;
             }
             pendingHistoryEvictions.delete(id);
@@ -3384,13 +2907,17 @@ export function createChatInstance({
                 const wrapper = node.closest('.chat-bubble');
                 releaseMessageNode(node);
                 if (wrapper && wrapper !== node && !wrapper.querySelector('.chat-gallery-item, .chat-file-item, .chat-quiz-card')) {
-                    chatMedia.release(wrapper); wrapper.remove();
+                    releaseMessageNode(wrapper);
                 }
             }
             seenMessageKeys.delete(`history:${id}`);
             released.add(id);
         }
         if (!released.size) return;
+        // A timeline's scroll is read once its released lines have left (where the engine anchors scrolling, the line
+        // being read has stayed in place), for every card they left at once: one layout.
+        const at = new Map([...liveCardRecords].filter(([, record]) => record.items.some(item => released.has(item.historyId || item.sourceHistoryId)))
+            .map(([id, record]) => [id, { scroll: timelineScroll(record), kept }]));
         for (const [id, record] of [...liveCardRecords].reverse()) {
             let affected = false;
             for (const key of record.historyIds || []) {
@@ -3399,114 +2926,161 @@ export function createChatInstance({
             const items = record.items.filter(item => !released.has(item.historyId || item.sourceHistoryId));
             if (items.length !== record.items.length) {
                 record.items = items;
-                renderLiveCardTimeline(record);
+                renderLiveCardTimeline(record, at.get(id));
                 updateLiveCardCount(record);
             }
             if (!affected || record.historyIds?.size || activeDirectActivities.has(id)
+                    || record.episodeDisclosure?.isConnected
                     || record.subagentsEl?.querySelector('.chat-live-card')
-                    || historyNodeIsProtected(record.root, messagesDiv)) continue;
+                    || heldCards.has(id)) continue;
             if (!record.finished && !record.historicalUnavailable && !record.historicalUnconfirmed) continue;
-            disposeLiveCard(id);
-            subagentChildParents.delete(id); subagentTerminalChildren.delete(id);
-            reviewDisclosureByTask.delete(id); explicitCardExpansion.delete(id); historicalTerminals.delete(id);
+            forgetLiveCard(id);
+            historicalTerminals.delete(id);
         }
     }
 
-    const historyControls = createHistoryControls(messagesDiv);
+    const historyControls = createHistoryControls(messagesDiv, pageNote || page.querySelector('.chat-panel-statusbar'), {
+        isVisible: () => isInstanceVisible() && !messagesDiv.closest('[inert]')
+            && !document.body.classList.contains('nav-drawer-open') && (asPanel || (!isProjectOpening?.()
+            && !document.body.classList.contains('project-panel-open'))),
+    });
     const { olderButton: loadOlderBtn } = historyControls;
 
     const historyPager = createChatHistoryPager({
-        fetchPage: (cursor, { signal }) => apiClient.chatHistory({ chatId, cursor, signal }),
-        isAlive: () => !destroyed,
+        fetchPage: fetchHistory,
+        isAlive: () => !destroyed && !leaving,
         applyPage: (messages, descriptor) => {
             pageHistoryIds.set(descriptor.id, new Set(messages.flatMap(historyRowIds)));
-            pageWindows.set(descriptor.id, descriptor.window);
-            applyHistoryMessages(messages, { archived: descriptor.direction !== 'recent' && descriptor.direction !== 'latest' });
+            const oldRecentIds = recentHistoryIds;
+            const admitted = descriptor.direction === 'latest' && (acceptRecentWindow(descriptor, messages) || descriptor.rechained);
+            const archived = descriptor.direction !== 'recent' && descriptor.direction !== 'latest';
+            if (!archived) pagerRecent = descriptor;
+            applyHistoryMessages(messages, { ...descriptor, archived });
+            // The present re-anchors the chain: rows no page or window owns any more
+            // (windows kept while the reader was in older history) go with it.
+            if (admitted) withStableViewport(() => releaseHistoryIds(new Set([...oldRecentIds,
+                ...historyStamps(messagesDiv).map(([id]) => id)])));
+            // An older page drawn can show, or name, the newest arrival without a scroll.
+            if (admitted) readReceipt.settle();
+            else if (archived) readReceipt.page(descriptor);
         },
         releasePage: descriptor => {
             const ids = pageHistoryIds.get(descriptor.id) || [];
-            pageHistoryIds.delete(descriptor.id); pageWindows.delete(descriptor.id);
+            pageHistoryIds.delete(descriptor.id);
             withStableViewport(() => releaseHistoryIds(ids));
         },
+        // Rows stored since the newest read join its window (and the saved preview).
+        applyArrivals: (messages, { window, fromReconnect }) => {
+            preview.append(messages);
+            for (const id of messages.flatMap(historyRowIds)) recentHistoryIds.add(id);
+            applyHistoryMessages(messages, { fromReconnect });
+            readReceipt.arrived(window);
+        },
+        readNewest: syncHistory, newestInFlight: () => historySyncPromise,
+        canArrive: () => historyLoaded && lastHistorySyncSucceeded && !liveCardBound.isArmed(),
         isPageProtected: isHistoryPageProtected,
         onState: snapshot => syncLoadOlderControl(snapshot),
     });
+    // The saved text shown until the first canonical read (chat_preview.js); `self` carries room_retire.js's kept selection.
+    let self = null;
+    const preview = createChatPreview({ feed: messagesDiv, room: [chatId, projectId], label: senderLabel,
+        mutate: withStableViewport, kept: () => self?.keptRanges });
 
     function syncLoadOlderControl(snapshot = historyPager.getState()) {
-        if (destroyed) return;
+        if (destroyed || leaving) return;
         withStableViewport(() => {
-            historyWindow = historyControls.render(snapshot, pageWindows.values());
+            const coverage = historyCoverage(recentCoverage, snapshot.coverage);
+            if (recentHasOrigins && !coverage.complete) coverage.gaps = true;
+            historyWindow = historyControls.render(snapshot, coverage, reading.approximate);
             return true;
         });
     }
+    const handleHistoryLanguage = () => syncLoadOlderControl();
+    window.addEventListener('ouro:language-changed', handleHistoryLanguage);
     async function loadOlderHistory() {
+        if (historyControls.recentFailed()) {
+            const owned = onHistoryRetry?.();
+            return historySyncPromise ? owned : syncHistory();
+        }
         const snapshot = historyPager.getState();
-        if (snapshot.error?.body?.reason_code === 'history_view_changed') return historyPager.latest();
-        return snapshot.error ? historyPager.retry() : loadOlderAtEdge();
+        if (snapshot.error?.body?.reason_code === 'history_view_changed') {
+            reading.cancel();
+            return historyPager.latest();
+        }
+        if (snapshot.error) return historyPager.retry();
+        return loadHistoryAtEdge('older');
     }
-    async function loadOlderAtEdge() {
+    // `Load more history` reads older messages, ↓ the present (owner, 2026-09-14 and 2026-10-05). Empty pages cross the
+    // server read ceiling: reading goes on until rows land or the chat ends. A grown room re-anchors unless its reader
+    // still walks its older chain; `current` guards each request.
+    async function loadHistoryAtEdge(direction, current = () => true) {
+        const { canNewer, canOlder } = historyPager.getState();
+        if (direction === 'older' && current() && historyWindow?.horizonGap && !canNewer && !(canOlder && readingHistory())) {
+            const rebased = await historyPager.latest();
+            if (destroyed || rebased.status !== 'applied') return rebased;
+        }
         let result;
         do {
-            result = await historyPager.older();
+            result = current() ? await historyPager[direction]() : {};
         } while (!destroyed && result.status === 'applied' && result.messageCount === 0
-            && isInstanceVisible() && messagesDiv.scrollTop < 80 && historyPager.getState().canOlder);
+            && historyPager.getState()[direction === 'older' ? 'canOlder' : 'canNewer']);
         return result;
     }
     loadOlderBtn.addEventListener('click', loadOlderHistory);
 
-    function navigateHistoryAtEdge() {
-        if (destroyed || _restoring || !historyLoaded || !isInstanceVisible()) return;
-        let snapshot = historyPager.getState();
-        if (snapshot.loading || snapshot.error || !snapshot.initialized) return;
+    function settleHistoryViewport() {
+        if (destroyed || reading.pending || !historyLoaded || !isInstanceVisible()) return;
         retryHistoricalUpserts();
         historyPager.trim();
         if (pendingLiveEvictions.size) withStableViewport(releaseLiveOverflow);
         if (pendingHistoryEvictions.size) withStableViewport(() => releaseHistoryIds([...pendingHistoryEvictions]));
-        snapshot = historyPager.getState();
-        if (messagesDiv.scrollTop < 80 && snapshot.canOlder) void loadOlderAtEdge();
-        else if (isNearBottom(80) && snapshot.canNewer) void historyPager.newer();
     }
-    messagesDiv.addEventListener('scroll', navigateHistoryAtEdge, { passive: true });
+    function navigateHistoryAtEdge(direction) {
+        if (destroyed || reading.pending || !historyLoaded || !isInstanceVisible()) return;
+        settleHistoryViewport();
+        const snapshot = historyPager.getState();
+        if (snapshot.loading || snapshot.error || !snapshot.initialized) return;
+        if (direction < 0 && messagesDiv.scrollTop < 80 && snapshot.canOlder) void loadHistoryAtEdge('older');
+        else if (direction > 0 && snapshot.canNewer) {
+            // Only an unambiguous page-owned island has a physical edge. A
+            // mixed card has no chronological boundary: use the same button.
+            const ids = pageHistoryIds.get(snapshot.firstPage?.id) || new Set();
+            if (historyIslandAtEdge(messagesDiv, ids, historyNodes)) void loadHistoryAtEdge('newer');
+        }
+    }
+    // Only the owner's own move toward older messages puts a phone keyboard away.
+    const disposeReadingGestures = reading.bindGestures(direction => {
+        if (direction < 0 && document.activeElement === input && document.body.classList.contains('keyboard-open')) input.blur();
+        navigateHistoryAtEdge(direction);
+    });
+    // Compact tables share rich-answer keyboard/overflow affordances; destroy releases them.
+    bindMarkdownTables(messagesDiv);
     function retryHistoricalUpserts() {
+        if (destroyed || leaving) return;
         const ready = [...pendingHistoryUpserts.values()].filter(row =>
             !historyNodes(row.history_id).some(node => historyNodeIsProtected(node, messagesDiv)));
         if (ready.length) applyHistoryMessages(ready, { archived: true });
     }
     document.addEventListener('selectionchange', retryHistoricalUpserts);
 
-    // Mounted, unfinished, not waiting: the blocks that host their own running
-    // indicator. Only a managed root among them drives the header's Working…;
-    // a direct turn's block keeps the census verdict (Thinking…).
+    // Active blocks host their own running indicator.
     const foregroundCards = () => Array.from(liveCardRecords.values()).filter((r) => isForegroundLiveCard(r) && !r.modelWaiting);
-    function hasActiveLiveCard() {
-        return foregroundCards().some((r) => !r.direct);
-    }
 
+    // The server's room under this client's own facts.
     function deriveChatStatus() {
-        let directCount = 0, managedActive = 0, managedQueued = 0, managedPaused = 0;
-        for (const [id, entry] of activeDirectActivities) {
-            if (modelWaits.waiting(id)) continue;
-            if (String(entry?.kind || '') !== 'managed_task') directCount += 1;
-            else if (String(entry?.phase || '') === 'queued') managedQueued += 1;
-            else if (String(entry?.phase || '') === 'budget_paused') managedPaused += 1;
-            else managedActive += 1;
-        }
-        return computeDerivedChatStatus({
-            isConnected: ws.isConnected ? ws.isConnected() : true,
-            hasActiveLiveCard: hasActiveLiveCard(),
-            activeDirectCount: directCount,
-            activeManagedCount: managedActive,
-            queuedManagedCount: managedQueued,
-            pausedManagedCount: managedPaused,
-            waitingModelCount: [...liveCardRecords.values()].filter((r) => isForegroundLiveCard(r) && r.modelWaiting).length,
-            pendingSubmissionsCount: pendingSubmissions.size,
-        });
+        return roomStatusView(workState, { connected: ws.isConnected ? ws.isConnected() : true,
+            serverAnswers: ws.serverAnswersWhileDown?.() === true, catchingUp: catchUp.active,
+            ready: hostStart.ready(),
+            boot: hostStart.status().bootPhase,
+            sending: pendingSubmissions.size > 0, stopping: ownStopPress(workState, liveCardRecords) });
     }
 
+    // A room away draws no status: its paused socket view is no outage; it derives the status again on its return.
     function syncChatStatus() {
+        if (leaving) return false;
         const derived = deriveChatStatus();
-        setStatus(derived.kind, derived.text);
-        return setTypingIndicatorVisible(derived.showDots && foregroundCards().length === 0);
+        setStatus(derived);
+        return setTypingIndicatorVisible(derived.mark === 'moving' && foregroundCards().length === 0);
     }
 
     function setTypingIndicatorVisible(visible) {
@@ -3524,8 +3098,7 @@ export function createChatInstance({
 
     function revokeManagedTaskCancelAuthority(taskId) {
         cancelableTaskIds.delete(taskId);
-        const record = liveCardRecords.get(taskId);
-        if (record) syncCancelRunButton(record);
+        syncCancelRunButton(liveCardRecords.get(taskId));
     }
 
     async function reconcileMissingManagedTask(taskId, onDomWrite = withStableViewport) {
@@ -3535,17 +3108,12 @@ export function createChatInstance({
             || concludedDirectActivities.has(taskId)
             || !missingManagedTaskIds.has(taskId)
         ) return;
-        const record = liveCardRecords.get(taskId);
-        if (subagentChildParents.has(taskId) || record?.isSubagent) {
-            missingManagedTaskIds.delete(taskId);
-            return;
-        }
         managedTaskDetailReads.add(taskId);
         try {
             const detail = await fetchTaskDetailStrict(taskId);
-            if (destroyed || concludedDirectActivities.has(taskId)) return;
+            if (destroyed || leaving || concludedDirectActivities.has(taskId)) return;
             const currentRecord = liveCardRecords.get(taskId);
-            if (!currentRecord || currentRecord.isSubagent || subagentChildParents.has(taskId)) return;
+            if (!currentRecord || currentRecord.finished) return;
             onDomWrite(() => {
                 let changed = Boolean(attachTaskDetailReviews(taskId, detail));
                 const cancelPending = taskCancelPending(detail);
@@ -3556,23 +3124,14 @@ export function createChatInstance({
                 const vouched = !missingManagedTaskIds.has(taskId) || activeDirectActivities.has(taskId);
                 if (!vouched && detail === null) {
                     revokeManagedTaskCancelAuthority(taskId);
-                    const historical = currentRecord.historicalTerminal;
-                    if (historical) {
-                        if (applyHistoricalModelExecution(currentRecord, historical)) {
-                            changed = renderLiveCardMeta(currentRecord) || changed;
-                        }
-                        return finishLiveCard(taskId, historical.phase) || changed;
-                    }
-                    changed = setHistoricalUnavailable(currentRecord, true) || changed;
-                    renderLiveCardMeta(currentRecord);
-                    syncChatStatus();
-                    return changed;
+                    return settleMissingTaskRecord(currentRecord) || changed;
                 }
                 if (cancelPending || (!vouched && !isTerminalTaskDetail(detail))) {
+                    if (currentRecord.isSubagent && detail?.status) missingManagedTaskIds.delete(taskId);
                     return Boolean(reconcileCancelCardFromDetail(currentRecord, taskId, detail) || changed);
                 }
                 if (vouched) return changed;
-                recordTerminalActivity(taskId);
+                recordTerminalActivity(taskId, taskTerminalPhase(detail));
                 return Boolean(appendTaskSummaryToLiveCard({ ...detail, task_id: taskId }) || changed);
             });
         } catch {
@@ -3584,15 +3143,15 @@ export function createChatInstance({
 
     function observeMissingManagedTask(taskId, onDomWrite = withStableViewport) {
         const id = taskKey(taskId);
-        if (!id || concludedDirectActivities.has(id)) return;
-        const record = liveCardRecords.get(id);
-        if (subagentChildParents.has(id) || record?.isSubagent) return;
+        if (!id || concludedDirectActivities.has(id) || subagentChildParents.has(id) || liveCardRecords.get(id)?.isSubagent) return;
         missingManagedTaskIds.add(id);
         void reconcileMissingManagedTask(id, onDomWrite);
     }
 
     function hydrateDirectActivities(turnsList, snapshotBarrierMs = Infinity, complete = false) {
         if (!Array.isArray(turnsList)) return;
+        const connected = ws.isConnected?.() !== false;
+        complete &&= connected;
         const {
             activities: nextMap,
             departedManagedTaskIds,
@@ -3605,14 +3164,21 @@ export function createChatInstance({
         );
         activeDirectActivities.clear();
         for (const [k, v] of nextMap.entries()) {
-            activeDirectActivities.set(k, v);
-            restoreCardActivity(liveCardRecords.get(k));
-            markReviewAnchor(liveCardRecords.get(k));
-            noteDirectTurn(liveCardRecords.get(k), String(v.kind || '') !== 'managed_task');
-            if (v.kind === 'managed_task') missingManagedTaskIds.delete(k);
-            if (v.clientMessageId) {
-                pendingSubmissions.delete(v.clientMessageId);
+            if (v.clientMessageId) pendingSubmissions.delete(v.clientMessageId);
+            const record = liveCardRecords.get(k);
+            if (!connected) v._activityUnconfirmed = true;
+            const facts = censusTaskFacts(v);
+            if (facts.ended) {
+                recordTerminalActivity(k, facts.outcome);
+                if (record) finishLiveCardMutation(k, facts.outcome);
+                continue;
             }
+            activeDirectActivities.set(k, v);
+            restoreCardActivity(liveCardRecords.get(k), v.project_admission_hold);
+            syncParkedPhase(record, v.phase, v);
+            syncCancelRunButton(record);
+            markReviewAnchor(record);
+            if (v.kind === 'managed_task') missingManagedTaskIds.delete(k);
         }
         for (const taskId of globallyActiveActivityIds) missingManagedTaskIds.delete(taskId);
         for (const row of settledDirectRows) {
@@ -3629,6 +3195,7 @@ export function createChatInstance({
             })),
             globallyActiveActivityIds,
         )) {
+            syncCancelRunButton(liveCardRecords.get(taskId));
             const observedAt = liveCardRecords.get(taskId)?.lastLiveObservedAt || 0;
             if (observedAt < snapshotBarrierMs) {
                 // Census absence revokes a live card's Stop; history cards await detail.
@@ -3639,164 +3206,133 @@ export function createChatInstance({
         if (complete) for (const taskId of missingManagedTaskIds) {
             if (!activeDirectActivities.has(taskId)) void reconcileMissingManagedTask(taskId);
         }
-        syncChatStatus();
-    }
-
-    const isKnownProjectFrame = (msg) => {
-        const cid = Number(msg?.chat_id ?? 1);
-        return state.projectChatIds instanceof Set && state.projectChatIds.has(cid);
-    };
-
-    function incrementUnreadIfNeeded(msg) {
-        if (!isMain) return;  // the global unread badge tracks the main chat
-        // Project visible_revision is the sole unread authority for a Project.
-        // Project-owned frames never create a second Main unread.
-        if (isKnownProjectFrame(msg)) return;
-        if (state.activePage === 'chat') return;
-        state.unreadCount++;
-        updateUnreadBadge();
     }
 
     onWs('typing', (msg) => {
         if (!isMyThread(msg)) return;  // each column shows typing only for its own thread
-        // A typing frame is a submission receipt, never liveness: it pulls the
-        // authoritative census at once and retires the linked `Sending...`
-        // only once that census has answered, so the header steps from
-        // Sending... straight to Thinking... when the census lists the turn
-        // (hydration retires the cmid itself) and to Online otherwise, never
-        // through a blank in between. The header derives from that census,
-        // pending sends and live cards only.
+        // A typing frame is a submission receipt, never liveness: it re-reads the state at once and retires the linked
+        // `Sending...` only when that read answers: the room steps from Sending... to the server's word.
         const cmid = String(msg.client_message_id || '');
         if (!cmid) return;
-        void refreshHeaderControlState(true).then(() => {
+        void refreshHeaderControlState().then(() => {
             if (pendingSubmissions.delete(cmid)) syncChatStatus();
         });
     });
 
-    const isMyThread = (msg) => {
-        return chatThreadAccepts(msg, isMain, chatId, state.projectChatIds);
-    };
-
-    const isMyLogThread = (msg) => {
-        return chatLogThreadAccepts(msg, isMain, chatId, state.projectChatIds);
-    };
+    const isMyThread = msg => chatThreadAccepts(msg, isMain, chatId, state.projectChatIds);
+    const isMyLogThread = msg => chatLogThreadAccepts(msg, isMain, chatId, state.projectChatIds);
 
     onWs('chat', (msg) => {
         if (!isMyThread(msg)) return;
+        if (msg.system_type === 'initialization_notice') {
+            unconfirmed.unsettle(msg.client_message_id ? [msg.client_message_id] : undefined);
+            if (leaving) return;
+        }
         if (msg.system_type === 'project_question_pointer') { chatDecision.appendQuestionPointer(msg); return; }
         if (msg.role === 'user') {
             const clientMessageId = msg.client_message_id || '';
             const senderSessionId = msg.sender_session_id || '';
-            // 2A: the user echo is receipt of the user ROW, not turn start —
-            // it settles the bubble but must NOT retire the `Sending...`
-            // submission; that takes a linked typing frame / snapshot turn /
-            // routing receipt or the turn's conclusion.
-            if (senderSessionId === chatSessionId && clientMessageId) {
-                markPendingDelivered(clientMessageId);
-                syncChatStatus();
+            // 2A: the user echo is receipt of the user ROW, not turn start: it settles the bubble but must NOT retire the
+            // `Sending...` submission (a linked typing frame, snapshot turn, routing receipt or the turn's conclusion does).
+            const own = senderSessionId === chatSessionId && clientMessageId;
+            if (own) markPendingDelivered(clientMessageId);
+            // The custody listener can settle this room's send while away; another client's echo waits for history.
+            if (leaving) {
+                if (own) markIngressSaved(messagesDiv, msg);
+                unconfirmed.settle(msg);
                 return;
             }
-            const added = withRemoteActivity(() => addMessage(
+            if (!own) withRemoteActivity(() => addMessage(
                 msg.content, 'user', false, msg.ts || null, false, {
                 source: msg.source || '',
                 senderLabel: msg.sender_label || '',
                 senderSessionId,
                 clientMessageId,
                 taskId: msg.task_id || '',
+                attachments: msg.attachments,
+                textPlaceholder: msg.text_placeholder === true, reply: msg,
                 },
             ));
-            if (added) incrementUnreadIfNeeded(msg);
+            withStableViewport(() => markIngressSaved(messagesDiv, msg) | replies.adopt(msg) | markSwarmLabel(messagesDiv, msg));
+            unconfirmed.settle(msg);
             syncChatStatus();
             return;
         }
 
+        if (leaving) return void showTaskIncidentToast(msg);  // away, a task's incident toasts; nothing is drawn
         if (msg.role === 'assistant' || msg.role === 'system') {
             return withRemoteActivity(() => {
             const explicitTaskId = msg.task_id || '';
-            const reference = handleCardReference(msg);
-            if (reference !== undefined) {
+            // Every path syncs status last. Main's number is its room revision, as a Project's (DESIGN "Unread").
+            const settled = (result) => {
                 syncChatStatus();
-                return reference;
-            }
+                return result;
+            };
+            if (isModelWaitReference(msg)) reread();
+            const reference = admitCardMetadata(msg);
+            if (reference !== undefined) return settled(reference);
             const review = attachReviewFromRow(msg, msg.ts || '', true);
-            if (review !== undefined) {
-                syncChatStatus();
-                return review;
-            }
+            if (review !== undefined) return settled(review);
             const cardRow = attachCardRow(msg, msg.ts || '');
-            if (cardRow !== undefined) {
-                if (cardRow) incrementUnreadIfNeeded(msg);
-                syncChatStatus();
-                return cardRow;
-            }
+            if (cardRow !== undefined) return settled(cardRow);
             if (PROJECT_ROW_TYPES.has(msg.system_type)) {
-                const added = addMessage(msg.content, 'system', msg.markdown, msg.ts || null, false, {
-                    systemType: msg.system_type,
-                    taskId: explicitTaskId,
-                    projectId: msg.project_id || '',
-                    projectName: msg.project_name || '',
-                });
-                if (added) incrementUnreadIfNeeded(msg);
-                syncChatStatus();
-                return Boolean(added);
+                return settled(Boolean(portals.row(msg, msg.content, { taskId: explicitTaskId })));
             }
             learnSubagentLineage(msg);
             if (msg.is_progress) {
                 showTaskIncidentToast(msg);
+                if (SUBAGENT_LIFECYCLE_EVENTS.has(String(msg.subagent_event || '').toLowerCase())) reread();  // members
                 const changed = updateLiveCardFromProgressMessage(msg, { grantCancelAuthority: true });
-                syncChatStatus();
-                return changed;
+                return settled(changed);
             }
 
             // An early final (post-task still running) is NOT the turn's
             // conclusion; task_done or the queue snapshot concludes it.
             const finalizing = Boolean(explicitTaskId) && msg.task_phase === 'finalizing';
             const typedTerminal = positiveTaskTerminalFact(msg);
+            if (typedTerminal) reread();
             if (!finalizing && (!explicitTaskId || typedTerminal)) {
                 if (explicitTaskId) {
-                    // 4A (active set): a keyed final concludes ITS OWN turn —
-                    // the finished activity + its linked pending — never a
-                    // concurrent turn's state (2A keeps later `Sending...`).
+                    // 4A (active set): a keyed final concludes ITS OWN turn (the finished activity and its linked
+                    // pending), never a concurrent turn's state (2A keeps later `Sending...`).
                     const finished = activeDirectActivities.get(explicitTaskId);
                     activeDirectActivities.delete(explicitTaskId);
-                    if (!REUSABLE_TASK_IDS.has(explicitTaskId)) recordConcludedActivity(explicitTaskId);
+                    if (!REUSABLE_TASK_IDS.has(explicitTaskId)) recordConcludedActivity(explicitTaskId, taskTerminalPhase(msg));
                     if (finished?.clientMessageId) {
                         pendingSubmissions.delete(finished.clientMessageId);
                     }
-                } else if (msg.system_type !== 'terminal_incident') {
-                    // Unkeyed finals clear unscoped state; incidents are informational.
+                } else if (unkeyedFrameEndsTurn(msg)) {  // a legacy model final
                     activeDirectActivities.clear();
                     pendingSubmissions.clear();
-                }
+                } else pendingSubmissions.delete(String(msg.client_message_id || ''));
             }
 
             if (msg.system_type === 'task_summary') {
                 const changed = appendTaskSummaryToLiveCard(msg);
-                if (changed) incrementUnreadIfNeeded(msg);
-                syncChatStatus();
-                return Boolean(changed);
+                return settled(Boolean(changed));
             }
-            if (explicitTaskId && subagentChildParents.has(explicitTaskId)) {
-                const changed = routeSubagentFinalMessageToCard(explicitTaskId, msg);
-                if (changed) incrementUnreadIfNeeded(msg);
-                syncChatStatus();
-                return Boolean(changed);
-            }
+            // A placed host row is never a child's answer; with no card it stays a System row.
+            const placed = explicitTaskId && !msg.card_row && subagentChildParents.has(explicitTaskId) && childRowPlacement(msg);
+            if (placed === 'line') return settled(Boolean(routeSubagentProgressToCard(explicitTaskId, msg, true)));
+            if (placed) return settled(Boolean(routeSubagentFinalMessageToCard(explicitTaskId, msg)));
             let changed = false;
-            if (finalizing) changed = markLiveCardFinalizing(explicitTaskId) || changed;
+            if (finalizing) changed = markLiveCardFinalizing(explicitTaskId, msg) || changed;
             else if (explicitTaskId && typedTerminal) {
                 changed = appendTaskSummaryToLiveCard(msg) || changed;
             }
             const routingCleared = clearTransientRoutingAnnotations(messagesDiv);
             const added = addMessage(msg.content, msg.role, msg.markdown, msg.ts || null, false, {
-                systemType: msg.system_type || '',
+                presenceContact: msg.presence_contact,
+                systemType: msg.system_type || '', narration: msg.narration,
                 source: msg.source || '',
                 initiator: msg.initiator || '',
-                taskId: explicitTaskId,
+                taskId: explicitTaskId, reply: msg, projectId: msg.project_id, projectName: msg.project_name,
+                // The saved row's own name, as history keys it; this frame's client_message_id is the owner's.
+                clientMessageId: msg.row_client_message_id || '',
+                // A placed row whose card is not in this chat keeps its record link.
+                evidenceRef: isPlacedCardRow(msg) ? cardRowEvidenceRef(msg) : null,
             });
-            if (added || changed) incrementUnreadIfNeeded(msg);
-            syncChatStatus();
-            return Boolean(added || changed || routingCleared);
+            return settled(Boolean(added || changed || routingCleared));
             });
         }
     });
@@ -3818,6 +3354,7 @@ export function createChatInstance({
         // the server, so it can never earn a receipt, a turn, or a journal row.
         const cid = String(msg?.clientMessageId || '');
         if (!cid) return;
+        unconfirmed.flushed(cid);  // the kept frame offers Send again from now on
         markPendingDropped(cid);
         localEchoJournal.delete(cid);
         if (pendingSubmissions.delete(cid)) syncChatStatus();
@@ -3825,17 +3362,15 @@ export function createChatInstance({
 
     onWs('log', (msg) => {
         if (!msg?.data) return;
-        // Log frames carry the task's canonical Project chat_id, so the
-        // Project panel alone builds/animates/finalizes that card. Legacy
-        // frames without chat_id default to the main chat.
+        // A log frame carries its task's canonical Project chat_id: only that panel builds/animates/finalizes its
+        // card; a legacy frame without one goes to Main.
         if (!isMyLogThread(msg)) return;
-        withRemoteActivity(() => updateLiveCardFromLogEvent(msg.data));
+        withRemoteActivity(() => updateLiveCardFromLogEvent({ ...msg.data, _live_tool_frame: !msg.data._historical }));
+        if (!msg.data._historical && ['task_done', 'task_model_wait'].includes(msg.data.type)) reread();
     });
 
-    // Admission naming (a promoted root, a headless run) coined a name for a
-    // managed card — show it as the card title up front (turn-into-project then
-    // reuses the same name). Not thread-gated on chat_id: the broadcast carries
-    // only task_id, and applySuggestedName no-ops unless THIS thread holds that card.
+    // Admission names the card and its future Project. The broadcast has only
+    // task_id: applySuggestedName ignores ids this thread does not hold.
     onWs('task_named', (msg) => {
         withRemoteActivity(
             () => applySuggestedName(msg?.task_id || '', msg?.suggested_name || ''),
@@ -3845,6 +3380,7 @@ export function createChatInstance({
     onWs('outbound_sent', (evt) => {
         const cid = evt?.clientMessageId || '';
         if (cid) {
+            unconfirmed.flushed(cid);
             // A socket write is not durable acceptance (2A): settle the
             // bubble only; `Sending...` retires on authoritative evidence.
             markPendingDelivered(cid);
@@ -3852,153 +3388,192 @@ export function createChatInstance({
         }
     });
 
-    const { appendMediaBubble, appendDocumentBubble, appendLinksMessage, appendQuizMessage } =
-        chatMedia.wireDeliveries({
-            onWs,
-            isMyThread,
-            hideTypingIndicatorOnly,
-            syncChatStatus,
-            incrementUnreadIfNeeded,
-            seenMessageKeys,
-            rememberMessageKey,
-            chatMediaMessageKey,
-            documentMessageKey,
-            buildQuizCard: chatDecision.buildQuizCard,
-            applyQuizStateFrame: chatDecision.applyQuizStateFrame,
-            messagesRoot: () => messagesDiv,
-            deliverContentMutation: withRemoteActivity,
-        });
+    const { appendDelivery, appendQuizMessage } = chatMedia.wireDeliveries({
+        onWs,
+        isMyThread,
+        hideTypingIndicatorOnly,
+        syncChatStatus,
+        seenMessageKeys,
+        rememberMessageKey,
+        chatMediaMessageKey,
+        documentMessageKey,
+        buildQuizCard: chatDecision.buildQuizCard,
+        applyQuizStateFrame: chatDecision.applyQuizStateFrame,
+        messagesRoot: () => messagesDiv,
+        deliverContentMutation: withRemoteActivity,
+        onQuestionFrame: reread,
+    });
 
     let wsHasConnectedOnce = false;
 
     onWs('open', (msg) => {
-        refreshHeaderControlState(true);
+        const openedVisit = visit;
+        mainWaiting?.setConnected(true);
+        refreshHeaderControlState();
         syncChatStatus();
-        // Reconnect truth comes from the ws CLIENT
-        // (previouslyConnected rides the open event) — a project instance
-        // created while the socket was already open must still treat the next
-        // open as a reconnect. The per-instance flag stays only as a fallback
-        // for open events without a payload.
+        // The socket's previouslyConnected covers newly mounted Projects too;
+        // per-instance state is only the fallback for legacy open events.
         const isReconnect = typeof msg?.previouslyConnected === 'boolean'
             ? msg.previouslyConnected
             : wsHasConnectedOnce;
-        const reconnectBanner =
-            pendingReconnectBannerText
-            || (isReconnect ? '♻️ Reconnected' : '');
-        const shouldClearReconnectParams = Boolean(pendingReconnectBannerText);
-        pendingReconnectBannerText = '';
+        // A changed-code reload owes one notice. Main exists from startup: if away at first open, it hears only
+        // resume's synthetic reconnect but still owes that notice. A Project mounted later owes none.
+        if (isReconnect && !wsHasConnectedOnce && !isMain) pendingRestartNotice = '';
+        const restartNotice = pendingRestartNotice;
         wsHasConnectedOnce = true;
         updateMessagesPadding();
+        if (isReconnect) catchUp.begin(() => !destroyed && openedVisit === visit);
+        const settled = () => {
+            if (destroyed || openedVisit !== visit) return;  // left meanwhile: a return opens again
+            catchUp.end();
+            if (restartNotice && pendingRestartNotice === restartNotice) {
+                pendingRestartNotice = '';
+                addMessage(restartNotice, 'system', false, null, false, { ephemeral: true, systemType: 'reconnect' });
+            }
+            clearReloadParams();
+        };
         loadUiPreferences()
-            // Reconnect ALWAYS does a real fetch (a lost task_done is healed
-            // only by refetching); the first clean open is a hydration trigger
-            // and rides the sticky single-flight behind Main's idle gate.
-            .then(() => (isReconnect
-                ? syncHistory({ includeUser: !historyLoaded, fromReconnect: isReconnect })
-                : waitForHydrationWindow().then(
-                    () => awaitInitialHydration({ includeUser: !historyLoaded }),
-                )))
-            .then((hasMessages) => {
-                if (!hasMessages) ensureWelcomeMessage();
-                if (reconnectBanner) {
-                    addMessage(reconnectBanner, 'system', false, null, false, { ephemeral: true, systemType: 'reconnect' });
-                    if (shouldClearReconnectParams) clearPendingReconnectBanner();
-                }
-            })
-            .catch(() => {
-                if (reconnectBanner) {
-                    addMessage(reconnectBanner, 'system', false, null, false, { ephemeral: true, systemType: 'reconnect' });
-                    if (shouldClearReconnectParams) clearPendingReconnectBanner();
-                }
-            });
+            // Reconnect refetches lost task_done; first open shares idle-gated hydration.
+            .then(() => (destroyed || openedVisit !== visit ? false : isReconnect ? syncHistory({ fromReconnect: true })
+                : waitForHydrationWindow().then(awaitInitialHydration)))
+            .then(settled, settled);
     });
 
+    // A disconnect: written sends not yet saved say so and the room shows the outage; away, which sends it doubts is
+    // decided now (custody) and both are drawn on its return (`stay`).
     onWs('close', () => {
+        if (leaving) { outageAway = [...outageAway || [], ...unconfirmed.written()]; return; }
+        showOutage();
+    });
+    onWs(SERVER_ANSWERS_EVENT, () => syncChatStatus());
+    function showOutage(doubted) {
+        unconfirmed.unsettle(doubted);
+        mainWaiting?.setConnected(false);
+        withStableViewport(() => {
+            for (const [id, activity] of activeDirectActivities) {
+                activeDirectActivities.set(id, { ...activity, _activityUnconfirmed: true });
+            }
+            let changed = false;
+            for (const [id, record] of liveCardRecords) {
+                record.childDetailRead = undefined;
+                changed = syncParkedPhase(record, 'unknown', activeDirectActivities.get(id)) || changed;
+            }
+            return changed;
+        });
+        hostStart.forget();
         hideTypingIndicatorOnly();
         syncChatStatus();
         syncHeaderControlState({ accounting: { available: false } });
-    });
+    }
 
-    return {
+    const revealQuestion = (taskId, quizId, options) => chatDecision.revealQuestion(
+        taskId, quizId, projectId, chatId, appendQuizMessage, isInstanceVisible,
+        () => { const current = reading.claim(); reading.stick = false; return current; }, reading.scroll, options);
+    const historyReveal = createHistoryReveal({ pager: historyPager, reading, feed: messagesDiv, records: liveCardRecords,
+        present: isInstanceVisible, expand: record =>
+            (explicitCardExpansion.set(record.groupId, true), setLiveCardExpanded(record, true)) });
+    roomWork = createRoomWork({ page, asPanel, ws, statusBadge, messagesDiv, reading, stateSnapshots, revealQuestion,
+        works: () => workState, liveCardRecords, pendingSubmissions, pendingSuggestedNames,
+        cancelRunFromCard, refreshHeaderControlState, captureVisibleTimelineAnchor, restoreVisibleTimelineAnchor,
+        historyPager, showLatest, hostReady: hostStart.ready });
+    // Main's bar: Restart, Panic, the budget and the consciousness chip; a Project's bar is app.js's.
+    header = asPanel ? null : createRoomHeader({ bar: pageHeader, ws, shade: roomWork, openDashboardTab,
+        refreshState: refreshHeaderControlState });
+
+    return self = {
         page,
         chatId,
         projectId,
-        // Called by app.js when this instance's panel is (re)shown so a project
-        // thread restores its scroll position instead of jumping to the top (P7).
-        restoreScrollPosition,
-        refreshHistory,
-        revealQuestion: (taskId, quizId) => chatDecision.revealQuestion(
-            taskId, quizId, projectId, chatId, appendQuizMessage, () => !page.hidden,
-            () => { restoreGeneration++; _restoring = false; }),
-        cancelHistoryPaint,
-        // app.js fans its already-existing /api/state refresh to every open
-        // thread; panels gain convergence without acquiring their own poll.
+        // The room's composer (composer.js): its draft, its "+" menu and its voice and chips slots.
+        composer,
+        showLatest,
+        resume,
+        ws,
+        // Shell exposure after its motion: present retained notice state, without fetching or scrolling.
+        showHistoryNotice: () => { if (!destroyed) historyControls.showNotice(); },
+        refreshHistory: readReceipt.refresh,
+        revealQuestion,
+        revealSource: replies.reveal,
+        drawsSource: replies.draws,
+        cancelHistoryPaint: readReceipt.cancel,
+        // app.js offers each room its /api/state snapshots (it polls); a room away takes none, catching up on return.
         hydrateStateSnapshot,
         // True once a history snapshot has actually been fetched and painted;
         // app.js uses it to decide whether a reopen needs a forced repaint.
         hasPaintedHistory: () => historyLoaded && lastHistorySyncSucceeded,
-        // Unsendable client-side state (staged File objects / an in-flight
-        // upload). app.js must hide, not destroy, an instance holding it.
-        hasPendingWork: () => pendingAttachments.length > 0 || attachmentsUploading,
-        // Viewport intent stash source for the single-live-panel policy.
-        getScrollState: () => {
-            const captured = captureVisibleTimelineAnchor();
-            const node = captured?.node?.closest?.('[data-history-id]')
-                || captured?.node?.querySelector?.('[data-history-id]') || captured?.topNode;
-            const id = node?.dataset?.historyId || '';
-            const pageId = [...pageHistoryIds].find(([, ids]) => ids.has(id))?.[0];
-            return { scrollTop: _savedScrollTop, stick: _savedStick,
-                history: historyPager.exportResume(pageId),
-                historyAnchor: id ? { id, offset: node.getBoundingClientRect().top
-                    - messagesDiv.getBoundingClientRect().top } : null };
+        // Unsendable state (staged Files, an upload in flight, an unsaved send and its Send again): room_retire.js keeps
+        // such a room even when its project goes away.
+        hasPendingWork: () => composer.hasPendingWork() || unconfirmed.count > 0,
+        // Another place covers the room: a reader or file dialog its card opened closes, its place is kept; `pause`
+        // (another place replaces it) also pauses what plays. Staged files stay.
+        closeTransient: (pause) => { roomWork?.leave(); keepPlace(); chatMedia.closeTransient(pause); },
+        // A room leaving the screen (room_retire.js), on exit and while away: its place kept, its paint receipt and reads
+        // stopped, neither shown nor read (its reader and playback are `closeTransient`'s); `stay` returns.
+        leave: () => {
+            if (leaving) return;
+            catchUp.cancel();  // its return reads, and says so, anew
+            roomWork?.leave(); keepPlace(); leaving = true; visit += 1;
+            readReceipt.cancel(); historyReadAbort?.abort(); historyPager.suspend(); historyResyncScheduler.cancel();
+            rowSleep.destroy(); chatResizeObserver?.disconnect(); reviewHydrator.suspend();
         },
-        // Full teardown (P3): release every resource this instance acquired —
-        // ws subscriptions, window/document listeners, the ResizeObserver, all
-        // timers — then drop the buffered collections and remove the DOM last.
-        // Idempotent; late rAF/async continuations no-op on `destroyed`.
+        stay: () => {
+            if (!leaving || destroyed) return;
+            leaving = false;
+            rowSleep = createRowSleep({ feed: messagesDiv, onRestyle: () => reading.reflow() });
+            installChatResizeObservers();
+            reviewHydrator.resume(); drawOwedTimelines();
+            if (outageAway) { const doubted = outageAway; outageAway = null; showOutage(doubted); }
+        },
+        // How the room was opened (app.js): pressed open by a pointer, its focus corners wait for a key.
+        quietFocus: (quiet) => messagesDiv.classList.toggle('is-quiet-focus', Boolean(quiet)),
+        // Full teardown (P3): every acquired resource (ws subscriptions, window/document listeners, ResizeObserver,
+        // timers), then buffered collections, the DOM last. Idempotent; late rAF/async continuations no-op on `destroyed`.
         destroy() {
             if (destroyed) return;
             destroyed = true;
-            cancelHistoryPaint();
+            catchUp.cancel();
+            historyReadAbort?.abort();
+            composer.destroy();
+            replies.destroy();
+            rowMenu.destroy();
+            rowSleep.destroy();
+            offRefit();
+            unconfirmed.release();
+            emptyWelcome?.dispose();
+            readReceipt.cancel();
+            sharedRead.dispose();
             for (const dispose of wsDisposers) {
                 try { dispose(); } catch {}
             }
             wsDisposers.length = 0;
+            historyControls.endRecent();
+            historyControls.destroy();
+            window.removeEventListener('ouro:language-changed', handleHistoryLanguage);
             historyPager.destroy();
-            messagesDiv.removeEventListener('scroll', navigateHistoryAtEdge);
+            disposeReadingGestures();
             document.removeEventListener('selectionchange', retryHistoricalUpserts);
             chatMedia.destroy();
-            workPointer?.destroy();
+            roomWork?.destroy();
             chatDecision.destroy();
             modelWaits.destroy();
-            window.removeEventListener('ouro:page-shown', handlePageShown);
-            document.removeEventListener('visibilitychange', handlePageShown);
-            if (documentClickHandler) document.removeEventListener('click', documentClickHandler);
-            if (documentKeydownHandler) document.removeEventListener('keydown', documentKeydownHandler);
+            mainWaiting?.destroy();
+            document.removeEventListener('visibilitychange', handleVisibility);
+            header?.destroy();
+            focusPanel?.removeEventListener('pointerdown', quietFocus);
+            focusPanel?.removeEventListener('keydown', showFocus);
             chatResizeObserver?.disconnect();
             chatResizeObserver = null;
             historyResyncScheduler.cancel();
-            if (_chatFreedTimer) { clearTimeout(_chatFreedTimer); _chatFreedTimer = null; }
-            if (headerControlInterval) { clearInterval(headerControlInterval); headerControlInterval = null; }
+            preview.destroy();
             for (const id of liveCardRecords.keys()) disposeLiveCard(id);
-            explicitCardExpansion.clear();
-            reviewDisclosureByTask.clear();
-            skillReviewDetailStore.clear();
             reviewHydrator.clear();
-            pendingSuggestedNames.clear();
-            subagentChildParents.clear();
-            subagentTerminalChildren.clear();
-            cancelableTaskIds.clear();
-            missingManagedTaskIds.clear();
-            managedTaskDetailReads.clear();
-            pendingUserBubbles.clear();
-            localEchoJournal.clear();
-            seenMessageKeys.clear();
+            // The buffered collections go last; a page replay never clears the subagent lineage, only this does.
+            for (const held of [explicitCardExpansion, reviewDisclosureByTask, pendingSuggestedNames, subagentChildParents,
+                subagentTerminalChildren, cancelableTaskIds, missingManagedTaskIds, managedTaskDetailReads, pendingUserBubbles,
+                localEchoJournal, seenMessageKeys, pageHistoryIds, historicalTerminals, pendingHistoryEvictions,
+                pendingHistoryUpserts, pendingLiveEvictions]) held.clear();
             messageKeyOrder.length = 0;
-            persistedHistory.length = 0;
-            pageHistoryIds.clear(); pageWindows.clear(); historicalTerminals.clear(); pendingHistoryEvictions.clear();
-            pendingHistoryUpserts.clear();
-            pendingLiveEvictions.clear();
+            recentCoverage = null;
             try { destroyChatMarkdown(page); page.remove(); } catch {}
         },
     };

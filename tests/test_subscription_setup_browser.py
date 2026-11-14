@@ -13,11 +13,13 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 from tests.test_onboarding_complete_endpoint import (
-    LIVE_SNAPSHOT, _profile, _profile_account,
+    LIVE_SNAPSHOT, _pool, _profile,
     onboarding as onboarding,  # explicit re-export of the real atomic settings fixture
 )
+from tests.ui_chat_viewport_smoke import wait_drawer_closed
+from tests.ui_console_errors import PageErrors
 
-pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
+pytestmark = [pytest.mark.ui_browser]
 WEB = Path(__file__).resolve().parents[1] / "web"
 
 
@@ -36,12 +38,10 @@ def subscription_ui():
     }]
     posts = []
     reads = []
-    page_errors = []
     backend = {}
     settings = {
         **fixture["preview"]["model_settings"],
         "OUROBOROS_SUBAGENTS": fixture["preview"]["available_subagents"],
-        "OUROBOROS_REVIEWER_SLOTS": json.dumps(fixture["preview"]["reviewer_slots"]),
         "OUROBOROS_RUNTIME_MODE": "advanced",
         "OUROBOROS_CONTEXT_MODE": "max",
         "_meta": {"setup_contract": bootstrap["contract"]},
@@ -51,7 +51,25 @@ def subscription_ui():
         def log_message(self, *_):
             pass
 
+        def do_HEAD(self):
+            if self.path in backend.get("downloads", {}):
+                self.do_GET()
+                return
+            super().do_HEAD()
+
         def do_GET(self):
+            # Browser-managed downloads may bypass Playwright's page routing.
+            # Tests can give the isolated HTTP server exact download bytes too.
+            if self.path in backend.get("downloads", {}):
+                body = backend["downloads"][self.path]
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Disposition", 'attachment; filename="archive.zip"')
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(body)
+                return
             if self.path == "/onboarding":
                 body = (WEB / "onboarding_template.html").read_text(encoding="utf-8").replace(
                     "__ONBOARDING_BOOTSTRAP__", json.dumps(bootstrap))
@@ -60,7 +78,17 @@ def subscription_ui():
                 self.end_headers()
                 self.wfile.write(body.encode())
                 return
-            self.path = self.path.removeprefix("/static")
+            if self.path.startswith("/api/tasks/") and backend.get("task_gateway"):
+                response = backend["task_gateway"].get(self.path)
+                self.send_response(response.status_code)
+                for key in ("content-type", "content-disposition", "content-length"):
+                    if key in response.headers:
+                        self.send_header(key, response.headers[key])
+                self.end_headers()
+                self.wfile.write(response.content)
+                return
+            # The wizard loads the core's builtin tree from /onboarding/static, the SPA from /static.
+            self.path = self.path.removeprefix("/onboarding").removeprefix("/static")
             super().do_GET()
 
     def respond(route):
@@ -90,30 +118,27 @@ def subscription_ui():
                 body = copy.deepcopy(fixture["preview"])
                 if not payload.get('subscriptionsConnected'):
                     body['model_settings'] = {key: payload.get(key, '') for key in body['model_settings']}
-                    body['available_subagents'] = {'enabled': True, 'items': []}
-                    body['reviewer_slots'] = {
-                        'triad': [{'slot_id': 'triad_1', 'route': {'kind': 'api_chat', 'target_id': payload.get('OUROBOROS_MODEL')}}],
-                        'scope': [{'slot_id': 'scope_1', 'route': {'kind': 'api_chat', 'target_id': payload.get('OUROBOROS_MODEL')}}],
-                        'advisory': {'enabled': True, 'route': {'kind': 'api_chat', 'target_id': payload.get('OUROBOROS_MODEL')}},
-                    }
+                    main = payload.get('OUROBOROS_MODEL')
+                    # The endpoint mints the factory reviewer row of an API-only draft.
+                    body['available_subagents'] = {'enabled': True, 'items': [{
+                        'subagent_id': 'review-1', 'recommended_use': 'Independent review.', 'effort': 'high',
+                        'route': {'kind': 'api_model', 'target_id': main},
+                        'review_eligible': True, 'minted_from': 'factory_default'}] if main else []}
                 if payload.get("skipSubscriptionPresets"):
                     body["model_settings"] = {key: payload.get(key, '') for key in body["model_settings"]}
-                    body["available_subagents"] = payload.get("OUROBOROS_SUBAGENTS") or {"enabled": True, "items": []}
-                    slots = json.loads(payload["OUROBOROS_REVIEWER_SLOTS"]) if payload.get("OUROBOROS_REVIEWER_SLOTS") else body["reviewer_slots"]
-                    for value in slots.values():
-                        for row in value if isinstance(value, list) else [value]:
-                            if not isinstance(row, dict):
-                                continue
-                            row.pop("subagent_id", None)
-                            row["route"] = {"kind": "api_chat", "target_id": payload["OUROBOROS_MODEL"]}
-                            pin = payload.get("OUROBOROS_MODEL_ACCOUNTS", {}).get("main")
-                            if pin:
-                                row["route"]["profile_id"] = pin
-                    body["reviewer_slots"] = slots
-                body["reviewer_slots"] = json.dumps(body["reviewer_slots"])
+                    catalog = payload.get("OUROBOROS_SUBAGENTS") or body["available_subagents"]
+                    pin = payload.get("OUROBOROS_MODEL_ACCOUNTS", {}).get("main")
+                    # Like ``review_rows_on_main``: every marked row moves onto Main; the rest stay.
+                    catalog["items"] = [{
+                        **{key: row[key] for key in ("subagent_id", "recommended_use", "effort", "review_eligible",
+                                                     "minted_from", "enabled") if key in row},
+                        "route": {"kind": "api_model", "target_id": payload["OUROBOROS_MODEL"],
+                                  **({"credential_profile_id": pin} if pin else {})},
+                    } if row.get("review_eligible") is True else row for row in catalog["items"]]
+                    body["available_subagents"] = catalog
             elif path == "/api/onboarding/complete":
-                assert isinstance(payload["OUROBOROS_REVIEWER_SLOTS"], str)
-                assert isinstance(json.loads(payload["OUROBOROS_REVIEWER_SLOTS"]), dict)
+                assert "OUROBOROS_REVIEWER_SLOTS" not in payload, "the wizard never authors review lanes"
+                assert isinstance(payload["OUROBOROS_SUBAGENTS"], dict)
                 if backend.get("client"):
                     result = backend["client"].post(path, json=payload)
                     route.fulfill(status=result.status_code, content_type="application/json", body=result.text)
@@ -121,12 +146,29 @@ def subscription_ui():
                 body = {"ok": True, "runtime_mode": "advanced", "restart_required": False}
             elif path == "/api/settings":
                 body = {"ok": True, "saved": True}
+            elif path == "/api/owner/safety-model":
+                # Save writes the checker's changed keys first (models, their flags and per-slot
+                # options, the Agents roster), in the gateway's owner transaction.
+                settings.update(payload.get("settings") or {})
+                body = {"ok": True}
         elif path == "/api/claudexor/status":
             body = fixture["status"]
         elif path == "/api/settings":
-            body = settings
-        elif path == "/api/reviewer-slots":
-            body = fixture["preview"]["reviewer_slots"]
+            query = parse_qs(urlparse(request.url).query)
+            if query.get("response_limit_preview") == ["1"] and backend.get("response_preview"):
+                body = backend["response_preview"](query)
+            elif query.get("response_limit_preview") == ["1"]:
+                from ouroboros.context_view_facts import window_projection
+                from ouroboros.context_window import WindowLimit, WindowRecord
+                window = int(query.get("window", [0])[0])
+                body = {"route": {}, "response_limit": {}, "window_ack": False,
+                        "window": window_projection(WindowRecord("fixture", reserve=65536,
+                            total=WindowLimit(window, "total", "user_setting") if window else None))}
+            else:
+                body = settings
+        elif path == "/api/review-pool":
+            body = backend.get("review_pool", {"pool": [], "excluded": [], "last_executions": {},
+                                               "row_costs": {}, "config_error": "", "migration": None})
         elif path == "/api/model-catalog":
             body = copy.deepcopy(backend.get("catalog_response", fixture["catalog"]))
             if backend.get("catalog_status"):
@@ -156,23 +198,45 @@ def subscription_ui():
             engine = os.environ.get("OUROBOROS_UI_BROWSER_ENGINE", "chromium")
             if engine not in {"chromium", "webkit", "firefox"}:
                 raise ValueError(f"Unsupported browser engine: {engine}")
-            browser = getattr(pw, engine).launch(headless=True)
+            page_errors = PageErrors(None, engine)
+            browser = getattr(pw, engine).launch(
+                headless=True, executable_path=os.environ.get("OUROBOROS_UI_BROWSER_EXECUTABLE") or None)
             try:
-                page = browser.new_page(viewport={"width": 1360, "height": 900},
-                                        has_touch=os.environ.get("OUROBOROS_UI_HAS_TOUCH") == "1")
-                page.route_web_socket('**/ws', lambda ws: ws.send(json.dumps({"type": "heartbeat"})))
-                page.route("**/api/**", respond)
-                page.on("pageerror", lambda error: page_errors.append(str(error)))
-                yield {"page": page, "url": f"http://127.0.0.1:{server.server_port}",
+                def new_page(**options):
+                    # A caller may ask for its own viewport or a touch context.
+                    page = browser.new_page(**{"viewport": {"width": 1360, "height": 900},
+                                               "has_touch": os.environ.get("OUROBOROS_UI_HAS_TOUCH") == "1",
+                                               **options})
+                    page.route_web_socket('**/ws', lambda ws: ws.send(json.dumps({"type": "heartbeat"})))
+                    page.route("**/api/**", respond)
+                    # Every error of every page counts unless the test declares a page it navigates
+                    # (``ui["errors"].watch(page)`` before the reload): then only WebKit's report of that
+                    # page's own cut-off fetch is set aside (tests/ui_console_errors.py).
+                    return page_errors.watch(page, navigates=False)
+
+                yield {"page": new_page(), "new_page": new_page, "url": f"http://127.0.0.1:{server.server_port}",
                        "posts": posts, "reads": reads, "fixture": fixture,
                        "settings": settings, "errors": page_errors, "backend": backend, "bootstrap": bootstrap}
-                assert not page_errors
+                assert not page_errors.unexpected(), page_errors.report()
             finally:
                 browser.close()
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def settings_saves(ui):
+    """What each Settings Save wrote: its generic body together with the checker's keys the same
+    Save sent first through the owner transaction (`/api/owner/safety-model`)."""
+    saves, checker = [], {}
+    for path, body in ui["posts"]:
+        if path == "/api/owner/safety-model":
+            checker = {**checker, **(body.get("settings") or {})}
+        elif path == "/api/settings":
+            saves.append({**body, **checker})
+            checker = {}
+    return saves
 
 
 def capture(page, name):
@@ -183,13 +247,51 @@ def capture(page, name):
         page.screenshot(path=str(target / f"{name}.png"), animations="disabled")
 
 
+def test_cursor_login_and_catalog_are_not_execution_readiness(subscription_ui):
+    """Real Accounts and onboarding consumers, no generation or live credentials."""
+    ui = subscription_ui
+    ui["fixture"]["status"]["profiles"]["profiles"] = [{
+        "profile": {"profile_id": "cursor-default", "harness_id": "cursor", "enabled": True},
+        "status": {"verification": "passed", "verification_source": "vendor", "availability": "available"},
+        "identity": {"label": "Cursor account"},
+    }]
+    ui["fixture"]["status"]["harnesses"] = [{
+        "id": "cursor", "display_name": "Cursor", "enabled": True, "status": "ok",
+        "models": [{"id": "cursor-test"}],
+    }]
+    ui["settings"]["OUROBOROS_SUBAGENTS"] = {"enabled": True, "items": []}
+    assert all(source["id"] != "cursor" for source in ui["fixture"]["catalog"]["model_sources"])
+    page = ui["page"]
+    from tests.settings_browser_helpers import open_settings
+    page.goto(ui["url"] + "/#settings")
+    # Settings › Accounts and keys › Cursor: the provider's own page holds its accounts.
+    cursor = open_settings(page, "accounts/cursor").locator('[data-family="cursor"]')
+    cursor.get_by_text("Signed in", exact=True).wait_for()
+    # A vendor-verified sign-in draws no warning beside the account (an ok badge has no words,
+    # harness_accounts.js rowHtml), and nothing on the page says the account is connected.
+    assert "Signed in — not verified live" not in cursor.text_content()
+    assert "Connected" not in cursor.text_content()
+    cursor.scroll_into_view_if_needed()
+    capture(page, "cursor-auth-only-settings")
+    ui["errors"].watch(page)  # leaving Settings may cut off the page's own reads (tests/ui_console_errors.py)
+    page.goto(ui["url"] + "/onboarding")
+    page.wait_for_function("() => document.querySelector('#agents-outcome')?.textContent.includes('Signed in to Cursor')")
+    outcome = page.locator("#agents-outcome").inner_text()
+    assert "Sign-in does not verify main-chat support or agent execution" in outcome
+    # What Main still needs is said once, beside the disabled Continue.
+    page.wait_for_function("() => document.querySelector('.wizard-error').textContent.includes('Ouroboros itself still needs a model')")
+    assert "still needs" not in outcome
+    capture(page, "cursor-auth-only-onboarding")
+    assert not ui["posts"] or all(path == "/api/onboarding/subagents/preview" for path, _ in ui["posts"])
+
+
 def test_codex_quick_setup_computes_skipped_steps_and_finishes_once(subscription_ui, onboarding):
     ui = subscription_ui
     ui['backend']['client'] = onboarding.client
     onboarding.calls['snapshot_payload'] = {
         **LIVE_SNAPSHOT, 'harnesses': [LIVE_SNAPSHOT['harnesses'][1]],
-        'profiles': {'harnessAccounts': [_profile_account('codex', 'personal')],
-                     'profiles': [_profile('codex', 'personal')]},
+        'profiles': {'profiles': [_profile('codex', 'personal')], 'harnessAccounts': [],
+                     'accountPools': [_pool('codex', {'kind': 'profile', 'profileId': 'personal'})]},
         'model_catalog': ui['fixture']['catalog']['items'],
     }
     ui['fixture']['status']['profiles']['profiles'] = ui['fixture']['status']['profiles']['profiles'][:1]
@@ -201,7 +303,8 @@ def test_codex_quick_setup_computes_skipped_steps_and_finishes_once(subscription
     page.click('#quick-start-btn')
     page.wait_for_selector('.summary-card')
     assert "gpt-test" in page.locator('.summary-card').inner_text()
-    assert "Deep self-review" in page.locator('.summary-card').inner_text()
+    reviewers = page.locator('.summary-kv').filter(has=page.get_by_text('Reviewers', exact=True))
+    assert "codex=gpt-test" in reviewers.inner_text()
     capture(page, "summary-quick")
     page.click('#next-btn')
     page.wait_for_url(ui["url"] + "/")
@@ -209,11 +312,17 @@ def test_codex_quick_setup_computes_skipped_steps_and_finishes_once(subscription
     assert len(writes) == 1
     assert writes[0]["OPENROUTER_API_KEY"] == ""
     assert writes[0]["OUROBOROS_MODEL"] == 'claudexor::codex=gpt-test'
-    assert json.loads(writes[0]["OUROBOROS_REVIEWER_SLOTS"])["deep_review"]["subagent_id"] == "codex"
+    # The reviewers are the catalog rows marked Reviewer; no lane is sent or kept.
+    assert [row.get("review_eligible") for row in writes[0]["OUROBOROS_SUBAGENTS"]["items"]] == [True]
     assert not any(path == '/api/settings' for path, _ in ui["posts"])
     saved = onboarding.saved()
     assert saved['OUROBOROS_MODEL'] == writes[0]['OUROBOROS_MODEL']
-    assert saved['OUROBOROS_REVIEWER_SLOTS'] == writes[0]['OUROBOROS_REVIEWER_SLOTS']
+    catalog = saved['OUROBOROS_SUBAGENTS']
+    catalog = json.loads(catalog) if isinstance(catalog, str) else catalog
+    posted = writes[0]["OUROBOROS_SUBAGENTS"]["items"]
+    # The visible rows are saved as shown (the subscription preset may only append its own).
+    assert [(row['subagent_id'], row.get('review_eligible')) for row in catalog['items'][:len(posted)]] == [('codex', True)]
+    assert 'OUROBOROS_REVIEWER_SLOTS' not in saved
     assert not saved['OPENAI_API_KEY'] and not saved['OPENROUTER_API_KEY']
     assert onboarding.calls['supervisor'] == 1
 
@@ -231,9 +340,34 @@ def test_quick_start_requires_a_model_source_for_the_connected_harness(subscript
     assert page.locator("#quick-start-btn").is_visible() is expected
 
 
-def test_model_roles_pin_context_fallback_and_manual_draft_survive_preview(subscription_ui):
+def test_model_roles_pin_context_fallback_and_manual_draft_survive_preview(subscription_ui, tmp_path, monkeypatch):
+    from ouroboros import capability_evidence as ce
+    from ouroboros.llm import LLMClient
+    from ouroboros.provider_models import provider_for_model
+    from ouroboros.response_limits import response_limit_preview
+
     ui = subscription_ui
     page = ui["page"]
+    def catalog(source, profile=None, **_kw):
+        profile = profile or "personal"
+        row = ui["fixture"]["catalog"]["items"][0]
+        return {"source": source, "credentialProfileId": profile, "accountFingerprint": f"identity-{profile}",
+                "observedAt": ce.utc_now_iso(), "provenance": "fixture",
+                "models": [{"id": row["id"], "maxContextWindow": 500000 if profile == "work" else row["max_context_window"],
+                            "maxOutputTokens": 8192 if profile == "work" else 4096}]}
+    monkeypatch.setattr(LLMClient, "claudexor_model_catalog", staticmethod(catalog))
+    monkeypatch.setattr(ce, "canonical_evidence_root", lambda: tmp_path)
+    # Discovery stores windows; each passive preview binds them through a fresh local catalog read.
+    for profile in ("personal", "work"):
+        ce.probe(tmp_path, provider="claudexor", model="claudexor::codex=gpt-test", base_url="",
+                 options={"source_id": "codex", "credential_profile_id": profile})
+    before = ce._store_path(tmp_path).read_bytes()
+    def preview(query):
+        model = query["model"][0]
+        return response_limit_preview(tmp_path, {"model": model, "provider": provider_for_model(model), "base_url": "",
+            "use_local": query["local"] == ["true"]}, account=query.get("account", [""])[0], settings=ui["settings"],
+            role=query["role"][0], window=int(query["window"][0]))
+    ui["backend"]["response_preview"] = preview
     page.goto(ui["url"] + "/onboarding")
     page.wait_for_selector('#quick-start-btn:not([hidden])')
     page.click('#next-btn')
@@ -241,23 +375,29 @@ def test_model_roles_pin_context_fallback_and_manual_draft_survive_preview(subsc
     main = page.locator('[data-model-role="main"]')
     light = page.locator('[data-model-role="light"]')
     main.locator('[data-model-role-account]').select_option('personal')
-    held_catalog = []
-    page.route('**/api/model-catalog?*credential_profile_id=work', lambda route: held_catalog.append(route))
+    held_preview = []
+    hold_preview = True
+    preview_pattern = '**/api/settings?*account=work&role=light&*'
+    def release_preview(route):
+        body = preview(parse_qs(urlparse(route.request.url).query))
+        route.fulfill(content_type='application/json', body=json.dumps(body))
+    page.route(preview_pattern, lambda route: held_preview.append(route) if hold_preview else release_preview(route))
     light.locator('[data-model-role-account]').select_option('work')
     main.locator('summary').click()
     light.locator('summary').click()
-    assert 'not known' in light.locator('[data-model-context-note]').inner_text()
+    assert light.locator('[data-model-context-note]').inner_text() == 'Context limit not known for this route.'
     page.wait_for_function("() => document.querySelector('[data-model-role=light] [data-model-role-account]').value === 'work'")
-    assert held_catalog
-    work_catalog = copy.deepcopy(ui['fixture']['catalog'])
-    work_catalog['items'][0].update(credential_profile_id='work', max_context_window=500000)
-    for route in held_catalog:
-        route.fulfill(content_type='application/json', body=json.dumps(work_catalog))
-    page.unroute('**/api/model-catalog?*credential_profile_id=work')
-    page.wait_for_function("() => document.querySelector('[data-model-role=light] [data-model-context-note]').textContent.includes('500,000')")
-    assert '872,000' in main.locator('[data-model-context-note]').inner_text()
+    assert held_preview
+    hold_preview = False
+    for route in held_preview:
+        release_preview(route)
+    page.unroute(preview_pattern)
+    page.wait_for_function("() => document.querySelector('[data-model-role=light] [data-model-context-note]').textContent.includes('Window 500k')")
+    page.wait_for_function("() => document.querySelector('[data-model-role=main] [data-model-context-note]').textContent.includes('Window 872k')")
+    assert '872k' not in light.locator('[data-model-context-note]').inner_text()
+    assert '500k' not in main.locator('[data-model-context-note]').inner_text()
     main.locator('[data-model-role-context]').fill('1000000')
-    assert 'set by you' in main.locator('[data-model-context-note]').inner_text()
+    page.wait_for_function("() => document.querySelector('[data-model-role=main] [data-model-context-note]').textContent.includes('set in Settings')")
     page.locator('[data-model-role="vision"] [data-model-role-account]').select_option('work')
     page.click('[data-model-add]')
     fallback = page.locator('[data-model-role-group="fallback"]')
@@ -270,15 +410,20 @@ def test_model_roles_pin_context_fallback_and_manual_draft_survive_preview(subsc
     main.locator('[data-model-role-model]').fill('owner-model')
     page.evaluate('window.scrollTo(0, 0)')
     capture(page, "models-desktop")
+    # A reviewer is a catalog row marked Reviewer, edited where the row is.
+    page.locator('[data-collapse="subagents"] > summary').click()
+    reviewer = page.locator('[data-subagent-row]').first
+    assert reviewer.locator('[data-subagent-field="review_eligible"]').is_checked()
+    assert page.locator('[data-review-pool-count]').inner_text() == 'Reviewers: 1'
+    default_effort = reviewer.locator('[data-subagent-field="effort"] option[value=""]')
+    assert default_effort.inner_text() == 'Auto (reviews at the top of the chat range)'
+    reviewer.locator('[data-subagent-field="effort"]').select_option('high')
+    assert reviewer.locator('[data-subagent-field="effort"]').input_value() == 'high'
+    reviewer.scroll_into_view_if_needed()
+    capture(page, "reviewer-row-editable")
     page.click('#next-btn')
-    page.wait_for_selector('#reviewer-slots-section', state='attached')
-    page.locator('details').filter(has=page.locator('#reviewer-slots-section')).locator(':scope > summary').click()
-    assert page.locator('#reviewer-deep-review-row select').count() > 0
+    assert page.locator('[data-reviewers-note]').inner_text().startswith('Reviewers: 1 — the rows marked Reviewer')
     capture(page, "review-editable")
-    deep_review = page.locator('#reviewer-deep-review-row')
-    deep_review.locator('[data-deep-review-effort]').select_option('high')
-    deep_review.scroll_into_view_if_needed()
-    capture(page, "deep-review-editable")
     page.click('#next-btn')
     page.wait_for_selector('[data-collapse="api-budget"]')
     assert not page.locator('[data-collapse="api-budget"]').evaluate('(el) => el.open')
@@ -291,8 +436,8 @@ def test_model_roles_pin_context_fallback_and_manual_draft_survive_preview(subsc
     vision = summary.locator('.summary-kv').filter(has=page.get_by_text('Vision', exact=True))
     assert 'Uses Main' in vision.inner_text()
     assert 'Account: work' in vision.inner_text()
-    deep_summary = summary.locator('.summary-kv').filter(has=page.get_by_text('Deep self-review', exact=True))
-    assert 'Effort: high' in deep_summary.inner_text()
+    reviewers = summary.locator('.summary-kv').filter(has=page.get_by_text('Reviewers', exact=True))
+    assert 'codex=gpt-test · Effort: high' in reviewers.inner_text()
     capture(page, "summary-manual")
     page.click('#next-btn')
     page.wait_for_url(ui["url"] + "/")
@@ -305,28 +450,33 @@ def test_model_roles_pin_context_fallback_and_manual_draft_survive_preview(subsc
     assert body['OUROBOROS_MODEL_ACCOUNTS']['fallback'] == ['', 'work']
     assert body['OUROBOROS_MODEL_CONTEXT_WINDOWS']['main'] == 1000000
     assert body['OUROBOROS_MODEL_FALLBACKS'] == 'openai::second, claudexor::codex=first'
-    assert json.loads(body['OUROBOROS_REVIEWER_SLOTS'])['deep_review']['effort'] == 'high'
+    (row,) = body['OUROBOROS_SUBAGENTS']['items']
+    assert (row['subagent_id'], row['review_eligible'], row['effort']) == ('codex', True, 'high')
+    assert ce._store_path(tmp_path).read_bytes() == before
 
 
 def test_settings_accounts_and_model_roles_use_the_same_compact_components(subscription_ui):
+    from tests.settings_browser_helpers import open_settings
     ui = subscription_ui
     page = ui['page']
     page.goto(ui['url'] + '/#settings')
-    page.wait_for_selector('#settings-model-roles .model-role-row', state='attached')
-    assert page.locator('[data-settings-tab="providers"]').inner_text() == 'Accounts'
-    assert page.locator('[data-settings-panel="providers"] #harness-accounts-section').count() == 1
-    assert page.locator('[data-settings-panel="agents"] #harness-accounts-section').count() == 0
-    page.click('[data-settings-tab="models"]')
-    page.wait_for_function("() => document.querySelector('[data-settings-tab=models]').getAttribute('aria-selected') === 'true'")
-    main = page.locator('[data-model-role="main"]')
+    # Subscription accounts live on Accounts and keys, never on Agents.
+    accounts = open_settings(page, 'accounts')
+    accounts.locator('[data-open-path^="accounts/"]').first.wait_for(state='visible')
+    assert open_settings(page, 'agents').locator('#harness-accounts-groups, [data-open-path^="accounts/"]').count() == 0
+    role = open_settings(page, 'models/role/main')
+    main = role.locator('[data-model-role="main"]')
+    main.locator('[data-model-role-model]').wait_for(state='visible')
     main.locator('[data-model-role-account]').select_option('work')
-    inputs = main.locator('.model-role-controls > input, .model-role-controls > select')
-    tops = inputs.evaluate_all('(els) => els.filter(el => !el.hidden).map(el => el.getBoundingClientRect().top)')
-    assert max(tops) - min(tops) <= 2
-    assert main.locator('input').first.evaluate('(el) => getComputedStyle(el).fontSize') == '14px'
+    controls = main.locator('.model-role-controls input, .model-role-controls select')
+    shapes = controls.evaluate_all("""(els) => els.filter((el) => !el.hidden && el.getClientRects().length).map((el) => ({
+        font: getComputedStyle(el).fontSize, height: Math.round(el.getBoundingClientRect().height) }))""")
+    assert len(shapes) >= 3, shapes  # source, model and account at least
+    assert {shape['font'] for shape in shapes} == {'14px'}, shapes
+    assert max(s['height'] for s in shapes) - min(s['height'] for s in shapes) <= 2, shapes
     capture(page, 'settings-models-desktop')
     page.set_viewport_size({'width': 390, 'height': 844})
-    page.wait_for_function("() => document.querySelector('#primary-sidebar').getBoundingClientRect().right <= 1")
+    wait_drawer_closed(page)
     assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
     capture(page, 'settings-models-narrow')
 
@@ -339,12 +489,14 @@ def test_cursor_only_does_not_claim_model_access_and_api_only_finishes(subscript
     }]
     page = ui['page']
     page.goto(ui['url'] + '/onboarding')
-    page.wait_for_function("() => document.querySelector('[data-agent-family=cursor]').textContent.includes('Connected')")
+    page.wait_for_function("() => document.querySelector('[data-agent-family=cursor]').textContent.includes('Signed in')")
     assert page.locator('#quick-start-btn').is_hidden()
     assert page.locator('#next-btn').is_disabled()
-    assert 'Main still needs Codex' in page.locator('#agents-outcome').inner_text()
+    page.wait_for_function("() => document.querySelector('.wizard-error').textContent.startsWith('Cursor can run agents; Ouroboros itself still needs a model.')")
+    assert 'still needs' not in page.locator('#agents-outcome').inner_text()
     # Removing the optional agent gives the API-only path the same five steps.
     ui['fixture']['status']['profiles']['profiles'] = []
+    ui['errors'].watch(page)  # the reload may cut off the page's own reads (tests/ui_console_errors.py)
     page.reload()
     page.locator('[data-collapse="api-access"] > summary').click()
     page.locator('#openai-key').fill('fixture-api-credential')
@@ -363,6 +515,58 @@ def test_cursor_only_does_not_claim_model_access_and_api_only_finishes(subscript
     assert not body['subscriptionsConnected']
 
 
+@pytest.mark.parametrize('sources_read', [True, False])
+def test_an_agent_only_subscription_reads_what_it_runs_and_retry_stays_wherever_it_can_help(subscription_ui, sources_read):
+    """Only agent subscriptions connected. Once the engine has named its model sources and none of them is connected,
+    the reason beside Continue says what the subscriptions can run and what Ouroboros itself still needs; a healthy
+    read leaves discovery nothing to retry, so there is no Retry and no "Optional" on the way forward. Retry stays
+    wherever it can help: while the source list is unread, after a later read fails, and once a key makes the
+    button the catalog's manual refresh again."""
+    ui, page = subscription_ui, subscription_ui['page']
+    ui['fixture']['status']['profiles']['profiles'] = [{
+        'profile': {'profile_id': f'{harness}-only', 'harness_id': harness, 'enabled': True},
+        'status': {'verification': 'passed'},
+    } for harness in ('claude', 'cursor')]
+    if not sources_read:
+        ui['backend'].update(catalog_status=500, catalog_response={'error': 'Raw model service unavailable.'})
+    page.goto(ui['url'] + '/onboarding')
+    page.wait_for_function("() => document.querySelector('[data-agent-family=cursor]').textContent.includes('Signed in')")
+    reason = page.locator('.wizard-error')
+    retry = page.locator('#onboarding-access-retry')
+    optional = page.locator('[data-collapse="api-access"] > summary .selection-badge')
+    if not sources_read:
+        page.wait_for_function("() => document.querySelector('#onboarding-access-note').textContent.includes('Raw model service unavailable')")
+        assert reason.inner_text().startswith('Could not confirm that a connected account can run')
+        assert 'Retry model discovery' in reason.inner_text() and retry.is_visible()
+        assert optional.is_visible() and optional.inner_text() == 'Optional'
+        assert page.locator('#next-btn').is_disabled()
+        return
+    page.wait_for_function("() => document.querySelector('.wizard-error').textContent.includes('still needs a model')")
+    text = reason.inner_text()
+    assert text == ('Claude Code and Cursor can run agents; Ouroboros itself still needs a model. '
+                    'Connect Codex, add an API key, or choose a local model.')
+    assert retry.is_hidden() and optional.is_hidden()
+    assert page.locator('#next-btn').is_disabled() and page.locator('#quick-start-btn').is_hidden()
+    capture(page, 'agent-only-sources-read')
+    # A later read that fails is named, and named failures keep their Retry.
+    ui['backend'].update(catalog_status=500, catalog_response={'error': 'Raw model service unavailable.'})
+    ui['fixture']['status']['profiles']['profiles'].pop()  # Cursor disconnects: the connected set changes, the catalog is read again
+    page.evaluate("async () => (await import('/onboarding/static/modules/claudexor_status_store.js')).claudexorStatus.refresh()")
+    page.wait_for_function("() => document.querySelector('#onboarding-access-note').textContent.includes('Raw model service unavailable')")
+    assert retry.is_visible() and reason.inner_text().startswith('Claude Code can run agents;')
+    ui['backend'].pop('catalog_status'), ui['backend'].pop('catalog_response')
+    with page.expect_response('**/api/model-catalog'):
+        retry.click()
+    page.wait_for_function("() => document.querySelector('#onboarding-access-retry').hidden")
+    # A key is another way to Main: Continue opens, and the button is the catalog's manual refresh again.
+    page.locator('[data-collapse="api-access"] > summary').click()
+    page.locator('#openai-key').fill('fixture-api-credential')
+    page.wait_for_selector('#next-btn:not([disabled])')
+    assert retry.is_visible() and reason.inner_text() == ''
+    assert optional.is_visible() and optional.inner_text() == 'Configured', 'the badge follows what is entered'
+    assert not any(path == '/api/onboarding/complete' for path, _ in ui['posts'])
+
+
 @pytest.mark.parametrize('edit_after_recovery', [False, True, 'main'])
 def test_failed_preview_allows_manual_main_and_visible_reviewer_recovery_before_save(subscription_ui, onboarding, edit_after_recovery):
     ui, page = subscription_ui, subscription_ui['page']
@@ -370,8 +574,8 @@ def test_failed_preview_allows_manual_main_and_visible_reviewer_recovery_before_
     onboarding.calls['snapshot_payload'] = {
         **LIVE_SNAPSHOT,
         'harnesses': [{**LIVE_SNAPSHOT['harnesses'][1], 'models': []}],
-        'profiles': {'harnessAccounts': [_profile_account('codex', 'personal')],
-                     'profiles': [_profile('codex', 'personal')]},
+        'profiles': {'profiles': [_profile('codex', 'personal')], 'harnessAccounts': [],
+                     'accountPools': [_pool('codex', {'kind': 'profile', 'profileId': 'personal'})]},
         'model_catalog': ui['fixture']['catalog']['items'],
     }
     page.goto(ui['url'] + '/onboarding')
@@ -397,9 +601,8 @@ def test_failed_preview_allows_manual_main_and_visible_reviewer_recovery_before_
     page.wait_for_function("() => document.querySelector('.wizard-inline-note')?.textContent.includes('Reviewers were assigned to Main')")
     assert not any(path == '/api/onboarding/complete' for path, _ in ui['posts']), 'Recovery is a preview, not a write'
     assert not onboarding.settings_path.exists()
-    for label in ['Triad review', 'Scope review', 'Advisory review', 'Deep self-review']:
-        row = page.locator('.summary-kv').filter(has=page.get_by_text(label, exact=True))
-        assert 'claudexor::codex=owner-main' in row.inner_text()
+    reviewers = page.locator('.summary-kv').filter(has=page.get_by_text('Reviewers', exact=True))
+    assert 'claudexor::codex=owner-main · Account: personal' in reviewers.inner_text()
     capture(page, 'manual-main-reviewer-recovery')
     if edit_after_recovery == 'main':
         for _ in range(3):
@@ -410,30 +613,36 @@ def test_failed_preview_allows_manual_main_and_visible_reviewer_recovery_before_
         page.wait_for_selector('#skip-presets-btn:not([hidden])')
         assert page.locator('#next-btn').is_enabled()
         assert 'Main changed; reviewers keep the assignments shown above' in page.locator('.wizard-inline-note').inner_text()
-        assert 'owner-main' in page.locator('.summary-kv').filter(has=page.get_by_text('Triad review', exact=True)).inner_text()
+        assert 'owner-main' in reviewers.inner_text() and 'new-main' not in reviewers.inner_text()
     elif edit_after_recovery:
-        page.click('#back-btn')
-        page.click('#back-btn')
-        page.locator('[data-collapse="reviewers"] > summary').click()
-        page.locator('[data-deep-review-api-model]').fill('owner-deep')
-        page.click('#next-btn')
-        page.click('#next-btn')
+        # The reviewers are rows of the Models step's catalog: edit one there.
+        for _ in range(3):
+            page.click('#back-btn')
+        page.locator('[data-collapse="subagents"] > summary').click()
+        first = page.locator('[data-subagent-row]').filter(has=page.locator('[data-subagent-field="review_eligible"]:checked')).first
+        assert first.count() == 1
+        first.locator('[data-subagent-field="model"]').fill('owner-deep')
+        for _ in range(3):
+            page.click('#next-btn')
         page.wait_for_function("() => !document.querySelector('.wizard-error').textContent")
-        deep = page.locator('.summary-kv').filter(has=page.get_by_text('Deep self-review', exact=True))
-        assert 'owner-deep' in deep.inner_text()
+        assert 'claudexor::codex=owner-deep' in reviewers.inner_text()
     page.click('#next-btn')
     page.wait_for_url(ui['url'] + '/')
     bodies = [body for path, body in ui['posts'] if path == '/api/onboarding/complete']
     assert len(bodies) == 1 and bodies[0]['skipSubscriptionPresets'] is True
     assert bodies[0]['OUROBOROS_MODEL'] == ('claudexor::codex=new-main' if edit_after_recovery == 'main' else 'claudexor::codex=owner-main')
-    assert json.loads(onboarding.saved()['OUROBOROS_REVIEWER_SLOTS']) == json.loads(bodies[0]['OUROBOROS_REVIEWER_SLOTS'])
+    saved = onboarding.saved()
+    catalog = saved['OUROBOROS_SUBAGENTS']
+    catalog = json.loads(catalog) if isinstance(catalog, str) else catalog
+    marked = [row for row in catalog['items'] if row.get('review_eligible') is True]
+    assert marked == [row for row in bodies[0]['OUROBOROS_SUBAGENTS']['items'] if row.get('review_eligible') is True]
+    assert 'OUROBOROS_REVIEWER_SLOTS' not in saved
     assert onboarding.calls['supervisor'] == 1
-    for kind, value in json.loads(bodies[0]['OUROBOROS_REVIEWER_SLOTS']).items():
-        for row in value if isinstance(value, list) else [value]:
-            if isinstance(row, dict):
-                expected = 'owner-deep' if edit_after_recovery is True and kind == 'deep_review' else 'owner-main'
-                assert row['route']['target_id'] == f'claudexor::codex={expected}'
-                assert row['route']['profile_id'] == 'personal'
+    assert marked, 'Use Main kept the reviewers: none were dropped'
+    for index, row in enumerate(marked):
+        expected = 'owner-deep' if edit_after_recovery is True and index == 0 else 'owner-main'
+        assert row['route'] == {'kind': 'api_model', 'target_id': f'claudexor::codex={expected}',
+                                'credential_profile_id': 'personal'}
 
 
 def test_failed_main_reviewer_recovery_does_not_latch_finish(subscription_ui):
@@ -477,6 +686,10 @@ def test_accounts_catalog_failure_is_visible_and_retry_keeps_the_draft(subscript
     page.goto(ui['url'] + '/onboarding')
     page.wait_for_function("() => document.querySelector('#onboarding-access-note').textContent.includes('Raw model service unavailable')")
     assert page.locator('#next-btn').is_disabled()
+    # The note offers only what the buttons allow: with Continue disabled, a Retry alone.
+    page.wait_for_function("() => document.querySelector('#onboarding-access-note').textContent.trim()"
+                           ".endsWith('Agent model discovery unavailable. Retry.')")
+    assert 'or Continue' not in page.locator('#onboarding-access-note').inner_text()
     page.locator('[data-collapse="api-access"] > summary').click()
     page.locator('#openai-key').fill('owner-draft-credential')
     ui['backend'].pop('catalog_status')
@@ -492,6 +705,8 @@ def test_accounts_catalog_failure_is_visible_and_retry_keeps_the_draft(subscript
 def test_declared_source_with_failed_inventory_preserves_stored_or_owner_authored_defaults(subscription_ui, fresh_install):
     ui, page = subscription_ui, subscription_ui['page']
     ui['bootstrap']['freshInstall'] = fresh_install
+    if not fresh_install:  # a stored install's bootstrap: its document sets every slot, none is the wizard's (#2969)
+        ui['bootstrap']['initialState']['automaticModels'] = []
     initial = ui['bootstrap']['initialState']['mainModel']
     ui['backend'].update(preview_error='Agent inventory unavailable.', catalog_response={
         'items': [], 'model_sources': ui['fixture']['catalog']['model_sources'],
@@ -525,10 +740,233 @@ def test_late_catalog_does_not_restore_access_after_the_account_disconnects(subs
     page.wait_for_function("() => document.querySelector('#onboarding-access-note').textContent.includes('Checking model sources')")
     assert held
     ui['fixture']['status']['profiles']['profiles'] = []
-    page.evaluate("async () => (await import('/static/modules/claudexor_status_store.js')).claudexorStatus.refresh()")
-    page.wait_for_function("() => !document.querySelector('[data-agent-family=codex]').textContent.includes('Connected')")
+    page.evaluate("async () => (await import('/onboarding/static/modules/claudexor_status_store.js')).claudexorStatus.refresh()")
+    page.wait_for_function("() => !document.querySelector('[data-agent-family=codex]').textContent.includes('Signed in')")
     for route in held:
         route.fulfill(content_type='application/json', body=json.dumps(ui['fixture']['catalog']))
     page.unroute('**/api/model-catalog')
     assert page.locator('#next-btn').is_disabled()
     assert page.locator('#quick-start-btn').is_hidden()
+
+
+def _zai_key(page, plan):
+    page.locator('[data-collapse="api-access"] > summary').click()
+    page.locator('[data-collapse="more-providers"] > summary').click()
+    page.locator('#zai-key').fill('zai-fixture-credential')
+    page.locator('#zai-plan').fill(plan)
+
+
+@pytest.mark.parametrize('plan, owner_vision', [('', None), ('coding', None), ('payg', ''), ('payg', 'zai::glm-ocr')])
+def test_fresh_zai_setup_proposes_the_image_capable_vision_the_owner_may_change(subscription_ui, plan, owner_vision):
+    """PR #1560: a fresh Z.ai-only setup shows and saves Flash in Vision; an owner's
+    clear or replacement survives Back/Next and is what gets saved."""
+    ui, page = subscription_ui, subscription_ui['page']
+    ui['fixture']['status']['profiles']['profiles'] = []
+    page.goto(ui['url'] + '/onboarding')
+    _zai_key(page, plan)
+    page.click('#next-btn')
+    vision = page.locator('[data-model-role="vision"] [data-model-role-model]')
+    vision.wait_for()
+    assert vision.input_value().endswith('glm-5.3-flash')
+    capture(page, f'zai-models-{plan or "default"}')
+    if owner_vision is not None:
+        vision.fill(owner_vision)
+        page.click('#back-btn')
+        page.click('#next-btn')
+        assert vision.input_value() == owner_vision.rpartition('::')[2]   # the source picker holds "zai"
+    for _ in range(3):
+        page.click('#next-btn')
+    page.wait_for_selector('.summary-card')
+    capture(page, f'zai-summary-{plan or "default"}-{"owner" if owner_vision is not None else "default"}')
+    page.click('#next-btn')
+    page.wait_for_url(ui['url'] + '/')
+    body = [body for path, body in ui['posts'] if path == '/api/onboarding/complete'][0]
+    assert (body['ZAI_API_KEY'], body['ZAI_PLAN'], body['OUROBOROS_MODEL']) == ('zai-fixture-credential', plan, 'zai::glm-5.3')
+    assert body['OUROBOROS_MODEL_VISION'] == ('zai::glm-5.3-flash' if owner_vision is None else owner_vision)
+
+
+def test_a_connected_subscription_keeps_the_zai_vision_default_out(subscription_ui):
+    """The subscription path owns model selection: a Z.ai key beside it adds no Vision default."""
+    ui, page = subscription_ui, subscription_ui['page']
+    page.goto(ui['url'] + '/onboarding')
+    page.wait_for_selector('#next-btn:not([disabled])')
+    _zai_key(page, '')
+    page.click('#next-btn')
+    page.wait_for_function("() => document.querySelector('[data-model-role=\"main\"] [data-model-role-model]')?.value === 'gpt-test'")
+    assert page.locator('[data-model-role="vision"] [data-model-role-model]').input_value() == ''
+    capture(page, 'zai-with-subscription-models')
+
+
+@pytest.mark.parametrize('scenario, expected_vision', [
+    ('key-first', ''), ('local-first', ''), ('remote-default', ''),
+    ('remote-main-edit', ''), ('remote-clear', ''),
+    ('remote-custom', 'zai::glm-ocr'), ('remote-explicit-default', 'zai::glm-5.3-flash'),
+    ('local-fallback', 'zai::glm-5.3-flash'),
+])
+def test_local_main_with_zai_defaults_only_untouched_vision(subscription_ui, monkeypatch, scenario, expected_vision):
+    ui, page = subscription_ui, subscription_ui['page']
+    ui['fixture']['status']['profiles']['profiles'] = []
+    page.goto(ui['url'] + '/onboarding')
+
+    def disclosure(name):
+        details = page.locator(f'[data-collapse="{name}"]')
+        if not details.evaluate('el => el.open'):
+            details.locator(':scope > summary').click()
+
+    def key():
+        disclosure('api-access')
+        disclosure('more-providers')
+        page.locator('#zai-key').fill('zai-fixture-credential')
+
+    def local():
+        disclosure('api-access')
+        disclosure('local-model')
+        page.locator('#local-source').fill('/models/local-test.gguf')
+        mode = 'fallback' if scenario == 'local-fallback' else 'all'
+        page.locator(f'[data-local-mode="{mode}"]').click()
+
+    vision = page.locator('[data-model-role="vision"] [data-model-role-model]')
+    if scenario == 'local-first':
+        local()
+        key()
+    else:
+        key()
+        if scenario.startswith('remote-'):
+            page.click('#next-btn')
+            assert vision.input_value() == 'glm-5.3-flash'
+            if scenario == 'remote-main-edit':
+                page.locator('[data-model-role="main"] [data-model-role-model]').fill('owner-main')
+            elif scenario in {'remote-clear', 'remote-custom', 'remote-explicit-default'}:
+                # Even an explicit choice equal to the suggestion belongs to the owner.
+                vision.fill(expected_vision.rpartition('::')[2])
+            page.click('#back-btn')
+        local()
+    page.click('#next-btn')
+    capture(page, f'local-zai-models-{scenario}')
+    assert vision.input_value() == expected_vision.rpartition('::')[2]
+    for _ in range(3):
+        page.click('#next-btn')
+    page.wait_for_selector('.summary-card')
+    capture(page, f'local-zai-summary-{scenario}')
+    page.click('#next-btn')
+    page.wait_for_url(ui['url'] + '/')
+    writes = [body for path, body in ui['posts'] if path == '/api/onboarding/complete']
+    assert len(writes) == 1
+    body = writes[0]
+    assert body['OUROBOROS_MODEL_VISION'] == expected_vision
+    assert body['LOCAL_ROUTING_MODE'] == ('fallback' if scenario == 'local-fallback' else 'all')
+    if scenario == 'remote-main-edit':
+        assert body['OUROBOROS_MODEL'] == 'zai::owner-main'
+    if not expected_vision:
+        # Continue the actual browser draft through the validator and caption
+        # consumer: a present Z.ai key must not turn local Main into a paid call.
+        from ouroboros.llm import LLMClient
+        from ouroboros.settings_setup_contract import validate_setup_payload
+        from ouroboros.vision_routing import VisionRoutingContext, prepare_messages_for_send
+
+        settings, error = validate_setup_payload(body, {})
+        assert not error
+        assert settings['USE_LOCAL_MAIN'] is True
+        for key, value in settings.items():
+            if isinstance(value, (str, bool, int, float)):
+                monkeypatch.setenv(key, str(value))
+        monkeypatch.setenv('OUROBOROS_IMAGE_INPUT_MODE', 'caption')
+        calls = []
+        monkeypatch.setattr(LLMClient, 'vision_query', lambda *_a, **_k: calls.append(_k))
+        message = [{'role': 'user', 'content': [{'type': 'image_url', 'image_url': {
+            'url': 'data:image/png;base64,aW1hZ2U='}}]}]
+        result = prepare_messages_for_send(message, routing=VisionRoutingContext(
+            settings['OUROBOROS_MODEL'], LLMClient(), {}, use_local=settings['USE_LOCAL_MAIN']))
+        assert calls == []
+        assert result[0]['content'][0]['text'] == (
+            '[image omitted: our local llama.cpp transport lane cannot carry images; no caption route is available]')
+
+
+@pytest.mark.parametrize('choice', ['generated', 'main-edited', 'deliberate-Flash'])
+def test_review_shortcut_reconciles_local_vision_before_preview(
+        subscription_ui, onboarding, monkeypatch, record_property, choice):
+    """The shortcut must reconcile the same draft as Next, before preview or save."""
+    import httpx
+    from ouroboros import net_transport
+    from ouroboros.llm import LLMClient
+    from ouroboros.vision_routing import VisionRoutingContext, prepare_messages_for_send
+
+    ui, page = subscription_ui, subscription_ui['page']
+    profiles = ui['fixture']['status']['profiles']['profiles']
+    ui['fixture']['status']['profiles']['profiles'] = []
+    ui['backend'].update(preview_client=onboarding.client, client=onboarding.client)
+    page.goto(ui['url'] + '/onboarding')
+    _zai_key(page, 'coding')
+    page.click('#next-btn')
+    vision = page.locator('[data-model-role="vision"] [data-model-role-model]')
+    assert vision.input_value() == 'glm-5.3-flash'
+    if choice == 'deliberate-Flash':
+        vision.fill('glm-5.3-flash')
+    elif choice == 'main-edited':
+        page.locator('[data-model-role="main"] [data-model-role-model]').fill('owner-main')
+    capture(page, f'shortcut-initial-vision-{choice}')
+    page.click('#back-btn')
+    # Observe a newly connected Codex account without a live login or daemon.
+    ui['fixture']['status']['profiles']['profiles'] = profiles
+    onboarding.calls['snapshot_payload'] = {
+        **LIVE_SNAPSHOT, 'harnesses': [LIVE_SNAPSHOT['harnesses'][1]],
+        'profiles': {'profiles': [_profile('codex', 'personal')], 'harnessAccounts': [],
+                     'accountPools': [_pool('codex', {'kind': 'profile', 'profileId': 'personal'})]},
+        'model_catalog': ui['fixture']['catalog']['items'],
+    }
+    page.evaluate("async () => (await import('/onboarding/static/modules/claudexor_status_store.js')).claudexorStatus.refresh()")
+    page.wait_for_selector('#quick-start-btn:not([hidden])')
+    page.wait_for_selector('#onboarding-access-retry:not([disabled])')
+    page.locator('[data-collapse="local-model"] > summary').click()
+    page.locator('#local-source').fill('/models/local-test.gguf')
+    page.locator('[data-local-mode="all"]').click()
+    capture(page, f'shortcut-local-accounts-{choice}')
+    page.click('#quick-start-btn')
+    page.wait_for_selector('.summary-card')
+    summary = page.locator('.summary-kv').filter(has=page.get_by_text('Vision', exact=True)).inner_text()
+    capture(page, f'shortcut-summary-{choice}')
+    page.click('#next-btn')
+    page.wait_for_url(ui['url'] + '/')
+    writes = [body for path, body in ui['posts'] if path == '/api/onboarding/complete']
+    assert len(writes) == 1
+    saved = onboarding.saved()
+    assert saved['USE_LOCAL_MAIN'] is True
+    for key, value in saved.items():
+        if isinstance(value, (str, bool, int, float)):
+            monkeypatch.setenv(key, str(value))
+    monkeypatch.setenv('OUROBOROS_IMAGE_INPUT_MODE', 'caption')
+    wire = []
+
+    def answer(request):
+        wire.append({'url': str(request.url), 'body': json.loads(request.content)})
+        return httpx.Response(200, json={
+            'id': 'shortcut-test', 'object': 'chat.completion', 'created': 0, 'model': 'glm-5.3-flash',
+            'choices': [{'index': 0, 'finish_reason': 'stop', 'message': {'role': 'assistant', 'content': 'Dark red'}}],
+            'usage': {'prompt_tokens': 9, 'completion_tokens': 2, 'total_tokens': 11},
+        })
+
+    monkeypatch.setattr(net_transport, 'remote_httpx_transport', lambda *_a, **_k: httpx.MockTransport(answer))
+    image = {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,aW1hZ2U='}}
+    result = prepare_messages_for_send([{'role': 'user', 'content': [image]}], routing=VisionRoutingContext(
+        saved['OUROBOROS_MODEL'], LLMClient(), {}, use_local=saved['USE_LOCAL_MAIN']))
+    record_property('caption_consumer', json.dumps({'vision': saved['OUROBOROS_MODEL_VISION'], 'wire': wire, 'result': result}))
+    expected = 'zai::glm-5.3-flash' if choice == 'deliberate-Flash' else ''
+    local_previews = [body for path, body in ui['posts']
+                      if path == '/api/onboarding/subagents/preview' and body.get('LOCAL_ROUTING_MODE') == 'all']
+    assert local_previews and all(body['OUROBOROS_MODEL_VISION'] == expected for body in local_previews)
+    assert writes[0]['subscriptionsConnected'] is True
+    assert writes[0]['OUROBOROS_MODEL_VISION'] == saved['OUROBOROS_MODEL_VISION'] == expected
+    if choice == 'main-edited':
+        assert saved['OUROBOROS_MODEL'] == 'zai::owner-main'
+    if expected:
+        assert 'glm-5.3-flash' in summary and 'Uses Main' not in summary
+        assert len(wire) == 1
+        assert wire[0]['url'] == 'https://api.z.ai/api/coding/paas/v4/chat/completions'
+        assert wire[0]['body']['model'] == 'glm-5.3-flash'
+        assert image in wire[0]['body']['messages'][0]['content']
+        assert result[0]['content'][0]['text'] == '[image caption: Dark red]'
+    else:
+        assert 'Uses Main' in summary
+        assert wire == []
+        assert result[0]['content'][0]['text'] == (
+            '[image omitted: our local llama.cpp transport lane cannot carry images; no caption route is available]')

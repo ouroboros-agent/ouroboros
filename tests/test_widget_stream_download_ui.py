@@ -19,7 +19,7 @@ import urllib.request
 
 import pytest
 
-pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
+pytestmark = [pytest.mark.ui_browser]
 REPO = Path(__file__).resolve().parents[1]
 
 _WIDGET = r'''
@@ -89,7 +89,9 @@ window.fetch=async (...args)=>{
  }
  return response;
 };
-window.disposeWidget=await mountModuleWidget(document.getElementById('mount'),{skill:'export_widget',ws_prefix:''},{entry:'widget.js',height:520});
+// A classic mount mints its route lease for the live tab's publication.
+const live=(await (await fetch('/api/widgets')).json()).ui_tabs.find(row=>row.skill==='export_widget'&&row.tab_id==='main');
+window.disposeWidget=await mountModuleWidget(document.getElementById('mount'),{skill:'export_widget',ws_prefix:'',tab_id:live.tab_id,generation:live.generation},{entry:'widget.js',height:520});
 window.fixtureReady=true;
 </script></body></html>'''
 
@@ -101,8 +103,10 @@ def widget_server(tmp_path, monkeypatch):
     from starlette.routing import Mount, Route
     from starlette.staticfiles import StaticFiles
     import uvicorn
-    from ouroboros import extension_loader
+    from ouroboros import extension_loader, server_auth
     from ouroboros.gateway.extensions import api_extension_module, api_extension_dispatch
+    from ouroboros.gateway.widget_assets import api_widget_asset_lease
+    from ouroboros.gateway.widgets import api_widgets
     from ouroboros.skill_loader import find_skill, save_enabled, save_review_state, SkillReviewState
     from tests._extension_loader_shared import _write_ext_skill, _add_fake_native_dep, _mark_isolated_deps_installed
     from tests._shared import clean_extension_runtime_state
@@ -126,13 +130,17 @@ def widget_server(tmp_path, monkeypatch):
     expected = {'widget-blob.txt': b'blob export', 'widget-data.txt': b'data export',
                 'widget-explicit.txt': b'explicit export', 'widget-large.bin': (root / 'large.bin').read_bytes()}
     app = Starlette(routes=[Route('/', lambda _r: HTMLResponse(_HTML)),
+        Route('/api/widgets', api_widgets),
+        Route('/api/widgets/asset-leases', api_widget_asset_lease, methods=['POST']),
+        Route('/api/widgets/asset-leases/{op}', api_widget_asset_lease, methods=['POST']),
         Route('/api/extensions/{skill}/module/{entry:path}', api_extension_module),
         Route('/api/extensions/{skill}/{rest:path}', api_extension_dispatch, methods=['GET','HEAD']),
         Mount('/web', app=StaticFiles(directory=REPO / 'web'))])
     app.state.drive_root, app.state.repo_dir = root, REPO
     sock = socket.socket()
     sock.bind(('127.0.0.1', 0))
-    server = uvicorn.Server(uvicorn.Config(app, log_level='warning'))
+    # The real gate owns the lease controls and the route-lease reads, as in the core.
+    server = uvicorn.Server(uvicorn.Config(server_auth.NetworkAuthGate(app), log_level='warning'))
     thread = threading.Thread(target=server.run, kwargs={'sockets':[sock]}, daemon=True)
     thread.start()
     deadline = time.monotonic() + 10
@@ -165,8 +173,11 @@ def native_file_api(port, read_sizes):
             return original(size)
         response.read = read
         return response
+    from ouroboros.launcher_background import DesktopApi
+    # The names MainApi's class body reads, as the sibling harness supplies them (headless, no facts).
     namespace = {'actual_port':port,'pathlib':__import__('pathlib'),'shutil':shutil,'tempfile':tempfile,
                  'base64':base64,'log':logging.getLogger(__name__),
+                 'DesktopApi':DesktopApi,'background':None,'_shell_facts':lambda: {},
                  'urllib':SimpleNamespace(parse=urllib.parse,request=SimpleNamespace(urlopen=open_recorded))}
     exec(compile(ast.Module(body=selected,type_ignores=[]),str(source),'exec'),namespace)
     return namespace['MainApi'](), hashlib.sha256(source.read_bytes()).hexdigest()
@@ -270,14 +281,18 @@ def _native_controller(window, actions, expected, root, evidence, failures):
 
 
 def test_native_widget_exports(widget_server, tmp_path, monkeypatch):
+    # The opt-in comes FIRST: the browser lane installs no desktop extra, and its
+    # registered skip is this reason, not a missing optional import. A run that DID
+    # select native Qt still stops on absent webview/qtpy below, a skip reason the
+    # required lane does not register, so it fails there instead of passing.
+    if os.environ.get('PYWEBVIEW_GUI') != 'qt':
+        pytest.skip('native Qt probe is explicitly selected by its isolated launcher')
     runtime = tmp_path / 'qt-runtime'
     runtime.mkdir(mode=0o700)
     monkeypatch.setenv('XDG_RUNTIME_DIR', str(runtime))
     webview = pytest.importorskip('webview')
     pytest.importorskip('qtpy')
     from qtpy.QtCore import QObject, Signal, Slot
-    if os.environ.get('PYWEBVIEW_GUI') != 'qt':
-        pytest.skip('native Qt probe is explicitly selected by its isolated launcher')
     class Actions(QObject):
         call = Signal(object)
         @Slot(object)

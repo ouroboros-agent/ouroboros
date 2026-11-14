@@ -17,6 +17,17 @@ v4.33.0 separates the two:
 
 from __future__ import annotations
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _packet_default_panel(monkeypatch):
+    """This module pins the PACKET assembly of the review pool: three packet seats
+    on the factory models (the pool's own default delivery is native)."""
+    from tests.review_pool_rosters import set_review_pool
+
+    set_review_pool(monkeypatch)
+
 
 class TestResolveIntentSubjectOnly:
     def test_subject_only_from_multiline_commit_message(self):
@@ -152,6 +163,7 @@ def test_triad_prompt_keeps_distinct_goal_and_scope_in_production_wiring(
         return ""
 
     def capture_review(*_args, **kwargs):
+        assert kwargs["row_plan"]["models"] == ["test/reviewer"]
         captured["prompt"] = kwargs["prompt"]
         return json.dumps({"results": []})
 
@@ -160,11 +172,12 @@ def test_triad_prompt_keeps_distinct_goal_and_scope_in_production_wiring(
     monkeypatch.setattr(_rbc, "capture_staged_diff",
                         lambda _repo, *, unified=3: "diff --git a/x.py b/x.py\n+x = 1")
     monkeypatch.setattr(review, "_preflight_check", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(review, "_load_checklist_section", lambda: "checklist")
+    monkeypatch.setattr(review, "_load_checklist_section", lambda *_a, **_k: "checklist")
     monkeypatch.setattr(review, "load_governance_doc", lambda *_args, **_kwargs: "governance")
     monkeypatch.setattr(review, "build_touched_file_pack", lambda *_args, **_kwargs: ("files", []))
-    monkeypatch.setattr(review._cfg, "get_review_models", lambda: ["test/reviewer"])
-    monkeypatch.setattr(review._cfg, "get_review_enforcement", lambda: "blocking")
+    from tests.review_pool_rosters import set_review_pool
+
+    set_review_pool(monkeypatch, ["test/reviewer"])
     monkeypatch.setattr(review, "_handle_multi_model_review", capture_review)
     ctx = SimpleNamespace(
         repo_dir=tmp_path,
@@ -177,6 +190,7 @@ def test_triad_prompt_keeps_distinct_goal_and_scope_in_production_wiring(
         _last_triad_raw_results=[],
         _review_degraded_reasons=[],
         _review_history=[],
+        _review_advisory=[],  # an empty wave's signal is recorded for the author, never returned as a refusal
     )
 
     review._run_unified_review(

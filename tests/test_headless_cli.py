@@ -442,21 +442,61 @@ def test_terminal_bench_harbor_adapter_imports_without_harbor():
 
 def test_queue_restore_accepts_headless_chat_zero(tmp_path, monkeypatch):
     import supervisor.queue as queue
+    from tests._shared import write_queue_document
 
     monkeypatch.setattr(queue, "PENDING", [])
     monkeypatch.setattr(queue, "RUNNING", {})
     monkeypatch.setattr(queue, "QUEUE_SEQ_COUNTER_REF", {"value": 0})
     monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
-    monkeypatch.setattr(queue, "QUEUE_SNAPSHOT_PATH", tmp_path / "queue_snapshot.json")
+    monkeypatch.setattr(queue, "QUEUE_SNAPSHOT_PATH", tmp_path / "state" / "queue_snapshot.json")
     monkeypatch.setattr(queue, "append_jsonl", lambda *args, **kwargs: None)
     monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": True)
-    (tmp_path / "queue_snapshot.json").write_text(
-        json.dumps({
-            "ts": utc_now_iso(),
-            "pending": [{"task": {"id": "headless1", "type": "task", "chat_id": 0, "text": "x"}}],
-        }),
-        encoding="utf-8",
-    )
+    write_queue_document(queue.QUEUE_SNAPSHOT_PATH, {
+        "ts": utc_now_iso(),
+        "pending": [{"task": {"id": "headless1", "type": "task", "chat_id": 0, "text": "x"}}],
+    })
 
     assert queue.restore_pending_from_snapshot(max_age_sec=900) == 1
     assert queue.PENDING[0]["id"] == "headless1"
+
+
+def test_cli_start_waits_on_the_dialogue_while_the_server_lives(monkeypatch):
+    """``--start`` waits for the started server's own readiness (``boot.dialogue_ready``), not for a
+    clock; the wait ends with the process's exit or the boot's failed verdict."""
+    from types import SimpleNamespace
+
+    from ouroboros import cli
+
+    monkeypatch.setattr(cli.time, "sleep", lambda _s: None)
+    answers = iter([cli.ConnectionCLIError("refused")] * 3
+                   + [{"status": "ok", "boot": {"phase": "serving", "dialogue_ready": False}}] * 100
+                   + [{"status": "ok", "boot": {"phase": "serving", "dialogue_ready": True}}])
+
+    class FakeClient:
+        base_url = "http://127.0.0.1:8765"
+
+        def request(self, method, path, body=None):
+            assert (method, path) == ("GET", "/api/health")
+            answer = next(answers)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+    alive = SimpleNamespace(poll=lambda: None, returncode=None)
+    assert cli._wait_for_dialogue(FakeClient(), alive) is not None
+
+    answers = iter([{"status": "ok"}])
+    assert cli._wait_for_dialogue(FakeClient(), alive) is not None, "an older core counts at its first answer"
+
+    answers = iter([{"status": "ok", "boot": {"phase": "ready", "dialogue_ready": False}}])
+    assert cli._wait_for_dialogue(FakeClient(), alive) is not None, "a providerless boot ends the wait at ready"
+
+    answers = iter([{"status": "ok", "boot": {"phase": "failed", "dialogue_ready": False, "error": "store not published"}}])
+    with pytest.raises(cli.CLIError, match="server start failed"):
+        cli._wait_for_dialogue(FakeClient(), alive)
+
+    exits = iter([None, None, 3])
+    dead_soon = SimpleNamespace(poll=lambda: next(exits), returncode=3)
+    answers = iter([cli.ConnectionCLIError("refused")] * 5)
+    with pytest.raises(cli.CLIError, match="exited with code 3"):
+        cli._wait_for_dialogue(FakeClient(), dead_soon)

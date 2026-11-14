@@ -158,7 +158,7 @@ def test_reading_settings_writes_nothing_to_disk(isolated_settings):
     from ouroboros import config as cfg
     from ouroboros.gateway.owner_settings import _owner_read_settings_raw
 
-    _seed(isolated_settings, LEGACY_OWNER_DOCUMENT)
+    _seed(isolated_settings, {**LEGACY_OWNER_DOCUMENT, "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE": "full"})
     before = isolated_settings.read_bytes()
     before_mtime = isolated_settings.stat().st_mtime_ns
 
@@ -172,15 +172,15 @@ def test_reading_settings_writes_nothing_to_disk(isolated_settings):
     assert not pathlib.Path(str(isolated_settings) + ".lock").exists()
 
 
-def test_the_one_read_that_writes_is_the_context_compatibility_migration(isolated_settings):
+def test_the_one_read_that_writes_is_the_migrating_context_compatibility_read(isolated_settings):
     """The single, deliberate exception, pinned rather than assumed.
 
     A document that carries a context mode WITHOUT the false provenance marker is
     ambiguous for the BIBLE P3 scope gate, and the one-window compatibility migration
     resolves it by writing the canonical pair back — under the settings lock, through
-    the live-data guard. So `load_settings` on such a file performs exactly ONE write
-    and is stable from then on. `_owner_read_settings_raw` performs NONE even on the
-    same file: it uses the non-persisting normalizer, so an owner GET is always a read.
+    the live-data guard. Only `load_settings(migrate=True)` (the boot, onboarding
+    completion) does that: it performs exactly ONE write and is stable from then on. An
+    ordinary `load_settings` and `_owner_read_settings_raw` perform NONE: a read is a read.
 
     This is easy to miss because a fixture whose document has no context keys makes any
     "a read writes nothing" assertion pass vacuously — which is how a live settings file
@@ -195,8 +195,10 @@ def test_the_one_read_that_writes_is_the_context_compatibility_migration(isolate
     for _ in range(3):
         _owner_read_settings_raw()
     assert isolated_settings.read_bytes() == before, "an owner read migrated the file"
+    assert cfg.load_settings()["OUROBOROS_CONTEXT_MODE"] == "max"
+    assert isolated_settings.read_bytes() == before, "an ordinary read migrated the file"
 
-    settings = cfg.load_settings()
+    settings = cfg.load_settings(migrate=True)
     after_first = isolated_settings.read_bytes()
     assert after_first != before, "the compatibility migration did not converge"
     stored = json.loads(after_first.decode("utf-8"))
@@ -206,7 +208,7 @@ def test_the_one_read_that_writes_is_the_context_compatibility_migration(isolate
     assert settings["OUROBOROS_CONTEXT_MODE"] == "max"
 
     for _ in range(3):
-        cfg.load_settings()
+        cfg.load_settings(migrate=True)
     assert isolated_settings.read_bytes() == after_first, "the migration is not idempotent"
 
 
@@ -381,16 +383,18 @@ def test_every_owner_endpoint_reaches_the_same_normalized_read(isolated_settings
             )
         }
 
-    assert _callers(owner_mod, "_owner_read_settings_raw") == {"_owner_update_settings"}
+    # ``_owner_settings_document`` is that one reader's authored-document view (the save's provenance input).
+    assert _callers(owner_mod, "_owner_read_settings_raw") == {"_owner_update_settings", "_owner_settings_document"}
     readers = _callers(settings_mod, "_owner_read_settings_raw") | _callers(
         settings_mod, "_owner_update_settings")
     assert readers == {
         "_api_owner_runtime_mode_sync",
         "_api_owner_auto_grant_sync",
         "_api_owner_context_mode_sync",
-        "_api_owner_safety_mode_sync",
         "_api_settings_post_locked",
     }, readers
+    from ouroboros.gateway import safety_settings
+    assert _callers(safety_settings, "_owner_update_settings") == {"_persist"}
 
 
 def test_normalize_settings_raw_is_idempotent(isolated_settings):
@@ -423,6 +427,30 @@ def test_normalize_settings_raw_is_idempotent(isolated_settings):
         cfg.normalize_settings_raw(document)
         assert document == snapshot
     assert not isolated_settings.exists()
+
+
+@pytest.mark.parametrize(
+    ("minimum", "maximum", "expected_minimum", "expected_maximum"),
+    [(30, 30, 60, 60), (30, 7200, 60, 7200), (900, 14400, 900, 14400)],
+)
+def test_wakeup_bounds_read_normalization_preserves_valid_values_and_does_not_write(
+    isolated_settings, minimum, maximum, expected_minimum, expected_maximum,
+):
+    """Legacy short wake minima become the current effective floor in every
+    read, while clean and owner-customized bounds remain byte-for-byte choices
+    and a GET/read never rewrites settings.json."""
+    from ouroboros import config as cfg
+
+    _seed(isolated_settings, {
+        "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE": "full",
+        "OUROBOROS_BG_WAKEUP_MIN": minimum,
+        "OUROBOROS_BG_WAKEUP_MAX": maximum,
+    })
+    before = isolated_settings.read_bytes()
+    loaded = cfg.load_settings()
+    assert loaded["OUROBOROS_BG_WAKEUP_MIN"] == expected_minimum
+    assert loaded["OUROBOROS_BG_WAKEUP_MAX"] == expected_maximum
+    assert isolated_settings.read_bytes() == before
 
 
 def test_a_stale_owner_read_cannot_overwrite_a_change_it_never_saw(isolated_settings):
@@ -493,8 +521,8 @@ def test_every_settings_writer_puts_the_one_serializers_bytes_on_disk(isolated_s
     """One serializer, one spelling. Each of the five writers, driven through its real
     entry point, leaves exactly ``serialize_settings(document).encode("utf-8")`` on disk:
     the three prologue-routed savers produce identical bytes for identical content, and
-    the two exempt writers — the context-pair migration, which is the one READ that
-    writes, and the Colab generator for the Drive root — produce the serializer's bytes
+    the two exempt writers — the context-pair migration, the one READ that writes
+    (``migrate=True``), and the Colab generator for the Drive root — produce the serializer's bytes
     for what they persist. The writers once disagreed on ``ensure_ascii``, and a writer
     that re-derived the JSON text itself agreed with the serializer only by coincidence:
     mutate the serializer and that writer keeps its old spelling while the others follow.
@@ -537,9 +565,9 @@ def test_every_settings_writer_puts_the_one_serializers_bytes_on_disk(isolated_s
     _save_settings(isolated_settings, dict(document))
     on_disk["packaged_cli._save_settings"] = isolated_settings.read_bytes()
 
-    # The migration is the one read that writes: an ambiguous Low makes the load persist.
+    # The migrating read is the one read that writes: an ambiguous Low makes it persist.
     _seed(isolated_settings, {**document, "OUROBOROS_CONTEXT_MODE": "low"})
-    cfg.load_settings()
+    cfg.load_settings(migrate=True)
     on_disk["context_mode_compat.normalize_and_persist_context_mode_compat"] = (
         isolated_settings.read_bytes())
 
@@ -664,11 +692,12 @@ def test_a_retired_key_is_absent_from_every_surface_that_would_react_to_it():
     retired keys carry exactly such a row today. What may not survive is the DEFAULT
     column offering a value, because that is the table saying the key is still a knob."""
     from ouroboros import config as cfg
+    from ouroboros import settings_scales
     from ouroboros.gateway import settings as settings_mod
 
     documented = architecture_text().splitlines()
     for key in cfg.RETIRED_SETTING_KEYS:
-        assert key not in settings_mod._IMMEDIATE_KEYS, key
+        assert key not in settings_scales.IMMEDIATE_SETTINGS, key
         assert key not in settings_mod._RESTART_REQUIRED_KEYS, key
         for row in [line for line in documented if line.startswith(f"| {key} |")]:
             default = row.split("|")[2].strip()
@@ -678,11 +707,30 @@ def test_a_retired_key_is_absent_from_every_surface_that_would_react_to_it():
                 f"instead, the way `(retired)` and `(env-only)` do.")
 
 
+# The review-lane keys are RETIRED but their value is MIGRATED, not dropped
+# (`review_pool_migration`, PR-3): a readable lanes document is consumed into reviewer
+# rows of OUROBOROS_SUBAGENTS at the same read seam, so every reader still serves
+# none of the five keys. An UNREADABLE lanes value is the one retired key that stays
+# in the document — for the owner, not as a ghost (tests/test_retired_settings_chat_notice.py).
+_READABLE_LANES_PROBE = json.dumps({
+    "triad": [{"slot_id": "t", "route": {"kind": "api_chat", "target_id": "probe/one"}, "delivery": "packet"}],
+    "scope": [{"slot_id": "s", "route": {"kind": "api_chat", "target_id": "probe/one"}}],
+})
+
+
+def _retired_probe_document() -> dict:
+    from ouroboros import config as cfg
+
+    stored = {key: "9999" for key in cfg.RETIRED_SETTING_KEYS}
+    stored["OUROBOROS_REVIEWER_SLOTS"] = _READABLE_LANES_PROBE
+    return stored
+
+
 def test_a_retired_key_is_dropped_by_every_reader(isolated_settings):
     from ouroboros import config as cfg
     from ouroboros.gateway.owner_settings import _owner_read_settings_raw
 
-    stored = {key: "9999" for key in cfg.RETIRED_SETTING_KEYS}
+    stored = _retired_probe_document()
     stored["TOTAL_BUDGET"] = 12.0
     _seed(isolated_settings, stored)
 
@@ -700,7 +748,7 @@ def test_a_retired_key_leaves_the_file_on_the_next_owner_write(isolated_settings
     path, which is the one that previously wrote the ghost straight back."""
     from ouroboros import config as cfg
 
-    stored = {key: "9999" for key in cfg.RETIRED_SETTING_KEYS}
+    stored = _retired_probe_document()
     stored["TOTAL_BUDGET"] = 12.0
     _seed(isolated_settings, stored)
 
@@ -734,9 +782,9 @@ def test_a_retired_comma_list_triad_is_not_dropped_silently(isolated_settings, c
     keys are in RETIRED_SETTING_KEYS, so the raw-stage normalization purges
     them before migration, and the install runs the SHIPPED default reviewer
     panel instead. That is the ratified migration ("move the config to the
-    structured OUROBOROS_REVIEWER_SLOTS BEFORE the upgrade"), but it happened
-    without a word: nothing in the runtime told the owner which keys went, or
-    what replaced them.
+    successor surface BEFORE the upgrade" — today the review pool, the reviewer
+    rows of OUROBOROS_SUBAGENTS), but it happened without a word: nothing in
+    the runtime told the owner which keys went, or what replaced them.
 
     The notice is ONE line per process per dropped set — the seam is on every
     settings read, so a per-call emission would be a log flood.
@@ -769,7 +817,8 @@ def test_a_retired_comma_list_triad_is_not_dropped_silently(isolated_settings, c
     for key in document:
         if key != "TOTAL_BUDGET":
             assert key in notices[0], key
-    assert "OUROBOROS_REVIEWER_SLOTS" in notices[0]
+    assert "OUROBOROS_SUBAGENTS" in notices[0] and "review pool" in notices[0]
+    assert "OUROBOROS_REVIEWER_SLOTS" not in notices[0], "the lanes are retired too; never named as the successor"
     assert "shipped" in notices[0].lower()
 
 
@@ -793,6 +842,7 @@ def test_the_retirement_notice_names_the_successor_the_table_states(
     from ouroboros.settings_defaults import (
         RETIRED_SETTING_KEYS,
         RETIRED_SETTING_SUCCESSORS,
+        REVIEW_POOL_MIGRATED_SETTING_KEYS,
     )
 
     # The map classifies INSIDE the retirement tuple: a successor for a key that
@@ -802,13 +852,20 @@ def test_the_retirement_notice_names_the_successor_the_table_states(
     # consumed into the shared cap before the purge computes the dropped set, so
     # an entry for it would promise a notice line nothing can emit.
     assert "OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES" not in RETIRED_SETTING_SUCCESSORS
+    # The review-lane keys are the one migrated class the table DOES name (the
+    # catalog is their successor for the RC auditor and for a migration that could
+    # not finish, which keeps them in the document); a readable document is
+    # consumed before the purge, so this notice never carries them either — the
+    # migration's own owner message does (tests/test_review_pool_migration.py).
+    for key in REVIEW_POOL_MIGRATED_SETTING_KEYS:
+        assert RETIRED_SETTING_SUCCESSORS[key] == ("OUROBOROS_SUBAGENTS",), key
 
     # The document is DERIVED from the table, not spelled out: the D04 grep gate
     # (tests/test_legacy_timeout_retirement.py) lets the retired wall-clock pair
     # appear only in the retirement SSOT and its own audits, and this pin is
     # about the CLASS "a retired key whose successor the table states", not about
     # one key's spelling.
-    successor_bearing = sorted(RETIRED_SETTING_SUCCESSORS)
+    successor_bearing = sorted(set(RETIRED_SETTING_SUCCESSORS) - set(REVIEW_POOL_MIGRATED_SETTING_KEYS))
     assert successor_bearing, "the notice's successor shape needs a member"
     document = dict.fromkeys(successor_bearing, 900)
     document["OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES"] = 3
@@ -880,3 +937,134 @@ def test_the_retirement_notice_stays_quiet_for_a_document_without_ghosts(
         cfg.normalize_settings_raw({"TOTAL_BUDGET": 10.0})
 
     assert [r.getMessage() for r in caplog.records] == []
+
+
+def test_a_settings_read_takes_no_lock_and_reads_a_torn_document_again_behind_its_writer(isolated_settings,
+                                                                                         monkeypatch):
+    """An ordinary read never creates, waits on or removes ``settings.json.lock`` (every reader of every
+    process once serialized on that one name). A document caught mid-way by ``save_settings``' in-place
+    fallback (truncate, then write: a prefix of one JSON object never decodes) is read once more behind
+    the lock its writer holds until the bytes are complete, never answered with defaults; a document
+    that stays undecodable is read again once, not in a loop."""
+    from ouroboros import config as cfg
+
+    _seed(isolated_settings, {**LEGACY_OWNER_DOCUMENT, "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE": "full",
+                              "TOTAL_BUDGET": 33.0})
+    foreign = pathlib.Path(str(isolated_settings) + ".lock")
+    foreign.write_text("pid=1 ts=0\n")  # another process's writer holds the lock
+    held = foreign.stat().st_mtime_ns
+    taken = []
+    monkeypatch.setattr(cfg, "_acquire_settings_lock", lambda timeout=2.0: taken.append("read") or None)
+    assert cfg.load_settings()["TOTAL_BUDGET"] == 33.0
+    assert taken == [] and foreign.stat().st_mtime_ns == held
+
+    complete = isolated_settings.read_bytes()
+    isolated_settings.write_bytes(complete[: len(complete) // 2])  # the in-place fallback, caught mid-write
+
+    def writer_finishes(timeout=2.0):
+        taken.append("torn")
+        isolated_settings.write_bytes(complete)  # the writer completes before it releases its lock
+        return None
+
+    monkeypatch.setattr(cfg, "_acquire_settings_lock", writer_finishes)
+    assert cfg.load_settings()["TOTAL_BUDGET"] == 33.0
+    assert taken == ["torn"]
+
+    taken.clear()
+    monkeypatch.setattr(cfg, "_acquire_settings_lock", lambda timeout=2.0: taken.append("broken") or None)
+    isolated_settings.write_bytes(complete[:-1])  # undecodable for good (a hand edit)
+    assert cfg.load_settings()["TOTAL_BUDGET"] == cfg.SETTINGS_DEFAULTS["TOTAL_BUDGET"]
+    assert taken == ["broken"]
+
+    # Windows: an open that meets a writer's replace is refused (a sharing violation): read again behind its lock.
+    isolated_settings.write_bytes(complete)
+    taken.clear()
+    opened, real_open = [], pathlib.Path.open
+
+    def refused_once(path, *args, **kwargs):
+        if path == isolated_settings and not opened:
+            opened.append(1)
+            raise PermissionError(13, "The process cannot access the file")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "open", refused_once)
+    monkeypatch.setattr(cfg, "_acquire_settings_lock", lambda timeout=2.0: taken.append("replacing") or None)
+    assert cfg.load_settings()["TOTAL_BUDGET"] == 33.0 and taken == ["replacing"]
+    isolated_settings.unlink()  # an absent document is no writer's: defaults, no lock
+    taken.clear()
+    assert cfg.load_settings()["TOTAL_BUDGET"] == cfg.SETTINGS_DEFAULTS["TOTAL_BUDGET"] and taken == []
+
+
+def test_a_strict_read_tells_an_absent_document_from_an_unknown_one(isolated_settings, monkeypatch):
+    """``load_settings(strict=True)`` (and ``skill_settings(strict=True)``, the skill reader over it) keeps the
+    ordinary read's values and its single read behind the writer, but a present document that stays unreadable,
+    undecodable or not an object is ``SettingsDocumentUnknown``, never defaults; absent is defaults. The ordinary
+    read is unchanged. A key this tree mirrored into the environment never stands in for the document's value."""
+    from ouroboros import config as cfg
+    from ouroboros.settings_integrity import SettingsDocumentUnknown, skill_settings
+
+    taken = []
+    monkeypatch.setattr(cfg, "_acquire_settings_lock", lambda timeout=2.0: taken.append("lock") or None)
+    assert cfg.load_settings(strict=True)["TOTAL_BUDGET"] == cfg.SETTINGS_DEFAULTS["TOTAL_BUDGET"]  # absent
+    _seed(isolated_settings, {**LEGACY_OWNER_DOCUMENT, "TELEGRAM_BOT_TOKEN": "1:a"})
+    assert skill_settings(strict=True)["TELEGRAM_BOT_TOKEN"] == "1:a"
+    complete = isolated_settings.read_bytes()
+    # Every present document that is not one object (JSON null included) is read once more behind its writer,
+    # then unknown; only a missing file is absent.
+    for broken, behind in ((complete[:-1], ["lock"]), (b"\xff\xfe", ["lock"]), (b"[1, 2]", ["lock"]),
+                           (b"null", ["lock"])):
+        isolated_settings.write_bytes(broken)
+        taken.clear()
+        with pytest.raises(SettingsDocumentUnknown):
+            cfg.load_settings(strict=True)
+        assert taken == behind
+        with pytest.raises(SettingsDocumentUnknown):
+            skill_settings(strict=True)
+        assert "TELEGRAM_BOT_TOKEN" not in cfg.load_settings()  # the ordinary read still falls back
+    isolated_settings.write_bytes(complete)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "9:operator")  # not a SETTINGS_DEFAULTS key: no environment fallback
+    _seed(isolated_settings, {**LEGACY_OWNER_DOCUMENT})
+    assert "TELEGRAM_BOT_TOKEN" not in skill_settings(strict=True)
+
+
+def test_the_owner_form_and_the_skills_share_one_strict_read_and_a_writer_never_retakes_its_lock(
+        isolated_settings, monkeypatch):
+    """The secret form's status (``_owner_settings_document(strict=True)``, outside the lock) reads a document a
+    writer is replacing once more behind that writer, as a skill's strict read does, so both see the same value;
+    a writer, which already holds the non-re-entrant lock, never asks for it again and refuses a document that
+    stays unreadable with ``SettingsDocumentUnreadable`` (one family with ``SettingsDocumentUnknown``), its bytes
+    untouched."""
+    from ouroboros import config as cfg
+    from ouroboros.gateway import owner_settings
+    from ouroboros.settings_integrity import SettingsDocumentUnknown, skill_settings
+
+    _seed(isolated_settings, {**LEGACY_OWNER_DOCUMENT, "TELEGRAM_BOT_TOKEN": "1:a"})
+    complete = isolated_settings.read_bytes()
+    taken = []
+
+    def writer_finishes(timeout=2.0):  # the lock a writer holds until its bytes are complete
+        taken.append("lock")
+        isolated_settings.write_bytes(complete)
+        return 99
+
+    monkeypatch.setattr(cfg, "_acquire_settings_lock", writer_finishes)
+    monkeypatch.setattr(cfg, "_release_settings_lock", lambda fd: None)
+    for reader in (lambda: owner_settings._owner_settings_document(strict=True), lambda: skill_settings(strict=True)):
+        isolated_settings.write_bytes(complete[:-1])  # torn mid-replace
+        taken.clear()
+        assert reader()["TELEGRAM_BOT_TOKEN"] == "1:a" and taken == ["lock"]
+
+    held = []
+    monkeypatch.setattr(cfg, "_acquire_settings_lock", lambda timeout=2.0: held.append("lock") or 99)
+    broken = complete[:-1]
+    isolated_settings.write_bytes(broken)
+    with pytest.raises(owner_settings.SettingsDocumentUnreadable) as refused:
+        owner_settings._owner_update_settings(lambda current: {**current, "TOTAL_BUDGET": 5})
+    assert isinstance(refused.value, SettingsDocumentUnknown) and str(refused.value) == \
+        owner_settings.UNREADABLE_SETTINGS_REFUSAL
+    assert held == ["lock"] and isolated_settings.read_bytes() == broken  # its own lock only; nothing written
+    with pytest.raises(owner_settings.SettingsDocumentUnreadable):
+        owner_settings._owner_settings_document(strict=True)  # still torn behind the writer: unknown, not defaults
+    assert "TELEGRAM_BOT_TOKEN" not in owner_settings._owner_settings_document()  # the ordinary read is unchanged
+    isolated_settings.unlink()
+    assert owner_settings._owner_settings_document(strict=True) == {}  # absent is new and empty

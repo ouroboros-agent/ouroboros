@@ -83,6 +83,9 @@ class ResolvedResourceBinding:
     skill_name: str
     state_drive_root: pathlib.Path
     logical_base_path: pathlib.Path | None = None
+    repository_path: pathlib.Path | None = None
+    # The address a READ asked for when a re-anchor opened ``target_path`` elsewhere: its policy holds too.
+    requested_path: pathlib.Path | None = None
 
 
 _ALL_ROOTS: frozenset[str] = frozenset({
@@ -117,14 +120,36 @@ _READ_OPS = frozenset({"read", "list", "search"})
 # write/edit/shell on the same root — property-pinned by the projection test.
 _WRITE_LIKE_OPS: frozenset[str] = frozenset({"write", "edit", "shell", "service"})
 
+# The matrix is CLOSED under two implications (TZ-1 cluster E): a root a profile
+# may ``read`` it may also ``list`` and ``search`` (both only read the same bytes
+# through the same per-file guards, so withholding them bought no protection and
+# sent the model into a probe loop over roots it could already read file by
+# file), and a root it may ``write`` it may also ``edit`` (an exact replacement
+# is a narrower write). Neither implication adds a write-like operation to a
+# read-only row, so every read-only ceiling — the read-only child, the
+# orchestrator read-only roots — holds byte for byte. The literals below are
+# written closed; ``_close_operations`` keeps a future row honest.
+_READ_IMPLIES: frozenset[str] = frozenset({"list", "search"})
+_WRITE_IMPLIES: frozenset[str] = frozenset({"edit"})
+
+
+def _close_operations(ops: set[str]) -> set[str]:
+    """``ops`` closed under read⇒list,search and write⇒edit (a new set)."""
+    closed = set(ops)
+    if "read" in closed:
+        closed |= _READ_IMPLIES
+    if "write" in closed:
+        closed |= _WRITE_IMPLIES
+    return closed
+
 
 _TOP_LEVEL_PRINCIPAL_POLICY: dict[str, set[str]] = {
     "active_workspace": {"read", "list", "search", "write", "edit", "shell", "vcs", "review", "service"},
     "system_repo": {"read", "list", "search", "write", "edit", "shell", "vcs", "review", "service"},
     "runtime_data": {"read", "list", "search", "write", "edit"},
-    "task_drive": {"read", "list", "write", "edit", "shell", "service"},
+    "task_drive": {"read", "list", "search", "write", "edit", "shell", "service"},
     "skill_payload": {"read", "list", "search", "write", "edit", "review", "shell"},
-    "artifact_store": {"read", "list", "write", "shell", "service"},
+    "artifact_store": {"read", "list", "search", "write", "edit", "shell", "service"},
     "user_files": {"read", "list", "search", "write", "edit", "shell", "service"},
     "subagent_projects": {"read", "list", "search"},
     "deliverables": {"read", "list", "search"},
@@ -133,19 +158,10 @@ _TOP_LEVEL_PRINCIPAL_POLICY: dict[str, set[str]] = {
 
 _POLICY: dict[str, dict[str, set[str]]] = {
     "local_readonly_subagent": {
-        # Read-only child VCS names still need their target binding to resolve.
+        **{root: set(_READ_OPS) for root in _TOP_LEVEL_PRINCIPAL_POLICY},
+        # Read-only VCS names still need a binding; no mutating names are exposed.
         "active_workspace": set(_READ_OPS) | {"vcs"},
         "system_repo": set(_READ_OPS) | {"vcs"},
-        "runtime_data": {"read", "list"},
-        "task_drive": {"read", "list"},
-        "artifact_store": {"read", "list"},
-        # v6.70.0 (owner-approved): read-only scouts sent to review a skill were
-        # structurally blind to its payload — a scout literally reported
-        # "reviewing blind", and a correct "skill does not exist" answer was
-        # indistinguishable from an access block. Payloads are skill CODE
-        # (data/skills/...); grants/secrets live in data/state/skills, which
-        # stays invisible to this profile.
-        "skill_payload": {"read", "list", "search"},
     },
     # Top-level preset names remain observable, but workspace focus never narrows
     # the ordinary principal. Independent path/credential/child/runtime guards
@@ -158,13 +174,9 @@ _POLICY: dict[str, dict[str, set[str]]] = {
     # keeps protected-path discipline active in the registry (it is the system
     # repo). runtime_data stays read-only.
     "acting_subagent": {
-        # Acting children write ONLY inside their isolated surface (active_workspace =
-        # the self_worktree / external_workspace / genesis). task_drive / artifact_store
-        # are read-only here (no extra write surface); the deliverable is a workspace.patch.
+        **{root: set(_READ_OPS) for root in _TOP_LEVEL_PRINCIPAL_POLICY},
+        # Broader reads do not grant another write surface.
         "active_workspace": {"read", "list", "search", "write", "edit", "shell", "vcs", "service"},
-        "runtime_data": {"read", "list"},
-        "task_drive": {"read", "list"},
-        "artifact_store": {"read", "list"},
     },
     "self_modification": _TOP_LEVEL_PRINCIPAL_POLICY,
     # operator_control gets full authority on every mutable root, but the orchestrator
@@ -176,6 +188,15 @@ _POLICY: dict[str, dict[str, set[str]]] = {
         **{root: {"read", "list", "search"} for root in _READONLY_RESOURCE_ROOTS},
     },
 }
+
+# Structural closure, in place: the row objects (and the one shared top-level
+# dict) keep their identity, so profile aliasing stays observable; a literal
+# that forgets an implied operation is corrected here, never silently narrower
+# than the rule above says. Idempotent over the shared matrix.
+for _matrix in _POLICY.values():
+    for _ops in _matrix.values():
+        _ops |= _close_operations(_ops)
+del _matrix, _ops
 
 
 _SUBAGENT_CAPABILITY_TO_OPERATION: dict[str, Operation] = {

@@ -18,7 +18,7 @@ def _repo(tmp_path):
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True, capture_output=True)
     subprocess.run(["git", "config", "user.email", "t@t"], cwd=tmp_path, check=True)
     subprocess.run(["git", "config", "user.name", "T"], cwd=tmp_path, check=True)
-    (tmp_path / "f.py").write_text("a\nb\nc\nd\ne\n", encoding="utf-8")
+    (tmp_path / "f.py").write_text("a\nb\nc\nd\ne\n", encoding="utf-8", newline="\n")
     subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
     subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=tmp_path, check=True,
                    capture_output=True)
@@ -42,7 +42,7 @@ def _fail_tree_read(monkeypatch, *, ref):
 
 def test_capture_returns_the_staged_diff(tmp_path):
     repo = _repo(tmp_path)
-    (repo / "f.py").write_text("a\nb\nCHANGED\nd\ne\n", encoding="utf-8")
+    (repo / "f.py").write_text("a\nb\nCHANGED\nd\ne\n", encoding="utf-8", newline="\n")
     subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
 
     diff = capture_staged_diff(repo)
@@ -53,7 +53,7 @@ def test_capture_returns_the_staged_diff(tmp_path):
 
 def test_capture_unified_zero_drops_unchanged_context(tmp_path):
     repo = _repo(tmp_path)
-    (repo / "f.py").write_text("a\nb\nCHANGED\nd\ne\n", encoding="utf-8")
+    (repo / "f.py").write_text("a\nb\nCHANGED\nd\ne\n", encoding="utf-8", newline="\n")
     subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
 
     compact = capture_staged_diff(repo, unified=0)
@@ -91,7 +91,7 @@ def test_git_diff_opts_env_cannot_reshape_the_capture(tmp_path, monkeypatch):
     """GIT_DIFF_OPTS overrides the context width from outside the argv; the
     capture drops it so the requested width survives."""
     repo = _repo(tmp_path)
-    (repo / "f.py").write_text("a\nb\nCHANGED\nd\ne\n", encoding="utf-8")
+    (repo / "f.py").write_text("a\nb\nCHANGED\nd\ne\n", encoding="utf-8", newline="\n")
     subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
     monkeypatch.setenv("GIT_DIFF_OPTS", "--unified=0")
 
@@ -190,15 +190,15 @@ def test_render_staged_binary_metadata_deletion_hard_blocks_on_merge_head_tree_r
     reports: a read failure is not proof the merge side never had the file."""
     repo = _repo(tmp_path)
     (repo / "bin.dat").write_bytes(b"\x00\x01old")
-    (repo / "other.txt").write_text("a\n", encoding="utf-8")
+    (repo / "other.txt").write_text("a\n", encoding="utf-8", newline="\n")
     subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
     subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=repo, check=True,
                     capture_output=True)
     subprocess.run(["git", "checkout", "-q", "-b", "side"], cwd=repo, check=True)
-    (repo / "other.txt").write_text("b\n", encoding="utf-8")
+    (repo / "other.txt").write_text("b\n", encoding="utf-8", newline="\n")
     subprocess.run(["git", "commit", "-aq", "-m", "side change"], cwd=repo, check=True)
     subprocess.run(["git", "checkout", "-q", "-"], cwd=repo, check=True)
-    (repo / "other.txt").write_text("c\n", encoding="utf-8")
+    (repo / "other.txt").write_text("c\n", encoding="utf-8", newline="\n")
     subprocess.run(["git", "commit", "-aq", "-m", "main change"], cwd=repo, check=True)
     subprocess.run(["git", "merge", "side"], cwd=repo, check=False, capture_output=True)
     assert (repo / ".git" / "MERGE_HEAD").exists(), (

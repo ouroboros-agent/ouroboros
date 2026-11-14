@@ -11,7 +11,7 @@ from ouroboros import delegate_custody as custody
 from ouroboros import observability
 from ouroboros.delegate_pending import request_body
 from tests._delegated_transport_shared import (
-    _LiveRunStub, _nanny_ctx,
+    _LiveRunStub, _nanny_ctx, _select_transport_access,
     _owned_gateway_uses_each_test_transport,  # noqa: F401 -- autouse fixture
 )
 from tests._review_session_route_shared import fake_route as _fake_route
@@ -53,7 +53,7 @@ def test_canonical_body_and_event_precede_dispatch(tmp_path, monkeypatch, reques
             return ref
         return real_write(root, body, **kwargs)
 
-    def emit(root, kind, payload):
+    def emit(root, kind, payload, **kwargs):
         if kind == custody.START_REQUESTED:
             assert order == ["blob"]
             assert "request" not in payload
@@ -61,13 +61,16 @@ def test_canonical_body_and_event_precede_dispatch(tmp_path, monkeypatch, reques
             if failure == "event":
                 return False
             order.append("event")
-        return real_emit(root, kind, payload)
+        return real_emit(root, kind, payload, **kwargs)
 
     if surface == "review":
         stub_type = request.getfixturevalue("fake_route")
     else:
         stub = _LiveRunStub()
         stub_type = type(stub)
+        # A READ-ONLY child: technical access alone decides the run shape (#1609),
+        # and this readonly-only daemon serves exactly that request.
+        _select_transport_access(monkeypatch, "readonly")
         monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
         monkeypatch.setattr(gateway, "ClaudexorGateway", lambda *a, **k: stub)
     original_start = stub_type.start_run
@@ -105,17 +108,23 @@ def test_canonical_body_and_event_precede_dispatch(tmp_path, monkeypatch, reques
         assert order == ["blob", "event", "dispatch"]
 
 
-def test_raw_review_envelope_and_thread_projection_round_trip(tmp_path):
+@pytest.mark.parametrize("access,geometry", [
+    ("readonly", None), ("full", None),
+    ("full", {"workspaceKind": "directory", "scopePaths": [], "isolation": "live"}),
+])
+def test_raw_review_envelope_and_thread_projection_round_trip(tmp_path, access, geometry):
     from ouroboros.review_thread_continuity import start_review_thread_turn
+    from ouroboros.review_session_custody import recorded_review_shape
 
     body = {"prompt": "Привет\n" + "x" * 80_000,
             "instructions": "Authorization: Bearer EXAMPLE-NOT-A-REAL-CREDENTIAL",
-            "authPreference": "subscription", "mode": "ask", "access": "readonly",
+            "authPreference": "subscription", "mode": "ask" if access == "readonly" else "agent", "access": access,
             "scope": {"kind": "project", "root": str(tmp_path)},
             "harnesses": ["codex"], "primaryHarness": "codex", "maxSeconds": 300,
             "credentialProfileId": None, "_use_thread": True, "_thread_id": "thread-1",
-            "execution": {"delegated": False, "isolation": "in_place"},
             "outputSchema": {"type": "object", "properties": {"passed": {"type": "boolean"}}}}
+    if geometry is not None:
+        body["execution"] = {"delegated": True, "workspaceRoot": str(tmp_path / "copy"), **geometry}
     original = copy.deepcopy(body)
     assert custody.record_start_requested(tmp_path, invocation_id="review", task_id="task", request=body)
     row = _start_rows(tmp_path)[0]
@@ -123,6 +132,7 @@ def test_raw_review_envelope_and_thread_projection_round_trip(tmp_path):
     restored = custody.invocation_record(tmp_path, "review")["request"]
     assert restored == body == original
     assert _digest(restored) == _digest(body)
+    assert recorded_review_shape(restored) is not None
     projections = []
 
     class Gateway:
@@ -133,7 +143,13 @@ def test_raw_review_envelope_and_thread_projection_round_trip(tmp_path):
     for envelope in (body, restored):
         start_review_thread_turn(Gateway(), envelope["_thread_id"], envelope, idempotency_key="review")
     assert projections[0] == projections[1]
-    assert not {"_thread_id", "_use_thread", "scope", "execution"} & projections[0][1].keys()
+    projected = projections[0][1]
+    assert not {"_thread_id", "_use_thread", "scope"} & projected.keys()
+    if geometry is None:
+        assert "execution" not in projected, "legacy requests acquire no new geometry during replay"
+    else:
+        assert projected["execution"] == geometry
+    assert body == original
 
 
 def test_legacy_inline_wins_even_beside_an_unreadable_ref(tmp_path, monkeypatch):
@@ -158,19 +174,26 @@ def test_unreadable_ref_keeps_request_unknown_and_retry_refuses(tmp_path, damage
         Path(row["request_ref"]["path"]).unlink()
     elif damage == "corrupt":
         Path(row["request_ref"]["path"]).write_bytes(b"not gzip")
-    else:
+    else:  # the stored request row itself carries a malformed reference: the pending obligation
+        from ouroboros import delegate_invocation, obligations, store  # and the invocation's addressed fold
+
         row["request_ref"]["size"] = "invalid"
-        custody.event_log_path(tmp_path).write_text(json.dumps(row) + "\n", encoding="utf-8")
+        obligations.add(tmp_path, "custody_open", "invocation:lost", {"request": row})
+        with store.open_store(tmp_path, write=True) as txn:
+            record = txn.get_row(delegate_invocation.INVOCATIONS, "lost")
+            record["request"]["request_ref"]["size"] = "invalid"
+            txn.put_row(delegate_invocation.INVOCATIONS, "lost", record)
     assert custody.invocation_record(tmp_path, "lost")["request"] is None
     pending = custody.pending_invocations(tmp_path)
     assert [row["invocation_id"] for row in pending] == ["lost"]
-    assert pending[0]["request"] is None and "request_ref" not in pending[0]
+    assert pending[0]["request"] is None and pending[0]["request_ref"] == row["request_ref"]
+    assert request_body(tmp_path, pending[0]) is None
     record, refusal = _validated_invocation(tmp_path, "lost", "task", "exact original")
     assert record is None
     assert json.loads(refusal.text)["reason"] == "invocation_request_unrecorded"
 
 
-@pytest.mark.parametrize("inline_request", [None, {}, [], "invalid"])
+@pytest.mark.parametrize("inline_request", [None, {}, "invalid"])
 def test_malformed_legacy_inline_without_a_reference_keeps_existing_behavior(tmp_path, inline_request):
     assert custody.emit(tmp_path, custody.START_REQUESTED, {
         "invocation_id": "legacy-empty", "task_id": "owner", "request": inline_request})
@@ -191,9 +214,10 @@ def test_lost_ack_keeps_the_original_start_claim_when_its_body_is_unreadable(tmp
             keys.append(idempotency_key)
             if len(keys) == 1:
                 raise gateway.ClaudexorUnavailable("daemon_unreachable", "fixture accepted start then lost reply")
-            return {"runId": "original-run"}
+            return {"runId": f"run-{len(keys)}"}
 
     stub = LostAcknowledgment()
+    _select_transport_access(monkeypatch, "readonly")   # a read-only child (#1609)
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
     monkeypatch.setattr(gateway, "ClaudexorGateway", lambda *args, **kwargs: stub)
     ctx = _nanny_ctx(tmp_path, task_id="owner")
@@ -210,14 +234,15 @@ def test_lost_ack_keeps_the_original_start_claim_when_its_body_is_unreadable(tmp
     _audit_task_custody(tmp_path, "owner", audit, emit_evidence=False)
     assert audit["pending_invocation_ids"] == [token]
     assert audit["unreconciled"] == [f"invocation:{token}"]
-    fresh = json.loads(delegate._delegate_start(ctx, "Inspect fixture files.").text)
-    assert fresh["reason"] == "replacement_requires_settlement" and keys == [token]
+    fresh = json.loads(delegate._delegate_start(ctx, "Inspect other fixture files.").text)
+    assert fresh["status"] == "started" and keys[0] == token and keys[1] != token
+    new_token = keys[1]
     retry = json.loads(delegate._delegate_start(ctx, "Inspect fixture files.", retry_of=token).text)
     if damage:
-        assert retry["reason"] == "invocation_request_unrecorded" and keys == [token]
+        assert retry["reason"] == "invocation_request_unrecorded" and keys == [token, new_token]
         assert "Start a new run" not in retry["detail"]
     else:
-        assert retry["status"] == "started" and keys == [token, token]
+        assert retry["status"] == "started" and keys == [token, new_token, token]
 
 
 @pytest.mark.parametrize("damage", ["missing", "corrupt"])
@@ -248,7 +273,7 @@ def test_missing_pending_body_keeps_snapshot_and_orphan_recovery_without_a_post(
     assert custody.pending_invocations(tmp_path) == [] and custody.open_snapshot_ids(tmp_path) == set()
 
 
-@pytest.mark.parametrize("prior", ["absent", "refused", "intact", "missing", "corrupt"])
+@pytest.mark.parametrize("prior", ["absent", "refused", "corrupt"])
 def test_skill_review_retries_distinguish_known_pending_from_absent_or_refused(tmp_path, fake_route, prior):
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
     from ouroboros.review_execution import ReviewRouteUnavailable
@@ -299,8 +324,10 @@ def test_pending_scan_only_reads_blobs_for_surviving_invocations(tmp_path, monke
     monkeypatch.setattr(observability, "read_blob_ref", read)
     pending = custody.pending_invocations(tmp_path)
     assert [row["invocation_id"] for row in pending] == ["pending"]
-    assert reads == ["pending"]
-    assert "request_ref" not in pending[0]
+    assert reads == []  # current inventory reads typed facts, not canonical bodies
+    assert pending[0]["request"] is None and pending[0]["request_ref"]
+    assert request_body(tmp_path, pending[0]) == {"prompt": "pending"}
+    assert reads == ["pending"]  # only an addressed replay resolves the surviving body
 
 
 @pytest.mark.parametrize("different", [False, True])
@@ -319,3 +346,53 @@ def test_task_event_omits_only_an_equal_contract_mirror_without_mutation(tmp_pat
     assert ("task_contract" in projected["metadata"]) is different
     if different:
         assert projected["metadata"]["task_contract"] == original["metadata"]["task_contract"]
+
+
+@pytest.mark.parametrize("start_row", ["written", "billing_refused", "unknown_error", "not_written"])
+def test_a_review_start_proven_unsent_spends_no_paid_wave_and_any_other_is_paid_before_its_post(
+        tmp_path, fake_route, monkeypatch, start_row):
+    """F4 (owner, 8 Nov 2026): the paid stamp follows the durable start row and precedes every POST. A start the
+    billing authority refused before any row or POST is proven unsent: no stamp, and the seat says unrequested. A
+    start row whose landing is unknown (an error, a False write a replay could still POST) is paid; a POST never
+    happens without the stamp before it."""
+    from ouroboros.review_execution import ReviewRouteUnavailable, SessionInvocation, run_delegated_review_session
+    from ouroboros.usage_accounting import BillingAuthorityUnavailable
+
+    order: list = []
+
+    def stamp():
+        order.append("stamp")
+
+    real_record, real_start = custody.record_start_requested, fake_route.start_run
+
+    def record(*args, **kwargs):
+        order.append("row")
+        if start_row == "billing_refused":
+            raise BillingAuthorityUnavailable("fixture: billing authority unreadable before any row")
+        if start_row == "unknown_error":
+            raise OSError("fixture: the row write's landing is unknown")
+        return False if start_row == "not_written" else real_record(*args, **kwargs)
+
+    def post(self, request, **kwargs):
+        order.append("post")
+        return real_start(self, request, **kwargs)
+
+    monkeypatch.setattr(custody, "record_start_requested", record)
+    monkeypatch.setattr(fake_route, "start_run", post)
+    invocation = SessionInvocation(task_id="t-paid", surface="scope_review", slot_id="scope_slot_1", timeout_sec=30,
+                                   dispatch_stamp=stamp)
+    if start_row == "written":
+        run_delegated_review_session(invocation=invocation, prompt="review this", root="/tmp/fake-repo",
+                                     custody_drive=tmp_path)
+        assert order == ["row", "stamp", "post"], "paid before the POST, after the start row"
+        return
+    with pytest.raises((ReviewRouteUnavailable, OSError)) as caught:
+        run_delegated_review_session(invocation=invocation, prompt="review this", root="/tmp/fake-repo",
+                                     custody_drive=tmp_path)
+    assert "post" not in order
+    if start_row == "billing_refused":
+        assert order == ["row"] and getattr(caught.value, "delegated_start_unrequested", None) is True
+        assert getattr(caught.value, "code", "") == "billing_authority_unavailable"
+    else:
+        assert order == ["row", "stamp"], "an unknown landing is paid, never refunded"
+        assert getattr(caught.value, "delegated_start_unrequested", None) is not True

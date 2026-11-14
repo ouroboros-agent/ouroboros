@@ -1,7 +1,7 @@
 """Reconciliation of delegated runs: the settle-or-cancel sweeps and their recovery.
 
 The open-run and pending-invocation projections, the loop-exit release, the
-kill-path and orphan sweeps and the per-run settle-or-cancel core. Extracted
+kill-path, tree-Stop and orphan sweeps and the per-run settle-or-cancel core. Extracted
 from delegate_custody.py (v7 DEL1 split); delegate_custody.py re-exports every
 name, so every existing reference — the tools, the supervisor sweeps, the
 tests and monkeypatch targets — still finds them there.
@@ -10,13 +10,14 @@ tests and monkeypatch targets — still finds them there.
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from ouroboros._usage_rows import REVIEW_ATTRIBUTION_KEYS
 from ouroboros.delegate_registration_policy import record_persistent as _record_persistent
+from ouroboros.observability import timed_phase
 from ouroboros.subagent_history import session_request_facts
-
-from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # annotation-only name; lazy under future annotations, never imported at runtime
     from ouroboros.delegate_custody import RunCustody
@@ -25,6 +26,14 @@ if TYPE_CHECKING:  # annotation-only name; lazy under future annotations, never 
 # The parent logger name is pinned on purpose: records moved with their code
 # keep the exact `%(name)s` every handler and reader saw before the split.
 log = logging.getLogger("ouroboros.delegate_custody")
+
+
+def _mark_root_cost(drive_root: Any, custody: Any) -> None:
+    """A custody transition this process made (a run started or settled): the root's live cost
+    figure is read again at the next supervisor flush (RV_MAIN M7). In a worker the memo is idle."""
+    from ouroboros.cost_projection import LIVE_ROOT_COSTS
+
+    LIVE_ROOT_COSTS.mark(drive_root, getattr(custody, "root_task_id", "") or getattr(custody, "task_id", ""))
 
 
 def _custody():
@@ -42,9 +51,44 @@ def _custody():
 
 def open_runs(drive_root: Any, state: Optional[Dict[str, "RunCustody"]] = None) -> List[RunCustody]:
     """Runs with a durable start and no durable settlement (``state``: a shared
-    pre-replayed snapshot, so a batch of audits pays one log traversal)."""
-    return [custody for custody in (state if state is not None else _custody().replay(drive_root)).values()
-            if not custody.settled]
+    pre-read snapshot, so a batch of audits pays one read; else the held rows that
+    may be open, so the settled held majority is never decoded: ``open_held_runs``)."""
+    if state is None:
+        from ouroboros.delegate_custody_current import open_held_runs
+
+        state = open_held_runs(drive_root)
+    return [custody for custody in state.values() if not custody.settled]
+
+
+def run_tree_id(custody: RunCustody) -> str:
+    """The task tree a run belongs to: its recorded root, else its own task (the custody store's tree key)."""
+    return str(custody.root_task_id or custody.task_id or "")
+
+
+def tree_open_runs(drive_root: Any, task_id: str) -> List[RunCustody]:
+    """The open runs a cascade Stop of ``task_id`` reaches (``stop_tree_runs``): the task's own and, when it is a
+    tree's root, every run of that tree, which the work projection counts as that root's live members."""
+    target = str(task_id or "")
+    return [custody for custody in open_runs(drive_root)
+            if target and target in {run_tree_id(custody), str(custody.task_id or "")}]
+
+
+def stop_tree_runs(drive_root: Any, task_id: str, *,
+                   gateway_factory: Optional[Callable[[], Any]] = None) -> List[Dict[str, Any]]:
+    """Cancel the open runs a cascade Stop of ``task_id`` reaches (``tree_open_runs``), behind the owner's verdict.
+
+    A run outlives every owner terminal that was not a verdict (``_reconcile_one``'s inverted floor), so
+    the open runs of a settled tree waited for exactly this one: the owner's cancellation, which also
+    speaks for a review panel's run. A Stop is a release surface: attach-only, no daemon is started and no
+    pending invocation is replayed (exit does not admit). An unconfirmed cancel leaves the run open.
+    """
+    from ouroboros.task_results import STATUS_CANCELLED
+
+    runs = tree_open_runs(drive_root, task_id)
+    if not runs:
+        return []
+    return _reconcile_each(drive_root, runs, gateway_factory or attach_only_gateway,
+                           deliberate_terminal=STATUS_CANCELLED)
 
 
 def pending_invocations(drive_root: Any,
@@ -57,169 +101,373 @@ def pending_invocations(drive_root: Any,
     same rule as ``invocation_record``). Legacy rows without a body stay excluded;
     an unreadable request reference retains identity with ``request=None``.
     Reconciliation cannot replay it without that body. ``rows`` shares
-    one pre-read snapshot with ``replay`` (atomic payload busy claim)."""
+    one pre-read snapshot with ``replay`` for consistent inventory reads."""
     from ouroboros.delegate_pending import pending_invocations as replay_pending
 
     return replay_pending(drive_root, rows)
 
 
+def attach_only_gateway() -> Any:
+    """The release surfaces' transport: attach to a serving daemon, never start one.
+
+    Exit does not admit (DEVELOPMENT "Process Custody Rule"): a loop exit, a kill
+    boundary or a stop settles what is already running and provisions, downloads,
+    spawns and admits nothing. ``read_owned_gateway`` raises the typed
+    ``ClaudexorUnavailable`` when no daemon answers, which every reconcile pass
+    already treats as "skipped, the sweep re-judges".
+    """
+    from ouroboros.claudexor_daemon import read_owned_gateway
+
+    return read_owned_gateway()
+
+
+_loop_exit_audit: ContextVar[Optional[Dict[str, Any]]] = ContextVar("loop_exit_audit", default=None)
+
+
+@contextmanager
+def defer_loop_exit_audit(usage: Dict[str, Any]):
+    """Retain only audit facts for delivery; resource release still finishes in this scope."""
+    token = _loop_exit_audit.set(usage)
+    try:
+        yield
+    finally:
+        _loop_exit_audit.reset(token)
+
+
+@timed_phase("release_task_runs")
 def release_task_runs(drive_root: Any, task_id: str, *,
                       gateway_factory: Optional[Callable[[], Any]] = None) -> List[Dict[str, Any]]:
-    """Run the one non-panic terminal custody boundary for a normal loop exit."""
+    """Run the one non-panic terminal custody boundary for a normal loop exit.
+
+    A release path: ``gateway_factory`` defaults to ``attach_only_gateway``, and a
+    pending invocation of this task is never replayed here (``reconcile_task_runs``).
+    """
 
     from ouroboros.delegate_terminal import (
-        record_terminal_reconciliation, terminal_reconcile_task,
+        record_terminal_reconciliation,
+        terminal_reconcile_task,
     )
 
+    deferred = _loop_exit_audit.get()
     result = terminal_reconcile_task(
-        drive_root, task_id, gateway_factory=gateway_factory, trigger="loop_exit",
+        drive_root, task_id, gateway_factory=gateway_factory or attach_only_gateway,
+        trigger="loop_exit", audit=deferred is None,
     )
-    record_terminal_reconciliation(drive_root, task_id, result)
+    if deferred is None:
+        record_terminal_reconciliation(drive_root, task_id, result)
+    else:
+        deferred["delegate_terminal_reconciliation"] = result
     return list(result.get("outcomes") or [])
 
 
+@timed_phase("custody_reconcile", within="release_task_runs")
 def reconcile_task_runs(drive_root: Any, task_id: str, *,
                         gateway_factory: Optional[Callable[[], Any]] = None,
-                        deliberate_terminal: str = "") -> List[Dict[str, Any]]:
+                        deliberate_terminal: str = "",
+                        run_ids: Optional[set[str]] = None) -> List[Dict[str, Any]]:
     """Settle or cancel ONE task's open runs from the DURABLE rows (kill path).
 
     The supervisor-side twin of ``release_task_runs`` for a task whose worker was
     just KILLED (cancellation custody / reap): the graceful release never ran and
     its memo died with the process, so the durable rows are the only complete
-    view. Covers pending invocations like the orphan sweep; cheap when the task
-    delegated nothing.
+    view. Cheap when the task delegated nothing. A release surface: the task's
+    pending (START_REQUESTED-only) invocations are NOT replayed here — a re-POST
+    starts work, and exit does not admit; they stay durable for the admitted
+    startup/periodic sweep (``reconcile_orphaned_runs``), which recovers them
+    under the same key once the owner is gone. A review panel's own pending
+    invocation, which that sweep leaves to its panel (#1006), is named here once
+    as retained, through no transport. ``gateway_factory`` defaults to
+    ``attach_only_gateway``; a kill boundary names it explicitly.
 
-    ``deliberate_terminal`` is the terminal status the KILLING caller is about to
-    write, when that terminal is the task's own deliberate end (an owner
-    cancellation). The kill boundary audits custody before its terminal write, so
-    the durable result the inverted floor otherwise reads does not exist yet; the
-    caller already knows the verdict and states it here rather than having the
-    host guess or re-read a file that is not there. Empty means "no verdict from
-    me", which is what every host bound (deadline, reap) and every read-only
-    sweep passes.
+    ``deliberate_terminal`` is the caller's verdict on the task's open runs: the
+    terminal status a KILLING caller is about to write when that terminal is the
+    task's deliberate end (an owner cancellation), or ``interrupted`` for an
+    abrupt loss whose task continues in a later attempt (a signal-death retry, the
+    work an owner Restart returns or a fault holds). The kill boundary audits
+    custody before its terminal write, so the durable result the inverted floor
+    otherwise reads does not exist yet; the caller already knows the verdict and
+    states it here rather than having the host guess or re-read a file that is
+    not there. Empty means "no verdict from me", which is what every host bound
+    (deadline, reap) and every read-only sweep passes.
     """
     mine = str(task_id or "")
     if not mine:
         return []
-    held = [c for c in _custody().open_runs(drive_root) if c.task_id == mine]
-    stray = [record for record in _custody().pending_invocations(drive_root)
-             if record["task_id"] == mine]
+    from ouroboros.delegate_custody_current import open_held_runs, task_snapshot
+
+    view = task_snapshot(drive_root, mine)  # one read; pending starts remain the admitted sweep's duty
+    if run_ids is not None:
+        view = {"runs": {rid: run for rid, run in view["runs"].items() if rid in run_ids}, "pending": []}
+    held = [c for c in view["runs"].values() if not c.settled]
+    named = [_retain_panel_invocation(drive_root, record) for record in view["pending"]
+             if _custody().review_owned_source(record.get("source"))]
     # Also the registration retry lane for the task's OWN settled-but-owned
     # runs in retire-eligible projects (a one-shot process may never see a
-    # sweep tick); deferred registrations stay with the periodic sweep.
-    snapshot = _custody().replay(drive_root).values()
-    live = {r.project_id for r in snapshot
-            if r.project_id and r.run_id and not r.settled}
-    owed = [r for r in snapshot
-            if r.task_id == mine and r.project_owned and r.project_id
-            and r.settled and r.project_id not in live]
-    if not held and not stray and not owed:
-        return []
-    return _reconcile_each(drive_root, held, gateway_factory, pending=stray,
-                           deliberate_terminal=deliberate_terminal)
+    # sweep tick); deferred registrations stay with the periodic sweep. A
+    # project with ANY unsettled run is live; unsettled runs are held rows.
+    owned = [r for r in view["runs"].values() if r.project_owned and r.project_id and r.settled]
+    live = ({r.project_id for r in open_held_runs(drive_root).values() if r.project_id and r.run_id and not r.settled}
+            if owned else set())
+    owed = [r for r in owned if r.project_id not in live]
+    if not held and not owed:
+        return named  # pending invocations alone open no transport: the sweep or their panel owns them
+    return [*named, *_reconcile_each(drive_root, held, gateway_factory or attach_only_gateway,
+                                     deliberate_terminal=deliberate_terminal)]
 
 
 def reconcile_orphaned_runs(
     drive_root: Any,
-    running_task_ids: Optional[set] = None,
+    running_task_ids: Optional[Any] = None,
     *,
     gateway_factory: Optional[Callable[[], Any]] = None,
     recoverable_task_ids: Optional[set] = None,
+    recoverable_handles: Optional[set] = None,
+    replay_pending: Optional[Callable[[], bool]] = None,
+    observe_pending: Optional[Callable[[], bool]] = None,
 ) -> List[Dict[str, Any]]:
     """Settle or cancel every open run whose owning task is no longer running.
 
     The owner-is-gone predicate is the SAME one ``process_custody.reap_orphaned_processes``
     already uses (the supervisor's live task set), so a delegated run and a spawned
     process cannot disagree about whether their owner still exists. ``running_task_ids``
-    of None means UNKNOWN and reconciles nothing — never mass-cancel on missing info.
+    is that set, or a zero-arg callable producing it; None means UNKNOWN and reconciles
+    nothing — never mass-cancel on missing info.
+
+    ``gateway_factory`` is named by every production caller: the admitted startup/periodic
+    sweep ensures, a stop or the owner's Restart attaches; a caller that names none gets
+    the attach-only transport (a bare sweep can only attach). ``replay_pending`` is the admission
+    predicate for re-POSTing an orphaned pending invocation (``_recover_pending_invocation``);
+    it is re-asked immediately before each replay, so a stop that lands mid-pass defers
+    the rest. ``None`` (the release and Restart surfaces) never replays: the rows stay
+    durable and are reported ``invocation_retained``. ``observe_pending`` separately admits
+    the noncreating read (``delegate_accepted``), re-asked before each row like the replay:
+    an orphan's accepted work is read before any replay is considered, and every other pending
+    start a review panel does not own (owner live, reserved or protected, a paused one too) is
+    read and bound only (``_observe_pending_invocation``). ``None`` reads nothing, so attach-only
+    release and shutdown passes do no new work; an attach-only recovery caller may read without
+    replaying. The admitted sweep derives both from one not-stopping predicate.
     """
     if running_task_ids is None:
         return []
-    spared = set(recoverable_task_ids or ())
-    live_or_reserved = set(running_task_ids) | spared
-    orphans = [c for c in _custody().open_runs(drive_root) if c.task_id and c.task_id not in live_or_reserved]
+    # CANDIDATES FIRST, LIVENESS SECOND, exactly as the process reaper reads its ledger:
+    # replaying the custody log takes seconds, and a candidate exists ⇒ its owner was
+    # registered earlier (admission takes ``_queue_lock`` before any spawn), so an owner
+    # absent from the LATER snapshot is really gone rather than merely not yet admitted.
+    from ouroboros.delegate_custody_current import open_held_runs
+    candidates = [c for c in open_held_runs(drive_root).values()
+                  if not c.settled]  # settled collection debt belongs to the body's independent held-row reader
     # The class ONE STEP EARLIER (P34R.2): an invocation whose POST the daemon may have
     # accepted but whose worker died before record_started has no run row for the sweep
     # above to find — a live mutating run nobody could ever collect. Recovered here on
     # the SAME owner-is-gone predicate; a pending invocation whose owner is ALIVE stays
     # untouched, because that owner holds the retry token and decides.
-    stray = [record for record in _custody().pending_invocations(drive_root)
-             if record["task_id"] and record["task_id"] not in live_or_reserved]
-    return _reconcile_each(drive_root, orphans, gateway_factory, pending=stray)
+    unbound = _custody().pending_invocations(drive_root)
+    live = running_task_ids() if callable(running_task_ids) else running_task_ids
+    if live is None:
+        return []  # the snapshot could not be taken: still UNKNOWN, still touch nothing
+    live_or_reserved = set(live)
+    protected = set(recoverable_handles or ())
+    if recoverable_task_ids:
+        from ouroboros.delegate_recovery import recoverable_handles as saved_handles
+
+        protected.update(pair for pair in saved_handles(drive_root) if pair[0] in recoverable_task_ids)
+    orphans = [c for c in candidates if c.task_id and c.task_id not in live_or_reserved
+               and (c.task_id, c.run_id, c.invocation_id) not in protected
+               and (c.task_id, c.run_id, "") not in protected]
+    # A review surface's pending invocation belongs to its panel, which rejoins it by
+    # its exact key (#1006): this sweep would only re-report "retained" every pass.
+    held = [record for record in unbound
+            if record["task_id"] and not _custody().review_owned_source(record.get("source"))]
+    stray = [record for record in held if record["task_id"] not in live_or_reserved
+             and (record["task_id"], "", record["invocation_id"]) not in protected]
+    # The rest have an owner holding their retry token (live, reserved or protected, a paused
+    # one included): only what the engine already accepted for them is read and bound (#3138).
+    strays = {record["invocation_id"] for record in stray}
+    watched = ([record for record in held if record["invocation_id"] not in strays]
+               if observe_pending is not None else [])
+    return _reconcile_each(drive_root, orphans, gateway_factory or attach_only_gateway, pending=stray,
+                           live_task_ids=live_or_reserved, recoverable_handles=protected, replay_pending=replay_pending,
+                           watched=watched, observe_pending=observe_pending)
 
 
 def _reconcile_each(drive_root: Any, runs: List[RunCustody],
-                    gateway_factory: Optional[Callable[[], Any]],
+                    gateway_factory: Callable[[], Any],
                     pending: Optional[List[Dict[str, Any]]] = None,
-                    deliberate_terminal: str = "") -> List[Dict[str, Any]]:
-    """One transport, one settle-or-cancel pass. Shared by both release surfaces.
+                    deliberate_terminal: str = "", live_task_ids=None, recoverable_handles=(),
+                    replay_pending: Optional[Callable[[], bool]] = None,
+                    watched: Optional[List[Dict[str, Any]]] = None,
+                    observe_pending: Optional[Callable[[], bool]] = None) -> List[Dict[str, Any]]:
+    """One settle-or-cancel pass, one transport per engine. Shared by every reconcile surface.
 
+    ``gateway_factory`` has NO default: the caller names whether this pass may ensure
+    (the admitted sweep) or only attach (every release, kill, stop and Restart path).
     ``pending`` is the durable sweep's extra duty: START_REQUESTED-only invocations
-    (P34R.2). The in-process twin ``release_task_runs`` never passes it — its memo is
-    run-keyed and cannot name an unbound invocation — so that class is covered by the
-    startup/periodic sweep, within its cadence. The registration pass at the end is
+    (P34R.2), passed by ``reconcile_orphaned_runs`` alone; the task-scoped
+    ``reconcile_task_runs`` leaves them to the sweep. Asked again before each row,
+    ``observe_pending()`` admits reading a row's accepted work and ``replay_pending()`` a
+    miss's replay; a row neither admits is retained. ``watched`` rows, whose owner holds
+    them, are only read and bound. The registration pass at the end is
     the third duty: settlement no longer discharges project ownership, and the
     startup/periodic sweep surface is where settled-but-owned registrations get
     their retry lane (the task-scoped surface can exit early with none open).
+    Runs, pending invocations and registrations bound to a managed work engine pass
+    through that engine alone, one pass per engine (``execution_domain.engine_groups``):
+    a lost create is re-POSTed only where it was bound, and one engine's answer never
+    settles another's run or project. Unmanaged, the owned engine's pass is the whole pass.
     """
+    if gateway_factory is None:
+        raise ValueError("delegated-run reconciliation needs an explicit gateway factory: "
+                         "ensure_owned_gateway for the admitted sweep, attach_only_gateway otherwise")
     # Registration duty is real work only for a retire-ELIGIBLE project:
     # a deferred one must not spin the daemon up.
-    snapshot = _custody().replay(drive_root).values()
-    unsettled_projects = {row.project_id for row in snapshot
-                          if row.project_id and row.run_id and not row.settled}
+    from ouroboros.delegate_continuation import still_continuable
+    from ouroboros.delegate_custody_current import held_runs
+    from ouroboros.execution_domain import engine_factory, engine_groups
+
+    # Owned registrations and unsettled runs are HELD rows: one indexed read.
+    snapshot = list(held_runs(drive_root).values())
+    # Only a still-owned registration can be retired, so only its rows are asked
+    # (each ask reads task results); one continuable row keeps the whole project.
+    owned = {row.project_id for row in snapshot if row.project_owned and row.project_id}
+    unsettled_projects: set = set()
+    for row in snapshot:
+        if (row.project_id in owned and row.project_id not in unsettled_projects and row.run_id
+                and (not row.settled or still_continuable(
+                    drive_root, row, live_task_ids, recoverable_handles=recoverable_handles))):
+            unsettled_projects.add(row.project_id)
     registrations = [row for row in snapshot
                      if row.project_owned and row.project_id
                      and row.project_id not in unsettled_projects]
-    if not runs and not pending and not registrations:
-        return []
+    outcomes: List[Dict[str, Any]] = []
+    for ref, (bound_runs, bound_pending, bound_registrations, bound_watched) in engine_groups(
+            runs, pending or [], registrations, watched or []):
+        outcomes.extend(_reconcile_engine(
+            drive_root, bound_runs, engine_factory(ref, gateway_factory), bound_pending if pending is not None else None,
+            bound_registrations, deliberate_terminal=deliberate_terminal, live_task_ids=live_task_ids,
+            recoverable_handles=recoverable_handles, replay_pending=replay_pending, watched=bound_watched,
+            observe_pending=observe_pending))
+    return outcomes
+
+
+def _reconcile_engine(drive_root: Any, runs: List[RunCustody], gateway_factory: Callable[[], Any],
+                      pending: Optional[List[Dict[str, Any]]], registrations: List[RunCustody], *,
+                      deliberate_terminal: str, live_task_ids, recoverable_handles,
+                      replay_pending: Optional[Callable[[], bool]], watched=(),
+                      observe_pending: Optional[Callable[[], bool]] = None) -> List[Dict[str, Any]]:
+    """``_reconcile_each``'s pass over one engine: its runs, pending invocations and registrations."""
+    def _replay_admitted() -> bool:
+        return replay_pending is not None and bool(replay_pending())
+
+    def _read_admitted() -> bool:
+        return observe_pending is not None and bool(observe_pending())
+
+    reading = _read_admitted()
+    retained = [] if reading or _replay_admitted() else [
+        {"invocation_id": str(record["invocation_id"]), "task_id": str(record["task_id"]),
+         "action": "invocation_retained", "reason": "replay_not_admitted"}
+        for record in pending or []]
+    watched = list(watched or ()) if reading else []
+    if not runs and not registrations and not watched and (not pending or retained):
+        return retained  # no transport is opened for rows this pass may not read or replay
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
-    if gateway_factory is None:
-        # Attach to the installation's surviving daemon, or restart a dead one
-        # when reconciliation has real work (never on the empty early return).
-        # A staged runtime pin applies at that natural start, not by killing
-        # a live daemon merely because its spawning server generation ended.
-        from ouroboros.claudexor_daemon import ensure_owned_gateway
-
-        gateway_factory = ensure_owned_gateway
+    gateway = None
+    outcomes: List[Dict[str, Any]] = list(retained)
+    settlement_pending = any(not row.settled for row in runs)
     try:
-        gateway = gateway_factory()
-        gateway.handshake()
-    except ClaudexorUnavailable:
-        log.debug("delegated-run reconciliation skipped: transport unavailable", exc_info=True)
-        return []
-    outcomes: List[Dict[str, Any]] = []
-    try:
+        try:
+            gateway = gateway_factory()
+            gateway.handshake()
+        except ClaudexorUnavailable:
+            # The body collects retained sources independently. A transport gap
+            # proves nothing about execution; control custody stays open.
+            log.debug("delegated-run reconciliation: transport unavailable", exc_info=True)
+            return retained
         for custody in runs:
             outcomes.append(_custody()._reconcile_one(
                 drive_root, gateway, custody,
                 deliberate_terminal=deliberate_terminal,
             ))
-        for record in pending or []:
+        for record in [] if retained else (pending or []):
+            may_read, may_replay = _read_admitted(), _replay_admitted()  # rechecked at dispatch: a stop defers the rest
+            if not (may_read or may_replay):
+                outcomes.append({"invocation_id": str(record["invocation_id"]),
+                                 "task_id": str(record["task_id"]),
+                                 "action": "invocation_retained", "reason": "replay_not_admitted"})
+                continue
             outcomes.append(_recover_pending_invocation(
-                drive_root, gateway, record, deliberate_terminal=deliberate_terminal,
+                drive_root, gateway, record, deliberate_terminal=deliberate_terminal, may_read=may_read,
+                may_replay=may_replay, replay_admitted=_replay_admitted,
             ))
-        # Recomputed inside: a run settled this very pass may have made its
-        # project eligible - the pre-pass gate is not the last word.
-        if registrations or runs:
-            _custody().retire_settled_registrations(drive_root, gateway)
+        for record in watched:
+            if not _read_admitted():  # a stop mid-pass defers the rest; the owner keeps the row either way
+                break
+            observed = _observe_pending_invocation(drive_root, gateway, record)
+            if observed["action"] == "accepted_start_bound":  # its owner's start in flight or unknown is no news
+                outcomes.append(observed)
+        # A newly settled run may make its project eligible. Collection of an
+        # already-settled run cannot: keep the pre-pass continuation deferral
+        # without reading all of that project's historical sharers again.
+        if registrations or settlement_pending:
+            _custody().retire_settled_registrations(drive_root, gateway, live_task_ids=live_task_ids,
+                                                  recoverable_handles=recoverable_handles)
     finally:
         try:
-            gateway.close()
+            if gateway is not None:
+                gateway.close()
         except Exception:
             log.debug("delegated-run reconciliation close failed", exc_info=True)
     return outcomes
 
 
+def _retain_panel_invocation(drive_root: Any, record: Dict[str, Any]) -> Dict[str, Any]:
+    """Name a REVIEW surface's pending invocation as retained: its panel rejoins it (#1006)."""
+    result = {"invocation_id": str(record["invocation_id"]), "task_id": str(record["task_id"]),
+              "action": "invocation_retained", "reason": "review_panel_owns_invocation"}
+    _custody().emit(drive_root, _custody().RECONCILED, result)
+    return result
+
+
+def _observe_pending_invocation(drive_root: Any, gateway: Any, record: Dict[str, Any]) -> Dict[str, Any]:
+    """Read what the engine accepted for a pending start its owner still holds (live, reserved or
+    protected, a paused owner's included), and bind it once (``delegate_accepted.recover``).
+
+    The owner keeps the retry token and every decision: nothing is re-sent, cancelled or settled
+    here, and its Pause stands. A bound run is observed, collected and stopped by the existing
+    owners of open runs (the body's held-row observer, the owner's own wait, a Pause's stop policy).
+    A miss writes nothing, so an owner whose start is still in flight costs one read per pass.
+    """
+    from ouroboros.delegate_accepted import recover
+    from ouroboros.delegate_pending import request_body
+
+    body = request_body(drive_root, record)
+    if not isinstance(body, dict) or not body:
+        return {"invocation_id": str(record["invocation_id"]), "task_id": str(record["task_id"]),
+                "action": "invocation_retained", "reason": "invocation_request_unrecorded"}
+    held, receipt = recover(drive_root, gateway, {**record, "request": body})
+    if held is not None and receipt["action"] == "accepted_start_bound":
+        _custody().emit(drive_root, _custody().RECONCILED, receipt)
+    return receipt
+
+
+@timed_phase("custody_pending", within="release_task_runs")
 def _recover_pending_invocation(drive_root: Any, gateway: Any,
                                 record: Dict[str, Any], *,
-                                deliberate_terminal: str = "") -> Dict[str, Any]:
+                                deliberate_terminal: str = "", may_read: bool = False,
+                                may_replay: bool = True,
+                                replay_admitted: Optional[Callable[[], bool]] = None) -> Dict[str, Any]:
     """Recover the run (if any) behind an orphaned pending invocation, idempotently.
 
-    The stored canonical body is re-POSTed under the invocation's own wire key:
-    the engine returns the ORIGINAL handle when the first POST was accepted, and
-    starts fresh only when the daemon truly never saw it. A definite 4xx retires
-    the invocation and its registration; an unknown outcome stays pending.
+    With ``may_read``, what the engine already accepted is read first (``delegate_accepted.recover``):
+    a found command, or a retained turn's run, is bound once and reconciled like any open run,
+    with nothing re-sent; accepted work custody cannot bind now, an answer from a store this start
+    is not for, or a typed refusal to read it keeps it pending with no replay (``NO_REPLAY``).
+    Otherwise, only with ``may_replay``, the stored canonical body is
+    re-POSTed under the invocation's own wire key: the engine returns the ORIGINAL handle when
+    the first POST was accepted, and starts fresh only when the daemon truly never saw it. Keys
+    live per engine store, so the re-POST goes only to the store the start was submitted to
+    (``replay_store_unproven``, unchanged: a lookup miss neither widens nor replaces it). A
+    definite 4xx retires the invocation and its registration; an unknown outcome stays pending.
 
     A REVIEW surface's own pending invocation is retained untouched: its panel
     rejoins it through ``review_session_custody``, and a delegation-domain
@@ -230,19 +478,53 @@ def _recover_pending_invocation(drive_root: Any, gateway: Any,
     invocation_id = str(record["invocation_id"])
     task_id = str(record["task_id"])
     if _custody().review_owned_source(record.get("source")):
-        result = {"invocation_id": invocation_id, "task_id": task_id,
-                  "action": "invocation_retained",
-                  "reason": "review_panel_owns_invocation"}
-        _custody().emit(drive_root, _custody().RECONCILED, result)
-        return result
-    body = record.get("request")
+        return _retain_panel_invocation(drive_root, record)
+    from ouroboros.delegate_pending import request_body
+    body = request_body(drive_root, record)
     if not isinstance(body, dict) or not body:
         result = {"invocation_id": invocation_id, "task_id": task_id,
                   "action": "invocation_retained", "reason": "invocation_request_unrecorded"}
         _custody().emit(drive_root, _custody().RECONCILED, result)
         return result
+    record = {**record, "request": body}
+    from types import SimpleNamespace
+
+    from ouroboros.delegate_accepted import NO_REPLAY, bind_started, recover
+    from ouroboros.delegate_pending import replay_store_unproven
+    from ouroboros.owner_pause import OwnerPauseRefused, run_operation
+
+    held, looked = recover(drive_root, gateway, record) if may_read else (None, {"reason": "", "lookup": "not_read"})
+    if held is not None:
+        if looked["action"] == "accepted_start_bound":
+            _custody().emit(drive_root, _custody().RECONCILED, looked)
+        return _custody()._reconcile_one(drive_root, gateway, held, deliberate_terminal=deliberate_terminal)
+    if looked["reason"] in NO_REPLAY:
+        return looked
+    if not may_replay:  # a read alone is admitted: nothing is sent
+        return {"invocation_id": invocation_id, "task_id": task_id, "action": "invocation_retained",
+                "reason": "replay_not_admitted", "lookup": looked["lookup"]}
+    if unproven := replay_store_unproven(record, getattr(gateway, "store_identity", "")):  # the pass's handshake
+        # No row per pass: the pending request row stays the durable fact while that store is not served.
+        return {"invocation_id": invocation_id, "task_id": task_id, "action": "invocation_retained",
+                "reason": "invocation_store_unproven", "detail": unproven, "lookup": looked["lookup"]}
+    request = dict(body)
+
+    def submit():
+        # Lookup and waiting for the launch lock can outlive the pass's admission snapshot.
+        if replay_admitted is not None and not replay_admitted():
+            raise OwnerPauseRefused("replay_not_admitted")
+        return gateway.start_run(request, idempotency_key=invocation_id)
+
     try:
-        handle = gateway.start_run(dict(body), idempotency_key=invocation_id)
+        # START_REQUESTED records custody, not an earlier executor handoff.
+        # The same-key POST may create a run: submit under Pause exclusion,
+        # then join outside the launch lock just like ordinary delegation.
+        handle = run_operation(SimpleNamespace(drive_root=drive_root, task_id=task_id,
+            root_task_id=record.get("root_task_id") or task_id),
+            submit)
+    except OwnerPauseRefused as exc:
+        return {"invocation_id": invocation_id, "task_id": task_id,
+                "action": "invocation_retained", "reason": str(exc)}
     except ClaudexorUnavailable as exc:
         status = int(getattr(exc, "status_code", 0) or 0)
         if 400 <= status < 500:
@@ -269,10 +551,50 @@ def _recover_pending_invocation(drive_root: Any, gateway: Any,
                   "action": "recovery_pending"}
         _custody().emit(drive_root, _custody().RECONCILED, result)
         return result
+    custody, shape = recovered_custody(drive_root, gateway, record, run_id, _custody().admitted_store_id(handle))
+    # The owner may have returned since this pass listed it: a read can already hold the command by its job id.
+    bound = bind_started(drive_root, custody, shape=shape, exclusive=True)
+    if bound.custody is None or not bound.durable:
+        return {"invocation_id": invocation_id, "task_id": task_id, "action": "invocation_retained",
+                "reason": "accepted_start_unbound", "lookup": looked["lookup"]}
+    if not bound.adopted:
+        _mark_root_cost(drive_root, bound.custody)
+    return _custody()._reconcile_one(
+        drive_root, gateway, bound.custody, deliberate_terminal=deliberate_terminal,
+    )
+
+
+def recovered_custody(drive_root: Any, gateway: Any, record: Dict[str, Any], run_id: str,
+                      daemon_store_id: str) -> Tuple[RunCustody, Dict[str, Any]]:
+    """The STARTED facts of a run recovered for a pending invocation: ``(custody, shape)``.
+
+    Every fact comes from the invocation's record and its stored ``request`` (the replay's
+    body), verbatim; ``daemon_store_id`` is the store whose own answer named the run (a replay
+    receipt's ``storeId``, a lookup's). Current access, target validity and model health are
+    never inferred from these old start facts.
+    """
+    body = record["request"]
+    invocation_id, task_id = str(record["invocation_id"]), str(record["task_id"])
     execution = body.get("execution") if isinstance(body.get("execution"), dict) else {}
     scope = body.get("scope") if isinstance(body.get("scope"), dict) else {}
+    from ouroboros.delegate_plan import plan_facts
+    from ouroboros.execution_domain import is_work_ref, recorded_ref
+
+    # The engine this invocation was bound to before its POST (this pass reached it there): the recovered row
+    # keeps it, with the store that engine proved, as a fresh start's row does; else a later pass would ask the
+    # owned engine about a work run and take its 404 for the run's absence.
+    bound = recorded_ref(record)
+    engine = dict(bound) if is_work_ref(bound) else {}
+    if engine and not engine.get("store"):
+        proven = getattr(gateway, "engine_ref", None)
+        if is_work_ref(proven) and proven.get("descriptor") == engine.get("descriptor") and proven.get("store"):
+            engine["store"] = str(proven["store"])
     custody = _custody().RunCustody(
-        run_id=run_id, task_id=task_id,
+        engine_ref=engine,
+        run_id=run_id, task_id=task_id, daemon_store_id=str(daemon_store_id or ""),
+        window_started_at=str(record.get("requested_at") or ""),
+        max_seconds=int(record.get("max_seconds") or body.get("maxSeconds") or 0),
+        **plan_facts(record),
         route_id=str(record["route"] or body.get("primaryHarness") or ""),
         model=str(body.get("model") or ""),
         profile_id=str(body.get("credentialProfileId") or ""),
@@ -289,6 +611,9 @@ def _recover_pending_invocation(drive_root: Any, gateway: Any,
         # belongs there like every other (P34R.1).
         ledger_root=str(drive_root),
         idempotency_key=str(record["idempotency_key"]), invocation_id=invocation_id,
+        continuation_of=str(record.get("continuation_of") or ""),
+        capture_id=str(record.get("capture_id") or ""),
+        snapshot_task_id=str(record.get("snapshot_task_id") or ""),
         selected_subagent_id=str(record.get("selected_subagent_id") or ""),
         config_fingerprint=str(record.get("config_fingerprint") or ""),
         work_order_fingerprint=str(record.get("work_order_fingerprint") or ""),
@@ -315,17 +640,15 @@ def _recover_pending_invocation(drive_root: Any, gateway: Any,
         mode=str(body.get("mode") or ""),
         isolation=str(execution.get("isolation") or ""),
         delegated=bool(execution.get("delegated")))
-    _custody().record_started(drive_root, custody, shape={
-        # The stored invocation is the single source of a replay's facts — the same
+    return custody, {
+        # The stored invocation is the single source of a recovered run's facts — the same
         # doctrine the explicit retry path follows.
         "effort": str(body.get("effort") or ""), "access": str(body.get("access") or ""),
         "mode": str(body.get("mode") or ""), "isolation": str(execution.get("isolation") or ""),
         "delegated": bool(execution.get("delegated")), "root": str(scope.get("root") or ""),
         "recovered_from_pending_invocation": True,
-    })
-    return _custody()._reconcile_one(
-        drive_root, gateway, custody, deliberate_terminal=deliberate_terminal,
-    )
+        "max_seconds": custody.max_seconds,
+    }
 
 
 def _retire_recovered_registration(gateway: Any, record: Dict[str, Any]) -> bool:
@@ -356,18 +679,24 @@ def _owner_terminal_is_deliberate(drive_root: Any, task_id: str, *,
     the run: an undignified nanny death must not kill a healthy paid run, and
     "unknown" is exactly the case the answer is about. No reason-code table and no
     special crash branch: the axis the finalizers already write is the class. The
-    spared run's own ``maxSeconds`` stays its damage limit (ARCHITECTURE, custody).
+    spared run keeps the bounds it started with: the ``maxSeconds`` it was sent, else none
+    but its own end, a later verdict and the owner's Stop (a run of an unbounded task is
+    sent no invented window; ARCHITECTURE, custody).
 
     ``review_owned`` raises that floor to the ONE verdict that also speaks for a
     review panel's run: an explicit cancellation. Task association does not confer
     lifecycle authority, so a reviewed task that merely finished — completed,
     degraded, best-effort or failed — is not a verdict about its own reviewer, and
-    killing the live panel on it is exactly the incident behind issue #1006. The panel's own bounds (its slot window and the run's ``maxSeconds``)
-    stay the reviewer's damage limit.
+    killing the live panel on it is exactly the incident behind issue #1006. The panel's own bounds (its slot window and the run's ``maxSeconds``,
+    where the task gives it any) stay the reviewer's limit.
     """
     from ouroboros.outcomes import (
-        EXECUTION_BEST_EFFORT, EXECUTION_CANCELLED, EXECUTION_DEGRADED, EXECUTION_FAILED,
-        EXECUTION_OK, normalize_outcome_axes,
+        EXECUTION_BEST_EFFORT,
+        EXECUTION_CANCELLED,
+        EXECUTION_DEGRADED,
+        EXECUTION_FAILED,
+        EXECUTION_OK,
+        normalize_outcome_axes,
     )
     from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
 
@@ -384,11 +713,31 @@ def _owner_terminal_is_deliberate(drive_root: Any, task_id: str, *,
                          EXECUTION_FAILED, EXECUTION_CANCELLED}
 
 
+def _reconcile_collection(drive_root: Any, gateway: Any, custody: RunCustody, *,
+                          detail=None) -> Dict[str, Any]:
+    """Retain observation and money here; the body's collector owns bulk output and files."""
+    from ouroboros.delegate_custody_current import collection_pending, run
+
+    before = run(drive_root, custody.run_id) or custody
+    if detail is not None:
+        _custody().settle_run(drive_root, gateway, custody, detail)
+        _mark_root_cost(drive_root, custody)
+    after = run(drive_root, custody.run_id) or before
+    _custody().record_settled_unread(drive_root, after)
+    result = {"run_id": after.run_id, "task_id": after.task_id,
+              "action": "settle_attempted", "settled": after.settled,
+              "collection": {"status": "pending" if collection_pending(after) else "collected"},
+              **_custody().output_disposition(after)}
+    if after != before:
+        _custody().emit(drive_root, _custody().RECONCILED, result)
+    return result
+
+
+@timed_phase("custody_run", within="release_task_runs")
 def _reconcile_one(drive_root: Any, gateway: Any, custody: RunCustody, *,
                    deliberate_terminal: str = "") -> Dict[str, Any]:
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
     from ouroboros.task_results import STATUS_CANCELLED
-    from ouroboros.tools.delegate_integration import capture_stranded_patch
 
     review_owned = custody.review_owned
     # The caller's claimed verdict speaks for a review panel's run only when it is
@@ -403,8 +752,8 @@ def _reconcile_one(drive_root: Any, gateway: Any, custody: RunCustody, *,
     try:
         detail = gateway.get_run(custody.run_id)
     except ClaudexorUnavailable as exc:
-        if _custody().daemon_says_absent(exc):
-            _custody().close_absent_run(drive_root, gateway, custody, "reconcile_absent")
+        if _custody().daemon_says_absent(exc, gateway=gateway, run=custody):
+            _custody().close_absent_run(drive_root, gateway, custody, "reconcile_absent", absence=exc)
             result = {"run_id": custody.run_id, "task_id": custody.task_id, "action": "absent"}
         else:
             _custody().record_containment_fault(drive_root, custody, "reconcile_unreadable", f"{exc.code}: {exc}")
@@ -417,22 +766,14 @@ def _reconcile_one(drive_root: Any, gateway: Any, custody: RunCustody, *,
         _custody().emit(drive_root, _custody().RECONCILED, result)
         return result
     if _custody().is_terminal(detail):
-        settled = _custody().settle_run(drive_root, gateway, custody, detail)
-        # Sweep custody REPLAYS with staged fields, so unlike the wait path
-        # the omission is already knowable here - and an ownerless run is the
-        # one nobody will come back to read (the D7 launched-never-collected
-        # half becomes durable in this row instead of inferred).
-        _custody().record_settled_unread(drive_root, custody)
-        # The action names the ATTEMPT; the facts ride separately (the old
-        # shape wrote action="settled" even when the returned flag was false).
-        result = {"run_id": custody.run_id, "task_id": custody.task_id,
-                  "action": "settle_attempted",
-                  "settled": settled["settled"],
-                  "project_retired": settled.get("project_retired"),
-                  **_custody().output_disposition(custody)}
-        # The C1 half: a TERMINAL DETAIL proves the run is over, so the sweep — its
-        # last terminal observer — captures the diff eagerly here.
-        result.update(capture_stranded_patch(drive_root, custody))
+        if review_owned:
+            settled = _custody().settle_run(drive_root, gateway, custody, detail)
+            _mark_root_cost(drive_root, custody)
+            _custody().record_settled_unread(drive_root, custody)
+            result = {"run_id": custody.run_id, "task_id": custody.task_id,
+                      "action": "settle_attempted", **settled, **_custody().output_disposition(custody)}
+        else:
+            return _reconcile_collection(drive_root, gateway, custody, detail=detail)
     elif not (claimed_verdict_cancels
               or _owner_terminal_is_deliberate(drive_root, custody.task_id,
                                                review_owned=review_owned)):
@@ -454,12 +795,8 @@ def _reconcile_one(drive_root: Any, gateway: Any, custody: RunCustody, *,
         cancelled = _custody().cancel_and_verify(drive_root, gateway, custody, "owner_task_gone")
         result = {"run_id": custody.run_id, "task_id": custody.task_id, "action": "cancelled",
                   "outcome": cancelled["outcome"], **_custody().output_disposition(custody)}
-        # Capture ONLY on a verified terminal receipt (the read-back proved the run
-        # over). A cancel merely requested leaves the run live and its snapshot
-        # still being written; a cancel confirmed by ABSENCE proves nothing about
-        # the run (same unknowable-state doctrine as above) — both leave the
-        # capture to disposition.
-        if cancelled["state"] in _custody().TERMINAL_STATES:
-            result.update(capture_stranded_patch(drive_root, custody))
+        # settle_run retained a verified terminal read-back. Bulk capture stays
+        # with the body or native review owner, including on Stop and Restart.
+        # An accepted cancel or absence supplies no terminal execution evidence.
     _custody().emit(drive_root, _custody().RECONCILED, result)
     return result

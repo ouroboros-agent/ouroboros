@@ -8,11 +8,20 @@ import sys
 
 import pytest
 
-from ouroboros import config, local_model, server_process
+from ouroboros import config, local_model, server_control, server_process
 from ouroboros.gateway import settings
 from ouroboros.server_control import restart_current_process
 from ouroboros.server_entrypoint import parse_server_args
 from tests.test_server_shutdown import _stop_restart_watcher
+
+
+def _assert_restart_argv(argv, env, original):
+    expected = sys.executable
+    if server_control.IS_WINDOWS:
+        expected = getattr(sys, "_base_executable", None) or sys.executable
+        if expected != sys.executable:
+            assert env["__PYVENV_LAUNCHER__"] == sys.executable
+    assert argv == [expected, *original]
 
 
 @pytest.fixture
@@ -24,13 +33,13 @@ def applied_host(monkeypatch, tmp_path):
     monkeypatch.setattr(local_model, "_manager", local_model.LocalModelManager())
     saved = dict(config.SETTINGS_DEFAULTS)
     server_process.record_applied_restart_settings({key: saved[key] for key in (
-        "OUROBOROS_MAX_WORKERS", "OUROBOROS_SERVER_HOST", "OUROBOROS_HOST_SERVICE_PORT",
-        "OUROBOROS_SKILLS_REPO_PATH",
+        "OUROBOROS_SERVER_HOST", "OUROBOROS_HOST_SERVICE_PORT",
+        "OUROBOROS_SKILLS_REPO_PATH", "OUROBOROS_UI_DIR",
     )}, server_host_source="settings")
     return saved
 
 
-@pytest.mark.parametrize("source", ["settings", "environment", "cli", "launcher"])
+@pytest.mark.parametrize("source", ["settings", "environment", "launcher"])
 def test_known_bind_is_separate_from_host_source(applied_host, tmp_path, source):
     saved = {**applied_host, "OUROBOROS_SERVER_HOST": "0.0.0.0"}
     server_process.record_applied_restart_settings({"OUROBOROS_SERVER_HOST": "127.0.0.1"},
@@ -45,8 +54,8 @@ def test_known_bind_is_separate_from_host_source(applied_host, tmp_path, source)
         assert "to apply" not in state["summary"]
     if source == "launcher":
         assert "Restart may apply" in state["summary"]
-    saved["OUROBOROS_MAX_WORKERS"] += 1
-    assert "OUROBOROS_MAX_WORKERS" in settings._build_restart_state(saved)["restart_keys"]
+    saved["OUROBOROS_HOST_SERVICE_PORT"] += 1
+    assert "OUROBOROS_HOST_SERVICE_PORT" in settings._build_restart_state(saved)["restart_keys"]
     assert settings._build_restart_state(applied_host)["summary"] == ""
 
 
@@ -88,8 +97,13 @@ def test_actual_main_captures_source_after_binding(applied_host, tmp_path, monke
     class FakeServer:
         def __init__(self, _config):
             self.should_exit = False
+            self.stop_watcher_bound = False
+
+        def watch_launcher_stop(self):
+            self.stop_watcher_bound = True
 
         def run(self, *, sockets):
+            assert self.stop_watcher_bound
             assert sockets[0].getsockname()[1] > 0
             assert server_process._applied_server_host_source == expected_source
             assert server_process.applied_restart_settings()["OUROBOROS_SERVER_HOST"] == expected_host
@@ -103,11 +117,10 @@ def test_actual_main_captures_source_after_binding(applied_host, tmp_path, monke
     monkeypatch.setattr(server, "DATA_DIR", tmp_path)
     monkeypatch.setattr(server, "DEFAULT_PORT", 0)
     monkeypatch.setattr(server, "_LAUNCHER_MANAGED", managed)
-    monkeypatch.setattr(server, "_ACTUAL_BOUND_PORT", None)
     monkeypatch.setattr(server, "get_network_auth_startup_warning", lambda _host: "")
     monkeypatch.setattr(server, "validate_network_auth_configuration", lambda _host: "")
     monkeypatch.setattr(server, "_event_loop", None)
-    monkeypatch.setattr(server.uvicorn, "Server", FakeServer)
+    monkeypatch.setattr(server, "_SignalStopServer", FakeServer)  # the main() server seam (#1142)
     server._restart_requested.clear()
     try:
         assert server.main() == 0
@@ -129,12 +142,14 @@ def test_two_settings_restarts_do_not_invent_environment_authority(monkeypatch, 
     monkeypatch.setattr(sys, "argv", argv)
     calls = []
     monkeypatch.setattr(os, "execvpe", lambda executable, argv, env: calls.append((executable, argv, env)))
+    monkeypatch.setattr("ouroboros.process_custody.spawn_supervised",
+                        lambda argv, **kw: calls.append((argv[0], argv, kw["env"])))
     actual = "127.0.0.1"
     for desired in ("127.0.0.2", "127.0.0.4"):
         saved["OUROBOROS_SERVER_HOST"] = desired
         restart_current_process(actual, 8765, repo_dir=tmp_path, log=logging.getLogger("test"))
         executable, reexec_argv, env = calls[-1]
-        assert reexec_argv == [sys.executable, *argv]
+        _assert_restart_argv(reexec_argv, env, argv)
         assert env.get("OUROBOROS_SERVER_HOST") == original_host
         # Simulate the child's actual argument/default selection with the exec boundary held.
         monkeypatch.setattr(sys, "argv", reexec_argv[1:])
@@ -149,6 +164,8 @@ def test_public_cli_reexec_argv_and_environment_override_remain_intact(monkeypat
     monkeypatch.setenv("OUROBOROS_SERVER_HOST", "0.0.0.0")
     captured = []
     monkeypatch.setattr(os, "execvpe", lambda executable, argv, env: captured.append((argv, env)))
+    monkeypatch.setattr("ouroboros.process_custody.spawn_supervised",
+                        lambda argv, **kw: captured.append((argv, kw["env"])))
     restart_current_process("0.0.0.0", 8765, repo_dir=tmp_path, log=logging.getLogger("test"))
-    assert captured[0][0] == [sys.executable, *argv]
+    _assert_restart_argv(captured[0][0], captured[0][1], argv)
     assert captured[0][1]["OUROBOROS_SERVER_HOST"] == "0.0.0.0"

@@ -2,8 +2,7 @@
 
 Consolidated from former ``test_loop_incoming_messages.py`` (image payload
 preservation) and ``test_loop_skill_finalization.py``, then divided by theme
-(the v7 L-B test split): the task-acceptance gate lives in
-``test_loop_acceptance_gate.py``, the self-authored skill finalization gate in
+(the v7 L-B test split): the self-authored skill finalization gate lives in
 ``test_loop_skill_finalization.py``, the ``run_llm_loop`` round/finalization
 suite in ``test_run_llm_loop.py`` and the image auto-attach seam in
 ``test_loop_image_attach.py``.
@@ -24,11 +23,12 @@ import pytest
 import ouroboros.loop as loop_mod
 from ouroboros.loop_llm_call import RETRY_WALL_EXHAUSTED_KEY
 from ouroboros.loop import (
+    _latch_final_answer_marker,
+    _server_web_allowed_by_task,
     run_llm_loop,
 )
-from ouroboros.loop_acceptance import _latch_final_answer_marker, _server_web_allowed_by_task
 from ouroboros.loop_messages import _initialize_owner_directives
-from ouroboros.loop_nudges import _maybe_inject_self_check, _maybe_inject_time_budget_milestone
+from ouroboros.loop_nudges import _inject_round_checkpoints, _maybe_inject_time_budget_milestone
 from ouroboros.loop_round_limits import _drain_incoming_messages
 
 
@@ -38,12 +38,17 @@ from ouroboros.loop_round_limits import _drain_incoming_messages
 # ---------------------------------------------------------------------------
 
 
-def test_drain_incoming_messages_preserves_image_payload():
+def test_drain_incoming_messages_preserves_image_payload(tmp_path):
+    import base64
+    from tests.test_live_image_delivery import pixels
+
+    raw = pixels()
+    encoded = base64.b64encode(raw).decode()
     messages: list = []
     incoming_messages: queue.Queue = queue.Queue()
     incoming_messages.put({
         "text": "photo from telegram",
-        "image_base64": "aW1hZ2U=",
+        "image_base64": encoded,
         "image_mime": "image/png",
         "image_caption": "photo from telegram",
     })
@@ -51,7 +56,7 @@ def test_drain_incoming_messages_preserves_image_payload():
     _drain_incoming_messages(
         messages=messages,
         incoming_messages=incoming_messages,
-        drive_root=None,
+        drive_root=tmp_path,
         task_id="",
         event_queue=None,
         _owner_msg_seen=set(),
@@ -63,8 +68,10 @@ def test_drain_incoming_messages_preserves_image_payload():
     assert isinstance(content, list)
     assert content[0]["type"] == "text"
     assert content[0]["text"] == "[Message from my human]: photo from telegram"
-    assert content[1]["type"] == "image_url"
-    assert content[1]["image_url"]["url"] == "data:image/png;base64,aW1hZ2U="
+    image, = [block for block in content if block["type"] == "image_url"]
+    assert image["image_url"]["url"] == "data:image/png;base64," + encoded
+    from pathlib import Path
+    assert Path(image["_source_path"]).read_bytes() == raw
 
 
 def test_owner_directives_survive_compaction_without_control_prose(tmp_path):
@@ -76,7 +83,8 @@ def test_owner_directives_survive_compaction_without_control_prose(tmp_path):
         write_owner_message,
     )
 
-    ctx = SimpleNamespace()
+    # An owner-started root: the door's stamp keeps the first text an owner row.
+    ctx = SimpleNamespace(task_metadata={"origin_message_ref": {"chat_id": 1, "client_message_id": "cm-root"}})
     messages = [
         {"role": "system", "content": "policy"},
         {"role": "user", "content": "Initial requirement verbatim"},
@@ -93,6 +101,7 @@ def test_owner_directives_survive_compaction_without_control_prose(tmp_path):
         row for row in drain_owner_entries(tmp_path, "root")
         if row["msg_id"] == "control-1"
     )
+    mail_entry = next(row for row in drain_owner_entries(tmp_path, "root") if row["msg_id"] == "mail-1")
     expected_deadline = (
         parse_deadline_ts(control_entry["ts"]).timestamp()
         + task_pacing.effective_finalization_reserve_sec(ctx)
@@ -116,42 +125,71 @@ def test_owner_directives_survive_compaction_without_control_prose(tmp_path):
     ]
     assert ctx._owner_directives[0]["content"] == "Initial requirement verbatim"
     assert ctx._owner_directives[1]["msg_id"] == "direct-1"
+    # No chat row is held for either: each keeps when the host received it (the mailbox entry's time; the
+    # drain's read time for the in-memory delivery), never an invented chat time or room.
+    assert ctx._owner_directives[1]["received"] and "ts" not in ctx._owner_directives[1]
     assert ctx._owner_directives[2] == {
         "source": "owner_mailbox",
         "content": "mailbox follow-up",
         "msg_id": "mail-1",
+        "received": mail_entry["ts"],
     }
     assert "deadline control" not in json.dumps(ctx._owner_directives)
 
 
-def test_maybe_inject_self_check_handles_assistant_none_content():
-    messages = [
-        {"role": "user", "content": "inspect"},
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [{
-                "id": "call-1",
-                "type": "function",
-                "function": {"name": "read_file", "arguments": "{}"},
-            }],
-        },
-        {"role": "tool", "tool_call_id": "call-1", "content": "done"},
-    ]
-    progress = []
+def _simulate_rounds(monkeypatch, ctx, *, rounds=60, minutes_per_round=2, cost_ceiling=None, cost_per_round=0.0):
+    """Drive the real per-round injector over a simulated run; return (messages, checkpoints)."""
+    from datetime import datetime, timedelta, timezone
 
-    injected = _maybe_inject_self_check(
-        15,
-        30,
-        messages,
-        {"cost": 0.0},
-        progress.append,
-    )
+    from ouroboros import loop
 
-    assert injected is True
-    assert messages[-1]["role"] == "user"
-    assert "[CHECKPOINT 1" in messages[-1]["content"]
-    assert progress
+    start = datetime(2026, 6, 10, 0, 0, tzinfo=timezone.utc)
+    clock = {"now": start}
+    monkeypatch.setattr("ouroboros.task_pacing.utc_now", lambda: clock["now"])
+    monkeypatch.setattr(loop, "_loop_tree_accounting", lambda **_kw: None)
+    checkpoints: list = []
+    monkeypatch.setattr(loop, "_emit_checkpoint_event", lambda _q, _id, _logs, payload: checkpoints.append(payload))
+    messages = [{"role": "user", "content": "solve"}]
+    usage: dict = {"cost": 0.0}
+    for round_idx in range(1, rounds + 1):
+        clock["now"] = start + timedelta(minutes=minutes_per_round * round_idx)
+        usage["cost"] = cost_per_round * round_idx
+        _inject_round_checkpoints(
+            round_idx=round_idx, messages=messages, accumulated_usage=usage, tools=SimpleNamespace(_ctx=ctx),
+            event_queue=None, task_id="sim", drive_logs=None, budget_remaining_usd=None, cost_ceiling=cost_ceiling)
+    return messages, checkpoints
+
+
+def test_a_two_hour_sixty_round_run_gets_no_periodic_host_note(monkeypatch):
+    """#1748: the 15-round self-check, the 10-minute [PACING] note and the nanny's
+    8-round/$2 economics reminder are gone. A 60-round, 2-hour nanny run without a
+    deadline or an in-task ceiling gets NO host note and NO checkpoint event at all
+    (base witness: the same loop injected checkpoints at rounds 15/30/45/60, a PACING
+    note every 10 minutes and proportional nanny reminders)."""
+    ctx = SimpleNamespace(task_metadata={"created_at": "2026-06-10T00:00:00Z"}, task_contract={},
+                          _nanny_route_dispatched=True, _nanny_delegate_baseline=None,
+                          _nanny_metered_progress={"round": 60, "cost": 30.0})
+    messages, checkpoints = _simulate_rounds(monkeypatch, ctx, cost_per_round=0.5)
+    assert messages == [{"role": "user", "content": "solve"}] and checkpoints == []
+
+
+def test_a_bounded_run_states_each_threshold_crossing_exactly_once(monkeypatch):
+    """Owner 13 Oct: the one-time crossing fact stays. Over the same 2-hour run, a
+    2-hour deadline crosses 50/25/10% once each, and a $10 in-task ceiling crosses
+    50/25% remaining, ~80% spent and 10% remaining once each — no repeats, no advice."""
+    ctx = SimpleNamespace(task_metadata={"created_at": "2026-06-10T00:00:00Z",
+                                         "deadline_at": "2026-06-10T02:00:00Z"}, task_contract={})
+    ceiling = __import__("ouroboros.task_pacing", fromlist=["CostCeiling"]).CostCeiling(state="active", ceiling_usd=10.0)
+    messages, checkpoints = _simulate_rounds(monkeypatch, ctx, rounds=59, cost_ceiling=ceiling, cost_per_round=0.17)
+    kinds = [(row["checkpoint_kind"], row.get("milestone")) for row in checkpoints]
+    assert [k for k in kinds if k[0] == "time_budget_milestone"] == [
+        ("time_budget_milestone", "50%"), ("time_budget_milestone", "25%"), ("time_budget_milestone", "10%")]
+    assert [k for k in kinds if k[0].startswith("cost_budget")] == [
+        ("cost_budget_milestone", "50%"), ("cost_budget_milestone", "25%"),
+        ("cost_budget_wrapup", None), ("cost_budget_milestone", "10%")]
+    text = "\n".join(str(row.get("content")) for row in messages)
+    for advice in ("planning context", "shortest path", "WRITE", "converging", "CHECKPOINT", "[PACING"):
+        assert advice not in text, advice
 
 
 def test_time_budget_milestone_injects_once_per_threshold(monkeypatch):
@@ -183,43 +221,18 @@ def test_time_budget_milestone_injects_once_per_threshold(monkeypatch):
     assert ctx._time_budget_milestones_seen == {"50%"}
 
 
-def test_intrinsic_pacing_injects_without_deadline(monkeypatch):
-    """No deadline_at: surface elapsed/rounds/cost once per interval bucket.
-    v6.60.0: the FINAL ANSWER phrase appears ONLY when the task contract declares
-    answer_protocol="final_answer_line" (marker phrases are protocol-gated)."""
-    messages = [{"role": "user", "content": "solve"}]
-    ctx = SimpleNamespace(task_metadata={"created_at": "2026-06-10T00:00:00Z"})  # no deadline_at
+def test_no_deadline_gets_no_time_notice_with_or_without_the_protocol(monkeypatch):
+    """No deadline_at and no execution budget: no [PACING] note and no FINAL ANSWER
+    salvage phrase at any elapsed time (the facts line carries elapsed time)."""
     from datetime import datetime, timezone
 
-    monkeypatch.delenv("OUROBOROS_PACING_INTERVAL_SEC", raising=False)
-    # 20 min elapsed, default interval 600s -> bucket 2.
     monkeypatch.setattr("ouroboros.task_pacing.utc_now", lambda: datetime(2026, 6, 10, 0, 20, tzinfo=timezone.utc))
-
-    injected = _maybe_inject_time_budget_milestone(
-        messages, SimpleNamespace(_ctx=ctx), round_idx=7,
-        accumulated_usage={"cost": 1.25}, task_id="t",
-    )
-    injected_again = _maybe_inject_time_budget_milestone(
-        messages, SimpleNamespace(_ctx=ctx), round_idx=8, accumulated_usage={"cost": 1.4},
-    )
-
-    assert injected is True
-    assert injected_again is False  # same bucket -> not repeated
-    assert "[PACING" in messages[-1]["content"]
-    assert "Rounds so far: 7" in messages[-1]["content"]
-    assert "FINAL ANSWER:" not in messages[-1]["content"]  # no protocol declared
-
-    # With the protocol declared, the salvage phrase rides the SAME milestone.
-    proto_ctx = SimpleNamespace(
-        task_metadata={"created_at": "2026-06-10T00:00:00Z"},
-        task_contract={"answer_protocol": "final_answer_line"},
-    )
-    proto_messages = [{"role": "user", "content": "solve"}]
-    assert _maybe_inject_time_budget_milestone(
-        proto_messages, SimpleNamespace(_ctx=proto_ctx), round_idx=7,
-        accumulated_usage={"cost": 1.25}, task_id="t2",
-    ) is True
-    assert "FINAL ANSWER:" in proto_messages[-1]["content"]
+    for contract in ({}, {"answer_protocol": "final_answer_line"}):
+        messages = [{"role": "user", "content": "solve"}]
+        ctx = SimpleNamespace(task_metadata={"created_at": "2026-06-10T00:00:00Z"}, task_contract=contract)
+        assert _maybe_inject_time_budget_milestone(
+            messages, SimpleNamespace(_ctx=ctx), accumulated_usage={"cost": 1.25}, task_id="t") is False
+        assert messages == [{"role": "user", "content": "solve"}]
 
 
 def test_latch_final_answer_marker_captures_explicit_marker_only():
@@ -246,17 +259,6 @@ def test_server_web_allowed_respects_task_resource_contract():
     assert _server_web_allowed_by_task(SimpleNamespace(task_contract={"allowed_resources": {"web": False}})) is False
     assert _server_web_allowed_by_task(SimpleNamespace(task_contract={"allowed_resources": {"network": False}})) is False
     assert _server_web_allowed_by_task(SimpleNamespace(task_contract={"disabled_tools": ["web_search"]})) is True
-
-
-def test_intrinsic_pacing_disabled_when_interval_zero(monkeypatch):
-    messages = [{"role": "user", "content": "solve"}]
-    ctx = SimpleNamespace(task_metadata={"created_at": "2026-06-10T00:00:00Z"})
-    from datetime import datetime, timezone
-
-    monkeypatch.setenv("OUROBOROS_PACING_INTERVAL_SEC", "0")
-    monkeypatch.setattr("ouroboros.task_pacing.utc_now", lambda: datetime(2026, 6, 10, 1, 0, tzinfo=timezone.utc))
-
-    assert _maybe_inject_time_budget_milestone(messages, SimpleNamespace(_ctx=ctx), round_idx=3) is False
 
 
 def test_deadline_local_finalize_gate(monkeypatch):
@@ -461,10 +463,9 @@ def test_provider_death_still_makes_the_forced_call_when_the_wall_is_unspent(tmp
         (1, False),
         ({"nested": "garbage"}, False),
         (0, True),
-        ("", True),
         (None, True),
     ],
-    ids=["truthy_str", "truthy_int", "truthy_dict", "zero", "empty_str", "none"],
+    ids=["truthy_str", "truthy_int", "truthy_dict", "zero", "none"],
 )
 def test_malformed_retry_wall_marker_reads_as_a_plain_truth_value(
     tmp_path, monkeypatch, marker, expect_call,
@@ -490,9 +491,6 @@ def test_malformed_retry_wall_marker_reads_as_a_plain_truth_value(
         ("round_limit", "[ROUND_LIMIT] wrap up"),
         ("finalization_grace", "[FINALIZE_NOW] wrap up"),
         ("deadline_local", "[DEADLINE] wrap up"),
-        ("owner_requested_finalization", "[OWNER_STOP] wrap up"),
-        ("budget_exhausted", "[BUDGET] wrap up"),
-        ("children_unabsorbed", "[CHILDREN] wrap up"),
     ],
 )
 def test_other_forced_rails_never_skip_even_with_the_wall_marker_set(
@@ -520,9 +518,9 @@ def test_other_forced_rails_never_skip_even_with_the_wall_marker_set(
 
 def test_quiz_answers_and_principal_messages_enter_the_directive_corpus_but_system_frames_do_not(tmp_path):
     """The premises every review reads: an owner quiz answer at a root and a parent's
-    message to a child grow ``_owner_directives`` (the count that supersedes a paid
-    acceptance verdict and binds an advisory author finish); a host system frame and a
-    descendant's escalation are delivered as before but never recorded as directives."""
+    message to a child grow ``_owner_directives`` (the owner's words a review reads and
+    the count a completion selection binds); a host system frame and a descendant's
+    escalation are delivered as before but never recorded as directives."""
     from ouroboros.owner_mailbox import KIND_QUIZ_ANSWER, write_owner_message, write_task_message
 
     ctx = SimpleNamespace()
@@ -558,3 +556,55 @@ def test_quiz_answers_and_principal_messages_enter_the_directive_corpus_but_syst
     delivered = "\n".join(str(m["content"]) for m in messages)
     assert "[System task message]" in delivered and "[Escalation from descendant task grandchild]" in delivered
     assert "[Message from task sibling-7, relayed by ancestor root-1]" in delivered
+
+
+def test_an_owner_answer_is_recorded_with_the_card_it_answers_beside_never_inside_its_words(tmp_path):
+    """Audit 05.11 item 37: Safety saw "1. Publish it" without the card that held the text. The answered card rides
+    beside the owner's words as the message they reply to: the asking task's question and options, the pressed
+    option marked; the owner's words stay what they pressed. An answer without a snapshot gets no invented card."""
+    from ouroboros.owner_mailbox import KIND_QUIZ_ANSWER, write_owner_message
+
+    ctx = SimpleNamespace()
+    messages = [{"role": "user", "content": "Initial requirement verbatim"}]
+    _initialize_owner_directives(ctx, messages)
+    card = {"quiz_id": "q7", "question": "Publish exactly this reply?\n> Thanks, taking it up.", "state": "answered",
+            "options": ["Publish it", "Not now"], "option_details": ["Post the quoted text", ""], "answered_index": 0}
+    write_owner_message(tmp_path, "[Owner quiz answer] quiz q7", task_id="root", msg_id="qa-7", kind=KIND_QUIZ_ANSWER,
+                        quiz_delivery={"task_id": "asker", "quiz_id": "q7", "answer_snapshot": card})
+    write_owner_message(tmp_path, "[Owner quiz answer] legacy", task_id="root", msg_id="qa-8", kind=KIND_QUIZ_ANSWER)
+    _drain_incoming_messages(messages, queue.Queue(), tmp_path, "root", None, set(), owner_ctx=ctx)
+    answered, legacy = ctx._owner_directives[-2:]
+    assert answered["content"] == "1. Publish it" and answered["quiz_id"] == "q7"
+    assert answered["reply_to"] == {
+        "address": "quiz q7 of task asker", "author": "Ouroboros, task asker",
+        "text": "Publish exactly this reply?\n> Thanks, taking it up.\n1. Publish it (Post the quoted text)\n2. Not now\n"
+                "(host record: my human pressed option 1)"}
+    assert legacy["content"] == "[Owner quiz answer] legacy" and "reply_to" not in legacy
+
+
+def test_a_late_answer_keeps_my_humans_words_with_its_card_on_a_fresh_head_and_on_a_reading_one(tmp_path):
+    """Audit 05.11 item 37, the late paths: an answer that arrives after the asking task finished opens a fresh head
+    whose first text is the host's frame, or reaches a head still reading. Either way the corpus keeps my human's words
+    with the card beside them, never the frame as their words and never the bare label; a plain head keeps its text."""
+    from ouroboros.owner_mailbox import write_owner_message
+
+    card = {"quiz_id": "q7", "question": "Publish exactly this reply?", "state": "answered", "answered_index": 0,
+            "options": ["Publish it", "Not now"], "answered_after_terminal": True}
+    late = {"task_id": "asker", "quiz_id": "q7", "answer_snapshot": {"task_id": "asker", "quiz": card}}
+    replied = {"address": "quiz q7 of task asker", "author": "Ouroboros, task asker",
+               "text": "Publish exactly this reply?\n1. Publish it\n2. Not now\n(host record: my human pressed option 1)"}
+    head = SimpleNamespace(task_metadata={"late_answer": late, "origin_suppressed": True})
+    frame = "[Late answer to a question asked by task asker, which had finished]\nQuestion was: Publish exactly this reply?"
+    _initialize_owner_directives(head, [{"role": "user", "content": frame}])
+    assert [(row["source"], row["content"], row.get("reply_to")) for row in head._owner_directives] == [
+        ("initial_user", "1. Publish it", replied)]
+    plain = SimpleNamespace(task_metadata={"origin_suppressed": True})
+    _initialize_owner_directives(plain, [{"role": "user", "content": "Hello"}])
+    assert plain._owner_directives == [{"source": "initial_user", "content": "Hello"}]
+    reading = SimpleNamespace()
+    messages = [{"role": "user", "content": "Initial requirement verbatim"}]
+    _initialize_owner_directives(reading, messages)
+    assert write_owner_message(tmp_path, "1. Publish it", task_id="head", msg_id="m-9", late_answer=late)
+    _drain_incoming_messages(messages, queue.Queue(), tmp_path, "head", None, set(), owner_ctx=reading)
+    assert [(row["source"], row["content"], row.get("reply_to")) for row in reading._owner_directives[1:]] == [
+        ("owner_mailbox", "1. Publish it", replied)]

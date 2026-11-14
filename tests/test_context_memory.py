@@ -1,11 +1,11 @@
-"""Recent chat, consolidation offsets and the memory sections around them.
+"""The open conversation in a built request and the memory sections around it.
 
-Split verbatim out of ``tests/test_context.py`` by theme (merged there from the former
-``test_context_memory_overhaul.py``). This module owns the offset a consolidation
-leaves, the full-awareness main thread against a project thread's own view, the
-workpad/journal that may not be silently sliced, the low-mode dialogue tail, the stale
-offset a rotation invalidates, the world profile, the retired dialogue summaries, the
-process logs filtered by task id, and the installed-skills verdict.
+Split out of ``tests/test_context.py`` by theme. This module owns where the open
+conversation starts (after the legacy frontier), Main's lines for other live rooms
+against a Project task's own room, the owner-selected Low that keeps lane 1 verbatim,
+the workpad/journal that may not be silently sliced, the world profile, the process
+logs filtered by task id, and the installed-skills verdict. The old chat tail after a
+consolidation cursor is gone (the memory view's projection: ``tests/test_memory_view_memo.py``).
 """
 
 from __future__ import annotations
@@ -13,125 +13,64 @@ from __future__ import annotations
 import json
 
 
+def test_the_open_conversation_starts_after_the_legacy_frontier(tmp_path):
+    """Rows the old memory retold are its record's, not the open conversation's; A2A never enters."""
+    from tests import _memory_inventory_shared as shared
+    from tests._memory_view_context import blocks, section, world
+
+    env, memory, _rooms = world(tmp_path)
+    shared.append(memory.drive_root / "logs" / "chat.jsonl",
+                  shared.msg("2026-09-03T00:10:00+00:00", "agent traffic after", chat_id=-5))
+    _a, identity, changing, _cap = blocks(env, memory, {"id": "tmain", "chat_id": 1})
+    room = section(changing, "## This room (Main)")
+    assert "] next please" in room and "] and more" in room  # after the frontier: verbatim
+    # All retold records are whole in the common story; the room keeps its open conversation.
+    story = section(identity, "## My story")
+    for record in ("Main talk.", "Main was quiet."):
+        assert f"\n  {record}" in story and record not in room
+    for retold in ("] hello\n", "] hello back", "alpha question", "agent traffic"):
+        assert retold not in changing, retold
 
 
+def test_main_holds_every_other_conversation_and_a_project_task_its_own_room(tmp_path):
+    """One mind: Main holds every other conversation, a Project's open words whole (it is mine, not a place); a task
+    bound to a Project works in that room and holds Main among its other conversations."""
+    from tests._memory_view_context import blocks, section, world
 
-# ===========================================================================
-# Memory / consolidation offset behavior (merged from former
-# test_context_memory_overhaul.py).  Inspect-only `limit=50` / `limit=1000`
-# source-string pins were dropped — behavioral coverage below already
-# exercises the offset path.  test_no_identity_truncation_in_consolidator_
-# prompts was also dropped (inspect-only); identity-truncation is covered
-# behaviorally by consolidator tests.
-# ===========================================================================
+    env, memory, rooms = world(tmp_path)
+    alpha = f"Project Alpha [chat_id={rooms['alpha']}]"
+    _a, _b, main, _cap = blocks(env, memory, {"id": "tmain", "chat_id": 1})
+    block = section(main, "## Other conversations")
+    assert f"### {alpha}" in block and f"### Project Beta [chat_id={rooms['beta']}]" in block
+    assert "] alpha again" in block and "] beta again" in block
+    assert "] next please" in section(main, "## This room (Main)") and "] next please" not in block
 
-
-def test_recent_chat_starts_after_consolidated_offset(tmp_path):
-    from ouroboros.context import build_recent_sections
-    from ouroboros.memory import Memory
-
-    logs_dir = tmp_path / "logs"
-    memory_dir = tmp_path / "memory"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    memory_dir.mkdir(parents=True, exist_ok=True)
-    entries = [
-        {"ts": f"2026-03-19T16:{i:02d}:00Z", "direction": "in", "username": "User", "text": f"msg-{i}"}
-        for i in range(5)
-    ]
-    (logs_dir / "chat.jsonl").write_text(
-        "\n".join(json.dumps(entry) for entry in entries) + "\n",
-        encoding="utf-8",
-    )
-    memory = Memory(drive_root=tmp_path)
-    (memory_dir / "dialogue_meta.json").write_text(
-        json.dumps({
-            "last_consolidated_offset": 3,
-            "chat_log_signature": memory.jsonl_generation_signature("chat.jsonl"),
-        }),
-        encoding="utf-8",
-    )
-
-    sections = build_recent_sections(memory, env=None)
-    combined = "\n\n".join(sections)
-
-    assert "msg-0" not in combined
-    assert "msg-1" not in combined
-    assert "msg-2" not in combined
-    assert "msg-3" in combined
-    assert "msg-4" in combined
+    _a, identity, bound, _cap = blocks(env, memory, {"id": "bound", "chat_id": 1})  # bound to alpha, written in Main
+    room = section(bound, f"## This room ({alpha})")
+    assert "] alpha again" in room  # current room detail stays verbatim
+    story = section(identity, "## My story")
+    for record in ("Alpha began.", "Alpha worked."):
+        assert f"\n  {record}" in story and record not in room
+    other = section(bound, "## Other conversations")
+    assert "### Main\n" in other and "] next please" in other and "] beta again" in other
+    assert "] alpha again" not in other  # this room's words are read here, once
 
 
-def test_recent_chat_main_includes_all_threads_full_awareness(tmp_path):
-    """Full project awareness (v6.32.0): the one identity's main/global context
-    sees its WHOLE conversation — main + project threads alike (BIBLE P1, one
-    awareness across direct chat, project rooms, and consciousness). Project chat
-    is part of the one mind's memory, NOT partitioned out; only A2A virtual
-    transport is excluded (covered elsewhere)."""
-    from ouroboros.context import build_recent_sections
-    from ouroboros.memory import Memory
-    from ouroboros.projects_registry import create_project
+def test_low_mode_keeps_the_open_conversation_verbatim(tmp_path, monkeypatch):
+    """An owner-selected Low never takes my replies or people's words: only the window could."""
+    from tests import _memory_inventory_shared as shared
+    from tests._memory_view_context import blocks, section, world
 
-    logs_dir = tmp_path / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-
-    project = create_project(tmp_path, "racer")
-    project_chat = int(project["chat_id"])
-    transport_chat = 555000111  # large NON-project id (e.g. a Telegram mirror)
-
-    entries = [
-        {"chat_id": 1, "direction": "in", "username": "User", "text": "main-keep"},
-        {"chat_id": project_chat, "direction": "in", "username": "User", "text": "project-visible"},
-        {"chat_id": transport_chat, "direction": "in", "username": "User", "text": "transport-keep"},
-        {"direction": "in", "username": "User", "text": "legacy-keep"},  # no chat_id -> main
-    ]
-    (logs_dir / "chat.jsonl").write_text(
-        "\n".join(json.dumps(entry) for entry in entries) + "\n",
-        encoding="utf-8",
-    )
-
-    combined = "\n\n".join(build_recent_sections(Memory(drive_root=tmp_path), env=None))
-
-    assert "main-keep" in combined
-    assert "legacy-keep" in combined
-    assert "transport-keep" in combined
-    assert "project-visible" in combined  # full awareness: the one mind sees project chat
-
-
-def test_recent_chat_for_project_thread_shows_only_its_own_thread(tmp_path):
-    """A project TASK gets a FOCUSED working view of its own thread (full
-    awareness, v6.32.0): its "## Recent chat" is its own project thread, not the
-    штаб's main chat nor a sibling project's chat, so cross-project noise does not
-    bloat its working context. This is focus, not memory isolation — the one mind
-    still sees everything via the main/background path. Pins that thread_chat_id
-    selects the project's own raw tail rather than the main consolidation stream."""
-    from ouroboros.context import build_recent_sections
-    from ouroboros.memory import Memory
-    from ouroboros.projects_registry import create_project
-
-    logs_dir = tmp_path / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-
-    proj_a = create_project(tmp_path, "racer")
-    proj_b = create_project(tmp_path, "research")
-    chat_a = int(proj_a["chat_id"])
-    chat_b = int(proj_b["chat_id"])
-
-    entries = [
-        {"chat_id": 1, "direction": "in", "username": "User", "text": "main-stab-chat"},
-        {"chat_id": chat_a, "direction": "in", "username": "User", "text": "project-a-own-thread"},
-        {"chat_id": chat_b, "direction": "in", "username": "User", "text": "project-b-sibling"},
-    ]
-    (logs_dir / "chat.jsonl").write_text(
-        "\n".join(json.dumps(entry) for entry in entries) + "\n",
-        encoding="utf-8",
-    )
-
-    combined = "\n\n".join(build_recent_sections(
-        Memory(drive_root=tmp_path), env=None, thread_chat_id=chat_a))
-
-    assert "project-a-own-thread" in combined   # its own thread is visible
-    assert "project-b-sibling" not in combined  # sibling project not in focused view
-    assert "main-stab-chat" not in combined     # main chat not in focused project view
+    env, memory, _rooms = world(tmp_path)
+    fresh = [shared.msg(f"2026-09-04T{i // 60:02d}:{i % 60:02d}:00+00:00", f"fresh-{i}", client_message_id=f"f{i}")
+             for i in range(305)]
+    shared.append(memory.drive_root / "logs" / "chat.jsonl", *fresh)
+    monkeypatch.setenv("OUROBOROS_CONTEXT_MODE", "low")
+    _a, _b, changing, cap = blocks(env, memory, {"id": "tmain", "chat_id": 1})
+    room = section(changing, "## This room (Main)")
+    assert all(f"] fresh-{i}\n" in room + "\n" for i in range(305))
+    assert cap["memory_view"]["floor"]["mode"] == "low"
+    assert not {"F2", "F6w", "F7"} & set(cap["memory_view"]["floor"]["steps"])  # nor my other conversations' words
 
 
 def test_project_workpad_and_journal_not_silently_sliced(tmp_path, monkeypatch):
@@ -178,179 +117,7 @@ def test_append_journal_milestone_bounds_over_limit_with_pointer(tmp_path, monke
     txt = rows[0]["text"]
     assert len(txt) <= _MAX_TEXT_CHARS         # honors the durable per-row contract
     assert "task_results" in txt               # VISIBLE pointer to the full text
-
-
-def test_low_mode_preserves_full_unconsolidated_dialogue_suffix(tmp_path, monkeypatch):
-    from ouroboros.context import build_recent_sections
-    from ouroboros.memory import Memory
-
-    logs_dir = tmp_path / "logs"
-    memory_dir = tmp_path / "memory"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    memory_dir.mkdir(parents=True, exist_ok=True)
-    fresh_count = 305
-    entries = [
-        {"chat_id": 1, "direction": "in", "username": "User", "text": f"consolidated-{i}"}
-        for i in range(3)
-    ] + [
-        {"chat_id": 1, "direction": "in", "username": "User", "text": f"fresh-{i}"}
-        for i in range(fresh_count)
-    ]
-    (logs_dir / "chat.jsonl").write_text(
-        "\n".join(json.dumps(entry) for entry in entries) + "\n",
-        encoding="utf-8",
-    )
-    memory = Memory(drive_root=tmp_path)
-    (memory_dir / "dialogue_meta.json").write_text(
-        json.dumps({
-            "last_consolidated_offset": 3,
-            "chat_log_signature": memory.jsonl_generation_signature("chat.jsonl"),
-        }),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("OUROBOROS_CONTEXT_MODE", "low")
-
-    combined = "\n\n".join(build_recent_sections(memory, env=None))
-
-    assert "consolidated-0" not in combined
-    assert "fresh-0" in combined
-    assert f"fresh-{fresh_count - 1}" in combined
-
-
-def test_low_mode_without_consolidation_keeps_max_raw_dialogue_tail(tmp_path, monkeypatch):
-    from ouroboros.context import build_recent_sections
-    from ouroboros.context_budget import MAX_RECENT_CHAT_TAIL
-    from ouroboros.memory import Memory
-
-    logs_dir = tmp_path / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    fresh_count = 305
-    entries = [
-        {"chat_id": 1, "direction": "in", "username": "User", "text": f"fresh-{i}"}
-        for i in range(fresh_count)
-    ]
-    (logs_dir / "chat.jsonl").write_text(
-        "\n".join(json.dumps(entry) for entry in entries) + "\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("OUROBOROS_CONTEXT_MODE", "low")
-
-    combined = "\n\n".join(build_recent_sections(Memory(drive_root=tmp_path), env=None))
-
-    assert fresh_count < MAX_RECENT_CHAT_TAIL
-    assert "fresh-0" in combined
-    assert f"fresh-{fresh_count - 1}" in combined
-
-
-def test_recent_chat_offset_uses_filtered_dialogue_entries(tmp_path):
-    from ouroboros.context import build_recent_sections
-    from ouroboros.memory import Memory
-
-    logs_dir = tmp_path / "logs"
-    memory_dir = tmp_path / "memory"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    memory_dir.mkdir(parents=True, exist_ok=True)
-    entries = [
-        {"chat_id": 1, "direction": "in", "username": "User", "text": "consolidated-0"},
-        {"chat_id": -1, "direction": "in", "username": "Agent", "text": "a2a-noise"},
-        {"chat_id": 1, "direction": "in", "username": "User", "text": "consolidated-1"},
-        {"chat_id": 1, "direction": "in", "username": "User", "text": "fresh"},
-    ]
-    (logs_dir / "chat.jsonl").write_text(
-        "\n".join(json.dumps(entry) for entry in entries) + "\n",
-        encoding="utf-8",
-    )
-    memory = Memory(drive_root=tmp_path)
-    (memory_dir / "dialogue_meta.json").write_text(
-        json.dumps({
-            "last_consolidated_offset": 2,
-            "chat_log_signature": memory.jsonl_generation_signature("chat.jsonl"),
-        }),
-        encoding="utf-8",
-    )
-
-    combined = "\n\n".join(build_recent_sections(memory, env=None))
-
-    assert "consolidated-0" not in combined
-    assert "consolidated-1" not in combined
-    assert "a2a-noise" not in combined
-    assert "fresh" in combined
-
-
-def test_recent_chat_ignores_stale_consolidation_offset_after_rotation(tmp_path):
-    from ouroboros.context import build_recent_sections
-    from ouroboros.memory import Memory
-
-    logs_dir = tmp_path / "logs"
-    memory_dir = tmp_path / "memory"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    memory_dir.mkdir(parents=True, exist_ok=True)
-    initial = [
-        {"chat_id": 1, "direction": "in", "username": "User", "text": f"early-{i}"}
-        for i in range(3)
-    ]
-    (logs_dir / "chat.jsonl").write_text(
-        "\n".join(json.dumps(entry) for entry in initial) + "\n",
-        encoding="utf-8",
-    )
-    memory = Memory(drive_root=tmp_path)
-    stale_signature = memory.jsonl_generation_signature("chat.jsonl")
-    (memory_dir / "dialogue_meta.json").write_text(
-        json.dumps({
-            "last_consolidated_offset": 3,
-            "chat_log_signature": stale_signature,
-        }),
-        encoding="utf-8",
-    )
-
-    rotated = [
-        {"chat_id": 1, "direction": "in", "username": "User", "text": f"post-rotate-{i}"}
-        for i in range(2)
-    ]
-    (logs_dir / "chat.jsonl").write_text(
-        "\n".join(json.dumps(entry) for entry in rotated) + "\n",
-        encoding="utf-8",
-    )
-
-    combined = "\n\n".join(build_recent_sections(memory, env=None))
-
-    # Rotation invalidates the stale offset; rotated entries appear.
-    assert "post-rotate-0" in combined
-    assert "post-rotate-1" in combined
-
-
-def test_recent_chat_keeps_offset_when_same_log_gets_appended(tmp_path):
-    from ouroboros.context import build_recent_sections
-    from ouroboros.memory import Memory
-
-    logs_dir = tmp_path / "logs"
-    memory_dir = tmp_path / "memory"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    memory_dir.mkdir(parents=True, exist_ok=True)
-    initial = [
-        {"chat_id": 1, "direction": "in", "username": "User", "text": f"old-{i}"}
-        for i in range(3)
-    ]
-    (logs_dir / "chat.jsonl").write_text(
-        "\n".join(json.dumps(entry) for entry in initial) + "\n",
-        encoding="utf-8",
-    )
-    memory = Memory(drive_root=tmp_path)
-    (memory_dir / "dialogue_meta.json").write_text(
-        json.dumps({
-            "last_consolidated_offset": 3,
-            "chat_log_signature": memory.jsonl_generation_signature("chat.jsonl"),
-        }),
-        encoding="utf-8",
-    )
-
-    with open(logs_dir / "chat.jsonl", "a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"chat_id": 1, "direction": "in", "username": "User", "text": "new"}) + "\n")
-
-    combined = "\n\n".join(build_recent_sections(memory, env=None))
-
-    assert "old-0" not in combined
-    assert "new" in combined
+    assert "digest" not in txt                 # recency event carries no full text
 
 
 def test_world_profile_is_loaded_with_stable_memory(tmp_path):
@@ -365,42 +132,6 @@ def test_world_profile_is_loaded_with_stable_memory(tmp_path):
     combined = "\n\n".join(sections)
 
     assert "world-profile-data" in combined
-
-
-def test_retired_dialogue_summary_remains_visible_when_blocks_exist(tmp_path):
-    from ouroboros.context import build_memory_sections
-    from ouroboros.memory import Memory
-
-    memory_dir = tmp_path / "memory"
-    memory_dir.mkdir(parents=True, exist_ok=True)
-    (memory_dir / "dialogue_summary.md").write_text("legacy dialogue", encoding="utf-8")
-    (memory_dir / "dialogue_blocks.json").write_text(
-        json.dumps([{"content": "new dialogue block"}]),
-        encoding="utf-8",
-    )
-    memory = Memory(drive_root=tmp_path)
-
-    combined = "\n\n".join(build_memory_sections(memory, partition="volatile"))
-
-    assert "## Dialogue History" in combined
-    assert "new dialogue block" in combined
-    assert "## Legacy Dialogue Summary (retired flat format, read-only fallback)" in combined
-    assert "legacy dialogue" in combined
-
-
-def test_retired_dialogue_summary_fallback_preserves_continuity_without_blocks(tmp_path):
-    from ouroboros.context import build_memory_sections
-    from ouroboros.memory import Memory
-
-    memory_dir = tmp_path / "memory"
-    memory_dir.mkdir(parents=True, exist_ok=True)
-    (memory_dir / "dialogue_summary.md").write_text("legacy dialogue only", encoding="utf-8")
-    memory = Memory(drive_root=tmp_path)
-
-    combined = "\n\n".join(build_memory_sections(memory, partition="volatile"))
-
-    assert "## Legacy Dialogue Summary (retired flat format, read-only fallback)" in combined
-    assert "legacy dialogue only" in combined
 
 
 def test_recent_sections_filter_process_logs_by_task_id(tmp_path):
@@ -439,7 +170,7 @@ def test_installed_skills_section_includes_warnings_verdict(tmp_path, monkeypatc
 
     monkeypatch.setattr(
         "ouroboros.skill_loader.summarize_skills",
-        lambda _root: {
+        lambda _root, _skills=None: {
             "skills": [
                 {
                     "name": "weather",
@@ -469,7 +200,7 @@ def test_installed_skills_section_qualifies_extension_liveness_process(tmp_path,
 
     monkeypatch.setattr(
         "ouroboros.skill_loader.summarize_skills",
-        lambda _root: {
+        lambda _root, _skills=None: {
             "skills": [{
                 "name": "weather_widget",
                 "type": "extension",

@@ -1,0 +1,301 @@
+"""Completion and recovery do not wait for history; custody still prevents loss."""
+
+import json
+
+import pytest
+
+from ouroboros import headless, observability
+from ouroboros.history_retention import retention_summary
+from ouroboros.task_custody import settle_child_drive
+from ouroboros.task_results import load_task_result, write_task_result
+
+
+@pytest.mark.parametrize("layout", ["direct", "headless"])
+def test_completion_adopts_answer_without_history_and_keeps_source(tmp_path, monkeypatch, layout):
+    parent = tmp_path / "parent"
+    child = parent / (headless.TASK_DRIVES_DIR if layout == "direct" else headless.HEADLESS_TASKS_DIR) / "finished"
+    if layout == "headless":
+        child /= "data"
+    child.mkdir(parents=True)
+    ref = observability.persist_call(child, task_id="finished", call_id="call", call_type="llm_response",
+                                     payload={"answer": "exact"})["manifest_ref"]
+    write_task_result(parent, "finished", "running", result="")
+    write_task_result(child, "finished", "completed", result="The answer", artifact_status="ready",
+                      trace_refs={"llm_call_refs": [{"response_ref": ref}]})
+    task = {"id": "finished", "drive_root": str(child)}
+    with monkeypatch.context() as blocked:
+        blocked.setattr(observability, "promote_child_task_refs",
+                        lambda *a, **k: pytest.fail("history walked on completion/startup"))
+        result = headless.copy_child_task_result(parent, task)
+        assert result["result"] == "The answer"
+        assert headless.terminal_task_files_ready(parent, task, result)
+        assert not headless.prepare_terminal_task_files(parent, task)["error"]
+    assert retention_summary(result)["status"] == "pending"
+    assert retention_summary(result)["problem_count"] == 0
+    assert result["trace_refs"]["llm_call_refs"][0]["response_ref"] == ref
+    assert settle_child_drive(parent, "finished", child, live=lambda _: False)["reason"] == "child_refs_pending"
+    assert child.exists()
+    assert any(json.loads(line)["type"] == "history_retention"
+               for line in (parent / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines())
+
+
+def test_adoption_copies_output_files_before_marking_answer_ready(tmp_path, monkeypatch):
+    parent = tmp_path / "parent"
+    child = parent / "task_drives" / "outputs"
+    output = child / "task_results" / "artifacts" / "outputs" / "answer.txt"
+    output.parent.mkdir(parents=True)
+    output.write_text("delivered bytes", encoding="utf-8")
+    write_task_result(child, "outputs", "completed", result="see file", artifact_status="ready",
+                      artifacts=[{"path": str(output), "name": "answer.txt", "kind": "file"}])
+    monkeypatch.setattr(observability, "promote_child_task_refs",
+                        lambda *a, **k: pytest.fail("history walked while saving outputs"))
+    copied = headless.copy_child_task_result(parent, {"id": "outputs", "drive_root": str(child)})
+    assert copied["status"] == "completed"
+    from pathlib import Path
+    saved = Path(copied["artifacts"][0]["path"])
+    assert saved.is_relative_to(parent / "task_results" / "artifacts" / "outputs")
+    assert saved.read_text(encoding="utf-8") == "delivered bytes"
+
+
+def test_retention_problem_is_distinct_from_normal_background_work():
+    normal = {"schema_version": 1, "status": "incomplete", "pending_refs": [
+        {"kind": "history_retention_deferred", "path": "/retained"}], "unavailable_refs": []}
+    assert retention_summary({"child_ref_promotion": normal})["status"] == "pending"
+    failed = {**normal, "unavailable_refs": [{"reason": "disk full"}]}
+    assert retention_summary({"child_ref_promotion": failed})["status"] == "problem"
+    assert retention_summary({"child_ref_promotion": {**normal, "status": "complete", "pending_refs": []}})["status"] == "complete"
+
+
+def test_startup_does_not_retry_history_of_already_adopted_answer(tmp_path, monkeypatch):
+    from ouroboros.server_maintenance import _recover_terminal_task_files
+
+    parent = tmp_path / "parent"
+    child = parent / "task_drives" / "recovered"
+    child.mkdir(parents=True)
+    write_task_result(child, "recovered", "completed", result="saved", artifact_status="ready")
+    monkeypatch.setattr(observability, "promote_child_task_refs",
+                        lambda *a, **k: pytest.fail("history walked on restart"))
+    from ouroboros.startup_migrations import prepare_startup_state
+    prepare_startup_state(parent)
+    first = _recover_terminal_task_files(parent, set())
+    assert first["recovered"] == ["recovered"]
+    assert not first["errors"]
+    assert load_task_result(parent, "recovered")["result"] == "saved"
+    second = _recover_terminal_task_files(parent, set())
+    assert not second["errors"]
+    assert load_task_result(parent, "recovered")["child_ref_promotion"]["status"] == "incomplete"
+
+
+@pytest.mark.parametrize("prior", ["cancelled", "old_complete", "late_call"])
+def test_gc_owes_unreferenced_physical_calls_including_old_and_cancelled_rows(tmp_path, prior):
+    parent = tmp_path / "parent"
+    child = parent / "task_drives" / "history"
+    child.mkdir(parents=True)
+    write_task_result(parent, "history", "cancelled" if prior == "cancelled" else "completed",
+                      result="saved", artifact_status="ready", headless_child_drive_root=str(child),
+                      child_ref_promotion={"schema_version": 1, "status": "complete", "pending_refs": []})
+    if prior == "late_call":
+        write_task_result(child, "history", "completed", result="saved", artifact_status="ready")
+        headless.copy_child_task_result(parent, {"id": "history", "drive_root": str(child)})
+        headless.retry_child_task_refs(parent, child, "history")
+    # Real physical call omitted from the task-result references, e.g. compaction/postwork.
+    trace = observability.persist_call(child, task_id="history", call_id="unlisted",
+                                       call_type="context_compaction_map", payload={"source": "exact"})
+    outcome = settle_child_drive(parent, "history", child, live=lambda _: False)
+    assert outcome["status"] == "retained" and outcome["reason"] == "call_inventory_pending"
+    pending = load_task_result(parent, "history")
+    assert pending["child_ref_promotion"]["status"] == "incomplete"
+    headless.retry_child_task_refs(parent, child, "history")
+    assert settle_child_drive(parent, "history", child, live=lambda _: False)["status"] == "removed"
+    assert not child.exists()
+    manifest = observability.read_call_manifest_ref(parent, trace["manifest_ref"], task_id="history")
+    assert observability.read_blob_ref(parent, manifest["full_payload_ref"]) == {"source": "exact"}
+
+
+def test_public_exact_review_reader_works_while_history_is_deferred(tmp_path):
+    """An old host acceptance record (nothing writes one any more) stays readable through
+    ``get_task_result(review_source_sha256=...)`` before and after deferred history placement."""
+    from pathlib import Path
+    from ouroboros.artifacts import store_actor_source_bytes, task_artifact_dir_path
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
+
+    parent, task_id = tmp_path / "parent", "source-author"
+    child = headless.prepare_task_drive(parent, task_id, "empty")
+    raw = json.dumps({"authority": "host_root", "request": {
+        "surface": "task_acceptance", "task_id": task_id, "subject": "exact original"}}).encode("utf-8")
+    ref = store_actor_source_bytes(child, task_id, category="context_checkpoints", source_id="acceptance",
+                                   data=raw, extension="json")
+    write_task_result(child, task_id, "completed", result="saved", artifact_status="ready",
+                      review_projection={"panels": [{"surface": "task_acceptance", "authority": "host_root",
+                                                      "applied_source_ref": ref}]})
+    headless.copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    canonical = task_artifact_dir_path(parent, task_id, create=False) / ref["path"]
+    assert not canonical.exists()
+    registry = ToolRegistry(repo_dir=Path.cwd(), drive_root=parent)
+    registry.set_context(ToolContext(repo_dir=Path.cwd(), drive_root=parent, task_id="next-owner",
+                                    task_metadata={"budget_drive_root": str(parent)}))
+    write_task_result(parent, "next-owner", "running", root_task_id="next-owner")
+    selector = {"tool": "get_task_result", "arguments": {"task_id": task_id, "review_source_sha256": ref["sha256"]}}
+    result = registry.execute_result(selector["tool"], selector["arguments"])
+    assert result.status == "ok"
+    before = json.loads(result.text)["review_source"]
+    assert before.get("status") != "unavailable" and before["source_ref"]["sha256"] == ref["sha256"]
+    assert not canonical.exists(), "a read must not perform deferred history placement"
+    headless.retry_child_task_refs(parent, child, task_id)
+    assert settle_child_drive(parent, task_id, child, live=lambda _: False)["status"] == "removed"
+    after = registry.execute_result(selector["tool"], selector["arguments"])
+    assert json.loads(after.text)["review_source"] == before
+
+
+def test_gc_rechecks_call_inventory_after_preparation(tmp_path, monkeypatch):
+    from ouroboros import task_custody
+
+    parent, task_id = tmp_path / "parent", "late-inventory"
+    child = headless.prepare_task_drive(parent, task_id, "empty")
+    write_task_result(child, task_id, "completed", result="saved", artifact_status="ready")
+    observability.persist_call(child, task_id=task_id, call_id="first", call_type="tool_call", payload={"data": "first"})
+    headless.copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    headless.retry_child_task_refs(parent, child, task_id)
+    original = task_custody._child_store_plan
+    late = []
+    def write_during_preparation(*args, **kwargs):
+        plan = original(*args, **kwargs)
+        late.append(observability.persist_call(child, task_id=task_id, call_id="late", call_type="tool_call",
+                                              payload={"data": "late physical result"})["manifest_ref"])
+        return plan
+    with monkeypatch.context() as writing:
+        writing.setattr(task_custody, "_child_store_plan", write_during_preparation)
+        outcome = settle_child_drive(parent, task_id, child, live=lambda _: False)
+    assert outcome["status"] == "retained" and outcome["reason"] == "call_inventory_changed"
+    assert child.exists()
+    assert settle_child_drive(parent, task_id, child, live=lambda _: False)["reason"] == "call_inventory_pending"
+    headless.retry_child_task_refs(parent, child, task_id)
+    assert settle_child_drive(parent, task_id, child, live=lambda _: False)["status"] == "removed"
+    stored = observability.read_call_manifest_ref(parent, late[0], task_id=task_id)
+    assert observability.read_blob_ref(parent, stored["full_payload_ref"]) == {"data": "late physical result"}
+
+
+@pytest.mark.parametrize("late", [False, True])
+def test_a_direct_drive_beside_a_helper_drive_is_judged_by_its_own_call_inventory(tmp_path, late):
+    """A root task's calls lived in its helper drive, so its row records THAT drive's call-inventory
+    revision; its direct drive has no calls folder. The direct drive is compared with its own (absent)
+    inventory and settles; a calls folder that appears there between preparation and the move keeps
+    it, and it settles once that inventory is promoted."""
+    import contextlib
+
+    parent, task_id = tmp_path / "parent", "two-drives"
+    helper = headless.prepare_task_drive(parent, task_id, "empty")
+    write_task_result(helper, task_id, "completed", result="saved", artifact_status="ready")
+    observability.persist_call(helper, task_id=task_id, call_id="first", call_type="tool_call", payload={"data": "first"})
+    headless.copy_child_task_result(parent, {"id": task_id, "drive_root": str(helper)})
+    headless.retry_child_task_refs(parent, helper, task_id)
+    promotion = load_task_result(parent, task_id)["child_ref_promotion"]
+    assert promotion["call_inventory_preserved"] is True and promotion["call_inventory_mtime_ns"]
+    assert settle_child_drive(parent, task_id, helper, live=lambda _: False)["status"] == "removed"
+    direct = parent / headless.TASK_DRIVES_DIR / task_id
+    (direct / "tmp_scripts").mkdir(parents=True)
+    calls = []
+
+    @contextlib.contextmanager
+    def interlock():
+        if late:  # a call recorded after preparation, before the move
+            calls.append(observability.persist_call(direct, task_id=task_id, call_id="late", call_type="tool_call",
+                                                    payload={"data": "late"})["manifest_ref"])
+        yield True
+
+    outcome = settle_child_drive(parent, task_id, direct, live=lambda _: False, guard=interlock)
+    if not late:
+        assert outcome["status"] == "removed" and not direct.exists(), outcome
+        return
+    assert (outcome["status"], outcome["reason"]) == ("retained", "call_inventory_changed") and direct.exists()
+    assert settle_child_drive(parent, task_id, direct, live=lambda _: False)["reason"] == "call_inventory_pending"
+    headless.retry_child_task_refs(parent, direct, task_id)
+    assert settle_child_drive(parent, task_id, direct, live=lambda _: False)["status"] == "removed"
+    stored = observability.read_call_manifest_ref(parent, calls[0], task_id=task_id)
+    assert observability.read_blob_ref(parent, stored["full_payload_ref"]) == {"data": "late"}
+
+
+def _shared_drive(parent, layout):
+    """An owner's drive in which a timeout successor continued (it keeps its predecessor's
+    drive) and wrote its own result, mailbox and one call whose blob is missing, so the
+    successor's canonical row carries real pending refs inside the owner's drive."""
+    from ouroboros import owner_mailbox
+
+    owner, successor = "shared-owner", "shared-successor"
+    if layout == "headless":
+        child = headless.prepare_task_drive(parent, owner, "empty")
+    else:
+        child = parent / headless.TASK_DRIVES_DIR / owner
+        (child / "task_results").mkdir(parents=True)
+    call = observability.persist_call(child, task_id=successor, call_id="response",
+                                      call_type="llm_response", payload={"answer": "exact successor"})
+    manifest = json.loads((child / "observability" / "calls" / successor / "response.json").read_text(encoding="utf-8"))
+    blob = child / manifest["full_payload_ref"]["path"]
+    exact = blob.read_bytes()
+    blob.unlink()  # the first copy then records a real unavailable source
+    write_task_result(child, owner, "completed", result="owner answer", artifact_status="ready")
+    write_task_result(parent, owner, "running", child_drive_root=str(child))
+    headless.copy_child_task_result(parent, {"id": owner, "drive_root": str(child)})
+    owner_mailbox.write_task_message(child, "successor mailbox text", successor,
+                                     source_task_id=owner, msg_id="mail-1")
+    write_task_result(child, successor, "completed", result="successor answer", artifact_status="ready",
+                      trace_refs={"llm_call_refs": [{"response_ref": call["manifest_ref"]}]})
+    write_task_result(parent, successor, "running", child_drive_root=str(child))
+    copied = headless.copy_child_task_result(parent, {"id": successor, "drive_root": str(child)})
+    assert copied["child_ref_promotion"]["status"] == "incomplete"
+    return child, call, blob, exact
+
+
+@pytest.mark.parametrize("layout", ["direct", "headless"])
+def test_shared_drive_successor_is_retried_by_task_id_and_its_custody_survives_prune(tmp_path, layout):
+    """Issue #1418: the pending-promotion set names the successor with the owner's drive, so the
+    retry reaches it although no directory carries its name; until it settles, the owner's drive stays."""
+    from ouroboros import owner_mailbox
+    from ouroboros.obligations import members
+
+    parent, successor = tmp_path / "parent", "shared-successor"
+    child, call, blob, exact = _shared_drive(parent, layout)
+    assert successor in members(parent, "promotions")
+    prune = headless.prune_headless_task_drives if layout == "headless" else headless.prune_task_drives
+
+    first = observability.retry_pending_child_ref_promotions(parent)
+    assert successor in first["pending"] and not first["errors"], first
+    kept = prune(parent, retention_days=1, now=4_000_000_000, live=lambda _task: False)
+    assert not kept["pruned"] and child.exists(), kept
+    assert {"task_id": "shared-owner", "reason": "child_refs_pending"} in kept["custody_pending"], kept
+
+    blob.write_bytes(exact)
+    repaired = observability.retry_pending_child_ref_promotions(parent)
+    assert successor in repaired["completed"] and not repaired["errors"], repaired
+    assert successor not in members(parent, "promotions")
+    pruned = prune(parent, retention_days=1, now=4_000_000_000, live=lambda _task: False)
+    assert [row["task_id"] for row in pruned["pruned"]] == ["shared-owner"], pruned
+    assert not child.exists()
+    settled = load_task_result(parent, successor)
+    assert [json.loads(row)["msg_id"] for row in settled["unread_mailbox"]["rows"]] == ["mail-1"]
+    assert not owner_mailbox._mailbox_path(child, successor).exists()
+    stored = observability.read_call_manifest_ref(parent, call["manifest_ref"], task_id=successor)
+    assert observability.read_blob_ref(parent, stored["full_payload_ref"]) == {"answer": "exact successor"}
+
+
+@pytest.mark.parametrize("guard", ["live", "liveness_unknown", "unknown_occupant"])
+def test_shared_drive_is_kept_while_a_successor_is_live_or_unknown(tmp_path, guard):
+    """A settled, fully promoted successor still keeps the owner's drive while it is live, its
+    liveness is unknown, or the drive holds an occupant that is not a task id."""
+    parent, successor = tmp_path / "parent", "shared-successor"
+    child, _call, blob, exact = _shared_drive(parent, "headless")
+    blob.write_bytes(exact)
+    assert successor in observability.retry_pending_child_ref_promotions(parent)["completed"]
+    if guard == "unknown_occupant":
+        # JSON result files are inert after import; an unowned artifact directory
+        # is still an occupant that the current custody census must retain.
+        (child / "task_results" / "artifacts" / "not a task id!").mkdir(parents=True)
+    probe = {"live": lambda task: True if task == successor else False,
+             "liveness_unknown": lambda task: None if task == successor else False}.get(guard, lambda _task: False)
+
+    report = headless.prune_headless_task_drives(parent, retention_days=1, now=4_000_000_000, live=probe)
+
+    assert not report["pruned"] and child.exists(), report
+    reason = {"live": "task_live", "liveness_unknown": "liveness_unknown"}.get(guard, "drive_occupant_unknown")
+    assert {"task_id": "shared-owner", "reason": reason} in report["custody_pending"], report
+    assert load_task_result(child, successor)["result"] == "successor answer"

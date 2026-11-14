@@ -8,7 +8,9 @@ external-workspace task and translates the terminal result into the benchmark's 
 (``traj_log.json`` + ``workspace/`` + a ``Status:`` line the runner greps).
 
 Engine contract (README "Подключение своего раннера"): ``--task_dir``, ``--max_steps``,
-``--phase agent|eval|all``. ``--phase eval`` runs only the benchmark's evaluator.
+``--phase agent|eval|all``. ``--phase eval`` runs only the benchmark's evaluator, at most once
+per task dump (``eval_attempt.py``, copied beside this file), plus the run's opt-in
+audit-only residual-state diagnostic.
 ``--phase inventory`` checks MCP startup and tool discovery without model calls.
 ``--phase stateful`` proves PPTX and browser state survives separate HTTP client sessions.
 Both preserve complete probe logs under ``--probe-output`` before any paid run.
@@ -63,7 +65,7 @@ COST_RESULT_FIELDS = (
     "accounted_upper_bound_usd", "accounted_upper_bound_usd_with_children", "cost_known",
     "cost_accounting_status", "cost_accounting_error", "cost_final", "cost_with_children_partial",
     "unknown_unmetered", "non_final_rows", "reserved_usd", "unresolved_upper_bound_usd",
-    "ledger_integrity_degraded",
+    "ledger_integrity_degraded", "cost_presentation", "cost_custody",
 )
 
 
@@ -204,7 +206,7 @@ def classify_outcome(result: Mapping[str, Any], truncation_codes: list[str]) -> 
 
     ``completed`` means the agent ended its work voluntarily, which is exactly the reference
     engines' ``success`` ("the model ended its turn"); the benchmark's evaluator, not the
-    acceptance panel, then judges the side effects. A runtime rail (round cap, budget, local
+    result review, then judges the side effects. A runtime rail (round cap, budget, local
     deadline) is the benchmark's ``max_turns_reached``. Provider/transport death is ``failed``
     AND flagged ``infra_failed`` so the launcher may re-run it without touching genuine misses.
     """
@@ -392,17 +394,29 @@ def collect_audit_artifacts(task_root: pathlib.Path, task_id: str, secrets: list
     """
     target = task_root / "ouroboros"
     target.mkdir(parents=True, exist_ok=True)
-    sources = [pathlib.Path(OUROBOROS_DATA) / "logs" / name for name in _AUDIT_LOGS]
-    if task_id:
-        sources.append(pathlib.Path(OUROBOROS_DATA) / "task_results" / f"{task_id}.json")
-    for source in sources:
+    texts: list[tuple[str, str]] = []
+    for name in _AUDIT_LOGS:
         try:
-            text = source.read_text(encoding="utf-8", errors="replace")
+            texts.append((name, (pathlib.Path(OUROBOROS_DATA) / "logs" / name).read_text(encoding="utf-8", errors="replace")))
         except OSError:
             continue
-        staged = target / f".{source.name}.tmp"
+    if task_id:
+        # The task record lives in the data root's store; the install's own interpreter reads it
+        # through the store code, so the artefact is the document the gateway would serve.
+        reader = ("import json, sys\nfrom ouroboros.task_store import read_document\n"
+                  "print(json.dumps(read_document(sys.argv[1], sys.argv[2])))")
+        try:
+            dumped = subprocess.run([OUROBOROS_PYTHON, "-c", reader, OUROBOROS_DATA, task_id], cwd=OUROBOROS_SRC,
+                                    capture_output=True, text=True, timeout=60,
+                                    env={**os.environ, "OUROBOROS_DATA_DIR": OUROBOROS_DATA})  # read as that install
+        except (OSError, subprocess.SubprocessError):
+            dumped = None
+        if dumped is not None and dumped.returncode == 0 and dumped.stdout.strip() not in ("", "null"):
+            texts.append((f"{task_id}.json", dumped.stdout))
+    for name, text in texts:
+        staged = target / f".{name}.tmp"
         staged.write_text(scrub(text, secrets), encoding="utf-8")
-        staged.replace(target / source.name)
+        staged.replace(target / name)
 
 
 def write_bench_logs(task_config, status: str, started: datetime, summary: Mapping[str, Any], final_answer: str) -> None:
@@ -830,16 +844,50 @@ def run_stateful_phase(output_dir: pathlib.Path) -> int:
 # --------------------------------------------------------------------------- eval phase
 
 
+def _eval_attempt():
+    """The stdlib helper the image copies beside this entrypoint; the repository package otherwise."""
+    try:
+        import eval_attempt
+    except ImportError:
+        from devtools.benchmarks.cowork_bench import eval_attempt
+    return eval_attempt
+
+
 def run_eval_phase(task_dir: str, max_steps: int) -> int:
+    """One claimed official evaluation; the opt-in residual diagnostic follows its final lines."""
+    attempts = _eval_attempt()
+    # Host evidence for the diagnostic only; the official evaluator keeps its original environment.
+    agent_state = os.environ.pop(attempts.AGENT_STATE_ENV, "") or "unknown"
     from utils.evaluation.evaluator import TaskEvaluator
 
     bench_config = load_bench_config()
-    task_config = build_task_config(task_dir, str(bench_config["model"]), max_steps)
+    model = str(bench_config["model"])
+    task_root = attempts.task_dump_root(f"{ENGINE}/{model}".replace("/", "_"), task_dir)
     print("\n====== Evaluating ======", flush=True)
-    eval_res = asyncio.run(TaskEvaluator.evaluate_from_log_file(task_config.log_file))
+
+    def prepare() -> str:
+        # Built only inside a fresh claim: `TaskConfig.build` deletes an existing eval_res.json.
+        log_file = build_task_config(task_dir, model, max_steps).log_file
+        if os.path.abspath(log_file) != str(task_root / "traj_log.json"):
+            raise attempts.NotRun("log_path_mismatch")
+        return log_file
+
+    bindings = attempts.official_bindings(task_root, task_dir, entry_path=__file__,
+                                          config_path=os.environ.get(CONFIG_ENV) or DEFAULT_CONFIG_PATH)
+    record, ran_here = attempts.official_attempt(
+        task_root, bindings, {"agent_container_state": agent_state}, prepare,
+        lambda log_file: asyncio.run(TaskEvaluator.evaluate_from_log_file(log_file)),
+    )
+    eval_res = attempts.official_verdict(record)
+    if eval_res is None:
+        print(attempts.refusal_line(record), flush=True)
+        return 1
     print(f"Pass:    {eval_res.get('pass', False)}", flush=True)
     print(f"Details: {eval_res.get('details', eval_res.get('failure', 'N/A'))}", flush=True)
-    return 0 if eval_res.get("pass", False) else 1
+    code = 0 if eval_res.get("pass", False) else 1
+    if ran_here and bench_config.get(attempts.FLAG) is True and eval_res.get("pass", False) is None:
+        attempts.run_residual_diagnostic(task_root, record["attempt_id"])
+    return code
 
 
 def main(argv: list[str] | None = None) -> int:

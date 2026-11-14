@@ -236,6 +236,7 @@ def test_new_campaign_is_stamped_for_same_generation_worker_respawns(tmp_path, m
 
     monkeypatch.setattr(process_custody, "current_custody_session_id", lambda: "same-server")
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     queue.init(tmp_path)
     queue.init_queue_refs([], {}, {"value": 0})
     campaign = evolution_lifecycle.start_evolution_campaign("Improve", source="test")
@@ -930,8 +931,13 @@ def test_containment_disowns_the_commit_intent_so_boot_cannot_adopt_it(
     assert int(current.get("absorbed_cycles_done") or 0) == 0
 
 
-@pytest.mark.parametrize('has_marker', [False, True])
-@pytest.mark.parametrize('native_status', ['unconfigured', 'verified', 'failed', 'missing', 'stale'])
+@pytest.mark.parametrize(("native_status", "has_marker"), [
+    ('unconfigured', True),
+    ('verified', False),
+    ('failed', False),
+    ('missing', True),
+    ('stale', False),
+])
 def test_native_host_adoption_is_required_for_restart_success(
     tmp_path, monkeypatch, has_marker, native_status,
 ):

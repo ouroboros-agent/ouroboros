@@ -1,35 +1,39 @@
 """W2 claims wiring: the ONE pure seam ``effective_acceptance_claims`` and its two
-consumers — the acceptance-evidence packet (ingress-contract claims first, the
-CLOSED plan wave's frozen claims only when ingress is empty) and the child-contract
-builder (claims re-stated AFTER the **parent_contract spread). The running task
-contract is NEVER mutated: plan-frozen claims live in plan_review_state and are
-resolved at read time."""
+consumers — the one read-time binder ``review_evidence_sections._accept_effective_claims``
+that the result review's subject reads (ingress-contract claims first, the CLOSED plan
+wave's frozen claims only when ingress is empty) and the child-contract builder (claims
+re-stated AFTER the **parent_contract spread). The running task contract is NEVER
+mutated: plan-frozen claims live in plan_review_state and are resolved at read time."""
 
 import tempfile
 import types as _t
 from pathlib import Path
 
 from ouroboros.contracts.task_contract import effective_acceptance_claims
-from ouroboros.review_evidence import build_task_acceptance_evidence
+from ouroboros.review_evidence_sections import _accept_effective_claims, _accept_task_contract
 
 
 def _v2_wave(fingerprint: str, claims: list, *, aggregate: str = "GREEN", closed: bool = True) -> dict:
-    from ouroboros.tools.plan_spec import normalize_spec, spec_hash
+    """A finished legacy (v2) wave as the retired engine stored it: its spec's claims in the
+    acceptance claim grammar (the normalizer the spec parser used)."""
+    from ouroboros.contracts.task_contract import normalize_acceptance_claims
+    from tests import _legacy_plan_shared as legacy
 
-    spec, errors = normalize_spec({"goal": "g", "acceptance_claims": claims})
-    assert not errors
-    return {
-        "schema_version": 2, "cycle_index": 1, "request_fingerprint": fingerprint,
-        "spec": spec, "spec_hash": spec_hash(spec), "findings": [], "aggregate": aggregate,
-        "closed": closed, "dispositions": [], "paid": True,
-    }
+    spec = {"goal": "g", "acceptance_claims": normalize_acceptance_claims(claims)}
+    return legacy.wave(1, fingerprint=fingerprint, spec=spec, aggregate=aggregate, closed=closed)
 
 
 def _close_green_wave(root: Path, task_id: str, fingerprint: str, claims: list) -> None:
-    from ouroboros.task_results import STATUS_RUNNING, record_plan_review_wave, write_task_result
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
+    from tests import _legacy_plan_shared as legacy
 
     write_task_result(root, task_id, STATUS_RUNNING, result="running")
-    record_plan_review_wave(root, task_id, _v2_wave(fingerprint, claims))
+    legacy.seed_plan_review_state(root, task_id, legacy.v2_state(_v2_wave(fingerprint, claims)))
+
+
+def _bind(ctx, root: Path, task_id: str):
+    """The read-time binder over the task's contract, as the result review's subject reads it."""
+    return _accept_effective_claims(ctx, _accept_task_contract(ctx), root, task_id)
 
 
 def test_effective_acceptance_claims_ingress_wins():
@@ -59,7 +63,7 @@ def test_effective_acceptance_claims_accepts_task_like_mapping():
     assert claims[0]["claim"] == "from contract"
 
 
-def test_packet_uses_plan_frozen_claims_when_ingress_empty():
+def test_binder_uses_plan_frozen_claims_when_ingress_empty():
     dr = Path(tempfile.mkdtemp())
     _close_green_wave(dr, "acc", "a" * 64, ["game boots", "score persists"])
     ctx = _t.SimpleNamespace(
@@ -67,15 +71,14 @@ def test_packet_uses_plan_frozen_claims_when_ingress_empty():
         task_metadata={}, drive_root=str(dr), task_id="acc", repo_dir=str(dr),
     )
 
-    ev = build_task_acceptance_evidence(ctx, llm_trace={"tool_calls": []}, drive_root=dr, task_id="acc")
+    claims, source, _exhibit = _bind(ctx, dr, "acc")
 
-    packet_claims = ev["task_contract"]["acceptance_claims"]
-    assert [c["claim"] for c in packet_claims] == ["game boots", "score persists"]
-    assert ev["acceptance_claims_source"] == "plan_review"
-    assert ev["__provenance__"]["acceptance_claims_source"] == "host_attested"
+    assert [c["claim"] for c in claims] == ["game boots", "score persists"]
+    assert source == "plan_review"
+    assert "acceptance_claims" not in ctx.task_contract  # resolved at read time, never written back
 
 
-def test_packet_prefers_ingress_claims_over_plan_wave():
+def test_binder_prefers_ingress_claims_over_plan_wave():
     dr = Path(tempfile.mkdtemp())
     _close_green_wave(dr, "acc", "a" * 64, ["plan claim"])
     ctx = _t.SimpleNamespace(
@@ -83,16 +86,15 @@ def test_packet_prefers_ingress_claims_over_plan_wave():
         task_metadata={}, drive_root=str(dr), task_id="acc", repo_dir=str(dr),
     )
 
-    ev = build_task_acceptance_evidence(ctx, llm_trace={"tool_calls": []}, drive_root=dr, task_id="acc")
+    claims, source, _exhibit = _bind(ctx, dr, "acc")
 
-    packet_claims = ev["task_contract"]["acceptance_claims"]
-    assert [c["claim"] for c in packet_claims] == ["adapter claim"]
-    assert ev["acceptance_claims_source"] == "ingress_contract"
+    assert [c["claim"] for c in claims] == ["adapter claim"]
+    assert source == "ingress_contract"
 
 
-def test_packet_claims_lookup_is_fail_soft():
+def test_binder_claims_lookup_is_fail_soft():
     dr = Path(tempfile.mkdtemp())
-    # Malformed task-result JSON: the plan-state lookup raises inside, packet survives.
+    # Malformed task-result JSON: the plan-state lookup raises inside, the binder survives.
     results = dr / "task_results"
     results.mkdir(parents=True, exist_ok=True)
     (results / "acc.json").write_text("{not json", encoding="utf-8")
@@ -101,10 +103,10 @@ def test_packet_claims_lookup_is_fail_soft():
         task_metadata={}, drive_root=str(dr), task_id="acc", repo_dir=str(dr),
     )
 
-    ev = build_task_acceptance_evidence(ctx, llm_trace={"tool_calls": []}, drive_root=dr, task_id="acc")
+    claims, source, _exhibit = _bind(ctx, dr, "acc")
 
-    assert "acceptance_claims_source" not in ev
-    assert not ev["task_contract"].get("acceptance_claims")
+    assert source == ""
+    assert not claims
 
 
 def test_schedule_subagent_publishes_claims_param_via_ssot():
@@ -239,67 +241,54 @@ def test_success_criteria_is_an_input_alias_not_a_second_carrier():
     assert explicit_empty["success_criteria"] == ["kept criterion"]
 
 
-def test_wave_freeze_and_bind_preserve_reviewed_claim_whitespace():
-    """G3-6: the review panel sees the normalized spec — per-item strip with internal
-    whitespace PRESERVED. The frozen v2 wave (the whole reviewed spec) and the read-time
-    binder must carry that text byte-for-byte, including decisive tails beyond the old cap;
-    the historical ``" ".join(split())`` rewrite made acceptance bind an exact-output
-    claim DIFFERENT from what the panel reviewed."""
-    from ouroboros.task_results import closed_plan_review_wave, load_plan_review_state
-    from ouroboros.tools.plan_spec import normalize_spec
+def test_wave_and_plan_bind_preserve_reviewed_claim_whitespace():
+    """G3-6: a claim is stripped at its edges with internal whitespace PRESERVED. A finished
+    legacy wave's reviewed claim and a plan revision's ``done_when`` must bind byte-for-byte,
+    including decisive tails beyond the old cap; the historical ``" ".join(split())``
+    rewrite made acceptance bind an exact-output claim DIFFERENT from what was reviewed."""
+    from ouroboros import plan_record
+    from ouroboros.contracts.task_contract import normalize_acceptance_claims
+    from ouroboros.task_results import current_plan_review_wave, load_plan_review_state
 
     raw = "stdout is exactly:\n    def f():\n        return  'a  b'"
-    spec, _errors = normalize_spec({"goal": "g", "acceptance_claims": [f"  {raw}  "]})
-    reviewed = [c["claim"] for c in spec["acceptance_claims"]]
-    assert reviewed == [raw]  # the panel-reviewed surface preserves internal whitespace
-
     dr = Path(tempfile.mkdtemp())
-    _close_green_wave(dr, "acc", "a" * 64, reviewed)
-    wave = closed_plan_review_wave(load_plan_review_state(dr, "acc"))
-    assert [c["claim"] for c in wave["spec"]["acceptance_claims"]] == [raw]  # frozen byte-for-byte
+    _close_green_wave(dr, "acc", "a" * 64, [f"  {raw}  "])
+    wave = current_plan_review_wave(load_plan_review_state(dr, "acc"))
+    assert [c["claim"] for c in wave["spec"]["acceptance_claims"]] == [raw]  # stored byte-for-byte
 
     claims, source = effective_acceptance_claims({"acceptance_claims": []}, wave)
     assert source == "plan_review"
     assert [c["claim"] for c in claims] == [raw]  # bound text == reviewed text
+    ctx = _t.SimpleNamespace(task_contract={"requirements": "do X"}, task_metadata={}, drive_root=str(dr),
+                             task_id="acc", repo_dir=str(dr))
+    assert [c["claim"] for c in _bind(ctx, dr, "acc")[0]] == [raw]
+    assert [row["claim"] for row in plan_record.normalize_done_when([{"claim": f"  {raw}  "}])] == [raw]
 
-    # Review/acceptance authority is not a preview: the old 600-char cut cannot
-    # certify a prefix as the complete claim.
+    # Review/acceptance authority is not a preview: no cut can certify a prefix as the
+    # complete claim.
     long_claim = "line with    significant\tspacing\n" * 40
-    bounded_spec, _ = normalize_spec({"goal": "g", "acceptance_claims": [long_claim]})
-    bounded = bounded_spec["acceptance_claims"][0]["claim"]
+    bounded = normalize_acceptance_claims([long_claim])[0]["claim"]
     assert bounded == long_claim.strip()
     assert "OMISSION NOTE" not in bounded
 
 
-def test_packet_open_plan_wave_binds_no_claims():
-    from ouroboros.review_execution import _render_prompt_parts
-    from ouroboros.review_substrate import ReviewRequest, ReviewSlot
-    from ouroboros.task_results import STATUS_RUNNING, record_plan_review_wave, write_task_result
+def test_binder_open_plan_wave_binds_no_claims():
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
+    from tests import _legacy_plan_shared as legacy
 
     dr = Path(tempfile.mkdtemp())
     write_task_result(dr, "acc", STATUS_RUNNING, result="running")
-    record_plan_review_wave(dr, "acc", _v2_wave("a" * 64, ["unreviewed claim"],
-                                                aggregate="REVIEW_REQUIRED", closed=False))
+    legacy.seed_plan_review_state(dr, "acc", legacy.v2_state(_v2_wave("a" * 64, ["unreviewed claim"],
+                                                                      aggregate="REVIEW_REQUIRED", closed=False)))
     ctx = _t.SimpleNamespace(
         task_contract={"requirements": "do X"},
         task_metadata={}, drive_root=str(dr), task_id="acc", repo_dir=str(dr),
     )
 
-    ev = build_task_acceptance_evidence(ctx, llm_trace={"tool_calls": []}, drive_root=dr, task_id="acc")
+    claims, source, exhibit = _bind(ctx, dr, "acc")
 
-    # An OPEN (unclosed) wave's claims never bind acceptance, but AP5 discloses
-    # why the contract has no claims instead of silently omitting that fact.
-    assert ev["acceptance_claims_source"] == "none_open_plan_wave"
-    assert not ev["task_contract"].get("acceptance_claims")
-    assert "acceptance_support_refs" not in ev
-
-    # The acceptance prompt keeps the disclosure at packet top level. Its
-    # claim-specific reviewer rule names only task_contract.acceptance_claims,
-    # so the typed source cannot be mistaken for a binding claim.
-    stable, _task, dynamic = _render_prompt_parts(
-        ReviewRequest(surface="task_acceptance", goal="do X", evidence=ev),
-        ReviewSlot("s0", "m"),
-    )
-    assert "`task_contract.acceptance_claims` is present" in stable
-    assert '"acceptance_claims_source": "none_open_plan_wave"' in dynamic
-    assert '"task_contract": {\n    "requirements": "do X"\n  }' in dynamic
+    # A legacy v2 wave the old organ never closed selected nothing: the one binder binds
+    # no claim, and the plan-history exhibit discloses the legacy record instead of the
+    # binding silently omitting the fact.
+    assert source == "" and not claims
+    assert exhibit["binding"] == "none" and exhibit["revisions"] == [] and exhibit["legacy"]["fingerprint"] == "a" * 64

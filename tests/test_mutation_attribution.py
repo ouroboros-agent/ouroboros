@@ -3,6 +3,8 @@ from __future__ import annotations
 import pathlib
 import subprocess
 
+import pytest
+
 
 def _git(root: pathlib.Path, *args: str) -> str:
     result = subprocess.run(
@@ -400,45 +402,6 @@ def test_quiescent_evidence_without_terminal_snapshot_fails_closed(tmp_path):
     assert "terminal_snapshot_missing" in projection["blockers"]
 
 
-def test_acceptance_gets_bounded_host_mutation_evidence(tmp_path):
-    from ouroboros.mutation_attribution import capture_mutation_baseline
-    from ouroboros.review_evidence import build_task_acceptance_evidence
-    from ouroboros.task_results import (
-        STATUS_RUNNING,
-        load_task_result,
-        write_task_result,
-    )
-    from ouroboros.tools.registry import ToolContext
-
-    root = _repo(tmp_path)
-    data = tmp_path / "data"
-    write_task_result(data, "task-evidence", STATUS_RUNNING)
-    capture_mutation_baseline(
-        data,
-        "task-evidence",
-        [{"surface_type": "system_repo", "host_root": str(root)}],
-    )
-    evidence = dict((load_task_result(data, "task-evidence") or {})["mutation_evidence"])
-    evidence["flags"] = [{
-        "flag": "opaque_unregistered_effect",
-        "detail": str(root / "secret-name.txt"),
-    }]
-    write_task_result(data, "task-evidence", STATUS_RUNNING, mutation_evidence=evidence)
-    ctx = ToolContext(repo_dir=root, system_repo_dir=root, drive_root=data, task_id="task-evidence")
-
-    packet = build_task_acceptance_evidence(
-        ctx,
-        drive_root=data,
-        task_id="task-evidence",
-    )
-    projection = packet["mutation_attribution"]
-    assert packet["__provenance__"]["mutation_attribution"] == "host_attested"
-    assert projection["clean_eligible"] is False
-    assert projection["blockers"] == ["opaque_unregistered_effect"]
-    assert str(root) not in repr(projection)
-    assert "secret-name.txt" not in repr(projection)
-
-
 def test_mutation_blockers_never_veto_outcome_but_ride_the_evidence():
     from ouroboros.outcomes import derive_loop_outcome
 
@@ -783,7 +746,10 @@ def test_conflicting_foreign_commit_stays_fail_closed(tmp_path):
     assert "baseline_stale" in (evidence.get("blockers") or [])
 
 
-def test_trashed_worktree_overflow_is_a_typed_blocker(tmp_path, monkeypatch):
+@pytest.mark.parametrize("surface_type", ["system_repo", "external_workspace"])
+def test_trashed_worktree_overflow_is_a_typed_blocker(tmp_path, monkeypatch, surface_type):
+    """An admitted folder's work is its delivery, never a body candidate's uncommitted remainder, past the dirty cap
+    too: only the body's own overflow leaves an unknown remainder for the card."""
     from ouroboros import mutation_attribution as ma
     from ouroboros.task_results import STATUS_RUNNING, write_task_result
 
@@ -796,87 +762,182 @@ def test_trashed_worktree_overflow_is_a_typed_blocker(tmp_path, monkeypatch):
     ma.capture_mutation_baseline(
         data,
         "task-trash",
-        [{"surface_type": "system_repo", "host_root": str(root)}],
+        [{"surface_type": surface_type, "host_root": str(root)}],
     )
     candidates = ma.attributed_git_candidates(data, "task-trash", root)
     assert candidates["candidates"] == []
     assert candidates["blockers"] == ["baseline_dirty_overflow"]
+    evidence = ma.record_terminal_mutation_candidates(data, "task-trash")
+    [row] = evidence["terminal_candidate_snapshot"]["surfaces"]
+    assert row["blockers"] == ["baseline_dirty_overflow"]
+    remainder = ma.mutation_evidence_projection(evidence).get("uncommitted_remainder")
+    if surface_type == "system_repo":
+        assert row["uncommitted_state"] == "unknown" and remainder["state"] == "unknown"
+    else:
+        assert "uncommitted_paths" not in row and "uncommitted_state" not in row and remainder is None
 
 
-def test_acceptance_evidence_aggregates_capability_deltas(tmp_path):
-    """W3 adjacent (f): the finalizer's evidence packet carries ONE typed
-    host-attested aggregate of capability reductions — the task's own dispatch
-    delta plus every direct child that ran below what was asked — using the
-    SAME disclosable predicate the absorption surfaces use. Nothing reduced =
-    no section (noise-free)."""
-    from ouroboros.review_evidence import build_task_acceptance_evidence
-    from ouroboros.task_results import STATUS_COMPLETED, STATUS_RUNNING, write_task_result
-    from ouroboros.tools.registry import ToolContext
+def _unborn(path: pathlib.Path) -> pathlib.Path:
+    path.mkdir(parents=True)
+    _git(path, "init", "-q")
+    _git(path, "config", "user.email", "tests@example.invalid")
+    _git(path, "config", "user.name", "Tests")
+    return path
+
+
+def test_an_unborn_admitted_folder_is_baselined_against_the_empty_tree_beside_the_system_repo(tmp_path):
+    """Astra, 8 Nov 2026: a freshly initialized folder has no HEAD yet. Its baseline is the empty tree on a branch
+    ``workspace_preflight.git_head_basis`` proves unborn, so a process's first file is this task's work before any
+    commit, the owner's earlier untracked file stays foreign, and the system repo's baseline is kept beside it. The
+    task's own first (root) commit stays its attributed path; a first commit no epoch records is a moved base."""
+    from ouroboros.mutation_attribution import (
+        advance_mutation_baseline, attributed_commit_paths, attributed_git_candidates, capture_root_baseline,
+        record_terminal_mutation_candidates,
+    )
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
+
+    system, data = _repo(tmp_path / "system"), tmp_path / "data"
+    empty = subprocess.run(["git", "hash-object", "-t", "tree", "--stdin"], cwd=system, input="",
+                           capture_output=True, text=True, check=True).stdout.strip()
+    for task_id in ("own", "shell"):
+        folder = _unborn(tmp_path / task_id)
+        (folder / "owner.txt").write_text("the owner's file before the task\n", encoding="utf-8")
+        write_task_result(data, task_id, STATUS_RUNNING)
+        evidence = capture_root_baseline(data, {"id": task_id}, system_repo=system, workspace=folder, conversation=False)
+        rows = {row["surface_type"]: row for row in evidence["baseline"]["surfaces"]}
+        assert sorted(rows) == ["external_workspace", "system_repo"], "the system repo's baseline is never lost with it"
+        git = rows["external_workspace"]["git"]
+        assert (git["base_commit"], git["base_tree"], git["head_state"], git["dirty_paths"]) == (
+            "", empty, "unborn", ["owner.txt"])
+        assert "head_state" not in rows["system_repo"]["git"], "a born repository's row keeps its shape"
+        (folder / "first.txt").write_text("made by a process\n", encoding="utf-8")
+        found = attributed_git_candidates(data, task_id, folder)
+        assert (found["candidates"], found["excluded_preexisting_dirty"], found["blockers"], found["base_tree"]) == (
+            ["first.txt"], ["owner.txt"], [], empty)
+        _git(folder, "add", "first.txt")
+        _git(folder, "commit", "-qm", "first")
+        if task_id == "own":  # the task's own reviewed commit opens the next epoch from it
+            advance_mutation_baseline(data, task_id, folder, commit=_git(folder, "rev-parse", "HEAD"))
+            assert attributed_commit_paths(data, task_id, folder) == ["first.txt"], "a root commit lists its paths"
+            assert attributed_git_candidates(data, task_id, folder)["blockers"] == []
+            continue
+        assert attributed_commit_paths(data, task_id, folder) == [], "a commit no epoch records is no authorship"
+        assert "baseline_stale" in attributed_git_candidates(data, task_id, folder)["blockers"]
+        terminal = record_terminal_mutation_candidates(data, task_id)["terminal_candidate_snapshot"]["surfaces"]
+        [row] = [row for row in terminal if row["surface_type"] == "external_workspace"]
+        assert (row["candidates"], row["blockers"], row["head_advanced"]) == (["first.txt"], [], True), \
+            "the empty tree..HEAD interval is read like any base..HEAD"
+
+
+@pytest.mark.parametrize("broken", ["folder", "system"])
+def test_a_surface_whose_head_cannot_be_proven_is_left_out_and_the_other_kept(tmp_path, broken):
+    """A HEAD that is neither a commit nor a positively unborn branch (a deleted branch with history) is an
+    unknown basis: that surface gets no baseline (a named gap), never a guessed empty tree, and the root's other
+    admitted surface is still recorded."""
+    from ouroboros.mutation_attribution import attributed_git_candidates, capture_root_baseline
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
+
+    system, data = _repo(tmp_path / "system"), tmp_path / "data"
+    folder = _repo(tmp_path / "folder")
+    _git(folder if broken == "folder" else system, "symbolic-ref", "HEAD", "refs/heads/gone")
+    write_task_result(data, "task-1", STATUS_RUNNING)
+    evidence = capture_root_baseline(data, {"id": "task-1"}, system_repo=system, workspace=folder, conversation=False)
+    assert [row["surface_type"] for row in evidence["baseline"]["surfaces"]] == (
+        ["system_repo"] if broken == "folder" else ["external_workspace"])
+    missing = attributed_git_candidates(data, "task-1", folder if broken == "folder" else system)
+    assert missing["blockers"] == ["baseline_surface_missing"]
+
+
+def test_a_roots_admitted_git_folder_is_baselined_at_its_start_for_queued_and_conversation_roots(tmp_path):
+    """Owner, 8 Nov 2026: queue membership is not what makes production attributable. Any root admitted to a Git
+    folder of its own gets that folder's baseline at its start; a queued root also keeps its system repo. A resumed
+    task keeps the surfaces it started with, and a folder inside another tree is no surface of its own."""
+    from ouroboros.mutation_attribution import (
+        attributed_git_candidates, attribution_task_id, capture_mutation_baseline, capture_root_baseline,
+    )
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
+
+    system, folder = _repo(tmp_path / "system"), _repo(tmp_path / "folder")
+    data = tmp_path / "data"
+    for task_id in ("queued", "chat", "resumed", "nested"):
+        write_task_result(data, task_id, STATUS_RUNNING)
+
+    def surfaces(evidence):
+        return sorted(row["surface_type"] for row in (evidence or {}).get("baseline", {}).get("surfaces", []))
+
+    queued = capture_root_baseline(data, {"id": "queued"}, system_repo=system, workspace=folder, conversation=False)
+    assert surfaces(queued) == ["external_workspace", "system_repo"]
+    chat = capture_root_baseline(data, {"id": "chat"}, system_repo=system, workspace=folder, conversation=True)
+    assert surfaces(chat) == ["external_workspace"], "a conversation root never takes the body's staging baseline"
+    assert capture_root_baseline(data, {"id": "x"}, system_repo=system, workspace=system, conversation=True) is None
+
+    (folder / "report.md").write_text("made\n", encoding="utf-8")
+    assert attributed_git_candidates(data, "chat", folder)["candidates"] == ["report.md"]
+    # The commit gate's staging contract is unchanged where the baseline names another folder (legacy staging).
+    assert attribution_task_id(data, ("chat",), repo_root=system) == ""
+    assert attribution_task_id(data, ("chat",), repo_root=folder) == attribution_task_id(data, ("chat",)) == "chat"
+    assert attribution_task_id(data, ("queued",), repo_root=system) == "queued"
+
+    capture_mutation_baseline(data, "resumed", [{"surface_type": "system_repo", "host_root": str(system)}])
+    resumed = capture_root_baseline(data, {"id": "resumed"}, system_repo=system, workspace=folder, conversation=False)
+    assert surfaces(resumed) == ["system_repo"], "no folder is baselined after its work may have been done"
+    (folder / "inner").mkdir()
+    nested = capture_root_baseline(data, {"id": "nested"}, system_repo=system, workspace=folder / "inner",
+                                   conversation=True)
+    assert nested is None, "a subfolder's status paths are its tree's, never its own"
+
+
+def test_the_tasks_own_reviewed_commits_stay_its_attributed_paths_but_a_pull_never_does(tmp_path):
+    from ouroboros.mutation_attribution import (
+        advance_mutation_baseline, attributed_commit_paths, capture_mutation_baseline,
+    )
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
 
     root = _repo(tmp_path)
     data = tmp_path / "data"
-    write_task_result(
-        data, "task-parent", STATUS_RUNNING,
-        capability_delta={"reduced": True, "reason": "subscription_window_exhausted"},
-    )
-    write_task_result(
-        data, "task-kid-a", STATUS_COMPLETED,
-        parent_task_id="task-parent", root_task_id="task-parent",
-        delegation_role="subagent",
-        capability_delta={"reduced": True, "reason": "lane_ran_on_main"},
-    )
-    # A child whose delta took nothing away is noise and must not appear.
-    write_task_result(
-        data, "task-kid-b", STATUS_COMPLETED,
-        parent_task_id="task-parent", root_task_id="task-parent",
-        delegation_role="subagent",
-        capability_delta={"reduced": False},
-    )
-    ctx = ToolContext(repo_dir=root, system_repo_dir=root, drive_root=data, task_id="task-parent")
-
-    packet = build_task_acceptance_evidence(ctx, drive_root=data, task_id="task-parent")
-    section = packet["capability_deltas"]
-    assert packet["__provenance__"]["capability_deltas"] == "host_attested"
-    assert section["own"]["reason"] == "subscription_window_exhausted"
-    assert section["children_reduced_count"] == 1
-    assert section["children"][0]["task_id"] == "task-kid-a"
-    assert section["children"][0]["capability_delta"]["reason"] == "lane_ran_on_main"
-
-    # Nothing reduced anywhere -> the section is absent, not an empty stub.
-    write_task_result(data, "task-clean", STATUS_RUNNING)
-    ctx_clean = ToolContext(repo_dir=root, system_repo_dir=root, drive_root=data, task_id="task-clean")
-    clean_packet = build_task_acceptance_evidence(ctx_clean, drive_root=data, task_id="task-clean")
-    assert "capability_deltas" not in clean_packet
+    write_task_result(data, "task-1", STATUS_RUNNING)
+    capture_mutation_baseline(data, "task-1", [{"surface_type": "external_workspace", "host_root": str(root)}])
+    (root / "clean.txt").write_text("the task's change\n", encoding="utf-8")
+    _git(root, "commit", "-qam", "own reviewed commit")
+    advance_mutation_baseline(data, "task-1", root, commit=_git(root, "rev-parse", "HEAD"))
+    (root / "foreign.txt").write_text("someone else\n", encoding="utf-8")
+    _git(root, "add", "foreign.txt")
+    _git(root, "commit", "-qm", "a pulled commit")
+    assert attributed_commit_paths(data, "task-1", root) == ["clean.txt"]
 
 
-def test_acceptance_packet_reads_mutation_evidence_from_the_canonical_root(tmp_path):
-    """AP4(1): the writer and the outcome consumer resolve `budget_drive_root`
-    first. Reading the EXECUTION drive made the whole section vanish from the
-    packet on a split-root install, with no absence marker to notice."""
-    from ouroboros.mutation_attribution import (
-        capture_mutation_baseline,
-        load_mutation_evidence_projection,
-    )
-    from ouroboros.review_evidence import build_task_acceptance_evidence
-    from ouroboros.task_results import STATUS_RUNNING, write_task_result
-    from ouroboros.tools.registry import ToolContext
+def test_git_paths_are_utf8_whatever_the_process_default_encoding(tmp_path, monkeypatch):
+    """Windows CI, 10 Nov 2026: ``text=True`` without an encoding decoded Git's ``-z`` path lists with the locale's
+    code page (cp1252 there). A Cyrillic name broke the status walk and every folder attribution built on it, and the
+    project import's listing lost its credential check with it. Git writes those paths as UTF-8 bytes on every OS;
+    the emulated cp1252 default below stands for Windows on any test machine."""
+    from ouroboros import mutation_attribution
+    from ouroboros.project_sources import _unstage_sensitive_paths
 
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     root = _repo(tmp_path)
-    canonical = tmp_path / "canonical"
-    local = tmp_path / "local"
-    local.mkdir(parents=True)
-    write_task_result(canonical, "task-split", STATUS_RUNNING)
-    capture_mutation_baseline(
-        canonical, "task-split",
-        [{"surface_type": "system_repo", "host_root": str(root)}],
-    )
-    assert load_mutation_evidence_projection(canonical, "task-split")
-    assert not load_mutation_evidence_projection(local, "task-split")
+    (root / "файл.txt").write_bytes(b"base\n")
+    _git(root, "add", "файл.txt")
+    _git(root, "commit", "-qm", "a Cyrillic name")
+    (root / "файл.txt").write_bytes(b"changed\n")
+    (root / "я.txt").write_bytes(b"new\n")
+    project = tmp_path / "project"
+    project.mkdir()
+    _git(project, "init", "-q")
+    (project / "я.txt").write_bytes(b"kept\n")
+    (project / ".env").write_bytes(b"TOKEN=1\n")
+    _git(project, "add", "-A")
+    real_run = subprocess.run
 
-    ctx = ToolContext(
-        repo_dir=root, system_repo_dir=root, drive_root=local,
-        budget_drive_root=canonical, task_id="task-split",
-    )
-    packet = build_task_acceptance_evidence(ctx, drive_root=local, task_id="task-split")
-    assert packet["mutation_attribution"]["present"] is True
-    assert packet["__provenance__"]["mutation_attribution"] == "host_attested"
+    def windows_default(cmd, *args, **kwargs):
+        if (kwargs.get("text") or kwargs.get("universal_newlines")) and kwargs.get("encoding") is None:
+            kwargs["encoding"] = "cp1252"
+        return real_run(cmd, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(subprocess, "run", windows_default)
+        assert mutation_attribution._git_status_paths(root) == ["файл.txt", "я.txt"]
+        assert _unstage_sensitive_paths(project) == [".env"]
+    staged = subprocess.run(["git", "diff", "--cached", "--name-only", "-z"], cwd=project, check=True,
+                            capture_output=True).stdout
+    assert staged == "я.txt".encode("utf-8") + b"\0", "the credential is unstaged and the other name kept"

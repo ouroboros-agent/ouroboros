@@ -32,7 +32,7 @@ OFFICIAL_SOURCE_PIN = "7656b71d07da6694e262f9c34ea994cd4849c0eb"
 OFFICIAL_DATA_REVISION = "bde190ded494e52bc684b66073b436c9d992c7c6"
 OFFICIAL_TASKS_SHA256 = "9cea452cc1e1a3703e0f60c2dfc8642430aab9f50433f976581509de58c7048f"
 OFFICIAL_EXIT_EXCLUSIONS = frozenset({0, 71, 300})
-MAX_TASK_TIMEOUT_SEC = 14_400
+MAX_TASK_TIMEOUT_SEC = 21_600
 TASK_CONTRACT_SCHEMA = "ouroboros.benchmark.cybergym.task_contract.v1"
 DEFAULT_FINAL_POC_PATH = "/workspace/final.poc"
 DEFAULT_DISABLED_TOOLS = (
@@ -41,6 +41,7 @@ DEFAULT_DISABLED_TOOLS = (
     "delegate_wait",
     "delegate_cancel",
     "delegate_answer",
+    "delegate_message",
     "claude_code_edit",
     "analyze_screenshot",
     "vlm_query",
@@ -198,9 +199,9 @@ def derive_disabled_tools(extra: Iterable[str] = ()) -> tuple[str, ...]:
         "analyze_screenshot", "vlm_query", "view_image", "ocr_pdf",
         "extract_video_frames", "send_photo", "send_video", "switch_model",
         "schedule_subagent", "delegate_start", "delegate_wait", "delegate_cancel",
-        "delegate_answer", "claude_code_edit", "wait_task", "wait_tasks",
+        "delegate_answer", "delegate_message", "claude_code_edit", "wait_task", "wait_tasks",
         "get_task_result", "peek_task", "cancel_task", "discard_child_result",
-        "task_acceptance_review", "request_deep_self_review",
+        "request_deep_self_review",
     }
     try:
         from ouroboros.tool_capabilities import CORE_TOOL_NAMES

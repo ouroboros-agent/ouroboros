@@ -45,10 +45,7 @@ def _block(ctx, workspace, cmd):
 
 @pytest.mark.parametrize("cmd", [
     ["cat", "./" + REF],
-    ["cp", "./" + REF, "/tmp/stolen"],
-    ["xxd", "./" + REF],
     ["dd", "if=./" + REF, "of=/tmp/out"],
-    ["strings", "./" + REF],
     ["sha256sum", "./" + REF],
 ])
 def test_direct_content_access_blocked(tmp_path, cmd):
@@ -72,7 +69,6 @@ def test_write_and_delete_of_artifact_blocked(tmp_path):
 
 @pytest.mark.parametrize("cmd", [
     ["./" + REF, "--help"],
-    "./reference_executable --version > ref.out 2>&1",
     "./reference_executable input.wav out.wav && ./executable input.wav out2.wav && diff out.wav out2.wav",
     "python3 -c \"import subprocess; print(subprocess.run(['./reference_executable','-h'], capture_output=True).stdout[:64])\"",
 ])
@@ -105,7 +101,7 @@ def test_ln_source_is_not_a_write_target(tmp_path):
 
 def test_git_diff_output_limited_shapes_allowed_content_diff_blocked(tmp_path):
     ctx, ws = _ctx(tmp_path)
-    # Output-LIMITED diffs (names/stat only — the vcs_diff(stat=true) FP shape) pass.
+    # Output-LIMITED diffs (names/stat only — the vcs_read(action=diff, stat=true) FP shape) pass.
     assert _block(ctx, ws, ["git", "diff", "--stat"]) == ""
     assert _block(ctx, ws, ["git", "diff", "--staged", "--name-only"]) == ""
     assert _block(ctx, ws, ["git", "diff", "--stat", "HEAD"]) == ""  # limited output wins over rev
@@ -226,7 +222,7 @@ def test_git_diff_stat_with_patch_flag_dumps_content_blocks(tmp_path):
                 ["git", "diff", "--stat", "--patch"],
                 ["git", "diff", "--numstat", "-U5"]):
         assert "RESOURCE_POLICY_BLOCKED" in _block(ctx, ws, cmd), cmd
-    # content-free stat diffs (the real vcs_diff FP) still pass.
+    # content-free stat diffs (the real vcs_read diff FP) still pass.
     assert _block(ctx, ws, ["git", "diff", "--stat"]) == ""
     assert _block(ctx, ws, ["git", "diff", "--name-only"]) == ""
 

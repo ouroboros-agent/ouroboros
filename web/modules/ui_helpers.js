@@ -1,6 +1,4 @@
 import { apiFetch } from './api_client.js';
-import { PAGE_ICONS } from './page_icons.js';
-import { escapeHtmlAttr as escapeHtml, normalizeTone } from './ui_primitives.js';
 import { safeExternalUrl } from './utils.js';
 export { renderSafeField, collectSafeFieldValues, normalizeTone, setInlineStatus } from './ui_primitives.js';
 // Cycle note: toast.js imports normalizeTone from this module. Both edges only
@@ -8,11 +6,6 @@ export { renderSafeField, collectSafeFieldValues, normalizeTone, setInlineStatus
 // the ES-module cycle is benign.
 import { showToast } from './toast.js';
 
-
-export function renderToneBadge(label, tone = 'muted', className = 'skills-badge') {
-    const cleanTone = normalizeTone(tone);
-    return `<span class="${className} ${className}-${cleanTone}">${escapeHtml(label || '')}</span>`;
-}
 
 export function installedTime(item) {
     const time = Date.parse(item?.installed_at || item?.provenance?.installed_at || item?.provenance?.updated_at || '');
@@ -30,57 +23,14 @@ export function formatRelativeAge(time, freshLabel = 'Just installed') {
     return days < 45 ? `${days}d ago` : new Date(time).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
-/**
- * Shared design-system action button for host-stamped system chat rows
- * (Project lifecycle rows and future system-message actions). One semantic
- * button role — `.btn.btn-default.btn-sm` — plus the layout-only
- * `.system-message-action` hook; callers place it inside a
- * `.system-message-actions` container.
- */
-export function createSystemMessageAction({ label, onClick, disabled = false, ariaLabel = '' } = {}) {
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'btn btn-default btn-sm system-message-action';
-    btn.textContent = String(label || '');
-    if (disabled) btn.disabled = true;
-    if (ariaLabel) btn.setAttribute('aria-label', ariaLabel);
-    if (typeof onClick === 'function') btn.addEventListener('click', onClick);
-    return btn;
-}
-
-// Composition owns spacing, wrapping and focus clearance, not bare buttons.
-export function createSystemMessageActions(...buttons) {
+// The row under a System or routed chat message: the composition owns spacing, wrapping and
+// focus clearance, never the controls inside it.
+export function createSystemMessageActions(...controls) {
     const row = document.createElement('div');
     row.className = 'system-message-actions';
-    row.append(...buttons);
+    row.append(...controls);
     return row;
 }
-
-/**
- * The one project chip: the bound-task footer in Main (`in project ↗`) and the
- * whole converted card (`running in background ↗`) share this exact DOM so the
- * two states of one element cannot drift apart. The icon is the shared Projects
- * vector (never an emoji); the name is written as text, never as HTML.
- */
-export function renderProjectChip({ name, status, onClick, className = '' } = {}) {
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = ['chat-live-project-card-btn', className].filter(Boolean).join(' ');
-    const icon = document.createElement('span');
-    icon.className = 'chat-live-project-icon';
-    icon.setAttribute('aria-hidden', 'true');
-    icon.innerHTML = PAGE_ICONS.projects;
-    const nameEl = document.createElement('span');
-    nameEl.className = 'chat-live-project-name';
-    nameEl.textContent = String(name || '');
-    const statusEl = document.createElement('span');
-    statusEl.className = 'chat-live-project-status';
-    statusEl.textContent = String(status || '');
-    btn.append(icon, nameEl, statusEl);
-    if (typeof onClick === 'function') btn.addEventListener('click', onClick);
-    return btn;
-}
-
 
 /**
  * A list editor's freshly added entry is shown where it landed and takes the
@@ -323,29 +273,74 @@ export async function downloadBlobViaHostBridge(source, filename = '', { win = w
     return { ok: true, native: false, filename: name };
 }
 
-/**
- * Clipboard write with the execCommand-textarea fallback. Non-secure origins
- * and the desktop shell have no async clipboard, so a bare
- * `navigator.clipboard?.writeText(...)` is a silently dead control there.
- * Throws when nothing could be copied, so every caller can report honestly.
- */
-async function copyTextToClipboard(url, win, doc) {
+// A modal dialog makes the rest of the page inert, so a field appended to <body> can be neither focused nor
+// selected there: `execCommand('copy')` then copies the dialog's own selection, or nothing. The field goes into
+// the open modal dialog instead. Focus lives only in the topmost modal; a click that moved none (a WebKit
+// button) names its dialog by the anchor, and the last modal in the document is the final guess.
+function isModalDialog(dialog) {
+    try { return dialog.matches(':modal'); } catch { return true; }
+}
+
+function copyFieldOwner(doc, anchor) {
+    const modals = Array.from(doc.querySelectorAll?.('dialog[open]') || []).filter(isModalDialog);
+    const holds = (node) => modals.find((dialog) => dialog.contains?.(node));
+    return holds(doc.activeElement) || holds(anchor) || modals.at(-1) || doc.body;
+}
+
+/** Select `value` in a throwaway read-only field and ask the engine to copy it; true only when it said so. */
+function copyBySelection(value, win, doc, anchor) {
+    const previous = doc.activeElement;
+    const selection = win?.getSelection?.();
+    const ranges = Array.from({ length: selection?.rangeCount || 0 }, (_, index) => selection.getRangeAt(index).cloneRange());
+    // A focused text field keeps its own caret/selection apart from the page's ranges.
+    const marks = typeof previous?.selectionStart === 'number'
+        ? [previous.selectionStart, previous.selectionEnd, previous.selectionDirection || 'none'] : null;
+    const area = doc.createElement('textarea');
+    area.className = 'chat-copy-fallback';  // fixed and off-screen (style.css): the page and the dialog cannot scroll for it
+    area.value = value;
+    area.setAttribute('readonly', '');
+    let copied = false;
     try {
-        if (!win.navigator?.clipboard?.writeText) throw new Error('no async clipboard');
-        await win.navigator.clipboard.writeText(url);
+        copyFieldOwner(doc, anchor).appendChild(area);
+        area.focus?.({ preventScroll: true });
+        area.select();
+        area.setSelectionRange?.(0, value.length);  // iOS ignores select() alone
+        copied = typeof doc.execCommand === 'function' && doc.execCommand('copy') === true;
     } catch {
-        const area = doc.createElement('textarea');
-        area.value = url;
-        area.setAttribute('readonly', '');
-        doc.body.appendChild(area);
-        try {
-            area.select();
-            const copied = typeof doc.execCommand === 'function' && doc.execCommand('copy') === true;
-            if (!copied) throw new Error('Clipboard access is unavailable');
-        } finally {
-            area.remove();
+        copied = false;
+    } finally {
+        area.remove();
+        // Focus and selection go back as they were; a keyboard owner stays on the control that asked. Focus
+        // first: WebKit drops the page selection when a control takes focus.
+        if (previous && previous !== doc.body && previous.isConnected !== false) previous.focus?.({ preventScroll: true });
+        if (marks) {
+            try { previous.setSelectionRange(marks[0], marks[1], marks[2]); } catch { /* a field type without a caret */ }
+        } else if (ranges.length) {
+            selection.removeAllRanges();
+            for (const range of ranges) selection.addRange(range);
         }
     }
+    return copied;
+}
+
+/**
+ * The shared text clipboard write (a code block, a message, a sign-in link, the LAN address); images copy blobs.
+ * The async Clipboard API goes first; it is missing on a non-secure origin and in the desktop shell and may be
+ * refused, and then a selection copied by `execCommand` is tried. It resolves only after the async write settled
+ * or `execCommand` answered `true`, and throws otherwise, so a caller never reports a copy that did not happen.
+ * `anchor` is the control or block that asked: it names the dialog that must own the selection field, since a
+ * click does not always move focus (a WebKit button).
+ */
+export async function copyTextToClipboard(text, { win = globalThis, doc = globalThis.document, anchor = null } = {}) {
+    const value = String(text ?? '');
+    const clipboard = win?.navigator?.clipboard;
+    if (clipboard?.writeText) {
+        try {
+            await clipboard.writeText(value);
+            return;
+        } catch { /* refused or unfocused: the selection path may still be allowed */ }
+    }
+    if (!copyBySelection(value, win, doc, anchor)) throw new Error('Clipboard access is unavailable');
 }
 
 /**
@@ -362,7 +357,7 @@ export async function copyTextWithToast(text, {
         return false;
     }
     try {
-        await copyTextToClipboard(value, win, doc);
+        await copyTextToClipboard(value, { win, doc });
     } catch (error) {
         toast(`Could not copy: ${error?.message || error}`, 'error');
         return false;
@@ -382,7 +377,7 @@ function absoluteShellUrl(url, win) {
 }
 
 async function copyShellLinkWithToast(url, win, doc, toast) {
-    await copyTextToClipboard(url, win, doc);
+    await copyTextToClipboard(url, { win, doc });
     toast('Link copied — open it in your browser.', 'info');
 }
 

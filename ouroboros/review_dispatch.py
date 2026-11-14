@@ -1,22 +1,25 @@
 """Reviewer dispatch primitives: the row-identity mint (moved whole from
 ``review_substrate.py`` at the module-size gate, same split shape as
-``skill_review_cycles.py``) and the write-ahead PAID stamp seam (owner
+``tools/review_change_custody.py``) and the write-ahead PAID stamp seam (owner
 Q16/Q17; Max-Review-Cycles fix round).
 
 The ``paid`` fact of Max-Review-Cycles accounting is recorded at PHYSICAL
 dispatch: a gate that must durably record "this wave spent reviewer money"
 installs a :class:`ReviewPaidStamp` on ``ctx._review_paid_stamp`` for the
-duration of its wave, and the shared reviewer transport entry
-(``review_custody.run_custodied_review_slots``) invokes it after slot resolution and
-immediately before worker fan-out. The coordinator also captures that exact
-once-only object: session routes invoke it before their replayable
-``START_REQUESTED`` row, while API routes bind it for the canonical physical-
-attempt boundary. Assembly-only refusals (triad fit ladder, scope pack signals,
-skill prompt building) exit before the seam, so a $0 attempt stays outside
-every ceiling; a worker that outlives its logical caller cannot race the
-write-ahead fact, and a crash after dispatch keeps the durable paid fact.
-Commit review verifies this write fail-closed; other callers retain historical
-fail-open accounting. This seam also hosts the L-review lane's two-phase admission.
+duration of its wave. Its optional reservation write records the wave's roster
+before any worker starts (``parallel_review``); the coordinator captures the
+once-only stamp itself: session routes first record the durable
+``START_REQUESTED`` row, then stamp the physical attempt immediately before
+POST (or after an ambiguous write), while API routes bind it at their
+canonical physical-attempt boundary. The custody entry
+(``review_custody.run_custodied_review_slots``) invokes it only for an
+executor that owns no route stamp. Assembly-only refusals, proven-unsent
+replays and refusals before a send never reach it, so a $0 attempt stays
+outside every ceiling; a worker that outlives its logical caller stamps the
+row its reservation wrote, and a crash after dispatch keeps the durable paid
+fact. Commit review verifies these writes fail-closed; other callers retain
+historical fail-open accounting. This seam also hosts the L-review lane's
+two-phase admission.
 """
 
 from __future__ import annotations
@@ -24,10 +27,8 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import logging
-import math
-import pathlib
 import threading
-from typing import Any, Callable, Dict, Iterator
+from typing import Any, Callable, Iterator
 
 log = logging.getLogger(__name__)
 _BOUND_API_PAID_STAMP: contextvars.ContextVar[Any] = contextvars.ContextVar(
@@ -42,214 +43,13 @@ SCOPE_SLOT_ID_PREFIX = "scope_slot"
 PLAN_SLOT_ID_PREFIX = "plan_slot"
 
 
-def task_acceptance_zero_physical_refusal(evidence: Any, *, retrieving: bool = False) -> dict[str, str]:
-    """Describe an acceptance refusal that needs no reviewer transport.
-
-    A retrieving row (native episode, agent session) reads the exact source
-    itself, so a partial tool-result PROJECTION does not refuse it; the
-    immutable-core overflow refuses every delivery — no owner requirement is
-    truncated for any reviewer."""
-    packet = evidence if isinstance(evidence, dict) else {}
-    # Only a genuinely UNAVAILABLE source withholds the panel. A row the budget
-    # ladder shed still has a durable, actor-resolvable source ref, so it is a
-    # disclosed omission — refusing on it burned real acceptance panels for $0
-    # while the reviewer could have read the exact bytes.
-    partials = packet.get("__unresolved_partial_artifacts__")
-    unavailable = (
-        [row for row in partials
-         if isinstance(row, dict) and str(row.get("status") or "") == "source_unavailable"]
-        if isinstance(partials, list) else ([partials] if partials else [])
-    )
-    if unavailable and not retrieving:
-        return {
-            "status": "degraded_partial_source",
-            "summary": (
-                "A decision-bearing tool result remains partial and its exact source "
-                "is unavailable; acceptance cannot treat that projection as complete."
-            ),
-        }
-    overflow = packet.get("__immutable_core_overflow__")
-    if overflow:
-        reason = str((overflow if isinstance(overflow, dict) else {}).get("reason") or "").strip()
-        return {
-            "status": "degraded_core_overflow",
-            "summary": (
-                "Immutable owner requirements do not fit the acceptance evidence "
-                "budget; no requirement was silently truncated."
-                + (f" {reason}" if reason else "")
-            ),
-        }
-    return {}
-
-
-def acceptance_slot_fit(
-    slot: Any, executor: Any, *, slot_input_caps: Any = None,
-) -> tuple[int, int]:
-    """This slot's calibrated input cap and the rendered prompt's token estimate.
-
-    The packet ceiling is resolved once against the review QUORUM's windows, so
-    a narrower slot in the same panel needs its own fit check before any send.
-    An unmeasurable prompt or an absent cached cap reads ``(0, 0)`` and
-    dispatches — the fit check is a backstop, never a new way to withhold a
-    panel.
-    """
-    from ouroboros.review_evidence import _ACCEPT_DENSE_CHARS_PER_TOKEN
-
-    caps = slot_input_caps or {}
-    slot_id = str(getattr(slot, "slot_id", "") or "")
-    if caps and slot_id not in caps and slot.model not in caps:
-        raise ValueError("Acceptance capacity has no entry for the frozen reviewer slot")
-    try:
-        chars = int(executor.prompt_chars())
-        cap = int(caps.get(slot_id, caps.get(slot.model, 0)) or 0)
-        return cap, math.ceil(
-            chars / _ACCEPT_DENSE_CHARS_PER_TOKEN
-        )
-    except Exception:
-        log.debug("acceptance per-slot fit check failed; dispatching", exc_info=True)
-        return 0, 0
-
-
-def run_zero_physical_task_acceptance(
-    request: Any, slots: Any, *, drive_root: Any, usage_ctx: Any,
-) -> Any:
-    """Return the substrate's synthetic refusal when EVERY row would be refused
-    free, or ``None`` for physical work — a mixed panel refuses its packet rows
-    inside `_run_slot` ($0) and runs its retrieving rows."""
-    if not all(
-        task_acceptance_zero_physical_refusal(
-            request.evidence, retrieving=bool(getattr(slot, "retrieves", False)))
-        for slot in slots
-    ):
-        return None
-    from ouroboros.review_substrate import run_review_request
-
-    return run_review_request(
-        request, slots=slots, drive_root=pathlib.Path(drive_root), usage_ctx=usage_ctx,
-    )
-
-
-def claim_task_acceptance_dispatch(
-    drive_root: Any,
-    root_task_id: str,
-    task_id: str,
-    binding: dict[str, Any],
-) -> dict[str, Any]:
-    """Atomically claim the canonical wallet immediately before dispatch."""
-    from ouroboros.task_results import claim_task_acceptance_review_cycle
-
-    return claim_task_acceptance_review_cycle(
-        drive_root, root_task_id, binding, claimed_by_task_id=task_id,
-    )
-
-
-def collect_task_acceptance_run(run: dict, *, drive_root: Any, usage_ctx: Any) -> Any:
-    """Collect the recorded operation at zero new dispatch, using its exact inputs.
-
-    The existing host review record owns the request and roster; custody owns live
-    workers and complete producer artifacts. No new configuration or evidence is
-    sampled here, and missing custody cannot turn collection into a new send.
-    """
-    import copy
-    import time
-    from ouroboros.review_custody import _freeze_roster_rows
-    from ouroboros.review_execution import ReviewRouteKind
-    from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
-
-    request = ReviewRequest(**copy.deepcopy(run["request"]))
-    if request.surface != "task_acceptance" or not request.retry_key:
-        raise ValueError("recorded acceptance operation identity is missing")
-    slots = [ReviewSlot(**{**row, "route": ReviewRouteKind(row["route"])})
-             for row in copy.deepcopy(run.get("slot_roster") or [])]
-    if not slots:
-        raise ValueError("recorded acceptance roster is unavailable")
-    request.reconcile_only, request.drain_deadline = True, time.monotonic()
-    previous = getattr(usage_ctx, "_review_frozen_rows", None)
-    usage_ctx._review_frozen_rows = {
-        **(previous or {}),
-        "task_acceptance": _freeze_roster_rows(usage_ctx, "task_acceptance", run.get("actors")),
-    }
-    try:
-        return run_review_request(request, slots=slots, drive_root=pathlib.Path(drive_root),
-                                  usage_ctx=usage_ctx)
-    finally:
-        usage_ctx._review_frozen_rows = previous
-
-
-def reconcile_pending_acceptance_runs(
-    llm_trace: dict, *, drive_root: Any, usage_ctx: Any,
-) -> int:
-    """Collect every already-paid acceptance panel still recorded as running, $0.
-
-    The dispatch barrier (``ReviewRequest.drain_deadline``) returns the host right
-    after dispatch, so a panel whose subject was re-authored before it settled is
-    left with ``pending_dispatch`` rows that nothing reads: the free-replay lookup
-    matches only the CURRENT binding or paid identity, so verdicts the tree already
-    bought were discarded. This is the acceptance twin of plan review's
-    reconcile-before-supersede (I3): it sends nothing, pays nothing, samples no new
-    evidence, and advances only producer facts on runs the tree already owns.
-    Idempotent by ``acceptance_run_pending`` alone -- a settled, custody-lost or
-    already-collected run is never collected again. Returns how many runs advanced.
-    """
-    from ouroboros.loop_acceptance_review import acceptance_run_pending
-
-    advanced = 0
-    for run in (llm_trace.get("review_runs") or []):
-        # Agent-tool acceptance runs carry no barrier and drain synchronously.
-        if not isinstance(run, dict) or run.get("authority") != "host_root":
-            continue
-        if not isinstance(run.get("request"), dict) or not run.get("slot_roster"):
-            continue
-        if not acceptance_run_pending(run):
-            continue
-        try:
-            result = collect_task_acceptance_run(
-                run, drive_root=drive_root, usage_ctx=usage_ctx,
-            )
-        except (OSError, TimeoutError, ValueError, KeyError) as exc:
-            log.warning("acceptance run %s could not be reconciled: %s",
-                        str(run.get("panel_id") or "")[:16], exc)
-            continue
-        # Keep the host panel identity and paid request; only producer facts advance.
-        run.update({key: value for key, value in vars(result).items() if key not in {"request", "panel_id"}})
-        advanced += not acceptance_run_pending(run)
-    return advanced
-
-
-def task_acceptance_preclaim_refusal(ctx: Any) -> Any:
-    """Project every free refusal before assembly and again at dispatch."""
-    from ouroboros.review_substrate import ReviewRunResult
-    from ouroboros.task_results import project_task_acceptance_review_capacity
-
-    projection = project_task_acceptance_review_capacity(
-        ctx.tools._ctx,
-        binding_hash=str((ctx.review_binding or {}).get("binding_hash") or ""),
-        task_id=str(ctx.task_id or ""),
-        # A-material: refuse a PAID dispatch whose material the tree already
-        # bought, even when the binding hash moved (a cosmetic tool call moves it).
-        paid_identity=str((ctx.review_binding or {}).get("paid_identity") or ""),
-    )
-    if projection.get("state") == "available" and not projection.get("binding_seen"):
-        return None
-    reason = (
-        "binding_dispatch_already_claimed"
-        if projection.get("binding_seen")
-        else str(projection.get("reason") or "review_capacity_unknown")
-    )
-    return ReviewRunResult(
-        request={"surface": "task_acceptance", "task_id": str(ctx.task_id)},
-        actors=[], parsed_findings=[], aggregate_signal="DEGRADED", degraded=True,
-        degraded_reasons=[f"{reason} (no reviewer was called)"],
-    )
-
-
 def slot_id_for_row(index: int, *, prefix: str = SLOT_ID_PREFIX) -> str:
     """Identity of the ``index``-th (1-based) configured reviewer row.
 
     The single mint for reviewer-slot identity, and the reason the substrate
     contract says slot identity is separate from model identity. Naming a row
     after its own model instead collides two rows that share a model (a supported
-    configuration — ``get_scope_review_models`` preserves duplicates on purpose),
+    configuration — the factory pool repeats Main on purpose),
     collides two model spellings that sanitize alike (``openai::gpt-5`` and
     ``openai/gpt/5``), and moves a row's identity the moment the owner edits its
     model, so the row's receipts stop lining up with its own history. The model,
@@ -258,29 +58,25 @@ def slot_id_for_row(index: int, *, prefix: str = SLOT_ID_PREFIX) -> str:
     return f"{prefix}_{int(index)}"
 
 
-class TaskAcceptanceDispatchUnavailable(RuntimeError):
-    """A task-acceptance panel was refused before reviewer transport."""
-
-
 class ReviewPaidStamp:
-    """Idempotent, thread-safe once-only wrapper around one durable write.
+    """Idempotent, thread-safe stamp shared by the seats of one review wave.
 
-    Parallel dispatch means two sides can race to be "the first transport
-    call" (the commit gate dispatches triad and scope concurrently): the first
-    caller performs the durable write-ahead, later callers block on the lock
-    until it lands and then no-op — so EVERY side is guaranteed the paid fact
-    is durable before its own transport begins. A failing default write is not
-    retried and still marks the stamp fired: the terminal record is the primary
-    ledger, and ordinary cost accounting remains fail-open. Task acceptance
-    uses ``fail_closed=True`` for its already-hard shared wallet authority;
-    every parallel caller then observes the same failure and no reviewer
+    The first caller attempts the durable write-ahead; siblings wait for its
+    result. A failed write is not retried here and still marks the stamp fired.
+    Ordinary cost accounting fails open, with the terminal record authoritative.
+    Commit-gate, review_change and resumed-skill stamps use
+    ``fail_closed=True``: every caller observes the failure and no reviewer
     transport proceeds.
     """
 
     def __init__(
         self, write: Callable[[], None], *, fail_closed: bool = False,
+        reserve: Callable[[], None] | None = None,
     ) -> None:
         self._write = write
+        # The wave's roster row, written before any worker starts; ``write`` then
+        # adds only the paid fact to it at the first physical send.
+        self.reserve = reserve
         self._lock = threading.Lock()
         self.fail_closed = bool(fail_closed)
         self._failure: Exception | None = None
@@ -290,9 +86,7 @@ class ReviewPaidStamp:
         with self._lock:
             if self.fired:
                 if self.fail_closed and self._failure is not None:
-                    raise TaskAcceptanceDispatchUnavailable(
-                        str(self._failure)
-                    ) from self._failure
+                    raise RuntimeError(str(self._failure)) from self._failure
                 return
             try:
                 self._write()
@@ -303,68 +97,8 @@ class ReviewPaidStamp:
                 self.fired = True
 
 
-def task_acceptance_paid_dispatch_stamp(
-    ctx: Any,
-    drive_root: Any,
-    root_task_id: str,
-    task_id: str,
-    binding: dict[str, Any],
-) -> ReviewPaidStamp:
-    """Build the strict once-only wallet claim for a physical panel dispatch.
-
-    The claim checks cancellation and the paid-cycle wallet only (owner R55):
-    the launch floor is evaluated once per panel, at loop admission, and a
-    running panel is bounded by the R23 deadline clamps and the per-send
-    wallet fence."""
-
-    def _claim() -> None:
-        refusal = task_acceptance_preclaim_refusal(ctx)
-        if refusal is not None:
-            reasons = list(getattr(refusal, "degraded_reasons", None) or [])
-            raise TaskAcceptanceDispatchUnavailable(
-                reasons[0] if reasons else "review_dispatch_refused"
-            )
-        claim = claim_task_acceptance_dispatch(
-            drive_root, root_task_id, task_id, binding,
-        )
-        if claim.get("status") != "claimed":
-            raise TaskAcceptanceDispatchUnavailable(
-                str(claim.get("reason") or "review_capacity_unknown")
-            )
-
-    return ReviewPaidStamp(_claim, fail_closed=True)
-
-
-@contextlib.contextmanager
-def bind_task_acceptance_paid_dispatch(ctx: Any) -> Iterator[Any]:
-    """Bind the canonical tree-wallet claim for this panel's physical seam."""
-    from ouroboros.task_results import resolve_task_lineage
-
-    tools_ctx = ctx.tools._ctx
-    metadata = getattr(tools_ctx, "task_metadata", {})
-    metadata = metadata if isinstance(metadata, dict) else {}
-    lineage = resolve_task_lineage(ctx.task_id, metadata=metadata)
-    root_task_id = str(lineage.get("root_task_id") or ctx.task_id)
-    accounting_root = pathlib.Path(str(
-        metadata.get("budget_drive_root")
-        or getattr(tools_ctx, "budget_drive_root", "")
-        or ctx.drive_root
-        or getattr(tools_ctx, "drive_root", ".")
-    ))
-    prior = getattr(tools_ctx, "_review_paid_stamp", None)
-    if prior is not None:
-        raise TaskAcceptanceDispatchUnavailable("review_dispatch_stamp_already_bound")
-    tools_ctx._review_paid_stamp = task_acceptance_paid_dispatch_stamp(
-        ctx, accounting_root, root_task_id, ctx.task_id, ctx.review_binding,
-    )
-    try:
-        yield tools_ctx
-    finally:
-        tools_ctx._review_paid_stamp = prior
-
-
 def invoke_review_paid_stamp(stamp: Any) -> None:
-    """Invoke one captured write-ahead stamp; strict wallet claims propagate."""
+    """Invoke one captured write-ahead stamp; a strict (fail-closed) stamp propagates."""
     if not callable(stamp):
         return
     try:
@@ -373,6 +107,26 @@ def invoke_review_paid_stamp(stamp: Any) -> None:
         if bool(getattr(stamp, "fail_closed", False)):
             raise
         log.debug("review paid dispatch stamp failed (fail-open)", exc_info=True)
+
+
+def invoke_late_review_paid_stamp(stamp: Any) -> bool:
+    """Stamp a send that already failed after dispatch; True when a strict stamp failed.
+
+    Only a transport that crossed the boundary without usage accounting's canonical
+    marker (a compatibility or test adapter) reaches this; the canonical lane stamps
+    before its claim. That send happened, so its own exception, with its capture and
+    attempt ids, stays the failure the caller raises for the retry rail, the native
+    cache and the failed-send observer (#1652). A strict stamp's failure is logged
+    here, never raised. The stamp keeps the failure for the canonical pre-send
+    marker; this fallback neither grants dispatch nor changes the retry policy.
+    """
+    try:
+        invoke_review_paid_stamp(stamp)
+    except Exception:
+        log.warning("review paid stamp failed after a dispatched send; the send's own failure stays raised",
+                    exc_info=True)
+        return True
+    return False
 
 
 @contextlib.contextmanager
@@ -390,11 +144,11 @@ def invoke_bound_api_review_paid_stamp(
 ) -> None:
     """Invoke the bound API stamp at its matching dispatch phase.
 
-    Strict task-acceptance authority runs immediately before the usage ledger
-    crosses into ``dispatched`` so a veto remains an honest released attempt.
-    Ordinary commit/skill accounting keeps its existing post-transition
-    write-ahead point.  ``None`` retains the historical unconditional helper
-    behavior for direct callers.
+    A strict (fail-closed) stamp runs immediately before the usage ledger
+    crosses into ``dispatched`` so a veto remains an honest released attempt;
+    a fail-open stamp keeps its existing post-transition write-ahead point.
+    ``None`` retains the historical unconditional helper behavior for direct
+    callers.
     """
     stamp = _BOUND_API_PAID_STAMP.get()
     if fail_closed is not None and bool(getattr(stamp, "fail_closed", False)) != fail_closed:
@@ -409,6 +163,13 @@ def stamp_review_paid_on_dispatch(ctx: Any) -> None:
     )
 
 
+def reserve_review_roster(ctx: Any) -> None:
+    """Write the caller-installed stamp's roster reservation; its failure propagates."""
+    reserve = getattr(getattr(ctx, "_review_paid_stamp", None), "reserve", None) if ctx is not None else None
+    if callable(reserve):
+        reserve()
+
+
 def review_operation_binding(request: Any, slot: Any, operation_id: str) -> dict:
     """Bind one physical result to its existing task, material and panel owners."""
     from ouroboros.review_custody import _attempt_key
@@ -421,6 +182,41 @@ def review_operation_binding(request: Any, slot: Any, operation_id: str) -> dict
         "operation_id": str(operation_id or ""),
         "request_key": _attempt_key(request, slot),
     }
+
+
+def recorded_binding_conflicts(binding: Any, expected: dict) -> bool:
+    """Does a recorded binding name another operation than ``expected``? An absent or
+    empty one is no conflict; its pending invocation token is a separate fact."""
+    if binding is None:
+        return False
+    return not isinstance(binding, dict) or bool(binding) and (
+        {key: value for key, value in binding.items() if key != "pending_invocation_id"} != expected)
+
+
+def recorded_review_slot(request: Any, slot: Any, operation_id: str, binding: Any) -> Any:
+    """Interpret a historical blank only when its full saved binding proves it.
+
+    Old writers omitted blank processing from identity; new captured blanks are
+    distinct from unspecified processing. Never change new requests or saved bytes.
+    Both prompt reconstruction and pending collection use this interpretation.
+    """
+    from dataclasses import replace
+
+    if slot.processing_preference == "" and isinstance(binding, dict):
+        saved = {key: value for key, value in binding.items() if key != "pending_invocation_id"}
+        if (all(saved.get(key) for key in ("subject_hash", "review_contract", "roster_hash", "root_task_id"))
+                and saved != review_operation_binding(request, slot, operation_id)):
+            legacy = replace(slot, processing_preference=None)
+            if saved == review_operation_binding(request, legacy, operation_id):
+                return legacy
+    return slot
+
+
+def recorded_invocation_tokens(row: dict) -> set:
+    """Every pending invocation token a frozen seat row recorded (row, usage, binding)."""
+    return {str(value) for value in (
+        row.get("pending_invocation_id"), (row.get("usage") or {}).get("pending_invocation_id"),
+        (row.get("recovery_binding") or {}).get("pending_invocation_id")) if value}
 
 
 def review_reconciliation_identity(request: Any, slots: list, *, root_task_id: str, contract: Any = "") -> dict:
@@ -438,9 +234,12 @@ def review_reconciliation_identity(request: Any, slots: list, *, root_task_id: s
     roster = []
     for slot in slots:
         values = asdict(slot) if is_dataclass(slot) else dict(getattr(slot, "__dict__", {}) or {})
+        # A read-only seat keeps the roster identity recorded before seats carried
+        # rights (#1609); writable rights are identity, as in ``_attempt_key``.
         roster.append({k: v for k, v in values.items()
                        if k not in {"timeout_sec", "transport_timeout_sec"}
-                       and (k != "processing_preference" or v)})
+                       and (k != "processing_preference" or v is not None)
+                       and (k != "session_access" or str(v or "readonly") != "readonly")})
     retry_key = getattr(request, "retry_key", None)
     return {
         "subject_hash": digest(retry_key or {
@@ -457,38 +256,3 @@ def review_reconciliation_identity(request: Any, slots: list, *, root_task_id: s
         **supplied,
         "root_task_id": str(root_task_id), "task_attempt": getattr(request, "task_attempt", None),
     }
-
-
-def retrieving_acceptance_packet(evidence: Dict[str, Any]) -> Dict[str, Any]:
-    """The packet a NATIVE row receives (R4/R15): the same host-attested exhibits
-    WITHOUT the freely degradable tail the api ladder spends first — the
-    tool-trajectory rows and artifact previews — because that row reads those
-    sources itself at the pointers. Every section key survives, so an
-    `evidence_ref` naming it still resolves against the FULL dict (the ref
-    authority never changes), and the omission is manifested like every other."""
-    packet = dict(evidence)
-    manifest_present = "omissions_manifest" in packet
-    manifest = packet.get("omissions_manifest")
-    # A sequence is a manifest; anything else present (None, a dict, a string) is
-    # malformed and is normalized to an empty list — never carried as-is, never its keys.
-    omissions = list(manifest) if isinstance(manifest, (list, tuple)) else []
-    trajectory = packet.get("tool_trajectory")
-    if isinstance(trajectory, list) and trajectory:
-        packet["tool_trajectory"] = [{
-            "retrieve": "tool-trajectory rows withheld from this delivery; read the trajectory log at the pointer",
-            "calls": len(trajectory),
-        }]
-        omissions.append({"section": "tool_trajectory", "omitted": len(trajectory), "reason": "retrieving_delivery"})
-    artifacts = packet.get("artifacts")
-    if isinstance(artifacts, list):
-        rows = [
-            {k: v for k, v in row.items() if k != "preview"} if isinstance(row, dict) and row.get("preview") else row
-            for row in artifacts
-        ]
-        stripped = sum(1 for before, after in zip(artifacts, rows) if before is not after)
-        if stripped:
-            packet["artifacts"] = rows
-            omissions.append({"section": "artifact_previews", "omitted": stripped, "reason": "retrieving_delivery"})
-    if omissions or (manifest_present and not isinstance(manifest, list)):
-        packet["omissions_manifest"] = omissions  # normalized whenever present and not a list; an absent key stays absent
-    return packet

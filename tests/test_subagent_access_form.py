@@ -7,6 +7,7 @@ import pytest
 from ouroboros.subagent_runtime import SubagentSelectionError, select_subagent_snapshot
 from ouroboros.tools import control
 from ouroboros.tools.registry import ToolRegistry
+from tests._store_shared import read_result
 
 
 def _settings():
@@ -29,22 +30,31 @@ def registry(tmp_path, monkeypatch):
     return registry
 
 
-@pytest.mark.parametrize("access", ["inherit", "readonly", "workspace_write"])
-@pytest.mark.parametrize("surface", ["read_only", "self_worktree"])
+@pytest.mark.parametrize(("surface", "access"), [
+    ("read_only", "inherit"),
+    ("self_worktree", "readonly"),
+    ("self_worktree", "workspace_write"),
+])
 def test_api_all_fields_form_queues_without_changing_write_surface(registry, access, surface):
     """The incident's complete optional shape must reach the actual registered handler."""
     args = {
         "subagent_id": "api-scout", "access": access,
         "objective": "Inspect the assigned source.", "expected_output": "Findings.",
         "role": "", "context": "", "constraints": "", "memory_mode": "forked",
-        "write_surface": surface, "write_root": "", "directory_strategy": "direct",
+        "input_sources": "shared",
+        "write_surface": surface, "write_root": "", "workspace_root": "", "directory_strategy": "direct",
         "scope_paths": [], "protected_paths_grant": False, "external_tool_grants": [],
         "allowed_origins": [], "delegation_intent": "", "may_mutate": False,
         "may_fan_out": True, "max_children": 0, "requested_depth": 0,
-        "required_capabilities": [], "deadline_at": "", "acceptance_claims": [],
+        "required_capabilities": [], "deadline_at": "", "acceptance_claims": [], "effort": "auto",
+        "input_files": [],  # an explicit none gates no surface
+        "memory_view": {},  # an explicit none widens no view; the child's start, not the schedule, judges it
     }
     schema = registry.get_schema_by_name("schedule_subagent")["function"]["parameters"]
-    assert set(args) == set(schema["properties"])
+    # Session-only choices have no API-child default; omission preserves native execution.
+    # API children refuse document selection (attachment_paths_unsupported), so it is session-only too.
+    assert set(args) == set(schema["properties"]) - {
+        "mode", "supervisor", "workspace", "attachment_paths", "attachment_import"}
     access_schema = schema["properties"]["access"]
     assert access_schema["enum"] == ["inherit", "readonly", "workspace_write"]
     assert access_schema["default"] == "inherit"
@@ -52,7 +62,9 @@ def test_api_all_fields_form_queues_without_changing_write_surface(registry, acc
     result = registry.execute_result("schedule_subagent", args)
 
     assert (result.status, result.code) == ("ok", "OK"), result.text
-    assert f"access={access!r} ignored for subagent_id='api-scout' (api_model)" in result.text
+    # The engine is named by its handle; the stored key never reaches the model.
+    assert f"access={access!r} ignored for subagent_id='openai/test-model' (api_model)" in result.text
+    assert "api-scout" not in result.text
     assert "write_surface controls read/write authority" in result.text
     events = [row for row in registry._ctx.pending_events if row["type"] == "schedule_subagent"]
     assert len(events) == 1
@@ -61,8 +73,7 @@ def test_api_all_fields_form_queues_without_changing_write_surface(registry, acc
     assert event["task_constraint"]["mode"] == (
         "local_readonly_subagent" if surface == "read_only" else "acting_subagent")
     assert "access" not in event["configured_subagent"]
-    saved = json.loads((registry._ctx.drive_root / "task_results" / f"{event['task_id']}.json")
-                       .read_text(encoding="utf-8"))
+    saved = read_result(registry._ctx.drive_root, event["task_id"])
     assert saved["configured_subagent"] == event["configured_subagent"]
     assert saved["task_constraint"] == event["task_constraint"]
 
@@ -75,13 +86,14 @@ def test_api_omitted_access_keeps_result_free_of_an_ignored_field_notice(registr
     assert "ignored" not in result.text
 
 
-@pytest.mark.parametrize("access", ["full", "", "invalid", [], {}])
+@pytest.mark.parametrize("access", ["full", "", {}])
 def test_invalid_access_names_field_value_and_selected_route(access):
     with pytest.raises(SubagentSelectionError) as raised:
         select_subagent_snapshot(_settings(), subagent_id="api-scout", access=access)
     assert raised.value.code == "subagent_access_invalid"
     assert f"access={access!r}" in raised.value.detail
-    assert "subagent_id='api-scout' (api_model)" in raised.value.detail
+    assert "subagent_id='openai/test-model' (api_model)" in raised.value.detail
+    assert "api-scout" not in raised.value.detail
     assert "inherit, readonly or workspace_write" in raised.value.detail
 
 

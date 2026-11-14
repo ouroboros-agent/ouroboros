@@ -1,4 +1,4 @@
-"""File walks prepare locations once while keeping target identity live."""
+"""File reads avoid credential-shape filters; command controls remain separate."""
 from __future__ import annotations
 
 from collections import Counter
@@ -9,20 +9,18 @@ from ouroboros.contracts.task_constraint import TaskConstraint
 from ouroboros.tools import core_secret_paths
 from tests.test_file_resource_consistency import environment as environment
 
-pytestmark = pytest.mark.serial
 
 
-@pytest.mark.parametrize("mode", ["local_readonly_subagent", "acting_subagent"])
-@pytest.mark.parametrize("tool,args,rg_failure", [
-    ("list_files", {"path": "src", "max_entries": 200}, None),
-    ("search_code", {"path": "src", "query": "visible_function"}, None),
-    ("search_code", {"path": "src", "query": "visible_function"}, FileNotFoundError),
-    ("search_code", {"path": "src", "query": "visible_function"}, RuntimeError),
-    ("search_code", {"path": "src/module_0.py", "query": "visible_function"}, None),
-    ("query_code", {"op": "symbols", "path": "src/module_0.py"}, None),
-    ("query_code", {"op": "structural", "query": "FunctionDef", "path": "src"}, None),
+@pytest.mark.parametrize(("tool", "args", "rg_failure", "mode"), [
+    pytest.param("list_files", {"path": "src", "max_entries": 200}, None, "local_readonly_subagent", id='list_files-args0-None-local_readonly_subagent'),
+    pytest.param("search_code", {"path": "src", "query": "visible_function"}, None, "acting_subagent", id='search_code-args1-None-acting_subagent'),
+    pytest.param("search_code", {"path": "src", "query": "visible_function"}, FileNotFoundError, "local_readonly_subagent", id='search_code-args2-FileNotFoundError-local_readonly_subagent'),
+    pytest.param("search_code", {"path": "src", "query": "visible_function"}, RuntimeError, "acting_subagent", id='search_code-args3-RuntimeError-acting_subagent'),
+    pytest.param("search_code", {"path": "src/module_0.py", "query": "visible_function"}, None, "local_readonly_subagent", id='search_code-args4-None-local_readonly_subagent'),
+    pytest.param("query_code", {"op": "symbols", "path": "src/module_0.py"}, None, "acting_subagent", id='query_code-args5-None-acting_subagent'),
+    pytest.param("query_code", {"op": "structural", "query": "FunctionDef", "path": "src"}, None, "local_readonly_subagent", id='query_code-args6-None-local_readonly_subagent'),
 ])
-def test_each_walk_prepares_locations_once_and_next_call_refreshes(environment, monkeypatch, mode, tool, args, rg_failure):
+def test_file_walks_do_not_prepare_credential_shape_filters(environment, monkeypatch, mode, tool, args, rg_failure):
     from ouroboros import code_search_rg, credential_shapes, tool_access
 
     if rg_failure is not None:
@@ -44,7 +42,8 @@ def test_each_walk_prepares_locations_once_and_next_call_refreshes(environment, 
         monkeypatch.setattr(module, name, run)
 
     counted(credential_shapes, "owner_credential_locations")
-    counted(core_secret_paths, "restricted_data_roots")
+    counted(core_secret_paths, "make_runtime_secret_target_check")
+    counted(core_secret_paths, "runtime_data_roots")
     counted(tool_access, "resource_root_path")
     for total in (12, 40):
         for index in range(total):
@@ -55,8 +54,8 @@ def test_each_walk_prepares_locations_once_and_next_call_refreshes(environment, 
         result = reg.execute(tool, args)
         assert "BLOCKED" not in result and "ERROR" not in result, result
         assert "module_0.py" in result
-        assert counts["owner_credential_locations"] == counts["restricted_data_roots"] == 1, counts
-        assert counts["task_drive"] == counts["artifact_store"] == 1, counts
+        assert counts["owner_credential_locations"] == counts["make_runtime_secret_target_check"] == 0, counts
+        assert counts["runtime_data_roots"] in {1, 2}, counts
 
 
 def test_prepared_check_keeps_per_target_identity_and_all_data_roots(environment, monkeypatch):
@@ -89,7 +88,7 @@ def test_prepared_check_keeps_per_target_identity_and_all_data_roots(environment
     state_alias = data / "uploads" / "state-copy.txt"
     state_alias.parent.mkdir()
     state_alias.hardlink_to(owner_files[0])
-    check = core_secret_paths.make_subagent_secret_target_check(repo, ctx=ctx)
+    check = core_secret_paths.make_runtime_secret_target_check(repo, ctx=ctx)
     assert not check(ordinary) and not check(public) and not check(output) and not check(nested)
     assert check(secret) and check(alias) and check(state_alias)
     assert all(check(path) for path in owner_files)
@@ -114,7 +113,7 @@ def test_prepared_check_resolves_each_new_symlink_target(environment):
         alias.symlink_to(ordinary)
     except (NotImplementedError, OSError):
         pytest.skip("symlink creation is not supported by this test host")
-    check = core_secret_paths.make_subagent_secret_target_check(repo, ctx=ctx)
+    check = core_secret_paths.make_runtime_secret_target_check(repo, ctx=ctx)
     assert not check(alias)
     alias.unlink()
     alias.symlink_to(secret)
@@ -124,7 +123,7 @@ def test_prepared_check_resolves_each_new_symlink_target(environment):
     assert not check(alias)
 
 
-def test_query_cached_facts_do_not_cache_read_permission(environment, monkeypatch):
+def test_query_cached_facts_remain_visible_with_credential_named_alias(environment, monkeypatch):
     from ouroboros import code_intelligence
 
     reg, ctx, _home, repo, data = environment
@@ -135,12 +134,10 @@ def test_query_cached_facts_do_not_cache_read_permission(environment, monkeypatc
     secret = repo / ".env"
     secret.hardlink_to(source)
 
-    def must_use_cached_facts(*_args, **_kwargs):
-        pytest.fail("unchanged digest should reuse the existing source facts")
-
-    monkeypatch.setattr(code_intelligence, "_file_fact", must_use_cached_facts)
-    hidden = reg.execute("query_code", {"op": "symbols", "path": "visible.py"})
-    assert "No results" in hidden and "visible_function" not in hidden, hidden
+    cached = {path: path.read_bytes() for path in (data / "state" / "code_intel").rglob("*") if path.is_file()}
+    first = reg.execute("query_code", {"op": "symbols", "path": "visible.py"})
+    assert "visible_function" in first, first
     secret.unlink()
     visible = reg.execute("query_code", {"op": "symbols", "path": "visible.py"})
     assert "visible_function" in visible, visible
+    assert cached == {path: path.read_bytes() for path in (data / "state" / "code_intel").rglob("*") if path.is_file()}

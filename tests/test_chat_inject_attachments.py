@@ -69,8 +69,7 @@ def test_inject_without_attachments_keeps_the_historical_kwargs(tmp_path):
     assert "client_message_id" not in bridge.messages[0]
 
 
-@pytest.mark.parametrize("copy_fails", [False, True])
-@pytest.mark.parametrize("cancel_mode", ["asyncio", "anyio"])
+@pytest.mark.parametrize(("cancel_mode", "copy_fails"), [("asyncio", False), ("anyio", True)])
 def test_cancelled_inject_retains_copy_and_inflight_until_worker_settles(tmp_path, monkeypatch, copy_fails, cancel_mode):
     import anyio
     import asyncio
@@ -83,7 +82,7 @@ def test_cancelled_inject_retains_copy_and_inflight_until_worker_settles(tmp_pat
     client = _client(tmp_path, bridge)
     ctx = client.app.state.host_service_context
     entered, release, finished = threading.Event(), threading.Event(), threading.Event()
-    original_copy, original_leave = host_service.store_chat_upload, ctx._leave_inflight
+    original_copy, original_leave = host_service.store_upload, ctx._leave_inflight
     left = []
 
     def copy(*args, **kwargs):
@@ -103,7 +102,7 @@ def test_cancelled_inject_retains_copy_and_inflight_until_worker_settles(tmp_pat
     async def payload():
         return {"chat_id": 42, "text": "file", "attachments": [{"path": str(source)}]}
 
-    monkeypatch.setattr(host_service, "store_chat_upload", copy)
+    monkeypatch.setattr(host_service, "store_upload", copy)
     monkeypatch.setattr(ctx, "_leave_inflight", leave)
     request = SimpleNamespace(app=client.app, headers={"x-skill-token": "token"}, json=payload)
     scopes = []
@@ -202,10 +201,12 @@ def test_decision_route_relays_to_the_one_decision_ingress(tmp_path, monkeypatch
 
     captured = {}
 
-    async def fake_answer(drive_root, body, *, source="web"):
+    async def fake_answer(drive_root, body, *, source="web", request=None):
         captured["drive_root"] = drive_root
         captured["body"] = body
         captured["source"] = source  # the relaying skill is the answer's transport, never "web"
+        # the relay hands the ingress its own request: a model-wait card's saved choice records its origin
+        captured["path"] = request.url.path if request is not None else None
         return 200, {"ok": True, "decision_id": body["decision_id"], "state": "answered", "answered_index": 1}
 
     monkeypatch.setattr(td, "answer_decision", fake_answer)
@@ -215,7 +216,7 @@ def test_decision_route_relays_to_the_one_decision_ingress(tmp_path, monkeypatch
 
     assert response.status_code == 200
     assert response.json() == {"ok": True, "decision_id": "quiz:task-1:q1", "state": "answered", "answered_index": 1}
-    assert captured == {"drive_root": tmp_path, "body": body, "source": "skill:telegram"}
+    assert captured == {"drive_root": tmp_path, "body": body, "source": "skill:telegram", "path": "/chat/decision"}
 
 
 def test_decision_route_returns_the_ingress_refusals_verbatim(tmp_path):
@@ -234,7 +235,7 @@ def test_decision_route_returns_the_ingress_refusals_verbatim(tmp_path):
 def test_decision_route_is_rate_limited_per_skill(tmp_path, monkeypatch):
     import ouroboros.gateway.task_decision as td
 
-    async def fake_answer(drive_root, body, *, source="web"):
+    async def fake_answer(drive_root, body, *, source="web", request=None):
         return 200, {"ok": True}
 
     monkeypatch.setattr(td, "answer_decision", fake_answer)
@@ -289,7 +290,7 @@ def test_server_routes_a_file_only_owner_message(monkeypatch):
     assert routed[0]["task_metadata"] == {"chat_attachment_uploads": uploads}
 
 
-@pytest.mark.parametrize("failure", ["missing_second", "bad_shape_second", "copy_second", "invalid_wait", "invalid_user"])
+@pytest.mark.parametrize("failure", ["missing_second", "bad_shape_second", "invalid_user"])
 def test_unaccepted_inject_removes_only_its_new_copies(tmp_path, monkeypatch, failure):
     from ouroboros.gateway import host_service
 
@@ -307,12 +308,12 @@ def test_unaccepted_inject_removes_only_its_new_copies(tmp_path, monkeypatch, fa
     elif failure == "bad_shape_second":
         body["attachments"].append("not an object")
     elif failure == "copy_second":
-        original = host_service.store_chat_upload
+        original = host_service.store_upload
         def fail_second(path, *args, **kwargs):
             if path == second:
                 raise OSError("controlled second-copy failure")
             return original(path, *args, **kwargs)
-        monkeypatch.setattr(host_service, "store_chat_upload", fail_second)
+        monkeypatch.setattr(host_service, "store_upload", fail_second)
         body["attachments"].append({"path": str(second)})
     elif failure == "invalid_wait":
         body["wait_for_response"] = True

@@ -8,7 +8,6 @@ subagent → parent mailbox frame; forged owner provenance impossible).
 
 from __future__ import annotations
 
-import json
 import types
 
 import pytest
@@ -22,12 +21,14 @@ from ouroboros.owner_quiz import (
     record_answered,
     record_asked,
 )
+from tests._store_shared import read_result, result_signature
 
 
-def _result_path(tmp_path, task_id):
-    from ouroboros.task_results import task_result_path
+def _plant(tmp_path, task_id, **fields):
+    """Merge FIELDS into the stored row exactly as a concurrent writer would."""
+    from ouroboros.task_store import patch_document
 
-    return task_result_path(tmp_path, task_id)
+    return patch_document(tmp_path, task_id, lambda row: {**row, **fields})
 
 
 # ---------------------------------------------------------------- projection
@@ -83,6 +84,24 @@ def test_projection_admits_the_late_answer_only_under_the_explicit_flag(tmp_path
     assert quiz_states(tmp_path, "t1")["q1"]["answered_index"] == 1
 
 
+@pytest.mark.parametrize("wait_mode", ["optional", "waiting", "resumed"])
+def test_late_frame_does_not_invent_continuation_after_terminal(tmp_path, monkeypatch, wait_mode):
+    from ouroboros import owner_quiz
+
+    record_asked(tmp_path, "t1", quiz_id="q1", question="Which?", options=["A"],
+                 assumption="assume A", wait_for_answer=wait_mode != "optional")
+    if wait_mode == "resumed":
+        monkeypatch.setattr(owner_quiz, "utc_now_iso", lambda: "2026-01-01T00:00:01Z")
+        assert owner_quiz.mark_wait_ended(tmp_path, "t1", "q1")
+    monkeypatch.setattr(owner_quiz, "utc_now_iso", lambda: "2026-01-01T00:00:02Z")
+    reconcile_terminal(tmp_path, "t1")
+    answer = record_answered(tmp_path, "t1", quiz_id="q1", option_index=0,
+                             request_id="late", allow_expired=True)
+    frame = owner_quiz.recorded_answer_frame(answer["block"])
+    assert ("You continued under the assumption" in frame) == (wait_mode != "waiting")
+    assert "The owner chose option 1: A" in frame
+
+
 def test_projection_refuses_out_of_range_and_unknown(tmp_path):
     record_asked(tmp_path, "t1", quiz_id="q1", question="?", options=["A", "B"])
     out = record_answered(tmp_path, "t1", quiz_id="q1", option_index=7, request_id="r")
@@ -113,13 +132,10 @@ def test_structural_expiry_flips_open_only(tmp_path):
 
 def test_structural_expiry_closes_the_paired_owner_wait(tmp_path):
     record_asked(tmp_path, "t1", quiz_id="q1", question="?", options=["A"])
-    path = _result_path(tmp_path, "t1")
-    row = json.loads(path.read_text())
-    row["owner_wait"] = {"quiz_id": "q1", "wait_id": "w1", "state": "waiting"}
-    path.write_text(json.dumps(row))
+    _plant(tmp_path, "t1", owner_wait={"quiz_id": "q1", "wait_id": "w1", "state": "waiting"})
 
     assert reconcile_terminal(tmp_path, "t1") == ["q1"]
-    updated = json.loads(path.read_text())
+    updated = read_result(tmp_path, "t1")
     assert updated["owner_quiz"]["q1"]["state"] == STATE_EXPIRED_TERMINAL
     assert updated["owner_wait"]["state"] == STATE_EXPIRED_TERMINAL
     assert updated["owner_wait"]["reconciled_at"]
@@ -127,39 +143,34 @@ def test_structural_expiry_closes_the_paired_owner_wait(tmp_path):
 
 def test_structural_expiry_repairs_wait_after_partial_pair_write_failure(tmp_path, monkeypatch):
     import ouroboros.owner_quiz as owner_quiz
-    from ouroboros.utils import update_json_locked as real_update_json_locked
+    from ouroboros.store import StoreError
+    from ouroboros.task_store import patch_document as real_patch_document
 
     record_asked(tmp_path, "t1", quiz_id="q1", question="?", options=["A"])
-    path = _result_path(tmp_path, "t1")
-    row = json.loads(path.read_text())
-    row["owner_wait"] = {"quiz_id": "q1", "wait_id": "w1", "state": "waiting"}
-    path.write_text(json.dumps(row))
+    _plant(tmp_path, "t1", owner_wait={"quiz_id": "q1", "wait_id": "w1", "state": "waiting"})
     calls = {"count": 0}
 
     def fail_pair_write(*args, **kwargs):
         calls["count"] += 1
         if calls["count"] == 2:
-            raise OSError("simulated paired projection failure")
-        return real_update_json_locked(*args, **kwargs)
+            raise StoreError("simulated paired projection failure")
+        return real_patch_document(*args, **kwargs)
 
-    monkeypatch.setattr(owner_quiz, "update_json_locked", fail_pair_write)
-    with pytest.raises(OSError):
+    monkeypatch.setattr(owner_quiz, "patch_document", fail_pair_write)
+    with pytest.raises(StoreError):
         reconcile_terminal(tmp_path, "t1")
-    assert json.loads(path.read_text())["owner_quiz"]["q1"]["state"] == STATE_EXPIRED_TERMINAL
+    assert read_result(tmp_path, "t1")["owner_quiz"]["q1"]["state"] == STATE_EXPIRED_TERMINAL
 
-    monkeypatch.setattr(owner_quiz, "update_json_locked", real_update_json_locked)
+    monkeypatch.setattr(owner_quiz, "patch_document", real_patch_document)
     assert reconcile_terminal(tmp_path, "t1") == []
-    assert json.loads(path.read_text())["owner_wait"]["state"] == STATE_EXPIRED_TERMINAL
+    assert read_result(tmp_path, "t1")["owner_wait"]["state"] == STATE_EXPIRED_TERMINAL
 
 
 def test_projection_survives_concurrent_result_fields(tmp_path):
     record_asked(tmp_path, "t1", quiz_id="q1", question="?", options=["A"] * 2)
-    path = _result_path(tmp_path, "t1")
-    data = json.loads(path.read_text())
-    assert "owner_quiz" in data
+    assert "owner_quiz" in read_result(tmp_path, "t1")
     # A terminal writer merging around the key keeps the projection intact.
-    data["status"] = "completed"
-    path.write_text(json.dumps(data))
+    _plant(tmp_path, "t1", status="completed")
     assert quiz_states(tmp_path, "t1")["q1"]["state"] == STATE_OPEN
 
 
@@ -170,18 +181,19 @@ def test_task_done_seam_reconciles_and_broadcasts(tmp_path, monkeypatch):
     quiz_state frame for each — replacing the per-domain events.py blocks."""
     import supervisor.queue_transitions as qt
 
-    record_asked(tmp_path, "t1", quiz_id="q1", question="?", options=["A", "B"])
+    record_asked(tmp_path, "t1", quiz_id="q1", question="?", options=["A", "B"], chat_id=73)
     frames = []
 
     class _Bridge:
-        def send_quiz_state(self, quiz_id, task_id, state, answered_index=None, chat_id=0, comment=None):
-            frames.append((quiz_id, task_id, state))
+        def send_quiz_state(self, quiz_id, task_id, state, answered_index=None, chat_id=0, comment=None,
+                            question_delivery=None, wait_for_answer=None):
+            frames.append((quiz_id, task_id, state, chat_id, wait_for_answer))
 
     import supervisor.message_bus as mb
 
     monkeypatch.setattr(mb, "get_bridge", lambda: _Bridge())
     qt.reconcile_terminal_task_projections(tmp_path, "t1")
-    assert frames == [("q1", "t1", "expired_terminal")]
+    assert frames == [("q1", "t1", "expired_terminal", 73, False)]
     assert quiz_states(tmp_path, "t1")["q1"]["state"] == STATE_EXPIRED_TERMINAL
 
 
@@ -196,9 +208,15 @@ def _decision_app(tmp_path, monkeypatch, live_task=None):
     monkeypatch.setattr(td, "request_drive_root", lambda request: tmp_path)
     monkeypatch.setattr(
         td, "_live_root_task",
-        lambda task_id: (live_task, "" if live_task else "task_not_live"),
+        lambda task_id, **_: (live_task, "" if live_task else "task_not_live"),
     )
     if live_task is not None:
+        # Tests of live answer effects start from an explicitly published card.
+        from ouroboros.owner_quiz import record_publication
+        from ouroboros.task_store import task_facts
+        for task_id in task_facts(tmp_path):
+            for quiz_id in quiz_states(tmp_path, task_id):
+                record_publication(tmp_path, task_id, quiz_id, int(live_task.get("chat_id") or 1))
         import supervisor.queue as q
 
         monkeypatch.setattr(q, "_task_drive_for_task", lambda task, task_id: tmp_path,
@@ -221,7 +239,7 @@ def test_ingress_answers_a_live_quiz_end_to_end(tmp_path, monkeypatch):
     frames = []
 
     class _Bridge:
-        def send_quiz_state(self, quiz_id, task_id, state, answered_index=None, chat_id=0, comment=None):
+        def send_quiz_state(self, quiz_id, task_id, state, answered_index=None, chat_id=0, comment=None, question_delivery=None):
             frames.append((quiz_id, task_id, state, answered_index))
 
     import supervisor.message_bus as mb
@@ -431,7 +449,7 @@ def test_escalate_settled_parent_is_a_typed_dead_end(tmp_path, monkeypatch):
 
 def test_escalate_invalid_payload_is_typed(tmp_path):
     ctx = _tool_ctx(tmp_path)
-    out = _escalate(ctx, question="?", options=["only-one"], assumption="a")
+    out = _escalate(ctx, question="?", options=["a"] * 7, assumption="a")
     assert out.startswith("⚠️ QUIZ_OPTIONS_INVALID")
     out = _escalate(ctx, question="?", options=["a", "b"], assumption="")
     assert out.startswith("⚠️ QUIZ_ASSUMPTION_REQUIRED")
@@ -462,12 +480,13 @@ def test_history_replay_merges_projection_state(tmp_path, monkeypatch):
     logs = tmp_path / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     chat_path = logs / "chat.jsonl"
-    chat_path.write_text(json.dumps({
+    from ouroboros import dialogue_store as ds
+    ds.append(tmp_path, "chat", {
         "ts": "2026-08-31T00:00:00Z", "direction": "out", "chat_id": 1,
         "user_id": 7, "text": "Which?", "type": "quiz", "task_id": "task-1",
         "quiz": {"quiz_id": "q1", "options": [{"label": "A"}, {"label": "B"}],
                  "stake": "", "assumption": "x", "state": "open"},
-    }) + "\n")
+    })
     from ouroboros.gateway.history import _collect_chat_rows
 
     rows, _ = _collect_chat_rows(chat_path, tmp_path / "archive", 50,
@@ -553,15 +572,15 @@ def test_live_root_task_refuses_children_through_the_real_queue(monkeypatch):
 
 
 def test_cap_eviction_prefers_closed_blocks(tmp_path):
-    """An evicted OPEN block would resurrect as an answerable card on replay
-    (the chat row froze state=open) whose click 404s — closed blocks go first."""
-    from ouroboros.owner_quiz import _QUIZ_CAP
+    """Only discharged closed blocks may leave the bounded history."""
+    from ouroboros.owner_quiz import _QUIZ_CAP, mark_discharged
 
     for i in range(_QUIZ_CAP):
         record_asked(tmp_path, "t1", quiz_id=f"closed-{i:02d}", question="?",
                      options=["A", "B"])
         record_answered(tmp_path, "t1", quiz_id=f"closed-{i:02d}", option_index=0,
                         request_id=f"r{i}")
+        mark_discharged(tmp_path, "t1", f"closed-{i:02d}")
     record_asked(tmp_path, "t1", quiz_id="open-late", question="?", options=["A", "B"])
     states = quiz_states(tmp_path, "t1")
     assert "open-late" in states
@@ -669,7 +688,7 @@ def test_own_answer_needs_no_option_index(tmp_path, monkeypatch):
     frames = []
 
     class _Bridge:
-        def send_quiz_state(self, quiz_id, task_id, state, answered_index=None, chat_id=0, comment=None):
+        def send_quiz_state(self, quiz_id, task_id, state, answered_index=None, chat_id=0, comment=None, question_delivery=None):
             frames.append((quiz_id, state, answered_index, comment))
 
     import supervisor.message_bus as mb
@@ -693,8 +712,10 @@ def test_own_answer_needs_no_option_index(tmp_path, monkeypatch):
 
     entries = drain_owner_entries(tmp_path, "task-1", set())
     frame_text = [e for e in entries if e.get("kind") == KIND_QUIZ_ANSWER][0]["text"]
-    assert ("The owner rejected all offered options and answered verbatim: "
-            "neither — use duckdb") in frame_text
+    assert ("The owner answered in their own words without choosing an offered "
+            "option. Verbatim: neither — use duckdb") in frame_text
+    # The host never words the free answer as a rejection the owner did not state.
+    assert "rejected" not in frame_text
     assert "chose option" not in frame_text
 
 
@@ -738,12 +759,13 @@ def test_history_replay_carries_the_owner_comment(tmp_path, monkeypatch):
     logs = tmp_path / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     chat_path = logs / "chat.jsonl"
-    chat_path.write_text(json.dumps({
+    from ouroboros import dialogue_store as ds
+    ds.append(tmp_path, "chat", {
         "ts": "2026-09-01T00:00:00Z", "direction": "out", "chat_id": 1,
         "user_id": 7, "text": "Which?", "type": "quiz", "task_id": "task-1",
         "quiz": {"quiz_id": "q1", "options": [{"label": "A"}, {"label": "B"}],
                  "stake": "", "assumption": "x", "state": "open"},
-    }) + "\n")
+    })
     from ouroboros.gateway.history import _collect_chat_rows
 
     rows, _ = _collect_chat_rows(chat_path, tmp_path / "archive", 50,
@@ -828,38 +850,50 @@ def test_projection_refuses_foreign_schema_and_stamps_its_own_write(tmp_path):
 
     from ouroboros.contracts.schema_versions import SCHEMA_VERSION_KEY
     from ouroboros.task_result_schema import TASK_RESULT_SCHEMA_VERSION
+    from ouroboros.task_store import patch_document
 
-    path = _result_path(tmp_path, "t-schema")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"status": "running"}), encoding="utf-8")
+    patch_document(tmp_path, "t-schema", lambda _row: {"task_id": "t-schema", "status": "running"})  # unstamped
     record_asked(tmp_path, "t-schema", quiz_id="q1", question="?", options=["A", "B"])
-    row = json.loads(path.read_text(encoding="utf-8"))
+    row = read_result(tmp_path, "t-schema")
     assert row[SCHEMA_VERSION_KEY] == TASK_RESULT_SCHEMA_VERSION
     assert "q1" in row["owner_quiz"] and row["status"] == "running"
 
-    foreign = {"status": "running", SCHEMA_VERSION_KEY: TASK_RESULT_SCHEMA_VERSION + 1}
-    path.write_text(json.dumps(foreign), encoding="utf-8")
+    foreign = {"task_id": "t-schema", "status": "running", SCHEMA_VERSION_KEY: TASK_RESULT_SCHEMA_VERSION + 1}
+    patch_document(tmp_path, "t-schema", lambda _row: dict(foreign))
+    before = result_signature(tmp_path, "t-schema")
     with pytest.raises(ValueError, match="TASK_RESULT_SCHEMA_REFUSED"):
         record_asked(tmp_path, "t-schema", quiz_id="q2", question="?", options=["A"])
-    assert json.loads(path.read_text(encoding="utf-8")) == foreign
+    assert read_result(tmp_path, "t-schema") == foreign and result_signature(tmp_path, "t-schema") == before
 
 
 def test_quiz_state_frame_carries_the_comment_only_when_recorded():
     """#471: `send_quiz_state` puts the owner's free-text answer on the live
     `quiz_state` frame when one was recorded and leaves the key absent
     otherwise (an option-only answer, an expiry, a supersede)."""
+    from ouroboros import event_bus
     from supervisor.message_bus import LocalChatBridge
 
     frames = []
+    bus = event_bus.init_global_event_bus()
+    published = []
+    bus.subscribe("test-transport", event_bus.CHAT_QUIZ_STATE, published.append)
     bridge = LocalChatBridge.__new__(LocalChatBridge)
     bridge._broadcast_fn = frames.append
-    bridge.send_quiz_state("q1", "t1", "answered", answered_index=1)
+    bridge._chat_transports = {7: {"provider": "telegram"}}
+    bridge.send_quiz_state("q1", "t1", "answered", answered_index=1, chat_id=7)
     bridge.send_quiz_state("q1", "t1", "answered", comment="neither — use duckdb")
     bridge.send_quiz_state("q1", "t1", "expired_terminal", comment="")
     assert [("comment" in f, f.get("comment")) for f in frames] == [
         (False, None), (True, "neither — use duckdb"), (False, None),
     ]
     assert frames[0]["answered_index"] == 1 and "answered_index" not in frames[1]
+    # TZ-2 B2: the same lifecycle fact reaches transport skills through the event
+    # bus (the WebSocket reaches only the SPA), carrying the chat's transport so a
+    # skill can edit the card it already delivered instead of waiting for a reload.
+    assert [e["state"] for e in published] == ["answered", "answered", "expired_terminal"]
+    assert published[0]["transport"] == {"provider": "telegram"} and published[1]["transport"] == {}
+    assert published[0]["chat_id"] == 7 and "chat_id" not in published[1]
+    assert published[2]["topic"] == event_bus.CHAT_QUIZ_STATE
 
 
 def test_recommended_option_rides_the_card_the_projection_and_the_parent_frame(tmp_path, monkeypatch):

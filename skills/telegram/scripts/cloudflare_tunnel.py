@@ -40,6 +40,7 @@ from platform_support import (
     WindowsKillJob,
     acquire_file_lock,
     fsync_directory,
+    machine_architecture,
     minimal_process_environment,
     path_is_link_or_reparse,
     release_file_lock,
@@ -156,7 +157,7 @@ _ASSETS = {
 
 def _current_asset() -> _AssetSpec:
     system = platform.system()
-    machine = platform.machine().lower()
+    machine = machine_architecture()
     arch = {
         "arm64": "arm64",
         "aarch64": "arm64",

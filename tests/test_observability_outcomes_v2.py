@@ -138,6 +138,41 @@ def test_redactor_masks_compound_secret_names_without_generic_key_false_positive
     assert {"secret_key_name", "secret_literal_assignment"} <= rules
 
 
+def test_tool_schema_parameter_names_stay_readable_while_credential_values_stay_masked():
+    """P1 keeps a request's tool schemas reconstructible: a schema name map names parameters."""
+    cursor = {"type": "string", "description": "Cursor for the next page"}
+    payload = {
+        "tools": [{"type": "function", "function": {"name": "list_pages", "parameters": {
+            "type": "object", "required": ["q"],
+            "properties": {"page_token": cursor, "q": {"type": "string"}, "limit": {"type": "integer", "default": 10},
+                           "payload": {}, "strict": True, "filter": {"properties": {"next_token": cursor}},
+                           "api_key": {
+                "type": "string", "default": "DefaultSecret1234", "examples": ["ExampleSecret1234"]},
+                "password": {"anyOf": [{"type": "string", "const": "ConstSecret12345"}, {"type": "null"}]}},
+        }}}],
+        "input": {"page_token": "CursorValue123456"},
+        "listing": {"properties": {"password": "PlainSecret12345"}},
+        "malformed": {"type": "object", "properties": {"password": "PlainSecret12345", "n": {"type": "string"}}},
+        "data": {"type": "object", "properties": {"password": {"value": "DataSecret123456"}}},  # no schema kind
+        "lookalike": {"type": "object", "properties": {"api_key": {"type": "string", "value": "LookalikeSecret1"}}},
+    }
+
+    redacted = redact_projection(payload)
+
+    properties = redacted.value["tools"][0]["function"]["parameters"]["properties"]
+    assert properties["page_token"] == cursor and properties["q"] == {"type": "string"}
+    assert properties["filter"] == {"properties": {"next_token": cursor}} and properties["strict"] is True
+    assert properties["api_key"]["type"] == "string"
+    rendered = json.dumps(redacted.value)
+    assert properties["password"]["anyOf"][1] == {"type": "null"} and properties["limit"]["default"] == 10
+    for secret in ("DefaultSecret1234", "ExampleSecret1234", "CursorValue123456", "PlainSecret12345",
+                   "ConstSecret12345", "DataSecret123456", "LookalikeSecret1"):
+        assert secret not in rendered
+    paths = {item["path"] for item in redacted.manifest()["rules"]}
+    assert "$.tools[0].function.parameters.properties.page_token" not in paths
+    assert "$.tools[0].function.parameters.properties.api_key.default" in paths
+
+
 def test_redactor_masks_segmented_secret_markers_with_trailing_qualifiers():
     payload = {
         "client_secret_v2": "ClientSecretValue1234",
@@ -333,6 +368,8 @@ def test_loop_outcome_distinguishes_success_empty_and_provider_failure():
     assert tool_failure["reason_code"] == "final_message"
     assert tool_failure["failure"] is None
     assert tool_failure["outcome_axes"]["execution"]["unresolved_tool_errors"][0]["status"] == "artifact_output_error"
+    # A command whose declared output never registered is loud (owner 09.11, A): a promised file is missing.
+    assert "details_only" not in tool_failure["outcome_axes"]["execution"]["unresolved_tool_errors"][0]
     assert tool_failure["outcome_axes"]["objective"]["warning"] == "residual_tool_errors_without_review"
 
     answer_with_tool_error = derive_loop_outcome(
@@ -481,7 +518,7 @@ def test_forced_finalization_with_answer_is_best_effort():
     """Deadline/budget/round-limit forced finalization with a REAL extracted
     model answer is the typed best_effort shelf, not a failure. Structural
     gate: forced reason code + the loop's typed _best_effort_extracted fact +
-    non-empty non-error text."""
+    non-empty text; punctuation does not establish provenance."""
     from ouroboros.outcomes import EXECUTION_BEST_EFFORT, derive_loop_outcome
 
     for reason in ("budget_exhausted", "round_limit", "finalization_grace", "deadline_local"):
@@ -517,18 +554,27 @@ def test_forced_finalization_with_answer_is_best_effort():
     )
     assert empty["outcome_axes"]["execution"]["status"] == "failed"
 
-    # Error-marker text stays a failure even with the fact set — BOTH marker
-    # families (⚠️ and ❌, e.g. deep-self-review error strings) are rejected.
+    # Genuine extracted answers can start with either former error marker.
     for marker_text in (
-        "⚠️ Task exceeded MAX_ROUNDS (200).",
-        "❌ Deep self-review unavailable: configure OUROBOROS_MODEL_DEEP_SELF_REVIEW.",
+        "⚠️ Three modules fixed; integration tests remain unverified.",
+        "❌ The login test still fails. The saved patch fixes the other two cases.",
     ):
         marker = derive_loop_outcome(
             marker_text,
             {"execution_status": "failed", "reason_code": "round_limit", "_best_effort_extracted": True},
             {"tool_calls": [], "reasoning_notes": []},
         )
-        assert marker["outcome_axes"]["execution"]["status"] == "failed", marker_text
+        execution = marker["outcome_axes"]["execution"]
+        assert execution["status"] == EXECUTION_BEST_EFFORT, marker_text
+        assert execution["reason_code"] == "round_limit" and execution["failure"] is None
+
+    for notice in ("⚠️ Task exceeded MAX_ROUNDS (200).",
+                   "❌ Deep self-review unavailable: configure OUROBOROS_MODEL_DEEP_SELF_REVIEW."):
+        unextracted = derive_loop_outcome(
+            notice, {"execution_status": "failed", "reason_code": "round_limit"},
+            {"tool_calls": [], "reasoning_notes": []},
+        )
+        assert unextracted["outcome_axes"]["execution"]["status"] == "failed", notice
 
     # Non-forced failure reasons keep failing regardless of text/fact.
     other = derive_loop_outcome(
@@ -742,9 +788,8 @@ def test_normalize_outcome_axes_canonicalizes_partial_and_unknown_legacy():
 
     # T4 (v6.35.0): an unrecovered one-shot run_command non-zero exit is COSMETIC,
     # not a degraded execution. The error is preserved on the execution axis for
-    # monitoring; because no acceptance review ran, the objective carries a
-    # structural warning so the default-`auto` path still flags a possible
-    # overclaim (honesty moves to the LLM review axis — Bible P5).
+    # monitoring; since 09.11 (owner, A) a command the task went past is a quiet
+    # leftover: no objective warning, the card keeps it in its details.
     cosmetic_shell = derive_loop_outcome(
         "Created another file.",
         {"rounds": 3},
@@ -769,7 +814,8 @@ def test_normalize_outcome_axes_canonicalizes_partial_and_unknown_legacy():
     assert cosmetic_shell["outcome_axes"]["execution"]["status"] == EXECUTION_OK
     assert cosmetic_shell["failure"] is None
     assert cosmetic_shell["outcome_axes"]["execution"]["cosmetic_tool_errors"][0]["status"] == "non_zero_exit"
-    assert cosmetic_shell["outcome_axes"]["objective"]["warning"] == "residual_tool_errors_without_review"
+    assert cosmetic_shell["outcome_axes"]["execution"]["cosmetic_tool_errors"][0]["details_only"] is True
+    assert "warning" not in cosmetic_shell["outcome_axes"]["objective"]
 
     cleanup_failure = derive_loop_outcome(
         "Done",
@@ -840,6 +886,25 @@ def test_t4_cosmetic_partition_guards():
     assert recovered["outcome_axes"]["execution"]["recoveries"]
     assert "warning" not in recovered["outcome_axes"]["objective"]
 
+    # The rerun that finished with a note about undeclared files is the same recovery: the note is
+    # no failure. A record from when that note was a refusal, and a failed registration, are not.
+    def rerun(**later):
+        return derive_loop_outcome("Built it.", {"rounds": 2}, {"tool_calls": [
+            {"tool": "run_command", "args": {"cmd": "make build"}, "is_error": True,
+             "status": "non_zero_exit", "result": "⚠️ SHELL_EXIT_ERROR: exit_code=1."},
+            {"tool": "run_command", "args": {"cmd": "make build"}, "result": "exit_code=0", **later},
+        ]})["outcome_axes"]
+
+    noted = rerun(is_error=False, status="artifact_output_undeclared")
+    assert noted["execution"]["recoveries"] and "warning" not in noted["objective"]
+    assert not rerun(is_error=True, status="artifact_output_undeclared")["execution"]["recoveries"]
+    assert not rerun(is_error=True, status="artifact_output_error")["execution"]["recoveries"]
+    # The mind's own digest of its calls marks that run as a success, and still names a typed ok
+    # answer that applied nothing.
+    from ouroboros.memory import _ok_answer_mark
+
+    assert _ok_answer_mark("artifact_output_undeclared") == "✓" and _ok_answer_mark("inspection_required") != "✓"
+
     # When an acceptance review DID run, the residual warning is suppressed
     # (the review axis already judged "did it actually work?").
     reviewed = derive_loop_outcome(
@@ -847,15 +912,15 @@ def test_t4_cosmetic_partition_guards():
         {"rounds": 2},
         {
             "tool_calls": [{
-                "tool": "run_command", "args": {"cmd": "find /nope"}, "is_error": True,
-                "status": "non_zero_exit", "result": "⚠️ SHELL_EXIT_ERROR: exit_code=1.",
+                "tool": "write_file", "args": {"path": "x.py"}, "is_error": True,
+                "status": "error", "result": "⚠️ unexpected write error",  # loud without a review
             }],
             "review_runs": [{"aggregate_signal": "PASS"}],  # a review ran -> objective judged
             "review_decision": {"eligibility": "eligible", "trigger": "agent_called_tool_result"},
         },
     )
     assert reviewed["outcome_axes"]["execution"]["status"] == EXECUTION_OK
-    assert reviewed["outcome_axes"]["execution"]["cosmetic_tool_errors"]
+    assert reviewed["outcome_axes"]["execution"]["unresolved_tool_errors"]
     assert "warning" not in reviewed["outcome_axes"]["objective"]
 
 
@@ -885,6 +950,8 @@ def test_signal_death_is_not_cosmetic_but_plain_exit_still_is():
     assert execution["failure"] is None
     assert execution["unresolved_tool_errors"][0]["signal"] == "SIGKILL"
     assert not execution["cosmetic_tool_errors"]
+    # A signal-killed command is loud (D7): the install acted, so the card still warns.
+    assert "details_only" not in execution["unresolved_tool_errors"][0]
     assert killed["outcome_axes"]["objective"]["warning"] == "residual_tool_errors_without_review"
 
     plain = derive_loop_outcome(
@@ -1300,8 +1367,8 @@ def test_omitted_ledger_stub_keeps_the_real_summary_across_artifact_finalization
     real ledger held nine entries and a failing verification receipt was
     rewritten to "0 entries / no failures / execution ok" on the record the
     owner and the parent read — the stub is a projection of the artifact file,
-    never a source. The stub's summary is now re-projected from the refreshed
-    file, and the recomputed bundle describes the bytes actually on disk.
+    never a source. The stub's summary is now computed in memory from the
+    complete file, whose captured bytes and identity stay as recorded (#2472).
     """
     from hashlib import sha256
 
@@ -1333,6 +1400,7 @@ def test_omitted_ledger_stub_keeps_the_real_summary_across_artifact_finalization
         outcome_axes={"lifecycle": {"status": STATUS_COMPLETED}, "execution": {"status": EXECUTION_OK}},
     )
 
+    captured = pathlib.Path(refs["artifact"]["path"]).read_bytes()
     for run in ("first", "second"):
         headless.finalize_task_artifacts(parent, {"id": task_id, "workspace_root": str(repo)})
         stored = load_task_result(parent, task_id)
@@ -1348,6 +1416,7 @@ def test_omitted_ledger_stub_keeps_the_real_summary_across_artifact_finalization
             if item.get("kind") == "verification_ledger"
         )
         data = pathlib.Path(ledger_item["path"]).read_bytes()
+        assert data == captured and stub["summary_source_sha256"] == refs["artifact"]["sha256"], run
         assert ledger_item["size"] == len(data), run
         assert ledger_item["sha256"] == sha256(data).hexdigest(), run
         on_disk = json.loads(data.decode("utf-8"))

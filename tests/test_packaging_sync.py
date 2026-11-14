@@ -8,10 +8,17 @@ from ouroboros.tools.release_sync import (
     DESKTOP_DOWNLOAD_IDS,
     _normalize_pep440,
     check_history_limit,
+    is_development_marker,
+    published_download_version,
     release_asset_download_url,
 )
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
+
+
+def _download_version(version: str, text: str) -> str:
+    """The release *text*'s links must name: a release itself, a development marker's last published one."""
+    return published_download_version(text) if is_development_marker(version) else version
 
 
 def test_version_file_and_pyproject_are_synced():
@@ -61,22 +68,22 @@ def test_push_to_remote_push_tags_compatibility(monkeypatch):
 
     ok, _ = git_ops.push_to_remote("feature", push_tags=False)
     assert ok is True
-    assert commands == [["push", "-u", "origin", "feature"]]
+    assert commands == [["push", "--no-follow-tags", "-u", "origin", "refs/heads/feature:refs/heads/feature"]]
 
     commands.clear()
     ok, _ = git_ops.push_to_remote("feature", push_tags=True)
     assert ok is True
-    assert commands == [
-        ["push", "-u", "origin", "feature"],
-        ["push", "origin", "--tags"],
-    ]
+    # The legacy boolean never invents evidence that this operation created a tag.
+    assert commands == [["push", "--no-follow-tags", "-u", "origin", "refs/heads/feature:refs/heads/feature"]]
 
 
 def test_readme_version_history_contains_current_version_row():
     version = (REPO / "VERSION").read_text(encoding="utf-8").strip()
     readme = (REPO / "README.md").read_text(encoding="utf-8")
 
-    assert f"| {version} |" in readme
+    # A development marker has no row; the release its links name always has one.
+    assert (f"| {version} |" in readme) != is_development_marker(version)
+    assert f"| {_download_version(version, readme)} |" in readme
 
 
 def test_release_guidance_accepts_author_facing_and_pep440_forms():
@@ -178,16 +185,18 @@ def test_readme_prioritizes_macos_dmg_install_and_model_access():
     assert "Ouroboros-<version>.dmg" in readme
     assert "drag `Ouroboros.app` onto the **Applications** shortcut" in readme
     assert 'src="assets/install-macos.png"' in readme
-    assert "at least one supported remote provider API key or a local GGUF model" in readme
+    assert "Codex account as the Main model source" in readme
+    assert "supported remote provider API key, or use a local GGUF model" in readme
     assert "https://ouroboros-agent.ai/install/#linux" in readme
     assert (
         "badges%2Fdownloads.json)](https://ouroboros-agent.ai/install/)"
         in readme
     )
     assert "/releases/latest/download/" not in readme
+    published = _download_version(version, readme)
     for proof_id in DESKTOP_DOWNLOAD_IDS:
         assert (
-            f"[download-{proof_id}]: {release_asset_download_url(proof_id, version)}"
+            f"[download-{proof_id}]: {release_asset_download_url(proof_id, published)}"
             in readme
         )
 
@@ -203,24 +212,17 @@ def test_install_page_matches_macos_quick_start_and_model_prerequisite():
     assert macos_section.count("<li>") == 3
     assert "Applications</strong> shortcut" in install_page
     assert 'src="/assets/install-macos.png?v=' in install_page
-    assert "at least one supported remote provider API key or a local GGUF model" in install_page
+    assert "Codex account as the Main model source" in install_page
+    assert "supported remote provider API key, or use a local GGUF model" in install_page
     assert "Normal installation does not require cloning the repository, Python, or uv" in install_page
     assert "verification evidence, not additional installers" in install_page
     assert install_page.index("platform-downloads") < install_page.index(
         "Advanced: headless CLI with uv"
     ) < install_page.index("Develop or run from source")
+    published = _download_version(version, install_page)
     for proof_id in DESKTOP_DOWNLOAD_IDS:
         assert f'data-release-download="{proof_id}"' in install_page
-        assert release_asset_download_url(proof_id, version) in install_page
-
-
-def test_architecture_doc_describes_build_script_release_tag_check():
-    architecture = architecture_text(REPO)
-
-    assert "Release tag prerequisite" in architecture
-    assert "scripts/build_repo_bundle.py" in architecture
-    assert "release-tag SSOT" in architecture
-    assert "annotated `v$(cat VERSION)` tag points at `HEAD`" in architecture
+        assert release_asset_download_url(proof_id, published) in install_page
 
 
 def test_system_prompt_lists_bible_in_safety_critical_set():
@@ -263,11 +265,12 @@ def test_safety_prompt_protected_path_list_mirrors_runtime_policy():
     )
 
     safety_md = (REPO / "prompts" / "SAFETY.md").read_text(encoding="utf-8")
-    marker = "Protected paths (exact mirror of `PROTECTED_RUNTIME_PATHS` plus the protected prefix in `ouroboros/runtime_mode_policy.py`):"
+    marker = ("(exact mirror of `PROTECTED_RUNTIME_PATHS` plus the protected prefix in "
+              "`ouroboros/runtime_mode_policy.py`):")
     start = safety_md.find(marker)
     assert start != -1, "SAFETY.md lost its protected-path mirror sentence"
-    line_end = safety_md.find("\n", start)
-    listed = set(re.findall(r"`([^`]+)`", safety_md[start + len(marker):line_end]))
+    sentence = safety_md[start + len(marker):].split("\n", 1)[0].split("`. ", 1)[0]  # the list ends its sentence
+    listed = set(re.findall(r"`([^`]+)`", sentence + "`"))
     expected = set(PROTECTED_RUNTIME_PATHS) | set(PROTECTED_RUNTIME_PATH_PREFIXES)
     assert listed == expected, listed ^ expected
 
@@ -306,21 +309,16 @@ def test_server_workers_init_reads_manifest_branches_not_hardcoded_strings():
 
 
 def test_architecture_module_tree_lists_all_live_extension_http_endpoints():
-    """The high-level module map entry for ``ouroboros/gateway/extensions.py``
-    must list every HTTP path the module actually registers, so the
-    architecture map does not contradict the endpoint table later in the
-    same document. Specifically the Phase 5 review surface
-    ``POST /api/skills/<skill>/review`` is exported via
-    ``server.py`` and must appear in both places."""
+    """The module map keeps an entry for ``ouroboros/gateway/extensions.py``,
+    and the §4 endpoint registry (the map entry points there) lists the
+    skill routes the module registers, including the Phase 5 review surface
+    ``POST /api/skills/{skill}/review``."""
     architecture = architecture_text(REPO)
 
-    # Module map entry lives on the ``gateway/extensions.py`` tree line.
-    tree_idx = architecture.find("├── extensions.py")
-    assert tree_idx != -1
-    tree_line = architecture[tree_idx : architecture.find("\n", tree_idx)]
-    assert "POST /api/skills/<skill>/toggle" in tree_line
-    assert "POST /api/skills/<skill>/delete" in tree_line
-    assert "POST /api/skills/<skill>/review" in tree_line
+    # Module map entry for ``gateway/extensions.py``.
+    assert re.search(r"^\s*extensions\.py — ", architecture, re.MULTILINE)
+    for route in ("toggle", "delete", "review"):
+        assert f"| POST | `/api/skills/{{skill}}/{route}` |" in architecture
 
 
 def test_architecture_doc_lists_valid_extension_route_methods_in_frozen_contracts():

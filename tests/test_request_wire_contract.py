@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+import itertools
 import json
 import multiprocessing
 from datetime import timedelta
@@ -123,10 +125,10 @@ def _capture(
     )
 
 
-def _candidate(profile=None, pending=()):
+def _candidate(profile=None, pending=(), payload=None):
     accepted = profile or _profile()
     target = _target(provider=accepted.provider, model=accepted.model)
-    source_payload = _payload()
+    source_payload = payload or _payload()
     source_payload["model"] = accepted.model
     source_payload["tool_choice"] = accepted.tool_choice
     candidate = bind_wire_candidate(
@@ -158,10 +160,10 @@ def _custom_candidate():
     )
 
 
-def _receipt(profile=None, pending=()):
+def _receipt(profile=None, pending=(), payload=None):
     candidate = _custom_candidate() if (
         profile is not None and profile.tool_dialect == "openai_chat_custom"
-    ) else _candidate(profile, pending)
+    ) else _candidate(profile, pending, payload)
     custom_receipts = ()
     normalized_response = {
         "role": "assistant",
@@ -240,6 +242,7 @@ def test_profile_isolates_route_surface_model_and_request_dialect_without_option
         _profile(tool_dialect_override="openai_chat_custom"),
         _profile(payload=_payload(tool_choice="auto")),
         _profile(function_strictness_override="plain"),
+        _profile(function_strictness_override="absent"),
     ]
     assert len({base.fingerprint, *(item.fingerprint for item in variants)}) == len(variants) + 1
 
@@ -251,6 +254,71 @@ def test_profile_isolates_route_surface_model_and_request_dialect_without_option
     }))
     assert named_probe.tool_choice == named_other.tool_choice == "named"
     assert named_probe.fingerprint != named_other.fingerprint
+
+
+def _strict_payload(*values, server=False):
+    payload = _payload()
+    payload["tools"] = [
+        {"type": "function", "function": {"name": f"probe{index or ''}", "parameters": {"type": "object"},
+                                          **({} if value is _ABSENT else {"strict": value})}}
+        for index, value in enumerate(values)
+    ] + ([{"type": "openrouter:web_search"}] if server else [])
+    return payload
+
+
+_ABSENT = object()
+
+
+@pytest.mark.parametrize(("values", "expected"), [
+    ((), "none"),
+    ((_ABSENT,), "absent"),
+    ((False,), "false"),
+])
+def test_function_strictness_names_each_physical_strict_state(values, expected):
+    payload = _strict_payload(*values, server=True)
+    assert wire.function_strictness(payload) == expected
+    assert _profile(payload=payload).function_strictness == expected
+
+
+def test_absent_and_false_are_distinct_profiles_and_legacy_values_only_decode():
+    states = ((_ABSENT,), (False,), (True, _ABSENT), (True, False), (None,))
+    assert len({_profile(payload=_strict_payload(*values)).fingerprint for values in states}) == 5
+    produced = {wire.function_strictness(_strict_payload(*values)) for size in range(5)
+                for values in itertools.product((_ABSENT, False, True, None), repeat=size)}
+    assert produced == wire.FUNCTION_STRICTNESS_VALUES - wire.LEGACY_FUNCTION_STRICTNESS_VALUES
+    base = _profile(payload=_strict_payload(_ABSENT))
+    for legacy in ("plain", "strict", "mixed"):
+        decoded = dataclasses.replace(base, function_strictness=legacy)
+        assert decoded.fingerprint == canonical_sha256(dict(base.as_dict(), function_strictness=legacy))
+        assert _profile(function_strictness_override=legacy).function_strictness == legacy
+    with pytest.raises(ValueError, match="function strictness"):
+        _profile(function_strictness_override="loose")
+
+
+def test_historical_strictness_evidence_stays_stored_but_authorizes_no_current_profile(tmp_path):
+    action = {"kind": "drop_field", "fields": ["temperature"], "reason_code": "provider_unsupported_field"}
+    current = {values: _profile(payload=_strict_payload(*values))
+               for values in ((_ABSENT,), (False,), (True, _ABSENT), (True, False))}
+    legacy = [dataclasses.replace(current[(_ABSENT,)], function_strictness="plain"),
+              dataclasses.replace(current[(True, _ABSENT)], function_strictness="mixed")]
+    path = tmp_path / "state" / REQUEST_WIRE_STATE_FILE
+    path.parent.mkdir(parents=True)
+    now = utc_now().isoformat()
+    stored = {profile.fingerprint: {"profile": profile.as_dict(), "observed_at": now,
+                                    "records": [{"action": action, "observed_at": now}]}
+              for profile in legacy}
+    path.write_text(json.dumps({"schema_version": 1, "profiles": stored}))
+    assert [wire._read_wire_actions_at(tmp_path, profile) for profile in legacy] == [(action,)] * 2
+    assert all(wire._read_wire_actions_at(tmp_path, profile) == () for profile in current.values())
+
+    learned = current[(False,)]
+    receipt = _receipt(learned, (_pending(learned),), _strict_payload(False))
+    assert wire._commit_wire_compatibility_at(tmp_path, receipt).committed
+    assert {values: wire._read_wire_actions_at(tmp_path, profile) for values, profile in current.items()} == {
+        (_ABSENT,): (), (False,): (action,), (True, _ABSENT): (), (True, False): ()}
+    profiles = json.loads(path.read_text())["profiles"]
+    assert {key: profiles[key] for key in stored} == stored
+    assert set(profiles) == {*stored, learned.fingerprint}
 
 
 def test_profile_isolates_provider_routing_reasoning_options_and_semantic_headers():
@@ -901,7 +969,6 @@ def _process_writer(root: str, model: str) -> None:
         raise RuntimeError(result.error_code)
 
 
-@pytest.mark.serial
 def test_store_cross_process_writers_do_not_lose_updates(tmp_path):
     ctx = multiprocessing.get_context("spawn")
     processes = [
