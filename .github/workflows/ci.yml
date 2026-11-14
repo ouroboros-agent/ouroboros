@@ -1,9 +1,9 @@
+# This branch only: the file sits at the path of the fork's dispatchable workflow so it can be started by hand.
 # One-off measurement for razzant/ouroboros#3204 (track R04): where the 980x780 setup window lands on a Windows
 # desktop of a given resolution. Runs only on this branch of the agent's fork; never part of a pull request.
 name: r04 setup window measure
 on:
-  push:
-    branches: ['r04/setup-window-measure']
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
